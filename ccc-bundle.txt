@@ -1,0 +1,1169 @@
+-~{File: package.json}~-
+{
+  "name": "ccc-claude-code-clone",
+  "version": "1.0.0",
+  "description": "Claude Code Clone - Clipboard-based bridge for internal Claude UI",
+  "main": "src/node-server/coordinator.js",
+  "scripts": {
+    "compile": "./compile.sh",
+    "start": "node src/node-server/coordinator.js",
+    "mock": "node mock-env/server.js",
+    "test": "./test.sh",
+    "java:compile": "cd src/java-agent && ./compile.sh",
+    "dev": "npm run compile && npm run test"
+  },
+  "keywords": [
+    "claude",
+    "clipboard",
+    "automation",
+    "bridge"
+  ],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "dependencies": {},
+  "devDependencies": {},
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yourusername/ccc-project.git"
+  },
+  "bugs": {
+    "url": "https://github.com/yourusername/ccc-project/issues"
+  },
+  "homepage": "https://github.com/yourusername/ccc-project#readme"
+}
+-~{END}~-
+
+-~{File: config.json}~-
+{
+  "coordinatorPort": 5555,
+  "mockServerPort": 5556,
+  "production": {
+    "coordinatorPort": 5555,
+    "mockServerPort": 5556
+  },
+  "development": {
+    "coordinatorPort": 3000,
+    "mockServerPort": 3001
+  }
+}
+-~{END}~-
+
+-~{File: src/java-agent/ClipboardAgent.java}~-
+import java.awt.*;
+import java.awt.datatransfer.*;
+import java.awt.event.InputEvent;
+import java.awt.image.BufferedImage;
+import java.io.*;
+import java.util.*;
+import java.util.concurrent.*;
+import javax.swing.*;
+
+public class ClipboardAgent {
+    private static Clipboard clipboard;
+    private static Robot robot;
+    private static String savedClipboard = "";
+    private static Point savedMousePosition = new Point(0, 0);
+    private static volatile boolean stopClicking = false;
+    private static TrayIcon trayIcon;
+    private static ExecutorService executor;
+    
+    public static void main(String[] args) {
+        try {
+            // Initialize components
+            clipboard = Toolkit.getDefaultToolkit().getSystemClipboard();
+            robot = new Robot();
+            executor = Executors.newSingleThreadExecutor();
+            
+            // Setup system tray
+            setupSystemTray();
+            
+            // Process commands from stdin
+            Scanner scanner = new Scanner(System.in);
+            while (scanner.hasNextLine()) {
+                String line = scanner.nextLine();
+                processCommand(line);
+            }
+            
+        } catch (Exception e) {
+            sendError("Initialization failed: " + e.getMessage());
+            System.exit(1);
+        }
+    }
+    
+    private static void setupSystemTray() {
+        if (!SystemTray.isSupported()) {
+            log("System tray not supported");
+            return;
+        }
+        
+        try {
+            SystemTray tray = SystemTray.getSystemTray();
+            
+            // Create a simple icon (16x16 green square)
+            Image image = new BufferedImage(16, 16, BufferedImage.TYPE_INT_RGB);
+            Graphics g = image.getGraphics();
+            g.setColor(Color.GREEN);
+            g.fillRect(0, 0, 16, 16);
+            g.dispose();
+            
+            // Create tray icon
+            trayIcon = new TrayIcon(image, "CCC Agent");
+            trayIcon.setImageAutoSize(true);
+            
+            // Add popup menu
+            PopupMenu popup = new PopupMenu();
+            MenuItem statusItem = new MenuItem("Status: Ready");
+            MenuItem exitItem = new MenuItem("Exit");
+            exitItem.addActionListener(e -> System.exit(0));
+            
+            popup.add(statusItem);
+            popup.addSeparator();
+            popup.add(exitItem);
+            
+            trayIcon.setPopupMenu(popup);
+            tray.add(trayIcon);
+            
+            log("System tray initialized");
+            
+        } catch (Exception e) {
+            log("Failed to setup system tray: " + e.getMessage());
+        }
+    }
+    
+    private static void processCommand(String jsonCommand) {
+        try {
+            // Parse JSON manually (avoiding external dependencies)
+            Map<String, Object> cmd = parseSimpleJson(jsonCommand);
+            String command = (String) cmd.get("cmd");
+            
+            switch (command) {
+                case "SAVE_CLIPBOARD":
+                    saveClipboard();
+                    break;
+                    
+                case "RESTORE_CLIPBOARD":
+                    restoreClipboard();
+                    break;
+                    
+                case "SET_CLIPBOARD":
+                    setClipboard((String) cmd.get("data"));
+                    break;
+                    
+                case "GET_CLIPBOARD":
+                    getClipboard();
+                    break;
+                    
+                case "SAVE_MOUSE":
+                    saveMousePosition();
+                    break;
+                    
+                case "GET_MOUSE":
+                    getMousePosition();
+                    break;
+                    
+                case "RESTORE_MOUSE":
+                    restoreMousePosition();
+                    break;
+                    
+                case "CLICK_LOOP":
+                    startClickLoop(
+                        parseInt(cmd.get("x")),
+                        parseInt(cmd.get("y")),
+                        parseInt(cmd.get("interval")),
+                        parseInt(cmd.get("maxDuration"))
+                    );
+                    break;
+                    
+                case "STOP_CLICKING":
+                    stopClicking();
+                    break;
+                    
+                case "SET_STATUS":
+                    setStatus((String) cmd.get("message"));
+                    break;
+                    
+                case "PING":
+                    sendResponse("pong", null);
+                    break;
+                    
+                default:
+                    sendError("Unknown command: " + command);
+            }
+            
+        } catch (Exception e) {
+            sendError("Command processing failed: " + e.getMessage());
+        }
+    }
+    
+    private static void saveClipboard() {
+        try {
+            Transferable contents = clipboard.getContents(null);
+            if (contents != null && contents.isDataFlavorSupported(DataFlavor.stringFlavor)) {
+                savedClipboard = (String) contents.getTransferData(DataFlavor.stringFlavor);
+                sendResponse("clipboard_saved", savedClipboard.length() + " chars");
+            } else {
+                savedClipboard = "";
+                sendResponse("clipboard_saved", "empty");
+            }
+        } catch (Exception e) {
+            sendError("Failed to save clipboard: " + e.getMessage());
+        }
+    }
+    
+    private static void restoreClipboard() {
+        try {
+            StringSelection selection = new StringSelection(savedClipboard);
+            clipboard.setContents(selection, null);
+            sendResponse("clipboard_restored", savedClipboard.length() + " chars");
+        } catch (Exception e) {
+            sendError("Failed to restore clipboard: " + e.getMessage());
+        }
+    }
+    
+    private static void setClipboard(String data) {
+        try {
+            StringSelection selection = new StringSelection(data);
+            clipboard.setContents(selection, null);
+            sendResponse("clipboard_set", data.length() + " chars");
+        } catch (Exception e) {
+            sendError("Failed to set clipboard: " + e.getMessage());
+        }
+    }
+    
+    private static void getClipboard() {
+        try {
+            Transferable contents = clipboard.getContents(null);
+            if (contents != null && contents.isDataFlavorSupported(DataFlavor.stringFlavor)) {
+                String data = (String) contents.getTransferData(DataFlavor.stringFlavor);
+                sendResponse("clipboard_content", data);
+            } else {
+                sendResponse("clipboard_content", "");
+            }
+        } catch (Exception e) {
+            sendError("Failed to get clipboard: " + e.getMessage());
+        }
+    }
+    
+    private static void saveMousePosition() {
+        savedMousePosition = MouseInfo.getPointerInfo().getLocation();
+        sendResponse("mouse_saved", savedMousePosition.x + "," + savedMousePosition.y);
+    }
+    
+    private static void getMousePosition() {
+        Point currentPos = MouseInfo.getPointerInfo().getLocation();
+        sendResponse("mouse_position", currentPos.x + "," + currentPos.y);
+    }
+    
+    private static void restoreMousePosition() {
+        robot.mouseMove(savedMousePosition.x, savedMousePosition.y);
+        sendResponse("mouse_restored", savedMousePosition.x + "," + savedMousePosition.y);
+    }
+    
+    private static void startClickLoop(int x, int y, int interval, int maxDuration) {
+        stopClicking = false;
+        
+        executor.submit(() -> {
+            try {
+                long startTime = System.currentTimeMillis();
+                int clickCount = 0;
+                
+                while (!stopClicking && (System.currentTimeMillis() - startTime) < maxDuration) {
+                    // Move to position
+                    robot.mouseMove(x, y);
+                    robot.delay(50);
+                    
+                    // Click with hold time (like the proven test)
+                    robot.mousePress(InputEvent.BUTTON1_DOWN_MASK);
+                    robot.delay(80); // Hold for 80ms like the test
+                    robot.mouseRelease(InputEvent.BUTTON1_DOWN_MASK);
+                    clickCount++;
+                    
+                    // Wait for interval (use longer interval for more deliberate clicks)
+                    Thread.sleep(Math.max(interval, 500)); // At least 500ms between clicks
+                }
+                
+                sendResponse("click_loop_complete", clickCount + " clicks");
+                
+            } catch (Exception e) {
+                sendError("Click loop failed: " + e.getMessage());
+            }
+        });
+        
+        sendResponse("click_loop_started", x + "," + y);
+    }
+    
+    private static void stopClicking() {
+        stopClicking = true;
+        sendResponse("clicking_stopped", null);
+    }
+    
+    private static void setStatus(String message) {
+        if (trayIcon != null) {
+            trayIcon.setToolTip("CCC Agent: " + message);
+        }
+        sendResponse("status_set", message);
+    }
+    
+    // Helper methods
+    private static Map<String, Object> parseSimpleJson(String json) {
+        Map<String, Object> result = new HashMap<>();
+        
+        // Remove braces and split by comma
+        json = json.trim();
+        if (json.startsWith("{")) json = json.substring(1);
+        if (json.endsWith("}")) json = json.substring(0, json.length() - 1);
+        
+        // Parse key-value pairs
+        String[] pairs = json.split(",(?=(?:[^\"]*\"[^\"]*\")*[^\"]*$)");
+        for (String pair : pairs) {
+            String[] kv = pair.split(":", 2);
+            if (kv.length == 2) {
+                String key = kv[0].trim().replaceAll("\"", "");
+                String value = kv[1].trim();
+                
+                // Remove quotes from string values
+                if (value.startsWith("\"") && value.endsWith("\"")) {
+                    value = value.substring(1, value.length() - 1);
+                    // Unescape JSON string
+                    value = value.replace("\\\"", "\"")
+                                 .replace("\\\\", "\\")
+                                 .replace("\\n", "\n")
+                                 .replace("\\r", "\r")
+                                 .replace("\\t", "\t");
+                }
+                
+                result.put(key, value);
+            }
+        }
+        
+        return result;
+    }
+    
+    private static int parseInt(Object value) {
+        if (value == null) return 0;
+        try {
+            return Integer.parseInt(value.toString());
+        } catch (NumberFormatException e) {
+            return 0;
+        }
+    }
+    
+    private static void sendResponse(String type, String data) {
+        // For clipboard_content, send raw data without escaping
+        if ("clipboard_content".equals(type) && data != null) {
+            String response = String.format("{\"type\":\"%s\",\"data\":%s,\"timestamp\":%d}",
+                type, escapeJson(data), System.currentTimeMillis());
+            System.out.println(response);
+        } else {
+            String response = String.format("{\"type\":\"%s\",\"data\":\"%s\",\"timestamp\":%d}",
+                type, data != null ? data : "", System.currentTimeMillis());
+            System.out.println(response);
+        }
+        System.out.flush();
+    }
+    
+    private static String escapeJson(String str) {
+        return "\"" + str.replace("\\", "\\\\")
+                         .replace("\"", "\\\"")
+                         .replace("\n", "\\n")
+                         .replace("\r", "\\r")
+                         .replace("\t", "\\t") + "\"";
+    }
+    
+    private static void sendError(String error) {
+        String response = String.format("{\"type\":\"error\",\"error\":\"%s\",\"timestamp\":%d}",
+            error, System.currentTimeMillis());
+        System.out.println(response);
+        System.out.flush();
+    }
+    
+    private static void log(String message) {
+        System.err.println("[Agent] " + message);
+    }
+}
+-~{END}~-
+
+-~{File: src/node-server/coordinator-demo.js}~-
+const { spawn } = require('child_process');
+const readline = require('readline');
+const crypto = require('crypto');
+const path = require('path');
+const fs = require('fs');
+
+// Configuration
+const CONFIG = {
+  javaAgentPath: path.join(__dirname, '..', 'java-agent', 'agent.jar'),
+  calibrationPollInterval: 1000,
+  responseTimeout: 120000, // 2 minutes for response
+  clickPosition: null // Will be set during calibration
+};
+
+// State
+const state = {
+  javaAgent: null,
+  calibrated: false
+};
+
+// Start Java agent
+async function startJavaAgent() {
+  return new Promise((resolve, reject) => {
+    console.log('[Demo] Starting Java agent...');
+    
+    const jarPath = CONFIG.javaAgentPath;
+    if (!fs.existsSync(jarPath)) {
+      console.error('[Demo] agent.jar not found. Please compile first.');
+      reject(new Error('Java agent not found'));
+      return;
+    }
+    
+    state.javaAgent = spawn('java', ['-jar', jarPath], {
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+    
+    const rl = readline.createInterface({
+      input: state.javaAgent.stdout,
+      crlfDelay: Infinity
+    });
+    
+    rl.on('line', (line) => {
+      try {
+        const response = JSON.parse(line);
+        handleJavaResponse(response);
+      } catch (e) {
+        console.log('[Java Agent]', line);
+      }
+    });
+    
+    state.javaAgent.stderr.on('data', (data) => {
+      console.error('[Java Agent Error]', data.toString());
+    });
+    
+    state.javaAgent.on('exit', (code) => {
+      console.log(`[Demo] Java agent exited with code ${code}`);
+      state.javaAgent = null;
+    });
+    
+    setTimeout(() => {
+      sendJavaCommand({ cmd: 'SET_STATUS', message: 'CCC Demo - Waiting for calibration' });
+      resolve();
+    }, 1000);
+  });
+}
+
+// Send command to Java agent
+function sendJavaCommand(command) {
+  if (!state.javaAgent) {
+    console.error('[Demo] Java agent not running');
+    return false;
+  }
+  
+  const commandStr = JSON.stringify(command) + '\n';
+  state.javaAgent.stdin.write(commandStr);
+  return true;
+}
+
+// Handle Java agent responses
+function handleJavaResponse(response) {
+  switch (response.type) {
+    case 'clipboard_content':
+      checkClipboardContent(response.data);
+      break;
+      
+    case 'mouse_position':
+      if (state.waitingForMousePos) {
+        // Parse position (format: "x,y")
+        const [x, y] = response.data.split(',').map(n => parseInt(n));
+        CONFIG.clickPosition = { x, y };
+        console.log('[Demo] Captured mouse position:', x, y);
+        state.waitingForMousePos = false;
+        
+        // Send AI request after short delay
+        setTimeout(() => sendAIRequest(), 2000);
+      } else {
+        console.log('[Demo] Current mouse position:', response.data);
+      }
+      break;
+      
+    default:
+      console.log('[Demo] Java response:', response);
+  }
+}
+
+// Check clipboard for calibration message
+function checkClipboardContent(content) {
+  if (!content) return;
+  
+  // Check for calibration message
+  if (content.includes('CCC_CALIBRATION') && !state.calibrated) {
+    try {
+      const msgEnd = content.indexOf('|||CCC_END|||');
+      if (msgEnd > 0) {
+        const calibrationData = JSON.parse(content.substring(0, msgEnd));
+        console.log('[Demo] Calibration click detected!');
+        
+        // Get current mouse position from Java
+        sendJavaCommand({ cmd: 'GET_MOUSE' });
+        state.waitingForMousePos = true;
+        state.calibrated = true;
+        
+        // Update status
+        sendJavaCommand({ cmd: 'SET_STATUS', message: 'CCC Demo - Calibrated! Sending AI request...' });
+        
+        // Clear clipboard
+        sendJavaCommand({ cmd: 'SET_CLIPBOARD', data: '' });
+      }
+    } catch (e) {
+      console.error('[Demo] Failed to parse calibration:', e);
+    }
+  }
+  
+  // Check for AI response
+  if (content.includes('BROWSER_RESPONSE')) {
+    try {
+      const msgEnd = content.indexOf('|||BROWSER_END|||');
+      if (msgEnd > 0) {
+        const response = JSON.parse(content.substring(0, msgEnd));
+        console.log('\n[Demo] Received AI Response!');
+        console.log('================================');
+        console.log('Response ID:', response.id);
+        console.log('Status:', response.status);
+        console.log('Content:', response.payload.content);
+        console.log('================================\n');
+        
+        // Stop polling
+        if (state.responseFound) {
+          state.responseFound();
+        }
+        
+        // Update status
+        sendJavaCommand({ cmd: 'SET_STATUS', message: 'CCC Demo - Success! Check console for response.' });
+        
+        // Clear clipboard and exit after delay
+        setTimeout(() => {
+          sendJavaCommand({ cmd: 'SET_CLIPBOARD', data: '' });
+          console.log('[Demo] Demo completed successfully!');
+          process.exit(0);
+        }, 3000);
+      }
+    } catch (e) {
+      console.error('[Demo] Failed to parse response:', e);
+    }
+  }
+}
+
+// Poll clipboard for calibration
+async function pollForCalibration() {
+  console.log('[Demo] Starting calibration polling...');
+  console.log('[Demo] Please load the bridge in your browser');
+  console.log('[Demo] Then click anywhere on the page to calibrate');
+  console.log('[Demo] (Waiting indefinitely for calibration...)\n');
+  
+  const pollInterval = setInterval(() => {
+    if (state.calibrated) {
+      clearInterval(pollInterval);
+      return;
+    }
+    
+    // Poll clipboard - no timeout, wait forever
+    sendJavaCommand({ cmd: 'GET_CLIPBOARD' });
+    
+  }, CONFIG.calibrationPollInterval);
+}
+
+// Send AI request through bridge
+async function sendAIRequest() {
+  if (!CONFIG.clickPosition) {
+    console.error('[Demo] No calibration position!');
+    return;
+  }
+  
+  console.log('[Demo] Sending AI request...');
+  
+  // Create request
+  const request = {
+    type: 'CCC_REQUEST',
+    id: crypto.randomUUID(),
+    timestamp: Date.now(),
+    action: 'ai-complete',
+    payload: {
+      prompt: 'Write a haiku about clipboard bridges between programs',
+      max_tokens: 100,
+      temperature: 0.7
+    }
+  };
+  
+  // Calculate checksum
+  request.checksum = 'sha256-' + crypto.createHash('sha256')
+    .update(JSON.stringify(request))
+    .digest('hex');
+  
+  const requestText = JSON.stringify(request) + '|||CCC_END|||';
+  
+  // Set clipboard
+  sendJavaCommand({ cmd: 'SET_CLIPBOARD', data: requestText });
+  
+  // Wait longer for clipboard to be set
+  setTimeout(() => {
+    console.log('[Demo] Request in clipboard, starting clicks...');
+    console.log('[Demo] Clicking at calibrated position:', CONFIG.clickPosition);
+    
+    // Single click first to check clipboard
+    sendJavaCommand({
+      cmd: 'CLICK_LOOP',
+      x: CONFIG.clickPosition.x,
+      y: CONFIG.clickPosition.y,
+      interval: 100,
+      maxDuration: 100  // Just one quick click
+    });
+    
+    // Then start polling for response
+    setTimeout(() => pollForResponse(), 1000);
+    
+  }, 2000); // Wait 2 seconds after setting clipboard
+}
+
+// Poll for AI response
+function pollForResponse() {
+  console.log('[Demo] Waiting for AI response...');
+  
+  let responseFound = false;
+  
+  // Poll clipboard
+  const pollInterval = setInterval(() => {
+    if (!responseFound) {
+      sendJavaCommand({ cmd: 'GET_CLIPBOARD' });
+    }
+  }, 500);
+  
+  // Also click periodically to trigger bridge
+  let clickCount = 0;
+  const clickInterval = setInterval(() => {
+    if (!responseFound && clickCount < 10) {
+      console.log('[Demo] Clicking again to check for response...');
+      sendJavaCommand({
+        cmd: 'CLICK_LOOP',
+        x: CONFIG.clickPosition.x,
+        y: CONFIG.clickPosition.y,
+        interval: 100,
+        maxDuration: 100
+      });
+      clickCount++;
+    } else if (responseFound || clickCount >= 10) {
+      clearInterval(clickInterval);
+    }
+  }, 2000);
+  
+  // Store intervals in state for cleanup
+  state.responseFound = () => {
+    responseFound = true;
+    clearInterval(pollInterval);
+    clearInterval(clickInterval);
+  };
+  
+  // Timeout after CONFIG.responseTimeout
+  setTimeout(() => {
+    if (!responseFound) {
+      clearInterval(pollInterval);
+      clearInterval(clickInterval);
+      console.error('[Demo] Response timeout after', CONFIG.responseTimeout / 1000, 'seconds!');
+      process.exit(1);
+    }
+  }, CONFIG.responseTimeout);
+}
+
+// Main
+async function main() {
+  console.log('================================');
+  console.log('CCC Demo - AI Bridge Test');
+  console.log('================================\n');
+  
+  try {
+    // Start Java agent
+    await startJavaAgent();
+    
+    // Start calibration polling
+    await pollForCalibration();
+    
+  } catch (error) {
+    console.error('[Demo] Fatal error:', error);
+    process.exit(1);
+  }
+}
+
+// Handle shutdown
+process.on('SIGINT', () => {
+  console.log('\n[Demo] Shutting down...');
+  
+  if (state.javaAgent) {
+    sendJavaCommand({ cmd: 'SET_CLIPBOARD', data: '' });
+    state.javaAgent.kill();
+  }
+  
+  process.exit(0);
+});
+
+// Start demo
+main();
+-~{END}~-
+
+-~{File: src/browser-bridge/bridge-api.js}~-
+// CCC Browser Bridge Script - Real API Flow Version
+// This follows the actual Claude API flow from SPEC.md
+(function() {
+  'use strict';
+  
+  console.log('[CCC Bridge API] Initializing with real API flow...');
+  
+  // Configuration
+  const CONFIG = {
+    apiBase: window.location.origin, // Use same origin as the page
+    colors: {
+      calibrating: '#1a1a2e',
+      ready: '#16213e',
+      processing: '#0f3460',
+      streaming: '#2d5016',
+      success: '#53bf9d',
+      error: '#e94560'
+    },
+    sessionId: '11111111111111111111' // 20 ones as per spec
+  };
+  
+  // State
+  let bridgeState = 'calibrating';
+  let lastRequest = null;
+  let clickCount = 0;
+  
+  // Get auth token from localStorage (mock server sets this)
+  const authToken = localStorage.getItem('token') || 'mock-token-12345';
+  
+  // Remove any existing bridge
+  const existing = document.getElementById('ccc-bridge-overlay');
+  if (existing) existing.remove();
+  
+  // Create full-page overlay
+  const overlay = document.createElement('div');
+  overlay.id = 'ccc-bridge-overlay';
+  overlay.style.cssText = `
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: ${CONFIG.colors.calibrating};
+    z-index: 999999;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: background-color 0.3s;
+    font-family: 'Courier New', monospace;
+    color: white;
+  `;
+  
+  // Create status display
+  const statusDisplay = document.createElement('div');
+  statusDisplay.style.cssText = `
+    text-align: center;
+    padding: 40px;
+    background: rgba(0, 0, 0, 0.3);
+    border-radius: 10px;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+    max-width: 600px;
+  `;
+  
+  const title = document.createElement('h1');
+  title.style.cssText = `margin: 0 0 20px 0; font-size: 36px;`;
+  title.textContent = 'CCC Bridge API';
+  
+  const status = document.createElement('div');
+  status.style.cssText = `font-size: 24px; margin-bottom: 10px;`;
+  status.textContent = 'Click to calibrate';
+  
+  const info = document.createElement('div');
+  info.style.cssText = `font-size: 16px; opacity: 0.8;`;
+  info.textContent = 'Ready for calibration';
+  
+  const streamingContent = document.createElement('div');
+  streamingContent.style.cssText = `
+    margin-top: 20px;
+    padding: 20px;
+    background: rgba(0, 0, 0, 0.2);
+    border-radius: 5px;
+    text-align: left;
+    font-size: 14px;
+    max-height: 200px;
+    overflow-y: auto;
+    display: none;
+  `;
+  
+  statusDisplay.appendChild(title);
+  statusDisplay.appendChild(status);
+  statusDisplay.appendChild(info);
+  statusDisplay.appendChild(streamingContent);
+  overlay.appendChild(statusDisplay);
+  
+  // Helper functions
+  function updateDisplay(state, message = '', showStreaming = false) {
+    bridgeState = state;
+    overlay.style.background = CONFIG.colors[state] || CONFIG.colors.ready;
+    status.textContent = state.charAt(0).toUpperCase() + state.slice(1);
+    info.textContent = message;
+    streamingContent.style.display = showStreaming ? 'block' : 'none';
+  }
+  
+  function generateUUID() {
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+      const r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
+      return v.toString(16);
+    });
+  }
+  
+  // API Functions following the spec
+  async function createNewChat(prompt) {
+    const userMessageId = generateUUID();
+    const timestamp = Math.floor(Date.now() / 1000);
+    
+    const body = {
+      message: prompt,
+      messages: [{
+        id: userMessageId,
+        role: 'user',
+        content: prompt,
+        parentId: null,
+        childrenIds: [],
+        timestamp: timestamp
+      }],
+      history: {
+        messages: {
+          [userMessageId]: {
+            id: userMessageId,
+            role: 'user',
+            content: prompt,
+            parentId: null,
+            childrenIds: [],
+            timestamp: timestamp
+          }
+        },
+        currentId: userMessageId
+      },
+      timestamp: Date.now() // 13-digit for chat
+    };
+    
+    const response = await fetch(`${CONFIG.apiBase}/api/v1/chats/new`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${authToken}`
+      },
+      body: JSON.stringify(body)
+    });
+    
+    if (!response.ok) throw new Error(`Chat creation failed: ${response.status}`);
+    return await response.json();
+  }
+  
+  async function getConversationState(chatId) {
+    const response = await fetch(`${CONFIG.apiBase}/api/v1/chats/${chatId}`, {
+      headers: {
+        'Authorization': `Bearer ${authToken}`
+      }
+    });
+    
+    if (!response.ok) throw new Error(`Get state failed: ${response.status}`);
+    return await response.json();
+  }
+  
+  async function createAssistantMessage(chatId, conversation, parentMessageId) {
+    const assistantId = generateUUID();
+    const timestamp = Math.floor(Date.now() / 1000);
+    
+    // Clone conversation data
+    const updatedConv = JSON.parse(JSON.stringify(conversation));
+    
+    // Create assistant message
+    const assistantMessage = {
+      id: assistantId,
+      role: 'assistant',
+      content: '',
+      parentId: parentMessageId,
+      childrenIds: [],
+      timestamp: timestamp
+    };
+    
+    // Add to messages array
+    updatedConv.messages.push(assistantMessage);
+    
+    // Add to history.messages
+    updatedConv.history.messages[assistantId] = assistantMessage;
+    
+    // Update parent's childrenIds
+    if (updatedConv.history.messages[parentMessageId]) {
+      updatedConv.history.messages[parentMessageId].childrenIds.push(assistantId);
+    }
+    
+    // Update currentId
+    updatedConv.history.currentId = assistantId;
+    
+    const response = await fetch(`${CONFIG.apiBase}/api/v1/chats/${chatId}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${authToken}`
+      },
+      body: JSON.stringify(updatedConv)
+    });
+    
+    if (!response.ok) throw new Error(`Update failed: ${response.status}`);
+    return assistantId;
+  }
+  
+  async function streamCompletion(chatId, messageId, onChunk) {
+    const body = {
+      session_uuid: CONFIG.sessionId,
+      chat_id: chatId,
+      id: messageId,
+      stream: true,
+      model: 'claude-3-opus',
+      max_tokens: 1000,
+      temperature: 0.7
+    };
+    
+    const response = await fetch(`${CONFIG.apiBase}/api/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${authToken}`
+      },
+      body: JSON.stringify(body)
+    });
+    
+    if (!response.ok) throw new Error(`Stream failed: ${response.status}`);
+    
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let accumulated = '';
+    
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      
+      const chunk = decoder.decode(value);
+      const lines = chunk.split('\n');
+      
+      for (const line of lines) {
+        if (line.startsWith('data: ')) {
+          try {
+            const data = JSON.parse(line.substring(6));
+            if (data.choices?.[0]?.delta?.content) {
+              accumulated += data.choices[0].delta.content;
+              onChunk(accumulated, false);
+            }
+            if (data.choices?.[0]?.finish_reason === 'stop') {
+              onChunk(accumulated, true);
+              return accumulated;
+            }
+          } catch (e) {
+            console.error('[CCC Bridge API] Parse error:', e);
+          }
+        }
+      }
+    }
+    
+    return accumulated;
+  }
+  
+  // Process AI request using real API flow
+  async function processAIRequest(request) {
+    try {
+      updateDisplay('processing', 'Step 1: Creating new chat...');
+      
+      // Step 1: Create new chat
+      const chatData = await createNewChat(request.payload.prompt);
+      const chatId = chatData.id;
+      console.log('[CCC Bridge API] Created chat:', chatId);
+      
+      await new Promise(resolve => setTimeout(resolve, 500));
+      updateDisplay('processing', 'Step 2: Getting conversation state...');
+      
+      // Step 2: Get conversation state and create assistant message
+      const conversation = await getConversationState(chatId);
+      const userMessageId = conversation.messages[0].id;
+      
+      const assistantId = await createAssistantMessage(chatId, conversation, userMessageId);
+      console.log('[CCC Bridge API] Created assistant message:', assistantId);
+      
+      await new Promise(resolve => setTimeout(resolve, 500));
+      updateDisplay('streaming', 'Step 3: Streaming response...', true);
+      
+      // Step 3: Stream completion
+      let finalContent = '';
+      streamingContent.textContent = '';
+      
+      finalContent = await streamCompletion(chatId, assistantId, (content, isComplete) => {
+        streamingContent.textContent = content;
+        streamingContent.scrollTop = streamingContent.scrollHeight;
+        
+        if (!isComplete) {
+          // Send progress update
+          const progressResponse = {
+            type: 'BROWSER_PROGRESS',
+            id: request.id,
+            status: 'streaming',
+            payload: {
+              accumulated: content,
+              chatId: chatId,
+              messageId: assistantId
+            }
+          };
+          // In real implementation, we'd write this to clipboard periodically
+        }
+      });
+      
+      // Return final response
+      return {
+        type: 'BROWSER_RESPONSE',
+        id: request.id,
+        timestamp: Date.now(),
+        status: 'success',
+        payload: {
+          content: finalContent,
+          chatId: chatId,
+          messageId: assistantId,
+          model: 'claude-3-opus'
+        }
+      };
+      
+    } catch (error) {
+      console.error('[CCC Bridge API] Error:', error);
+      return {
+        type: 'BROWSER_RESPONSE',
+        id: request.id,
+        timestamp: Date.now(),
+        status: 'error',
+        payload: {
+          error: error.message
+        }
+      };
+    }
+  }
+  
+  // Handle clicks
+  overlay.addEventListener('click', async (e) => {
+    clickCount++;
+    console.log(`[CCC Bridge API] Click #${clickCount} at ${e.clientX}, ${e.clientY}`);
+    
+    if (bridgeState === 'calibrating') {
+      try {
+        const calibrationMsg = JSON.stringify({
+          type: 'CCC_CALIBRATION',
+          clicked: true,
+          timestamp: Date.now()
+        }) + '|||CCC_END|||';
+        
+        await navigator.clipboard.writeText(calibrationMsg);
+        console.log('[CCC Bridge API] Calibration click written to clipboard');
+        updateDisplay('ready', 'Waiting for AI requests...');
+        
+      } catch (err) {
+        console.error('[CCC Bridge API] Calibration failed:', err);
+        updateDisplay('error', 'Clipboard access failed');
+      }
+      return;
+    }
+    
+    if (bridgeState === 'ready') {
+      try {
+        const clipboardText = await navigator.clipboard.readText();
+        console.log('[CCC Bridge API] Clipboard content:', clipboardText.substring(0, 100) + '...');
+        
+        if (clipboardText.includes('CCC_REQUEST')) {
+          const requestEnd = clipboardText.indexOf('|||CCC_END|||');
+          if (requestEnd > 0) {
+            const requestJson = clipboardText.substring(0, requestEnd);
+            lastRequest = JSON.parse(requestJson);
+            console.log('[CCC Bridge API] Found request:', lastRequest.id);
+            
+            // Process using real API
+            const response = await processAIRequest(lastRequest);
+            
+            // Write response to clipboard
+            const responseText = JSON.stringify(response) + '|||BROWSER_END|||';
+            await navigator.clipboard.writeText(responseText);
+            
+            console.log('[CCC Bridge API] Response written to clipboard');
+            updateDisplay('success', 'Response sent!');
+            
+            setTimeout(() => updateDisplay('ready', 'Waiting for AI requests...'), 3000);
+          }
+        } else {
+          console.log('[CCC Bridge API] No CCC_REQUEST found in clipboard');
+        }
+      } catch (err) {
+        console.error('[CCC Bridge API] Error:', err);
+        updateDisplay('error', err.message);
+      }
+    }
+  });
+  
+  // Add to page
+  document.body.appendChild(overlay);
+  
+  // Set mock token if needed
+  if (!localStorage.getItem('token')) {
+    localStorage.setItem('token', 'mock-token-12345');
+  }
+  
+  console.log('[CCC Bridge API] Ready with real API flow');
+  
+  // Export for debugging
+  window.CCCBridgeAPI = {
+    getState: () => ({ state: bridgeState, clicks: clickCount, lastRequest }),
+    recalibrate: () => updateDisplay('calibrating'),
+    remove: () => overlay.remove()
+  };
+})();
+-~{END}~-
+
+-~{File: run-prod.bat}~-
+@echo off
+echo ================================
+echo CCC Production Runner
+echo ================================
+echo.
+
+REM Install Node dependencies if needed
+if not exist node_modules (
+    echo Installing Node.js dependencies...
+    npm install
+)
+
+REM Compile Java agent
+echo Compiling Java agent...
+javac src/java-agent/ClipboardAgent.java
+jar cvf src/java-agent/agent.jar -C . src/java-agent/ClipboardAgent.class
+
+REM Copy bridge script to clipboard
+echo.
+echo Copying bridge script to clipboard...
+type src\browser-bridge\bridge-api.js | clip
+echo.
+echo ================================
+echo BRIDGE SCRIPT COPIED TO CLIPBOARD!
+echo ================================
+echo.
+echo Instructions:
+echo 1. Open your internal Claude UI
+echo 2. Open Developer Console (F12)
+echo 3. Paste the bridge script (Ctrl+V)
+echo 4. Click anywhere on the overlay to calibrate
+echo.
+echo Starting coordinator...
+node src/node-server/coordinator-demo.js
+
+pause
+
+-~{END}~-
