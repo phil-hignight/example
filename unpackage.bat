@@ -1,6 +1,6 @@
 @echo off
 echo ================================
-echo CCC Production Unpacker
+echo CCC Production Unpacker v2
 echo ================================
 echo.
 
@@ -10,42 +10,44 @@ if not exist ccc-bundle.txt (
     exit /b 1
 )
 
-echo Unpacking files...
-echo.
+echo Creating PowerShell extraction script...
 
-setlocal enabledelayedexpansion
+REM Create a PowerShell script to handle the extraction
+echo $content = Get-Content 'ccc-bundle.txt' -Raw > extract.ps1
+echo $current = $null >> extract.ps1
+echo $buffer = "" >> extract.ps1
+echo $inFile = $false >> extract.ps1
+echo. >> extract.ps1
+echo foreach ($line in ($content -split "`r?`n")) { >> extract.ps1
+echo     if ($line -match '^-~\{File: (.+)\}~-$') { >> extract.ps1
+echo         $current = $matches[1] >> extract.ps1
+echo         Write-Host "Extracting: $current" >> extract.ps1
+echo         $dir = Split-Path $current -Parent >> extract.ps1
+echo         if ($dir -and -not (Test-Path $dir)) { >> extract.ps1
+echo             New-Item -ItemType Directory -Path $dir -Force ^| Out-Null >> extract.ps1
+echo         } >> extract.ps1
+echo         $buffer = "" >> extract.ps1
+echo         $inFile = $true >> extract.ps1
+echo     } >> extract.ps1
+echo     elseif ($line -eq '-~{END}~-') { >> extract.ps1
+echo         if ($inFile -and $current) { >> extract.ps1
+echo             $buffer ^| Out-File -FilePath $current -Encoding UTF8 >> extract.ps1
+echo         } >> extract.ps1
+echo         $inFile = $false >> extract.ps1
+echo         $current = $null >> extract.ps1
+echo         $buffer = "" >> extract.ps1
+echo     } >> extract.ps1
+echo     elseif ($inFile) { >> extract.ps1
+echo         if ($buffer) { $buffer += "`n" } >> extract.ps1
+echo         $buffer += $line >> extract.ps1
+echo     } >> extract.ps1
+echo } >> extract.ps1
 
-REM Read the bundle file and extract files
-set "currentFile="
-set "inFile=0"
+echo Running extraction...
+powershell -ExecutionPolicy Bypass -File extract.ps1
 
-for /f "usebackq delims=" %%A in ("ccc-bundle.txt") do (
-    set "line=%%A"
-    
-    REM Check for file header
-    if "!line:~0,8!"=="-~{File:" (
-        set "currentFile=!line:~9,-3!"
-        echo Extracting: !currentFile!
-        
-        REM Create directory if needed
-        for %%F in ("!currentFile!") do (
-            set "dir=%%~dpF"
-            if not "!dir!"=="" (
-                if not exist "!dir!" mkdir "!dir!"
-            )
-        )
-        
-        REM Clear/create the file
-        type nul > "!currentFile!"
-        set "inFile=1"
-    ) else if "!line!"=="-~{END}~-" (
-        set "inFile=0"
-        set "currentFile="
-    ) else if "!inFile!"=="1" (
-        REM Write line to current file
-        echo.%%A>>"!currentFile!"
-    )
-)
+echo Cleaning up...
+del extract.ps1
 
 echo.
 echo ================================
@@ -56,7 +58,7 @@ echo Files extracted:
 echo - package.json
 echo - config.json
 echo - src/java-agent/ClipboardAgent.java
-echo - src/node-server/coordinator-demo.js
+echo - src/node-server/coordinator-demo.js  
 echo - src/browser-bridge/bridge-api.js
 echo - run-prod.bat
 echo.
