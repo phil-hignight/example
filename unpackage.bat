@@ -1,18 +1,17 @@
 @echo off
 echo ================================
-echo CCC Production Unpacker v2
+echo CCC Production Unpacker
 echo ================================
 echo.
 
 if not exist ccc-bundle.txt (
     echo ERROR: ccc-bundle.txt not found!
-    echo Make sure you're in the same directory as the bundle file.
+    pause
     exit /b 1
 )
 
 echo Creating PowerShell extraction script...
 
-REM Create a PowerShell script to handle the extraction
 echo $content = Get-Content 'ccc-bundle.txt' -Raw > extract.ps1
 echo $current = $null >> extract.ps1
 echo $buffer = "" >> extract.ps1
@@ -31,8 +30,10 @@ echo         $inFile = $true >> extract.ps1
 echo     } >> extract.ps1
 echo     elseif ($line -eq '-~{END}~-') { >> extract.ps1
 echo         if ($inFile -and $current) { >> extract.ps1
-echo             $buffer = $buffer -replace "`r`n", "`n" -replace "`r", "`n" -replace "`n", "`r`n" >> extract.ps1
-echo             [System.IO.File]::WriteAllText($current, $buffer, [System.Text.Encoding]::UTF8) >> extract.ps1
+echo             $buffer = $buffer -replace "`n", "`r`n" >> extract.ps1
+echo             # Create UTF-8 encoding without BOM >> extract.ps1
+echo             $utf8NoBom = New-Object System.Text.UTF8Encoding -ArgumentList @($false) >> extract.ps1
+echo             [System.IO.File]::WriteAllText($current, $buffer, $utf8NoBom) >> extract.ps1
 echo         } >> extract.ps1
 echo         $inFile = $false >> extract.ps1
 echo         $current = $null >> extract.ps1
@@ -59,12 +60,15 @@ echo Files extracted:
 echo - package.json
 echo - config.json
 echo - src/java-agent/ClipboardAgent.java
-echo - src/node-server/coordinator-demo.js  
+echo - src/java-agent/StandaloneAgent.java  
+echo - mock-env/server.js
+echo - mock-env/ui.html
 echo - src/browser-bridge/bridge-api.js
-echo - run-prod.bat
+echo - run-prod.bat (production - requires real Claude UI)
+echo - run-dev.bat (development - includes mock server)
 echo.
 echo To run CCC:
-echo 1. Make sure you have Java and Node.js installed
-echo 2. Run: run-prod.bat
+echo For development/testing: run-dev.bat
+echo For production: run-prod.bat
 echo.
 pause
