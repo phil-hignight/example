@@ -1794,6 +1794,7 @@ server.listen(PORT, () => {
     return accumulated;
   }
   
+  
   // Process AI request using real API flow
   async function processAIRequest(request) {
     try {
@@ -1807,17 +1808,17 @@ server.listen(PORT, () => {
       await new Promise(resolve => setTimeout(resolve, 500));
       updateDisplay('processing', 'Step 2: Getting conversation state...');
       
-      // Step 2: Get conversation state and create assistant message
+      // Step 2: Get conversation state (no manual assistant message creation)
       const conversation = await getConversationState(chatId);
       const userMessageId = conversation.chat.messages[0].id;
       
-      const assistantId = await createAssistantMessage(chatId, conversation, userMessageId);
-      console.log('[CCC Bridge API] Created assistant message:', assistantId);
+      console.log('[CCC Bridge API] Got conversation, proceeding to stream completions');
       
       await new Promise(resolve => setTimeout(resolve, 500));
       updateDisplay('streaming', 'Step 3: Streaming response...', true);
       
-      // Step 3: Stream completion
+      // Step 3: Stream completion (generate assistant ID locally)  
+      const assistantId = generateUUID();
       let finalContent = '';
       streamingContent.textContent = '';
       
@@ -1841,6 +1842,9 @@ server.listen(PORT, () => {
         }
       });
       
+      // Stream is complete when we reach here (indicated by [DONE] in SSE)
+      console.log('[CCC Bridge API] Stream completed, final content length:', finalContent.length);
+      
       // Return final response
       return {
         type: 'BROWSER_RESPONSE',
@@ -1851,7 +1855,7 @@ server.listen(PORT, () => {
           content: finalContent,
           chatId: chatId,
           messageId: assistantId,
-          model: 'claude-3-opus'
+          model: 'Anthropic Claude 4 Sonnet'
         }
       };
       
