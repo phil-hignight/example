@@ -1484,6 +1484,16 @@ server.listen(PORT, () => {
   
   console.log('[CCC Bridge API] Initializing with real API flow...');
   
+  // Generate realistic session ID
+  function generateSessionId() {
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    let result = '';
+    for (let i = 0; i < 20; i++) {
+      result += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    return result;
+  }
+  
   // Configuration
   const CONFIG = {
     apiBase: window.location.origin, // Use same origin as the page
@@ -1495,7 +1505,7 @@ server.listen(PORT, () => {
       success: '#53bf9d',
       error: '#e94560'
     },
-    sessionId: '11111111111111111111' // 20 ones as per spec
+    sessionId: generateSessionId() // Generate realistic session ID
   };
   
   // State
@@ -1754,6 +1764,8 @@ server.listen(PORT, () => {
       "session_id": CONFIG.sessionId,
       "stream": true
     };
+    
+    console.log('[CCC Bridge API] Full request body:', JSON.stringify(body, null, 2));
     
     const response = await fetch(`${CONFIG.apiBase}/api/chat/completions`, {
       method: 'POST',
