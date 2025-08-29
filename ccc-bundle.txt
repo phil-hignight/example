@@ -1135,12 +1135,12 @@ echo CCC Production Runner
 echo ================================
 echo.
 
-REM Install Node dependencies if needed
-if not exist node_modules (
-    echo Installing Node.js dependencies...
-    npm install
-)
+REM Check for Node modules
+if exist node_modules goto :compile
+echo Installing Node.js dependencies...
+npm install
 
+:compile
 REM Compile Java agent
 echo Compiling Java agent...
 javac src/java-agent/ClipboardAgent.java
