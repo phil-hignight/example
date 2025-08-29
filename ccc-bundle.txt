@@ -386,327 +386,1094 @@ public class ClipboardAgent {
 }
 -~{END}~-
 
--~{File: src/node-server/coordinator-demo.js}~-
-const { spawn } = require('child_process');
-const readline = require('readline');
-const crypto = require('crypto');
-const path = require('path');
-const fs = require('fs');
+-~{File: src/java-agent/StandaloneAgent.java}~-
+import java.awt.*;
+import java.awt.datatransfer.*;
+import java.awt.event.InputEvent;
+import java.awt.image.BufferedImage;
+import java.io.*;
+import java.util.*;
+import java.util.concurrent.*;
+import javax.swing.*;
 
-// Configuration
-const CONFIG = {
-  javaAgentPath: path.join(__dirname, '..', 'java-agent', 'agent.jar'),
-  calibrationPollInterval: 1000,
-  responseTimeout: 120000, // 2 minutes for response
-  clickPosition: null // Will be set during calibration
-};
-
-// State
-const state = {
-  javaAgent: null,
-  calibrated: false
-};
-
-// Start Java agent
-async function startJavaAgent() {
-  return new Promise((resolve, reject) => {
-    console.log('[Demo] Starting Java agent...');
+public class StandaloneAgent {
+    private static Clipboard clipboard;
+    private static Robot robot;
+    private static String savedClipboard = "";
+    private static Point clickPosition = null;
+    private static volatile boolean calibrated = false;
+    private static TrayIcon trayIcon;
     
-    const jarPath = CONFIG.javaAgentPath;
-    if (!fs.existsSync(jarPath)) {
-      console.error('[Demo] agent.jar not found. Please compile first.');
-      reject(new Error('Java agent not found'));
-      return;
+    public static void main(String[] args) {
+        try {
+            // Initialize components
+            clipboard = Toolkit.getDefaultToolkit().getSystemClipboard();
+            robot = new Robot();
+            
+            // Setup system tray
+            setupSystemTray();
+            
+            // Start the demo flow
+            runDemo();
+            
+        } catch (Exception e) {
+            System.err.println("Error: " + e.getMessage());
+            e.printStackTrace();
+            System.exit(1);
+        }
     }
     
-    state.javaAgent = spawn('java', ['-jar', jarPath], {
-      stdio: ['pipe', 'pipe', 'pipe']
-    });
+    private static void setupSystemTray() {
+        if (!SystemTray.isSupported()) {
+            System.out.println("System tray not supported");
+            return;
+        }
+        
+        try {
+            SystemTray tray = SystemTray.getSystemTray();
+            
+            // Create icon (16x16 pixels)
+            BufferedImage image = new BufferedImage(16, 16, BufferedImage.TYPE_INT_RGB);
+            Graphics2D g = image.createGraphics();
+            g.setColor(Color.GREEN);
+            g.fillOval(0, 0, 16, 16);
+            g.dispose();
+            
+            trayIcon = new TrayIcon(image, "CCC Agent - Ready");
+            trayIcon.setImageAutoSize(true);
+            
+            // Add popup menu
+            PopupMenu popup = new PopupMenu();
+            MenuItem statusItem = new MenuItem("Status: Waiting for calibration");
+            MenuItem exitItem = new MenuItem("Exit");
+            exitItem.addActionListener(e -> System.exit(0));
+            
+            popup.add(statusItem);
+            popup.addSeparator();
+            popup.add(exitItem);
+            
+            trayIcon.setPopupMenu(popup);
+            tray.add(trayIcon);
+            
+            System.out.println("System tray initialized");
+            
+        } catch (Exception e) {
+            System.out.println("Failed to setup system tray: " + e.getMessage());
+        }
+    }
     
-    const rl = readline.createInterface({
-      input: state.javaAgent.stdout,
-      crlfDelay: Infinity
-    });
+    private static void runDemo() throws Exception {
+        System.out.println("================================");
+        System.out.println("CCC Demo - Java Standalone");
+        System.out.println("================================");
+        System.out.println();
+        
+        // Wait for bridge script to be pasted
+        waitForBridgePaste();
+        
+        // Wait for calibration
+        waitForCalibration();
+        
+        // Send test AI request
+        sendAIRequest();
+        
+        // Wait for response
+        waitForResponse();
+        
+        System.out.println("Demo completed!");
+    }
     
-    rl.on('line', (line) => {
+    private static void waitForBridgePaste() throws Exception {
+        System.out.println("Waiting for bridge script to be pasted...");
+        System.out.println("1. Bridge script should already be in your clipboard");
+        System.out.println("2. Go to http://localhost:5556/ or your internal Claude UI");
+        System.out.println("3. Open Developer Console (F12) and paste the script");
+        System.out.println("4. The script will signal when it's loaded");
+        System.out.println();
+        
+        // Save current clipboard content first
+        String originalClipboard = "";
+        try {
+            originalClipboard = getClipboardContent();
+            if (originalClipboard != null) {
+                System.out.println("[Demo] Saved original clipboard (" + originalClipboard.length() + " chars)");
+            }
+        } catch (Exception e) {
+            System.out.println("[Demo] Could not save original clipboard: " + e.getMessage());
+        }
+        
+        // Poll for bridge initialization message
+        System.out.println("[Demo] Waiting for bridge script initialization...");
+        while (true) {
+            Thread.sleep(1000);
+            
+            try {
+                String clipboardText = getClipboardContent();
+                if (clipboardText != null) {
+                    // Debug output
+                    String preview = clipboardText.length() > 50 ? clipboardText.substring(0, 50) + "..." : clipboardText;
+                    System.out.println("[Demo] Clipboard check: " + clipboardText.length() + " chars - " + preview);
+                    
+                    if (clipboardText.startsWith("CCC_BRIDGE_INITIALIZED")) {
+                        System.out.println("[Demo] Bridge script initialization detected!");
+                        
+                        // Restore original clipboard
+                        if (originalClipboard != null && !originalClipboard.isEmpty()) {
+                            setClipboard(originalClipboard);
+                            System.out.println("[Demo] Original clipboard restored (" + originalClipboard.length() + " chars)");
+                        } else {
+                            setClipboard("");
+                            System.out.println("[Demo] Clipboard cleared");
+                        }
+                        
+                        Thread.sleep(500);
+                        break;
+                    }
+                }
+            } catch (Exception e) {
+                // Ignore clipboard errors
+            }
+        }
+    }
+    
+    private static void waitForCalibration() throws Exception {
+        System.out.println("[Demo] Waiting for calibration click...");
+        System.out.println("[Demo] Ready to detect calibration (not clearing clipboard)...");
+        
+        while (!calibrated) {
+            Thread.sleep(1000);
+            
+            try {
+                String clipboardText = getClipboardContent();
+                if (clipboardText != null && !clipboardText.trim().isEmpty()) {
+                    if (clipboardText.contains("CCC_CALIBRATION") && clipboardText.contains("|||CCC_END|||")) {
+                        processCalibration(clipboardText);
+                    }
+                }
+            } catch (Exception e) {
+                // Ignore clipboard errors
+            }
+        }
+    }
+    
+    private static void processCalibration(String content) throws Exception {
+        System.out.println("[Demo] Calibration click detected!");
+        
+        // Get current mouse position
+        Point mousePos = MouseInfo.getPointerInfo().getLocation();
+        clickPosition = mousePos;
+        calibrated = true;
+        
+        System.out.println("[Demo] Captured mouse position: " + mousePos.x + ", " + mousePos.y);
+        
+        // Update tray icon
+        if (trayIcon != null) {
+            PopupMenu popup = trayIcon.getPopupMenu();
+            if (popup.getItemCount() > 0) {
+                MenuItem statusItem = popup.getItem(0);
+                statusItem.setLabel("Status: Calibrated - Sending AI request");
+            }
+        }
+        
+        // Clear clipboard
+        setClipboard("");
+        Thread.sleep(1000);
+    }
+    
+    private static void sendAIRequest() throws Exception {
+        System.out.println("[Demo] Sending AI request...");
+        
+        // Create test request
+        String request = String.format(
+            "{\"type\":\"CCC_REQUEST\",\"id\":\"%s\",\"timestamp\":%d,\"action\":\"ai-complete\",\"payload\":{\"prompt\":\"Write a haiku about clipboard bridges between programs\"}}|||CCC_END|||",
+            generateUUID(),
+            System.currentTimeMillis()
+        );
+        
+        // Set clipboard
+        setClipboard(request);
+        Thread.sleep(2000);
+        
+        // Click at calibrated position
+        System.out.println("[Demo] Clicking at calibrated position...");
+        robot.mouseMove(clickPosition.x, clickPosition.y);
+        Thread.sleep(500);
+        
+        // Single click
+        robot.mousePress(InputEvent.BUTTON1_DOWN_MASK);
+        robot.delay(100);
+        robot.mouseRelease(InputEvent.BUTTON1_DOWN_MASK);
+        
+        System.out.println("[Demo] Request sent, waiting for response...");
+    }
+    
+    private static void waitForResponse() throws Exception {
+        int timeout = 60; // 60 seconds timeout
+        int elapsed = 0;
+        
+        while (elapsed < timeout) {
+            Thread.sleep(1000);
+            elapsed++;
+            
+            try {
+                String clipboardText = getClipboardContent();
+                if (clipboardText != null && clipboardText.contains("BROWSER_RESPONSE")) {
+                    processResponse(clipboardText);
+                    return;
+                }
+            } catch (Exception e) {
+                // Ignore clipboard errors
+            }
+            
+            if (elapsed % 5 == 0) {
+                System.out.println("[Demo] Still waiting... (" + elapsed + "s)");
+            }
+        }
+        
+        System.out.println("[Demo] Response timeout after " + timeout + " seconds");
+    }
+    
+    private static void processResponse(String content) throws Exception {
+        try {
+            String responseText = content.split("\\|\\|\\|BROWSER_END\\|\\|\\|")[0];
+            // Simple JSON parsing for the response content
+            if (responseText.contains("\"content\":")) {
+                String contentStart = "\"content\":\"";
+                int start = responseText.indexOf(contentStart) + contentStart.length();
+                int end = responseText.indexOf("\",", start);
+                if (end == -1) end = responseText.indexOf("\"}", start);
+                
+                if (start > 0 && end > start) {
+                    String aiResponse = responseText.substring(start, end);
+                    System.out.println();
+                    System.out.println("================================");
+                    System.out.println("AI Response Received!");
+                    System.out.println("================================");
+                    System.out.println(aiResponse);
+                    System.out.println("================================");
+                    System.out.println();
+                }
+            }
+            
+            // Update tray icon
+            if (trayIcon != null) {
+                PopupMenu popup = trayIcon.getPopupMenu();
+                if (popup.getItemCount() > 0) {
+                    MenuItem statusItem = popup.getItem(0);
+                    statusItem.setLabel("Status: Success! Response received");
+                }
+            }
+            
+        } catch (Exception e) {
+            System.out.println("[Demo] Error parsing response: " + e.getMessage());
+        }
+    }
+    
+    private static String getClipboardContent() throws Exception {
+        Transferable contents = clipboard.getContents(null);
+        if (contents != null && contents.isDataFlavorSupported(DataFlavor.stringFlavor)) {
+            return (String) contents.getTransferData(DataFlavor.stringFlavor);
+        }
+        return null;
+    }
+    
+    private static void setClipboard(String text) throws Exception {
+        StringSelection selection = new StringSelection(text);
+        clipboard.setContents(selection, null);
+    }
+    
+    private static String generateUUID() {
+        return UUID.randomUUID().toString();
+    }
+}
+-~{END}~-
+
+-~{File: mock-env/server.js}~-
+const http = require('http');
+const url = require('url');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+
+const PORT = process.env.MOCK_PORT || 5556;
+
+// In-memory storage
+const conversations = new Map();
+const tokens = new Set(['mock-token-12345']);
+
+// Helper to parse JSON body
+async function parseBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', chunk => body += chunk);
+    req.on('end', () => {
       try {
-        const response = JSON.parse(line);
-        handleJavaResponse(response);
+        resolve(body ? JSON.parse(body) : {});
       } catch (e) {
-        console.log('[Java Agent]', line);
+        reject(e);
       }
     });
-    
-    state.javaAgent.stderr.on('data', (data) => {
-      console.error('[Java Agent Error]', data.toString());
-    });
-    
-    state.javaAgent.on('exit', (code) => {
-      console.log(`[Demo] Java agent exited with code ${code}`);
-      state.javaAgent = null;
-    });
-    
-    setTimeout(() => {
-      sendJavaCommand({ cmd: 'SET_STATUS', message: 'CCC Demo - Waiting for calibration' });
-      resolve();
-    }, 1000);
   });
 }
 
-// Send command to Java agent
-function sendJavaCommand(command) {
-  if (!state.javaAgent) {
-    console.error('[Demo] Java agent not running');
-    return false;
-  }
-  
-  const commandStr = JSON.stringify(command) + '\n';
-  state.javaAgent.stdin.write(commandStr);
-  return true;
+// CORS headers for browser access
+function setCorsHeaders(res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 }
 
-// Handle Java agent responses
-function handleJavaResponse(response) {
-  switch (response.type) {
-    case 'clipboard_content':
-      checkClipboardContent(response.data);
-      break;
-      
-    case 'mouse_position':
-      if (state.waitingForMousePos) {
-        // Parse position (format: "x,y")
-        const [x, y] = response.data.split(',').map(n => parseInt(n));
-        CONFIG.clickPosition = { x, y };
-        console.log('[Demo] Captured mouse position:', x, y);
-        state.waitingForMousePos = false;
-        
-        // Send AI request after short delay
-        setTimeout(() => sendAIRequest(), 2000);
-      } else {
-        console.log('[Demo] Current mouse position:', response.data);
-      }
-      break;
-      
-    default:
-      console.log('[Demo] Java response:', response);
-  }
+// Validate auth token
+function validateAuth(req) {
+  const auth = req.headers.authorization;
+  if (!auth || !auth.startsWith('Bearer ')) return false;
+  return tokens.has(auth.substring(7));
 }
 
-// Check clipboard for calibration message
-function checkClipboardContent(content) {
-  if (!content) return;
+// Generate message structure
+function createMessage(content, role, parentId = null) {
+  const id = crypto.randomUUID();
+  const timestamp = Math.floor(Date.now() / 1000);
   
-  // Check for calibration message
-  if (content.includes('CCC_CALIBRATION') && !state.calibrated) {
-    try {
-      const msgEnd = content.indexOf('|||CCC_END|||');
-      if (msgEnd > 0) {
-        const calibrationData = JSON.parse(content.substring(0, msgEnd));
-        console.log('[Demo] Calibration click detected!');
-        
-        // Get current mouse position from Java
-        sendJavaCommand({ cmd: 'GET_MOUSE' });
-        state.waitingForMousePos = true;
-        state.calibrated = true;
-        
-        // Update status
-        sendJavaCommand({ cmd: 'SET_STATUS', message: 'CCC Demo - Calibrated! Sending AI request...' });
-        
-        // Clear clipboard
-        sendJavaCommand({ cmd: 'SET_CLIPBOARD', data: '' });
-      }
-    } catch (e) {
-      console.error('[Demo] Failed to parse calibration:', e);
-    }
-  }
-  
-  // Check for AI response
-  if (content.includes('BROWSER_RESPONSE')) {
-    try {
-      const msgEnd = content.indexOf('|||BROWSER_END|||');
-      if (msgEnd > 0) {
-        const response = JSON.parse(content.substring(0, msgEnd));
-        console.log('\n[Demo] Received AI Response!');
-        console.log('================================');
-        console.log('Response ID:', response.id);
-        console.log('Status:', response.status);
-        console.log('Content:', response.payload.content);
-        console.log('================================\n');
-        
-        // Stop polling
-        if (state.responseFound) {
-          state.responseFound();
-        }
-        
-        // Update status
-        sendJavaCommand({ cmd: 'SET_STATUS', message: 'CCC Demo - Success! Check console for response.' });
-        
-        // Clear clipboard and exit after delay
-        setTimeout(() => {
-          sendJavaCommand({ cmd: 'SET_CLIPBOARD', data: '' });
-          console.log('[Demo] Demo completed successfully!');
-          process.exit(0);
-        }, 3000);
-      }
-    } catch (e) {
-      console.error('[Demo] Failed to parse response:', e);
-    }
-  }
+  return {
+    id,
+    role,
+    content,
+    parentId,
+    childrenIds: [],
+    timestamp
+  };
 }
 
-// Poll clipboard for calibration
-async function pollForCalibration() {
-  console.log('[Demo] Starting calibration polling...');
-  console.log('[Demo] Please load the bridge in your browser');
-  console.log('[Demo] Then click anywhere on the page to calibrate');
-  console.log('[Demo] (Waiting indefinitely for calibration...)\n');
+// Handle requests
+const server = http.createServer(async (req, res) => {
+  setCorsHeaders(res);
   
-  const pollInterval = setInterval(() => {
-    if (state.calibrated) {
-      clearInterval(pollInterval);
-      return;
-    }
-    
-    // Poll clipboard - no timeout, wait forever
-    sendJavaCommand({ cmd: 'GET_CLIPBOARD' });
-    
-  }, CONFIG.calibrationPollInterval);
-}
-
-// Send AI request through bridge
-async function sendAIRequest() {
-  if (!CONFIG.clickPosition) {
-    console.error('[Demo] No calibration position!');
+  const parsedUrl = url.parse(req.url, true);
+  const pathname = parsedUrl.pathname;
+  
+  // Handle preflight
+  if (req.method === 'OPTIONS') {
+    res.writeHead(200);
+    res.end();
     return;
   }
   
-  console.log('[Demo] Sending AI request...');
-  
-  // Create request
-  const request = {
-    type: 'CCC_REQUEST',
-    id: crypto.randomUUID(),
-    timestamp: Date.now(),
-    action: 'ai-complete',
-    payload: {
-      prompt: 'Write a haiku about clipboard bridges between programs',
-      max_tokens: 100,
-      temperature: 0.7
+  // Serve UI page
+  if (pathname === '/' && req.method === 'GET') {
+    const htmlPath = path.join(__dirname, 'ui.html');
+    
+    if (fs.existsSync(htmlPath)) {
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end(fs.readFileSync(htmlPath));
+    } else {
+      res.writeHead(404);
+      res.end('UI page not found');
     }
-  };
+    return;
+  }
   
-  // Calculate checksum
-  request.checksum = 'sha256-' + crypto.createHash('sha256')
-    .update(JSON.stringify(request))
-    .digest('hex');
-  
-  const requestText = JSON.stringify(request) + '|||CCC_END|||';
-  
-  // Set clipboard
-  sendJavaCommand({ cmd: 'SET_CLIPBOARD', data: requestText });
-  
-  // Wait longer for clipboard to be set
-  setTimeout(() => {
-    console.log('[Demo] Request in clipboard, starting clicks...');
-    console.log('[Demo] Clicking at calibrated position:', CONFIG.clickPosition);
+  // Serve demo page
+  if (pathname === '/demo' && req.method === 'GET') {
+    const demoPath = path.join(__dirname, 'demo.html');
     
-    // Single click first to check clipboard
-    sendJavaCommand({
-      cmd: 'CLICK_LOOP',
-      x: CONFIG.clickPosition.x,
-      y: CONFIG.clickPosition.y,
-      interval: 100,
-      maxDuration: 100  // Just one quick click
-    });
-    
-    // Then start polling for response
-    setTimeout(() => pollForResponse(), 1000);
-    
-  }, 2000); // Wait 2 seconds after setting clipboard
-}
-
-// Poll for AI response
-function pollForResponse() {
-  console.log('[Demo] Waiting for AI response...');
-  
-  let responseFound = false;
-  
-  // Poll clipboard
-  const pollInterval = setInterval(() => {
-    if (!responseFound) {
-      sendJavaCommand({ cmd: 'GET_CLIPBOARD' });
+    if (fs.existsSync(demoPath)) {
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end(fs.readFileSync(demoPath));
+    } else {
+      res.writeHead(404);
+      res.end('Demo page not found');
     }
-  }, 500);
+    return;
+  }
   
-  // Also click periodically to trigger bridge
-  let clickCount = 0;
-  const clickInterval = setInterval(() => {
-    if (!responseFound && clickCount < 10) {
-      console.log('[Demo] Clicking again to check for response...');
-      sendJavaCommand({
-        cmd: 'CLICK_LOOP',
-        x: CONFIG.clickPosition.x,
-        y: CONFIG.clickPosition.y,
-        interval: 100,
-        maxDuration: 100
+  // Serve bridge scripts
+  if ((pathname === '/bridge-calibrate.js' || pathname === '/bridge-api.js') && req.method === 'GET') {
+    const scriptName = pathname.substring(1); // Remove leading /
+    const scriptPath = path.join(__dirname, '..', 'src', 'browser-bridge', scriptName);
+    
+    if (fs.existsSync(scriptPath)) {
+      res.writeHead(200, { 
+        'Content-Type': 'application/javascript',
+        'Access-Control-Allow-Origin': '*'
       });
-      clickCount++;
-    } else if (responseFound || clickCount >= 10) {
-      clearInterval(clickInterval);
+      res.end(fs.readFileSync(scriptPath));
+    } else {
+      res.writeHead(404);
+      res.end('Bridge script not found');
     }
-  }, 2000);
+    return;
+  }
   
-  // Store intervals in state for cleanup
-  state.responseFound = () => {
-    responseFound = true;
-    clearInterval(pollInterval);
-    clearInterval(clickInterval);
-  };
-  
-  // Timeout after CONFIG.responseTimeout
-  setTimeout(() => {
-    if (!responseFound) {
-      clearInterval(pollInterval);
-      clearInterval(clickInterval);
-      console.error('[Demo] Response timeout after', CONFIG.responseTimeout / 1000, 'seconds!');
-      process.exit(1);
-    }
-  }, CONFIG.responseTimeout);
-}
-
-// Main
-async function main() {
-  console.log('================================');
-  console.log('CCC Demo - AI Bridge Test');
-  console.log('================================\n');
+  // API endpoints
+  if (!validateAuth(req) && pathname.startsWith('/api/')) {
+    res.writeHead(401, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Unauthorized' }));
+    return;
+  }
   
   try {
-    // Start Java agent
-    await startJavaAgent();
+    // Create new chat
+    if (pathname === '/api/v1/chats/new' && req.method === 'POST') {
+      const body = await parseBody(req);
+      const chatId = 'mock-conv-' + Date.now();
+      
+      const userMessage = createMessage(
+        body.message || 'Hello',
+        'user',
+        null
+      );
+      
+      const conversation = {
+        id: chatId,
+        created_at: Math.floor(Date.now() / 1000),
+        user_id: 'mock-user-123',
+        messages: [userMessage],
+        history: {
+          messages: {
+            [userMessage.id]: userMessage
+          },
+          currentId: userMessage.id
+        },
+        timestamp: Date.now()
+      };
+      
+      conversations.set(chatId, conversation);
+      
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        id: chatId,
+        created_at: conversation.created_at,
+        user_id: conversation.user_id
+      }));
+      return;
+    }
     
-    // Start calibration polling
-    await pollForCalibration();
+    // Get conversation state
+    if (pathname.match(/^\/api\/v1\/chats\/[^\/]+$/) && req.method === 'GET') {
+      const chatId = pathname.split('/').pop();
+      const conversation = conversations.get(chatId);
+      
+      if (!conversation) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Conversation not found' }));
+        return;
+      }
+      
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(conversation));
+      return;
+    }
+    
+    // Update conversation
+    if (pathname.match(/^\/api\/v1\/chats\/[^\/]+$/) && req.method === 'POST') {
+      const chatId = pathname.split('/').pop();
+      const conversation = conversations.get(chatId);
+      
+      if (!conversation) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Conversation not found' }));
+        return;
+      }
+      
+      const body = await parseBody(req);
+      
+      // Update conversation with new data
+      if (body.messages) {
+        conversation.messages = body.messages;
+      }
+      if (body.history) {
+        conversation.history = body.history;
+      }
+      
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(conversation));
+      return;
+    }
+    
+    // Stream completions (SSE)
+    if (pathname === '/api/chat/completions' && req.method === 'POST') {
+      const body = await parseBody(req);
+      
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive'
+      });
+      
+      // Simulate streaming response
+      const chunks = [
+        'Hello! ',
+        'This is ',
+        'a mock ',
+        'streaming ',
+        'response ',
+        'from the ',
+        'CCC mock ',
+        'server.'
+      ];
+      
+      let chunkIndex = 0;
+      const interval = setInterval(() => {
+        if (chunkIndex < chunks.length) {
+          const data = {
+            id: String(chunkIndex + 1),
+            choices: [{
+              delta: { content: chunks[chunkIndex] }
+            }]
+          };
+          res.write(`data: ${JSON.stringify(data)}\n\n`);
+          chunkIndex++;
+        } else {
+          const finalData = {
+            id: String(chunkIndex + 1),
+            choices: [{
+              finish_reason: 'stop'
+            }]
+          };
+          res.write(`data: ${JSON.stringify(finalData)}\n\n`);
+          res.end();
+          clearInterval(interval);
+        }
+      }, 100); // 100ms between chunks
+      
+      return;
+    }
+    
+    // 404 for unknown routes
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Not found' }));
     
   } catch (error) {
-    console.error('[Demo] Fatal error:', error);
-    process.exit(1);
+    console.error('Server error:', error);
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Internal server error' }));
   }
-}
-
-// Handle shutdown
-process.on('SIGINT', () => {
-  console.log('\n[Demo] Shutting down...');
-  
-  if (state.javaAgent) {
-    sendJavaCommand({ cmd: 'SET_CLIPBOARD', data: '' });
-    state.javaAgent.kill();
-  }
-  
-  process.exit(0);
 });
 
-// Start demo
-main();
+server.listen(PORT, () => {
+  console.log(`Mock API server running at http://localhost:${PORT}`);
+  console.log('Mock token: mock-token-12345');
+});
+-~{END}~-
+
+-~{File: mock-env/ui.html}~-
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CCC Mock Internal UI</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 0;
+      font-family: monospace;
+      background: #1a1a1a;
+      color: #fff;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+    }
+    
+    #status-bar {
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      padding: 10px;
+      background: #2a2a2a;
+      border-bottom: 2px solid #444;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    
+    #main-container {
+      text-align: center;
+      padding: 40px;
+      background: #2a2a2a;
+      border-radius: 10px;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+      min-width: 500px;
+    }
+    
+    .click-button {
+      display: inline-block;
+      margin: 20px;
+      padding: 30px 50px;
+      font-size: 20px;
+      font-weight: bold;
+      cursor: pointer;
+      border: none;
+      border-radius: 8px;
+      transition: all 0.3s;
+    }
+    
+    #clipboard-read-btn {
+      background: #28a745;
+      color: white;
+    }
+    
+    #clipboard-read-btn:hover {
+      background: #218838;
+    }
+    
+    #clipboard-write-btn {
+      background: #17a2b8;
+      color: white;
+    }
+    
+    #clipboard-write-btn:hover {
+      background: #138496;
+    }
+    
+    #status {
+      margin-top: 30px;
+      padding: 20px;
+      background: #1a1a1a;
+      border-radius: 5px;
+      height: 250px;
+      overflow-y: auto;
+      text-align: left;
+      font-size: 12px;
+      white-space: pre-wrap;
+    }
+    
+    .log-entry {
+      margin: 2px 0;
+      padding: 2px;
+    }
+    
+    .log-entry.info { color: #88ff88; }
+    .log-entry.error { color: #ff8888; }
+    .log-entry.success { color: #00ff00; }
+    .log-entry.debug { color: #8888ff; }
+    
+    #instructions {
+      position: absolute;
+      bottom: 20px;
+      left: 20px;
+      right: 20px;
+      padding: 15px;
+      background: rgba(0,0,0,0.8);
+      border-radius: 5px;
+      font-size: 14px;
+      color: #aaa;
+    }
+    
+    .stats {
+      position: absolute;
+      top: 60px;
+      right: 20px;
+      background: rgba(0,0,0,0.8);
+      padding: 15px;
+      border-radius: 5px;
+      font-size: 14px;
+    }
+    
+    .indicator {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      margin-left: 10px;
+    }
+    
+    .indicator.ready { background: #28a745; }
+    .indicator.processing { background: #ffc107; }
+    .indicator.error { background: #dc3545; }
+  </style>
+</head>
+<body>
+  <div id="status-bar">
+    <div>CCC Mock UI <span id="bridge-status" class="indicator ready"></span></div>
+    <div>Token: <span id="token-status">mock-token-12345</span></div>
+  </div>
+  
+  <div id="main-container">
+    <h1>CCC Clipboard Bridge Test</h1>
+    
+    <div>
+      <button id="clipboard-read-btn" class="click-button">
+        READ CLIPBOARD
+      </button>
+      
+      <button id="clipboard-write-btn" class="click-button">
+        WRITE RESPONSE
+      </button>
+    </div>
+    
+    <div id="status"></div>
+  </div>
+  
+  <div class="stats">
+    <div>Click Count: <span id="click-count">0</span></div>
+    <div>Success Count: <span id="success-count">0</span></div>
+    <div>Fail Count: <span id="fail-count">0</span></div>
+    <div>Last Click: <span id="last-click">Never</span></div>
+    <div>isTrusted: <span id="trusted-status">N/A</span></div>
+  </div>
+  
+  <div id="instructions">
+    <strong>Instructions:</strong> The Java Robot will click these buttons automatically. 
+    Watch for clipboard read/write operations. The READ button checks for CCC_REQUEST messages,
+    and the WRITE button sends back responses.
+  </div>
+  
+  <script>
+    // Set mock token
+    localStorage.setItem('token', 'mock-token-12345');
+    
+    // State
+    let clickCount = 0;
+    let successCount = 0;
+    let failCount = 0;
+    let lastRequest = null;
+    let processingRequest = false;
+    
+    // Logging
+    function log(message, type = 'info') {
+      const timestamp = new Date().toLocaleTimeString();
+      const statusDiv = document.getElementById('status');
+      const entry = document.createElement('div');
+      entry.className = `log-entry ${type}`;
+      entry.textContent = `[${timestamp}] ${message}`;
+      statusDiv.appendChild(entry);
+      statusDiv.scrollTop = statusDiv.scrollHeight;
+      
+      // Keep only last 50 entries
+      while (statusDiv.children.length > 50) {
+        statusDiv.removeChild(statusDiv.firstChild);
+      }
+      
+      console.log(`[${type.toUpperCase()}] ${message}`);
+    }
+    
+    // Update stats
+    function updateStats(isTrusted = null) {
+      document.getElementById('click-count').textContent = clickCount;
+      document.getElementById('success-count').textContent = successCount;
+      document.getElementById('fail-count').textContent = failCount;
+      document.getElementById('last-click').textContent = new Date().toLocaleTimeString();
+      if (isTrusted !== null) {
+        document.getElementById('trusted-status').textContent = isTrusted ? 'YES' : 'NO';
+      }
+    }
+    
+    // Read button - Check clipboard for CCC_REQUEST
+    document.getElementById('clipboard-read-btn').addEventListener('click', async (e) => {
+      clickCount++;
+      updateStats(e.isTrusted);
+      
+      log(`Click #${clickCount} - READ button (isTrusted: ${e.isTrusted})`);
+      
+      // Check if this is a trusted event (real or Robot click)
+      if (!e.isTrusted) {
+        log('Warning: Click not trusted by browser', 'error');
+      }
+      
+      try {
+        // Try to read clipboard
+        const clipboardText = await navigator.clipboard.readText();
+        log(`Read ${clipboardText.length} chars from clipboard`, 'success');
+        
+        // Check if it's a CCC request
+        if (clipboardText.includes('CCC_REQUEST')) {
+          log('Found CCC_REQUEST!', 'success');
+          successCount++;
+          
+          // Parse the request
+          const requestEnd = clipboardText.indexOf('|||CCC_END|||');
+          if (requestEnd > 0) {
+            const requestJson = clipboardText.substring(0, requestEnd);
+            try {
+              lastRequest = JSON.parse(requestJson);
+              log(`Parsed request ID: ${lastRequest.id}`, 'success');
+              log(`Request action: ${lastRequest.action}`, 'info');
+              
+              // Set flag to write response on next write button click
+              processingRequest = true;
+              document.getElementById('clipboard-write-btn').style.background = '#ffc107';
+              
+            } catch (parseErr) {
+              log(`Failed to parse request: ${parseErr.message}`, 'error');
+              failCount++;
+            }
+          }
+        } else {
+          log('No CCC_REQUEST in clipboard', 'debug');
+        }
+        
+      } catch (error) {
+        failCount++;
+        log(`Failed to read clipboard: ${error.message}`, 'error');
+        
+        // Try fallback method
+        try {
+          // For reading, there's no good fallback in modern browsers
+          log('Note: No fallback for clipboard read in modern browsers', 'info');
+        } catch (fallbackErr) {
+          log(`Fallback also failed: ${fallbackErr.message}`, 'error');
+        }
+      }
+      
+      updateStats(e.isTrusted);
+    });
+    
+    // Write button - Send response back
+    document.getElementById('clipboard-write-btn').addEventListener('click', async (e) => {
+      clickCount++;
+      updateStats(e.isTrusted);
+      
+      log(`Click #${clickCount} - WRITE button (isTrusted: ${e.isTrusted})`);
+      
+      if (!processingRequest || !lastRequest) {
+        log('No request to respond to', 'debug');
+        return;
+      }
+      
+      try {
+        // Create response
+        const response = {
+          type: 'BROWSER_RESPONSE',
+          id: lastRequest.id,
+          timestamp: Date.now(),
+          status: 'success',
+          payload: {
+            content: 'Mock response from fixed UI - clipboard access successful!',
+            chat_id: 'mock-chat-' + Date.now(),
+            trusted: e.isTrusted
+          }
+        };
+        
+        const responseText = JSON.stringify(response) + '|||BROWSER_END|||';
+        
+        // Try to write to clipboard
+        await navigator.clipboard.writeText(responseText);
+        successCount++;
+        log(`Wrote response for request ${lastRequest.id}`, 'success');
+        log(`Response length: ${responseText.length} chars`, 'info');
+        
+        // Reset state
+        processingRequest = false;
+        lastRequest = null;
+        document.getElementById('clipboard-write-btn').style.background = '#17a2b8';
+        
+      } catch (error) {
+        failCount++;
+        log(`Failed to write clipboard: ${error.message}`, 'error');
+        
+        // Try fallback method (execCommand)
+        try {
+          const textarea = document.createElement('textarea');
+          textarea.value = responseText;
+          textarea.style.position = 'fixed';
+          textarea.style.opacity = '0';
+          document.body.appendChild(textarea);
+          textarea.select();
+          const success = document.execCommand('copy');
+          document.body.removeChild(textarea);
+          
+          if (success) {
+            successCount++;
+            failCount--; // Correct the count
+            log('SUCCESS with fallback method (execCommand)!', 'success');
+            
+            // Reset state
+            processingRequest = false;
+            lastRequest = null;
+            document.getElementById('clipboard-write-btn').style.background = '#17a2b8';
+          } else {
+            log('Fallback method also failed', 'error');
+          }
+        } catch (fallbackErr) {
+          log(`Fallback error: ${fallbackErr.message}`, 'error');
+        }
+      }
+      
+      updateStats(e.isTrusted);
+    });
+    
+    // Monitor all clicks for debugging
+    document.addEventListener('click', (e) => {
+      console.log(`%cClick detected on ${e.target.tagName}#${e.target.id || '(no-id)'}`, 
+                  'background: yellow; color: black');
+      console.log(`  isTrusted: ${e.isTrusted}`);
+      console.log(`  Target: ${e.target.id}`);
+    }, true);
+    
+    // Initialize
+    log('Fixed UI ready. Waiting for Java Robot clicks...', 'success');
+    log('The READ button will check for CCC_REQUEST messages', 'info');
+    log('The WRITE button will send BROWSER_RESPONSE messages', 'info');
+    
+    // Auto-load bridge enhancement
+    setTimeout(() => {
+      log('Loading bridge enhancement...', 'info');
+      loadBridgeEnhancement();
+    }, 1000);
+    
+    // Bridge Enhancement Script (from bridge-mock.js)
+    function loadBridgeEnhancement() {
+      'use strict';
+      
+      console.log('[CCC Bridge Mock] Initializing for button-based UI...');
+      
+      // State
+      let bridgeActive = false;
+      let bridgeLastRequest = null;
+      let bridgeClickCount = 0;
+      
+      // Find the buttons
+      const readBtn = document.getElementById('clipboard-read-btn');
+      const writeBtn = document.getElementById('clipboard-write-btn');
+      
+      if (!readBtn || !writeBtn) {
+        console.error('[CCC Bridge Mock] Buttons not found! Make sure you\'re on the mock UI page.');
+        log('Bridge enhancement failed - buttons not found', 'error');
+        return;
+      }
+      
+      console.log('[CCC Bridge Mock] Found buttons, enhancing...');
+      
+      // Enhanced click handler for READ button
+      const originalReadClick = readBtn.onclick;
+      readBtn.onclick = async function(e) {
+        console.log('[CCC Bridge Mock] READ button clicked by', e.isTrusted ? 'user/robot' : 'script');
+        
+        // Call original handler if exists
+        if (originalReadClick) originalReadClick.call(this, e);
+        
+        // Our enhancement - check for CCC requests
+        if (bridgeActive) {
+          bridgeClickCount++;
+          console.log('[CCC Bridge Mock] Checking clipboard for CCC_REQUEST...');
+          
+          try {
+            const clipboardText = await navigator.clipboard.readText();
+            console.log('[CCC Bridge Mock] Clipboard length:', clipboardText.length);
+            
+            if (clipboardText.includes('CCC_REQUEST')) {
+              console.log('[CCC Bridge Mock] Found CCC_REQUEST!');
+              const requestEnd = clipboardText.indexOf('|||CCC_END|||');
+              if (requestEnd > 0) {
+                const requestJson = clipboardText.substring(0, requestEnd).trim();
+                console.log('[CCC Bridge Mock] Raw request JSON:', requestJson);
+                console.log('[CCC Bridge Mock] First 50 chars:', requestJson.substring(0, 50));
+                console.log('[CCC Bridge Mock] First char code:', requestJson.charCodeAt(0));
+                
+                try {
+                  // Remove any BOM or zero-width characters
+                  const cleanJson = requestJson.replace(/^\uFEFF/, '').replace(/^[\u200B-\u200D\uFEFF]/, '');
+                  bridgeLastRequest = JSON.parse(cleanJson);
+                  console.log('[CCC Bridge Mock] Parsed request:', bridgeLastRequest.id, bridgeLastRequest.action);
+                  
+                  // Visual feedback
+                  readBtn.style.background = '#ffc107';
+                  setTimeout(() => {
+                    readBtn.style.background = '#28a745';
+                  }, 500);
+                } catch (parseErr) {
+                  console.error('[CCC Bridge Mock] JSON parse error:', parseErr.message);
+                  console.error('[CCC Bridge Mock] Invalid JSON:', requestJson);
+                  // Log char codes for debugging
+                  console.error('[CCC Bridge Mock] First 10 char codes:', 
+                    [...requestJson.substring(0, 10)].map(c => c.charCodeAt(0)).join(', '));
+                }
+              } else {
+                console.warn('[CCC Bridge Mock] Found CCC_REQUEST but no |||CCC_END||| marker');
+              }
+            } else {
+              console.log('[CCC Bridge Mock] No CCC_REQUEST in clipboard');
+            }
+          } catch (err) {
+            console.error('[CCC Bridge Mock] Error reading clipboard:', err);
+          }
+        }
+      };
+      
+      // Enhanced click handler for WRITE button
+      const originalWriteClick = writeBtn.onclick;
+      writeBtn.onclick = async function(e) {
+        console.log('[CCC Bridge Mock] WRITE button clicked by', e.isTrusted ? 'user/robot' : 'script');
+        
+        // Call original handler if exists
+        if (originalWriteClick) originalWriteClick.call(this, e);
+        
+        // Our enhancement - write response if we have a request
+        if (bridgeActive && bridgeLastRequest) {
+          console.log('[CCC Bridge Mock] Writing response for request:', bridgeLastRequest.id);
+          
+          try {
+            const response = {
+              type: 'BROWSER_RESPONSE',
+              id: bridgeLastRequest.id,
+              timestamp: Date.now(),
+              status: 'success',
+              payload: {
+                content: 'Mock response via bridge script - buttons working!',
+                chat_id: 'mock-' + Date.now(),
+                clickCount: bridgeClickCount,
+                trusted: e.isTrusted
+              }
+            };
+            
+            const responseText = JSON.stringify(response) + '|||BROWSER_END|||';
+            await navigator.clipboard.writeText(responseText);
+            
+            console.log('[CCC Bridge Mock] Response written to clipboard');
+            
+            // Visual feedback
+            writeBtn.style.background = '#28a745';
+            setTimeout(() => {
+              writeBtn.style.background = '#17a2b8';
+            }, 500);
+            
+            // Clear the request
+            bridgeLastRequest = null;
+            
+          } catch (err) {
+            console.error('[CCC Bridge Mock] Error writing clipboard:', err);
+          }
+        }
+      };
+      
+      // Add visual indicator
+      const indicator = document.createElement('div');
+      indicator.style.cssText = `
+        position: fixed;
+        top: 10px;
+        right: 10px;
+        padding: 10px 20px;
+        background: #28a745;
+        color: white;
+        border-radius: 5px;
+        font-family: monospace;
+        font-weight: bold;
+        z-index: 10000;
+      `;
+      indicator.textContent = 'CCC BRIDGE ACTIVE';
+      document.body.appendChild(indicator);
+      
+      // Activate bridge
+      bridgeActive = true;
+      
+      console.log('[CCC Bridge Mock] Bridge active! The existing buttons will now handle CCC requests.');
+      console.log('[CCC Bridge Mock] Calibrate the button positions and start testing.');
+      log('Bridge enhancement loaded successfully!', 'success');
+      
+      // Export for debugging
+      window.CCCBridgeMock = {
+        status: () => ({ active: bridgeActive, clickCount: bridgeClickCount, lastRequest: bridgeLastRequest }),
+        deactivate: () => { bridgeActive = false; indicator.style.background = '#dc3545'; }
+      };
+    }
+  </script>
+</body>
+</html>
 -~{END}~-
 
 -~{File: src/browser-bridge/bridge-api.js}~-
@@ -1119,6 +1886,29 @@ main();
   
   console.log('[CCC Bridge API] Ready with real API flow');
   
+  // Signal initialization to Java agent via clipboard after user click
+  setTimeout(() => {
+    console.log('[CCC Bridge API] Ready to signal initialization...');
+    console.log('[CCC Bridge API] Please click anywhere on the main page content (not in DevTools)');
+    console.log('[CCC Bridge API] The page will then signal the Java agent');
+    
+    // Add one-time click listener to the document
+    const handleInitClick = async (e) => {
+      console.log('[CCC Bridge API] Click detected! Signaling Java agent...');
+      document.removeEventListener('click', handleInitClick);
+      
+      try {
+        await navigator.clipboard.writeText('CCC_BRIDGE_INITIALIZED');
+        console.log('[CCC Bridge API] Initialization signal sent to Java agent');
+      } catch (err) {
+        console.log('[CCC Bridge API] Could not send initialization signal:', err.message);
+        console.log('[CCC Bridge API] Make sure the main page has focus, not DevTools');
+      }
+    };
+    
+    document.addEventListener('click', handleInitClick);
+  }, 1000);
+  
   // Export for debugging
   window.CCCBridgeAPI = {
     getState: () => ({ state: bridgeState, clicks: clickCount, lastRequest }),
@@ -1131,25 +1921,58 @@ main();
 -~{File: run-prod.bat}~-
 @echo off
 echo ================================
-echo CCC Production Runner
+echo CCC Production Runner (Java Only)
 echo ================================
 echo.
 
-REM Check for Node modules
-if exist node_modules goto :compile
-echo Installing Node.js dependencies...
-npm install
-
-:compile
 REM Compile Java agent
 echo Compiling Java agent...
-javac src/java-agent/ClipboardAgent.java
-jar cvf src/java-agent/agent.jar -C . src/java-agent/ClipboardAgent.class
+javac src\java-agent\StandaloneAgent.java
+if errorlevel 1 (
+    echo Java compilation failed!
+    pause
+    exit /b 1
+)
+
+REM Create manifest file for JAR
+echo Main-Class: StandaloneAgent > manifest.txt
+echo. >> manifest.txt
+jar cvfm src\java-agent\agent.jar manifest.txt -C src\java-agent StandaloneAgent.class
+if errorlevel 1 (
+    echo JAR creation failed!
+    pause
+    exit /b 1
+)
+del manifest.txt
 
 REM Copy bridge script to clipboard
 echo.
-echo Copying bridge script to clipboard...
-type src\browser-bridge\bridge-api.js | clip
+echo [DEBUG] About to copy bridge script to clipboard...
+echo [DEBUG] File exists check:
+if exist src\browser-bridge\bridge-api.js (
+    echo [DEBUG] bridge-api.js found
+) else (
+    echo [DEBUG] ERROR: bridge-api.js NOT found!
+)
+
+echo [DEBUG] File size:
+for %%A in (src\browser-bridge\bridge-api.js) do echo [DEBUG] Size: %%~zA bytes
+
+echo [DEBUG] First few lines of file:
+head -n 3 src\browser-bridge\bridge-api.js 2>nul || (
+    powershell -Command "Get-Content 'src\browser-bridge\bridge-api.js' | Select-Object -First 3"
+)
+
+echo [DEBUG] Copying to clipboard using PowerShell...
+powershell -Command "Get-Content 'src\browser-bridge\bridge-api.js' -Raw | Set-Clipboard"
+
+echo [DEBUG] Immediate clipboard verification after copy...
+powershell -Command "$clip = Get-Clipboard -Raw; Write-Host '[DEBUG] Clipboard length:' $clip.Length; if($clip.Length -gt 0) { Write-Host '[DEBUG] First 100 chars:' $clip.Substring(0, [Math]::Min(100, $clip.Length)) } else { Write-Host '[DEBUG] Clipboard is empty!' }"
+
+echo [DEBUG] Starting clipboard monitoring every 1 second...
+echo [DEBUG] Press Ctrl+C to stop monitoring and continue
+powershell -Command "for($i=1; $i -le 10; $i++) { Start-Sleep 1; $clip = Get-Clipboard -Raw; Write-Host \"[DEBUG] Second $i - Clipboard length: $($clip.Length)\"; if($clip.Length -gt 0 -and $clip.Length -lt 200) { Write-Host \"[DEBUG] Full content: $clip\" } elseif($clip.Length -gt 0) { Write-Host \"[DEBUG] First 50 chars: $($clip.Substring(0, [Math]::Min(50, $clip.Length)))\" } else { Write-Host \"[DEBUG] Clipboard is empty!\" } }"
+
 echo.
 echo ================================
 echo BRIDGE SCRIPT COPIED TO CLIPBOARD!
@@ -1161,8 +1984,70 @@ echo 2. Open Developer Console (F12)
 echo 3. Paste the bridge script (Ctrl+V)
 echo 4. Click anywhere on the overlay to calibrate
 echo.
-echo Starting coordinator...
-node src/node-server/coordinator-demo.js
+echo Starting Java agent...
+java -jar src\java-agent\agent.jar
 
 pause
+-~{END}~-
+
+-~{File: run-dev.bat}~-
+@echo off
+echo ================================
+echo CCC Development Runner
+echo ================================
+echo.
+
+echo [DEBUG] Checking for node_modules directory...
+if exist node_modules (
+    echo [DEBUG] node_modules found, skipping npm install
+    goto :startserver
+)
+
+echo [DEBUG] node_modules not found, installing...
+echo Installing Node.js dependencies...
+call npm install
+echo [DEBUG] npm install completed with exit code: %errorlevel%
+if errorlevel 1 (
+    echo npm install failed!
+    pause
+    exit /b 1
+)
+echo [DEBUG] npm install successful, continuing...
+
+:startserver
+echo [DEBUG] Starting mock server section...
+
+REM Kill any existing mock server on port 5556
+echo [DEBUG] Killing any existing node processes on port 5556...
+powershell -Command "Get-NetTCPConnection -LocalPort 5556 -ErrorAction SilentlyContinue | ForEach-Object { $proc = Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue; if($proc -and $proc.ProcessName -eq 'node') { Write-Host 'Killing node process' $proc.Id 'on port 5556'; Stop-Process -Id $proc.Id -Force } }" 2>nul
+timeout /t 1 > nul
+
+echo Starting mock server on http://localhost:5556/...
+start /B node mock-env\server.js
+echo [DEBUG] Mock server started in background
+
+REM Wait for server to start
+echo [DEBUG] Waiting 3 seconds for server startup...
+timeout /t 3 > nul
+echo [DEBUG] Wait complete
+
+REM Don't open browser automatically
+echo [DEBUG] Mock server ready at http://localhost:5556/
+echo [DEBUG] You can open the browser manually if needed
+
+REM Run production script (Java client with bridge copy)
+echo [DEBUG] About to call run-prod.bat for clipboard copy and Java agent...
+echo.
+echo ================================
+echo DEVELOPMENT ENVIRONMENT READY!
+echo ================================
+echo.
+echo Instructions:
+echo 1. Open http://localhost:5556/ in your browser
+echo 2. Bridge script will be copied to clipboard
+echo 3. Paste it in dev console or just use the built-in mock UI
+echo 4. Java agent will start automatically
+echo.
+call run-prod.bat
+echo [DEBUG] run-prod.bat completed
 -~{END}~-
