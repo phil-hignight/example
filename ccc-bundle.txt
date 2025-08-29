@@ -1165,5 +1165,4 @@ echo Starting coordinator...
 node src/node-server/coordinator-demo.js
 
 pause
-
 -~{END}~-
