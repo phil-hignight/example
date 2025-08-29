@@ -31,7 +31,7 @@ echo         $inFile = $true >> extract.ps1
 echo     } >> extract.ps1
 echo     elseif ($line -eq '-~{END}~-') { >> extract.ps1
 echo         if ($inFile -and $current) { >> extract.ps1
-echo             $buffer ^| Out-File -FilePath $current -Encoding UTF8 >> extract.ps1
+echo             [System.IO.File]::WriteAllText($current, $buffer, [System.Text.Encoding]::UTF8) >> extract.ps1
 echo         } >> extract.ps1
 echo         $inFile = $false >> extract.ps1
 echo         $current = $null >> extract.ps1
