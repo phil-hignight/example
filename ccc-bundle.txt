@@ -1721,9 +1721,12 @@ server.listen(PORT, () => {
     return assistantId;
   }
   
-  async function streamCompletion(chatId, messageId, onChunk) {
-    // Get the conversation to extract messages for the completion request
-    const conversation = await getConversationState(chatId);
+  async function streamCompletion(chatId, messageId, conversation, onChunk) {
+    // Use conversation passed directly from create response (no GET call needed)
+    
+    // Debug logging
+    console.log('[CCC Bridge API] Conversation for completions:', JSON.stringify(conversation, null, 2));
+    console.log('[CCC Bridge API] Messages structure:', conversation.chat.messages);
     
     // Build messages array for completions - only user messages for the model
     const messages = conversation.chat.messages
@@ -1732,6 +1735,8 @@ server.listen(PORT, () => {
         role: m.role,
         content: m.content
       }));
+    
+    console.log('[CCC Bridge API] Filtered messages for completion:', messages);
     
     const body = {
       "background_tasks": {
@@ -1800,16 +1805,13 @@ server.listen(PORT, () => {
     try {
       updateDisplay('processing', 'Step 1: Creating new chat...');
       
-      // Step 1: Create new chat
+      // Step 1: Create new chat (returns full conversation immediately)
       const chatData = await createNewChat(request.payload.prompt);
       const chatId = chatData.id;
       console.log('[CCC Bridge API] Created chat:', chatId);
       
-      await new Promise(resolve => setTimeout(resolve, 500));
-      updateDisplay('processing', 'Step 2: Getting conversation state...');
-      
-      // Step 2: Get conversation state (no manual assistant message creation)
-      const conversation = await getConversationState(chatId);
+      // Use conversation data directly from create response (no separate GET needed)
+      const conversation = chatData;  // chatData already contains the full conversation
       const userMessageId = conversation.chat.messages[0].id;
       
       console.log('[CCC Bridge API] Got conversation, proceeding to stream completions');
@@ -1822,7 +1824,7 @@ server.listen(PORT, () => {
       let finalContent = '';
       streamingContent.textContent = '';
       
-      finalContent = await streamCompletion(chatId, assistantId, (content, isComplete) => {
+      finalContent = await streamCompletion(chatId, assistantId, conversation, (content, isComplete) => {
         streamingContent.textContent = content;
         streamingContent.scrollTop = streamingContent.scrollHeight;
         
