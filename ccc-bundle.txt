@@ -1592,32 +1592,40 @@ server.listen(PORT, () => {
   // API Functions following the spec
   async function createNewChat(prompt) {
     const userMessageId = generateUUID();
-    const timestamp = Math.floor(Date.now() / 1000);
+    const timestamp = Date.now();
     
     const body = {
-      message: prompt,
-      messages: [{
-        id: userMessageId,
-        role: 'user',
-        content: prompt,
-        parentId: null,
-        childrenIds: [],
-        timestamp: timestamp
-      }],
-      history: {
-        messages: {
-          [userMessageId]: {
-            id: userMessageId,
-            role: 'user',
-            content: prompt,
-            parentId: null,
-            childrenIds: [],
-            timestamp: timestamp
+      "chat": {
+        "params": {},
+        "tags": [],
+        "timestamp": timestamp,
+        "title": "Chat Pending",
+        "models": ["Anthropic Claude 4 Sonnet"],
+        "messages": [
+          {
+            "id": userMessageId,
+            "role": "user",
+            "content": prompt,
+            "timestamp": timestamp,
+            "parentId": null,
+            "children": []
           }
-        },
-        currentId: userMessageId
-      },
-      timestamp: Date.now() // 13-digit for chat
+        ],
+        "id": "",
+        "history": {
+          "currentId": userMessageId,
+          "messages": [
+            {
+              "id": userMessageId,
+              "role": "user",
+              "content": prompt,
+              "timestamp": timestamp,
+              "parentId": null,
+              "children": []
+            }
+          ]
+        }
+      }
     };
     
     const response = await fetch(`${CONFIG.apiBase}/api/v1/chats/new`, {
@@ -1646,7 +1654,7 @@ server.listen(PORT, () => {
   
   async function createAssistantMessage(chatId, conversation, parentMessageId) {
     const assistantId = generateUUID();
-    const timestamp = Math.floor(Date.now() / 1000);
+    const timestamp = Date.now();
     
     // Clone conversation data
     const updatedConv = JSON.parse(JSON.stringify(conversation));
@@ -1656,21 +1664,25 @@ server.listen(PORT, () => {
       id: assistantId,
       role: 'assistant',
       content: '',
+      timestamp: timestamp,
       parentId: parentMessageId,
-      childrenIds: [],
-      timestamp: timestamp
+      children: []
     };
     
     // Add to messages array
-    updatedConv.messages.push(assistantMessage);
+    updatedConv.chat.messages.push(assistantMessage);
     
     // Add to history.messages
-    updatedConv.history.messages[assistantId] = assistantMessage;
+    updatedConv.chat.history.messages.push(assistantMessage);
     
-    // Update parent's childrenIds
-    if (updatedConv.history.messages[parentMessageId]) {
-      updatedConv.history.messages[parentMessageId].childrenIds.push(assistantId);
+    // Update parent's children array
+    const parentMessage = updatedConv.chat.messages.find(m => m.id === parentMessageId);
+    if (parentMessage) {
+      parentMessage.children.push(assistantId);
     }
+    
+    // Update currentId in history
+    updatedConv.chat.history.currentId = assistantId;
     
     // Update currentId
     updatedConv.history.currentId = assistantId;
@@ -1689,14 +1701,32 @@ server.listen(PORT, () => {
   }
   
   async function streamCompletion(chatId, messageId, onChunk) {
+    // Get the conversation to extract messages for the completion request
+    const conversation = await getConversationState(chatId);
+    
+    // Build messages array for completions - only user messages for the model
+    const messages = conversation.chat.messages
+      .filter(m => m.role === 'user')
+      .map(m => ({
+        role: m.role,
+        content: m.content
+      }));
+    
     const body = {
-      session_uuid: CONFIG.sessionId,
-      chat_id: chatId,
-      id: messageId,
-      stream: true,
-      model: 'claude-3-opus',
-      max_tokens: 1000,
-      temperature: 0.7
+      "background_tasks": {
+        "title_generation": true,
+        "tags_generation": true
+      },
+      "chat_id": chatId,
+      "features": {
+        "web_search": false
+      },
+      "id": messageId,
+      "messages": messages,
+      "model": "Anthropic Claude 4 Sonnet",
+      "params": {},
+      "session_id": CONFIG.sessionId,
+      "stream": true
     };
     
     const response = await fetch(`${CONFIG.apiBase}/api/chat/completions`, {
@@ -1758,7 +1788,7 @@ server.listen(PORT, () => {
       
       // Step 2: Get conversation state and create assistant message
       const conversation = await getConversationState(chatId);
-      const userMessageId = conversation.messages[0].id;
+      const userMessageId = conversation.chat.messages[0].id;
       
       const assistantId = await createAssistantMessage(chatId, conversation, userMessageId);
       console.log('[CCC Bridge API] Created assistant message:', assistantId);
