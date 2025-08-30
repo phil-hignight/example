@@ -1601,8 +1601,14 @@ server.listen(PORT, () => {
   
   // API Functions following the spec
   async function createNewChat(prompt) {
+    console.log('[CCC Bridge API] === CREATING NEW CHAT ===');
+    console.log('[CCC Bridge API] Prompt length:', prompt.length);
+    console.log('[CCC Bridge API] Prompt preview:', prompt.substring(0, 100) + (prompt.length > 100 ? '...' : ''));
+    
     const userMessageId = generateUUID();
     const timestamp = Date.now();
+    console.log('[CCC Bridge API] Generated user message ID:', userMessageId);
+    console.log('[CCC Bridge API] Timestamp:', timestamp);
     
     const body = {
       "chat": {
@@ -1638,6 +1644,9 @@ server.listen(PORT, () => {
       }
     };
     
+    console.log('[CCC Bridge API] Making chat creation request to:', `${CONFIG.apiBase}/api/v1/chats/new`);
+    console.log('[CCC Bridge API] Chat creation body:', JSON.stringify(body, null, 2));
+    
     const response = await fetch(`${CONFIG.apiBase}/api/v1/chats/new`, {
       method: 'POST',
       headers: {
@@ -1647,27 +1656,61 @@ server.listen(PORT, () => {
       body: JSON.stringify(body)
     });
     
-    if (!response.ok) throw new Error(`Chat creation failed: ${response.status}`);
-    return await response.json();
+    console.log('[CCC Bridge API] Chat creation response status:', response.status);
+    
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error('[CCC Bridge API] Chat creation failed:', response.status, errorText);
+      throw new Error(`Chat creation failed: ${response.status} - ${errorText}`);
+    }
+    
+    const result = await response.json();
+    console.log('[CCC Bridge API] Chat creation result:', JSON.stringify(result, null, 2));
+    return result;
   }
   
   async function getConversationState(chatId) {
+    console.log('[CCC Bridge API] === GETTING CONVERSATION STATE ===');
+    console.log('[CCC Bridge API] Chat ID:', chatId);
+    console.log('[CCC Bridge API] Request URL:', `${CONFIG.apiBase}/api/v1/chats/${chatId}`);
+    
     const response = await fetch(`${CONFIG.apiBase}/api/v1/chats/${chatId}`, {
       headers: {
         'Authorization': `Bearer ${authToken}`
       }
     });
     
-    if (!response.ok) throw new Error(`Get state failed: ${response.status}`);
-    return await response.json();
+    console.log('[CCC Bridge API] Get state response status:', response.status);
+    
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error('[CCC Bridge API] Get state failed:', response.status, errorText);
+      throw new Error(`Get state failed: ${response.status} - ${errorText}`);
+    }
+    
+    const result = await response.json();
+    console.log('[CCC Bridge API] Get state result structure:');
+    console.log('[CCC Bridge API] - Has result?', !!result);
+    console.log('[CCC Bridge API] - Has chat?', !!result?.chat);
+    console.log('[CCC Bridge API] - Has messages?', !!result?.chat?.messages);
+    console.log('[CCC Bridge API] - Messages count:', result?.chat?.messages?.length || 0);
+    console.log('[CCC Bridge API] Full get state result:', JSON.stringify(result, null, 2));
+    
+    return result;
   }
   
   async function createAssistantMessage(chatId, conversation, parentMessageId) {
+    console.log('[CCC Bridge API] === CREATING ASSISTANT MESSAGE VIA POST ===');
+    
     const assistantId = generateUUID();
     const timestamp = Date.now();
     
+    console.log('[CCC Bridge API] Generated assistant ID:', assistantId);
+    console.log('[CCC Bridge API] Parent message ID:', parentMessageId);
+    console.log('[CCC Bridge API] Timestamp:', timestamp);
+    
     // Debug logging
-    console.log('[CCC Bridge API] Conversation structure:', JSON.stringify(conversation, null, 2));
+    console.log('[CCC Bridge API] Input conversation structure:', JSON.stringify(conversation, null, 2));
     
     // Clone conversation data
     const updatedConv = JSON.parse(JSON.stringify(conversation));
@@ -1718,6 +1761,10 @@ server.listen(PORT, () => {
     // Update updated_at timestamp
     updatedConv.updated_at = timestamp;
     
+    console.log('[CCC Bridge API] Making POST request to update conversation...');
+    console.log('[CCC Bridge API] URL:', `${CONFIG.apiBase}/api/v1/chats/${chatId}`);
+    console.log('[CCC Bridge API] Updated conversation payload:', JSON.stringify(updatedConv, null, 2));
+    
     const response = await fetch(`${CONFIG.apiBase}/api/v1/chats/${chatId}`, {
       method: 'POST',
       headers: {
@@ -1727,26 +1774,60 @@ server.listen(PORT, () => {
       body: JSON.stringify(updatedConv)
     });
     
-    if (!response.ok) throw new Error(`Update failed: ${response.status}`);
+    console.log('[CCC Bridge API] POST response status:', response.status);
+    console.log('[CCC Bridge API] POST response headers:', Object.fromEntries(response.headers.entries()));
+    
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error('[CCC Bridge API] POST failed:', response.status, errorText);
+      throw new Error(`Update failed: ${response.status} - ${errorText}`);
+    }
+    
+    const responseData = await response.json();
+    console.log('[CCC Bridge API] POST response data:', JSON.stringify(responseData, null, 2));
+    console.log('[CCC Bridge API] ✓ Successfully created assistant message via POST');
+    
     return assistantId;
   }
   
   async function streamCompletion(chatId, messageId, conversation, onChunk) {
-    // Use conversation passed directly from create response (no GET call needed)
+    console.log('[CCC Bridge API] === STARTING STREAM COMPLETION ===');
+    console.log('[CCC Bridge API] Chat ID:', chatId);
+    console.log('[CCC Bridge API] Message ID:', messageId);
+    console.log('[CCC Bridge API] Conversation structure validation:');
+    console.log('[CCC Bridge API] - Has conversation?', !!conversation);
+    console.log('[CCC Bridge API] - Has conversation.chat?', !!conversation?.chat);
+    console.log('[CCC Bridge API] - Has messages array?', !!conversation?.chat?.messages);
+    console.log('[CCC Bridge API] - Messages count:', conversation?.chat?.messages?.length || 0);
+    
+    if (!conversation?.chat?.messages) {
+      throw new Error('Invalid conversation structure: missing messages array');
+    }
     
     // Debug logging
-    console.log('[CCC Bridge API] Conversation for completions:', JSON.stringify(conversation, null, 2));
-    console.log('[CCC Bridge API] Messages structure:', conversation.chat.messages);
+    console.log('[CCC Bridge API] Full conversation for completions:', JSON.stringify(conversation, null, 2));
+    console.log('[CCC Bridge API] Messages structure:', conversation.chat.messages.map(m => ({
+      id: m.id,
+      role: m.role,
+      contentLength: m.content?.length || 0,
+      hasParentId: !!m.parentId,
+      childrenCount: m.children?.length || 0
+    })));
     
     // Build messages array for completions - only user messages for the model
-    const messages = conversation.chat.messages
-      .filter(m => m.role === 'user')
-      .map(m => ({
-        role: m.role,
-        content: m.content
-      }));
+    const userMessages = conversation.chat.messages.filter(m => m.role === 'user');
+    console.log('[CCC Bridge API] Found user messages:', userMessages.length);
+    
+    const messages = userMessages.map(m => ({
+      role: m.role,
+      content: m.content
+    }));
     
     console.log('[CCC Bridge API] Filtered messages for completion:', messages);
+    
+    if (messages.length === 0) {
+      throw new Error('No user messages found to send to completions API');
+    }
     
     const body = {
       "background_tasks": {
@@ -1765,6 +1846,7 @@ server.listen(PORT, () => {
       "stream": true
     };
     
+    console.log('[CCC Bridge API] Making completions request to:', `${CONFIG.apiBase}/api/chat/completions`);
     console.log('[CCC Bridge API] Full request body:', JSON.stringify(body, null, 2));
     
     const response = await fetch(`${CONFIG.apiBase}/api/chat/completions`, {
@@ -1776,34 +1858,65 @@ server.listen(PORT, () => {
       body: JSON.stringify(body)
     });
     
-    if (!response.ok) throw new Error(`Stream failed: ${response.status}`);
+    console.log('[CCC Bridge API] Completions response status:', response.status);
+    console.log('[CCC Bridge API] Completions response headers:', Object.fromEntries(response.headers.entries()));
     
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error('[CCC Bridge API] Completions request failed:', response.status, errorText);
+      throw new Error(`Stream failed: ${response.status} - ${errorText}`);
+    }
+    
+    console.log('[CCC Bridge API] Starting to read SSE stream...');
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let accumulated = '';
+    let chunkCount = 0;
     
     while (true) {
       const { done, value } = await reader.read();
-      if (done) break;
+      if (done) {
+        console.log('[CCC Bridge API] Stream ended, total chunks processed:', chunkCount);
+        break;
+      }
       
       const chunk = decoder.decode(value);
       const lines = chunk.split('\n');
       
+      console.log('[CCC Bridge API] Received chunk with', lines.length, 'lines');
+      
       for (const line of lines) {
         if (line.startsWith('data: ')) {
           try {
-            const data = JSON.parse(line.substring(6));
+            const dataStr = line.substring(6);
+            console.log('[CCC Bridge API] Processing SSE line:', dataStr.substring(0, 100) + (dataStr.length > 100 ? '...' : ''));
+            
+            if (dataStr === '[DONE]') {
+              console.log('[CCC Bridge API] Received [DONE] marker, ending stream');
+              return accumulated;
+            }
+            
+            const data = JSON.parse(dataStr);
+            chunkCount++;
+            
             if (data.choices?.[0]?.delta?.content) {
-              accumulated += data.choices[0].delta.content;
+              const newContent = data.choices[0].delta.content;
+              accumulated += newContent;
+              console.log('[CCC Bridge API] Added content chunk:', newContent.substring(0, 50) + (newContent.length > 50 ? '...' : ''));
+              console.log('[CCC Bridge API] Total accumulated length:', accumulated.length);
               onChunk(accumulated, false);
             }
             if (data.choices?.[0]?.finish_reason === 'stop') {
+              console.log('[CCC Bridge API] Received finish_reason=stop, ending stream');
               onChunk(accumulated, true);
               return accumulated;
             }
           } catch (e) {
+            console.error('[CCC Bridge API] Parse error on line:', line.substring(0, 100));
             console.error('[CCC Bridge API] Parse error:', e);
           }
+        } else if (line.trim()) {
+          console.log('[CCC Bridge API] Non-data SSE line:', line.substring(0, 100));
         }
       }
     }
@@ -1811,43 +1924,40 @@ server.listen(PORT, () => {
     return accumulated;
   }
   
-  // Poll for server-generated assistant message
-  async function pollForAssistantMessage(chatId, initialMessageIds) {
-    const startTime = Date.now();
-    const timeoutMs = 5 * 60 * 1000; // 5 minutes
-    const pollInterval = 200; // 200ms between polls
+  // Create assistant message manually (server doesn't auto-generate)
+  async function createAssistantMessageSlot(chatId, parentMessageId) {
+    console.log('[CCC Bridge API] ===== CREATING ASSISTANT MESSAGE SLOT =====');
+    console.log('[CCC Bridge API] Chat ID:', chatId);
+    console.log('[CCC Bridge API] Parent message ID:', parentMessageId);
     
-    console.log('[CCC Bridge API] Starting to poll for assistant message...');
-    
-    while (Date.now() - startTime < timeoutMs) {
-      try {
-        const conversation = await getConversationState(chatId);
-        
-        // Look for new messages (not in initial set)
-        const newMessages = conversation.chat.messages.filter(m => !initialMessageIds.has(m.id));
-        
-        // Find new assistant message
-        const newAssistantMessage = newMessages.find(m => m.role === 'assistant');
-        
-        if (newAssistantMessage) {
-          console.log('[CCC Bridge API] Found new assistant message:', newAssistantMessage.id);
-          return newAssistantMessage.id;
-        }
-        
-        // Log current message count for debugging
-        console.log('[CCC Bridge API] Polling... Current messages:', conversation.chat.messages.length, 'New messages:', newMessages.length);
-        
-        // Wait before next poll
-        await new Promise(resolve => setTimeout(resolve, pollInterval));
-        
-      } catch (error) {
-        console.warn('[CCC Bridge API] Error during polling:', error.message);
-        await new Promise(resolve => setTimeout(resolve, pollInterval));
-      }
+    try {
+      // Get current conversation state
+      console.log('[CCC Bridge API] Step 1: Getting current conversation state...');
+      const conversation = await getConversationState(chatId);
+      console.log('[CCC Bridge API] Current conversation state before creating assistant message:');
+      console.log('[CCC Bridge API] Messages count:', conversation.chat.messages.length);
+      console.log('[CCC Bridge API] Messages:', conversation.chat.messages.map(m => ({id: m.id, role: m.role, contentLength: m.content?.length || 0})));
+      
+      // Create assistant message slot
+      console.log('[CCC Bridge API] Step 2: Creating assistant message via POST...');
+      const assistantId = await createAssistantMessage(chatId, conversation, parentMessageId);
+      console.log('[CCC Bridge API] ✓ Successfully created assistant message slot:', assistantId);
+      
+      // Get updated conversation state
+      console.log('[CCC Bridge API] Step 3: Verifying assistant message was created...');
+      const updatedConversation = await getConversationState(chatId);
+      console.log('[CCC Bridge API] Updated conversation state after creating assistant message:');
+      console.log('[CCC Bridge API] Messages count:', updatedConversation.chat.messages.length);
+      console.log('[CCC Bridge API] Messages:', updatedConversation.chat.messages.map(m => ({id: m.id, role: m.role, contentLength: m.content?.length || 0})));
+      
+      console.log('[CCC Bridge API] ===== ASSISTANT MESSAGE SLOT CREATION COMPLETE =====');
+      return { assistantId, conversation: updatedConversation };
+      
+    } catch (error) {
+      console.error('[CCC Bridge API] ❌ ERROR in createAssistantMessageSlot:', error);
+      console.error('[CCC Bridge API] Error stack:', error.stack);
+      throw error;
     }
-    
-    // Timeout reached
-    throw new Error('Timeout waiting for server to generate assistant message (5 minutes)');
   }
   
   // Process AI request using real API flow
@@ -1860,17 +1970,39 @@ server.listen(PORT, () => {
       const chatId = chatData.id;
       console.log('[CCC Bridge API] Created chat:', chatId);
       
-      // Step 2: Poll for server-generated assistant message
-      updateDisplay('processing', 'Step 2: Waiting for server to generate assistant message...');
+      // Step 2: Create assistant message slot manually (server doesn't auto-generate)
+      updateDisplay('processing', 'Step 2: Creating assistant message slot...');
       
-      // Get initial conversation to know what messages already exist
-      const initialConversation = await getConversationState(chatId);
-      const initialMessageIds = new Set(initialConversation.chat.messages.map(m => m.id));
-      console.log('[CCC Bridge API] Initial message IDs:', Array.from(initialMessageIds));
+      // Debug: Log the chat creation response
+      console.log('[CCC Bridge API] Chat creation response:', JSON.stringify(chatData, null, 2));
       
-      // Poll for new assistant message with timeout
-      const assistantId = await pollForAssistantMessage(chatId, initialMessageIds);
-      console.log('[CCC Bridge API] Found assistant message ID:', assistantId);
+      // Get the user message ID - try multiple possible paths
+      let userMessageId = null;
+      
+      // Method 1: Check if chatData contains full conversation
+      if (chatData.chat?.messages?.[0]?.id) {
+        userMessageId = chatData.chat.messages[0].id;
+        console.log('[CCC Bridge API] Found user message ID in chatData.chat.messages:', userMessageId);
+      } 
+      // Method 2: Get from conversation state
+      else {
+        console.log('[CCC Bridge API] User message not in chatData, fetching conversation state...');
+        const currentConversation = await getConversationState(chatId);
+        console.log('[CCC Bridge API] Current conversation:', JSON.stringify(currentConversation, null, 2));
+        const userMessage = currentConversation.chat.messages.find(m => m.role === 'user');
+        if (userMessage) {
+          userMessageId = userMessage.id;
+          console.log('[CCC Bridge API] Found user message ID in conversation state:', userMessageId);
+        }
+      }
+      
+      if (!userMessageId) {
+        throw new Error('Could not find user message ID in chat creation response or conversation state');
+      }
+      
+      // Create assistant message slot manually
+      const { assistantId, conversation } = await createAssistantMessageSlot(chatId, userMessageId);
+      console.log('[CCC Bridge API] Created assistant message ID:', assistantId);
       
       await new Promise(resolve => setTimeout(resolve, 500));
       updateDisplay('streaming', 'Step 3: Streaming response...', true);
