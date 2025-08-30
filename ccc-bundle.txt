@@ -1968,7 +1968,7 @@ server.listen(PORT, () => {
       console.log('[CCC Bridge API] Found api_template, length:', apiTemplateStr.length);
       
       // Get auth token from localStorage
-      const authToken = localStorage.getItem('authToken');
+      const authToken = localStorage.getItem('token');
       if (!authToken) {
         throw new Error('Auth token not found in localStorage');
       }
@@ -2104,7 +2104,7 @@ server.listen(PORT, () => {
       console.log('[CCC Bridge API] Found api_template, length:', apiTemplateStr.length);
       
       // Get auth token from localStorage
-      const authToken = localStorage.getItem('authToken');
+      const authToken = localStorage.getItem('token');
       if (!authToken) {
         throw new Error('Auth token not found in localStorage');
       }
