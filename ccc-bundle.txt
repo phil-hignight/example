@@ -1811,6 +1811,44 @@ server.listen(PORT, () => {
     return accumulated;
   }
   
+  // Poll for server-generated assistant message
+  async function pollForAssistantMessage(chatId, initialMessageIds) {
+    const startTime = Date.now();
+    const timeoutMs = 5 * 60 * 1000; // 5 minutes
+    const pollInterval = 200; // 200ms between polls
+    
+    console.log('[CCC Bridge API] Starting to poll for assistant message...');
+    
+    while (Date.now() - startTime < timeoutMs) {
+      try {
+        const conversation = await getConversationState(chatId);
+        
+        // Look for new messages (not in initial set)
+        const newMessages = conversation.chat.messages.filter(m => !initialMessageIds.has(m.id));
+        
+        // Find new assistant message
+        const newAssistantMessage = newMessages.find(m => m.role === 'assistant');
+        
+        if (newAssistantMessage) {
+          console.log('[CCC Bridge API] Found new assistant message:', newAssistantMessage.id);
+          return newAssistantMessage.id;
+        }
+        
+        // Log current message count for debugging
+        console.log('[CCC Bridge API] Polling... Current messages:', conversation.chat.messages.length, 'New messages:', newMessages.length);
+        
+        // Wait before next poll
+        await new Promise(resolve => setTimeout(resolve, pollInterval));
+        
+      } catch (error) {
+        console.warn('[CCC Bridge API] Error during polling:', error.message);
+        await new Promise(resolve => setTimeout(resolve, pollInterval));
+      }
+    }
+    
+    // Timeout reached
+    throw new Error('Timeout waiting for server to generate assistant message (5 minutes)');
+  }
   
   // Process AI request using real API flow
   async function processAIRequest(request) {
@@ -1822,17 +1860,20 @@ server.listen(PORT, () => {
       const chatId = chatData.id;
       console.log('[CCC Bridge API] Created chat:', chatId);
       
-      // Use conversation data directly from create response (no separate GET needed)
-      const conversation = chatData;  // chatData already contains the full conversation
-      const userMessageId = conversation.chat.messages[0].id;
+      // Step 2: Poll for server-generated assistant message
+      updateDisplay('processing', 'Step 2: Waiting for server to generate assistant message...');
       
-      console.log('[CCC Bridge API] Got conversation, proceeding to stream completions');
+      // Get initial conversation to know what messages already exist
+      const initialConversation = await getConversationState(chatId);
+      const initialMessageIds = new Set(initialConversation.chat.messages.map(m => m.id));
+      console.log('[CCC Bridge API] Initial message IDs:', Array.from(initialMessageIds));
+      
+      // Poll for new assistant message with timeout
+      const assistantId = await pollForAssistantMessage(chatId, initialMessageIds);
+      console.log('[CCC Bridge API] Found assistant message ID:', assistantId);
       
       await new Promise(resolve => setTimeout(resolve, 500));
       updateDisplay('streaming', 'Step 3: Streaming response...', true);
-      
-      // Step 3: Stream completion (generate assistant ID locally)  
-      const assistantId = generateUUID();
       let finalContent = '';
       streamingContent.textContent = '';
       
