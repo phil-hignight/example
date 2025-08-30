@@ -5,8 +5,16 @@
     // Storage key for localStorage
     const STORAGE_KEY = 'intercepted_requests';
     
-    // Keywords to watch for in URLs
-    const watchKeywords = ['chat', 'completions', 'completed', 'new'];
+    // URL patterns to watch for (exact matching)
+    const urlPatterns = [
+        /^.*\/api\/v1\/chats\/new$/,  // exactly /api/v1/chats/new
+        /^.*\/api\/chat\/completions$/,  // exactly /api/chat/completions
+        /^.*\/api\/chat\/completed$/,  // exactly /api/chat/completed
+        /^.*\/api\/v1\/chats\/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/  // exactly /api/v1/chats/<uuid>
+    ];
+    
+    // Negative patterns - exclude URLs containing these strings
+    const excludePatterns = ['count', 'pinned', '/tags', 'page'];
     
     // Initialize storage if it doesn't exist
     if (!localStorage.getItem(STORAGE_KEY)) {
@@ -18,9 +26,19 @@
         const [url, options = {}] = args;
         const urlString = typeof url === 'string' ? url : url.toString();
         
-        // Check if URL contains any of the watched keywords (case insensitive)
-        const shouldCapture = watchKeywords.some(keyword => 
-            urlString.toLowerCase().includes(keyword.toLowerCase())
+        // First check if URL contains any excluded patterns
+        const shouldExclude = excludePatterns.some(pattern => 
+            urlString.toLowerCase().includes(pattern.toLowerCase())
+        );
+        
+        if (shouldExclude) {
+            // Don't capture if URL contains excluded patterns
+            return originalFetch.apply(this, args);
+        }
+        
+        // Check if URL matches any of the watched patterns
+        const shouldCapture = urlPatterns.some(pattern => 
+            pattern.test(urlString)
         );
         
         if (shouldCapture) {
@@ -106,5 +124,10 @@
     console.log('  - replay() - Replay all captured requests');
     console.log('  - viewCapturedRequests() - View all captured requests');
     console.log('  - clearCapturedRequests() - Clear the request history');
-    console.log('📡 Watching for URLs containing: chat, completions, completed, new');
+    console.log('📡 Watching for exact URL matches:');
+    console.log('  - /api/v1/chats/new');
+    console.log('  - /api/chat/completions'); 
+    console.log('  - /api/chat/completed');
+    console.log('  - /api/v1/chats/<uuid>');
+    console.log('🚫 Excluding URLs containing: count, pinned, /tags, page');
 })();
