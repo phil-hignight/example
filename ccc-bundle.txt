@@ -3101,23 +3101,23 @@ server.listen(PORT, () => {
 -~{File: run-prod.bat}~-
 @echo off
 echo ================================
-echo CCC Production Runner (Java Only)
+echo CCC Chat Server (Production)
 echo ================================
 echo.
 
-REM Compile Java agent
-echo Compiling Java agent...
-javac src\java-agent\StandaloneAgent.java
+REM Compile ChatServerAgent
+echo Compiling ChatServerAgent...
+javac src\java-agent\ChatServerAgent.java
 if errorlevel 1 (
-    echo Java compilation failed!
+    echo ChatServerAgent compilation failed!
     pause
     exit /b 1
 )
 
 REM Create manifest file for JAR
-echo Main-Class: StandaloneAgent > manifest.txt
+echo Main-Class: ChatServerAgent > manifest.txt
 echo. >> manifest.txt
-jar cvfm src\java-agent\agent.jar manifest.txt -C src\java-agent StandaloneAgent.class
+jar cvfm src\java-agent\chat-server.jar manifest.txt -C src\java-agent ChatServerAgent*.class
 if errorlevel 1 (
     echo JAR creation failed!
     pause
@@ -3125,47 +3125,30 @@ if errorlevel 1 (
 )
 del manifest.txt
 
-REM Copy bridge script to clipboard
-echo.
-echo [DEBUG] About to copy bridge script to clipboard...
-echo [DEBUG] File exists check:
-if exist src\browser-bridge\bridge-api.js (
-    echo [DEBUG] bridge-api.js found
-) else (
-    echo [DEBUG] ERROR: bridge-api.js NOT found!
-)
-
-echo [DEBUG] File size:
-for %%A in (src\browser-bridge\bridge-api.js) do echo [DEBUG] Size: %%~zA bytes
-
-echo [DEBUG] First few lines of file:
-head -n 3 src\browser-bridge\bridge-api.js 2>nul || (
-    powershell -Command "Get-Content 'src\browser-bridge\bridge-api.js' | Select-Object -First 3"
-)
-
-echo [DEBUG] Copying to clipboard using PowerShell...
-powershell -Command "Get-Content 'src\browser-bridge\bridge-api.js' -Raw | Set-Clipboard"
-
-echo [DEBUG] Immediate clipboard verification after copy...
-powershell -Command "$clip = Get-Clipboard -Raw; Write-Host '[DEBUG] Clipboard length:' $clip.Length; if($clip.Length -gt 0) { Write-Host '[DEBUG] First 100 chars:' $clip.Substring(0, [Math]::Min(100, $clip.Length)) } else { Write-Host '[DEBUG] Clipboard is empty!' }"
-
-echo [DEBUG] Starting clipboard monitoring every 1 second...
-echo [DEBUG] Press Ctrl+C to stop monitoring and continue
-powershell -Command "for($i=1; $i -le 10; $i++) { Start-Sleep 1; $clip = Get-Clipboard -Raw; Write-Host \"[DEBUG] Second $i - Clipboard length: $($clip.Length)\"; if($clip.Length -gt 0 -and $clip.Length -lt 200) { Write-Host \"[DEBUG] Full content: $clip\" } elseif($clip.Length -gt 0) { Write-Host \"[DEBUG] First 50 chars: $($clip.Substring(0, [Math]::Min(50, $clip.Length)))\" } else { Write-Host \"[DEBUG] Clipboard is empty!\" } }"
-
 echo.
 echo ================================
-echo BRIDGE SCRIPT COPIED TO CLIPBOARD!
+echo STARTING CCC CHAT SERVER
 echo ================================
 echo.
-echo Instructions:
-echo 1. Open your internal Claude UI
-echo 2. Open Developer Console (F12)
-echo 3. Paste the bridge script (Ctrl+V)
-echo 4. Click anywhere on the overlay to calibrate
+echo The chat server will:
+echo 1. Start HTTP server on port 4444
+echo 2. Auto-launch Chrome with chat interface
+echo 3. Wait for you to paste bridge script in Claude UI
+echo 4. Handle chat requests via clipboard bridge
 echo.
-echo Starting Java agent...
-java -jar src\java-agent\agent.jar
+echo Chat interface will be available at:
+echo http://localhost:4444
+echo.
+echo Instructions for setup:
+echo 1. When Chrome opens, keep it open
+echo 2. Open your internal Claude UI in another tab/window
+echo 3. Open Developer Console (F12) in Claude UI
+echo 4. Copy and paste the bridge script (it will be in your clipboard)
+echo 5. Click the calibration overlay to set click position
+echo 6. Return to the chat interface and start chatting!
+echo.
+echo Starting chat server...
+java -jar src\java-agent\chat-server.jar
 
 pause
 -~{END}~-
