@@ -6,7 +6,7 @@
 			"headers": {
 				"Accept": "application/json",
 				"Content-Type": "application/json",
-				"authorization": Bearer ${auth}"
+				"authorization": "Bearer ${auth}"
 			},
 			"body": {
 				"chat": {
@@ -16,8 +16,8 @@
 					"params": {},
 					"history": {
 						"messages": {
-							"23987169-fbbd-4215-aad5-dd458f6dd308": {
-							  "id": "23987169-fbbd-4215-aad5-dd458f6dd308",
+							"23987168-fbbd-4215-aad5-dd458f6dd308": {
+							  "id": "23987168-fbbd-4215-aad5-dd458f6dd308",
 							  "parentId": null,
 							  "childrenIds": [],
 							  "role": "user",
@@ -25,12 +25,12 @@
 							  "timestamp": 1756572926,
 							  "models": ["Anthropic Claude 4 Sonnet"]
 							}
-						}
-						"currentId": "23987169-fbbd-4215-aad5-dd458f6dd308"
+						},
+						"currentId": "23987168-fbbd-4215-aad5-dd458f6dd308"
 					},
 					"messages": [
 						{
-							"id": "23987169-fbbd-4215-aad5-dd458f6dd308",
+							"id": "23987168-fbbd-4215-aad5-dd458f6dd308",
 							"parentId": null,
 							"childrenIds": [],
 							"role": "user",
@@ -45,7 +45,7 @@
 			},
 			"signal": null
 		},
-		"timestamp": 1756572926981
+		"timestamp": 1756572926981,
 		"isNewChat": true
 	},
 	{
@@ -55,25 +55,25 @@
 			"headers": {
 				"Accept": "application/json",
 				"Content-Type": "application/json",
-				"authorization": Bearer ${auth}"
+				"authorization": "Bearer ${auth}"
 			},
 			"body": {
 				"chat": {
 					"models": ["Anthropic Claude 4 Sonnet"],
 					"history": {
 						"messages": {
-							"23987169-fbbd-4215-aad5-dd458f6dd308": {
-							  "id": "23987169-fbbd-4215-aad5-dd458f6dd308",
+							"23987168-fbbd-4215-aad5-dd458f6dd308": {
+							  "id": "23987168-fbbd-4215-aad5-dd458f6dd308",
 							  "parentId": null,
-							  "childrenIds": ["62a8abd3-c622-4160-adaf-e2e9f2cb39c"],
+							  "childrenIds": ["62a8abd3-c622-4160-adaf-e2e9f2cb36c"],
 							  "role": "user",
 							  "content": "${message}",
 							  "timestamp": 1756572926,
 							  "models": ["Anthropic Claude 4 Sonnet"]
 							},
-							"62a8abd3-c622-4160-adaf-e2e9f2cb39c": {
-							  "parentId": "23987169-fbbd-4215-aad5-dd458f6dd308",
-							  "id": "62a8abd3-c622-4160-adaf-e2e9f2cb39c",
+							"62a8abd3-c622-4160-adaf-e2e9f2cb36c": {
+							  "parentId": "23987168-fbbd-4215-aad5-dd458f6dd308",
+							  "id": "62a8abd3-c622-4160-adaf-e2e9f2cb36c",
 							  "childrenIds": [],
 							  "role": "assistant",
 							  "content": "",
@@ -83,22 +83,22 @@
 							  "userContext": null,
 							  "timestamp": 1756572928
 							}
-						}
-						"currentId": "62a8abd3-c622-4160-adaf-e2e9f2cb39c"
+						},
+						"currentId": "62a8abd3-c622-4160-adaf-e2e9f2cb36c"
 					},
 					"messages": [
 						{
-							"id": "23987169-fbbd-4215-aad5-dd458f6dd308",
+							"id": "23987168-fbbd-4215-aad5-dd458f6dd308",
 							"parentId": null,
-							"childrenIds": ["62a8abd3-c622-4160-adaf-e2e9f2cb39c"],
+							"childrenIds": ["62a8abd3-c622-4160-adaf-e2e9f2cb36c"],
 							"role": "user",
 							"content": "${message}",
 							"timestamp": 1756572926,
 							"models": ["Anthropic Claude 4 Sonnet"]
 						},
 						{
-						  "parentId": "23987169-fbbd-4215-aad5-dd458f6dd308",
-						  "id": "62a8abd3-c622-4160-adaf-e2e9f2cb39c",
+						  "parentId": "23987168-fbbd-4215-aad5-dd458f6dd308",
+						  "id": "62a8abd3-c622-4160-adaf-e2e9f2cb36c",
 						  "childrenIds": [],
 						  "role": "assistant",
 						  "content": "",
@@ -115,7 +115,7 @@
 			},
 			"signal": null
 		},
-		"timestamp": 1756572928250
+		"timestamp": 1756572928250,
 		"isTemplate": true
 	},
 	{
@@ -123,7 +123,7 @@
 		"options": {
 			"method": "POST",
 			"headers": {
-				"Authorization": Bearer ${auth}",
+				"Authorization": "Bearer ${auth}",
 				"Content-Type": "application/json"
 			},
 			"body": {
@@ -149,7 +149,7 @@
 			},
 			"signal": null
 		},
-		"timestamp": 1756572929913
+		"timestamp": 1756572929913,
 		"isTemplate": true
 	}
 ]
