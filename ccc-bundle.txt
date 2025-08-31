@@ -688,6 +688,714 @@ public class StandaloneAgent {
 }
 -~{END}~-
 
+-~{File: src/java-agent/ChatServerAgent.java}~-
+import java.awt.*;
+import java.awt.datatransfer.*;
+import java.awt.event.InputEvent;
+import java.awt.image.BufferedImage;
+import java.io.*;
+import java.net.*;
+import java.util.*;
+import java.util.concurrent.*;
+import javax.swing.*;
+import com.sun.net.httpserver.*;
+
+public class ChatServerAgent {
+    private static Clipboard clipboard;
+    private static Robot robot;
+    private static String savedClipboard = "";
+    private static Point clickPosition = null;
+    private static volatile boolean calibrated = false;
+    private static TrayIcon trayIcon;
+    private static HttpServer server;
+    private static final int SERVER_PORT = 4444;
+    private static final String FRONTEND_URL = "http://localhost:" + SERVER_PORT;
+    private static ExecutorService executor = Executors.newCachedThreadPool();
+    private static Map<String, PendingRequest> pendingRequests = new ConcurrentHashMap<>();
+    private static Map<String, Future<?>> clickingTasks = new ConcurrentHashMap<>();
+    
+    static class PendingRequest {
+        String requestId;
+        HttpExchange exchange;
+        long timestamp;
+        
+        PendingRequest(String requestId, HttpExchange exchange) {
+            this.requestId = requestId;
+            this.exchange = exchange;
+            this.timestamp = System.currentTimeMillis();
+        }
+    }
+    
+    public static void main(String[] args) {
+        try {
+            // Initialize components
+            clipboard = Toolkit.getDefaultToolkit().getSystemClipboard();
+            robot = new Robot();
+            
+            // Setup system tray
+            setupSystemTray();
+            
+            // Start HTTP server
+            startHttpServer();
+            
+            // Launch Chrome
+            launchChrome();
+            
+            // Start clipboard monitoring
+            startClipboardMonitoring();
+            
+            // Keep running
+            System.out.println("CCC Chat Server running. Press Ctrl+C to exit.");
+            
+            // Shutdown hook
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                System.out.println("Shutting down CCC Chat Server...");
+                if (server != null) {
+                    server.stop(0);
+                }
+                executor.shutdown();
+            }));
+            
+            // Keep main thread alive
+            while (true) {
+                Thread.sleep(1000);
+            }
+            
+        } catch (Exception e) {
+            System.err.println("Error: " + e.getMessage());
+            e.printStackTrace();
+            System.exit(1);
+        }
+    }
+    
+    private static void setupSystemTray() {
+        if (!SystemTray.isSupported()) {
+            System.out.println("System tray not supported");
+            return;
+        }
+        
+        try {
+            SystemTray tray = SystemTray.getSystemTray();
+            
+            // Create icon (16x16 pixels)
+            BufferedImage image = new BufferedImage(16, 16, BufferedImage.TYPE_INT_RGB);
+            Graphics2D g = image.createGraphics();
+            g.setColor(Color.BLUE);
+            g.fillOval(0, 0, 16, 16);
+            g.dispose();
+            
+            trayIcon = new TrayIcon(image, "CCC Chat Server");
+            trayIcon.setImageAutoSize(true);
+            
+            // Add popup menu
+            PopupMenu popup = new PopupMenu();
+            MenuItem statusItem = new MenuItem("Status: Starting...");
+            MenuItem urlItem = new MenuItem("Open: " + FRONTEND_URL);
+            MenuItem exitItem = new MenuItem("Exit");
+            
+            urlItem.addActionListener(e -> {
+                try {
+                    Desktop.getDesktop().browse(new URI(FRONTEND_URL));
+                } catch (Exception ex) {
+                    System.err.println("Could not open browser: " + ex.getMessage());
+                }
+            });
+            
+            exitItem.addActionListener(e -> System.exit(0));
+            
+            popup.add(statusItem);
+            popup.add(urlItem);
+            popup.addSeparator();
+            popup.add(exitItem);
+            
+            trayIcon.setPopupMenu(popup);
+            tray.add(trayIcon);
+            
+            System.out.println("System tray initialized");
+            
+        } catch (Exception e) {
+            System.out.println("Failed to setup system tray: " + e.getMessage());
+        }
+    }
+    
+    private static void startHttpServer() throws Exception {
+        server = HttpServer.create(new InetSocketAddress(SERVER_PORT), 0);
+        
+        // Serve static files
+        server.createContext("/", new StaticFileHandler());
+        
+        // API endpoint for chat requests
+        server.createContext("/api/chat", new ChatHandler());
+        
+        server.setExecutor(executor);
+        server.start();
+        
+        System.out.println("HTTP server started on port " + SERVER_PORT);
+        System.out.println("Frontend available at: " + FRONTEND_URL);
+        
+        updateTrayStatus("HTTP server running on port " + SERVER_PORT);
+    }
+    
+    private static void launchChrome() {
+        try {
+            // Try different Chrome executable locations
+            String[] chromePaths = {
+                "google-chrome",
+                "google-chrome-stable", 
+                "chromium-browser",
+                "chromium",
+                "/usr/bin/google-chrome",
+                "/usr/bin/chromium-browser",
+                "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+                "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe"
+            };
+            
+            for (String chromePath : chromePaths) {
+                try {
+                    ProcessBuilder pb = new ProcessBuilder(chromePath, "--new-window", FRONTEND_URL);
+                    Process process = pb.start();
+                    System.out.println("Chrome launched successfully with: " + chromePath);
+                    updateTrayStatus("Chrome launched - Ready for chat");
+                    return;
+                } catch (Exception e) {
+                    // Try next path
+                }
+            }
+            
+            // Fallback to system default browser
+            if (Desktop.isDesktopSupported()) {
+                Desktop.getDesktop().browse(new URI(FRONTEND_URL));
+                System.out.println("Opened default browser (Chrome not found)");
+                updateTrayStatus("Browser opened - Ready for chat");
+            } else {
+                System.out.println("Could not launch browser automatically");
+                System.out.println("Please open: " + FRONTEND_URL);
+                updateTrayStatus("Manual browser open required");
+            }
+            
+        } catch (Exception e) {
+            System.err.println("Could not launch browser: " + e.getMessage());
+            System.out.println("Please open: " + FRONTEND_URL);
+            updateTrayStatus("Manual browser open required");
+        }
+    }
+    
+    private static void startClipboardMonitoring() {
+        executor.submit(() -> {
+            System.out.println("Starting clipboard monitoring for responses...");
+            
+            while (!Thread.currentThread().isInterrupted()) {
+                try {
+                    Thread.sleep(100); // Check every 100ms
+                    
+                    String clipboardText = getClipboardContent();
+                    if (clipboardText != null) {
+                        // Handle progress updates
+                        if (clipboardText.contains("BROWSER_PROGRESS") && clipboardText.contains("|||BROWSER_PROGRESS|||")) {
+                            handleProgressUpdate(clipboardText);
+                        }
+                        // Handle final responses
+                        else if (clipboardText.contains("BROWSER_RESPONSE") && clipboardText.contains("|||BROWSER_END|||")) {
+                            handleFinalResponse(clipboardText);
+                        }
+                    }
+                    
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                } catch (Exception e) {
+                    // Ignore clipboard errors
+                }
+            }
+        });
+    }
+    
+    private static void handleProgressUpdate(String clipboardText) {
+        try {
+            String jsonText = clipboardText.split("\\|\\|\\|BROWSER_PROGRESS\\|\\|\\|")[0];
+            // Simple JSON parsing for request ID
+            String requestId = extractJsonField(jsonText, "id");
+            String accumulated = extractJsonField(jsonText, "accumulated");
+            
+            if (requestId != null && accumulated != null) {
+                PendingRequest pending = pendingRequests.get(requestId);
+                if (pending != null) {
+                    // Send SSE progress update to frontend
+                    sendSSEUpdate(pending.exchange, "data: " + jsonText + "\n\n");
+                }
+            }
+            
+        } catch (Exception e) {
+            System.err.println("Error handling progress update: " + e.getMessage());
+        }
+    }
+    
+    private static void handleFinalResponse(String clipboardText) {
+        try {
+            String jsonText = clipboardText.split("\\|\\|\\|BROWSER_END\\|\\|\\|")[0];
+            String requestId = extractJsonField(jsonText, "id");
+            
+            if (requestId != null) {
+                // Stop continuous clicking
+                stopContinuousClicking(requestId);
+                
+                PendingRequest pending = pendingRequests.remove(requestId);
+                if (pending != null) {
+                    // Send final SSE response and close
+                    sendSSEUpdate(pending.exchange, "data: " + jsonText + "\n\n");
+                    sendSSEUpdate(pending.exchange, "data: [DONE]\n\n");
+                    
+                    try {
+                        pending.exchange.getResponseBody().close();
+                    } catch (IOException e) {
+                        // Ignore close errors
+                    }
+                    
+                    System.out.println("Response completed for request: " + requestId);
+                }
+            }
+            
+        } catch (Exception e) {
+            System.err.println("Error handling final response: " + e.getMessage());
+        }
+    }
+    
+    private static void sendSSEUpdate(HttpExchange exchange, String data) {
+        try {
+            OutputStream os = exchange.getResponseBody();
+            os.write(data.getBytes("UTF-8"));
+            os.flush();
+        } catch (Exception e) {
+            System.err.println("Error sending SSE update: " + e.getMessage());
+        }
+    }
+    
+    private static String extractJsonField(String json, String field) {
+        try {
+            String pattern = "\"" + field + "\":\"";
+            int start = json.indexOf(pattern);
+            if (start == -1) return null;
+            start += pattern.length();
+            
+            int end = json.indexOf("\"", start);
+            if (end == -1) return null;
+            
+            return json.substring(start, end);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+    
+    private static void updateTrayStatus(String status) {
+        if (trayIcon != null) {
+            PopupMenu popup = trayIcon.getPopupMenu();
+            if (popup.getItemCount() > 0) {
+                MenuItem statusItem = popup.getItem(0);
+                statusItem.setLabel("Status: " + status);
+            }
+        }
+    }
+    
+    // HTTP Handlers
+    static class StaticFileHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            String path = exchange.getRequestURI().getPath();
+            
+            if (path.equals("/") || path.equals("/index.html")) {
+                sendChatInterface(exchange);
+            } else {
+                send404(exchange);
+            }
+        }
+        
+        private void sendChatInterface(HttpExchange exchange) throws IOException {
+            String html = 
+                "<!DOCTYPE html>" +
+                "<html>" +
+                "<head>" +
+                "    <title>CCC Chat</title>" +
+                "    <meta charset=\"UTF-8\">" +
+                "    <style>" +
+                "        body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }" +
+                "        .chat-container { max-width: 800px; margin: 0 auto; background: white; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }" +
+                "        .chat-header { padding: 20px; border-bottom: 1px solid #eee; background: #4CAF50; color: white; border-radius: 8px 8px 0 0; }" +
+                "        .chat-messages { height: 400px; overflow-y: auto; padding: 20px; }" +
+                "        .message { margin: 10px 0; padding: 10px; border-radius: 8px; }" +
+                "        .user { background: #e3f2fd; text-align: right; }" +
+                "        .assistant { background: #f1f8e9; }" +
+                "        .error { background: #ffebee; color: #c62828; border: 1px solid #f8bbd9; }" +
+                "        .chat-input { display: flex; padding: 20px; border-top: 1px solid #eee; }" +
+                "        .input-field { flex: 1; padding: 10px; border: 1px solid #ddd; border-radius: 4px; font-size: 16px; }" +
+                "        .send-btn { margin-left: 10px; padding: 10px 20px; background: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer; }" +
+                "        .send-btn:disabled { background: #ccc; cursor: not-allowed; }" +
+                "        .retry-btn { background: #ff9800; margin-left: 5px; padding: 5px 10px; font-size: 12px; cursor: pointer; border: none; border-radius: 3px; color: white; }" +
+                "        .loading { opacity: 0.7; }" +
+                "    </style>" +
+                "</head>" +
+                "<body>" +
+                "    <div id=\"app\"></div>" +
+                "    <script>" +
+                "        class StateManager {" +
+                "            constructor(initialState = {}) {" +
+                "                this.state = initialState;" +
+                "                this.subscribers = new Map();" +
+                "                this.pendingNotifications = new Set();" +
+                "                this.isFlushScheduled = false;" +
+                "            }" +
+                "            updateState(state, path, newValue) {" +
+                "                this.setValueAtPath(state, path, newValue);" +
+                "                this.scheduleNotifications(path);" +
+                "            }" +
+                "            onUpdate(paths, callback) {" +
+                "                const pathArray = Array.isArray(paths) ? paths : [paths];" +
+                "                const subscriptionId = Math.random().toString(36);" +
+                "                this.subscribers.set(subscriptionId, { paths: pathArray, callback: callback });" +
+                "                return () => this.subscribers.delete(subscriptionId);" +
+                "            }" +
+                "            get(path) { return this.getValueAtPath(this.state, path); }" +
+                "            setValueAtPath(obj, path, value) {" +
+                "                const parts = this.parsePath(path);" +
+                "                let current = obj;" +
+                "                for (let i = 0; i < parts.length - 1; i++) {" +
+                "                    const part = parts[i];" +
+                "                    if (!(part in current)) current[part] = {};" +
+                "                    current = current[part];" +
+                "                }" +
+                "                current[parts[parts.length - 1]] = value;" +
+                "            }" +
+                "            getValueAtPath(obj, path) {" +
+                "                const parts = this.parsePath(path);" +
+                "                let current = obj;" +
+                "                for (const part of parts) {" +
+                "                    if (current == null || !(part in current)) return undefined;" +
+                "                    current = current[part];" +
+                "                }" +
+                "                return current;" +
+                "            }" +
+                "            parsePath(path) { return path.split(/[\\\\.\\\\[\\\\]]/).filter(p => p !== ''); }" +
+                "            scheduleNotifications(changedPath) {" +
+                "                this.pendingNotifications.add(changedPath);" +
+                "                if (!this.isFlushScheduled) {" +
+                "                    this.isFlushScheduled = true;" +
+                "                    queueMicrotask(() => this.flushNotifications());" +
+                "                }" +
+                "            }" +
+                "            flushNotifications() {" +
+                "                const changedPaths = Array.from(this.pendingNotifications);" +
+                "                this.pendingNotifications.clear();" +
+                "                this.isFlushScheduled = false;" +
+                "                for (const [subscriptionId, subscription] of this.subscribers) {" +
+                "                    const affectedPaths = subscription.paths.filter(subPath => " +
+                "                        changedPaths.some(changed => changed.startsWith(subPath) || subPath.startsWith(changed))" +
+                "                    );" +
+                "                    if (affectedPaths.length > 0) {" +
+                "                        const values = subscription.paths.map(path => this.get(path));" +
+                "                        subscription.callback(...values);" +
+                "                    }" +
+                "                }" +
+                "            }" +
+                "        }" +
+                "        function el(tag, attrs = {}, children = []) {" +
+                "            const element = document.createElement(tag);" +
+                "            Object.entries(attrs).forEach(([key, value]) => {" +
+                "                if (key === 'class') element.className = value;" +
+                "                else if (key.startsWith('on')) element.addEventListener(key.slice(2), value);" +
+                "                else element.setAttribute(key, value);" +
+                "            });" +
+                "            children.forEach(child => {" +
+                "                if (typeof child === 'string') element.appendChild(document.createTextNode(child));" +
+                "                else if (child) element.appendChild(child);" +
+                "            });" +
+                "            return element;" +
+                "        }" +
+                "        const stateManager = new StateManager({ chat: { messages: [] }, ui: { isProcessing: false } });" +
+                "        let currentAssistantMessage = null;" +
+                "        window.sendChatMessage = async function(message) {" +
+                "            try {" +
+                "                const messages = stateManager.get('chat.messages') || [];" +
+                "                messages.push({ id: generateUUID(), role: 'user', content: message, timestamp: Date.now() });" +
+                "                stateManager.updateState(stateManager.state, 'chat.messages', messages);" +
+                "                stateManager.updateState(stateManager.state, 'ui.isProcessing', true);" +
+                "                const request = { type: 'CCC_REQUEST', id: generateUUID(), timestamp: Date.now(), action: 'ai-complete', payload: { prompt: message } };" +
+                "                const assistantMessage = { id: request.id, role: 'assistant', content: '', timestamp: Date.now() };" +
+                "                messages.push(assistantMessage);" +
+                "                stateManager.updateState(stateManager.state, 'chat.messages', [...messages]);" +
+                "                currentAssistantMessage = assistantMessage;" +
+                "                const response = await fetch('/api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(request) });" +
+                "                if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);" +
+                "                await handleSSEResponse(response, request.id);" +
+                "            } catch (error) {" +
+                "                const messages = stateManager.get('chat.messages') || [];" +
+                "                messages.push({ id: generateUUID(), role: 'error', content: error.message, error: error.message, timestamp: Date.now() });" +
+                "                stateManager.updateState(stateManager.state, 'chat.messages', [...messages]);" +
+                "            } finally {" +
+                "                stateManager.updateState(stateManager.state, 'ui.isProcessing', false);" +
+                "            }" +
+                "        };" +
+                "        async function handleSSEResponse(response, requestId) {" +
+                "            const reader = response.body.getReader();" +
+                "            const decoder = new TextDecoder();" +
+                "            while (true) {" +
+                "                const { done, value } = await reader.read();" +
+                "                if (done) break;" +
+                "                const chunk = decoder.decode(value);" +
+                "                const lines = chunk.split('\\\\n');" +
+                "                for (const line of lines) {" +
+                "                    if (line.startsWith('data: ')) {" +
+                "                        const dataStr = line.substring(6);" +
+                "                        if (dataStr === '[DONE]') return;" +
+                "                        try {" +
+                "                            const data = JSON.parse(dataStr);" +
+                "                            if (data.type === 'BROWSER_PROGRESS' || data.type === 'BROWSER_RESPONSE') {" +
+                "                                let content = '';" +
+                "                                if (data.payload && data.payload.accumulated) content = data.payload.accumulated;" +
+                "                                else if (data.payload && data.payload.content) content = data.payload.content;" +
+                "                                if (content && currentAssistantMessage) {" +
+                "                                    currentAssistantMessage.content = content;" +
+                "                                    const messages = stateManager.get('chat.messages') || [];" +
+                "                                    stateManager.updateState(stateManager.state, 'chat.messages', [...messages]);" +
+                "                                }" +
+                "                            }" +
+                "                        } catch (parseError) {}" +
+                "                    }" +
+                "                }" +
+                "            }" +
+                "        }" +
+                "        function generateUUID() { return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) { const r = Math.random() * 16 | 0; const v = c == 'x' ? r : (r & 0x3 | 0x8); return v.toString(16); }); }" +
+                "        function ChatMessage(state, basePath) {" +
+                "            const message = el('div', {class: 'message'}, [el('div', {class: 'content'})]);" +
+                "            const unsubscribes = [];" +
+                "            unsubscribes.push(state.onUpdate([`${basePath}.role`, `${basePath}.content`], (role, content) => {" +
+                "                message.className = `message ${role || 'user'}`;" +
+                "                message.querySelector('.content').textContent = content || '';" +
+                "            }));" +
+                "            return { elements: message, destroy: () => unsubscribes.forEach(unsub => unsub()) };" +
+                "        }" +
+                "        function ChatInput(state, basePath) {" +
+                "            const container = el('div', {class: 'chat-input'}, [" +
+                "                el('input', { type: 'text', class: 'input-field', placeholder: 'Type your message...' })," +
+                "                el('button', {class: 'send-btn'}, ['Send'])" +
+                "            ]);" +
+                "            const input = container.querySelector('.input-field');" +
+                "            const button = container.querySelector('.send-btn');" +
+                "            const unsubscribes = [];" +
+                "            unsubscribes.push(state.onUpdate(`${basePath}.isProcessing`, (isProcessing) => {" +
+                "                button.disabled = isProcessing;" +
+                "                input.disabled = isProcessing;" +
+                "                button.textContent = isProcessing ? 'Sending...' : 'Send';" +
+                "            }));" +
+                "            const sendMessage = () => {" +
+                "                const message = input.value.trim();" +
+                "                if (!message || state.get(`${basePath}.isProcessing`)) return;" +
+                "                input.value = '';" +
+                "                window.sendChatMessage(message);" +
+                "            };" +
+                "            button.addEventListener('click', sendMessage);" +
+                "            input.addEventListener('keypress', (e) => { if (e.key === 'Enter') sendMessage(); });" +
+                "            return { elements: container, destroy: () => unsubscribes.forEach(unsub => unsub()) };" +
+                "        }" +
+                "        function ChatMessages(state, basePath) {" +
+                "            const container = el('div', {class: 'chat-messages'});" +
+                "            const messageComponents = [];" +
+                "            const unsubscribes = [];" +
+                "            unsubscribes.push(state.onUpdate(`${basePath}.messages`, (messages) => {" +
+                "                messageComponents.forEach(comp => comp.destroy());" +
+                "                messageComponents.length = 0;" +
+                "                container.innerHTML = '';" +
+                "                if (messages) {" +
+                "                    messages.forEach((_, index) => {" +
+                "                        const messageComp = ChatMessage(state, `${basePath}.messages[${index}]`);" +
+                "                        messageComponents.push(messageComp);" +
+                "                        container.appendChild(messageComp.elements);" +
+                "                    });" +
+                "                }" +
+                "                container.scrollTop = container.scrollHeight;" +
+                "            }));" +
+                "            return { elements: container, destroy: () => { unsubscribes.forEach(unsub => unsub()); messageComponents.forEach(comp => comp.destroy()); } };" +
+                "        }" +
+                "        function ChatApp(state, basePath) {" +
+                "            const container = el('div', {class: 'chat-container'}, [" +
+                "                el('div', {class: 'chat-header'}, [" +
+                "                    el('h1', {}, ['CCC Chat Interface'])," +
+                "                    el('p', {}, ['Clipboard bridge to Claude API'])" +
+                "                ])" +
+                "            ]);" +
+                "            const messagesComp = ChatMessages(state, `${basePath}.chat`);" +
+                "            const inputComp = ChatInput(state, `${basePath}.ui`);" +
+                "            container.appendChild(messagesComp.elements);" +
+                "            container.appendChild(inputComp.elements);" +
+                "            return { elements: container, destroy: () => { messagesComp.destroy(); inputComp.destroy(); } };" +
+                "        }" +
+                "        const app = ChatApp(stateManager, 'root');" +
+                "        document.getElementById('app').appendChild(app.elements);" +
+                "    </script>" +
+                "</body>" +
+                "</html>";
+            
+            byte[] bytes = html.getBytes("UTF-8");
+            exchange.getResponseHeaders().set("Content-Type", "text/html; charset=UTF-8");
+            exchange.sendResponseHeaders(200, bytes.length);
+            
+            OutputStream os = exchange.getResponseBody();
+            os.write(bytes);
+            os.close();
+        }
+        
+        private void send404(HttpExchange exchange) throws IOException {
+            String response = "404 Not Found";
+            byte[] bytes = response.getBytes("UTF-8");
+            exchange.sendResponseHeaders(404, bytes.length);
+            
+            OutputStream os = exchange.getResponseBody();
+            os.write(bytes);
+            os.close();
+        }
+    }
+    
+    static class ChatHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            if (!"POST".equals(exchange.getRequestMethod())) {
+                exchange.sendResponseHeaders(405, 0);
+                exchange.getResponseBody().close();
+                return;
+            }
+            
+            try {
+                // Read request body
+                InputStream is = exchange.getRequestBody();
+                String requestBody = new String(is.readAllBytes(), "UTF-8");
+                
+                System.out.println("Received chat request: " + requestBody);
+                
+                // Parse request to get ID
+                String requestId = extractJsonField(requestBody, "id");
+                if (requestId == null) {
+                    throw new Exception("No request ID found");
+                }
+                
+                // Store pending request for response correlation
+                pendingRequests.put(requestId, new PendingRequest(requestId, exchange));
+                
+                // Set up SSE response headers
+                exchange.getResponseHeaders().set("Content-Type", "text/event-stream");
+                exchange.getResponseHeaders().set("Cache-Control", "no-cache");
+                exchange.getResponseHeaders().set("Connection", "keep-alive");
+                exchange.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
+                exchange.sendResponseHeaders(200, 0);
+                
+                // Forward request via clipboard bridge
+                String clipboardRequest = requestBody + "|||CCC_END|||";
+                setClipboard(clipboardRequest);
+                
+                System.out.println("Request forwarded via clipboard bridge");
+                
+                // Start continuous clicking until response completes (if calibrated)
+                if (calibrated && clickPosition != null) {
+                    startContinuousClicking(requestId);
+                }
+                
+            } catch (Exception e) {
+                System.err.println("Chat request error: " + e.getMessage());
+                
+                // Send error response
+                String errorResponse = "HTTP/1.1 500 Internal Server Error\\r\\n\\r\\n" + e.getMessage();
+                byte[] bytes = errorResponse.getBytes("UTF-8");
+                exchange.sendResponseHeaders(500, bytes.length);
+                
+                OutputStream os = exchange.getResponseBody();
+                os.write(bytes);
+                os.close();
+            }
+        }
+    }
+    
+    private static String getClipboardContent() throws Exception {
+        Transferable contents = clipboard.getContents(null);
+        if (contents != null && contents.isDataFlavorSupported(DataFlavor.stringFlavor)) {
+            return (String) contents.getTransferData(DataFlavor.stringFlavor);
+        }
+        return null;
+    }
+    
+    private static void setClipboard(String text) throws Exception {
+        StringSelection selection = new StringSelection(text);
+        clipboard.setContents(selection, null);
+    }
+    
+    private static void startContinuousClicking(String requestId) {
+        System.out.println("Starting continuous clicking for request: " + requestId);
+        
+        // Save current mouse position
+        Point originalPosition = MouseInfo.getPointerInfo().getLocation();
+        System.out.println("Saved original mouse position: " + originalPosition.x + ", " + originalPosition.y);
+        
+        Future<?> clickingTask = executor.submit(() -> {
+            long startTime = System.currentTimeMillis();
+            long timeoutMs = 5 * 60 * 1000; // 5 minutes
+            int clickCount = 0;
+            
+            try {
+                while (!Thread.currentThread().isInterrupted() && 
+                       (System.currentTimeMillis() - startTime) < timeoutMs) {
+                    
+                    // Move to calibrated position
+                    robot.mouseMove(clickPosition.x, clickPosition.y);
+                    Thread.sleep(50);
+                    
+                    // Click
+                    robot.mousePress(InputEvent.BUTTON1_DOWN_MASK);
+                    robot.delay(50);
+                    robot.mouseRelease(InputEvent.BUTTON1_DOWN_MASK);
+                    clickCount++;
+                    
+                    System.out.println("Bridge click #" + clickCount + " sent for request: " + requestId);
+                    
+                    // Move back to original position
+                    robot.mouseMove(originalPosition.x, originalPosition.y);
+                    
+                    // Wait 500ms before next click
+                    Thread.sleep(500);
+                }
+                
+                if (!Thread.currentThread().isInterrupted()) {
+                    System.out.println("Clicking timeout reached for request: " + requestId + " (5 minutes)");
+                }
+                
+            } catch (InterruptedException e) {
+                System.out.println("Clicking stopped for request: " + requestId + " (total clicks: " + clickCount + ")");
+                Thread.currentThread().interrupt();
+            } catch (Exception e) {
+                System.err.println("Error in continuous clicking: " + e.getMessage());
+            } finally {
+                // Always restore original mouse position
+                try {
+                    robot.mouseMove(originalPosition.x, originalPosition.y);
+                    System.out.println("Mouse position restored to: " + originalPosition.x + ", " + originalPosition.y);
+                } catch (Exception e) {
+                    System.err.println("Could not restore mouse position: " + e.getMessage());
+                }
+            }
+        });
+        
+        clickingTasks.put(requestId, clickingTask);
+    }
+    
+    private static void stopContinuousClicking(String requestId) {
+        Future<?> clickingTask = clickingTasks.remove(requestId);
+        if (clickingTask != null) {
+            clickingTask.cancel(true);
+            System.out.println("Stopped continuous clicking for request: " + requestId);
+        }
+    }
+    
+    private static String generateUUID() {
+        return UUID.randomUUID().toString();
+    }
+}
+-~{END}~-
+
 -~{File: mock-env/server.js}~-
 const http = require('http');
 const url = require('url');
