@@ -2118,8 +2118,13 @@ class CodingAssistantUI {
             content: message
         });
 
+        // Add system message with tool instructions if this is the first message
+        const messagesToSend = this.conversationHistory.length === 1 
+            ? this.addSystemMessage(this.conversationHistory)
+            : this.conversationHistory;
+
         try {
-            const response = await this.sendMessageToBackend(this.conversationHistory);
+            const response = await this.sendMessageToBackend(messagesToSend);
             await this.processResponse(response);
         } catch (error) {
             this.addErrorMessage('Error: ' + error.message);
@@ -2292,13 +2297,14 @@ class CodingAssistantUI {
     }
 
     async sendToolResults(toolId, toolData, results) {
-        // Add tool result as a system message to conversation history
+        // Create tool result message but don't add to conversation history yet
         const toolResultMessage = `[SYSTEM] Tool execution completed:\n\nTool: ${toolData.name}\nQuery: ${toolData.parameters?.query || 'N/A'}\nResults: ${JSON.stringify(results, null, 2)}\n\nPlease provide a response based on these results.`;
         
-        this.conversationHistory.push({
+        // Create messages array with tool result for this request only
+        const messagesWithToolResult = [...this.conversationHistory, {
             role: 'user',
             content: toolResultMessage
-        });
+        }];
 
         const request = {
             type: 'TOOL_RESULT',
@@ -2308,7 +2314,7 @@ class CodingAssistantUI {
                 toolId,
                 toolName: toolData.name,
                 results,
-                messages: this.conversationHistory,  // Send full conversation history
+                messages: messagesWithToolResult,  // Send conversation + tool result
                 chatId: this.chatId  // Include current chat ID
             }
         };
@@ -2320,6 +2326,12 @@ class CodingAssistantUI {
         });
 
         if (response.ok) {
+            // Add tool result to conversation history only after sending request
+            this.conversationHistory.push({
+                role: 'user',
+                content: toolResultMessage
+            });
+            
             // Process the AI's response to the tool results
             await this.processResponse({ response, requestId: request.id });
         }
@@ -2481,6 +2493,27 @@ class CodingAssistantUI {
 
     scrollToBottom() {
         this.chatArea.scrollTop = this.chatArea.scrollHeight;
+    }
+
+    addSystemMessage(messages) {
+        const systemMessage = {
+            role: 'user',
+            content: `You are a coding assistant with access to the following tools:
+
+<tool_use>
+search_files: Search for files by name pattern
+- Parameters: {"query": "search_term"}
+- Use this to find files matching a name pattern
+- Example: {"name": "search_files", "parameters": {"query": "java"}}
+</tool_use>
+
+When a user asks you to search for files or find code, use the search_files tool. Format tool use as:
+<tool>{"name": "search_files", "parameters": {"query": "search_term"}}</tool>
+
+Always use tools when appropriate instead of asking the user to provide code manually.`
+        };
+
+        return [systemMessage, ...messages];
     }
 
     generateUUID() {
