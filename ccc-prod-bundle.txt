@@ -931,6 +931,9 @@ public class ChatServerAgent {
         // API endpoints
         server.createContext("/api/chat", new ChatHandler());
         server.createContext("/api/tools/search-files", new FileSearchHandler());
+        server.createContext("/api/tools/search-content", new ContentSearchHandler());
+        server.createContext("/api/tools/list-files", new ListFilesHandler());
+        server.createContext("/api/tools/read-file", new ReadFileHandler());
         server.createContext("/api/tool-result", new ToolResultHandler());
         
         server.setExecutor(executor);
@@ -1014,6 +1017,10 @@ public class ChatServerAgent {
                         if (clipboardText.contains("CCC_CALIBRATION") && clipboardText.contains("|||CCC_END|||") && clipboardText.startsWith("{")) {
                             handleCalibration(clipboardText);
                         }
+                        // Handle user cancellation
+                        else if (clipboardText.contains("USER_CANCELLED") && clipboardText.contains("|||CCC_END|||") && clipboardText.startsWith("{")) {
+                            handleUserCancellation(clipboardText);
+                        }
                         // Handle progress updates
                         else if (clipboardText.contains("BROWSER_PROGRESS") && clipboardText.contains("|||BROWSER_PROGRESS|||")) {
                             handleProgressUpdate(clipboardText);
@@ -1053,6 +1060,45 @@ public class ChatServerAgent {
             
         } catch (Exception e) {
             System.err.println("Error handling calibration: " + e.getMessage());
+        }
+    }
+    
+    private static void handleUserCancellation(String clipboardText) {
+        try {
+            String jsonText = clipboardText.split("\\|\\|\\|CCC_END\\|\\|\\|")[0];
+            System.out.println("User cancelled operation (ESC ESC)");
+            
+            // Stop all ongoing clicking tasks
+            for (String requestId : clickingTasks.keySet()) {
+                stopContinuousClicking(requestId);
+            }
+            
+            // Cancel all pending requests with cancellation message
+            for (Map.Entry<String, PendingRequest> entry : pendingRequests.entrySet()) {
+                String requestId = entry.getKey();
+                PendingRequest pending = entry.getValue();
+                
+                // Send cancellation message to frontend
+                String cancelResponse = "{\"type\":\"USER_CANCELLED\",\"id\":\"" + requestId + "\",\"timestamp\":" + 
+                                      System.currentTimeMillis() + ",\"payload\":{\"message\":\"Operation cancelled by user (ESC ESC)\"}}";
+                
+                sendSSEUpdate(pending.exchange, "data: " + cancelResponse + "\n\n");
+                sendSSEUpdate(pending.exchange, "data: [DONE]\n\n");
+                
+                try {
+                    pending.exchange.getResponseBody().close();
+                } catch (IOException e) {
+                    // Ignore close errors
+                }
+            }
+            
+            // Clear all pending requests
+            pendingRequests.clear();
+            
+            updateTrayStatus("User cancelled - Ready for new requests");
+            
+        } catch (Exception e) {
+            System.err.println("Error handling user cancellation: " + e.getMessage());
         }
     }
     
@@ -1392,10 +1438,10 @@ public class ChatServerAgent {
         }
         
         private String getContentType(String filePath) {
-            if (filePath.endsWith(".html")) return "text/html";
-            if (filePath.endsWith(".css")) return "text/css";
-            if (filePath.endsWith(".js")) return "application/javascript";
-            return "text/plain";
+            if (filePath.endsWith(".html")) return "text/html; charset=UTF-8";
+            if (filePath.endsWith(".css")) return "text/css; charset=UTF-8";
+            if (filePath.endsWith(".js")) return "application/javascript; charset=UTF-8";
+            return "text/plain; charset=UTF-8";
         }
         
         private void send404(HttpExchange exchange) throws IOException {
@@ -1534,6 +1580,207 @@ public class ChatServerAgent {
         }
     }
     
+    static class ContentSearchHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            if (!"POST".equals(exchange.getRequestMethod())) {
+                exchange.sendResponseHeaders(405, 0);
+                exchange.getResponseBody().close();
+                return;
+            }
+            
+            try {
+                // Read request body
+                InputStream is = exchange.getRequestBody();
+                String requestBody = new String(is.readAllBytes(), "UTF-8");
+                
+                System.out.println("Content search request: " + requestBody);
+                
+                // Parse query and file pattern from request
+                String query = extractJsonField(requestBody, "query");
+                String filePattern = extractJsonField(requestBody, "file_pattern");
+                
+                if (query == null || query.trim().isEmpty()) {
+                    throw new Exception("No query provided");
+                }
+                
+                // Execute content search using PowerShell
+                java.util.List<String> results = searchContent(query, filePattern);
+                
+                // Create response
+                String response = "{\"results\":[" + 
+                    results.stream()
+                        .map(result -> "\"" + result.replace("\\", "\\\\").replace("\"", "\\\"") + "\"")
+                        .reduce((a, b) -> a + "," + b)
+                        .orElse("") +
+                    "]}";
+                
+                // Send response
+                exchange.getResponseHeaders().set("Content-Type", "application/json");
+                exchange.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
+                byte[] bytes = response.getBytes("UTF-8");
+                exchange.sendResponseHeaders(200, bytes.length);
+                
+                try (OutputStream os = exchange.getResponseBody()) {
+                    os.write(bytes);
+                }
+                
+            } catch (Exception e) {
+                System.err.println("Content search error: " + e.getMessage());
+                
+                String errorResponse = "{\"error\":\"" + e.getMessage().replace("\"", "\\\"") + "\"}";
+                exchange.getResponseHeaders().set("Content-Type", "application/json");
+                byte[] bytes = errorResponse.getBytes("UTF-8");
+                exchange.sendResponseHeaders(500, bytes.length);
+                
+                try (OutputStream os = exchange.getResponseBody()) {
+                    os.write(bytes);
+                }
+            }
+        }
+    }
+    
+    static class ListFilesHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            if (!"POST".equals(exchange.getRequestMethod())) {
+                exchange.sendResponseHeaders(405, 0);
+                exchange.getResponseBody().close();
+                return;
+            }
+            
+            try {
+                // Read request body
+                InputStream is = exchange.getRequestBody();
+                String requestBody = new String(is.readAllBytes(), "UTF-8");
+                
+                System.out.println("List files request: " + requestBody);
+                
+                // Parse path from request
+                String path = extractJsonField(requestBody, "path");
+                if (path == null || path.trim().isEmpty()) {
+                    path = "."; // Default to current directory
+                }
+                
+                // Execute list files using PowerShell
+                java.util.List<String> files = listFiles(path);
+                
+                // Create response
+                String response = "{\"files\":[" + 
+                    files.stream()
+                        .map(file -> "\"" + file.replace("\\", "\\\\").replace("\"", "\\\"") + "\"")
+                        .reduce((a, b) -> a + "," + b)
+                        .orElse("") +
+                    "]}";
+                
+                // Send response
+                exchange.getResponseHeaders().set("Content-Type", "application/json");
+                exchange.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
+                byte[] bytes = response.getBytes("UTF-8");
+                exchange.sendResponseHeaders(200, bytes.length);
+                
+                try (OutputStream os = exchange.getResponseBody()) {
+                    os.write(bytes);
+                }
+                
+            } catch (Exception e) {
+                System.err.println("List files error: " + e.getMessage());
+                
+                String errorResponse = "{\"error\":\"" + e.getMessage().replace("\"", "\\\"") + "\"}";
+                exchange.getResponseHeaders().set("Content-Type", "application/json");
+                byte[] bytes = errorResponse.getBytes("UTF-8");
+                exchange.sendResponseHeaders(500, bytes.length);
+                
+                try (OutputStream os = exchange.getResponseBody()) {
+                    os.write(bytes);
+                }
+            }
+        }
+    }
+    
+    static class ReadFileHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            if (!"POST".equals(exchange.getRequestMethod())) {
+                exchange.sendResponseHeaders(405, 0);
+                exchange.getResponseBody().close();
+                return;
+            }
+            
+            try {
+                // Read request body
+                InputStream is = exchange.getRequestBody();
+                String requestBody = new String(is.readAllBytes(), "UTF-8");
+                
+                System.out.println("Read file request: " + requestBody);
+                
+                // Parse file path from request
+                String filePath = extractJsonField(requestBody, "file_path");
+                if (filePath == null || filePath.trim().isEmpty()) {
+                    throw new Exception("No file_path provided");
+                }
+                
+                // Parse optional start_line and end_line parameters
+                String startLineStr = extractJsonField(requestBody, "start_line");
+                String endLineStr = extractJsonField(requestBody, "end_line");
+                
+                Integer startLine = null;
+                Integer endLine = null;
+                
+                if (startLineStr != null && !startLineStr.trim().isEmpty()) {
+                    try {
+                        startLine = Integer.parseInt(startLineStr.trim());
+                    } catch (NumberFormatException e) {
+                        throw new Exception("Invalid start_line parameter: must be a number");
+                    }
+                }
+                
+                if (endLineStr != null && !endLineStr.trim().isEmpty()) {
+                    try {
+                        endLine = Integer.parseInt(endLineStr.trim());
+                    } catch (NumberFormatException e) {
+                        throw new Exception("Invalid end_line parameter: must be a number");
+                    }
+                }
+                
+                // Read file content with optional line range
+                String content = readFileContent(filePath, startLine, endLine);
+                
+                // Create response (escape content for JSON)
+                String escapedContent = content.replace("\\", "\\\\")
+                                              .replace("\"", "\\\"")
+                                              .replace("\n", "\\n")
+                                              .replace("\r", "\\r")
+                                              .replace("\t", "\\t");
+                
+                String response = "{\"content\":\"" + escapedContent + "\",\"file_path\":\"" + 
+                                filePath.replace("\\", "\\\\").replace("\"", "\\\"") + "\"}";
+                
+                // Send response
+                exchange.getResponseHeaders().set("Content-Type", "application/json");
+                exchange.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
+                byte[] bytes = response.getBytes("UTF-8");
+                exchange.sendResponseHeaders(200, bytes.length);
+                
+                try (OutputStream os = exchange.getResponseBody()) {
+                    os.write(bytes);
+                }
+                
+            } catch (Exception e) {
+                System.err.println("Read file error: " + e.getMessage());
+                
+                String errorResponse = "{\"error\":\"" + e.getMessage().replace("\"", "\\\"") + "\"}";
+                exchange.getResponseHeaders().set("Content-Type", "application/json");
+                byte[] bytes = errorResponse.getBytes("UTF-8");
+                exchange.sendResponseHeaders(500, bytes.length);
+                
+                try (OutputStream os = exchange.getResponseBody()) {
+                    os.write(bytes);
+                }
+            }
+        }
+    }
+    
     static class ToolResultHandler implements HttpHandler {
         @Override
         public void handle(HttpExchange exchange) throws IOException {
@@ -1634,6 +1881,163 @@ public class ChatServerAgent {
         
         process.waitFor();
         return results;
+    }
+    
+    private static java.util.List<String> searchContent(String query, String filePattern) throws Exception {
+        java.util.List<String> results = new java.util.ArrayList<>();
+        
+        // Build PowerShell command for content search with context lines
+        String command = "powershell.exe -Command \"" +
+            "$matches = @(); " +
+            
+            // Get file list
+            (filePattern != null && !filePattern.trim().isEmpty() ? 
+                "Get-ChildItem -Recurse -File -Filter '" + filePattern.replace("'", "''") + "'" :
+                "Get-ChildItem -Recurse -File") +
+            
+            " | ForEach-Object { " +
+                "$file = $_; " +
+                "$content = Get-Content $file.FullName; " +
+                "$lineNum = 0; " +
+                "$content | ForEach-Object { " +
+                    "$lineNum++; " +
+                    "if ($_ -match '" + query.replace("'", "''") + "') { " +
+                        "$startLine = [Math]::Max(1, $lineNum - 5); " +
+                        "$endLine = [Math]::Min($content.Length, $lineNum + 5); " +
+                        "$contextLines = @(); " +
+                        "for ($i = $startLine; $i -le $endLine; $i++) { " +
+                            "$prefix = if ($i -eq $lineNum) { '> ' } else { '  ' }; " +
+                            "$contextLines += \\\"$prefix$($i): $($content[$i-1])\\\"; " +
+                        "} " +
+                        "$matches += [PSCustomObject]@{ " +
+                            "File = $file.Name; " +
+                            "Path = $file.FullName; " +
+                            "MatchLine = $lineNum; " +
+                            "Context = ($contextLines -join \\\"`n\\\") " +
+                        "}; " +
+                    "} " +
+                "} " +
+            "} | Select-Object -First 20; " +
+            
+            "$matches | ForEach-Object { " +
+                "\\\"=== $($_.File) (Line $($_.MatchLine)) ===`n$($_.Context)`n\\\" " +
+            "}\"";
+        
+        Process process = Runtime.getRuntime().exec(command);
+        
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if (!line.trim().isEmpty()) {
+                    results.add(line);
+                }
+            }
+        }
+        
+        process.waitFor();
+        return results;
+    }
+    
+    private static java.util.List<String> listFiles(String path) throws Exception {
+        java.util.List<String> results = new java.util.ArrayList<>();
+        
+        // Use PowerShell to list files and directories
+        String command = "powershell.exe -Command \"Get-ChildItem -Path '" + path.replace("'", "''") + "' | " +
+                        "ForEach-Object { if ($_.PSIsContainer) { '[DIR] ' + $_.Name } else { '[FILE] ' + $_.Name + ' (' + $_.Length + ' bytes)' } }\"";
+        
+        Process process = Runtime.getRuntime().exec(command);
+        
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                line = line.trim();
+                if (!line.isEmpty()) {
+                    results.add(line);
+                }
+            }
+        }
+        
+        process.waitFor();
+        return results;
+    }
+    
+    private static String readFileContent(String filePath) throws Exception {
+        return readFileContent(filePath, null, null);
+    }
+    
+    private static String readFileContent(String filePath, Integer startLine, Integer endLine) throws Exception {
+        // Use PowerShell to read file content with safety checks and optional line range
+        String command = "powershell.exe -Command \"" +
+                        "if (-not (Test-Path '" + filePath.replace("'", "''") + "')) { " +
+                            "throw 'File not found: " + filePath.replace("'", "''") + "' " +
+                        "} " +
+                        "if ((Get-Item '" + filePath.replace("'", "''") + "').PSIsContainer) { " +
+                            "throw 'Path is a directory, not a file: " + filePath.replace("'", "''") + "' " +
+                        "} " +
+                        "$fileSize = (Get-Item '" + filePath.replace("'", "''") + "').Length; " +
+                        "if ($fileSize -gt 1048576) { " +
+                            "throw 'File too large (max 1MB): " + filePath.replace("'", "''") + "' " +
+                        "} ";
+        
+        if (startLine != null && endLine != null) {
+            // Read specific line range with line numbers
+            command += "$content = Get-Content '" + filePath.replace("'", "''") + "'; " +
+                      "$totalLines = $content.Length; " +
+                      "if (" + startLine + " -gt $totalLines) { " +
+                          "throw 'Start line " + startLine + " exceeds file length (' + $totalLines + ')' " +
+                      "} " +
+                      "$actualStart = [Math]::Max(1, " + startLine + "); " +
+                      "$actualEnd = [Math]::Min($totalLines, " + endLine + "); " +
+                      "$result = @(); " +
+                      "for ($i = $actualStart; $i -le $actualEnd; $i++) { " +
+                          "$result += \\\"$($i): $($content[$i-1])\\\" " +
+                      "} " +
+                      "$result -join \\\"`n\\\"";
+        } else if (startLine != null) {
+            // Read from startLine to end with line numbers
+            command += "$content = Get-Content '" + filePath.replace("'", "''") + "'; " +
+                      "$totalLines = $content.Length; " +
+                      "if (" + startLine + " -gt $totalLines) { " +
+                          "throw 'Start line " + startLine + " exceeds file length (' + $totalLines + ')' " +
+                      "} " +
+                      "$result = @(); " +
+                      "for ($i = " + startLine + "; $i -le $totalLines; $i++) { " +
+                          "$result += \\\"$($i): $($content[$i-1])\\\" " +
+                      "} " +
+                      "$result -join \\\"`n\\\"";
+        } else {
+            // Read entire file without line numbers
+            command += "Get-Content '" + filePath.replace("'", "''") + "' -Raw";
+        }
+        
+        command += "\"";
+        
+        Process process = Runtime.getRuntime().exec(command);
+        
+        StringBuilder content = new StringBuilder();
+        StringBuilder error = new StringBuilder();
+        
+        // Read both stdout and stderr
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
+             BufferedReader errorReader = new BufferedReader(new InputStreamReader(process.getErrorStream()))) {
+            
+            String line;
+            while ((line = reader.readLine()) != null) {
+                content.append(line).append("\n");
+            }
+            
+            while ((line = errorReader.readLine()) != null) {
+                error.append(line).append("\n");
+            }
+        }
+        
+        int exitCode = process.waitFor();
+        
+        if (exitCode != 0 && error.length() > 0) {
+            throw new Exception(error.toString().trim());
+        }
+        
+        return content.toString();
     }
     
     private static String getClipboardContent() throws Exception {
@@ -2085,7 +2489,6 @@ class CodingAssistantUI {
     constructor() {
         this.chatArea = document.getElementById('chat-area');
         this.messageInput = document.getElementById('message-input');
-        this.statusIndicator = document.getElementById('status-indicator');
         this.isProcessing = false;
         this.currentAssistantMessage = null;
         this.toolExecutions = new Map(); // Track ongoing tool executions
@@ -2118,10 +2521,8 @@ class CodingAssistantUI {
             content: message
         });
 
-        // Add system message with tool instructions if this is the first message
-        const messagesToSend = this.conversationHistory.length === 1 
-            ? this.addSystemMessage(this.conversationHistory)
-            : this.conversationHistory;
+        // Always add system message to messages being sent (but not to saved history)
+        const messagesToSend = this.addSystemMessage([...this.conversationHistory]);
 
         try {
             const response = await this.sendMessageToBackend(messagesToSend);
@@ -2204,6 +2605,24 @@ class CodingAssistantUI {
     }
 
     async handleStreamData(data) {
+        if (data.type === 'USER_CANCELLED') {
+            // Handle user cancellation
+            this.stopSpinnerAnimation();
+            if (this.currentAssistantMessage) {
+                this.currentAssistantMessage.style.display = 'none';
+            }
+            
+            // Add cancellation message
+            const messageDiv = document.createElement('div');
+            messageDiv.className = 'message assistant error';
+            messageDiv.innerHTML = `&#9888; ${data.payload.message || 'Operation cancelled by user'}`;
+            this.chatArea.appendChild(messageDiv);
+            this.scrollToBottom();
+            
+            this.setProcessing(false);
+            return;
+        }
+        
         if (data.type === 'BROWSER_PROGRESS' || data.type === 'BROWSER_RESPONSE') {
             // Extract and store chatId if present
             if (data.payload && data.payload.chatId && !this.chatId) {
@@ -2222,52 +2641,91 @@ class CodingAssistantUI {
                 // Update current assistant content for history tracking
                 this.currentAssistantContent = content;
                 
-                // Check if this is a tool use
-                if (this.isToolUse(content)) {
-                    // Stop spinner and hide the loading message since we're showing tool execution instead
+                // Check if this is tool use (starts with <execute>) or response text
+                if (content.trim().startsWith('<execute>')) {
+                    // TYPE 1: Tool use only - parse and execute tools
                     this.stopSpinnerAnimation();
                     if (this.currentAssistantMessage) {
                         this.currentAssistantMessage.style.display = 'none';
                     }
-                    await this.handleToolUse(content);
+                    
+                    await this.handleToolOnlyResponse(content);
                 } else {
-                    // Convert loading message to regular assistant message with white dot
-                    this.convertToAssistantMessage(content);
+                    // TYPE 2: Response text only - convert loading message to assistant message
+                    this.convertToAssistantMessage(content.trim());
                 }
             }
         }
     }
 
-    isToolUse(content) {
-        return content.includes('<tool>') && content.includes('</tool>');
-    }
+    async handleToolOnlyResponse(content) {
+        // Parse <execute><tool name="..."><parameter name="...">...</parameter></tool></execute> format
+        const tools = [];
+        
+        // Extract all <tool> blocks within <execute> blocks
+        const toolMatches = content.matchAll(/<tool name="([^"]+)">(.*?)<\/tool>/gs);
+        
+        for (const match of toolMatches) {
+            const [, toolName, toolContent] = match;
+            const parameters = {};
+            
+            // Extract parameters from within this tool block
+            const paramMatches = toolContent.matchAll(/<parameter name="([^"]+)">([^<]*)<\/parameter>/g);
+            
+            for (const paramMatch of paramMatches) {
+                const [, paramName, paramValue] = paramMatch;
+                parameters[paramName] = paramValue.trim();
+            }
+            
+            tools.push({
+                name: toolName,
+                parameters: parameters
+            });
+        }
+        
+        if (tools.length === 0) {
+            console.error('No tools found in execute block:', content.substring(0, 200));
+            return;
+        }
 
-    async handleToolUse(content) {
-        // Extract tool JSON from content
-        const toolMatch = content.match(/<tool>(.*?)<\/tool>/s);
-        if (!toolMatch) return;
-
-        try {
-            const toolData = JSON.parse(toolMatch[1]);
+        // Execute all tools
+        const allResults = [];
+        for (const toolData of tools) {
             const toolId = this.generateUUID();
             
             // Add tool execution UI
-            const toolExecution = this.addToolExecution(toolId, toolData);
+            this.addToolExecution(toolId, toolData);
             
-            // Execute tool
-            const results = await this.executeTool(toolData);
-            
-            // Update tool execution with results
-            this.updateToolExecution(toolId, 'completed', results);
-            
-            // Send results back to AI
-            await this.sendToolResults(toolId, toolData, results);
-            
-        } catch (error) {
-            console.error('Tool execution error:', error);
-            this.addErrorMessage('Tool execution failed: ' + error.message);
+            try {
+                // Execute tool
+                const results = await this.executeTool(toolData);
+                
+                // Update tool execution with results
+                this.updateToolExecution(toolId, 'completed', results);
+                
+                allResults.push({
+                    toolId,
+                    toolData,
+                    results
+                });
+            } catch (toolError) {
+                console.error(`Tool ${toolData.name} execution error:`, toolError);
+                this.updateToolExecution(toolId, 'error', { error: toolError.message });
+                
+                allResults.push({
+                    toolId,
+                    toolData,
+                    results: { error: toolError.message }
+                });
+            }
+        }
+        
+        // Send all results back to AI
+        if (allResults.length > 0) {
+            await this.sendToolResults(allResults);
         }
     }
+
 
     async executeTool(toolData) {
         const { name, parameters } = toolData;
@@ -2275,6 +2733,12 @@ class CodingAssistantUI {
         switch (name) {
             case 'search_files':
                 return await this.executeFileSearch(parameters);
+            case 'search_content':
+                return await this.executeContentSearch(parameters);
+            case 'list_files':
+                return await this.executeListFiles(parameters);
+            case 'read_file':
+                return await this.executeReadFile(parameters);
             default:
                 throw new Error(`Unknown tool: ${name}`);
         }
@@ -2290,31 +2754,114 @@ class CodingAssistantUI {
         });
 
         if (!response.ok) {
-            throw new Error(`Search failed: ${response.status}`);
+            throw new Error(`File search failed: ${response.status}`);
         }
 
         return await response.json();
     }
 
-    async sendToolResults(toolId, toolData, results) {
-        // Create tool result message but don't add to conversation history yet
-        const toolResultMessage = `[SYSTEM] Tool execution completed:\n\nTool: ${toolData.name}\nQuery: ${toolData.parameters?.query || 'N/A'}\nResults: ${JSON.stringify(results, null, 2)}\n\nPlease provide a response based on these results.`;
+    async executeContentSearch(parameters) {
+        const { query, file_pattern } = parameters;
         
-        // Create messages array with tool result for this request only
+        const response = await fetch('/api/tools/search-content', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ query, file_pattern })
+        });
+
+        if (!response.ok) {
+            throw new Error(`Content search failed: ${response.status}`);
+        }
+
+        return await response.json();
+    }
+
+    async executeListFiles(parameters) {
+        const { path } = parameters;
+        
+        const response = await fetch('/api/tools/list-files', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path: path || '.' })
+        });
+
+        if (!response.ok) {
+            throw new Error(`List files failed: ${response.status}`);
+        }
+
+        return await response.json();
+    }
+
+    async executeReadFile(parameters) {
+        const { file_path, start_line, end_line } = parameters;
+        
+        const requestBody = { file_path };
+        if (start_line !== undefined) {
+            requestBody.start_line = start_line;
+        }
+        if (end_line !== undefined) {
+            requestBody.end_line = end_line;
+        }
+        
+        const response = await fetch('/api/tools/read-file', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(requestBody)
+        });
+
+        if (!response.ok) {
+            throw new Error(`Read file failed: ${response.status}`);
+        }
+
+        return await response.json();
+    }
+
+    async sendToolResults(allResults) {
+        // Handle both single tool result (legacy) and multiple tool results
+        const results = Array.isArray(allResults) ? allResults : [{ toolId: allResults, toolData: arguments[1], results: arguments[2] }];
+        
+        // Create combined tool result message
+        let toolResultMessage = '[SYSTEM] Tool execution completed:\n\n';
+        
+        results.forEach((result, index) => {
+            const { toolData, results: toolResults } = result;
+            toolResultMessage += `Tool ${index + 1}: ${toolData.name}\n`;
+            
+            // Add relevant parameters
+            if (toolData.parameters.query) {
+                toolResultMessage += `Query: ${toolData.parameters.query}\n`;
+            }
+            if (toolData.parameters.path) {
+                toolResultMessage += `Path: ${toolData.parameters.path}\n`;
+            }
+            if (toolData.parameters.file_pattern) {
+                toolResultMessage += `File Pattern: ${toolData.parameters.file_pattern}\n`;
+            }
+            if (toolData.parameters.file_path) {
+                toolResultMessage += `File Path: ${toolData.parameters.file_path}\n`;
+            }
+            
+            toolResultMessage += `Results: ${JSON.stringify(toolResults, null, 2)}\n\n`;
+        });
+        
+        toolResultMessage += 'Please provide a response based on these results.';
+        
+        // Create messages array with tool result, then add system message
         const messagesWithToolResult = [...this.conversationHistory, {
             role: 'user',
             content: toolResultMessage
         }];
+        
+        // Always add system message to messages being sent (but not to saved history)
+        const messagesToSendWithSystem = this.addSystemMessage(messagesWithToolResult);
 
         const request = {
             type: 'TOOL_RESULT',
             id: this.generateUUID(),
             timestamp: Date.now(),
             payload: {
-                toolId,
-                toolName: toolData.name,
-                results,
-                messages: messagesWithToolResult,  // Send conversation + tool result
+                toolResults: results,
+                messages: messagesToSendWithSystem,  // Send conversation + tool result + system message
                 chatId: this.chatId  // Include current chat ID
             }
         };
@@ -2342,18 +2889,50 @@ class CodingAssistantUI {
         toolDiv.className = 'tool-execution';
         toolDiv.id = `tool-${toolId}`;
         
+        // Build parameter display for first line
+        let paramDisplay = '';
+        if (toolData.parameters.query) {
+            paramDisplay = toolData.parameters.query;
+        } else if (toolData.parameters.path) {
+            paramDisplay = toolData.parameters.path;
+        } else if (toolData.parameters.file_path) {
+            paramDisplay = toolData.parameters.file_path;
+        }
+        
+        // Capitalize tool name for display
+        const toolDisplayName = toolData.name.split('_').map(word => 
+            word.charAt(0).toUpperCase() + word.slice(1)
+        ).join(' ');
+        
         toolDiv.innerHTML = `
-            <div class="tool-header">
-                <span class="tool-name">${toolData.name}</span>
-                <span class="tool-status running" id="status-${toolId}">Running...</span>
+            <div class="tool-header">${toolDisplayName}(${paramDisplay})</div>
+            <div class="tool-summary" id="summary-${toolId}">
+                <span class="loading-dots">Loading...</span>
             </div>
-            <div class="tool-details">
-                <div class="tool-query">Query: ${toolData.parameters.query || 'N/A'}</div>
-                <div class="tool-results" id="results-${toolId}">
-                    <span class="loading-dots">Searching</span>
-                </div>
+            <div class="tool-details-expanded" id="details-${toolId}" style="display: none;">
+                <div class="tool-results-full" id="results-${toolId}"></div>
             </div>
         `;
+        
+        // Add click handlers for expand/collapse
+        const header = toolDiv.querySelector('.tool-header');
+        const summary = toolDiv.querySelector('.tool-summary');
+        const details = toolDiv.querySelector('.tool-details-expanded');
+        
+        const toggleExpand = () => {
+            const isExpanded = details.style.display !== 'none';
+            if (isExpanded) {
+                details.style.display = 'none';
+                toolDiv.classList.remove('expanded');
+            } else {
+                details.style.display = 'block';
+                toolDiv.classList.add('expanded');
+            }
+        };
+        
+        header.addEventListener('click', toggleExpand);
+        summary.addEventListener('click', toggleExpand);
+        details.addEventListener('click', toggleExpand);
         
         this.chatArea.appendChild(toolDiv);
         this.scrollToBottom();
@@ -2366,21 +2945,48 @@ class CodingAssistantUI {
         const toolDiv = this.toolExecutions.get(toolId);
         if (!toolDiv) return;
 
-        const statusElement = document.getElementById(`status-${toolId}`);
+        const summaryElement = document.getElementById(`summary-${toolId}`);
         const resultsElement = document.getElementById(`results-${toolId}`);
         
-        if (statusElement) {
-            statusElement.textContent = status === 'completed' ? 'Completed' : 'Error';
-            statusElement.className = `tool-status ${status}`;
-        }
-
-        if (resultsElement && results) {
+        if (status === 'completed' && results) {
+            // Update summary line (second line)
+            let summaryText = '';
+            let resultsContent = '';
+            
             if (results.files && Array.isArray(results.files)) {
-                resultsElement.innerHTML = results.files.map(file => 
-                    `<div class="file-result">${file}</div>`
-                ).join('');
+                // For file lists or search results
+                summaryText = `&#9151; ${results.files.length} ${results.files.length === 1 ? 'file' : 'files'}`;
+                resultsContent = results.files.map(file => `${file}`).join('\n');
+            } else if (results.content) {
+                // For file reads
+                const lines = results.content.split('\n');
+                summaryText = `&#9151; ${lines.length} lines`;
+                resultsContent = results.content;
+            } else if (results.error) {
+                summaryText = `&#9151; Error: ${results.error}`;
+                resultsContent = results.error;
             } else {
-                resultsElement.textContent = JSON.stringify(results, null, 2);
+                summaryText = `&#9151; Completed`;
+                resultsContent = JSON.stringify(results, null, 2);
+            }
+            
+            if (summaryElement) {
+                summaryElement.innerHTML = summaryText;
+            }
+            
+            if (resultsElement) {
+                resultsElement.textContent = resultsContent;
+            }
+        } else if (status === 'error') {
+            // Add error class for red bullet point
+            toolDiv.classList.add('error');
+            
+            const errorMsg = (results && results.error) ? results.error : 'Unknown error';
+            if (summaryElement) {
+                summaryElement.innerHTML = `&#9151; Error: ${errorMsg}`;
+            }
+            if (resultsElement && results) {
+                resultsElement.textContent = results.error || 'Unknown error';
             }
         }
 
@@ -2416,17 +3022,14 @@ class CodingAssistantUI {
     }
 
     startSpinnerAnimation(spinnerElement) {
-        const chars = ['~', '-', '`', '+', '=', '*', '%', 'X', 'O'];
-        // Timing for each character (in ms) - some pause longer for effect
-        const timings = [100, 80, 60, 150, 80, 300, 120, 200, 150];
+        const chars = ['&bull;', '&middot;', '&#8728;', '&#8729;', '&#9675;', '&#9679;', '*', '&deg;', '&#10043;', '&#10045;', '&#10038;'];
         let index = 0;
         
         const nextFrame = () => {
-            spinnerElement.textContent = chars[index];
-            const currentTiming = timings[index];
+            spinnerElement.innerHTML = chars[index];
             index = (index + 1) % chars.length;
             
-            this.spinnerTimeout = setTimeout(nextFrame, currentTiming);
+            this.spinnerTimeout = setTimeout(nextFrame, 300);
         };
         
         nextFrame(); // Start the animation
@@ -2478,17 +3081,10 @@ class CodingAssistantUI {
         this.scrollToBottom();
     }
 
+
     setProcessing(isProcessing) {
         this.isProcessing = isProcessing;
         this.messageInput.disabled = isProcessing;
-        
-        if (isProcessing) {
-            this.statusIndicator.textContent = 'Processing...';
-            this.statusIndicator.className = 'status-indicator processing';
-        } else {
-            this.statusIndicator.textContent = 'Ready';
-            this.statusIndicator.className = 'status-indicator';
-        }
     }
 
     scrollToBottom() {
@@ -2500,17 +3096,38 @@ class CodingAssistantUI {
             role: 'user',
             content: `You are a coding assistant with access to the following tools:
 
-<tool_use>
 search_files: Search for files by name pattern
 - Parameters: {"query": "search_term"}
-- Use this to find files matching a name pattern
-- Example: {"name": "search_files", "parameters": {"query": "java"}}
-</tool_use>
 
-When a user asks you to search for files or find code, use the search_files tool. Format tool use as:
-<tool>{"name": "search_files", "parameters": {"query": "search_term"}}</tool>
+search_content: Search for content within files (returns 5 lines above/below matches with line numbers)
+- Parameters: {"query": "search_term", "file_pattern": "*.ext"} (file_pattern is optional)
 
-Always use tools when appropriate instead of asking the user to provide code manually.`
+list_files: List files and directories in a path
+- Parameters: {"path": "directory_path"} (defaults to current directory if not specified)
+
+read_file: Read the contents of a file
+- Parameters: {"file_path": "path/to/file", "start_line": 10, "end_line": 20} (start_line and end_line are optional - when used, returns lines with line numbers)
+
+IMPORTANT: You can return exactly 2 types of responses:
+
+TYPE 1 - TOOL USE ONLY: Start with <execute> and contain only tool calls, no response text
+Format: <execute><tool name="tool_name"><parameter name="param_name">value</parameter></tool></execute>
+
+TYPE 2 - RESPONSE TEXT ONLY: Normal response text with no tools
+
+Examples:
+
+TYPE 1 (tools only):
+<execute>
+<tool name="search_files">
+<parameter name="query">*.js</parameter>
+</tool>
+</execute>
+
+TYPE 2 (response only):
+I found several JavaScript files in your project. The main application logic appears to be in src/main.js, which handles the core functionality.
+
+Do NOT mix tools and response text. Choose one type per message.`
         };
 
         return [systemMessage, ...messages];
@@ -2541,6 +3158,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
 body {
     font-family: 'Fira Code', 'Consolas', 'Monaco', 'Menlo', monospace;
+    font-size: 12px;
     background-color: #000000;
     color: #ffffff;
     height: 100vh;
@@ -2643,6 +3261,21 @@ body {
     color: #ff6b6b;
 }
 
+/* Format error styling with red dot */
+.message.format-error {
+    color: #e94560;
+    border-left: 3px solid #e94560;
+    background-color: rgba(233, 69, 96, 0.1);
+    padding-left: 12px;
+}
+
+.message.format-error::before {
+    content: '●';
+    color: #e94560;
+    margin-right: 8px;
+    font-weight: bold;
+}
+
 .message.success {
     color: #51cf66;
 }
@@ -2653,6 +3286,7 @@ body {
     padding-left: 15px;
     position: relative;
     color: #ffffff;
+    cursor: pointer;
     word-wrap: break-word;
     overflow-wrap: break-word;
 }
@@ -2666,80 +3300,47 @@ body {
     font-weight: bold;
 }
 
-.tool-header {
-    display: inline-block;
-    margin-bottom: 10px;
-}
-
-.tool-name {
-    color: #28a745;
-    font-weight: bold;
-}
-
-.tool-status {
-    margin-left: 10px;
-    font-size: 12px;
-    color: #888;
-}
-
-.tool-status.running {
-    color: #ffc107;
-}
-
-.tool-status.completed {
-    color: #28a745;
-}
-
-.tool-status.error {
+.tool-execution.error::before {
     color: #dc3545;
 }
 
-.tool-details {
+.tool-header {
+    color: #28a745;
+    font-weight: normal;
+    margin-bottom: 2px;
+}
+
+.tool-summary {
+    color: #87ceeb;
+    margin-left: 5px;
+    font-size: 14px;
+}
+
+.tool-details-expanded {
+    background-color: #1a1a1a;
+    border-radius: 4px;
+    padding: 10px;
     margin-top: 5px;
     margin-left: 5px;
+    cursor: pointer;
 }
 
-.tool-query {
-    color: #87ceeb;
-    margin-bottom: 5px;
-    word-wrap: break-word;
-    overflow-wrap: break-word;
-}
-
-.tool-results {
+.tool-results-full {
     color: #ffffff;
-    margin-left: 5px;
+    white-space: pre-wrap;
+    font-family: inherit;
+    font-size: 14px;
 }
 
+/* Remove hover effect for file results */
 .file-result {
-    padding: 2px 0;
     color: #87ceeb;
-    word-wrap: break-word;
-    overflow-wrap: break-word;
-    white-space: pre-wrap;
 }
 
 .file-result:hover {
-    color: #ffffff;
+    color: #87ceeb;
 }
 
-/* Status indicator */
-.status-indicator {
-    position: fixed;
-    top: 10px;
-    right: 10px;
-    padding: 8px 12px;
-    background-color: #28a745;
-    color: white;
-    border-radius: 4px;
-    font-size: 12px;
-    z-index: 1000;
-}
-
-.status-indicator.processing {
-    background-color: #ffc107;
-    color: #000;
-}
 
 /* Loading animation */
 .loading-dots::after {
@@ -2757,12 +3358,34 @@ body {
 .message.loading {
     color: #888;
     padding-left: 15px;
+    position: relative;
 }
 
 .loading-spinner {
-    margin-right: 8px;
+    position: absolute;
+    left: 0;
+    top: 0;
     display: inline-block;
     min-width: 1em;
+}
+
+/* Scratchpad thinking sections */
+.message.scratchpad {
+    color: #666;
+    font-style: italic;
+    border-left: 2px solid #333;
+    background-color: rgba(255, 255, 255, 0.02);
+    padding-left: 15px;
+}
+
+.message.scratchpad::before {
+    content: '\2022';
+    color: #ffffff;
+    position: absolute;
+    left: 0;
+    top: 0;
+    font-weight: bold;
+    font-style: normal;
 }
 -~{END}~-
 
@@ -2780,14 +3403,14 @@ body {
 </head>
 <body>
     <div class="terminal-container">
-        <div class="status-indicator" id="status-indicator">Ready</div>
         <div class="chat-area" id="chat-area">
             <div class="message assistant">
                 Welcome to Claude Code Clone! I'm your AI coding assistant.<br><br>
                 I can help you with:<br>
-                &bull; Searching for files by name<br>
-                &bull; Code analysis and debugging<br>
-                &bull; File editing and management<br><br>
+                &bull; Searching for files by name or content<br>
+                &bull; Reading and analyzing file contents<br>
+                &bull; Exploring directory structures<br>
+                &bull; Code analysis and debugging<br><br>
                 What would you like to work on?
             </div>
         </div>
@@ -2926,9 +3549,9 @@ body {
     });
   }
   
-  // Tool use detection
+  // Tool use detection - only detect if message starts with <execute>
   function isToolUse(content) {
-    return content.includes('<tool>') && content.includes('</tool>');
+    return content.trim().startsWith('<execute>');
   }
   
   // Stream completions for existing conversations
@@ -3870,18 +4493,37 @@ body {
             if (dataStr === '[DONE]') {
               console.log('[CCC Bridge API] ===== SSE STREAM COMPLETE =====');
               
-              // Send final response via clipboard
-              const finalResponse = {
-                type: 'BROWSER_RESPONSE',
-                id: request.id,
-                timestamp: Date.now(),
-                status: 'success',
-                payload: {
-                  content: finalContent,
-                  chatId: chatId,
-                  model: 'Anthropic Claude 4 Sonnet'
-                }
-              };
+              // Check if final complete content is tool use
+              let finalResponse;
+              if (isToolUse(finalContent)) {
+                console.log('[CCC Bridge API] Detected tool use in final response');
+                finalResponse = {
+                  type: 'BROWSER_RESPONSE',
+                  id: request.id,
+                  timestamp: Date.now(),
+                  status: 'tool_use',
+                  payload: {
+                    content: finalContent,
+                    chatId: chatId,
+                    model: 'Anthropic Claude 4 Sonnet'
+                  }
+                };
+                updateDisplay('success', 'Tool use detected - response sent!');
+              } else {
+                console.log('[CCC Bridge API] Regular response (no tool use)');
+                finalResponse = {
+                  type: 'BROWSER_RESPONSE',
+                  id: request.id,
+                  timestamp: Date.now(),
+                  status: 'success',
+                  payload: {
+                    content: finalContent,
+                    chatId: chatId,
+                    model: 'Anthropic Claude 4 Sonnet'
+                  }
+                };
+                updateDisplay('success', 'Response sent!');
+              }
               
               const responseText = JSON.stringify(finalResponse) + '|||BROWSER_END|||';
               await navigator.clipboard.writeText(responseText);
@@ -3898,7 +4540,6 @@ body {
                 console.log('[CCC Bridge API] Cached conversation:', chatId);
               }
               
-              updateDisplay('success', 'Response sent!');
               setTimeout(() => updateDisplay('ready', 'Waiting for AI requests...'), 3000);
               
               return finalResponse;
@@ -3913,32 +4554,7 @@ body {
                 streamingContent.textContent = finalContent;
                 streamingContent.scrollTop = streamingContent.scrollHeight;
                 
-                // Check if this content contains tool use
-                if (isToolUse(finalContent)) {
-                  console.log('[CCC Bridge API] Detected tool use in response');
-                  
-                  // Send tool use response immediately
-                  const toolResponse = {
-                    type: 'BROWSER_RESPONSE',
-                    id: request.id,
-                    timestamp: Date.now(),
-                    status: 'tool_use',
-                    payload: {
-                      content: finalContent,
-                      chatId: chatId,
-                      model: 'Anthropic Claude 4 Sonnet'
-                    }
-                  };
-                  
-                  const responseText = JSON.stringify(toolResponse) + '|||BROWSER_END|||';
-                  await navigator.clipboard.writeText(responseText);
-                  console.log('[CCC Bridge API] Tool use response written to clipboard');
-                  
-                  updateDisplay('success', 'Tool use detected - response sent!');
-                  setTimeout(() => updateDisplay('ready', 'Waiting for AI requests...'), 3000);
-                  
-                  return toolResponse;
-                }
+                // Don't check for tool use during streaming - wait for complete response
                 
                 // Note: Progress updates removed to avoid clipboard focus errors
                 // The final response will contain the complete content
@@ -4030,7 +4646,32 @@ body {
     localStorage.setItem('token', 'mock-token-12345');
   }
   
-  console.log('[CCC Bridge API] Ready with real API flow');
+  // Add ESC ESC cancellation handler
+  let lastEscTime = 0;
+  document.addEventListener('keydown', async (e) => {
+    if (e.key === 'Escape') {
+      const now = Date.now();
+      if (now - lastEscTime < 500) { // Double ESC within 500ms
+        console.log('[CCC Bridge API] Double ESC detected - sending cancellation');
+        try {
+          const cancelMessage = JSON.stringify({
+            type: 'USER_CANCELLED',
+            timestamp: Date.now(),
+            reason: 'User pressed ESC ESC'
+          }) + '|||CCC_END|||';
+          
+          await navigator.clipboard.writeText(cancelMessage);
+          updateDisplay('error', 'Cancelled by user (ESC ESC)');
+          setTimeout(() => updateDisplay('ready', 'Waiting for AI requests...'), 2000);
+        } catch (err) {
+          console.error('[CCC Bridge API] Failed to send cancellation:', err);
+        }
+      }
+      lastEscTime = now;
+    }
+  });
+  
+  console.log('[CCC Bridge API] Ready with real API flow (ESC ESC to cancel)');
   
   // Initialization complete - overlay click handler will handle calibration directly
   
