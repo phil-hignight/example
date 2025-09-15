@@ -2006,14 +2006,21 @@ public class ChatServerAgent {
                 javaMessageQueue.add(forwardMessage);
                 
                 // Try to send the queue immediately
+                System.out.println("[FLOW] Attempting to send initial request to bridge, queue size: " + javaMessageQueue.size());
+                System.out.println("[FLOW] Request ID: " + extractJsonField(requestBody, "id"));
                 boolean clipboardWriteSuccess = sendQueueToBridge();
                 if (!clipboardWriteSuccess) {
-                    System.out.println("Failed to send initial request, will retry during polling");
+                    System.out.println("[ERROR] Failed to send initial request - clipboard write failed");
+                    System.out.println("[ERROR] Queue contents: " + javaMessageQueue);
+                    System.out.println("[ERROR] Will retry during polling cycle");
+                } else {
+                    System.out.println("[FLOW] Initial request sent successfully to clipboard");
                 }
                 
                 // Start continuous clicking ONLY if clipboard write succeeded (if calibrated)
                 if (clipboardWriteSuccess && calibrated && clickPosition != null) {
                     System.out.println("[FLOW] Starting auto-click at: " + clickPosition.x + ", " + clickPosition.y);
+                    System.out.println("[FLOW] Calibration state: calibrated=" + calibrated + ", clickPosition=" + clickPosition);
                     startContinuousClicking(requestId);
                 } else if (!clipboardWriteSuccess) {
                     System.out.println("[ERROR] Clipboard write failed - no clicking");
@@ -3123,22 +3130,31 @@ public class ChatServerAgent {
         long startTime = System.nanoTime();
         boolean success = false;
         
+        System.out.println("[CLIPBOARD-SEND] Starting sendQueueToBridge, queue size: " + javaMessageQueue.size());
+        
         try {
             synchronized (javaMessageQueue) {
                 // Don't send empty queues
                 if (javaMessageQueue.isEmpty()) {
+                    System.out.println("[CLIPBOARD-SEND] Queue is empty, nothing to send");
                     return true; // Nothing to send is technically a success
                 }
                 
                 long timestamp = System.currentTimeMillis();
                 String lockToken = "|||||JAVA LOCK|||||";
+                System.out.println("[CLIPBOARD-SEND] Step 1: Attempting to acquire lock");
+                
                 // Step 1: Try to acquire lock
                 setClipboard(lockToken);
                 Thread.sleep(10); // Brief delay for write to complete
                 
                 // Step 2: Verify we own the lock
+                System.out.println("[CLIPBOARD-SEND] Step 2: Verifying lock ownership");
                 String verification = getClipboardContent();
+                System.out.println("[CLIPBOARD-SEND] Verification result: " + (verification != null ? verification.substring(0, Math.min(50, verification.length())) : "null"));
+                
                 if (verification != null && verification.equals(lockToken)) {
+                    System.out.println("[CLIPBOARD-SEND] Lock acquired successfully");
                     // Step 3: We won the lock, now write our actual message separately
                     StringBuilder queueJson = new StringBuilder("[");
                     for (int i = 0; i < javaMessageQueue.size(); i++) {
@@ -3148,28 +3164,46 @@ public class ChatServerAgent {
                     queueJson.append("]");
                     
                     String messageToken = "|||||MESSAGE->BRIDGE|||||" + timestamp + "|||||" + queueJson.toString() + "|||||END|||||";
+                    System.out.println("[CLIPBOARD-SEND] Step 3: Writing message, length: " + messageToken.length());
+                    System.out.println("[CLIPBOARD-SEND] Message preview: " + messageToken.substring(0, Math.min(200, messageToken.length())) + "...");
+                    
                     setClipboard(messageToken);
                     Thread.sleep(50); // Additional delay to ensure clipboard is fully propagated
                     
-                    System.out.println("[FLOW] → Sent " + javaMessageQueue.size() + " messages to bridge");
-                    javaMessageQueue.clear();
-                    success = true;
+                    // Verify the message was written
+                    String finalCheck = getClipboardContent();
+                    if (finalCheck != null && finalCheck.startsWith("|||||MESSAGE->BRIDGE|||||")) {
+                        System.out.println("[CLIPBOARD-SEND] ✓ Message verified in clipboard");
+                        System.out.println("[FLOW] → Sent " + javaMessageQueue.size() + " messages to bridge");
+                        javaMessageQueue.clear();
+                        success = true;
+                    } else {
+                        System.out.println("[CLIPBOARD-SEND] ✗ Message verification failed!");
+                        System.out.println("[CLIPBOARD-SEND] Expected: MESSAGE->BRIDGE..., Got: " + (finalCheck != null ? finalCheck.substring(0, Math.min(50, finalCheck.length())) : "null"));
+                        success = false;
+                    }
                 } else {
+                    System.out.println("[CLIPBOARD-SEND] Failed to acquire lock");
+                    System.out.println("[CLIPBOARD-SEND] Expected: " + lockToken);
+                    System.out.println("[CLIPBOARD-SEND] Got: " + (verification != null ? verification : "null"));
                 }
             }
             
         } catch (Exception e) {
-            // Suppress clipboard send errors - they're usually focus issues
+            System.out.println("[CLIPBOARD-SEND] Exception during send: " + e.getClass().getSimpleName() + " - " + e.getMessage());
+            e.printStackTrace();
         }
         
         // Update adaptive timing
         long duration = (System.nanoTime() - startTime) / 1_000_000; // Convert to ms
         lastClipboardOpTime = Math.max(1, duration);
+        System.out.println("[CLIPBOARD-SEND] Operation took " + duration + "ms, success=" + success);
         
         if (success) {
             pollMultiplier = 5; // Reset to x5 on success
         } else {
             pollMultiplier = Math.min(10, pollMultiplier + 1); // Increment up to x10
+            System.out.println("[CLIPBOARD-SEND] Failed, increasing poll multiplier to " + pollMultiplier);
         }
         
         return success;
@@ -3423,10 +3457,12 @@ public class ChatServerAgent {
         }
         
         System.out.println("[FLOW] Auto-clicking bridge for request: " + requestId);
+        System.out.println("[CLICK] Starting clicking task - will click every 100ms at position: " + clickPosition);
         currentClickingRequestId = requestId;
         
         // Save current mouse position
         Point originalPosition = robotInterface.getMousePosition();
+        System.out.println("[CLICK] Saved original mouse position: " + originalPosition);
         
         currentClickingTask = executor.submit(() -> {
             long startTime = System.currentTimeMillis();
@@ -3434,6 +3470,8 @@ public class ChatServerAgent {
             long timeoutMs = 5 * 60 * 1000; // 5 minutes total timeout
             long inactivityTimeoutMs = 3 * 1000; // 3 seconds of no expected activity
             int clickCount = 0;
+            
+            System.out.println("[CLICK] Click thread started for request: " + requestId);
             
             try {
                 while (!Thread.currentThread().isInterrupted() && 
@@ -3522,31 +3560,47 @@ public class ChatServerAgent {
         long startTime = System.currentTimeMillis();
         clickConfirmationReceived = false; // Reset flag
         
+        System.out.println("[CLICK-CONFIRM] Waiting for click confirmation, timeout: " + timeoutMs + "ms");
+        int checkCount = 0;
+        
         while (System.currentTimeMillis() - startTime < timeoutMs) {
+            checkCount++;
+            long elapsed = System.currentTimeMillis() - startTime;
+            
             // Check for thread interruption first
             if (Thread.currentThread().isInterrupted()) {
-                System.out.println("[CLICK-DEBUG] Thread is interrupted - stopping click confirmation wait");
-                System.out.println("[CLICK-DEBUG] Clipboard monitoring active: " + clipboardMonitoringActive);
+                System.out.println("[CLICK-CONFIRM] Thread is interrupted - stopping click confirmation wait");
+                System.out.println("[CLICK-CONFIRM] Elapsed time: " + elapsed + "ms, checks: " + checkCount);
+                System.out.println("[CLICK-CONFIRM] Clipboard monitoring active: " + clipboardMonitoringActive);
                 return false;
             }
             
             // Check if confirmation was received via message processing
             if (clickConfirmationReceived && (System.currentTimeMillis() - lastClickConfirmationTime) < 1000) {
-                System.out.println("+ Click confirmation received via message queue");
+                System.out.println("[CLICK-CONFIRM] ✓ Click confirmation received via message queue");
+                System.out.println("[CLICK-CONFIRM] Elapsed time: " + elapsed + "ms, checks: " + checkCount);
                 return true;
+            }
+            
+            // Log periodically to track progress
+            if (checkCount % 10 == 0) { // Every second
+                System.out.println("[CLICK-CONFIRM] Still waiting... elapsed: " + elapsed + "ms, checks: " + checkCount);
             }
             
             try {
                 Thread.sleep(100); // Check every 100ms
             } catch (InterruptedException e) {
                 // Thread was interrupted during sleep - respect the interruption
-                System.out.println("[CLICK-DEBUG] Click confirmation wait interrupted during sleep");
-                System.out.println("[CLICK-DEBUG] Clipboard monitoring active: " + clipboardMonitoringActive);
+                System.out.println("[CLICK-CONFIRM] Click confirmation wait interrupted during sleep");
+                System.out.println("[CLICK-CONFIRM] Elapsed time: " + elapsed + "ms, checks: " + checkCount);
+                System.out.println("[CLICK-CONFIRM] Clipboard monitoring active: " + clipboardMonitoringActive);
                 Thread.currentThread().interrupt(); // Restore interrupted status
                 return false;
             }
         }
         
+        System.out.println("[CLICK-CONFIRM] ✗ Timeout - no confirmation received after " + timeoutMs + "ms");
+        System.out.println("[CLICK-CONFIRM] Total checks performed: " + checkCount);
         return false; // Timeout - no confirmation received
     }
     
@@ -5438,59 +5492,63 @@ create_directory: Create a new directory
 delete_directory_recursive: Delete a directory and all its contents (safety check: requires recent list_recursive call)
 - Parameters: {"dir_path": "path/to/directory"}
 
+## Tool Usage Guidelines
+
+**CRITICAL:** When using tools:
+- If you need to use tools, use them WITHOUT any accompanying message
+- Batch multiple tool calls into a single execute block when possible
+- Only provide a message AFTER all necessary tools have been executed and you have the information needed to respond
+- Never provide running commentary during tool execution
+
 ## Response Format
 
 IMPORTANT: All responses must be wrapped in a <response> tag and can contain any combination of <message> and <execute> sections:
 
 <response>
-  <message>Your text explanation here</message>
   <execute>
     <tool name="tool_name">
       <parameter name="param_name">value</parameter>
     </tool>
+    <tool name="another_tool">
+      <parameter name="param_name">value</parameter>
+    </tool>
   </execute>
-  <message>Additional explanation</message>
+  <message>Your concise response based on tool results</message>
 </response>
 
 Rules:
 - Always wrap your entire response in <response></response> tags
-- Use <message> tags for any explanatory text  
-- Use <execute> tags for tool calls
-- You can have multiple <message> and <execute> sections in any order
-- Each <execute> block can contain one or more <tool> calls
+- When using tools, put ALL tool calls in a single <execute> block WITHOUT any accompanying message
+- Only use <message> after tools have provided the information you need
 - Keep messages concise per the tone guidelines above
 
 Examples:
 
 Example 1 (message only):
 <response>
-  <message>Found 3 JavaScript files in src/</message>
+  <message>4</message>
 </response>
 
-Example 2 (tools with explanation):
+Example 2 (tools only, when gathering information):
 <response>
-  <message>Searching for JavaScript files.</message>
   <execute>
     <tool name="search_files">
       <parameter name="query">*.js</parameter>
     </tool>
-  </execute>
-</response>
-
-Example 3 (multiple operations):
-<response>
-  <message>Checking project structure.</message>
-  <execute>
-    <tool name="list_files">
-      <parameter name="path">.</parameter>
-    </tool>
-  </execute>
-  <message>Reading package.json.</message>
-  <execute>
     <tool name="read_file">
       <parameter name="file_path">package.json</parameter>
     </tool>
   </execute>
+</response>
+
+Example 3 (tools then response):
+<response>
+  <execute>
+    <tool name="list_files">
+      <parameter name="path">src</parameter>
+    </tool>
+  </execute>
+  <message>Found 3 JavaScript files in src/</message>
 </response>`;
 -~{END}~-
 
@@ -5605,6 +5663,7 @@ class CodingAssistantUI {
         this.toolExecutions = new Map(); // Track ongoing tool executions
         this.conversationHistory = []; // Track full conversation history
         this.chatId = null; // Track conversation ID from bridge script
+        this.toolLoadingMessage = null; // Track loading message for tools
         
         this.setupEventListeners();
     }
@@ -5819,21 +5878,27 @@ class CodingAssistantUI {
             sections.push(match[1]);
         }
         
+        // Check if there are any <execute> blocks
+        const hasToolExecutions = sections.some(section => section.startsWith('<execute>'));
+        
         // Process each section in order
         for (const section of sections) {
             if (section.startsWith('<message>')) {
-                // Extract and display message content
-                const messageMatch = section.match(/<message>(.*?)<\/message>/s);
-                if (messageMatch) {
-                    const messageText = messageMatch[1].trim();
-                    if (messageText) {
-                        // Hide spinner if showing
-                        this.stopSpinnerAnimation();
-                        // Display this message
-                        this.convertToAssistantMessage(messageText);
-                        // Reset for next section
-                        this.currentAssistantMessage = null;
-                        this.currentAssistantContent = '';
+                // Skip message display if there are also tool executions
+                if (!hasToolExecutions) {
+                    // Extract and display message content only if no tools
+                    const messageMatch = section.match(/<message>(.*?)<\/message>/s);
+                    if (messageMatch) {
+                        const messageText = messageMatch[1].trim();
+                        if (messageText) {
+                            // Hide spinner if showing
+                            this.stopSpinnerAnimation();
+                            // Display this message
+                            this.convertToAssistantMessage(messageText);
+                            // Reset for next section
+                            this.currentAssistantMessage = null;
+                            this.currentAssistantContent = '';
+                        }
                     }
                 }
             } else if (section.startsWith('<execute>')) {
@@ -6197,15 +6262,38 @@ class CodingAssistantUI {
             word.charAt(0).toUpperCase() + word.slice(1)
         ).join(' ');
         
+        // Create moving dots element
+        const movingDots = document.createElement('span');
+        movingDots.className = 'moving-dots';
+        movingDots.innerHTML = '⠋';
+        
+        // Animation frames for moving dots in a rectangle pattern
+        const frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        let frameIndex = 0;
+        
+        // Start the animation
+        const dotsInterval = setInterval(() => {
+            movingDots.innerHTML = frames[frameIndex];
+            frameIndex = (frameIndex + 1) % frames.length;
+        }, 100);
+        
+        // Store the interval ID so we can stop it later
+        toolDiv.dotsInterval = dotsInterval;
+        
         toolDiv.innerHTML = `
-            <div class="tool-header">${toolDisplayName}(${paramDisplay})</div>
-            <div class="tool-summary" id="summary-${toolId}">
-                <span class="loading-dots">Loading...</span>
+            <div class="tool-header">
+                <span class="dots-container"></span>
+                ${toolDisplayName}(${paramDisplay})
+            </div>
+            <div class="tool-summary" id="summary-${toolId}" style="display: none;">
             </div>
             <div class="tool-details-expanded" id="details-${toolId}" style="display: none;">
                 <div class="tool-results-full" id="results-${toolId}"></div>
             </div>
         `;
+        
+        // Add the moving dots
+        toolDiv.querySelector('.dots-container').appendChild(movingDots);
         
         // Add click handlers for expand/collapse
         const header = toolDiv.querySelector('.tool-header');
@@ -6230,16 +6318,39 @@ class CodingAssistantUI {
         this.chatArea.appendChild(toolDiv);
         this.scrollToBottom();
         
-        this.toolExecutions.set(toolId, toolDiv);
+        this.toolExecutions.set(toolId, { div: toolDiv, interval: dotsInterval });
+        
+        // Show loading message if this is the first tool being executed
+        if (!this.toolLoadingMessage && this.toolExecutions.size === 1) {
+            this.toolLoadingMessage = this.createLoadingMessage();
+        }
+        
         return toolDiv;
     }
 
     updateToolExecution(toolId, status, results) {
-        const toolDiv = this.toolExecutions.get(toolId);
-        if (!toolDiv) return;
+        const toolExecution = this.toolExecutions.get(toolId);
+        if (!toolExecution) return;
 
+        const toolDiv = toolExecution.div || toolExecution; // Handle both old and new format
         const summaryElement = document.getElementById(`summary-${toolId}`);
         const resultsElement = document.getElementById(`results-${toolId}`);
+        
+        // Stop the moving dots animation
+        if (toolExecution.interval) {
+            clearInterval(toolExecution.interval);
+        }
+        
+        // Replace moving dots with static indicator
+        const dotsContainer = toolDiv.querySelector('.dots-container');
+        if (dotsContainer) {
+            dotsContainer.innerHTML = status === 'error' ? '✗' : '✓';
+        }
+        
+        // Show the summary line
+        if (summaryElement) {
+            summaryElement.style.display = 'block';
+        }
         
         if (status === 'completed' && results) {
             // Update summary line (second line)
@@ -6288,6 +6399,19 @@ class CodingAssistantUI {
             }
             if (resultsElement && results) {
                 resultsElement.textContent = results.error || 'Unknown error';
+            }
+        }
+        
+        // Hide loading message when all tools are done
+        const allToolsDone = Array.from(this.toolExecutions.values()).every(
+            tool => !tool.interval || (tool.div && tool.div.querySelector('.dots-container').innerHTML !== '⠋')
+        );
+        
+        if (allToolsDone && this.toolLoadingMessage) {
+            this.stopSpinnerAnimation();
+            if (this.toolLoadingMessage) {
+                this.toolLoadingMessage.style.display = 'none';
+                this.toolLoadingMessage = null;
             }
         }
 
@@ -6718,6 +6842,62 @@ body {
 .retry-button:active {
     background-color: #1e7e34;
 }
+
+/* Tool execution styles */
+.tool-execution {
+    margin: 15px 0;
+    padding: 12px;
+    background-color: #1a1a1a;
+    border-left: 3px solid #4a9eff;
+    border-radius: 4px;
+    font-family: 'Consolas', 'Fira Code', monospace;
+}
+
+.tool-execution.error {
+    border-left-color: #ff4444;
+}
+
+.tool-header {
+    display: flex;
+    align-items: center;
+    cursor: pointer;
+    font-weight: 600;
+    color: #e0e0e0;
+}
+
+.dots-container {
+    display: inline-block;
+    width: 20px;
+    margin-right: 8px;
+    text-align: center;
+    font-size: 16px;
+}
+
+.moving-dots {
+    display: inline-block;
+    color: #4a9eff;
+}
+
+.tool-summary {
+    margin-top: 4px;
+    color: #a0a0a0;
+    font-size: 12px;
+    cursor: pointer;
+}
+
+.tool-details-expanded {
+    margin-top: 8px;
+    padding: 8px;
+    background-color: #0f0f0f;
+    border-radius: 4px;
+    font-size: 12px;
+    overflow-x: auto;
+}
+
+.tool-results-full {
+    white-space: pre-wrap;
+    word-wrap: break-word;
+}
 -~{END}~-
 
 -~{File: src/java-agent/web/index.html}~-
@@ -6964,6 +7144,9 @@ var CCCBridgeAPI = (function() {
   
   // Try to acquire clipboard lock and send our queue to Java
   async function sendQueueToJava() {
+    console.log('[SEND-QUEUE] Starting sendQueueToJava, queue size:', bridgeMessageQueue.length);
+    console.log('[SEND-QUEUE] Queue contents:', bridgeMessageQueue.map(m => m.type));
+    
     const startTime = performance.now();
     let success = false;
     const maxRetries = 10;
@@ -7047,6 +7230,8 @@ var CCCBridgeAPI = (function() {
     // Handle final failure after all retries
     if (!success) {
       console.log('[CLIPBOARD] Failed to acquire lock after', maxRetries, 'attempts');
+      console.log('[SEND-QUEUE] FAILURE: Could not send messages to Java');
+      console.log('[SEND-QUEUE] Failed queue contents:', bridgeMessageQueue);
     }
     
     // Update adaptive timing
@@ -7055,8 +7240,10 @@ var CCCBridgeAPI = (function() {
     
     if (success) {
       pollMultiplier = 5; // Reset to x5 on success
+      console.log('[SEND-QUEUE] SUCCESS: Sent', bridgeMessageQueue.length, 'messages in', duration.toFixed(2), 'ms');
     } else {
       pollMultiplier = Math.min(10, pollMultiplier + 1); // Increment up to x10
+      console.log('[SEND-QUEUE] Failed after', duration.toFixed(2), 'ms');
     }
     
     return success;
@@ -7256,12 +7443,18 @@ var CCCBridgeAPI = (function() {
   
   // Process incoming messages from Java
   async function processIncomingMessage(messageType, message) {
+    console.log('[BRIDGE-INCOMING] Processing message type:', messageType);
+    console.log('[BRIDGE-INCOMING] Message timestamp:', message.timestamp || 'no timestamp');
+    console.log('[BRIDGE-INCOMING] Message preview:', JSON.stringify(message).substring(0, 200) + '...');
+    
     try {
       switch (messageType) {
         case 'CCC_REQUEST':
+          console.log('[BRIDGE-INCOMING] Received CCC_REQUEST, calling handleCCCRequest...');
           await handleCCCRequest(message);
           break;
         case 'CALIBRATION_CONFIRMED':
+          console.log('[BRIDGE-INCOMING] Received CALIBRATION_CONFIRMED');
           // Java has confirmed calibration with screen position
           if (message.screenPosition) {
             console.log('[CCC Bridge API] Calibration confirmed at screen position:', message.screenPosition);
@@ -7275,12 +7468,14 @@ var CCCBridgeAPI = (function() {
           }
           break;
         case 'RAW_MESSAGE':
+          console.log('[BRIDGE-INCOMING] Received RAW_MESSAGE with error:', message.error);
           // Handle double-encoded messages
           if (message.error === 'double-encoded' && message.content) {
             try {
               // Parse the array
               const parsed = JSON.parse(message.content);
               if (Array.isArray(parsed)) {
+                console.log('[BRIDGE-INCOMING] Parsed', parsed.length, 'messages from RAW_MESSAGE');
                 for (const msg of parsed) {
                   if (msg.type) {
                     await processIncomingMessage(msg.type, msg);
@@ -7297,6 +7492,7 @@ var CCCBridgeAPI = (function() {
       }
     } catch (error) {
       console.log('[CLIPBOARD] Error processing message', messageType + ':', error.message);
+      console.log('[CLIPBOARD] Error stack:', error.stack);
     }
   }
   
@@ -8439,13 +8635,17 @@ var CCCBridgeAPI = (function() {
   overlay.addEventListener('click', async (e) => {
     clickCount++;
     console.log(`[CCC Bridge API] Click #${clickCount} at ${e.clientX}, ${e.clientY}`);
+    console.log('[CLICK-HANDLER] Current bridge state:', bridgeState);
+    console.log('[CLICK-HANDLER] Bridge message queue size:', bridgeMessageQueue.length);
     
     // ALWAYS check for pending messages first, regardless of state
     try {
       console.log('[CLIPBOARD-TRACE] Click handler - checking for messages before processing click...');
       const messages = await readMessagesFromJava();
+      console.log('[CLICK-HANDLER] Found', messages.length, 'messages from Java');
       for (const message of messages) {
         if (message.type) {
+          console.log('[CLICK-HANDLER] Processing message type:', message.type);
           await processIncomingMessage(message.type, message);
         }
       }
