@@ -1,41 +1,37 @@
 import java.awt.*;
 import java.awt.datatransfer.*;
+import java.awt.image.BufferedImage;
 import java.io.*;
 import java.nio.file.*;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.List;
-import java.util.concurrent.TimeUnit;
 
 public class ConversationCLI {
     private static final String CONVERSATION_FILE = ".agent/conversation.txt";
-    private static final String INPUT_FILE = "input.md";
     private static final String LOG_FILE = ".agent/debug.log";
     private static final String ANSI_RESET = "\u001B[0m";
     private static final String ANSI_GRAY = "\u001B[90m";
     private static final String ANSI_GOLD = "\u001B[33m";
     private static final String ANSI_RED = "\u001B[31m";
+    private static final String ANSI_WHITE = "\u001B[37m";
     
     // Use ASCII control characters as separators (very unlikely in normal text)
     private static final String FIELD_SEP = "\u001E"; // ASCII Record Separator
     private static final String RECORD_SEP = "\u001F"; // ASCII Unit Separator
     
     private static List<Message> conversation = new ArrayList<>();
-    private static long lastInputModified = 0;
+    private static TrayIcon trayIcon;
 
     public static void main(String[] args) {
         try {
             initializeFiles();
             log("Application started");
+            setupSystemTray();
             loadConversation();
-            displayConversation();
             
-            if (!Files.exists(Paths.get(INPUT_FILE))) {
-                createInputFile();
-            }
-            
-            watchInputFile();
+            runConversationLoop();
         } catch (Exception e) {
             log("Fatal error: " + e.getMessage());
             System.err.println("Error: " + e.getMessage());
@@ -55,9 +51,133 @@ public class ConversationCLI {
         }
     }
 
-    private static void createInputFile() throws IOException {
-        Files.write(Paths.get(INPUT_FILE), "".getBytes());
-        lastInputModified = Files.getLastModifiedTime(Paths.get(INPUT_FILE)).toMillis();
+    private static void setupSystemTray() {
+        if (!SystemTray.isSupported()) {
+            log("System tray not supported on this platform");
+            return;
+        }
+        
+        try {
+            SystemTray tray = SystemTray.getSystemTray();
+            
+            // Create a simple green icon (16x16)
+            Image image = createTrayIcon();
+            
+            // Create popup menu
+            PopupMenu popup = new PopupMenu();
+            
+            MenuItem statusItem = new MenuItem("Conversation CLI - Running");
+            statusItem.setEnabled(false);
+            popup.add(statusItem);
+            
+            popup.addSeparator();
+            
+            MenuItem exitItem = new MenuItem("Exit");
+            exitItem.addActionListener(e -> {
+                log("Exit requested from system tray");
+                System.exit(0);
+            });
+            popup.add(exitItem);
+            
+            // Create tray icon
+            trayIcon = new TrayIcon(image, "Conversation CLI", popup);
+            trayIcon.setImageAutoSize(true);
+            trayIcon.setToolTip("Conversation CLI - Maintaining clipboard access");
+            
+            // Add to system tray
+            tray.add(trayIcon);
+            
+            log("System tray icon added successfully");
+            System.out.println(ANSI_GOLD + "System tray icon added - maintaining clipboard access" + ANSI_RESET);
+            
+        } catch (Exception e) {
+            log("Failed to setup system tray: " + e.getMessage());
+            System.err.println("Warning: Could not setup system tray: " + e.getMessage());
+        }
+    }
+    
+    private static Image createTrayIcon() {
+        BufferedImage image = new BufferedImage(16, 16, BufferedImage.TYPE_INT_ARGB);
+        Graphics2D g2d = image.createGraphics();
+        
+        // Enable antialiasing
+        g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+        
+        // Draw a green circle
+        g2d.setColor(new Color(76, 175, 80)); // Material Design Green
+        g2d.fillOval(2, 2, 12, 12);
+        
+        // Add a white "C" for CLI
+        g2d.setColor(Color.WHITE);
+        g2d.setFont(new Font("Arial", Font.BOLD, 10));
+        FontMetrics fm = g2d.getFontMetrics();
+        String text = "C";
+        int x = (16 - fm.stringWidth(text)) / 2;
+        int y = (16 - fm.getHeight()) / 2 + fm.getAscent();
+        g2d.drawString(text, x, y);
+        
+        g2d.dispose();
+        return image;
+    }
+    
+    private static void updateTrayStatus(String status) {
+        if (trayIcon != null) {
+            trayIcon.setToolTip("Conversation CLI - " + status);
+        }
+    }
+
+    private static void runConversationLoop() throws IOException {
+        Scanner scanner = new Scanner(System.in);
+        
+        while (true) {
+            displayConversation();
+            System.out.print(ANSI_WHITE + "> " + ANSI_RESET);
+            
+            String userInput = scanner.nextLine().trim();
+            
+            if (userInput.isEmpty()) {
+                continue;
+            }
+            
+            if (userInput.equalsIgnoreCase("exit") || userInput.equalsIgnoreCase("quit")) {
+                log("User requested exit");
+                System.out.println("Goodbye!");
+                break;
+            }
+            
+            try {
+                // Add user message
+                Message userMessage = new Message("user", userInput);
+                conversation.add(userMessage);
+                saveMessage(userMessage);
+                log("User message added: " + userInput.length() + " chars");
+                
+                // Generate and copy prompt immediately
+                String prompt = generatePrompt();
+                copyToClipboard(prompt);
+                log("Prompt copied to clipboard");
+                updateTrayStatus("Prompt copied - waiting for response");
+                
+                System.out.println(ANSI_GOLD + "Prompt copied to clipboard! Paste the response and hit Enter..." + ANSI_RESET);
+                
+                // Read response from clipboard with retry
+                String response = getResponseFromClipboard(scanner);
+                
+                if (response != null && !response.trim().isEmpty()) {
+                    Message assistantMessage = new Message("assistant", response.trim());
+                    conversation.add(assistantMessage);
+                    saveMessage(assistantMessage);
+                    log("Assistant response added: " + response.length() + " chars");
+                    updateTrayStatus("Ready");
+                } else {
+                    updateTrayStatus("Ready");
+                }
+                
+            } catch (Exception e) {
+                log("Error in conversation loop: " + e.getMessage());
+                System.out.println(ANSI_RED + "Error: " + e.getMessage() + ANSI_RESET);
+            }
+        }
     }
 
     private static void loadConversation() throws IOException {
@@ -143,106 +263,51 @@ public class ConversationCLI {
         }
     }
 
-    private static void watchInputFile() throws IOException, InterruptedException {
-        Path inputPath = Paths.get(INPUT_FILE);
-        lastInputModified = Files.getLastModifiedTime(inputPath).toMillis();
+    private static String getResponseFromClipboard(Scanner scanner) {
+        String response = null;
+        int attempts = 0;
+        int maxAttempts = 5;
         
-        System.out.println(ANSI_GOLD + "Watching for changes to " + INPUT_FILE + "..." + ANSI_RESET);
-        
-        while (true) {
-            Thread.sleep(100);
+        while (response == null && attempts < maxAttempts) {
+            if (attempts > 0) {
+                System.out.println(ANSI_GOLD + "Attempt " + (attempts + 1) + "/" + maxAttempts + ". Press Enter when ready..." + ANSI_RESET);
+            }
+            scanner.nextLine();
             
-            if (Files.exists(inputPath)) {
-                long currentModified = Files.getLastModifiedTime(inputPath).toMillis();
-                if (currentModified > lastInputModified) {
-                    lastInputModified = currentModified;
-                    handleInputChange();
+            // Add small delay for clipboard operations on work computers
+            try {
+                Thread.sleep(200);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            
+            response = readFromClipboard();
+            attempts++;
+            
+            log("Clipboard read attempt " + attempts + ": " + 
+                (response == null ? "null" : response.length() + " chars"));
+            
+            if (response == null || response.trim().isEmpty()) {
+                String msg = "Clipboard appears empty or inaccessible. Make sure you've copied the response text.";
+                System.out.println(ANSI_RED + msg + ANSI_RESET);
+                log("Clipboard empty on attempt " + attempts);
+                if (attempts < maxAttempts) {
+                    System.out.println(ANSI_GOLD + "Try copying the text again, then press Enter..." + ANSI_RESET);
                 }
+            } else {
+                String msg = "Successfully read " + response.length() + " characters from clipboard.";
+                System.out.println(ANSI_GOLD + msg + ANSI_RESET);
+                log("Clipboard read successful: " + response.length() + " chars");
             }
         }
+        
+        if (response == null || response.trim().isEmpty()) {
+            System.out.println(ANSI_RED + "Failed to read clipboard after " + maxAttempts + " attempts. Skipping this response." + ANSI_RESET);
+        }
+        
+        return response;
     }
 
-    private static void handleInputChange() throws IOException {
-        try {
-            String input = new String(Files.readAllBytes(Paths.get(INPUT_FILE))).trim();
-            
-            if (input.isEmpty() || input.equals("Loading...") || input.equals("Processing completed!")) {
-                return;
-            }
-            
-            // Add user message
-            Message userMessage = new Message("user", input);
-            conversation.add(userMessage);
-            saveMessage(userMessage);
-            
-            // Update input file
-            Files.write(Paths.get(INPUT_FILE), "Loading...".getBytes());
-            
-            // Generate and copy prompt
-            String prompt = generatePrompt();
-            copyToClipboard(prompt);
-            
-            displayConversation();
-            System.out.println(ANSI_GOLD + "Prompt copied to clipboard! Paste the response and hit Enter..." + ANSI_RESET);
-            
-            // Wait for user to hit enter with retry loop
-            Scanner scanner = new Scanner(System.in);
-            String response = null;
-            int attempts = 0;
-            int maxAttempts = 5;
-            
-            while (response == null && attempts < maxAttempts) {
-                if (attempts > 0) {
-                    System.out.println(ANSI_GOLD + "Attempt " + (attempts + 1) + "/" + maxAttempts + ". Press Enter when ready..." + ANSI_RESET);
-                }
-                scanner.nextLine();
-                
-                // Add small delay for clipboard operations on work computers
-                try {
-                    Thread.sleep(200);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
-                
-                response = readFromClipboard();
-                attempts++;
-                
-                log("Clipboard read attempt " + attempts + ": " + 
-                    (response == null ? "null" : response.length() + " chars"));
-                
-                if (response == null || response.trim().isEmpty()) {
-                    String msg = "Clipboard appears empty or inaccessible. Make sure you've copied the response text.";
-                    System.out.println(ANSI_RED + msg + ANSI_RESET);
-                    log("Clipboard empty on attempt " + attempts);
-                    if (attempts < maxAttempts) {
-                        System.out.println(ANSI_GOLD + "Try copying the text again, then press Enter..." + ANSI_RESET);
-                    }
-                } else {
-                    String msg = "Successfully read " + response.length() + " characters from clipboard.";
-                    System.out.println(ANSI_GOLD + msg + ANSI_RESET);
-                    log("Clipboard read successful: " + response.length() + " chars");
-                }
-            }
-            
-            if (response != null && !response.trim().isEmpty()) {
-                Message assistantMessage = new Message("assistant", response.trim());
-                conversation.add(assistantMessage);
-                saveMessage(assistantMessage);
-                
-                displayConversation();
-                Files.write(Paths.get(INPUT_FILE), "Processing completed!".getBytes());
-                System.out.println(ANSI_GOLD + "Watching for changes to " + INPUT_FILE + "..." + ANSI_RESET);
-            } else {
-                System.out.println(ANSI_RED + "Failed to read clipboard after " + maxAttempts + " attempts. Skipping this response." + ANSI_RESET);
-                Files.write(Paths.get(INPUT_FILE), "Processing completed!".getBytes());
-            }
-            
-        } catch (Exception e) {
-            log("Error processing input: " + e.getMessage());
-            System.out.println(ANSI_RED + "Error processing input: " + e.getMessage() + ANSI_RESET);
-            Files.write(Paths.get(INPUT_FILE), "Processing completed!".getBytes());
-        }
-    }
 
     private static String generatePrompt() {
         StringBuilder prompt = new StringBuilder();
