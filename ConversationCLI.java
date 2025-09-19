@@ -11,6 +11,7 @@ import java.util.concurrent.TimeUnit;
 public class ConversationCLI {
     private static final String CONVERSATION_FILE = ".agent/conversation.txt";
     private static final String INPUT_FILE = "input.md";
+    private static final String LOG_FILE = ".agent/debug.log";
     private static final String ANSI_RESET = "\u001B[0m";
     private static final String ANSI_GRAY = "\u001B[90m";
     private static final String ANSI_GOLD = "\u001B[33m";
@@ -26,6 +27,7 @@ public class ConversationCLI {
     public static void main(String[] args) {
         try {
             initializeFiles();
+            log("Application started");
             loadConversation();
             displayConversation();
             
@@ -35,6 +37,7 @@ public class ConversationCLI {
             
             watchInputFile();
         } catch (Exception e) {
+            log("Fatal error: " + e.getMessage());
             System.err.println("Error: " + e.getMessage());
             e.printStackTrace();
         }
@@ -182,11 +185,45 @@ public class ConversationCLI {
             displayConversation();
             System.out.println(ANSI_GOLD + "Prompt copied to clipboard! Paste the response and hit Enter..." + ANSI_RESET);
             
-            // Wait for user to hit enter
-            new Scanner(System.in).nextLine();
+            // Wait for user to hit enter with retry loop
+            Scanner scanner = new Scanner(System.in);
+            String response = null;
+            int attempts = 0;
+            int maxAttempts = 5;
             
-            // Read response from clipboard
-            String response = readFromClipboard();
+            while (response == null && attempts < maxAttempts) {
+                if (attempts > 0) {
+                    System.out.println(ANSI_GOLD + "Attempt " + (attempts + 1) + "/" + maxAttempts + ". Press Enter when ready..." + ANSI_RESET);
+                }
+                scanner.nextLine();
+                
+                // Add small delay for clipboard operations on work computers
+                try {
+                    Thread.sleep(200);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                
+                response = readFromClipboard();
+                attempts++;
+                
+                log("Clipboard read attempt " + attempts + ": " + 
+                    (response == null ? "null" : response.length() + " chars"));
+                
+                if (response == null || response.trim().isEmpty()) {
+                    String msg = "Clipboard appears empty or inaccessible. Make sure you've copied the response text.";
+                    System.out.println(ANSI_RED + msg + ANSI_RESET);
+                    log("Clipboard empty on attempt " + attempts);
+                    if (attempts < maxAttempts) {
+                        System.out.println(ANSI_GOLD + "Try copying the text again, then press Enter..." + ANSI_RESET);
+                    }
+                } else {
+                    String msg = "Successfully read " + response.length() + " characters from clipboard.";
+                    System.out.println(ANSI_GOLD + msg + ANSI_RESET);
+                    log("Clipboard read successful: " + response.length() + " chars");
+                }
+            }
+            
             if (response != null && !response.trim().isEmpty()) {
                 Message assistantMessage = new Message("assistant", response.trim());
                 conversation.add(assistantMessage);
@@ -196,11 +233,12 @@ public class ConversationCLI {
                 Files.write(Paths.get(INPUT_FILE), "Processing completed!".getBytes());
                 System.out.println(ANSI_GOLD + "Watching for changes to " + INPUT_FILE + "..." + ANSI_RESET);
             } else {
-                System.out.println(ANSI_RED + "Error: Clipboard is empty. Please try again." + ANSI_RESET);
+                System.out.println(ANSI_RED + "Failed to read clipboard after " + maxAttempts + " attempts. Skipping this response." + ANSI_RESET);
                 Files.write(Paths.get(INPUT_FILE), "Processing completed!".getBytes());
             }
             
         } catch (Exception e) {
+            log("Error processing input: " + e.getMessage());
             System.out.println(ANSI_RED + "Error processing input: " + e.getMessage() + ANSI_RESET);
             Files.write(Paths.get(INPUT_FILE), "Processing completed!".getBytes());
         }
@@ -232,13 +270,28 @@ public class ConversationCLI {
 
     private static String readFromClipboard() {
         try {
+            log("Attempting to read clipboard...");
             Clipboard clipboard = Toolkit.getDefaultToolkit().getSystemClipboard();
             Transferable contents = clipboard.getContents(null);
-            if (contents != null && contents.isDataFlavorSupported(DataFlavor.stringFlavor)) {
-                return (String) contents.getTransferData(DataFlavor.stringFlavor);
+            
+            if (contents == null) {
+                log("Clipboard contents are null");
+                return null;
             }
+            
+            if (!contents.isDataFlavorSupported(DataFlavor.stringFlavor)) {
+                log("Clipboard does not support string data flavor");
+                return null;
+            }
+            
+            String result = (String) contents.getTransferData(DataFlavor.stringFlavor);
+            log("Clipboard read successful, content length: " + (result != null ? result.length() : "null"));
+            return result;
+            
         } catch (Exception e) {
-            System.out.println(ANSI_RED + "Error reading clipboard: " + e.getMessage() + ANSI_RESET);
+            String errorMsg = "Error reading clipboard: " + e.getMessage();
+            log(errorMsg);
+            System.out.println(ANSI_RED + errorMsg + ANSI_RESET);
         }
         return null;
     }
@@ -246,6 +299,17 @@ public class ConversationCLI {
     private static void saveMessage(Message message) throws IOException {
         String record = message.role + FIELD_SEP + message.content + RECORD_SEP;
         Files.write(Paths.get(CONVERSATION_FILE), record.getBytes(), StandardOpenOption.APPEND, StandardOpenOption.CREATE);
+    }
+
+    private static void log(String message) {
+        try {
+            String timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS"));
+            String logEntry = "[" + timestamp + "] " + message + "\n";
+            Files.write(Paths.get(LOG_FILE), logEntry.getBytes(), 
+                       StandardOpenOption.APPEND, StandardOpenOption.CREATE);
+        } catch (IOException e) {
+            System.err.println("Failed to write to log file: " + e.getMessage());
+        }
     }
 
     private static class Message {
