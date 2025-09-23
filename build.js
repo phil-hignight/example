@@ -10,12 +10,18 @@ const SCRIPT_DIR = __dirname;
 const BUNDLE_FILE = path.join(SCRIPT_DIR, 'bundle.txt');
 const DELIMITER = '|~|~|~|~|~|~|~|~|~|~|~|';
 
+// Check for run-only mode
+const RUN_ONLY = process.argv.includes('r');
+
 console.log('=== Manual Coding Agent Build Script ===');
 console.log('');
 
 console.log(`Execution directory (Java app working dir): ${EXECUTION_DIR}`);
 console.log(`Script directory (extraction/compilation): ${SCRIPT_DIR}`);
 console.log(`Bundle file: ${BUNDLE_FILE}`);
+if (RUN_ONLY) {
+    console.log('Mode: Run-only (skipping extraction and compilation)');
+}
 console.log('');
 
 // Check if script directory exists
@@ -24,15 +30,20 @@ if (!fs.existsSync(SCRIPT_DIR)) {
     process.exit(1);
 }
 
-// Check if bundle file exists
-if (!fs.existsSync(BUNDLE_FILE)) {
+// Only check bundle file if we're not in run-only mode
+if (!RUN_ONLY && !fs.existsSync(BUNDLE_FILE)) {
     console.error(`ERROR: Bundle file not found: ${BUNDLE_FILE}`);
     console.error('Please ensure bundle.txt is in the same directory as build.js');
     process.exit(1);
 }
 
-console.log('[1/5] Unbundling Java files to script directory...');
-process.chdir(SCRIPT_DIR);
+// Skip extraction and compilation if in run-only mode
+if (RUN_ONLY) {
+    console.log('Skipping extraction and compilation - running existing classes...');
+    process.chdir(SCRIPT_DIR);
+} else {
+    console.log('[1/5] Unbundling Java files to script directory...');
+    process.chdir(SCRIPT_DIR);
 
 try {
     // Read bundle file
@@ -133,6 +144,7 @@ if (!fs.existsSync('ConversationCLI.class')) {
     console.error('ERROR: ConversationCLI.class not found after compilation!');
     process.exit(1);
 }
+} // End of extraction and compilation block
 
 console.log('[5/5] Starting ConversationCLI...');
 console.log('');
