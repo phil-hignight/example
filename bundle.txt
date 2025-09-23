@@ -434,6 +434,7 @@ public class ConversationCLI {
     
     private static Scanner scanner = new Scanner(System.in);
     private static String workingDirectory = "."; // Default to current directory
+    private static java.util.List<ConversationManager.Message> temporaryMessages = new java.util.ArrayList<>();
 
     public static void main(String[] args) {
         try {
@@ -449,6 +450,7 @@ public class ConversationCLI {
             initializeManagers();
             initializeFiles();
             log("Application started");
+            logDisplayInformation();
             
             systemTrayManager.setupSystemTray();
             conversationManager.loadConversation();
@@ -501,7 +503,10 @@ public class ConversationCLI {
         
         while (true) {
             try {
-                displayManager.displayConversation(conversationManager.getConversation());
+                // Combine conversation with temporary messages for display
+                java.util.List<ConversationManager.Message> displayConversation = new java.util.ArrayList<>(conversationManager.getConversation());
+                displayConversation.addAll(temporaryMessages);
+                displayManager.displayConversation(displayConversation);
                 
                 if (needsPromptCopy) {
                     displayManager.showStatusMessage("Last conversation was incomplete. Press Enter to copy prompt to clipboard...");
@@ -571,6 +576,15 @@ public class ConversationCLI {
                     handleCopyJSCommand();
                     continue;
                 }
+                
+                // Check for mousecapture command
+                if (userInput.toLowerCase().equals("mousecapture")) {
+                    handleMouseCaptureCommand();
+                    continue;
+                }
+                
+                // Clear temporary messages when conversation continues
+                clearTemporaryMessages();
                 
                 // Add user message
                 ConversationManager.Message userMessage = new ConversationManager.Message("user", userInput);
@@ -829,10 +843,10 @@ public class ConversationCLI {
     
     private static void handleMouseToCommand(String command) {
         try {
-            // Parse command: "mouseto 500 300"
+            // Parse command: "mouseto 500 300" (supports negative coordinates)
             String[] parts = command.trim().split("\\s+");
             if (parts.length != 3) {
-                System.out.println(DisplayManager.ANSI_RED + "Usage: mouseto <x> <y>" + DisplayManager.ANSI_RESET);
+                System.out.println(DisplayManager.ANSI_RED + "Usage: mouseto <x> <y> (negative coordinates supported)" + DisplayManager.ANSI_RESET);
                 return;
             }
             
@@ -841,14 +855,17 @@ public class ConversationCLI {
             
             // Move mouse to coordinates
             ClipboardManager.moveMouseTo(x, y);
-            System.out.println(DisplayManager.ANSI_GREEN + "Mouse moved to (" + x + ", " + y + ")" + DisplayManager.ANSI_RESET);
+            String message = "Mouse moved to (" + x + ", " + y + ")";
+            addTemporaryMessage("system", message);
             log("Mouse moved to coordinates: " + x + ", " + y);
             
         } catch (NumberFormatException e) {
-            System.out.println(DisplayManager.ANSI_RED + "Invalid coordinates. Usage: mouseto <x> <y>" + DisplayManager.ANSI_RESET);
+            String errorMsg = "Invalid coordinates. Usage: mouseto <x> <y> (negative coordinates supported)";
+            addTemporaryMessage("system", errorMsg);
             log("Invalid mouseto command: " + command);
         } catch (Exception e) {
-            System.out.println(DisplayManager.ANSI_RED + "Error moving mouse: " + e.getMessage() + DisplayManager.ANSI_RESET);
+            String errorMsg = "Error moving mouse: " + e.getMessage();
+            addTemporaryMessage("system", errorMsg);
             log("Error in mouseto command: " + e.getMessage());
         }
     }
@@ -857,12 +874,98 @@ public class ConversationCLI {
         try {
             String bridgeJS = BridgeScript.getBridgeJS();
             ClipboardManager.copyToClipboard(bridgeJS);
-            System.out.println(DisplayManager.ANSI_GREEN + "Bridge button script copied to clipboard! (" + bridgeJS.length() + " chars)" + DisplayManager.ANSI_RESET);
+            String message = "Bridge button script copied to clipboard! (" + bridgeJS.length() + " chars)";
+            addTemporaryMessage("system", message);
             log("Bridge button script copied to clipboard: " + bridgeJS.length() + " characters");
         } catch (Exception e) {
-            System.out.println(DisplayManager.ANSI_RED + "Error copying bridge script: " + e.getMessage() + DisplayManager.ANSI_RESET);
+            String errorMsg = "Error copying bridge script: " + e.getMessage();
+            addTemporaryMessage("system", errorMsg);
             log("Error in copyjs command: " + e.getMessage());
         }
+    }
+    
+    private static void handleMouseCaptureCommand() {
+        try {
+            addTemporaryMessage("system", "Mouse capture starting... Move your mouse and wait 10 seconds...");
+            log("Mouse capture command initiated");
+            
+            // Wait 10 seconds
+            Thread.sleep(10000);
+            
+            // Get current mouse position
+            java.awt.Point mousePos = java.awt.MouseInfo.getPointerInfo().getLocation();
+            
+            String captureMsg = "Mouse captured at: (" + mousePos.x + ", " + mousePos.y + ")";
+            addTemporaryMessage("system", captureMsg);
+            log("Mouse captured at coordinates: " + mousePos.x + ", " + mousePos.y);
+            
+        } catch (InterruptedException e) {
+            String errorMsg = "Mouse capture interrupted";
+            addTemporaryMessage("system", errorMsg);
+            log("Mouse capture interrupted: " + e.getMessage());
+            Thread.currentThread().interrupt();
+        } catch (Exception e) {
+            String errorMsg = "Error capturing mouse position: " + e.getMessage();
+            addTemporaryMessage("system", errorMsg);
+            log("Error in mousecapture command: " + e.getMessage());
+        }
+    }
+    
+    private static void logDisplayInformation() {
+        try {
+            java.awt.GraphicsEnvironment ge = java.awt.GraphicsEnvironment.getLocalGraphicsEnvironment();
+            java.awt.GraphicsDevice[] devices = ge.getScreenDevices();
+            
+            log("Display Information:");
+            log("Number of displays: " + devices.length);
+            
+            for (int i = 0; i < devices.length; i++) {
+                java.awt.GraphicsDevice device = devices[i];
+                java.awt.GraphicsConfiguration config = device.getDefaultConfiguration();
+                java.awt.Rectangle bounds = config.getBounds();
+                
+                log("Display " + (i + 1) + ":");
+                log("  ID: " + device.getIDstring());
+                log("  Bounds: x=" + bounds.x + ", y=" + bounds.y + 
+                    ", width=" + bounds.width + ", height=" + bounds.height);
+                log("  Top-left: (" + bounds.x + ", " + bounds.y + ")");
+                log("  Top-right: (" + (bounds.x + bounds.width - 1) + ", " + bounds.y + ")");
+                log("  Bottom-left: (" + bounds.x + ", " + (bounds.y + bounds.height - 1) + ")");
+                log("  Bottom-right: (" + (bounds.x + bounds.width - 1) + ", " + (bounds.y + bounds.height - 1) + ")");
+                
+                if (device == ge.getDefaultScreenDevice()) {
+                    log("  [Primary Display]");
+                }
+            }
+            
+            // Also get mouse position
+            java.awt.Point mousePos = java.awt.MouseInfo.getPointerInfo().getLocation();
+            log("Current mouse position: (" + mousePos.x + ", " + mousePos.y + ")");
+            
+        } catch (Exception e) {
+            log("Error getting display information: " + e.getMessage());
+        }
+    }
+    
+    private static void addTemporaryMessage(String role, String content) {
+        temporaryMessages.add(new ConversationManager.Message(role, content));
+        // Refresh display to show the new temporary message immediately
+        refreshDisplay();
+    }
+    
+    private static void refreshDisplay() {
+        try {
+            // Combine conversation with temporary messages for display
+            java.util.List<ConversationManager.Message> displayConversation = new java.util.ArrayList<>(conversationManager.getConversation());
+            displayConversation.addAll(temporaryMessages);
+            displayManager.displayConversation(displayConversation);
+        } catch (Exception e) {
+            log("Error refreshing display: " + e.getMessage());
+        }
+    }
+    
+    private static void clearTemporaryMessages() {
+        temporaryMessages.clear();
     }
     
     private static void log(String message) {
@@ -3210,12 +3313,18 @@ const SCRIPT_DIR = __dirname;
 const BUNDLE_FILE = path.join(SCRIPT_DIR, 'bundle.txt');
 const DELIMITER = '|~|~|~|~|~|~|~|~|~|~|~|';
 
+// Check for run-only mode
+const RUN_ONLY = process.argv.includes('r');
+
 console.log('=== Manual Coding Agent Build Script ===');
 console.log('');
 
 console.log(`Execution directory (Java app working dir): ${EXECUTION_DIR}`);
 console.log(`Script directory (extraction/compilation): ${SCRIPT_DIR}`);
 console.log(`Bundle file: ${BUNDLE_FILE}`);
+if (RUN_ONLY) {
+    console.log('Mode: Run-only (skipping extraction and compilation)');
+}
 console.log('');
 
 // Check if script directory exists
@@ -3224,15 +3333,20 @@ if (!fs.existsSync(SCRIPT_DIR)) {
     process.exit(1);
 }
 
-// Check if bundle file exists
-if (!fs.existsSync(BUNDLE_FILE)) {
+// Only check bundle file if we're not in run-only mode
+if (!RUN_ONLY && !fs.existsSync(BUNDLE_FILE)) {
     console.error(`ERROR: Bundle file not found: ${BUNDLE_FILE}`);
     console.error('Please ensure bundle.txt is in the same directory as build.js');
     process.exit(1);
 }
 
-console.log('[1/5] Unbundling Java files to script directory...');
-process.chdir(SCRIPT_DIR);
+// Skip extraction and compilation if in run-only mode
+if (RUN_ONLY) {
+    console.log('Skipping extraction and compilation - running existing classes...');
+    process.chdir(SCRIPT_DIR);
+} else {
+    console.log('[1/5] Unbundling Java files to script directory...');
+    process.chdir(SCRIPT_DIR);
 
 try {
     // Read bundle file
@@ -3333,6 +3447,7 @@ if (!fs.existsSync('ConversationCLI.class')) {
     console.error('ERROR: ConversationCLI.class not found after compilation!');
     process.exit(1);
 }
+} // End of extraction and compilation block
 
 console.log('[5/5] Starting ConversationCLI...');
 console.log('');
