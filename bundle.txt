@@ -366,9 +366,9 @@ public class ConfigManager {
                 throw new IOException("Invalid configuration for automatic mode");
             }
             
-            // Validate coordinates are reasonable
-            if (clickX < 0 || clickY < 0 || clickX > 10000 || clickY > 10000) {
-                String error = "Configuration Error: Click coordinates must be between 0 and 10000. Found clickX=" + clickX + ", clickY=" + clickY;
+            // Validate coordinates are reasonable (allow negative for multi-monitor setups)
+            if (clickX < -10000 || clickY < -10000 || clickX > 10000 || clickY > 10000) {
+                String error = "Configuration Error: Click coordinates must be between -10000 and 10000. Found clickX=" + clickX + ", clickY=" + clickY;
                 log(error);
                 System.err.println(error);
                 throw new IOException("Invalid click coordinates");
