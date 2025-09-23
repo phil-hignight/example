@@ -309,8 +309,8 @@ public class ConfigManager {
                     mode = "manual"; // fallback
                 }
                 
-                // Simple JSON parsing for clickX
-                String clickXPattern = "\"clickX\"\\s*:\\s*(\\d+)";
+                // Simple JSON parsing for clickX (support negative numbers)
+                String clickXPattern = "\"clickX\"\\s*:\\s*(-?\\d+)";
                 java.util.regex.Pattern p4 = java.util.regex.Pattern.compile(clickXPattern);
                 java.util.regex.Matcher m4 = p4.matcher(configContent);
                 if (m4.find()) {
@@ -319,8 +319,8 @@ public class ConfigManager {
                     clickX = 500; // fallback
                 }
                 
-                // Simple JSON parsing for clickY
-                String clickYPattern = "\"clickY\"\\s*:\\s*(\\d+)";
+                // Simple JSON parsing for clickY (support negative numbers)
+                String clickYPattern = "\"clickY\"\\s*:\\s*(-?\\d+)";
                 java.util.regex.Pattern p5 = java.util.regex.Pattern.compile(clickYPattern);
                 java.util.regex.Matcher m5 = p5.matcher(configContent);
                 if (m5.find()) {
@@ -856,16 +856,16 @@ public class ConversationCLI {
             // Move mouse to coordinates
             ClipboardManager.moveMouseTo(x, y);
             String message = "Mouse moved to (" + x + ", " + y + ")";
-            addTemporaryMessage("system", message);
+            addTemporaryMessage("system", message, "command_output");
             log("Mouse moved to coordinates: " + x + ", " + y);
             
         } catch (NumberFormatException e) {
             String errorMsg = "Invalid coordinates. Usage: mouseto <x> <y> (negative coordinates supported)";
-            addTemporaryMessage("system", errorMsg);
+            addTemporaryMessage("system", errorMsg, "command_output");
             log("Invalid mouseto command: " + command);
         } catch (Exception e) {
             String errorMsg = "Error moving mouse: " + e.getMessage();
-            addTemporaryMessage("system", errorMsg);
+            addTemporaryMessage("system", errorMsg, "command_output");
             log("Error in mouseto command: " + e.getMessage());
         }
     }
@@ -875,19 +875,23 @@ public class ConversationCLI {
             String bridgeJS = BridgeScript.getBridgeJS();
             ClipboardManager.copyToClipboard(bridgeJS);
             String message = "Bridge button script copied to clipboard! (" + bridgeJS.length() + " chars)";
-            addTemporaryMessage("system", message);
+            addTemporaryMessage("system", message, "command_output");
             log("Bridge button script copied to clipboard: " + bridgeJS.length() + " characters");
         } catch (Exception e) {
             String errorMsg = "Error copying bridge script: " + e.getMessage();
-            addTemporaryMessage("system", errorMsg);
+            addTemporaryMessage("system", errorMsg, "command_output");
             log("Error in copyjs command: " + e.getMessage());
         }
     }
     
     private static void handleMouseCaptureCommand() {
         try {
-            addTemporaryMessage("system", "Mouse capture starting... Move your mouse and wait 10 seconds...");
+            addTemporaryMessage("system", "Mouse capture starting... Move your mouse and wait 10 seconds...", "command_output");
             log("Mouse capture command initiated");
+            
+            // Show prompt after displaying the start message
+            System.out.print(DisplayManager.ANSI_WHITE + "> " + DisplayManager.ANSI_RESET);
+            System.out.flush();
             
             // Wait 10 seconds
             Thread.sleep(10000);
@@ -896,17 +900,21 @@ public class ConversationCLI {
             java.awt.Point mousePos = java.awt.MouseInfo.getPointerInfo().getLocation();
             
             String captureMsg = "Mouse captured at: (" + mousePos.x + ", " + mousePos.y + ")";
-            addTemporaryMessage("system", captureMsg);
+            addTemporaryMessage("system", captureMsg, "command_output");
             log("Mouse captured at coordinates: " + mousePos.x + ", " + mousePos.y);
+            
+            // Show prompt again after capture
+            System.out.print(DisplayManager.ANSI_WHITE + "> " + DisplayManager.ANSI_RESET);
+            System.out.flush();
             
         } catch (InterruptedException e) {
             String errorMsg = "Mouse capture interrupted";
-            addTemporaryMessage("system", errorMsg);
+            addTemporaryMessage("system", errorMsg, "command_output");
             log("Mouse capture interrupted: " + e.getMessage());
             Thread.currentThread().interrupt();
         } catch (Exception e) {
             String errorMsg = "Error capturing mouse position: " + e.getMessage();
-            addTemporaryMessage("system", errorMsg);
+            addTemporaryMessage("system", errorMsg, "command_output");
             log("Error in mousecapture command: " + e.getMessage());
         }
     }
@@ -947,8 +955,10 @@ public class ConversationCLI {
         }
     }
     
-    private static void addTemporaryMessage(String role, String content) {
-        temporaryMessages.add(new ConversationManager.Message(role, content));
+    private static void addTemporaryMessage(String role, String content, String type) {
+        temporaryMessages.add(new ConversationManager.Message(role, content, type));
+        log("Added temporary message (" + type + "): " + content);
+        log("Temporary messages count: " + temporaryMessages.size());
         // Refresh display to show the new temporary message immediately
         refreshDisplay();
     }
@@ -958,6 +968,7 @@ public class ConversationCLI {
             // Combine conversation with temporary messages for display
             java.util.List<ConversationManager.Message> displayConversation = new java.util.ArrayList<>(conversationManager.getConversation());
             displayConversation.addAll(temporaryMessages);
+            log("Refreshing display with " + displayConversation.size() + " total messages (" + temporaryMessages.size() + " temporary)");
             displayManager.displayConversation(displayConversation);
         } catch (Exception e) {
             log("Error refreshing display: " + e.getMessage());
@@ -1373,10 +1384,18 @@ public class ConversationManager {
     public static class Message {
         public String role;
         public String content;
-
+        public String type; // Message type for different handling
+        
         public Message(String role, String content) {
             this.role = role;
             this.content = content;
+            this.type = "conversation"; // Default type for normal conversation
+        }
+        
+        public Message(String role, String content, String type) {
+            this.role = role;
+            this.content = content;
+            this.type = type;
         }
     }
     
@@ -1752,8 +1771,15 @@ public class DisplayManager {
                     }
                     System.out.println();
                 } else if (msg.role.equals("system")) {
-                    // System tool results are not displayed in terminal conversation
-                    continue;
+                    // Handle different system message types
+                    if ("command_output".equals(msg.type)) {
+                        // Show command output in terminal
+                        System.out.println(ANSI_LIGHT_GREEN + "| " + msg.content + ANSI_RESET);
+                        System.out.println();
+                    } else {
+                        // Other system messages (like tool results) are not displayed in terminal
+                        continue;
+                    }
                 }
             }
             
