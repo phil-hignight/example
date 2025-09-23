@@ -1,0 +1,3355 @@
+FILE: BridgeScript.java
+|~|~|~|~|~|~|~|~|~|~|~|
+import java.io.*;
+import java.nio.file.*;
+
+public class BridgeScript {
+    
+    // Embedded bridge-button.js content
+    private static String BRIDGE_JS_CONTENT = null;
+    
+    public static String getBridgeJS() {
+        if (BRIDGE_JS_CONTENT == null) {
+            loadBridgeJS();
+        }
+        return BRIDGE_JS_CONTENT;
+    }
+    
+    private static void loadBridgeJS() {
+        try {
+            // Try to read from external file first
+            Path jsFile = Paths.get("bridge-button.js");
+            if (Files.exists(jsFile)) {
+                BRIDGE_JS_CONTENT = new String(Files.readAllBytes(jsFile));
+                return;
+            }
+            
+            // Fallback to reading from embedded resource or bundle
+            InputStream is = BridgeScript.class.getResourceAsStream("/bridge-button.js");
+            if (is != null) {
+                BufferedReader reader = new BufferedReader(new InputStreamReader(is));
+                StringBuilder content = new StringBuilder();
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    content.append(line).append("\n");
+                }
+                reader.close();
+                BRIDGE_JS_CONTENT = content.toString();
+                return;
+            }
+            
+            // Final fallback - hardcoded content
+            BRIDGE_JS_CONTENT = getHardcodedBridgeJS();
+            
+        } catch (Exception e) {
+            // If all else fails, use hardcoded version
+            BRIDGE_JS_CONTENT = getHardcodedBridgeJS();
+        }
+    }
+    
+    private static String getHardcodedBridgeJS() {
+        return "// Claude Bridge Script - Button Interface with Clipboard Protocol\\n" +
+               "(function() {\\n" +
+               "    'use strict';\\n" +
+               "    console.log('[Button Bridge] Script not found, using minimal version');\\n" +
+               "    alert('Bridge script loaded from fallback');\\n" +
+               "})();";
+    }
+}
+|~|~|~|~|~|~|~|~|~|~|~|
+
+FILE: ClipboardManager.java
+|~|~|~|~|~|~|~|~|~|~|~|
+import java.awt.*;
+import java.awt.datatransfer.*;
+import java.awt.event.InputEvent;
+import java.util.Scanner;
+
+public class ClipboardManager {
+    private static Scanner scanner = new Scanner(System.in);
+    
+    private static void log(String message) {
+        Logger.log(message);
+    }
+    
+    public static void copyToClipboard(String text) {
+        try {
+            Clipboard clipboard = Toolkit.getDefaultToolkit().getSystemClipboard();
+            StringSelection selection = new StringSelection(text);
+            clipboard.setContents(selection, null);
+            log("Text copied to clipboard: " + text.length() + " characters");
+        } catch (Exception e) {
+            log("Error copying to clipboard: " + e.getMessage());
+            System.err.println("Error copying to clipboard: " + e.getMessage());
+        }
+    }
+    
+    public static String getClipboardContent() {
+        try {
+            Clipboard clipboard = Toolkit.getDefaultToolkit().getSystemClipboard();
+            Transferable contents = clipboard.getContents(null);
+            
+            if (contents != null && contents.isDataFlavorSupported(DataFlavor.stringFlavor)) {
+                return (String) contents.getTransferData(DataFlavor.stringFlavor);
+            }
+        } catch (Exception e) {
+            log("Error reading from clipboard: " + e.getMessage());
+        }
+        return null;
+    }
+    
+    public static String getResponseFromClipboard(String originalPrompt) {
+        while (true) {
+            try {
+                String input = scanner.nextLine().trim();
+                
+                if (input.equalsIgnoreCase("quit")) {
+                    log("Quit requested from clipboard loop");
+                    return "QUIT_REQUESTED";
+                }
+                
+                if (input.equalsIgnoreCase("c")) {
+                    copyToClipboard(originalPrompt);
+                    log("Prompt re-copied to clipboard");
+                    System.out.println(DisplayManager.ANSI_LIGHT_BLUE + "~{ Prompt re-copied to clipboard }~" + DisplayManager.ANSI_RESET);
+                    continue;
+                }
+                
+                String clipboardContent = getClipboardContent();
+                log("Clipboard read: " + (clipboardContent != null ? clipboardContent.length() : 0) + " characters");
+                
+                if (clipboardContent == null || clipboardContent.trim().isEmpty()) {
+                    System.out.println(DisplayManager.ANSI_RED + "Clipboard is empty. Please copy Claude's response and try again." + DisplayManager.ANSI_RESET);
+                    System.out.print(DisplayManager.ANSI_WHITE + "Press Enter when response is copied (or 'c' to copy prompt again): " + DisplayManager.ANSI_RESET);
+                    continue;
+                }
+                
+                // Check if clipboard still contains the original prompt (user hasn't pasted response yet)
+                if (clipboardContent.trim().equals(originalPrompt.trim())) {
+                    System.out.println(DisplayManager.ANSI_RED + "Clipboard still contains the original prompt. Please copy Claude's response." + DisplayManager.ANSI_RESET);
+                    System.out.print(DisplayManager.ANSI_WHITE + "Press Enter when response is copied (or 'c' to copy prompt again): " + DisplayManager.ANSI_RESET);
+                    continue;
+                }
+                
+                return clipboardContent;
+                
+            } catch (Exception e) {
+                log("Error in clipboard interaction: " + e.getMessage());
+                System.out.println(DisplayManager.ANSI_RED + "Error reading clipboard. Please try again." + DisplayManager.ANSI_RESET);
+                System.out.print(DisplayManager.ANSI_WHITE + "Press Enter to retry: " + DisplayManager.ANSI_RESET);
+            }
+        }
+    }
+    
+    public static void clickAtCoordinates(int x, int y) {
+        try {
+            Robot robot = new Robot();
+            robot.mouseMove(x, y);
+            robot.mousePress(InputEvent.BUTTON1_DOWN_MASK);
+            robot.mouseRelease(InputEvent.BUTTON1_DOWN_MASK);
+            log("Clicked at coordinates: " + x + ", " + y);
+        } catch (Exception e) {
+            log("Error clicking at coordinates: " + e.getMessage());
+        }
+    }
+    
+    public static void moveMouseTo(int x, int y) {
+        try {
+            Robot robot = new Robot();
+            robot.mouseMove(x, y);
+            log("Mouse moved to coordinates: " + x + ", " + y);
+        } catch (Exception e) {
+            log("Error moving mouse to coordinates: " + e.getMessage());
+            throw new RuntimeException("Failed to move mouse: " + e.getMessage());
+        }
+    }
+    
+    public static String waitForAutomaticResponse(int clickX, int clickY) {
+        log("Starting automatic response polling");
+        
+        while (true) {
+            try {
+                // Move mouse to coordinates and click
+                clickAtCoordinates(clickX, clickY);
+                
+                // Check clipboard for response with terminator
+                String clipboardContent = getClipboardContent();
+                if (clipboardContent != null && clipboardContent.endsWith("|||||TO JAVA|||||")) {
+                    // Remove terminator and return response
+                    String response = clipboardContent.substring(0, clipboardContent.length() - "|||||TO JAVA|||||".length());
+                    log("Received automatic response: " + response.length() + " characters");
+                    return response;
+                }
+                
+                // Sleep for 1 second, but check mouse position during this time
+                Thread.sleep(1000);
+                
+                // After waiting, check if mouse moved outside the allowed area
+                Point currentMousePos = MouseInfo.getPointerInfo().getLocation();
+                int deltaX = Math.abs(currentMousePos.x - clickX);
+                int deltaY = Math.abs(currentMousePos.y - clickY);
+                
+                if (deltaX > 300 || deltaY > 300) {
+                    log("Mouse moved outside 300px square from click position - canceling auto-clicking");
+                    return "MOUSE_CANCELLED";
+                }
+                
+            } catch (InterruptedException e) {
+                log("Automatic polling interrupted: " + e.getMessage());
+                Thread.currentThread().interrupt();
+                return null;
+            } catch (Exception e) {
+                log("Error in automatic polling: " + e.getMessage());
+                try {
+                    Thread.sleep(1000);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return null;
+                }
+            }
+        }
+    }
+    
+    public static String handleAutoCancelRetry(String originalPrompt, int clickX, int clickY) {
+        System.out.println(DisplayManager.ANSI_RED + "Auto-clicking cancelled (mouse moved too far)" + DisplayManager.ANSI_RESET);
+        System.out.println(DisplayManager.ANSI_GOLD + "Press 'r' to retry auto-clicking or 'a' to abort: " + DisplayManager.ANSI_RESET);
+        
+        while (true) {
+            try {
+                String input = scanner.nextLine().trim().toLowerCase();
+                
+                if (input.equals("r")) {
+                    log("User chose to retry auto-clicking");
+                    System.out.println("Retrying auto-clicking...");
+                    return waitForAutomaticResponse(clickX, clickY);
+                } else if (input.equals("a")) {
+                    log("User chose to abort auto-clicking");
+                    return null;
+                } else {
+                    System.out.println(DisplayManager.ANSI_GOLD + "Invalid input. Press 'r' to retry or 'a' to abort: " + DisplayManager.ANSI_RESET);
+                }
+            } catch (Exception e) {
+                log("Error in cancel retry handler: " + e.getMessage());
+                return null;
+            }
+        }
+    }
+}
+|~|~|~|~|~|~|~|~|~|~|~|
+
+FILE: ConfigManager.java
+|~|~|~|~|~|~|~|~|~|~|~|
+import java.io.*;
+import java.nio.file.*;
+
+public class ConfigManager {
+    private static String getConfigFile() {
+        return Paths.get(ConversationCLI.getWorkingDirectory(), ".agent", "config.json").toString();
+    }
+    
+    private int maxMessageChars = 350000; // Default max message chars
+    private int wrapWidth = 110; // Default wrap width
+    private String mode = "manual"; // Default mode (manual or automatic)
+    private int clickX = 500; // Default click X coordinate for automatic mode
+    private int clickY = 300; // Default click Y coordinate for automatic mode
+    
+    private static void log(String message) {
+        Logger.log(message);
+    }
+    
+    public void loadConfig() throws IOException {
+        Path configPath = Paths.get(getConfigFile());
+        if (!Files.exists(configPath)) {
+            // Ensure .agent directory exists
+            Path agentDir = configPath.getParent();
+            if (!Files.exists(agentDir)) {
+                Files.createDirectories(agentDir);
+            }
+            
+            // Create default config
+            String defaultConfig = "{\"maxMessageChars\": 350000, \"wrapWidth\": 110, \"mode\": \"manual\", \"clickX\": 500, \"clickY\": 300}";
+            Files.write(configPath, defaultConfig.getBytes());
+            maxMessageChars = 350000;
+            wrapWidth = 110;
+            mode = "manual";
+            clickX = 500;
+            clickY = 300;
+            log("Created default config file");
+        } else {
+            try {
+                String configContent = new String(Files.readAllBytes(configPath));
+                
+                // Simple JSON parsing for maxMessageChars
+                String maxCharsPattern = "\"maxMessageChars\"\\s*:\\s*(\\d+)";
+                java.util.regex.Pattern p1 = java.util.regex.Pattern.compile(maxCharsPattern);
+                java.util.regex.Matcher m1 = p1.matcher(configContent);
+                if (m1.find()) {
+                    maxMessageChars = Integer.parseInt(m1.group(1));
+                } else {
+                    maxMessageChars = 350000; // fallback
+                }
+                
+                // Simple JSON parsing for wrapWidth
+                String wrapPattern = "\"wrapWidth\"\\s*:\\s*(\\d+)";
+                java.util.regex.Pattern p2 = java.util.regex.Pattern.compile(wrapPattern);
+                java.util.regex.Matcher m2 = p2.matcher(configContent);
+                if (m2.find()) {
+                    wrapWidth = Integer.parseInt(m2.group(1));
+                } else {
+                    wrapWidth = 110; // fallback
+                }
+                
+                // Simple JSON parsing for mode
+                String modePattern = "\"mode\"\\s*:\\s*\"([^\"]+)\"";
+                java.util.regex.Pattern p3 = java.util.regex.Pattern.compile(modePattern);
+                java.util.regex.Matcher m3 = p3.matcher(configContent);
+                if (m3.find()) {
+                    mode = m3.group(1);
+                } else {
+                    mode = "manual"; // fallback
+                }
+                
+                // Simple JSON parsing for clickX
+                String clickXPattern = "\"clickX\"\\s*:\\s*(\\d+)";
+                java.util.regex.Pattern p4 = java.util.regex.Pattern.compile(clickXPattern);
+                java.util.regex.Matcher m4 = p4.matcher(configContent);
+                if (m4.find()) {
+                    clickX = Integer.parseInt(m4.group(1));
+                } else {
+                    clickX = 500; // fallback
+                }
+                
+                // Simple JSON parsing for clickY
+                String clickYPattern = "\"clickY\"\\s*:\\s*(\\d+)";
+                java.util.regex.Pattern p5 = java.util.regex.Pattern.compile(clickYPattern);
+                java.util.regex.Matcher m5 = p5.matcher(configContent);
+                if (m5.find()) {
+                    clickY = Integer.parseInt(m5.group(1));
+                } else {
+                    clickY = 300; // fallback
+                }
+                
+                log("Loaded config: maxMessageChars = " + maxMessageChars + ", wrapWidth = " + wrapWidth + ", mode = " + mode + ", clickX = " + clickX + ", clickY = " + clickY);
+                
+                // Validate configuration
+                validateConfig(configContent);
+                
+            } catch (Exception e) {
+                log("Error loading config, using defaults: " + e.getMessage());
+                maxMessageChars = 350000;
+                wrapWidth = 110;
+                mode = "manual";
+                clickX = 500;
+                clickY = 300;
+            }
+        }
+    }
+    
+    private void validateConfig(String configContent) throws IOException {
+        if (isAutomaticMode()) {
+            // Check if clickX and clickY are explicitly set in the config
+            boolean hasClickX = configContent.contains("\"clickX\"");
+            boolean hasClickY = configContent.contains("\"clickY\"");
+            
+            if (!hasClickX || !hasClickY) {
+                String error = "Configuration Error: Automatic mode requires 'clickX' and 'clickY' coordinates to be set in config.json";
+                log(error);
+                System.err.println(error);
+                System.err.println("Example config.json:");
+                System.err.println("{");
+                System.err.println("  \"maxMessageChars\": 350000,");
+                System.err.println("  \"wrapWidth\": 110,");
+                System.err.println("  \"mode\": \"automatic\",");
+                System.err.println("  \"clickX\": 500,");
+                System.err.println("  \"clickY\": 300");
+                System.err.println("}");
+                throw new IOException("Invalid configuration for automatic mode");
+            }
+            
+            // Validate coordinates are reasonable
+            if (clickX < 0 || clickY < 0 || clickX > 10000 || clickY > 10000) {
+                String error = "Configuration Error: Click coordinates must be between 0 and 10000. Found clickX=" + clickX + ", clickY=" + clickY;
+                log(error);
+                System.err.println(error);
+                throw new IOException("Invalid click coordinates");
+            }
+            
+            log("Automatic mode validated with coordinates: (" + clickX + ", " + clickY + ")");
+        }
+    }
+    
+    public int getMaxMessageChars() {
+        return maxMessageChars;
+    }
+    
+    public int getWrapWidth() {
+        return wrapWidth;
+    }
+    
+    public void setMaxMessageChars(int maxMessageChars) {
+        this.maxMessageChars = maxMessageChars;
+    }
+    
+    public void setWrapWidth(int wrapWidth) {
+        this.wrapWidth = wrapWidth;
+    }
+    
+    public String getMode() {
+        return mode;
+    }
+    
+    public int getClickX() {
+        return clickX;
+    }
+    
+    public int getClickY() {
+        return clickY;
+    }
+    
+    public boolean isAutomaticMode() {
+        return "automatic".equals(mode);
+    }
+}
+|~|~|~|~|~|~|~|~|~|~|~|
+
+FILE: ConversationCLI.java
+|~|~|~|~|~|~|~|~|~|~|~|
+import java.io.*;
+import java.nio.file.*;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+
+public class ConversationCLI {
+    public static String getLogFile() {
+        return Paths.get(workingDirectory, ".agent", "debug.log").toString();
+    }
+    
+    // Manager instances
+    private static ConfigManager configManager;
+    private static ConversationManager conversationManager;
+    private static DisplayManager displayManager;
+    private static SystemTrayManager systemTrayManager;
+    private static PromptGenerator promptGenerator;
+    
+    private static Scanner scanner = new Scanner(System.in);
+    private static String workingDirectory = "."; // Default to current directory
+
+    public static void main(String[] args) {
+        try {
+            // Set working directory if provided as command line argument
+            if (args.length > 0) {
+                workingDirectory = args[0];
+                log("Working directory set to: " + workingDirectory);
+            } else {
+                workingDirectory = System.getProperty("user.dir");
+                log("Using current working directory: " + workingDirectory);
+            }
+            
+            initializeManagers();
+            initializeFiles();
+            log("Application started");
+            
+            systemTrayManager.setupSystemTray();
+            conversationManager.loadConversation();
+            promptGenerator.captureProjectStructure(workingDirectory);
+            
+            // Add shutdown hook for tray cleanup
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                systemTrayManager.cleanup();
+            }));
+            
+            runConversationLoop();
+        } catch (Exception e) {
+            log("Fatal error: " + e.getMessage());
+            System.err.println("Error: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+    
+    private static void initializeManagers() throws IOException {
+        configManager = new ConfigManager();
+        conversationManager = new ConversationManager();
+        displayManager = new DisplayManager();
+        systemTrayManager = new SystemTrayManager();
+        promptGenerator = new PromptGenerator();
+        
+        // Load configuration
+        configManager.loadConfig();
+        
+        // Configure managers with loaded settings
+        conversationManager.setMaxMessageChars(configManager.getMaxMessageChars());
+        displayManager.setWrapWidth(configManager.getWrapWidth());
+    }
+
+    private static void initializeFiles() throws IOException {
+        Path agentDir = Paths.get(workingDirectory, ".agent");
+        if (!Files.exists(agentDir)) {
+            Files.createDirectories(agentDir);
+        }
+        
+        Path conversationPath = Paths.get(workingDirectory, ".agent", "conversation.txt");
+        if (!Files.exists(conversationPath)) {
+            Files.createFile(conversationPath);
+        }
+    }
+
+    private static void runConversationLoop() throws IOException {
+        
+        // Check if last message was user message (incomplete conversation)
+        boolean needsPromptCopy = conversationManager.needsPromptCopy();
+        
+        while (true) {
+            try {
+                displayManager.displayConversation(conversationManager.getConversation());
+                
+                if (needsPromptCopy) {
+                    displayManager.showStatusMessage("Last conversation was incomplete. Press Enter to copy prompt to clipboard...");
+                    scanner.nextLine();
+                    displayManager.clearStatusMessages();
+                    
+                    String prompt = promptGenerator.generatePrompt(conversationManager.getConversation(), conversationManager);
+                    ClipboardManager.copyToClipboard(prompt);
+                    log("Prompt copied to clipboard on restart");
+                    systemTrayManager.updateTrayStatus("Prompt copied - waiting for response");
+                    
+                    displayManager.showStatusMessage("Prompt copied to clipboard! \"c\" to copy again.");
+                    displayManager.showStatusMessage("[ENTER] = copies response on clipboard back to cli");
+                    
+                    String response = ClipboardManager.getResponseFromClipboard(prompt);
+                    
+                    if (response != null && response.equals("QUIT_REQUESTED")) {
+                        System.out.println("Goodbye!");
+                        cleanup();
+                        System.exit(0);
+                    } else if (response != null && !response.trim().isEmpty()) {
+                        boolean shouldContinue = handleAiResponse(response.trim(), prompt);
+                        if (shouldContinue) {
+                            needsPromptCopy = false;
+                            continue;
+                        }
+                        systemTrayManager.updateTrayStatus("Ready");
+                    } else {
+                        systemTrayManager.updateTrayStatus("Ready");
+                    }
+                    
+                    needsPromptCopy = false;
+                    continue;
+                }
+                
+                System.out.print(DisplayManager.ANSI_WHITE + "> " + DisplayManager.ANSI_RESET);
+                
+                String userInput = scanner.nextLine().trim();
+                
+                if (userInput.isEmpty()) {
+                    continue;
+                }
+                
+                if (userInput.equalsIgnoreCase("quit")) {
+                    System.out.println("Goodbye!");
+                    cleanup();
+                    // Force exit if normal exit doesn't work
+                    new Thread(() -> {
+                        try {
+                            Thread.sleep(1000);
+                            Runtime.getRuntime().halt(0);
+                        } catch (InterruptedException ex) {
+                            Runtime.getRuntime().halt(0);
+                        }
+                    }).start();
+                    System.exit(0);
+                }
+                
+                // Check for mouseto command
+                if (userInput.toLowerCase().startsWith("mouseto ")) {
+                    handleMouseToCommand(userInput);
+                    continue;
+                }
+                
+                // Check for copyjs command
+                if (userInput.toLowerCase().equals("copyjs")) {
+                    handleCopyJSCommand();
+                    continue;
+                }
+                
+                // Add user message
+                ConversationManager.Message userMessage = new ConversationManager.Message("user", userInput);
+                conversationManager.addMessage(userMessage);
+                log("User message added: " + userInput.length() + " chars");
+                
+                String response;
+                String lastMessage; // Track what was sent to the AI
+                
+                if (configManager.isAutomaticMode()) {
+                    // Automatic mode: Generate JSON message with terminator
+                    String automaticMessage = promptGenerator.generateAutomaticMessage(conversationManager.getConversation());
+                    ClipboardManager.copyToClipboard(automaticMessage);
+                    log("Automatic message copied to clipboard");
+                    lastMessage = automaticMessage;
+                    
+                    // Show loading message and wait for automatic response
+                    displayManager.showLoadingMessage();
+                    response = ClipboardManager.waitForAutomaticResponse(configManager.getClickX(), configManager.getClickY());
+                    
+                    // Handle mouse cancellation with loop until valid response or abort
+                    while (response != null && response.equals("MOUSE_CANCELLED")) {
+                        response = ClipboardManager.handleAutoCancelRetry(automaticMessage, configManager.getClickX(), configManager.getClickY());
+                    }
+                } else {
+                    // Manual mode: Generate prompt and wait for manual response
+                    String prompt = promptGenerator.generatePrompt(conversationManager.getConversation(), conversationManager);
+                    ClipboardManager.copyToClipboard(prompt);
+                    log("Prompt copied to clipboard");
+                    systemTrayManager.updateTrayStatus("Prompt copied - waiting for response");
+                    lastMessage = prompt;
+                    
+                    displayManager.showStatusMessage("Prompt copied to clipboard! \"c\" to copy again.");
+                    displayManager.showStatusMessage("[ENTER] = copies response on clipboard back to cli");
+                    
+                    // Read response from clipboard with retry
+                    response = ClipboardManager.getResponseFromClipboard(prompt);
+                }
+                
+                if (response == null) {
+                    // User aborted or error occurred, continue to next iteration
+                    continue;
+                }
+                
+                if (response.equals("QUIT_REQUESTED")) {
+                    System.out.println("Goodbye!");
+                    cleanup();
+                    System.exit(0);
+                } else if (response != null && !response.trim().isEmpty()) {
+                    boolean shouldContinue = handleAiResponse(response.trim(), lastMessage);
+                    if (shouldContinue) {
+                        continue;
+                    }
+                    systemTrayManager.updateTrayStatus("Ready");
+                } else {
+                    systemTrayManager.updateTrayStatus("Ready");
+                }
+                
+            } catch (NoSuchElementException e) {
+                // Input stream closed - exit gracefully
+                System.out.println("\nGoodbye!");
+                cleanup();
+                System.exit(0);
+            } catch (Exception e) {
+                log("Error in conversation loop: " + e.getMessage());
+                System.out.println(DisplayManager.ANSI_RED + "Error: " + e.getMessage() + DisplayManager.ANSI_RESET);
+            }
+        }
+    }
+
+    private static boolean handleAiResponse(String response, String lastPrompt) throws IOException {
+        displayManager.clearStatusMessages();
+        
+        ProcessedResponse processed = processAiResponse(response);
+        
+        if (processed.hasToolExecutions) {
+            // Store the raw assistant response (XML with <execute>)
+            ConversationManager.Message assistantMessage = new ConversationManager.Message("assistant", response.trim());
+            conversationManager.addMessage(assistantMessage);
+            log("Assistant response stored: " + response.length() + " chars");
+            
+            // Store system tool results
+            if (!processed.toolResults.trim().isEmpty()) {
+                ConversationManager.Message systemMessage = new ConversationManager.Message("system", processed.toolResults.trim());
+                conversationManager.addMessage(systemMessage);
+                log("System tool results stored: " + processed.toolResults.length() + " chars");
+            }
+            
+            // Tools were executed, generate next prompt automatically
+            log("Tools executed, generating automatic follow-up prompt");
+            
+            String followUpResponse;
+            String lastFollowUpMessage; // Track what was sent to the AI
+            
+            if (configManager.isAutomaticMode()) {
+                // Automatic mode: Generate JSON message with terminator
+                String automaticMessage = promptGenerator.generateAutomaticMessage(conversationManager.getConversation());
+                ClipboardManager.copyToClipboard(automaticMessage);
+                log("Automatic follow-up message copied to clipboard");
+                lastFollowUpMessage = automaticMessage;
+                
+                // Show loading message and wait for automatic response
+                displayManager.showLoadingMessage();
+                followUpResponse = ClipboardManager.waitForAutomaticResponse(configManager.getClickX(), configManager.getClickY());
+            } else {
+                // Manual mode: Generate prompt and wait for manual response
+                String nextPrompt = promptGenerator.generatePrompt(conversationManager.getConversation(), conversationManager);
+                ClipboardManager.copyToClipboard(nextPrompt);
+                log("Automatic follow-up prompt copied to clipboard");
+                systemTrayManager.updateTrayStatus("Follow-up prompt copied - waiting for response");
+                lastFollowUpMessage = nextPrompt;
+                
+                displayManager.showStatusMessage("Follow-up prompt copied to clipboard! \"c\" to copy again.");
+                displayManager.showStatusMessage("[ENTER] = copies response on clipboard back to cli");
+                
+                followUpResponse = ClipboardManager.getResponseFromClipboard(nextPrompt);
+            }
+            
+            if (followUpResponse != null && followUpResponse.equals("QUIT_REQUESTED")) {
+                System.out.println("Goodbye!");
+                cleanup();
+                System.exit(0);
+            } else if (followUpResponse != null && !followUpResponse.trim().isEmpty()) {
+                return handleAiResponse(followUpResponse.trim(), lastFollowUpMessage);
+            }
+            
+            return false;
+        } else if (!processed.finalMessage.isEmpty()) {
+            // Regular assistant message
+            ConversationManager.Message assistantMessage = new ConversationManager.Message("assistant", processed.finalMessage);
+            conversationManager.addMessage(assistantMessage);
+            log("Assistant message added: " + processed.finalMessage.length() + " chars");
+            
+            // Check if summarization is needed
+            conversationManager.checkAndSummarizeIfNeeded(lastPrompt, response);
+        }
+        
+        return false;
+    }
+    
+    private static ProcessedResponse processAiResponse(String response) {
+        ProcessedResponse result = new ProcessedResponse();
+        result.hasToolExecutions = false;
+        result.toolResults = "";
+        result.finalMessage = "";
+        
+        if (response == null || response.trim().isEmpty()) {
+            return result;
+        }
+        
+        try {
+            log("Processing AI response: " + response.substring(0, Math.min(100, response.length())) + "...");
+            
+            // Check if response contains <execute> or <message> at top level
+            String responseContent = response.trim();
+            log("Processing response content directly");
+            
+            // Look for <execute> blocks
+            String executePattern = "<execute>(.*?)</execute>";
+            java.util.regex.Pattern execPattern = java.util.regex.Pattern.compile(executePattern, java.util.regex.Pattern.DOTALL);
+            java.util.regex.Matcher execMatcher = execPattern.matcher(responseContent);
+                
+                StringBuilder toolResults = new StringBuilder();
+                
+                while (execMatcher.find()) {
+                    String executeBlock = execMatcher.group(1).trim();
+                    log("Processing execute block: " + executeBlock.substring(0, Math.min(100, executeBlock.length())) + "...");
+                    String blockResults = processToolBlock(executeBlock);
+                    log("Execute block results: " + blockResults.length() + " chars");
+                    toolResults.append(blockResults).append("\n");
+                    result.hasToolExecutions = true;
+                }
+                
+                result.toolResults = toolResults.toString();
+                log("Tool executions found: " + result.hasToolExecutions);
+                
+            // Look for <message> content
+            String messagePattern = "<message>(.*?)</message>";
+            java.util.regex.Pattern msgPattern = java.util.regex.Pattern.compile(messagePattern, java.util.regex.Pattern.DOTALL);
+            java.util.regex.Matcher msgMatcher = msgPattern.matcher(responseContent);
+            
+            if (msgMatcher.find()) {
+                result.finalMessage = msgMatcher.group(1).trim();
+                log("Found final message: " + result.finalMessage.substring(0, Math.min(50, result.finalMessage.length())) + "...");
+            } else if (!result.hasToolExecutions) {
+                // No tools and no message tags - treat entire response as message
+                result.finalMessage = responseContent;
+                log("No tools or message tags found, using entire response content");
+            } else {
+                // Tools executed but no message found - this is expected
+                result.finalMessage = "";
+                log("Tools executed, no message content (expected)");
+            }
+            
+        } catch (Exception e) {
+            log("Error processing AI response: " + e.getMessage());
+            result.finalMessage = response.trim();
+        }
+        
+        return result;
+    }
+    
+    private static String processToolBlock(String executeBlock) {
+        StringBuilder results = new StringBuilder();
+        
+        try {
+            String toolPattern = "<tool name=\"([^\"]+)\">(.*?)</tool>";
+            java.util.regex.Pattern p = java.util.regex.Pattern.compile(toolPattern, java.util.regex.Pattern.DOTALL);
+            java.util.regex.Matcher m = p.matcher(executeBlock);
+            
+            while (m.find()) {
+                String toolName = m.group(1);
+                String toolParams = m.group(2);
+                
+                log("Executing tool: " + toolName);
+                
+                // Extract main parameter for display
+                String mainParam = extractMainParameter(toolName, toolParams);
+                
+                // Display tool execution in green format (real-time only)
+                displayManager.displayToolExecution(toolName, mainParam);
+                
+                ToolExecutor.ToolExecutionResult toolExecResult = ToolExecutor.executeToolWithSummary(toolName, toolParams);
+                log("Tool " + toolName + " result: " + toolExecResult.fullResult.length() + " chars");
+                
+                // Display tool result summary (real-time only)
+                displayManager.displayToolResult(toolExecResult.summary);
+                
+                // Still collect results for prompt generation with clean format
+                if (!toolExecResult.fullResult.isEmpty()) {
+                    results.append("## Tool: ").append(toolName).append("\n");
+                    results.append(toolExecResult.summary).append("\n");
+                    
+                    // Add clean content without DISPLAY_INFO, wrapped in contents tags
+                    String cleanContent = cleanDisplayInfo(toolExecResult.fullResult);
+                    if (!cleanContent.trim().isEmpty()) {
+                        results.append("<contents>\n");
+                        results.append(cleanContent);
+                        results.append("\n</contents>");
+                    }
+                    results.append("\n\n");
+                }
+            }
+            
+        } catch (Exception e) {
+            log("Error processing tool block: " + e.getMessage());
+            results.append("Error processing tools: ").append(e.getMessage()).append("\n");
+        }
+        
+        return results.toString();
+    }
+    
+    private static void cleanup() {
+        systemTrayManager.cleanup();
+    }
+    
+    private static void handleMouseToCommand(String command) {
+        try {
+            // Parse command: "mouseto 500 300"
+            String[] parts = command.trim().split("\\s+");
+            if (parts.length != 3) {
+                System.out.println(DisplayManager.ANSI_RED + "Usage: mouseto <x> <y>" + DisplayManager.ANSI_RESET);
+                return;
+            }
+            
+            int x = Integer.parseInt(parts[1]);
+            int y = Integer.parseInt(parts[2]);
+            
+            // Move mouse to coordinates
+            ClipboardManager.moveMouseTo(x, y);
+            System.out.println(DisplayManager.ANSI_GREEN + "Mouse moved to (" + x + ", " + y + ")" + DisplayManager.ANSI_RESET);
+            log("Mouse moved to coordinates: " + x + ", " + y);
+            
+        } catch (NumberFormatException e) {
+            System.out.println(DisplayManager.ANSI_RED + "Invalid coordinates. Usage: mouseto <x> <y>" + DisplayManager.ANSI_RESET);
+            log("Invalid mouseto command: " + command);
+        } catch (Exception e) {
+            System.out.println(DisplayManager.ANSI_RED + "Error moving mouse: " + e.getMessage() + DisplayManager.ANSI_RESET);
+            log("Error in mouseto command: " + e.getMessage());
+        }
+    }
+    
+    private static void handleCopyJSCommand() {
+        try {
+            String bridgeJS = BridgeScript.getBridgeJS();
+            ClipboardManager.copyToClipboard(bridgeJS);
+            System.out.println(DisplayManager.ANSI_GREEN + "Bridge button script copied to clipboard! (" + bridgeJS.length() + " chars)" + DisplayManager.ANSI_RESET);
+            log("Bridge button script copied to clipboard: " + bridgeJS.length() + " characters");
+        } catch (Exception e) {
+            System.out.println(DisplayManager.ANSI_RED + "Error copying bridge script: " + e.getMessage() + DisplayManager.ANSI_RESET);
+            log("Error in copyjs command: " + e.getMessage());
+        }
+    }
+    
+    private static void log(String message) {
+        Logger.log(message);
+    }
+    
+    public static String getWorkingDirectory() {
+        return workingDirectory;
+    }
+    
+    private static String extractMainParameter(String toolName, String toolParams) {
+        try {
+            String mainParamName = getMainParameterName(toolName);
+            if (mainParamName != null) {
+                String pattern = "<parameter name=\"" + mainParamName + "\">(.*?)</parameter>";
+                java.util.regex.Pattern p = java.util.regex.Pattern.compile(pattern, java.util.regex.Pattern.DOTALL);
+                java.util.regex.Matcher m = p.matcher(toolParams);
+                if (m.find()) {
+                    return m.group(1).trim();
+                }
+            }
+        } catch (Exception e) {
+            log("Error extracting main parameter: " + e.getMessage());
+        }
+        return "";
+    }
+    
+    private static String getMainParameterName(String toolName) {
+        switch (toolName) {
+            case "read_file":
+            case "create_file":
+            case "delete_file":
+                return "file_path";
+            case "move_file":
+                return "source_path";
+            case "list_files":
+            case "list_recursive":
+                return "path";
+            case "create_directory":
+            case "delete_directory_recursive":
+                return "dir_path";
+            case "search_files":
+            case "search_content":
+                return "query";
+            default:
+                return null;
+        }
+    }
+    
+    private static String cleanDisplayInfo(String content) {
+        String[] lines = content.split("\n");
+        if (lines.length > 0 && lines[0].startsWith("DISPLAY_INFO:")) {
+            // Remove the DISPLAY_INFO line
+            StringBuilder cleaned = new StringBuilder();
+            for (int i = 1; i < lines.length; i++) {
+                if (i > 1) cleaned.append("\n");
+                cleaned.append(lines[i]);
+            }
+            return cleaned.toString();
+        }
+        return content;
+    }
+    
+    // INNER CLASSES
+    private static class ProcessedResponse {
+        String finalMessage;
+        boolean hasToolExecutions;
+        String toolResults;
+    }
+}
+|~|~|~|~|~|~|~|~|~|~|~|
+
+FILE: ConversationManager.java
+|~|~|~|~|~|~|~|~|~|~|~|
+import java.io.*;
+import java.nio.file.*;
+import java.util.*;
+
+public class ConversationManager {
+    private static String getConversationFile() {
+        return Paths.get(ConversationCLI.getWorkingDirectory(), ".agent", "conversation.txt").toString();
+    }
+    private static final String FIELD_SEP = "|`|~";
+    private static final String RECORD_SEP = "\n||||||||\n";
+    
+    // Record type definitions - defines expected fields for each record type
+    private static final Map<String, String[]> RECORD_SCHEMAS = new HashMap<>();
+    static {
+        RECORD_SCHEMAS.put("user", new String[]{"content"});
+        RECORD_SCHEMAS.put("assistant", new String[]{"content"});
+        RECORD_SCHEMAS.put("summary", new String[]{"content"});
+        RECORD_SCHEMAS.put("tool_results", new String[]{"tool_name", "lines", "path", "content"});
+    }
+    
+    private List<Message> conversation = new ArrayList<>();
+    private int conversationCharCount = 0;
+    private int maxMessageChars = 200;
+    
+    private static void log(String message) {
+        Logger.log(message);
+    }
+    
+    public void setMaxMessageChars(int maxMessageChars) {
+        this.maxMessageChars = maxMessageChars;
+    }
+    
+    public List<Message> getConversation() {
+        return conversation;
+    }
+    
+    public int getConversationCharCount() {
+        return conversationCharCount;
+    }
+    
+    public void loadConversation() throws IOException {
+        logPaths();
+        
+        Path conversationPath = Paths.get(getConversationFile());
+        if (Files.exists(conversationPath)) {
+            String content = new String(Files.readAllBytes(conversationPath));
+            log("Loading conversation file, content length: " + content.length());
+            if (!content.trim().isEmpty()) {
+                String[] records = content.split(java.util.regex.Pattern.quote(RECORD_SEP));
+                log("Found " + records.length + " records in conversation file");
+                List<Message> allMessages = new ArrayList<>();
+                
+                // Parse all messages using generic parser
+                for (String record : records) {
+                    record = record.trim();
+                    if (!record.isEmpty()) {
+                        ParsedRecord parsed = parseRecord(record);
+                        
+                        if (parsed.type.equals("tool_results")) {
+                            // Reconstruct tool_results content in internal format
+                            String toolName = parsed.get("tool_name");
+                            String lines = parsed.get("lines");
+                            String path = parsed.get("path");
+                            String toolContent = parsed.get("content");
+                            
+                            String internalContent = toolName + FIELD_SEP + lines + FIELD_SEP + path + FIELD_SEP + toolContent;
+                            Message msg = new Message("tool_results", internalContent);
+                            allMessages.add(msg);
+                            log("Loaded tool_results: " + toolName + " (" + toolContent.length() + " chars)");
+                        } else {
+                            // Standard message types
+                            String msgContent = parsed.get("content");
+                            if (!msgContent.isEmpty()) {
+                                Message msg = new Message(parsed.type, msgContent);
+                                allMessages.add(msg);
+                                log("Loaded message: " + parsed.type + " (" + msgContent.length() + " chars)");
+                            } else {
+                                log("Skipping record with empty content: " + parsed.type);
+                            }
+                        }
+                    }
+                }
+                
+                // Work backwards to find the most recent summary
+                int startIndex = 0;
+                for (int i = allMessages.size() - 1; i >= 0; i--) {
+                    if (allMessages.get(i).role.equals("summary")) {
+                        startIndex = i;
+                        break;
+                    }
+                }
+                
+                // Load from the summary onwards (or from beginning if no summary)
+                for (int i = startIndex; i < allMessages.size(); i++) {
+                    conversation.add(allMessages.get(i));
+                }
+                
+                log("Loaded " + conversation.size() + " messages from conversation file");
+                
+                // Calculate current char count
+                conversationCharCount = calculateConversationCharCount();
+            }
+        }
+        
+        // If no conversation exists, add initial greeting
+        if (conversation.isEmpty()) {
+            Message greeting = new Message("assistant", "Hello! How can I help you today?");
+            conversation.add(greeting);
+            saveMessage(greeting);
+            conversationCharCount = calculateConversationCharCount();
+        }
+    }
+    
+    public void saveMessage(Message message) throws IOException {
+        // Convert message to file format based on type
+        String recordContent;
+        
+        if (message.role.equals("tool_results")) {
+            // Parse internal format: "toolname|`|~lines|`|~path|`|~content"
+            String[] parts = message.content.split(java.util.regex.Pattern.quote(FIELD_SEP));
+            if (parts.length >= 4) {
+                String toolName = parts[0];
+                String lines = parts[1];
+                String path = parts[2];
+                String content = parts[3];
+                recordContent = message.role + FIELD_SEP + toolName + FIELD_SEP + lines + FIELD_SEP + path + FIELD_SEP + content;
+            } else {
+                // Fallback for malformed tool_results
+                recordContent = message.role + FIELD_SEP + message.content;
+            }
+        } else {
+            // Standard message types (user, assistant, summary)
+            recordContent = message.role + FIELD_SEP + message.content;
+        }
+        
+        // Write to file
+        Path conversationPath = Paths.get(getConversationFile());
+        String fileContent = recordContent + RECORD_SEP;
+        Files.write(conversationPath, fileContent.getBytes(), StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+        
+        log("Saved message: " + message.role + " (" + message.content.length() + " chars)");
+    }
+    
+    public void addMessage(Message message) throws IOException {
+        conversation.add(message);
+        saveMessage(message);
+        conversationCharCount += message.content.length();
+        log("Added message: " + message.role + " (" + message.content.length() + " chars)");
+    }
+    
+    public void checkAndSummarizeIfNeeded(String lastPrompt, String lastResponse) throws IOException {
+        conversationCharCount = calculateConversationCharCount();
+        
+        if (conversationCharCount > maxMessageChars) {
+            log("Conversation length (" + conversationCharCount + " chars) exceeds limit (" + maxMessageChars + "), creating summary");
+            
+            String summaryPrompt = generateSummarizationPrompt();
+            
+            log("Generated summarization prompt, copying to clipboard");
+            ClipboardManager.copyToClipboard(summaryPrompt);
+            
+            System.out.println("\n" + DisplayManager.ANSI_GOLD + "🔄 Conversation is getting long. A summarization prompt has been copied to clipboard." + DisplayManager.ANSI_RESET);
+            System.out.println(DisplayManager.ANSI_GOLD + "Please paste it into Claude, then copy the summary back here." + DisplayManager.ANSI_RESET);
+            System.out.print("Press Enter when you've copied the summary to clipboard: ");
+            
+            Scanner scanner = new Scanner(System.in);
+            scanner.nextLine();
+            
+            String summary = ClipboardManager.getClipboardContent();
+            if (summary != null && !summary.trim().isEmpty()) {
+                // Remove old messages up to halfway point and replace with summary
+                int halfPoint = conversation.size() / 2;
+                List<Message> newConversation = new ArrayList<>();
+                
+                // Add summary as first message
+                Message summaryMessage = new Message("summary", summary.trim());
+                newConversation.add(summaryMessage);
+                
+                // Add second half of conversation
+                for (int i = halfPoint; i < conversation.size(); i++) {
+                    newConversation.add(conversation.get(i));
+                }
+                
+                // Replace conversation and rewrite file
+                conversation = newConversation;
+                rewriteConversationFile();
+                
+                conversationCharCount = calculateConversationCharCount();
+                log("Summarization complete. New char count: " + conversationCharCount);
+                
+                System.out.println(DisplayManager.ANSI_GOLD + "✅ Conversation summarized successfully." + DisplayManager.ANSI_RESET);
+            } else {
+                log("No summary received from clipboard");
+                System.out.println(DisplayManager.ANSI_RED + "No summary received. Continuing without summarization." + DisplayManager.ANSI_RESET);
+            }
+        }
+    }
+    
+    private void rewriteConversationFile() throws IOException {
+        Path conversationPath = Paths.get(getConversationFile());
+        // Delete and recreate file
+        if (Files.exists(conversationPath)) {
+            Files.delete(conversationPath);
+        }
+        
+        // Save all messages
+        for (Message msg : conversation) {
+            saveMessage(msg);
+        }
+        
+        log("Rewrote conversation file with " + conversation.size() + " messages");
+    }
+    
+    private String generateSummarizationPrompt() {
+        StringBuilder prompt = new StringBuilder();
+        prompt.append("Summarize the following conversation history concisely, preserving key context and decisions. ");
+        prompt.append("Focus on important information that affects future interactions.\n\n");
+        
+        // Add first half of conversation (NO base system prompt or project structure for summarization)
+        int halfPoint = conversation.size() / 2;
+        for (int i = 0; i < halfPoint; i++) {
+            Message msg = conversation.get(i);
+            if (msg.role.equals("assistant")) {
+                prompt.append("[ASSISTANT]\n\n");
+            } else if (msg.role.equals("user")) {
+                prompt.append("[USER]\n\n");
+            } else if (msg.role.equals("summary")) {
+                prompt.append("[SUMMARY]\n\n");
+            }
+            prompt.append(msg.content).append("\n\n");
+        }
+        
+        prompt.append("Please provide a concise summary of the above conversation that captures the essential context and decisions made.");
+        
+        return prompt.toString();
+    }
+    
+    // Generic record parser that uses schema lookup for field definitions
+    private ParsedRecord parseRecord(String recordText) {
+        String[] parts = recordText.split(java.util.regex.Pattern.quote(FIELD_SEP));
+        if (parts.length < 1) {
+            return new ParsedRecord("unknown", new HashMap<>());
+        }
+        
+        String recordType = parts[0];
+        String[] schema = RECORD_SCHEMAS.get(recordType);
+        Map<String, String> fields = new HashMap<>();
+        
+        if (schema != null) {
+            // Use schema to parse fields
+            for (int i = 0; i < schema.length && i + 1 < parts.length; i++) {
+                String fieldName = schema[i];
+                String fieldValue = parts[i + 1];
+                fields.put(fieldName, fieldValue);
+            }
+            
+            // If there are extra parts beyond the schema, join them into the last field
+            if (parts.length > schema.length + 1) {
+                String lastFieldName = schema[schema.length - 1];
+                StringBuilder lastFieldValue = new StringBuilder(fields.get(lastFieldName));
+                for (int i = schema.length + 1; i < parts.length; i++) {
+                    lastFieldValue.append(FIELD_SEP).append(parts[i]);
+                }
+                fields.put(lastFieldName, lastFieldValue.toString());
+            }
+        } else {
+            // Unknown record type - treat as simple content record
+            if (parts.length >= 2) {
+                StringBuilder content = new StringBuilder();
+                for (int i = 1; i < parts.length; i++) {
+                    if (i > 1) content.append(FIELD_SEP);
+                    content.append(parts[i]);
+                }
+                fields.put("content", content.toString());
+            }
+        }
+        
+        return new ParsedRecord(recordType, fields);
+    }
+    
+    public String formatToolResultForPrompt(String toolResultContent) {
+        ParsedRecord record = parseRecord("tool_results" + FIELD_SEP + toolResultContent);
+        
+        String toolName = record.get("tool_name");
+        String lines = record.get("lines");
+        String path = record.get("path");
+        String content = record.get("content");
+        
+        // For prompts, we want the cleaned content without DISPLAY_INFO
+        String cleanContent = content;
+        String[] contentLines = content.split("\n");
+        if (contentLines.length > 0 && contentLines[0].startsWith("DISPLAY_INFO:")) {
+            // Remove the DISPLAY_INFO line
+            StringBuilder cleanBuilder = new StringBuilder();
+            for (int i = 1; i < contentLines.length; i++) {
+                if (i > 1) cleanBuilder.append("\n");
+                cleanBuilder.append(contentLines[i]);
+            }
+            cleanContent = cleanBuilder.toString();
+        }
+        
+        return String.format("[SYSTEM]\n\n## Tool: %s\n%s", toolName, cleanContent);
+    }
+    
+    private void logPaths() {
+        try {
+            String currentDir = System.getProperty("user.dir");
+            log("Current working directory: " + currentDir);
+            log("Conversation file path: " + Paths.get(getConversationFile()).toAbsolutePath());
+            log("Conversation file exists: " + Files.exists(Paths.get(getConversationFile())));
+        } catch (Exception e) {
+            log("Error logging paths: " + e.getMessage());
+        }
+    }
+    
+    private int calculateConversationCharCount() {
+        int total = 0;
+        // Only count actual conversation messages, not the base system prompt
+        // (base prompt is added dynamically to prompts but not stored in conversation)
+        for (Message msg : conversation) {
+            total += msg.content.length();
+        }
+        return total;
+    }
+    
+    public boolean needsPromptCopy() {
+        return !conversation.isEmpty() && conversation.get(conversation.size() - 1).role.equals("user");
+    }
+    
+    // INNER CLASSES
+    public static class Message {
+        public String role;
+        public String content;
+
+        public Message(String role, String content) {
+            this.role = role;
+            this.content = content;
+        }
+    }
+    
+    private static class ParsedRecord {
+        String type;
+        Map<String, String> fields;
+        
+        ParsedRecord(String type, Map<String, String> fields) {
+            this.type = type;
+            this.fields = fields;
+        }
+        
+        String get(String fieldName) {
+            return fields.getOrDefault(fieldName, "");
+        }
+    }
+}
+|~|~|~|~|~|~|~|~|~|~|~|
+
+FILE: DirectoryOperations.java
+|~|~|~|~|~|~|~|~|~|~|~|
+import java.io.*;
+import java.nio.file.*;
+import java.util.*;
+import java.util.stream.Collectors;
+
+public class DirectoryOperations {
+    
+    private static void log(String message) {
+        Logger.log(message);
+    }
+    
+    private static String getWorkingDirectory() {
+        return ConversationCLI.getWorkingDirectory();
+    }
+    
+    private static Path resolvePath(String filePath) {
+        Path path = Paths.get(filePath);
+        if (path.isAbsolute()) {
+            return path;
+        } else {
+            return Paths.get(getWorkingDirectory()).resolve(path);
+        }
+    }
+    
+    public static ToolExecutor.ToolExecutionResult executeCreateDirectoryWithSummary(String toolParams) {
+        try {
+            String dirPath = ToolParameterExtractor.extractParameter(toolParams, "dir_path");
+            
+            if (dirPath == null || dirPath.trim().isEmpty()) {
+                String error = "Error: dir_path parameter is required";
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            Path path = resolvePath(dirPath);
+            
+            Files.createDirectories(path);
+            
+            String fullResult = String.format("Directory: %s\nCreated successfully", dirPath);
+            String summary = String.format("Created directory %s", dirPath);
+            
+            String enhancedResult = "DISPLAY_INFO:0|" + dirPath + "\n" + fullResult;
+            
+            return new ToolExecutor.ToolExecutionResult(enhancedResult, summary);
+            
+        } catch (Exception e) {
+            String error = "Error creating directory: " + e.getMessage();
+            return new ToolExecutor.ToolExecutionResult(error, error);
+        }
+    }
+    
+    public static ToolExecutor.ToolExecutionResult executeDeleteDirectoryWithSummary(String toolParams) {
+        try {
+            String dirPath = ToolParameterExtractor.extractParameter(toolParams, "dir_path");
+            
+            if (dirPath == null || dirPath.trim().isEmpty()) {
+                String error = "Error: dir_path parameter is required";
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            Path path = resolvePath(dirPath);
+            
+            if (!Files.exists(path)) {
+                String error = "Error: Directory not found: " + dirPath;
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            if (!Files.isDirectory(path)) {
+                String error = "Error: Path is not a directory: " + dirPath;
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            Files.walk(path)
+                .sorted((a, b) -> b.compareTo(a))
+                .forEach(p -> {
+                    try {
+                        Files.delete(p);
+                    } catch (Exception e) {
+                        throw new RuntimeException("Failed to delete: " + p, e);
+                    }
+                });
+            
+            String fullResult = String.format("Directory: %s\nDeleted successfully (recursive)", dirPath);
+            String summary = String.format("Deleted directory %s (recursive)", dirPath);
+            
+            String enhancedResult = "DISPLAY_INFO:0|" + dirPath + "\n" + fullResult;
+            
+            return new ToolExecutor.ToolExecutionResult(enhancedResult, summary);
+            
+        } catch (Exception e) {
+            String error = "Error deleting directory: " + e.getMessage();
+            return new ToolExecutor.ToolExecutionResult(error, error);
+        }
+    }
+    
+    public static ToolExecutor.ToolExecutionResult executeListFilesWithSummary(String toolParams) {
+        try {
+            String pathParam = ToolParameterExtractor.extractParameter(toolParams, "path");
+            String targetPath = (pathParam != null && !pathParam.trim().isEmpty()) ? pathParam : getWorkingDirectory();
+            
+            Path path = resolvePath(targetPath);
+            
+            if (!Files.exists(path)) {
+                String error = "Error: Path not found: " + targetPath;
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            if (!Files.isDirectory(path)) {
+                String error = "Error: Path is not a directory: " + targetPath;
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            StringBuilder results = new StringBuilder();
+            int fileCount = 0;
+            int dirCount = 0;
+            
+            try {
+                List<Path> entries = Files.list(path)
+                    .sorted((a, b) -> {
+                        boolean aIsDir = Files.isDirectory(a);
+                        boolean bIsDir = Files.isDirectory(b);
+                        if (aIsDir && !bIsDir) return -1;
+                        if (!aIsDir && bIsDir) return 1;
+                        return a.getFileName().toString().compareToIgnoreCase(b.getFileName().toString());
+                    })
+                    .collect(Collectors.toList());
+                
+                for (Path entry : entries) {
+                    String fileName = entry.getFileName().toString();
+                    if (Files.isDirectory(entry)) {
+                        results.append(String.format("[DIR]  %s/\n", fileName));
+                        dirCount++;
+                    } else {
+                        long fileSize = Files.size(entry);
+                        results.append(String.format("[FILE] %s (%s)\n", fileName, ToolParameterExtractor.formatFileSize(fileSize)));
+                        fileCount++;
+                    }
+                }
+            } catch (Exception e) {
+                String error = "Error listing directory: " + e.getMessage();
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            String fullResult = String.format("Directory listing for: %s\n\n%s\nTotal: %d directories, %d files", 
+                targetPath, results.toString(), dirCount, fileCount);
+            String summary = String.format("Listed %d dirs, %d files in %s", dirCount, fileCount, targetPath);
+            
+            String enhancedResult = "DISPLAY_INFO:" + (dirCount + fileCount) + "|" + targetPath + "\n" + fullResult;
+            return new ToolExecutor.ToolExecutionResult(enhancedResult, summary);
+            
+        } catch (Exception e) {
+            String error = "Error listing files: " + e.getMessage();
+            return new ToolExecutor.ToolExecutionResult(error, error);
+        }
+    }
+    
+    public static ToolExecutor.ToolExecutionResult executeListRecursiveWithSummary(String toolParams) {
+        try {
+            String pathParam = ToolParameterExtractor.extractParameter(toolParams, "path");
+            String targetPath = (pathParam != null && !pathParam.trim().isEmpty()) ? pathParam : getWorkingDirectory();
+            
+            Path path = resolvePath(targetPath);
+            
+            if (!Files.exists(path)) {
+                String error = "Error: Path not found: " + targetPath;
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            if (!Files.isDirectory(path)) {
+                String error = "Error: Path is not a directory: " + targetPath;
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            StringBuilder results = new StringBuilder();
+            int fileCount = 0;
+            int dirCount = 0;
+            
+            try {
+                List<Path> entries = Files.walk(path)
+                    .filter(p -> !p.equals(path))
+                    .sorted()
+                    .collect(Collectors.toList());
+                
+                for (Path entry : entries) {
+                    String relativePath = path.relativize(entry).toString();
+                    if (Files.isDirectory(entry)) {
+                        results.append(String.format("[DIR]  %s/\n", relativePath));
+                        dirCount++;
+                    } else {
+                        long fileSize = Files.size(entry);
+                        results.append(String.format("[FILE] %s (%s)\n", relativePath, ToolParameterExtractor.formatFileSize(fileSize)));
+                        fileCount++;
+                    }
+                }
+            } catch (Exception e) {
+                String error = "Error listing directory recursively: " + e.getMessage();
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            String fullResult = String.format("Recursive listing for: %s\n\n%s\nTotal: %d directories, %d files", 
+                targetPath, results.toString(), dirCount, fileCount);
+            String summary = String.format("Listed %d dirs, %d files recursively in %s", dirCount, fileCount, targetPath);
+            
+            String enhancedResult = "DISPLAY_INFO:" + (dirCount + fileCount) + "|" + targetPath + "\n" + fullResult;
+            return new ToolExecutor.ToolExecutionResult(enhancedResult, summary);
+            
+        } catch (Exception e) {
+            String error = "Error listing files recursively: " + e.getMessage();
+            return new ToolExecutor.ToolExecutionResult(error, error);
+        }
+    }
+}
+|~|~|~|~|~|~|~|~|~|~|~|
+
+FILE: DisplayManager.java
+|~|~|~|~|~|~|~|~|~|~|~|
+import java.util.*;
+
+public class DisplayManager {
+    public static final String ANSI_RESET = "\u001B[0m";
+    public static final String ANSI_GRAY = "\u001B[90m";
+    public static final String ANSI_GOLD = "\u001B[33m";
+    public static final String ANSI_RED = "\u001B[31m";
+    public static final String ANSI_WHITE = "\u001B[37m";
+    public static final String ANSI_CYAN = "\u001B[36m";
+    public static final String ANSI_LIGHT_BLUE = "\u001B[94m";
+    public static final String ANSI_BLUE = "\u001B[34m";
+    public static final String ANSI_DIM = "\u001B[2m";
+    public static final String ANSI_GREEN = "\u001B[32m";
+    public static final String ANSI_LIGHT_GREEN = "\u001B[92m";
+    public static final String ANSI_DARK_GREEN = "\u001B[2;32m";
+    
+    private static final String FIELD_SEP = "|`|~";
+    
+    private int wrapWidth = 100;
+    private int statusMessageCount = 0;
+    
+    private static void log(String message) {
+        Logger.log(message);
+    }
+    
+    public void setWrapWidth(int wrapWidth) {
+        this.wrapWidth = wrapWidth;
+    }
+    
+    public void displayToolExecution(String toolName, String mainParam) {
+        String toolDisplay = toolName.toUpperCase();
+        String paramDisplay = mainParam.isEmpty() ? "" : " " + mainParam;
+        System.out.println(ANSI_GREEN + "  [" + toolDisplay + "]" + paramDisplay + ANSI_RESET);
+    }
+    
+    public void displayToolResult(String summary) {
+        System.out.println(ANSI_DARK_GREEN + "    " + summary + ANSI_RESET);
+    }
+    
+    public void displayToolExecutionsFromXML(String xmlContent) {
+        try {
+            // Extract tool executions from <execute> block and display in green format
+            String toolPattern = "<tool name=\"([^\"]+)\">(.*?)</tool>";
+            java.util.regex.Pattern p = java.util.regex.Pattern.compile(toolPattern, java.util.regex.Pattern.DOTALL);
+            java.util.regex.Matcher m = p.matcher(xmlContent);
+            
+            while (m.find()) {
+                String toolName = m.group(1);
+                String toolParams = m.group(2);
+                
+                // Extract main parameter for display
+                String mainParam = extractMainParameterFromXML(toolName, toolParams);
+                
+                // Display in green format
+                displayToolExecution(toolName, mainParam);
+                
+                // For terminal display, we could add a summary line here if needed
+                // For now, just show the tool execution
+                System.out.println(ANSI_DARK_GREEN + "    Tool executed" + ANSI_RESET);
+            }
+            // Add newline after all tool executions
+            System.out.println();
+        } catch (Exception e) {
+            log("Error displaying tool executions from XML: " + e.getMessage());
+        }
+    }
+    
+    private String extractMainParameterFromXML(String toolName, String toolParams) {
+        try {
+            String mainParamName = getMainParameterName(toolName);
+            if (mainParamName != null) {
+                String pattern = "<parameter name=\"" + mainParamName + "\">(.*?)</parameter>";
+                java.util.regex.Pattern p = java.util.regex.Pattern.compile(pattern, java.util.regex.Pattern.DOTALL);
+                java.util.regex.Matcher m = p.matcher(toolParams);
+                if (m.find()) {
+                    return m.group(1).trim();
+                }
+            }
+        } catch (Exception e) {
+            log("Error extracting main parameter: " + e.getMessage());
+        }
+        return "";
+    }
+    
+    private String getMainParameterName(String toolName) {
+        switch (toolName) {
+            case "read_file":
+            case "create_file":
+            case "delete_file":
+                return "file_path";
+            case "move_file":
+                return "source_path";
+            case "list_files":
+            case "list_recursive":
+                return "path";
+            case "create_directory":
+            case "delete_directory_recursive":
+                return "dir_path";
+            case "search_files":
+            case "search_content":
+                return "query";
+            default:
+                return null;
+        }
+    }
+    
+    public void displayConversation(List<ConversationManager.Message> conversation) {
+        try {
+            // Clear screen and move to top
+            System.out.print("\u001B[2J\u001B[H");
+            
+            System.out.println("=== Conversation ===");
+            System.out.println();
+            
+            for (ConversationManager.Message msg : conversation) {
+                if (msg.role.equals("user")) {
+                    System.out.println(ANSI_GRAY + "> " + msg.content + ANSI_RESET);
+                } else if (msg.role.equals("assistant")) {
+                    // Check if this is an <execute> block or a regular message
+                    if (msg.content.trim().startsWith("<execute>")) {
+                        // Parse and display tool executions in green format
+                        System.out.println();
+                        displayToolExecutionsFromXML(msg.content);
+                    } else {
+                        // Regular assistant message
+                        String[] lines = wrapText(msg.content, wrapWidth);
+                        for (String line : lines) {
+                            System.out.println(ANSI_GOLD + "| " + line + ANSI_RESET);
+                        }
+                        System.out.println();
+                    }
+                } else if (msg.role.equals("summary")) {
+                    System.out.println(ANSI_CYAN + "[SUMMARY]" + ANSI_RESET);
+                    String[] lines = wrapText(msg.content, wrapWidth - 4);
+                    for (String line : lines) {
+                        System.out.println(ANSI_CYAN + "| " + line + ANSI_RESET);
+                    }
+                    System.out.println();
+                } else if (msg.role.equals("system")) {
+                    // System tool results are not displayed in terminal conversation
+                    continue;
+                }
+            }
+            
+        } catch (Exception e) {
+            log("Error displaying conversation: " + e.getMessage());
+            System.err.println("Error displaying conversation: " + e.getMessage());
+        }
+    }
+    
+    public void displayToolResults(String toolResultContent) {
+        // Parse structured format: "toolname|`|~lines|`|~path|`|~content" or old format "toolname|`|~content"
+        String[] parts = toolResultContent.split("\\|`\\|~");
+        if (parts.length < 2) return;
+        
+        String toolName = parts[0];
+        String displayLines = "";
+        String displayPath = "";
+        String content = "";
+        
+        if (parts.length >= 4) {
+            // New structured format: toolname|`|~lines|`|~path|`|~content
+            displayLines = parts[1];
+            displayPath = parts[2];
+            content = parts[3];
+        } else {
+            // Old format: toolname|`|~content - parse DISPLAY_INFO from content
+            content = parts[1];
+            displayLines = "1";
+            displayPath = "unknown";
+            
+            String[] lines = content.split("\n");
+            for (String line : lines) {
+                if (line.startsWith("DISPLAY_INFO:")) {
+                    String displayInfo = line.substring(13);
+                    String[] infoParts = displayInfo.split("\\|");
+                    if (infoParts.length >= 2) {
+                        try {
+                            displayLines = infoParts[0];
+                            displayPath = infoParts[1];
+                        } catch (Exception e) {
+                            // Keep defaults
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        
+        // Use bracketed style similar to user status messages but distinct
+        System.out.println(ANSI_GREEN + "[" + toolName.toUpperCase() + "]" + ANSI_RESET);
+        
+        // Show just a summary line for each tool in the conversation history
+        if (toolName.equals("read_file")) {
+            try {
+                int actualLines = Integer.parseInt(displayLines);
+                System.out.println(ANSI_DARK_GREEN + "  " + actualLines + " lines from " + displayPath + ANSI_RESET);
+            } catch (NumberFormatException e) {
+                System.out.println(ANSI_DARK_GREEN + "  " + displayLines + " lines from " + displayPath + ANSI_RESET);
+            }
+        } else if (toolName.equals("create_file")) {
+            try {
+                int actualLines = Integer.parseInt(displayLines);
+                System.out.println(ANSI_DARK_GREEN + "  Created " + displayPath + " (" + actualLines + " lines)" + ANSI_RESET);
+            } catch (NumberFormatException e) {
+                System.out.println(ANSI_DARK_GREEN + "  Created " + displayPath + " (" + displayLines + " lines)" + ANSI_RESET);
+            }
+        } else if (toolName.equals("delete_file")) {
+            System.out.println(ANSI_DARK_GREEN + "  Deleted " + displayPath + ANSI_RESET);
+        } else if (toolName.equals("create_directory")) {
+            System.out.println(ANSI_DARK_GREEN + "  Created directory " + displayPath + ANSI_RESET);
+        } else if (toolName.equals("delete_directory_recursive")) {
+            System.out.println(ANSI_DARK_GREEN + "  Deleted directory " + displayPath + " (recursive)" + ANSI_RESET);
+        } else if (toolName.equals("move_file")) {
+            try {
+                int actualLines = Integer.parseInt(displayLines);
+                System.out.println(ANSI_DARK_GREEN + "  Moved to " + displayPath + " (" + actualLines + " lines)" + ANSI_RESET);
+            } catch (NumberFormatException e) {
+                System.out.println(ANSI_DARK_GREEN + "  Moved to " + displayPath + ANSI_RESET);
+            }
+        } else if (toolName.equals("search_files")) {
+            try {
+                int matchCount = Integer.parseInt(displayLines);
+                if (matchCount > 0) {
+                    System.out.println(ANSI_DARK_GREEN + "  Found " + matchCount + " files" + ANSI_RESET);
+                } else {
+                    System.out.println(ANSI_DARK_GREEN + "  No files found" + ANSI_RESET);
+                }
+            } catch (NumberFormatException e) {
+                System.out.println(ANSI_DARK_GREEN + "  Search completed" + ANSI_RESET);
+            }
+        } else if (toolName.equals("search_content")) {
+            try {
+                int matchCount = Integer.parseInt(displayLines);
+                if (matchCount > 0) {
+                    System.out.println(ANSI_DARK_GREEN + "  Found matches in " + matchCount + " files" + ANSI_RESET);
+                } else {
+                    System.out.println(ANSI_DARK_GREEN + "  No matches found" + ANSI_RESET);
+                }
+            } catch (NumberFormatException e) {
+                System.out.println(ANSI_DARK_GREEN + "  Search completed" + ANSI_RESET);
+            }
+        } else if (toolName.equals("list_files")) {
+            try {
+                int itemCount = Integer.parseInt(displayLines);
+                System.out.println(ANSI_DARK_GREEN + "  " + itemCount + " items in " + displayPath + ANSI_RESET);
+            } catch (NumberFormatException e) {
+                System.out.println(ANSI_DARK_GREEN + "  Listed " + displayPath + ANSI_RESET);
+            }
+        } else if (toolName.equals("list_recursive")) {
+            try {
+                int itemCount = Integer.parseInt(displayLines);
+                System.out.println(ANSI_DARK_GREEN + "  " + itemCount + " items in " + displayPath + " (recursive)" + ANSI_RESET);
+            } catch (NumberFormatException e) {
+                System.out.println(ANSI_DARK_GREEN + "  Listed " + displayPath + " (recursive)" + ANSI_RESET);
+            }
+        }
+        System.out.println(); // Add newline after tool results
+    }
+    
+    public void showStatusMessage(String message) {
+        System.out.println(ANSI_LIGHT_BLUE + "~{ " + message + " }~" + ANSI_RESET);
+        statusMessageCount++;
+    }
+    
+    public void clearStatusMessages() {
+        for (int i = 0; i < statusMessageCount; i++) {
+            // Move cursor up one line and clear it
+            System.out.print("\u001B[1A\u001B[2K");
+        }
+        statusMessageCount = 0;
+    }
+    
+    public void showLoadingMessage() {
+        System.out.println();
+        System.out.println(ANSI_GRAY + "Loading..." + ANSI_RESET);
+    }
+    
+    public String[] wrapText(String text, int width) {
+        List<String> lines = new ArrayList<>();
+        
+        // First split by actual newlines to preserve line breaks
+        String[] paragraphs = text.split("\n");
+        
+        for (String paragraph : paragraphs) {
+            if (paragraph.trim().isEmpty()) {
+                lines.add(""); // Preserve empty lines
+                continue;
+            }
+            
+            String[] words = paragraph.split("\\s+");
+            StringBuilder currentLine = new StringBuilder();
+            
+            for (String word : words) {
+                if (currentLine.length() + word.length() + 1 > width) {
+                    if (currentLine.length() > 0) {
+                        lines.add(currentLine.toString());
+                        currentLine = new StringBuilder();
+                    }
+                }
+                if (currentLine.length() > 0) {
+                    currentLine.append(" ");
+                }
+                currentLine.append(word);
+            }
+            
+            if (currentLine.length() > 0) {
+                lines.add(currentLine.toString());
+            }
+        }
+        
+        return lines.toArray(new String[0]);
+    }
+}
+|~|~|~|~|~|~|~|~|~|~|~|
+
+FILE: FileOperations.java
+|~|~|~|~|~|~|~|~|~|~|~|
+import java.io.*;
+import java.nio.file.*;
+import java.nio.file.StandardCopyOption;
+import java.util.*;
+
+public class FileOperations {
+    
+    private static void log(String message) {
+        Logger.log(message);
+    }
+    
+    private static String getWorkingDirectory() {
+        return ConversationCLI.getWorkingDirectory();
+    }
+    
+    private static Path resolvePath(String filePath) {
+        Path path = Paths.get(filePath);
+        if (path.isAbsolute()) {
+            return path;
+        } else {
+            return Paths.get(getWorkingDirectory()).resolve(path);
+        }
+    }
+    
+    public static ToolExecutor.ToolExecutionResult executeReadFileWithSummary(String toolParams) {
+        try {
+            String filePath = ToolParameterExtractor.extractParameter(toolParams, "file_path");
+            String findString = ToolParameterExtractor.extractParameter(toolParams, "find_string");
+            String limitStr = ToolParameterExtractor.extractParameter(toolParams, "limit");
+            
+            if (filePath == null || filePath.trim().isEmpty()) {
+                String error = "Error: file_path parameter is required";
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            Path path = resolvePath(filePath);
+            
+            if (!Files.exists(path)) {
+                String error = "Error: File not found: " + filePath;
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            List<String> lines = Files.readAllLines(path);
+            int startIndex = 0;
+            int limit = lines.size();
+            
+            if (findString != null && !findString.trim().isEmpty()) {
+                FindResult findResult = findStringInLines(lines, findString);
+                if (findResult.isError()) {
+                    return new ToolExecutor.ToolExecutionResult(findResult.errorMessage, findResult.errorMessage);
+                }
+                startIndex = findResult.lineIndex;
+            }
+            
+            if (limitStr != null && !limitStr.trim().isEmpty()) {
+                try {
+                    limit = Integer.parseInt(limitStr.trim());
+                } catch (NumberFormatException e) {
+                    String error = "Error: limit parameter must be a valid number: " + limitStr;
+                    return new ToolExecutor.ToolExecutionResult(error, error);
+                }
+            }
+            
+            int endIndex = Math.min(startIndex + limit, lines.size());
+            StringBuilder content = new StringBuilder();
+            
+            for (int i = startIndex; i < endIndex; i++) {
+                content.append(lines.get(i)).append("\n");
+            }
+            
+            int linesRead = endIndex - startIndex;
+            String summary = String.format("Read %d lines from %s", linesRead, filePath);
+            
+            if (findString != null && !findString.trim().isEmpty()) {
+                summary += " starting from \"" + findString + "\"";
+            }
+            
+            String enhancedResult = "DISPLAY_INFO:" + linesRead + "|" + filePath + "\n" + content.toString();
+            
+            return new ToolExecutor.ToolExecutionResult(enhancedResult, summary);
+            
+        } catch (Exception e) {
+            String error = "Error reading file: " + e.getMessage();
+            return new ToolExecutor.ToolExecutionResult(error, error);
+        }
+    }
+    
+    public static ToolExecutor.ToolExecutionResult executeCreateFileWithSummary(String toolParams) {
+        try {
+            String filePath = ToolParameterExtractor.extractParameter(toolParams, "file_path");
+            String content = ToolParameterExtractor.extractParameter(toolParams, "content");
+            
+            if (filePath == null || filePath.trim().isEmpty()) {
+                String error = "Error: file_path parameter is required";
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            if (content == null) {
+                content = "";
+            }
+            
+            Path path = resolvePath(filePath);
+            
+            Path parentDir = path.getParent();
+            if (parentDir != null && !Files.exists(parentDir)) {
+                Files.createDirectories(parentDir);
+            }
+            
+            Files.write(path, content.getBytes());
+            
+            long lines = content.isEmpty() ? 0 : content.split("\n").length;
+            String fullResult = String.format("File: %s\nCreated successfully (%d lines)", filePath, lines);
+            String summary = String.format("Created %s (%d lines)", filePath, lines);
+            
+            String enhancedResult = "DISPLAY_INFO:" + lines + "|" + filePath + "\n" + fullResult;
+            
+            return new ToolExecutor.ToolExecutionResult(enhancedResult, summary);
+            
+        } catch (Exception e) {
+            String error = "Error creating file: " + e.getMessage();
+            return new ToolExecutor.ToolExecutionResult(error, error);
+        }
+    }
+    
+    public static ToolExecutor.ToolExecutionResult executeDeleteFileWithSummary(String toolParams) {
+        try {
+            String filePath = ToolParameterExtractor.extractParameter(toolParams, "file_path");
+            
+            if (filePath == null || filePath.trim().isEmpty()) {
+                String error = "Error: file_path parameter is required";
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            Path path = resolvePath(filePath);
+            
+            if (!Files.exists(path)) {
+                String error = "Error: File not found: " + filePath;
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            Files.delete(path);
+            
+            String fullResult = String.format("File: %s\nDeleted successfully", filePath);
+            String summary = String.format("Deleted %s", filePath);
+            
+            String enhancedResult = "DISPLAY_INFO:0|" + filePath + "\n" + fullResult;
+            
+            return new ToolExecutor.ToolExecutionResult(enhancedResult, summary);
+            
+        } catch (Exception e) {
+            String error = "Error deleting file: " + e.getMessage();
+            return new ToolExecutor.ToolExecutionResult(error, error);
+        }
+    }
+    
+    public static ToolExecutor.ToolExecutionResult executeMoveFileWithSummary(String toolParams) {
+        try {
+            String sourcePath = ToolParameterExtractor.extractParameter(toolParams, "source_path");
+            String destPath = ToolParameterExtractor.extractParameter(toolParams, "dest_path");
+            
+            if (sourcePath == null || sourcePath.trim().isEmpty()) {
+                String error = "Error: source_path parameter is required";
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            if (destPath == null || destPath.trim().isEmpty()) {
+                String error = "Error: dest_path parameter is required";
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            Path source = resolvePath(sourcePath);
+            Path dest = resolvePath(destPath);
+            
+            if (!Files.exists(source)) {
+                String error = "Error: Source file not found: " + sourcePath;
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            Path destParent = dest.getParent();
+            if (destParent != null && !Files.exists(destParent)) {
+                Files.createDirectories(destParent);
+            }
+            
+            Files.move(source, dest, StandardCopyOption.REPLACE_EXISTING);
+            
+            String fullResult = String.format("File moved successfully\nFrom: %s\nTo: %s", sourcePath, destPath);
+            String summary = String.format("Moved %s to %s", sourcePath, destPath);
+            
+            long fileSize = Files.size(dest);
+            long lines = 0;
+            try {
+                lines = Files.lines(dest).count();
+            } catch (Exception e) {
+                // Non-text file or reading issue, keep lines as 0
+            }
+            
+            String enhancedResult = "DISPLAY_INFO:" + lines + "|" + destPath + "\n" + fullResult;
+            
+            return new ToolExecutor.ToolExecutionResult(enhancedResult, summary);
+            
+        } catch (Exception e) {
+            String error = "Error moving file: " + e.getMessage();
+            return new ToolExecutor.ToolExecutionResult(error, error);
+        }
+    }
+    
+    private static FindResult findStringInLines(List<String> lines, String findString) {
+        for (int i = 0; i < lines.size(); i++) {
+            if (lines.get(i).contains(findString)) {
+                return FindResult.success(i);
+            }
+        }
+        return FindResult.error("String not found: " + findString);
+    }
+    
+    private static class FindResult {
+        boolean isError;
+        String errorMessage;
+        int lineIndex;
+        
+        FindResult(boolean isError, String errorMessage, int lineIndex) {
+            this.isError = isError;
+            this.errorMessage = errorMessage;
+            this.lineIndex = lineIndex;
+        }
+        
+        boolean isError() {
+            return isError;
+        }
+        
+        static FindResult success(int lineIndex) {
+            return new FindResult(false, null, lineIndex);
+        }
+        
+        static FindResult error(String message) {
+            return new FindResult(true, message, -1);
+        }
+    }
+}
+|~|~|~|~|~|~|~|~|~|~|~|
+
+FILE: Logger.java
+|~|~|~|~|~|~|~|~|~|~|~|
+import java.io.*;
+import java.nio.file.*;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+
+public class Logger {
+    
+    public static void log(String message) {
+        try {
+            String logFile = ConversationCLI.getLogFile();
+            String timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS"));
+            String logMessage = "[" + timestamp + "] " + message + "\n";
+            Files.write(Paths.get(logFile), logMessage.getBytes(), 
+                       StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+        } catch (Exception e) {
+            System.err.println("Failed to write to log: " + e.getMessage());
+        }
+    }
+}
+|~|~|~|~|~|~|~|~|~|~|~|
+
+FILE: PromptGenerator.java
+|~|~|~|~|~|~|~|~|~|~|~|
+import java.io.*;
+import java.nio.file.*;
+import java.util.List;
+
+public class PromptGenerator {
+private static final String BASE_SYSTEM_PROMPT = "<system-reminder>\n" +
+        "Never start responses by saying a question, idea, or observation was good, great, fascinating, profound, excellent, or any other positive adjective. Skip flattery and respond directly.\n\n" +
+        "Critically evaluate code proposals, architecture decisions, technical theories, claims, and ideas rather than automatically agreeing or praising them. When presented with dubious, incorrect, ambiguous, or unverifiable approaches, respectfully point out flaws, potential security issues, performance concerns, or lack of clarity rather than validating them. Prioritize technical accuracy and best practices over agreeability.\n\n" +
+        "Provide honest and accurate technical feedback even when it might not be what the developer hopes to hear, rather than prioritizing immediate approval or agreement. While remaining helpful, maintain objectivity about code quality, point out anti-patterns, suggest improvements, and identify potential issues. A developer's long-term success is often best served by honest, constructive technical feedback.\n\n" +
+        "Do not use emojis unless the person asks for it or if the person's message contains an emoji, and be judicious about emoji use even then.\n\n" +
+        "Avoid emotes or actions inside asterisks unless specifically requested.\n" +
+        "</system-reminder>\n\n" +
+        "You are a Windows Code Assistant, an interactive CLI tool that helps users with software engineering tasks. Use the instructions below and the tools available to you to assist the user.\n\n" +
+        "**IMPORTANT:** Assist with defensive security tasks only. Refuse to create, modify, or improve code that may be used maliciously. Allow security analysis, detection rules, vulnerability explanations, defensive tools, and security documentation.\n\n" +
+        "**IMPORTANT:** You must NEVER generate or guess URLs for the user unless you are confident that the URLs are for helping the user with programming. You may use URLs provided by the user in their messages or local files.\n\n" +
+        "## Core Operational Guidelines\n\n" +
+        "Do what has been asked; nothing more, nothing less.\n" +
+        "NEVER create files unless they're absolutely necessary for achieving your goal.\n" +
+        "ALWAYS prefer editing an existing file to creating a new one.\n" +
+        "NEVER proactively create documentation files (*.md) or README files. Only create documentation files if explicitly requested by the User.\n\n" +
+        "## Tone and Style\n\n" +
+        "- Be friendly but professional with a helpful, knowledgeable tone while staying focused\n" +
+        "- Be concise but helpful - provide brief context when useful for understanding\n" +
+        "- Keep responses brief (typically 2-4 lines) unless more detail is specifically needed\n" +
+        "- Only address the specific query or task at hand, avoiding tangential information unless absolutely critical\n" +
+        "- Should NOT answer with unnecessary preamble or postamble unless the user asks you to\n" +
+        "- When modifying code, include a one-line explanation of what changed and why\n" +
+        "- Answer the user's question directly with brief but complete information\n\n" +
+        "### Response Examples\n\n" +
+        "- User: \"2 + 2\" → Assistant: \"4\"\n" +
+        "- User: \"what is 2+2?\" → Assistant: \"4\"\n" +
+        "- User: \"is 11 a prime number?\" → Assistant: \"Yes, 11 is prime (only divisible by 1 and itself)\"\n" +
+        "- User: \"what command should I run to list files in the current directory?\" → Assistant: \"`dir` lists files in the current directory\"\n\n" +
+        "## Proactiveness\n\n" +
+        "You are allowed to be proactive, but only when the user asks you to do something. Strike a balance between:\n" +
+        "- Doing the right thing when asked, including taking actions and follow-up actions\n" +
+        "- Not surprising the user with actions you take without asking\n\n" +
+        "## Following Conventions\n\n" +
+        "When making changes to files, first understand the file's code conventions:\n" +
+        "- Mimic code style, use existing libraries and utilities, and follow existing patterns\n" +
+        "- **NEVER** assume that a given library is available, even if it is well known\n" +
+        "- Whenever you write code that uses a library or framework, first check that this codebase already uses the given library\n" +
+        "- When you create a new component, first look at existing components to see how they're written\n" +
+        "- When you edit a piece of code, first look at the code's surrounding context to understand the code's choice of frameworks and libraries\n" +
+        "- Always follow security best practices. Never introduce code that exposes or logs secrets and keys. Never commit secrets or keys to the repository\n\n" +
+        "## Code Style\n\n" +
+        "- **IMPORTANT:** DO NOT ADD ***ANY*** COMMENTS unless asked\n\n" +
+        "---\n\n" +
+        "**Note:** This prompt is designed to be used as the first message in a conversation along with the actual user input.\n\n" +
+        "## Available Tools\n\n" +
+        "search_files: Search for files by name pattern\n" +
+        "- Parameters: <parameter name=\"query\">search_term</parameter>\n\n" +
+        "search_content: Search for content within files (returns 5 lines above/below matches with line numbers)\n" +
+        "- Parameters: <parameter name=\"query\">search_term</parameter>, <parameter name=\"file_pattern\">*.ext</parameter> (file_pattern is optional)\n\n" +
+        "list_files: List files and directories in a path\n" +
+        "- Parameters: <parameter name=\"path\">directory_path</parameter> (defaults to current directory if not specified)\n\n" +
+        "read_file: Read the contents of a file\n" +
+        "- Parameters: <parameter name=\"file_path\">path/to/file</parameter>, <parameter name=\"find_string\">unique text to start from</parameter>, <parameter name=\"limit\">number of lines</parameter> (find_string and limit are optional)\n\n" +
+        "create_file: Create a new file with content\n" +
+        "- Parameters: <parameter name=\"file_path\">path/to/file</parameter>, <parameter name=\"content\">file content</parameter> (content is optional - defaults to empty file)\n\n" +
+        "delete_file: Delete an existing file\n" +
+        "- Parameters: <parameter name=\"file_path\">path/to/file</parameter>\n\n" +
+        "move_file: Move/rename a file from source to destination\n" +
+        "- Parameters: <parameter name=\"source_path\">path/to/source/file</parameter>, <parameter name=\"dest_path\">path/to/destination/file</parameter>\n\n" +
+        "list_recursive: List all files and directories recursively in a path\n" +
+        "- Parameters: <parameter name=\"path\">directory_path</parameter> (defaults to current directory if not specified)\n\n" +
+        "create_directory: Create a new directory\n" +
+        "- Parameters: <parameter name=\"dir_path\">path/to/directory</parameter>\n\n" +
+        "delete_directory_recursive: Delete a directory and all its contents (safety check: requires recent list_recursive call)\n" +
+        "- Parameters: <parameter name=\"dir_path\">path/to/directory</parameter>\n\n" +
+        "## Tool Usage Guidelines\n\n" +
+        "**CRITICAL:** When using tools:\n" +
+        "- **CRITICAL:** Each response must be EITHER tools OR a message, never both\n" +
+        "- If you need information, use <execute> with tools and NO message\n" +
+        "- If you have enough information, provide ONLY a <message> with NO tools\n" +
+        "- **ALWAYS** batch as many tool calls as possible into a single execute block\n" +
+        "- Use multiple tools simultaneously whenever you can anticipate what information you'll need\n" +
+        "- Never provide running commentary during tool execution\n\n" +
+        "## Response Format\n\n" +
+        "IMPORTANT: Respond with EITHER a message OR tool execution, never both:\n\n" +
+        "For messages:\n" +
+        "<message>Your response</message>\n\n" +
+        "For tool execution:\n" +
+        "<execute>\n" +
+        "  <tool name=\"tool_name\">\n" +
+        "    <parameter name=\"param_name\">value</parameter>\n" +
+        "  </tool>\n" +
+        "  <tool name=\"another_tool\">\n" +
+        "    <parameter name=\"param_name\">value</parameter>\n" +
+        "  </tool>\n" +
+        "</execute>\n\n" +
+        "Rules:\n" +
+        "- Use <execute> when you need to gather information or perform actions\n" +
+        "- Use <message> when you have enough information to provide a final response\n" +
+        "- Never use both <execute> and <message> in the same response\n" +
+        "- Put ALL related tool calls in a single <execute> block\n" +
+        "- Keep messages concise per the tone guidelines above\n\n" +
+        "Examples:\n\n" +
+        "Example 1 (message only - when you have enough info):\n" +
+        "<message>4</message>\n\n" +
+        "Example 2 (tools only - when you need more info):\n" +
+        "<execute>\n" +
+        "  <tool name=\"search_files\">\n" +
+        "    <parameter name=\"query\">*.js</parameter>\n" +
+        "  </tool>\n" +
+        "  <tool name=\"read_file\">\n" +
+        "    <parameter name=\"file_path\">package.json</parameter>\n" +
+        "  </tool>\n" +
+        "</execute>\n\n" +
+        "WRONG (never do this):\n" +
+        "<execute>\n" +
+        "  <tool name=\"read_file\">\n" +
+        "    <parameter name=\"file_path\">file.txt</parameter>\n" +
+        "  </tool>\n" +
+        "</execute>\n" +
+        "<message>Here's what I found</message>";
+    
+    private String currentProjectStructure = "";
+    
+    private static void log(String message) {
+        Logger.log(message);
+    }
+    
+    public void captureProjectStructure(String workingDirectory) {
+        try {
+            currentProjectStructure = generateProjectStructure(Paths.get(workingDirectory), "");
+            log("Project structure captured from " + workingDirectory + ": " + currentProjectStructure.length() + " chars");
+        } catch (Exception e) {
+            log("Error capturing project structure: " + e.getMessage());
+            currentProjectStructure = "";
+        }
+    }
+    
+    public String generatePrompt(List<ConversationManager.Message> conversation, ConversationManager conversationManager) {
+        StringBuilder prompt = new StringBuilder();
+        
+        // Add base system prompt
+        prompt.append(BASE_SYSTEM_PROMPT);
+        
+        // Add project structure
+        if (!currentProjectStructure.trim().isEmpty()) {
+            prompt.append("\n\n## Project Structure\n\n");
+            prompt.append("Current project file tree:\n");
+            prompt.append("```\n");
+            prompt.append(currentProjectStructure);
+            prompt.append("```\n");
+        }
+        
+        // Add conversation history (excluding the first message if it's just the greeting)
+        prompt.append("\n\n## Previous Conversation\n\n");
+        
+        for (int i = 0; i < conversation.size(); i++) {
+            ConversationManager.Message msg = conversation.get(i);
+            
+            // Skip the initial greeting unless it's the only message
+            if (i == 0 && msg.role.equals("assistant") && msg.content.equals("Hello! How can I help you today?") && conversation.size() > 1) {
+                continue;
+            }
+            
+            if (msg.role.equals("user")) {
+                prompt.append("[USER]\n\n");
+                prompt.append(msg.content).append("\n\n");
+            } else if (msg.role.equals("assistant")) {
+                prompt.append("[ASSISTANT]\n\n");
+                prompt.append(msg.content).append("\n\n");
+            } else if (msg.role.equals("summary")) {
+                prompt.append("[SUMMARY]\n\n");
+                prompt.append(msg.content).append("\n\n");
+            } else if (msg.role.equals("tool_results")) {
+                String formattedToolResult = conversationManager.formatToolResultForPrompt(msg.content);
+                prompt.append(formattedToolResult).append("\n\n");
+            } else if (msg.role.equals("system")) {
+                prompt.append("[SYSTEM]\n\n");
+                prompt.append(msg.content).append("\n\n");
+            }
+        }
+        
+        prompt.append("[ASSISTANT]\n\nGenerate the next assistant message to be appended to this conversation.");
+        
+        return prompt.toString();
+    }
+    
+    public String generateAutomaticMessage(List<ConversationManager.Message> conversation) {
+        StringBuilder messages = new StringBuilder();
+        messages.append("{\"messages\":[");
+        
+        boolean first = true;
+        for (ConversationManager.Message msg : conversation) {
+            if (msg.role.equals("user")) {
+                if (!first) messages.append(",");
+                messages.append("{\"role\":\"user\",\"content\":\"").append(escapeJson(msg.content)).append("\"}");
+                first = false;
+            } else if (msg.role.equals("assistant")) {
+                if (!first) messages.append(",");
+                messages.append("{\"role\":\"assistant\",\"content\":\"").append(escapeJson(msg.content)).append("\"}");
+                first = false;
+            } else if (msg.role.equals("system")) {
+                if (!first) messages.append(",");
+                // Convert system tool results to user messages with SYSTEM: prefix
+                String systemContent = "SYSTEM: " + msg.content;
+                messages.append("{\"role\":\"user\",\"content\":\"").append(escapeJson(systemContent)).append("\"}");
+                first = false;
+            }
+        }
+        
+        messages.append("]}|||||TO BRIDGE|||||");
+        return messages.toString();
+    }
+    
+    private String escapeJson(String text) {
+        return text.replace("\\", "\\\\")
+                  .replace("\"", "\\\"")
+                  .replace("\n", "\\n")
+                  .replace("\r", "\\r")
+                  .replace("\t", "\\t");
+    }
+    
+    private String generateProjectStructure(Path startPath, String indent) {
+        StringBuilder structure = new StringBuilder();
+        
+        try {
+            java.util.stream.Stream<Path> entries = Files.list(startPath)
+                .filter(path -> !shouldSkipPath(path))
+                .sorted((a, b) -> {
+                    // Directories first, then files
+                    boolean aIsDir = Files.isDirectory(a);
+                    boolean bIsDir = Files.isDirectory(b);
+                    if (aIsDir && !bIsDir) return -1;
+                    if (!aIsDir && bIsDir) return 1;
+                    return a.getFileName().toString().compareToIgnoreCase(b.getFileName().toString());
+                });
+            
+            entries.forEach(path -> {
+                String fileName = path.getFileName().toString();
+                if (Files.isDirectory(path)) {
+                    structure.append(indent).append(fileName).append("/\n");
+                    // Recursively add subdirectory contents (limited depth)
+                    if (indent.length() < 12) { // Limit to 3 levels deep
+                        addDirectoryContents(structure, path, indent + "  ");
+                    }
+                } else {
+                    structure.append(indent).append(fileName);
+                    try {
+                        long size = Files.size(path);
+                        structure.append(" (").append(formatFileSize(size)).append(")");
+                    } catch (Exception e) {
+                        // Ignore size errors
+                    }
+                    structure.append("\n");
+                }
+            });
+            
+        } catch (Exception e) {
+            structure.append(indent).append("Error reading directory: ").append(e.getMessage()).append("\n");
+        }
+        
+        return structure.toString();
+    }
+    
+    private boolean shouldSkipPath(Path path) {
+        String fileName = path.getFileName().toString();
+        return fileName.startsWith(".") ||
+               fileName.equals("node_modules") ||
+               fileName.equals("target") ||
+               fileName.equals("build") ||
+               fileName.equals("dist") ||
+               fileName.equals("out") ||
+               fileName.equals("bin") ||
+               fileName.equals("obj") ||
+               fileName.endsWith(".class") ||
+               fileName.endsWith(".jar") ||
+               fileName.endsWith(".war");
+    }
+    
+    private void addDirectoryContents(StringBuilder structure, Path dir, String indent) {
+        try {
+            java.util.stream.Stream<Path> entries = Files.list(dir)
+                .filter(path -> !shouldSkipPath(path))
+                .sorted((a, b) -> {
+                    boolean aIsDir = Files.isDirectory(a);
+                    boolean bIsDir = Files.isDirectory(b);
+                    if (aIsDir && !bIsDir) return -1;
+                    if (!aIsDir && bIsDir) return 1;
+                    return a.getFileName().toString().compareToIgnoreCase(b.getFileName().toString());
+                });
+            
+            entries.forEach(path -> {
+                String fileName = path.getFileName().toString();
+                if (Files.isDirectory(path)) {
+                    structure.append(indent).append(fileName).append("/\n");
+                    if (indent.length() < 8) { // Limit recursion depth
+                        addDirectoryContents(structure, path, indent + "  ");
+                    }
+                } else {
+                    structure.append(indent).append(fileName);
+                    try {
+                        long size = Files.size(path);
+                        structure.append(" (").append(formatFileSize(size)).append(")");
+                    } catch (Exception e) {
+                        // Ignore size errors
+                    }
+                    structure.append("\n");
+                }
+            });
+            
+        } catch (Exception e) {
+            structure.append(indent).append("Error reading directory: ").append(e.getMessage()).append("\n");
+        }
+    }
+    
+    private String formatFileSize(long bytes) {
+        if (bytes < 1024) return bytes + "B";
+        if (bytes < 1024 * 1024) return String.format("%.1fKB", bytes / 1024.0);
+        if (bytes < 1024 * 1024 * 1024) return String.format("%.1fMB", bytes / (1024.0 * 1024.0));
+        return String.format("%.1fGB", bytes / (1024.0 * 1024.0 * 1024.0));
+    }
+}
+|~|~|~|~|~|~|~|~|~|~|~|
+
+FILE: SearchOperations.java
+|~|~|~|~|~|~|~|~|~|~|~|
+import java.io.*;
+import java.nio.file.*;
+import java.util.*;
+
+public class SearchOperations {
+    
+    private static void log(String message) {
+        Logger.log(message);
+    }
+    
+    private static String getWorkingDirectory() {
+        return ConversationCLI.getWorkingDirectory();
+    }
+    
+    public static ToolExecutor.ToolExecutionResult executeSearchFilesWithSummary(String toolParams) {
+        try {
+            String query = ToolParameterExtractor.extractParameter(toolParams, "query");
+            
+            if (query == null || query.trim().isEmpty()) {
+                String error = "Error: query parameter is required";
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            Path currentPath = Paths.get(getWorkingDirectory());
+            StringBuilder results = new StringBuilder();
+            int matchCount = 0;
+            
+            try {
+                matchCount = (int) Files.walk(currentPath)
+                    .filter(Files::isRegularFile)
+                    .filter(path -> path.getFileName().toString().toLowerCase().contains(query.toLowerCase()))
+                    .peek(path -> {
+                        try {
+                            long fileSize = Files.size(path);
+                            results.append(String.format("%s (%s)\n", 
+                                path.toString().replace("./", ""), 
+                                ToolParameterExtractor.formatFileSize(fileSize)));
+                        } catch (Exception e) {
+                            results.append(path.toString().replace("./", "")).append("\n");
+                        }
+                    })
+                    .mapToInt(e -> 1)
+                    .sum();
+            } catch (Exception e) {
+                String error = "Error searching files: " + e.getMessage();
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            String fullResult;
+            String summary;
+            
+            if (matchCount == 0) {
+                fullResult = "No files found matching: " + query;
+                summary = "No files found";
+            } else {
+                fullResult = String.format("Found %d file(s) matching '%s':\n\n%s", 
+                    matchCount, query, results.toString());
+                summary = String.format("Found %d files matching '%s'", matchCount, query);
+            }
+            
+            String enhancedResult = "DISPLAY_INFO:" + matchCount + "|search results\n" + fullResult;
+            return new ToolExecutor.ToolExecutionResult(enhancedResult, summary);
+            
+        } catch (Exception e) {
+            String error = "Error searching files: " + e.getMessage();
+            return new ToolExecutor.ToolExecutionResult(error, error);
+        }
+    }
+    
+    public static ToolExecutor.ToolExecutionResult executeSearchContentWithSummary(String toolParams) {
+        try {
+            String query = ToolParameterExtractor.extractParameter(toolParams, "query");
+            String filePattern = ToolParameterExtractor.extractParameter(toolParams, "file_pattern");
+            
+            if (query == null || query.trim().isEmpty()) {
+                String error = "Error: query parameter is required";
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            Path currentPath = Paths.get(getWorkingDirectory());
+            StringBuilder results = new StringBuilder();
+            int matchCount = 0;
+            
+            try {
+                matchCount = (int) Files.walk(currentPath)
+                    .filter(Files::isRegularFile)
+                    .filter(path -> {
+                        if (filePattern == null || filePattern.trim().isEmpty()) {
+                            return true;
+                        }
+                        String fileName = path.getFileName().toString();
+                        String pattern = filePattern.replace("*", ".*").replace("?", ".");
+                        return fileName.matches(pattern);
+                    })
+                    .mapToInt(path -> {
+                        try {
+                            List<String> lines = Files.readAllLines(path);
+                            boolean foundInFile = false;
+                            
+                            for (int i = 0; i < lines.size(); i++) {
+                                if (lines.get(i).toLowerCase().contains(query.toLowerCase())) {
+                                    if (!foundInFile) {
+                                        results.append("\n=== ").append(path.toString().replace("./", "")).append(" ===\n");
+                                        foundInFile = true;
+                                    }
+                                    
+                                    int startLine = Math.max(0, i - 2);
+                                    int endLine = Math.min(lines.size() - 1, i + 2);
+                                    
+                                    for (int j = startLine; j <= endLine; j++) {
+                                        String prefix = (j == i) ? ">>> " : "    ";
+                                        results.append(String.format("%s%s\n", prefix, lines.get(j)));
+                                    }
+                                    results.append("\n");
+                                }
+                            }
+                            
+                            return foundInFile ? 1 : 0;
+                        } catch (Exception e) {
+                            return 0;
+                        }
+                    })
+                    .sum();
+            } catch (Exception e) {
+                String error = "Error searching content: " + e.getMessage();
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            String fullResult;
+            String summary;
+            
+            if (matchCount == 0) {
+                String patternInfo = (filePattern != null && !filePattern.trim().isEmpty()) 
+                    ? " in " + filePattern + " files" : "";
+                fullResult = "No matches found for: " + query + patternInfo;
+                summary = "No matches found";
+            } else {
+                String patternInfo = (filePattern != null && !filePattern.trim().isEmpty()) 
+                    ? " in " + filePattern + " files" : "";
+                fullResult = String.format("Found matches for '%s'%s in %d file(s):\n%s", 
+                    query, patternInfo, matchCount, results.toString());
+                summary = String.format("Found matches in %d files", matchCount);
+            }
+            
+            String enhancedResult = "DISPLAY_INFO:" + matchCount + "|search results\n" + fullResult;
+            return new ToolExecutor.ToolExecutionResult(enhancedResult, summary);
+            
+        } catch (Exception e) {
+            String error = "Error searching content: " + e.getMessage();
+            return new ToolExecutor.ToolExecutionResult(error, error);
+        }
+    }
+}
+|~|~|~|~|~|~|~|~|~|~|~|
+
+FILE: SystemTrayManager.java
+|~|~|~|~|~|~|~|~|~|~|~|
+import java.awt.*;
+import java.awt.image.BufferedImage;
+
+public class SystemTrayManager {
+    private TrayIcon trayIcon;
+    
+    private static void log(String message) {
+        Logger.log(message);
+    }
+    
+    public void setupSystemTray() {
+        if (!SystemTray.isSupported()) {
+            log("System tray not supported on this platform");
+            return;
+        }
+        
+        try {
+            SystemTray tray = SystemTray.getSystemTray();
+            
+            // Create a simple green icon (16x16)
+            Image image = createTrayIcon();
+            
+            // Create popup menu
+            PopupMenu popup = new PopupMenu();
+            
+            MenuItem statusItem = new MenuItem("Conversation CLI - Running");
+            statusItem.setEnabled(false);
+            popup.add(statusItem);
+            
+            popup.addSeparator();
+            
+            MenuItem exitItem = new MenuItem("Exit");
+            exitItem.addActionListener(e -> {
+                log("Exit requested from system tray");
+                cleanup();
+                System.exit(0);
+            });
+            popup.add(exitItem);
+            
+            // Create tray icon
+            trayIcon = new TrayIcon(image, "Conversation CLI", popup);
+            trayIcon.setImageAutoSize(true);
+            trayIcon.setToolTip("Conversation CLI - Maintaining clipboard access");
+            
+            // Add to system tray
+            tray.add(trayIcon);
+            
+            log("System tray icon added successfully");
+            System.out.println(DisplayManager.ANSI_LIGHT_BLUE + "~{ System tray icon added - maintaining clipboard access }~" + DisplayManager.ANSI_RESET);
+            
+        } catch (Exception e) {
+            log("Failed to setup system tray: " + e.getMessage());
+            System.err.println("Warning: Could not setup system tray: " + e.getMessage());
+        }
+    }
+    
+    private Image createTrayIcon() {
+        BufferedImage image = new BufferedImage(16, 16, BufferedImage.TYPE_INT_ARGB);
+        Graphics2D g2d = image.createGraphics();
+        
+        // Enable antialiasing
+        g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+        
+        // Draw a green circle
+        g2d.setColor(new Color(76, 175, 80)); // Material Design Green
+        g2d.fillOval(2, 2, 12, 12);
+        
+        // Add a white "C" for CLI
+        g2d.setColor(Color.WHITE);
+        g2d.setFont(new Font("Arial", Font.BOLD, 10));
+        FontMetrics fm = g2d.getFontMetrics();
+        String text = "C";
+        int x = (16 - fm.stringWidth(text)) / 2;
+        int y = (16 - fm.getHeight()) / 2 + fm.getAscent();
+        g2d.drawString(text, x, y);
+        
+        g2d.dispose();
+        return image;
+    }
+    
+    public void updateTrayStatus(String status) {
+        if (trayIcon != null) {
+            trayIcon.setToolTip("Conversation CLI - " + status);
+        }
+    }
+    
+    public void cleanup() {
+        if (trayIcon != null) {
+            SystemTray.getSystemTray().remove(trayIcon);
+        }
+    }
+}
+|~|~|~|~|~|~|~|~|~|~|~|
+
+FILE: ToolExecutor.java
+|~|~|~|~|~|~|~|~|~|~|~|
+public class ToolExecutor {
+    
+    private static void log(String message) {
+        Logger.log(message);
+    }
+    
+    public static String executeTool(String toolName, String toolParams) {
+        try {
+            switch (toolName) {
+                case "read_file":
+                    return FileOperations.executeReadFileWithSummary(toolParams).fullResult;
+                case "create_file":
+                    return FileOperations.executeCreateFileWithSummary(toolParams).fullResult;
+                case "delete_file":
+                    return FileOperations.executeDeleteFileWithSummary(toolParams).fullResult;
+                case "move_file":
+                    return FileOperations.executeMoveFileWithSummary(toolParams).fullResult;
+                case "create_directory":
+                    return DirectoryOperations.executeCreateDirectoryWithSummary(toolParams).fullResult;
+                case "delete_directory_recursive":
+                    return DirectoryOperations.executeDeleteDirectoryWithSummary(toolParams).fullResult;
+                case "list_files":
+                    return DirectoryOperations.executeListFilesWithSummary(toolParams).fullResult;
+                case "list_recursive":
+                    return DirectoryOperations.executeListRecursiveWithSummary(toolParams).fullResult;
+                case "search_files":
+                    return SearchOperations.executeSearchFilesWithSummary(toolParams).fullResult;
+                case "search_content":
+                    return SearchOperations.executeSearchContentWithSummary(toolParams).fullResult;
+                default:
+                    log("Unknown tool: " + toolName);
+                    return "Error: Unknown tool '" + toolName + "'";
+            }
+        } catch (Exception e) {
+            log("Error executing tool " + toolName + ": " + e.getMessage());
+            return "Error executing " + toolName + ": " + e.getMessage();
+        }
+    }
+    
+    public static ToolExecutionResult executeToolWithSummary(String toolName, String toolParams) {
+        try {
+            switch (toolName) {
+                case "read_file":
+                    return FileOperations.executeReadFileWithSummary(toolParams);
+                case "create_file":
+                    return FileOperations.executeCreateFileWithSummary(toolParams);
+                case "delete_file":
+                    return FileOperations.executeDeleteFileWithSummary(toolParams);
+                case "move_file":
+                    return FileOperations.executeMoveFileWithSummary(toolParams);
+                case "create_directory":
+                    return DirectoryOperations.executeCreateDirectoryWithSummary(toolParams);
+                case "delete_directory_recursive":
+                    return DirectoryOperations.executeDeleteDirectoryWithSummary(toolParams);
+                case "list_files":
+                    return DirectoryOperations.executeListFilesWithSummary(toolParams);
+                case "list_recursive":
+                    return DirectoryOperations.executeListRecursiveWithSummary(toolParams);
+                case "search_files":
+                    return SearchOperations.executeSearchFilesWithSummary(toolParams);
+                case "search_content":
+                    return SearchOperations.executeSearchContentWithSummary(toolParams);
+                default:
+                    log("Unknown tool: " + toolName);
+                    String error = "Error: Unknown tool '" + toolName + "'";
+                    return new ToolExecutionResult(error, error);
+            }
+        } catch (Exception e) {
+            log("Error executing tool " + toolName + ": " + e.getMessage());
+            String error = "Error executing " + toolName + ": " + e.getMessage();
+            return new ToolExecutionResult(error, error);
+        }
+    }
+    
+    public static class ToolExecutionResult {
+        public String fullResult;
+        public String summary;
+        
+        public ToolExecutionResult(String fullResult, String summary) {
+            this.fullResult = fullResult;
+            this.summary = summary;
+        }
+    }
+}
+|~|~|~|~|~|~|~|~|~|~|~|
+
+FILE: ToolParameterExtractor.java
+|~|~|~|~|~|~|~|~|~|~|~|
+import java.util.regex.Pattern;
+import java.util.regex.Matcher;
+
+public class ToolParameterExtractor {
+    
+    private static void log(String message) {
+        Logger.log(message);
+    }
+    
+    public static String extractParameter(String toolParams, String paramName) {
+        try {
+            String pattern = "<parameter name=\"" + paramName + "\">(.*?)</parameter>";
+            Pattern p = Pattern.compile(pattern, Pattern.DOTALL);
+            Matcher m = p.matcher(toolParams);
+            
+            if (m.find()) {
+                return m.group(1).trim();
+            }
+            
+        } catch (Exception e) {
+            log("Error extracting parameter " + paramName + ": " + e.getMessage());
+        }
+        
+        return null;
+    }
+    
+    public static String formatFileSize(long bytes) {
+        if (bytes < 1024) return bytes + "B";
+        if (bytes < 1024 * 1024) return String.format("%.1fKB", bytes / 1024.0);
+        if (bytes < 1024 * 1024 * 1024) return String.format("%.1fMB", bytes / (1024.0 * 1024.0));
+        return String.format("%.1fGB", bytes / (1024.0 * 1024.0 * 1024.0));
+    }
+}
+|~|~|~|~|~|~|~|~|~|~|~|
+
+FILE: bridge-button.js
+|~|~|~|~|~|~|~|~|~|~|~|
+// Claude Bridge Script - Button Interface with Clipboard Protocol
+(function() {
+    'use strict';
+    
+    console.log('[Button Bridge] Initializing...');
+    
+    // State management
+    let currentState = 'listening'; // 'listening' or 'response'
+    let isProcessing = false;
+    let currentResponse = '';
+    
+    // Protocol constants
+    const TO_BRIDGE_MARKER = '|||||TO BRIDGE|||||';
+    const TO_JAVA_MARKER = '|||||TO JAVA|||||';
+    
+    // Remove any existing bridge UI
+    const existingBridge = document.getElementById('claude-bridge-ui');
+    if (existingBridge) {
+        existingBridge.remove();
+    }
+    
+    // Create main UI container
+    const bridgeUI = document.createElement('div');
+    bridgeUI.id = 'claude-bridge-ui';
+    bridgeUI.style.cssText = `
+        position: fixed;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        z-index: 999999;
+        background: rgba(0, 0, 0, 0.9);
+        border: 3px solid #4CAF50;
+        border-radius: 20px;
+        padding: 40px;
+        text-align: center;
+        font-family: Arial, sans-serif;
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+        backdrop-filter: blur(10px);
+        user-select: none;
+    `;
+    
+    // Create main button
+    const mainButton = document.createElement('button');
+    mainButton.id = 'bridge-main-button';
+    mainButton.style.cssText = `
+        width: 300px;
+        height: 150px;
+        background: linear-gradient(45deg, #4CAF50, #45a049);
+        color: white;
+        border: none;
+        border-radius: 15px;
+        font-size: 24px;
+        font-weight: bold;
+        cursor: pointer;
+        transition: all 0.3s ease;
+        box-shadow: 0 5px 15px rgba(76, 175, 80, 0.3);
+        margin-bottom: 20px;
+    `;
+    
+    // Create status text
+    const statusText = document.createElement('div');
+    statusText.id = 'bridge-status';
+    statusText.style.cssText = `
+        color: #4CAF50;
+        font-size: 18px;
+        font-weight: bold;
+        margin-bottom: 15px;
+    `;
+    
+    // Create info text
+    const infoText = document.createElement('div');
+    infoText.id = 'bridge-info';
+    infoText.style.cssText = `
+        color: #ccc;
+        font-size: 14px;
+        max-width: 400px;
+        line-height: 1.4;
+    `;
+    
+    // Create close button
+    const closeButton = document.createElement('button');
+    closeButton.textContent = '×';
+    closeButton.style.cssText = `
+        position: absolute;
+        top: 10px;
+        right: 15px;
+        background: none;
+        border: none;
+        color: #ccc;
+        font-size: 24px;
+        cursor: pointer;
+        width: 30px;
+        height: 30px;
+        border-radius: 50%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        transition: all 0.3s ease;
+    `;
+    
+    closeButton.addEventListener('click', () => {
+        bridgeUI.remove();
+        console.log('[Button Bridge] Bridge UI closed');
+    });
+    
+    closeButton.addEventListener('mouseenter', () => {
+        closeButton.style.background = 'rgba(255, 255, 255, 0.1)';
+    });
+    
+    closeButton.addEventListener('mouseleave', () => {
+        closeButton.style.background = 'none';
+    });
+    
+    // Add hover effects to main button
+    mainButton.addEventListener('mouseenter', () => {
+        if (!isProcessing) {
+            mainButton.style.transform = 'scale(1.05)';
+            mainButton.style.boxShadow = '0 8px 25px rgba(76, 175, 80, 0.4)';
+        }
+    });
+    
+    mainButton.addEventListener('mouseleave', () => {
+        if (!isProcessing) {
+            mainButton.style.transform = 'scale(1)';
+            mainButton.style.boxShadow = '0 5px 15px rgba(76, 175, 80, 0.3)';
+        }
+    });
+    
+    // Main button click handler
+    mainButton.addEventListener('click', async () => {
+        if (isProcessing) {
+            console.log('[Button Bridge] Already processing, ignoring click');
+            return;
+        }
+        
+        if (currentState === 'listening') {
+            await handleListeningClick();
+        } else if (currentState === 'response') {
+            await handleResponseClick();
+        }
+    });
+    
+    // Handle click in listening mode
+    async function handleListeningClick() {
+        console.log('[Button Bridge] Listening mode click - checking clipboard...');
+        
+        try {
+            // Read clipboard
+            const clipboardText = await navigator.clipboard.readText();
+            
+            // Check for TO_BRIDGE marker
+            if (!clipboardText.endsWith(TO_BRIDGE_MARKER)) {
+                console.log('[Button Bridge] No TO_BRIDGE marker found');
+                updateUI('listening', 'No valid request found in clipboard');
+                return;
+            }
+            
+            // Remove marker and parse JSON
+            const jsonText = clipboardText.slice(0, -TO_BRIDGE_MARKER.length);
+            let request;
+            try {
+                request = JSON.parse(jsonText);
+                if (!request.messages || !Array.isArray(request.messages)) {
+                    throw new Error('Invalid request format');
+                }
+            } catch (e) {
+                console.error('[Button Bridge] Invalid JSON:', e);
+                updateUI('listening', 'Invalid JSON in clipboard');
+                return;
+            }
+            
+            console.log('[Button Bridge] Valid request found, processing...');
+            isProcessing = true;
+            updateUI('processing', 'Processing request...');
+            
+            // Get auth token
+            const token = getAuthToken();
+            if (!token) {
+                updateUI('listening', 'No auth token found');
+                isProcessing = false;
+                return;
+            }
+            
+            // Submit to API and get response
+            const response = await submitToInternalAPI(request.messages, token);
+            currentResponse = response;
+            
+            // Switch to response mode
+            currentState = 'response';
+            isProcessing = false;
+            updateUI('response', 'Response ready - click to copy');
+            
+        } catch (error) {
+            console.error('[Button Bridge] Error in listening click:', error);
+            updateUI('listening', `Error: ${error.message}`);
+            isProcessing = false;
+        }
+    }
+    
+    // Handle click in response mode
+    async function handleResponseClick() {
+        console.log('[Button Bridge] Response mode click - copying to clipboard...');
+        
+        try {
+            // Copy response with TO_JAVA marker
+            const responseWithMarker = currentResponse + TO_JAVA_MARKER;
+            await navigator.clipboard.writeText(responseWithMarker);
+            
+            // Switch back to listening mode
+            currentState = 'listening';
+            currentResponse = '';
+            updateUI('listening', 'Response copied - ready for next request');
+            
+        } catch (error) {
+            console.error('[Button Bridge] Error copying response:', error);
+            updateUI('response', `Copy failed: ${error.message}`);
+        }
+    }
+    
+    // Get auth token from localStorage
+    function getAuthToken() {
+        const token = localStorage.getItem('token');
+        if (!token) {
+            console.error('[Button Bridge] No auth token found in localStorage');
+            return null;
+        }
+        return token;
+    }
+    
+    // Submit to internal API (same as original bridge)
+    async function submitToInternalAPI(messages, token) {
+        console.log('[Button Bridge] Submitting to internal API...');
+        
+        const timestamp = Date.now();
+        const userMessageId = 'msg-' + timestamp + '-user';
+        const assistantMessageId = 'msg-' + timestamp + '-assistant';
+        const sessionId = 'session-' + Math.random().toString(36).substr(2, 9);
+        
+        const apiBase = 'http://localhost:5556'; // Mock server
+        
+        // Step 1: Create new chat
+        console.log('[Button Bridge] Step 1: Creating new chat...');
+        const newChatResponse = await fetch(`${apiBase}/api/v1/chats/new`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${token}`
+            },
+            body: JSON.stringify({
+                chat: {
+                    id: '',
+                    title: 'Chat Pending',
+                    models: ['Anthropic Claude 4 Sonnet'],
+                    params: {},
+                    history: {
+                        messages: {
+                            [userMessageId]: {
+                                id: userMessageId,
+                                parentId: null,
+                                childrenIds: [],
+                                role: 'user',
+                                content: messages.length > 0 ? messages[messages.length - 1].content : '',
+                                timestamp: Math.floor(timestamp / 1000),
+                                models: ['Anthropic Claude 4 Sonnet']
+                            }
+                        },
+                        currentId: userMessageId
+                    },
+                    messages: [
+                        {
+                            id: userMessageId,
+                            role: 'user',
+                            content: messages.length > 0 ? messages[messages.length - 1].content : '',
+                            timestamp: Math.floor(timestamp / 1000),
+                            models: ['Anthropic Claude 4 Sonnet']
+                        }
+                    ],
+                    files: []
+                }
+            })
+        });
+        
+        if (!newChatResponse.ok) {
+            throw new Error(`Chat creation failed: ${newChatResponse.status}`);
+        }
+        
+        const chatResult = await newChatResponse.json();
+        const chatId = chatResult.id;
+        console.log('[Button Bridge] Chat created with ID:', chatId);
+        
+        // Step 2: Stream completions
+        console.log('[Button Bridge] Step 2: Starting completions stream...');
+        const completionsResponse = await fetch(`${apiBase}/api/chat/completions`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${token}`
+            },
+            body: JSON.stringify({
+                stream: true,
+                model: 'Anthropic Claude 4 Sonnet',
+                messages: messages,
+                params: {},
+                features: {
+                    web_search: false
+                },
+                session_id: sessionId,
+                chat_id: chatId,
+                id: assistantMessageId,
+                background_tasks: {
+                    title_generation: true,
+                    tags_generation: true
+                }
+            })
+        });
+        
+        if (!completionsResponse.ok) {
+            throw new Error(`Completions failed: ${completionsResponse.status}`);
+        }
+        
+        // Read the SSE stream
+        const reader = completionsResponse.body.getReader();
+        const decoder = new TextDecoder();
+        let finalContent = '';
+        
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            
+            const chunk = decoder.decode(value);
+            const lines = chunk.split('\n');
+            
+            for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                    const data = line.slice(6);
+                    if (data === '[DONE]') {
+                        console.log('[Button Bridge] Stream completed');
+                        return finalContent;
+                    }
+                    
+                    try {
+                        const parsed = JSON.parse(data);
+                        if (parsed.choices && parsed.choices[0] && parsed.choices[0].delta && parsed.choices[0].delta.content) {
+                            finalContent += parsed.choices[0].delta.content;
+                        }
+                    } catch (e) {
+                        // Ignore parsing errors
+                    }
+                }
+            }
+        }
+        
+        return finalContent;
+    }
+    
+    // Update UI based on state
+    function updateUI(state, statusMessage) {
+        if (state === 'listening') {
+            mainButton.textContent = 'LISTENING';
+            mainButton.style.background = 'linear-gradient(45deg, #4CAF50, #45a049)';
+            statusText.textContent = 'READY TO RECEIVE';
+            infoText.textContent = statusMessage || 'Waiting for request with |||||TO BRIDGE||||| marker';
+        } else if (state === 'processing') {
+            mainButton.textContent = 'PROCESSING...';
+            mainButton.style.background = 'linear-gradient(45deg, #FF9800, #F57C00)';
+            statusText.textContent = 'WORKING...';
+            infoText.textContent = statusMessage || 'Calling /new then /completions...';
+        } else if (state === 'response') {
+            mainButton.textContent = 'CLICK TO COPY';
+            mainButton.style.background = 'linear-gradient(45deg, #2196F3, #1976D2)';
+            statusText.textContent = 'RESPONSE READY';
+            infoText.textContent = statusMessage || 'Click to copy response with |||||TO JAVA||||| marker';
+        }
+        
+        // Update button colors
+        if (state === 'listening') {
+            statusText.style.color = '#4CAF50';
+        } else if (state === 'processing') {
+            statusText.style.color = '#FF9800';
+        } else if (state === 'response') {
+            statusText.style.color = '#2196F3';
+        }
+    }
+    
+    // Assemble UI
+    bridgeUI.appendChild(closeButton);
+    bridgeUI.appendChild(statusText);
+    bridgeUI.appendChild(mainButton);
+    bridgeUI.appendChild(infoText);
+    
+    // Add to page
+    document.body.appendChild(bridgeUI);
+    
+    // Initialize UI
+    updateUI('listening', 'Bridge ready - paste requests ending with |||||TO BRIDGE|||||');
+    
+    console.log('[Button Bridge] Button interface ready!');
+    console.log('[Button Bridge] Protocol: TO_BRIDGE =', TO_BRIDGE_MARKER);
+    console.log('[Button Bridge] Protocol: TO_JAVA =', TO_JAVA_MARKER);
+    
+})();
+|~|~|~|~|~|~|~|~|~|~|~|
+
+FILE: build.js
+|~|~|~|~|~|~|~|~|~|~|~|
+const fs = require('fs');
+const path = require('path');
+const { execSync } = require('child_process');
+
+// Two separate locations:
+// 1. EXECUTION_DIR - where the build script was run from (for Java app working directory)
+// 2. SCRIPT_DIR - where build.js and bundle.txt are located (for extraction and compilation)
+const EXECUTION_DIR = process.cwd();
+const SCRIPT_DIR = __dirname;
+const BUNDLE_FILE = path.join(SCRIPT_DIR, 'bundle.txt');
+const DELIMITER = '|~|~|~|~|~|~|~|~|~|~|~|';
+
+console.log('=== Manual Coding Agent Build Script ===');
+console.log('');
+
+console.log(`Execution directory (Java app working dir): ${EXECUTION_DIR}`);
+console.log(`Script directory (extraction/compilation): ${SCRIPT_DIR}`);
+console.log(`Bundle file: ${BUNDLE_FILE}`);
+console.log('');
+
+// Check if script directory exists
+if (!fs.existsSync(SCRIPT_DIR)) {
+    console.error(`ERROR: Script directory does not exist: ${SCRIPT_DIR}`);
+    process.exit(1);
+}
+
+// Check if bundle file exists
+if (!fs.existsSync(BUNDLE_FILE)) {
+    console.error(`ERROR: Bundle file not found: ${BUNDLE_FILE}`);
+    console.error('Please ensure bundle.txt is in the same directory as build.js');
+    process.exit(1);
+}
+
+console.log('[1/5] Unbundling Java files to script directory...');
+process.chdir(SCRIPT_DIR);
+
+try {
+    // Read bundle file
+    const bundleContent = fs.readFileSync(BUNDLE_FILE, 'utf8');
+    const lines = bundleContent.split('\n');
+    
+    let currentFile = null;
+    let fileContent = [];
+    let inFileContent = false;
+    let extractedFiles = 0;
+    
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i].trim();
+        
+        // Check if line starts with "FILE: "
+        if (line.startsWith('FILE: ')) {
+            // Save previous file if we have one
+            if (currentFile && fileContent.length > 0) {
+                const content = fileContent.join('\n');
+                fs.writeFileSync(currentFile, content, 'utf8');
+                console.log(`  ✓ Wrote ${currentFile} (${content.length} chars)`);
+                extractedFiles++;
+            }
+            
+            // Start new file
+            currentFile = line.substring(6).trim(); // Remove "FILE: "
+            fileContent = [];
+            inFileContent = false;
+            console.log(`  Extracting: ${currentFile}`);
+        }
+        // Check if line is delimiter
+        else if (line === DELIMITER) {
+            if (inFileContent) {
+                // End of file content
+                inFileContent = false;
+            } else {
+                // Start of file content
+                inFileContent = true;
+            }
+        }
+        // Regular content line
+        else if (inFileContent && currentFile) {
+            fileContent.push(lines[i]); // Keep original line with whitespace
+        }
+    }
+    
+    // Save last file
+    if (currentFile && fileContent.length > 0) {
+        const content = fileContent.join('\n');
+        fs.writeFileSync(currentFile, content, 'utf8');
+        console.log(`  ✓ Wrote ${currentFile} (${content.length} chars)`);
+        extractedFiles++;
+    }
+    
+    console.log(`  Extracted ${extractedFiles} Java files`);
+    
+    // Verify files were created
+    const javaFiles = fs.readdirSync('.').filter(f => f.endsWith('.java'));
+    if (javaFiles.length === 0) {
+        console.error('ERROR: No Java files were extracted!');
+        process.exit(1);
+    }
+    
+} catch (error) {
+    console.error(`ERROR: Failed to parse bundle file: ${error.message}`);
+    process.exit(1);
+}
+
+console.log('[2/5] Cleaning previous compilation artifacts...');
+// Clean up any previous .class files
+try {
+    const classFiles = fs.readdirSync('.').filter(f => f.endsWith('.class'));
+    for (const classFile of classFiles) {
+        fs.unlinkSync(classFile);
+        console.log(`  Deleted ${classFile}`);
+    }
+} catch (error) {
+    // Ignore errors if no class files exist
+}
+
+console.log('[3/5] Compiling Java files...');
+try {
+    // Get list of Java files explicitly
+    const javaFiles = fs.readdirSync('.').filter(f => f.endsWith('.java'));
+    console.log(`  Found ${javaFiles.length} Java files to compile`);
+    
+    const compileCommand = `javac ${javaFiles.join(' ')}`;
+    execSync(compileCommand, { stdio: 'inherit' });
+    console.log('  Compilation successful!');
+} catch (error) {
+    console.error('ERROR: Compilation failed!');
+    console.error(error.message);
+    process.exit(1);
+}
+
+console.log('[4/5] Verifying main class...');
+if (!fs.existsSync('ConversationCLI.class')) {
+    console.error('ERROR: ConversationCLI.class not found after compilation!');
+    process.exit(1);
+}
+
+console.log('[5/5] Starting ConversationCLI...');
+console.log('');
+console.log('=====================================');
+console.log('   Manual Coding Agent Started');
+console.log('=====================================');
+console.log('');
+
+try {
+    execSync(`java ConversationCLI "${EXECUTION_DIR}"`, { stdio: 'inherit' });
+} catch (error) {
+    // Java process was terminated, this is normal
+}
+
+console.log('');
+console.log('=====================================');
+console.log('   Manual Coding Agent Stopped');
+console.log('=====================================');
+|~|~|~|~|~|~|~|~|~|~|~|
+
