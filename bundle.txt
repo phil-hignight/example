@@ -185,6 +185,9 @@ public class BridgeTestRunner {
                 return;
             }
 
+            // Wait for clipboard to settle from previous test
+            Thread.sleep(500);
+
             systemTrayManager.updateTrayStatus("Test: Continuation");
 
             String testMessage = buildTestMessage(
@@ -225,6 +228,9 @@ public class BridgeTestRunner {
                 return;
             }
 
+            // Wait for clipboard to settle from previous test
+            Thread.sleep(500);
+
             systemTrayManager.updateTrayStatus("Test: Empty response");
 
             // Create huge message to trigger empty backend response
@@ -263,6 +269,9 @@ public class BridgeTestRunner {
                 System.out.println("[SKIP] Size limits - not auto mode");
                 return;
             }
+
+            // Wait for clipboard to settle from previous test
+            Thread.sleep(500);
 
             systemTrayManager.updateTrayStatus("Test: Size limits");
 
@@ -410,6 +419,7 @@ public class BridgeTestRunner {
             System.out.println("Error waiting for user input: " + e.getMessage());
         }
     }
+
 }
 
 |~|~|~|~|~|~|~|~|~|~|~|
@@ -429,14 +439,31 @@ public class ClipboardManager {
     }
     
     public static void copyToClipboard(String text) {
-        try {
-            Clipboard clipboard = Toolkit.getDefaultToolkit().getSystemClipboard();
-            StringSelection selection = new StringSelection(text);
-            clipboard.setContents(selection, null);
-            log("Text copied to clipboard: " + text.length() + " characters");
-        } catch (Exception e) {
-            log("Error copying to clipboard: " + e.getMessage());
-            System.err.println("Error copying to clipboard: " + e.getMessage());
+        int maxRetries = 3;
+        int retryDelay = 100; // Start with 100ms
+
+        for (int attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                Clipboard clipboard = Toolkit.getDefaultToolkit().getSystemClipboard();
+                StringSelection selection = new StringSelection(text);
+                clipboard.setContents(selection, null);
+                log("Text copied to clipboard: " + text.length() + " characters" + (attempt > 1 ? " (attempt " + attempt + ")" : ""));
+                return; // Success
+            } catch (Exception e) {
+                log("Error copying to clipboard (attempt " + attempt + "): " + e.getMessage());
+
+                if (attempt < maxRetries) {
+                    try {
+                        Thread.sleep(retryDelay);
+                        retryDelay *= 2; // Exponential backoff
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                } else {
+                    System.err.println("Error copying to clipboard after " + maxRetries + " attempts: " + e.getMessage());
+                }
+            }
         }
     }
     
