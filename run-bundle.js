@@ -1,165 +1,2771 @@
-const fs = require('fs');
-const path = require('path');
-const { execSync } = require('child_process');
+FILE: BridgeTestRunner.java
+|~|~|~|~|~|~|~|~|~|~|~|
+import java.io.*;
+import java.nio.file.*;
+import java.util.*;
 
-// Two separate locations:
-// 1. EXECUTION_DIR - where the build script was run from (for Java app working directory)
-// 2. SCRIPT_DIR - where build.js and bundle.txt are located (for extraction and compilation)
-const EXECUTION_DIR = process.cwd();
-const SCRIPT_DIR = __dirname;
-const BUNDLE_FILE = path.join(SCRIPT_DIR, 'bundle.txt');
-const DELIMITER = '|~|~|~|~|~|~|~|~|~|~|~|';
+public class BridgeTestRunner {
 
-// Check for run-only mode
-const RUN_ONLY = process.argv.includes('r');
+    private static ConfigManager configManager;
+    private static SystemTrayManager systemTrayManager;
+    private static String workingDirectory;
+    private static int passCount = 0;
+    private static int failCount = 0;
 
-console.log('=== Manual Coding Agent Build Script ===');
-console.log('');
+    // Error code mapping:
+    // 1: Clipboard mismatch
+    // 2: Clipboard exception
+    // 3: Not in automatic mode
+    // 4: Invalid click coordinates
+    // 5: Auto-click setup exception
+    // 6: Round-trip null response
+    // 7: Round-trip mouse cancelled
+    // 8: Round-trip token limit
+    // 9: Round-trip empty
+    // 10: Round-trip exception
+    // 11: Continuation null response
+    // 12: Continuation mouse cancelled
+    // 13: Continuation token limit
+    // 14: Continuation exception
+    // 15: Empty test null response
+    // 16: Empty test mouse cancelled
+    // 17: Empty test got response instead of TOKEN_LIMIT_EXCEEDED
+    // 18: Empty test exception
+    // 19: Size limit failed even at 1000 chars
+    // 20: Size limit exception
+    // 21: Mouse cancel expected MOUSE_CANCELLED
+    // 22: Mouse cancel exception
+    // 23: Response format unexpected
+    // 24: Special chars null response
+    // 25: Special chars mouse cancelled
+    // 26: Special chars token limit
+    // 27: Special chars response missing expected content
+    // 28: Special chars exception
+    // 29: Large response null
+    // 30: Large response mouse cancelled
+    // 31: Large response token limit
+    // 32: Large response too small
+    // 33: Large response exception
+    // 34: Rapid requests null response
+    // 35: Rapid requests mouse cancelled
+    // 36: Rapid requests token limit
+    // 37: Rapid requests exception
+    // 38: Continuation END marker not found
+    // 39: Continuation END marker exception
 
-console.log(`Execution directory (Java app working dir): ${EXECUTION_DIR}`);
-console.log(`Script directory (extraction/compilation): ${SCRIPT_DIR}`);
-console.log(`Bundle file: ${BUNDLE_FILE}`);
-if (RUN_ONLY) {
-    console.log('Mode: Run-only (skipping extraction and compilation)');
+    public static void main(String[] args) {
+        try {
+            workingDirectory = args.length > 0 ? args[0] : System.getProperty("user.dir");
+
+            System.out.println("=== Bridge Test Suite ===");
+            System.out.println("Working directory: " + workingDirectory);
+            System.out.println();
+
+            // Initialize
+            configManager = new ConfigManager(workingDirectory);
+            systemTrayManager = new SystemTrayManager();
+            systemTrayManager.setupSystemTray();
+
+            // Copy bridge JS to clipboard and prompt user
+            copyBridgeScriptToClipboard();
+            promptUserToSetupBridge();
+
+            // Run all tests
+            testClipboardAccess();
+            testAutoClickSetup();
+            testSimpleMessageRoundTrip();
+            testSpecialCharacters();
+            testLargeResponse();
+            testRapidRequests();
+            testContinuationEndMarker();
+            testEmptyResponseHandling();
+            testMouseCancellation();
+
+            // Summary
+            System.out.println();
+            System.out.println("=== Test Summary ===");
+            System.out.println("PASS: " + passCount);
+            System.out.println("FAIL: " + failCount);
+
+            if (failCount == 0) {
+                System.out.println("All tests passed!");
+                systemTrayManager.updateTrayStatus("Tests: All Passed");
+            } else {
+                System.out.println("Some tests failed.");
+                systemTrayManager.updateTrayStatus("Tests: " + failCount + " Failed");
+            }
+
+        } catch (Exception e) {
+            System.out.println("FATAL: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    private static void pass(String test) {
+        System.out.println("[PASS] " + test);
+        passCount++;
+    }
+
+    private static void fail(String test, int errorCode, String data) {
+        System.out.println("[FAIL] " + test + " - " + errorCode + " " + data);
+        failCount++;
+    }
+
+    private static void fail(String test, int errorCode) {
+        System.out.println("[FAIL] " + test + " - " + errorCode);
+        failCount++;
+    }
+
+    // Test 1: Clipboard Access
+    private static void testClipboardAccess() {
+        try {
+            String testData = "TEST_" + System.currentTimeMillis();
+            ClipboardManager.copyToClipboard(testData);
+            String retrieved = ClipboardManager.getClipboardContent();
+
+            if (testData.equals(retrieved)) {
+                pass("Clipboard access");
+            } else {
+                fail("Clipboard access", 1, "`" + retrieved + "` `" + testData + "`");
+            }
+        } catch (Exception e) {
+            fail("Clipboard access", 2, e.getMessage());
+        }
+    }
+
+    // Test 2: Auto-click Setup
+    private static void testAutoClickSetup() {
+        try {
+            if (!configManager.isAutomaticMode()) {
+                fail("Auto-click setup", 3);
+                return;
+            }
+
+            int x = configManager.getClickX();
+            int y = configManager.getClickY();
+
+            if (x >= -10000 && y >= -10000 && x <= 10000 && y <= 10000) {
+                pass("Auto-click setup (" + x + "," + y + ")");
+            } else {
+                fail("Auto-click setup", 4, x + " " + y);
+            }
+        } catch (Exception e) {
+            fail("Auto-click setup", 5, e.getMessage());
+        }
+    }
+
+    // Test 3: Simple Message Round-trip
+    private static void testSimpleMessageRoundTrip() {
+        try {
+            if (!configManager.isAutomaticMode()) {
+                System.out.println("[SKIP] Round-trip - not auto mode");
+                return;
+            }
+
+            systemTrayManager.updateTrayStatus("Test: Round-trip");
+
+            String testMessage = buildTestMessage("Test message");
+            ClipboardManager.copyToClipboard(testMessage);
+
+            String response = ClipboardManager.waitForAutomaticResponse(
+                configManager.getClickX(),
+                configManager.getClickY()
+            );
+
+            // Validate format
+            String formatIssue = validateResponseFormat(response);
+            if (formatIssue != null) {
+                fail("Round-trip", 23, formatIssue);
+                return;
+            }
+
+            if (response == null) {
+                fail("Round-trip", 6);
+            } else if (response.equals("MOUSE_CANCELLED")) {
+                fail("Round-trip", 7);
+            } else if (response.equals("TOKEN_LIMIT_EXCEEDED")) {
+                fail("Round-trip", 8);
+            } else if (response.trim().length() > 0) {
+                pass("Round-trip (" + response.length() + "ch)");
+            } else {
+                fail("Round-trip", 9);
+            }
+        } catch (Exception e) {
+            fail("Round-trip", 10, e.getMessage());
+        }
+    }
+
+    // Test 4: Continuation Handling
+    private static void testContinuationHandling() {
+        try {
+            if (!configManager.isAutomaticMode()) {
+                System.out.println("[SKIP] Continuation - not auto mode");
+                return;
+            }
+
+            // Wait for clipboard to settle from previous test
+            Thread.sleep(500);
+
+            systemTrayManager.updateTrayStatus("Test: Continuation");
+
+            String testMessage = buildTestMessage(
+                "Write 500-word essay on Java. End with |||||END|||||"
+            );
+            ClipboardManager.copyToClipboard(testMessage);
+
+            String response = ClipboardManager.waitForAutomaticResponse(
+                configManager.getClickX(),
+                configManager.getClickY()
+            );
+
+            String formatIssue = validateResponseFormat(response);
+            if (formatIssue != null) {
+                fail("Continuation", 23, formatIssue);
+                return;
+            }
+
+            if (response == null) {
+                fail("Continuation", 11);
+            } else if (response.equals("MOUSE_CANCELLED")) {
+                fail("Continuation", 12);
+            } else if (response.equals("TOKEN_LIMIT_EXCEEDED")) {
+                fail("Continuation", 13);
+            } else {
+                pass("Continuation (" + response.length() + "ch)");
+            }
+        } catch (Exception e) {
+            fail("Continuation", 14, e.getMessage());
+        }
+    }
+
+    // Test 5: Token Limit Discovery
+    private static void testEmptyResponseHandling() {
+        try {
+            if (!configManager.isAutomaticMode()) {
+                System.out.println("[SKIP] Token limit - not auto mode");
+                return;
+            }
+
+            // Wait for clipboard to settle from previous test
+            Thread.sleep(500);
+
+            systemTrayManager.updateTrayStatus("Test: Token limit");
+
+            // Test increasing sizes to find the actual token limit
+            // Starting at 100K to verify no truncation, then go higher
+            int[] sizes = {100000, 200000, 300000, 400000, 500000, 600000, 700000, 800000, 900000, 1000000, 1500000, 2000000};
+            int maxWorking = 0;
+
+            for (int size : sizes) {
+                System.out.println("  Testing " + size + " chars...");
+
+                // Build message with unique marker at the END to verify full input processing
+                String uniqueMarker = "ENDMARKER_" + System.currentTimeMillis();
+                StringBuilder large = new StringBuilder("Reply with the end marker if you can see it. ");
+                for (int i = 0; i < size; i++) {
+                    large.append("x");
+                }
+                large.append(" ").append(uniqueMarker);
+
+                String testMessage = buildTestMessage(large.toString());
+                ClipboardManager.copyToClipboard(testMessage);
+
+                String response = ClipboardManager.waitForAutomaticResponse(
+                    configManager.getClickX(),
+                    configManager.getClickY()
+                );
+
+                if (response == null) {
+                    fail("Token limit", 15);
+                    return;
+                } else if (response.equals("MOUSE_CANCELLED")) {
+                    fail("Token limit", 16);
+                    return;
+                } else if (response.equals("TOKEN_LIMIT_EXCEEDED")) {
+                    // Found the limit!
+                    pass("Token limit found at ~" + size + " chars");
+                    return;
+                } else if (response.trim().length() > 0) {
+                    // Check if response mentions the end marker to verify full input was processed
+                    boolean sawEndMarker = response.contains(uniqueMarker) || response.contains("ENDMARKER");
+                    maxWorking = size;
+                    System.out.println("    ✓ " + size + " chars OK (response: " + response.length() + " chars, saw_end_marker: " + sawEndMarker + ")");
+                    if (!sawEndMarker) {
+                        System.out.println("    WARNING: Response doesn't mention end marker - input may be truncated!");
+                    }
+                } else {
+                    fail("Token limit", 17, "`empty_at_" + size + "`");
+                    return;
+                }
+            }
+
+            // If we got here, even 2M worked
+            pass("Token limit >2M chars (tested up to " + maxWorking + ")");
+
+        } catch (Exception e) {
+            fail("Token limit", 18, e.getMessage());
+        }
+    }
+
+    // Test 6: Special Characters
+    private static void testSpecialCharacters() {
+        try {
+            if (!configManager.isAutomaticMode()) {
+                System.out.println("[SKIP] Special chars - not auto mode");
+                return;
+            }
+
+            Thread.sleep(500);
+            systemTrayManager.updateTrayStatus("Test: Special chars");
+
+            // Test message with various special characters, unicode, emojis
+            String specialContent = "Reply PASS_SPECIAL. Test: \n\t\"quotes\" 'apostrophe' \\backslash\\ {braces} [brackets] (parens) <angles> & ampersand | pipe $ dollar % percent @ at # hash ! bang ? question * asterisk ~ tilde ` backtick 你好 مرحبا 😀🎉🚀 ñáéíóú Δφλ";
+
+            String testMessage = buildTestMessage(specialContent);
+            ClipboardManager.copyToClipboard(testMessage);
+
+            String response = ClipboardManager.waitForAutomaticResponse(
+                configManager.getClickX(),
+                configManager.getClickY()
+            );
+
+            if (response == null) {
+                fail("Special chars", 24);
+            } else if (response.equals("MOUSE_CANCELLED")) {
+                fail("Special chars", 25);
+            } else if (response.equals("TOKEN_LIMIT_EXCEEDED")) {
+                fail("Special chars", 26);
+            } else if (response.contains("PASS_SPECIAL")) {
+                pass("Special chars (" + response.length() + "ch)");
+            } else {
+                fail("Special chars", 27, "`" + response.substring(0, Math.min(50, response.length())) + "`");
+            }
+        } catch (Exception e) {
+            fail("Special chars", 28, e.getMessage());
+        }
+    }
+
+    // Test 7: Large Response (Multi-continuation)
+    private static void testLargeResponse() {
+        try {
+            if (!configManager.isAutomaticMode()) {
+                System.out.println("[SKIP] Large response - not auto mode");
+                return;
+            }
+
+            Thread.sleep(500);
+            systemTrayManager.updateTrayStatus("Test: Large response");
+
+            // Request massive output - bridge should automatically get all continuations
+            String testMessage = buildTestMessage("Generate a 50000 character response (about 10000 words). Start with RESPONSE_START, fill the middle with repeated text, and end with RESPONSE_END. Do not include the END marker - just write RESPONSE_END as the last word.");
+            ClipboardManager.copyToClipboard(testMessage);
+
+            String response = ClipboardManager.waitForAutomaticResponse(
+                configManager.getClickX(),
+                configManager.getClickY()
+            );
+
+            if (response == null) {
+                fail("Large response", 29);
+            } else if (response.equals("MOUSE_CANCELLED")) {
+                fail("Large response", 30);
+            } else if (response.equals("TOKEN_LIMIT_EXCEEDED")) {
+                fail("Large response", 31);
+            } else if (response.length() > 20000 && response.contains("RESPONSE_START") && response.contains("RESPONSE_END")) {
+                pass("Large response (" + response.length() + "ch)");
+            } else {
+                String preview = response.length() > 60 ? response.substring(response.length() - 60) : response;
+                fail("Large response", 32, "len=" + response.length() + " start=" + response.contains("RESPONSE_START") + " end=" + response.contains("RESPONSE_END") + " last60=\"" + preview + "\"");
+            }
+        } catch (Exception e) {
+            fail("Large response", 33, e.getMessage());
+        }
+    }
+
+    // Test 8: Rapid Requests
+    private static void testRapidRequests() {
+        try {
+            if (!configManager.isAutomaticMode()) {
+                System.out.println("[SKIP] Rapid requests - not auto mode");
+                return;
+            }
+
+            Thread.sleep(500);
+            systemTrayManager.updateTrayStatus("Test: Rapid requests");
+
+            // Send 3 requests in quick succession
+            for (int i = 1; i <= 3; i++) {
+                String testMessage = buildTestMessage("Reply: Request " + i + " of 3");
+                ClipboardManager.copyToClipboard(testMessage);
+
+                String response = ClipboardManager.waitForAutomaticResponse(
+                    configManager.getClickX(),
+                    configManager.getClickY()
+                );
+
+                if (response == null) {
+                    fail("Rapid requests", 34, "req_" + i);
+                    return;
+                } else if (response.equals("MOUSE_CANCELLED")) {
+                    fail("Rapid requests", 35, "req_" + i);
+                    return;
+                } else if (response.equals("TOKEN_LIMIT_EXCEEDED")) {
+                    fail("Rapid requests", 36, "req_" + i);
+                    return;
+                }
+
+                System.out.println("    ✓ Request " + i + " OK");
+                Thread.sleep(100); // Small delay between requests
+            }
+
+            pass("Rapid requests (3/3)");
+        } catch (Exception e) {
+            fail("Rapid requests", 37, e.getMessage());
+        }
+    }
+
+    // Test 9: Continuation END Marker
+    private static void testContinuationEndMarker() {
+        try {
+            if (!configManager.isAutomaticMode()) {
+                System.out.println("[SKIP] Continuation END - not auto mode");
+                return;
+            }
+
+            Thread.sleep(500);
+            systemTrayManager.updateTrayStatus("Test: Continuation END");
+
+            String testMessage = buildTestMessage(
+                "Write a 500-word essay about Java. End with exactly: |||||END|||||"
+            );
+            ClipboardManager.copyToClipboard(testMessage);
+
+            String response = ClipboardManager.waitForAutomaticResponse(
+                configManager.getClickX(),
+                configManager.getClickY()
+            );
+
+            String formatIssue = validateResponseFormat(response);
+            if (formatIssue != null) {
+                fail("Continuation END", 23, formatIssue);
+                return;
+            }
+
+            if (response != null && !response.equals("MOUSE_CANCELLED") && !response.equals("TOKEN_LIMIT_EXCEEDED")) {
+                if (response.contains("|||||END|||||")) {
+                    pass("Continuation END (" + response.length() + "ch)");
+                } else {
+                    String last60 = response.length() > 60 ? response.substring(response.length() - 60) : response;
+                    fail("Continuation END", 38, "len=" + response.length() + " last60=\"" + last60 + "\"");
+                }
+            } else {
+                fail("Continuation END", 38, "`" + response + "`");
+            }
+        } catch (Exception e) {
+            fail("Continuation END", 39, e.getMessage());
+        }
+    }
+
+    // Test 7: Mouse Cancellation
+    private static void testMouseCancellation() {
+        System.out.println("[MANUAL] Mouse cancel - Move >300px after ENTER");
+        System.out.print("         Press ENTER: ");
+
+        try {
+            Scanner scanner = new Scanner(System.in);
+            scanner.nextLine();
+
+            String testMessage = buildTestMessage("Test");
+            ClipboardManager.copyToClipboard(testMessage);
+
+            String response = ClipboardManager.waitForAutomaticResponse(
+                configManager.getClickX(),
+                configManager.getClickY()
+            );
+
+            if (response != null && response.equals("MOUSE_CANCELLED")) {
+                pass("Mouse cancel");
+            } else {
+                fail("Mouse cancel", 21, "`" + response + "`");
+            }
+        } catch (Exception e) {
+            fail("Mouse cancel", 22, e.getMessage());
+        }
+    }
+
+    // Validate response format
+    private static String validateResponseFormat(String response) {
+        if (response == null) {
+            return null; // null is a valid case, handled separately
+        }
+
+        if (response.equals("MOUSE_CANCELLED") || response.equals("TOKEN_LIMIT_EXCEEDED")) {
+            return null; // These are special valid responses
+        }
+
+        // Check for unexpected format issues
+        if (response.contains("|||||TO BRIDGE|||||")) {
+            return "contains_bridge_marker";
+        }
+
+        if (response.contains("|||||TO JAVA|||||")) {
+            return "contains_java_marker";
+        }
+
+        if (response.startsWith("{\"messages\":")) {
+            return "looks_like_request_json";
+        }
+
+        // All good
+        return null;
+    }
+
+    // Build test message in bridge protocol format
+    private static String buildTestMessage(String content) {
+        String escaped = content
+            .replace("\\", "\\\\")
+            .replace("\"", "\\\"")
+            .replace("\n", "\\n")
+            .replace("\r", "\\r")
+            .replace("\t", "\\t");
+
+        return "{\"messages\":[{\"role\":\"user\",\"content\":\"" + escaped + "\"}]}|||||TO BRIDGE|||||";
+    }
+
+    public static String getWorkingDirectory() {
+        return workingDirectory;
+    }
+
+    public static String getLogFile() {
+        return workingDirectory + "/.agent/debug.log";
+    }
+
+    private static void copyBridgeScriptToClipboard() {
+        try {
+            Path bridgeScriptPath = Paths.get(workingDirectory, "src", "browser", "bridge-button.js");
+
+            if (!Files.exists(bridgeScriptPath)) {
+                System.out.println("WARNING: bridge-button.js not found at: " + bridgeScriptPath);
+                return;
+            }
+
+            String bridgeScript = new String(Files.readAllBytes(bridgeScriptPath));
+            ClipboardManager.copyToClipboard(bridgeScript);
+
+            System.out.println("✓ Bridge script copied to clipboard (" + bridgeScript.length() + " chars)");
+
+        } catch (Exception e) {
+            System.out.println("WARNING: Failed to copy bridge script: " + e.getMessage());
+        }
+    }
+
+    private static void promptUserToSetupBridge() {
+        System.out.println();
+        System.out.println("=== Setup Instructions ===");
+        System.out.println("1. Open your browser and navigate to Claude");
+        System.out.println("2. Open browser console (F12 or Cmd+Option+J)");
+        System.out.println("3. Paste the bridge script (already in clipboard)");
+        System.out.println("4. Press Enter in console to run the script");
+        System.out.println("5. You should see the green bridge button appear");
+        System.out.println("6. Come back here and press ENTER to continue");
+        System.out.println();
+        System.out.print("Press ENTER when bridge is ready: ");
+
+        try {
+            Scanner scanner = new Scanner(System.in);
+            scanner.nextLine();
+            System.out.println("✓ Starting tests...");
+            System.out.println();
+        } catch (Exception e) {
+            System.out.println("Error waiting for user input: " + e.getMessage());
+        }
+    }
+
 }
-console.log('');
 
-// Check if script directory exists
-if (!fs.existsSync(SCRIPT_DIR)) {
-    console.error(`ERROR: Script directory does not exist: ${SCRIPT_DIR}`);
-    process.exit(1);
-}
+|~|~|~|~|~|~|~|~|~|~|~|
 
-// Only check bundle file if we're not in run-only mode
-if (!RUN_ONLY && !fs.existsSync(BUNDLE_FILE)) {
-    console.error(`ERROR: Bundle file not found: ${BUNDLE_FILE}`);
-    console.error('Please ensure bundle.txt is in the same directory as build.js');
-    process.exit(1);
-}
+FILE: ClipboardManager.java
+|~|~|~|~|~|~|~|~|~|~|~|
+import java.awt.*;
+import java.awt.datatransfer.*;
+import java.awt.event.InputEvent;
+import java.util.Scanner;
 
-// Skip extraction and compilation if in run-only mode
-if (RUN_ONLY) {
-    console.log('Skipping extraction and compilation - running existing classes...');
-    process.chdir(SCRIPT_DIR);
-} else {
-    console.log('[1/5] Unbundling Java files to script directory...');
-    process.chdir(SCRIPT_DIR);
-
-try {
-    // Read bundle file
-    const bundleContent = fs.readFileSync(BUNDLE_FILE, 'utf8');
-    const lines = bundleContent.split('\n');
+public class ClipboardManager {
+    private static Scanner scanner = new Scanner(System.in);
     
-    let currentFile = null;
-    let fileContent = [];
-    let inFileContent = false;
-    let extractedFiles = 0;
+    private static void log(String message) {
+        Logger.log(message);
+    }
     
-    for (let i = 0; i < lines.length; i++) {
-        const line = lines[i].trim();
+    public static void copyToClipboard(String text) {
+        int maxRetries = 3;
+        int retryDelay = 100; // Start with 100ms
+
+        for (int attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                Clipboard clipboard = Toolkit.getDefaultToolkit().getSystemClipboard();
+                StringSelection selection = new StringSelection(text);
+                clipboard.setContents(selection, null);
+                log("Text copied to clipboard: " + text.length() + " characters" + (attempt > 1 ? " (attempt " + attempt + ")" : ""));
+                return; // Success
+            } catch (Exception e) {
+                log("Error copying to clipboard (attempt " + attempt + "): " + e.getMessage());
+
+                if (attempt < maxRetries) {
+                    try {
+                        Thread.sleep(retryDelay);
+                        retryDelay *= 2; // Exponential backoff
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                } else {
+                    System.err.println("Error copying to clipboard after " + maxRetries + " attempts: " + e.getMessage());
+                }
+            }
+        }
+    }
+    
+    public static String getClipboardContent() {
+        try {
+            Clipboard clipboard = Toolkit.getDefaultToolkit().getSystemClipboard();
+            Transferable contents = clipboard.getContents(null);
+            
+            if (contents != null && contents.isDataFlavorSupported(DataFlavor.stringFlavor)) {
+                return (String) contents.getTransferData(DataFlavor.stringFlavor);
+            }
+        } catch (Exception e) {
+            log("Error reading from clipboard: " + e.getMessage());
+        }
+        return null;
+    }
+    
+    public static String getResponseFromClipboard(String originalPrompt) {
+        while (true) {
+            try {
+                String input = scanner.nextLine().trim();
+                
+                if (input.equalsIgnoreCase("quit")) {
+                    log("Quit requested from clipboard loop");
+                    return "QUIT_REQUESTED";
+                }
+                
+                if (input.equalsIgnoreCase("c")) {
+                    copyToClipboard(originalPrompt);
+                    log("Prompt re-copied to clipboard");
+                    System.out.println("~{ Prompt re-copied to clipboard }~");
+                    continue;
+                }
+                
+                String clipboardContent = getClipboardContent();
+                log("Clipboard read: " + (clipboardContent != null ? clipboardContent.length() : 0) + " characters");
+                
+                // CRITICAL: Log details about what was actually read from clipboard
+                if (clipboardContent != null) {
+                    if (clipboardContent.trim().isEmpty()) {
+                        log("CRITICAL: Clipboard contains only whitespace: '" + clipboardContent + "'");
+                    } else if (clipboardContent.length() < 10) {
+                        log("WARNING: Very short clipboard content: '" + clipboardContent + "'");
+                    } else {
+                        log("Clipboard first 100 chars: " + clipboardContent.substring(0, Math.min(100, clipboardContent.length())));
+                        log("Clipboard last 50 chars: " + clipboardContent.substring(Math.max(0, clipboardContent.length() - 50)));
+                    }
+                } else {
+                    log("CRITICAL: Clipboard content is NULL");
+                }
+                
+                if (clipboardContent == null || clipboardContent.trim().isEmpty()) {
+                    System.out.println("Clipboard is empty. Please copy Claude's response and try again.");
+                    System.out.print("Press Enter when response is copied (or 'c' to copy prompt again): ");
+                    continue;
+                }
+                
+                // Check if clipboard still contains the original prompt (user hasn't pasted response yet)
+                if (clipboardContent.trim().equals(originalPrompt.trim())) {
+                    System.out.println("Clipboard still contains the original prompt. Please copy Claude's response.");
+                    System.out.print("Press Enter when response is copied (or 'c' to copy prompt again): ");
+                    continue;
+                }
+                
+                return clipboardContent;
+                
+            } catch (Exception e) {
+                log("Error in clipboard interaction: " + e.getMessage());
+                System.out.println("Error reading clipboard. Please try again.");
+                System.out.print("Press Enter to retry: ");
+            }
+        }
+    }
+    
+    public static void clickAtCoordinates(int x, int y) {
+        try {
+            Robot robot = new Robot();
+            robot.mouseMove(x, y);
+            robot.mousePress(InputEvent.BUTTON1_DOWN_MASK);
+            robot.mouseRelease(InputEvent.BUTTON1_DOWN_MASK);
+            log("Clicked at coordinates: " + x + ", " + y);
+        } catch (Exception e) {
+            log("Error clicking at coordinates: " + e.getMessage());
+        }
+    }
+    
+    public static void moveMouseTo(int x, int y) {
+        try {
+            Robot robot = new Robot();
+            robot.mouseMove(x, y);
+            log("Mouse moved to coordinates: " + x + ", " + y);
+        } catch (Exception e) {
+            log("Error moving mouse to coordinates: " + e.getMessage());
+            throw new RuntimeException("Failed to move mouse: " + e.getMessage());
+        }
+    }
+    
+    public static String waitForAutomaticResponse(int clickX, int clickY) {
+        log("Starting automatic response polling");
         
-        // Check if line starts with "FILE: "
-        if (line.startsWith('FILE: ')) {
-            // Save previous file if we have one
-            if (currentFile && fileContent.length > 0) {
-                const content = fileContent.join('\n');
-                fs.writeFileSync(currentFile, content, 'utf8');
-                console.log(`  [OK] Wrote ${currentFile} (${content.length} chars)`);
-                extractedFiles++;
+        while (true) {
+            try {
+                // Move mouse to coordinates and click
+                clickAtCoordinates(clickX, clickY);
+                
+                // Check clipboard for response with terminator
+                String clipboardContent = getClipboardContent();
+                if (clipboardContent != null && clipboardContent.endsWith("|||||TO JAVA|||||")) {
+                    // Remove terminator and return response
+                    String response = clipboardContent.substring(0, clipboardContent.length() - "|||||TO JAVA|||||".length());
+                    log("Received automatic response: " + response.length() + " characters");
+                    
+                    // CRITICAL: Log details about empty or problematic responses
+                    if (response.trim().isEmpty()) {
+                        log("CRITICAL: Received EMPTY response from Claude!");
+                        log("CRITICAL: Full clipboard content was: '" + clipboardContent + "'");
+                        log("CRITICAL: Response after terminator removal: '" + response + "'");
+                        log("CRITICAL: Returning null to trigger retry or user intervention");
+                        return null; // Treat empty responses as no response
+                    } else if (response.length() < 10) {
+                        log("WARNING: Received very short response: '" + response + "'");
+                        log("WARNING: Short response content: '" + response + "'");
+                        log("WARNING: Returning null to trigger retry or user intervention");
+                        return null; // Treat very short responses as problematic
+                    } else {
+                        log("Response first 100 chars: " + response.substring(0, Math.min(100, response.length())));
+                        log("Response last 50 chars: " + response.substring(Math.max(0, response.length() - 50)));
+                    }
+                    
+                    return response;
+                }
+                
+                // Sleep for 1 second, but check mouse position during this time
+                Thread.sleep(1000);
+                
+                // After waiting, check if mouse moved outside the allowed area
+                Point currentMousePos = MouseInfo.getPointerInfo().getLocation();
+                int deltaX = Math.abs(currentMousePos.x - clickX);
+                int deltaY = Math.abs(currentMousePos.y - clickY);
+                
+                if (deltaX > 300 || deltaY > 300) {
+                    log("Mouse moved outside 300px square from click position - canceling auto-clicking");
+                    return "MOUSE_CANCELLED";
+                }
+                
+            } catch (InterruptedException e) {
+                log("Automatic polling interrupted: " + e.getMessage());
+                Thread.currentThread().interrupt();
+                return null;
+            } catch (Exception e) {
+                log("Error in automatic polling: " + e.getMessage());
+                try {
+                    Thread.sleep(1000);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return null;
+                }
+            }
+        }
+    }
+    
+    public static String handleAutoCancelRetry(String originalPrompt, int clickX, int clickY) {
+        System.out.println("Auto-clicking cancelled (mouse moved too far)");
+        System.out.println("Press 'r' to retry auto-clicking or 'a' to abort: ");
+        
+        while (true) {
+            try {
+                String input = scanner.nextLine().trim().toLowerCase();
+                
+                if (input.equals("r")) {
+                    log("User chose to retry auto-clicking");
+                    System.out.println("Retrying auto-clicking...");
+                    return waitForAutomaticResponse(clickX, clickY);
+                } else if (input.equals("a")) {
+                    log("User chose to abort auto-clicking");
+                    return null;
+                } else {
+                    System.out.println("Invalid input. Press 'r' to retry or 'a' to abort: ");
+                }
+            } catch (Exception e) {
+                log("Error in cancel retry handler: " + e.getMessage());
+                return null;
+            }
+        }
+    }
+}
+|~|~|~|~|~|~|~|~|~|~|~|
+
+FILE: ConfigManager.java
+|~|~|~|~|~|~|~|~|~|~|~|
+import java.io.*;
+import java.nio.file.*;
+
+public class ConfigManager {
+    private String workingDirectory;
+
+    private String getConfigFile() {
+        return Paths.get(workingDirectory, ".agent", "config.json").toString();
+    }
+
+    private int maxMessageChars = 350000; // Default max message chars
+    private int wrapWidth = 110; // Default wrap width
+    private String mode = "manual"; // Default mode (manual or automatic)
+    private int clickX = 500; // Default click X coordinate for automatic mode
+    private int clickY = 300; // Default click Y coordinate for automatic mode
+
+    private static void log(String message) {
+        Logger.log(message);
+    }
+
+    public ConfigManager(String workingDirectory) throws IOException {
+        this.workingDirectory = workingDirectory;
+        loadConfig();
+    }
+
+    private void loadConfig() throws IOException {
+        Path configPath = Paths.get(getConfigFile());
+        if (!Files.exists(configPath)) {
+            // Ensure .agent directory exists
+            Path agentDir = configPath.getParent();
+            if (!Files.exists(agentDir)) {
+                Files.createDirectories(agentDir);
             }
             
-            // Start new file
-            currentFile = line.substring(6).trim(); // Remove "FILE: "
-            fileContent = [];
-            inFileContent = false;
-            console.log(`  Extracting: ${currentFile}`);
-        }
-        // Check if line is delimiter
-        else if (line === DELIMITER) {
-            if (inFileContent) {
-                // End of file content
-                inFileContent = false;
-            } else {
-                // Start of file content
-                inFileContent = true;
+            // Create default config
+            String defaultConfig = "{\"maxMessageChars\": 350000, \"wrapWidth\": 110, \"mode\": \"manual\", \"clickX\": 500, \"clickY\": 300}";
+            Files.write(configPath, defaultConfig.getBytes());
+            maxMessageChars = 350000;
+            wrapWidth = 110;
+            mode = "manual";
+            clickX = 500;
+            clickY = 300;
+            log("Created default config file");
+        } else {
+            try {
+                String configContent = new String(Files.readAllBytes(configPath));
+                
+                // Simple JSON parsing for maxMessageChars
+                String maxCharsPattern = "\"maxMessageChars\"\\s*:\\s*(\\d+)";
+                java.util.regex.Pattern p1 = java.util.regex.Pattern.compile(maxCharsPattern);
+                java.util.regex.Matcher m1 = p1.matcher(configContent);
+                if (m1.find()) {
+                    maxMessageChars = Integer.parseInt(m1.group(1));
+                } else {
+                    maxMessageChars = 350000; // fallback
+                }
+                
+                // Simple JSON parsing for wrapWidth
+                String wrapPattern = "\"wrapWidth\"\\s*:\\s*(\\d+)";
+                java.util.regex.Pattern p2 = java.util.regex.Pattern.compile(wrapPattern);
+                java.util.regex.Matcher m2 = p2.matcher(configContent);
+                if (m2.find()) {
+                    wrapWidth = Integer.parseInt(m2.group(1));
+                } else {
+                    wrapWidth = 110; // fallback
+                }
+                
+                // Simple JSON parsing for mode
+                String modePattern = "\"mode\"\\s*:\\s*\"([^\"]+)\"";
+                java.util.regex.Pattern p3 = java.util.regex.Pattern.compile(modePattern);
+                java.util.regex.Matcher m3 = p3.matcher(configContent);
+                if (m3.find()) {
+                    mode = m3.group(1);
+                } else {
+                    mode = "manual"; // fallback
+                }
+                
+                // Simple JSON parsing for clickX (support negative numbers)
+                String clickXPattern = "\"clickX\"\\s*:\\s*(-?\\d+)";
+                java.util.regex.Pattern p4 = java.util.regex.Pattern.compile(clickXPattern);
+                java.util.regex.Matcher m4 = p4.matcher(configContent);
+                if (m4.find()) {
+                    clickX = Integer.parseInt(m4.group(1));
+                } else {
+                    clickX = 500; // fallback
+                }
+                
+                // Simple JSON parsing for clickY (support negative numbers)
+                String clickYPattern = "\"clickY\"\\s*:\\s*(-?\\d+)";
+                java.util.regex.Pattern p5 = java.util.regex.Pattern.compile(clickYPattern);
+                java.util.regex.Matcher m5 = p5.matcher(configContent);
+                if (m5.find()) {
+                    clickY = Integer.parseInt(m5.group(1));
+                } else {
+                    clickY = 300; // fallback
+                }
+                
+                log("Loaded config: maxMessageChars = " + maxMessageChars + ", wrapWidth = " + wrapWidth + ", mode = " + mode + ", clickX = " + clickX + ", clickY = " + clickY);
+                
+                // Validate configuration
+                validateConfig(configContent);
+                
+            } catch (Exception e) {
+                log("Error loading config, using defaults: " + e.getMessage());
+                maxMessageChars = 350000;
+                wrapWidth = 110;
+                mode = "manual";
+                clickX = 500;
+                clickY = 300;
             }
         }
-        // Regular content line
-        else if (inFileContent && currentFile) {
-            fileContent.push(lines[i]); // Keep original line with whitespace
+    }
+    
+    private void validateConfig(String configContent) throws IOException {
+        if (isAutomaticMode()) {
+            // Check if clickX and clickY are explicitly set in the config
+            boolean hasClickX = configContent.contains("\"clickX\"");
+            boolean hasClickY = configContent.contains("\"clickY\"");
+            
+            if (!hasClickX || !hasClickY) {
+                String error = "Configuration Error: Automatic mode requires 'clickX' and 'clickY' coordinates to be set in config.json";
+                log(error);
+                System.err.println(error);
+                System.err.println("Example config.json:");
+                System.err.println("{");
+                System.err.println("  \"maxMessageChars\": 350000,");
+                System.err.println("  \"wrapWidth\": 110,");
+                System.err.println("  \"mode\": \"automatic\",");
+                System.err.println("  \"clickX\": 500,");
+                System.err.println("  \"clickY\": 300");
+                System.err.println("}");
+                throw new IOException("Invalid configuration for automatic mode");
+            }
+            
+            // Validate coordinates are reasonable (allow negative for multi-monitor setups)
+            if (clickX < -10000 || clickY < -10000 || clickX > 10000 || clickY > 10000) {
+                String error = "Configuration Error: Click coordinates must be between -10000 and 10000. Found clickX=" + clickX + ", clickY=" + clickY;
+                log(error);
+                System.err.println(error);
+                throw new IOException("Invalid click coordinates");
+            }
+            
+            log("Automatic mode validated with coordinates: (" + clickX + ", " + clickY + ")");
         }
     }
     
-    // Save last file
-    if (currentFile && fileContent.length > 0) {
-        const content = fileContent.join('\n');
-        fs.writeFileSync(currentFile, content, 'utf8');
-        console.log(`  [OK] Wrote ${currentFile} (${content.length} chars)`);
-        extractedFiles++;
+    public int getMaxMessageChars() {
+        return maxMessageChars;
     }
     
-    console.log(`  Extracted ${extractedFiles} Java files`);
-    
-    // Verify files were created
-    const javaFiles = fs.readdirSync('.').filter(f => f.endsWith('.java'));
-    if (javaFiles.length === 0) {
-        console.error('ERROR: No Java files were extracted!');
-        process.exit(1);
+    public int getWrapWidth() {
+        return wrapWidth;
     }
     
-} catch (error) {
-    console.error(`ERROR: Failed to parse bundle file: ${error.message}`);
-    process.exit(1);
-}
-
-console.log('[2/5] Cleaning previous compilation artifacts...');
-// Clean up any previous .class files
-try {
-    const classFiles = fs.readdirSync('.').filter(f => f.endsWith('.class'));
-    for (const classFile of classFiles) {
-        fs.unlinkSync(classFile);
-        console.log(`  Deleted ${classFile}`);
+    public void setMaxMessageChars(int maxMessageChars) {
+        this.maxMessageChars = maxMessageChars;
     }
-} catch (error) {
-    // Ignore errors if no class files exist
-}
-
-console.log('[3/5] Compiling Java files...');
-try {
-    // Get list of Java files explicitly
-    const javaFiles = fs.readdirSync('.').filter(f => f.endsWith('.java'));
-    console.log(`  Found ${javaFiles.length} Java files to compile`);
     
-    const compileCommand = `javac ${javaFiles.join(' ')}`;
-    execSync(compileCommand, { stdio: 'inherit' });
-    console.log('  Compilation successful!');
-} catch (error) {
-    console.error('ERROR: Compilation failed!');
-    console.error(error.message);
-    process.exit(1);
+    public void setWrapWidth(int wrapWidth) {
+        this.wrapWidth = wrapWidth;
+    }
+    
+    public String getMode() {
+        return mode;
+    }
+    
+    public int getClickX() {
+        return clickX;
+    }
+    
+    public int getClickY() {
+        return clickY;
+    }
+    
+    public boolean isAutomaticMode() {
+        return "automatic".equals(mode);
+    }
+}
+|~|~|~|~|~|~|~|~|~|~|~|
+
+FILE: DirectoryOperations.java
+|~|~|~|~|~|~|~|~|~|~|~|
+import java.io.*;
+import java.nio.file.*;
+import java.util.*;
+import java.util.stream.Collectors;
+
+public class DirectoryOperations {
+    
+    private static void log(String message) {
+        Logger.log(message);
+    }
+    
+    private static String getWorkingDirectory() {
+        return BridgeTestRunner.getWorkingDirectory();
+    }
+    
+    private static Path resolvePath(String filePath) {
+        Path path = Paths.get(filePath);
+        if (path.isAbsolute()) {
+            return path;
+        } else {
+            return Paths.get(getWorkingDirectory()).resolve(path);
+        }
+    }
+    
+    public static ToolExecutor.ToolExecutionResult executeCreateDirectoryWithSummary(String toolParams) {
+        try {
+            String dirPath = ToolParameterExtractor.extractParameter(toolParams, "dir_path");
+            
+            if (dirPath == null || dirPath.trim().isEmpty()) {
+                String error = "Error: dir_path parameter is required";
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            Path path = resolvePath(dirPath);
+            
+            Files.createDirectories(path);
+            
+            String fullResult = String.format("Directory: %s\nCreated successfully", dirPath);
+            String summary = "Directory created";
+            
+            String enhancedResult = "DISPLAY_INFO:0|" + dirPath + "\n" + fullResult;
+            
+            return new ToolExecutor.ToolExecutionResult(enhancedResult, summary);
+            
+        } catch (Exception e) {
+            String error = "Error creating directory: " + e.getMessage();
+            return new ToolExecutor.ToolExecutionResult(error, error);
+        }
+    }
+    
+    public static ToolExecutor.ToolExecutionResult executeDeleteDirectoryWithSummary(String toolParams) {
+        try {
+            String dirPath = ToolParameterExtractor.extractParameter(toolParams, "dir_path");
+            
+            if (dirPath == null || dirPath.trim().isEmpty()) {
+                String error = "Error: dir_path parameter is required";
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            Path path = resolvePath(dirPath);
+            
+            if (!Files.exists(path)) {
+                String error = "Error: Directory not found: " + dirPath;
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            if (!Files.isDirectory(path)) {
+                String error = "Error: Path is not a directory: " + dirPath;
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            Files.walk(path)
+                .sorted((a, b) -> b.compareTo(a))
+                .forEach(p -> {
+                    try {
+                        Files.delete(p);
+                    } catch (Exception e) {
+                        throw new RuntimeException("Failed to delete: " + p, e);
+                    }
+                });
+            
+            String fullResult = String.format("Directory: %s\nDeleted successfully (recursive)", dirPath);
+            String summary = "Directory deleted (recursive)";
+            
+            String enhancedResult = "DISPLAY_INFO:0|" + dirPath + "\n" + fullResult;
+            
+            return new ToolExecutor.ToolExecutionResult(enhancedResult, summary);
+            
+        } catch (Exception e) {
+            String error = "Error deleting directory: " + e.getMessage();
+            return new ToolExecutor.ToolExecutionResult(error, error);
+        }
+    }
+    
+    public static ToolExecutor.ToolExecutionResult executeListFilesWithSummary(String toolParams) {
+        try {
+            String pathParam = ToolParameterExtractor.extractParameter(toolParams, "path");
+            String targetPath = (pathParam != null && !pathParam.trim().isEmpty()) ? pathParam : getWorkingDirectory();
+            
+            Path path = resolvePath(targetPath);
+            
+            if (!Files.exists(path)) {
+                String error = "Error: Path not found: " + targetPath;
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            if (!Files.isDirectory(path)) {
+                String error = "Error: Path is not a directory: " + targetPath;
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            StringBuilder results = new StringBuilder();
+            int fileCount = 0;
+            int dirCount = 0;
+            
+            try {
+                List<Path> entries = Files.list(path)
+                    .sorted((a, b) -> {
+                        boolean aIsDir = Files.isDirectory(a);
+                        boolean bIsDir = Files.isDirectory(b);
+                        if (aIsDir && !bIsDir) return -1;
+                        if (!aIsDir && bIsDir) return 1;
+                        return a.getFileName().toString().compareToIgnoreCase(b.getFileName().toString());
+                    })
+                    .collect(Collectors.toList());
+                
+                for (Path entry : entries) {
+                    String fileName = entry.getFileName().toString();
+                    if (Files.isDirectory(entry)) {
+                        results.append(String.format("[DIR]  %s/\n", fileName));
+                        dirCount++;
+                    } else {
+                        long fileSize = Files.size(entry);
+                        results.append(String.format("[FILE] %s (%s)\n", fileName, ToolParameterExtractor.formatFileSize(fileSize)));
+                        fileCount++;
+                    }
+                }
+            } catch (Exception e) {
+                String error = "Error listing directory: " + e.getMessage();
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            String fullResult = String.format("Directory listing for: %s\n\n%s\nTotal: %d directories, %d files", 
+                targetPath, results.toString(), dirCount, fileCount);
+            String summary = "Listed " + dirCount + " dirs, " + fileCount + " files";
+            
+            String enhancedResult = "DISPLAY_INFO:" + (dirCount + fileCount) + "|" + targetPath + "\n" + fullResult;
+            return new ToolExecutor.ToolExecutionResult(enhancedResult, summary);
+            
+        } catch (Exception e) {
+            String error = "Error listing files: " + e.getMessage();
+            return new ToolExecutor.ToolExecutionResult(error, error);
+        }
+    }
+    
+    public static ToolExecutor.ToolExecutionResult executeListRecursiveWithSummary(String toolParams) {
+        try {
+            String pathParam = ToolParameterExtractor.extractParameter(toolParams, "path");
+            String targetPath = (pathParam != null && !pathParam.trim().isEmpty()) ? pathParam : getWorkingDirectory();
+            
+            Path path = resolvePath(targetPath);
+            
+            if (!Files.exists(path)) {
+                String error = "Error: Path not found: " + targetPath;
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            if (!Files.isDirectory(path)) {
+                String error = "Error: Path is not a directory: " + targetPath;
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            StringBuilder results = new StringBuilder();
+            int fileCount = 0;
+            int dirCount = 0;
+            
+            try {
+                List<Path> entries = Files.walk(path)
+                    .filter(p -> !p.equals(path))
+                    .sorted()
+                    .collect(Collectors.toList());
+                
+                for (Path entry : entries) {
+                    String relativePath = path.relativize(entry).toString();
+                    if (Files.isDirectory(entry)) {
+                        results.append(String.format("[DIR]  %s/\n", relativePath));
+                        dirCount++;
+                    } else {
+                        long fileSize = Files.size(entry);
+                        results.append(String.format("[FILE] %s (%s)\n", relativePath, ToolParameterExtractor.formatFileSize(fileSize)));
+                        fileCount++;
+                    }
+                }
+            } catch (Exception e) {
+                String error = "Error listing directory recursively: " + e.getMessage();
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            String fullResult = String.format("Recursive listing for: %s\n\n%s\nTotal: %d directories, %d files", 
+                targetPath, results.toString(), dirCount, fileCount);
+            String summary = "Listed " + dirCount + " dirs, " + fileCount + " files (recursive)";
+            
+            String enhancedResult = "DISPLAY_INFO:" + (dirCount + fileCount) + "|" + targetPath + "\n" + fullResult;
+            return new ToolExecutor.ToolExecutionResult(enhancedResult, summary);
+            
+        } catch (Exception e) {
+            String error = "Error listing files recursively: " + e.getMessage();
+            return new ToolExecutor.ToolExecutionResult(error, error);
+        }
+    }
+}
+|~|~|~|~|~|~|~|~|~|~|~|
+
+FILE: FileOperations.java
+|~|~|~|~|~|~|~|~|~|~|~|
+import java.io.*;
+import java.nio.file.*;
+import java.nio.file.StandardCopyOption;
+import java.util.*;
+
+public class FileOperations {
+    
+    private static void log(String message) {
+        Logger.log(message);
+    }
+    
+    private static String getWorkingDirectory() {
+        return BridgeTestRunner.getWorkingDirectory();
+    }
+    
+    private static Path resolvePath(String filePath) {
+        Path path = Paths.get(filePath);
+        if (path.isAbsolute()) {
+            return path;
+        } else {
+            return Paths.get(getWorkingDirectory()).resolve(path);
+        }
+    }
+    
+    public static ToolExecutor.ToolExecutionResult executeReadFileWithSummary(String toolParams) {
+        try {
+            String filePath = ToolParameterExtractor.extractParameter(toolParams, "file_path");
+            String findString = ToolParameterExtractor.extractParameter(toolParams, "find_string");
+            String limitStr = ToolParameterExtractor.extractParameter(toolParams, "limit");
+            
+            if (filePath == null || filePath.trim().isEmpty()) {
+                String error = "Error: file_path parameter is required";
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            Path path = resolvePath(filePath);
+            
+            if (!Files.exists(path)) {
+                String error = "Error: File not found: " + filePath;
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            List<String> lines = Files.readAllLines(path);
+            int startIndex = 0;
+            int limit = lines.size();
+            
+            if (findString != null && !findString.trim().isEmpty()) {
+                FindResult findResult = findStringInLines(lines, findString);
+                if (findResult.isError()) {
+                    return new ToolExecutor.ToolExecutionResult(findResult.errorMessage, findResult.errorMessage);
+                }
+                startIndex = findResult.lineIndex;
+            }
+            
+            if (limitStr != null && !limitStr.trim().isEmpty()) {
+                try {
+                    limit = Integer.parseInt(limitStr.trim());
+                } catch (NumberFormatException e) {
+                    String error = "Error: limit parameter must be a valid number: " + limitStr;
+                    return new ToolExecutor.ToolExecutionResult(error, error);
+                }
+            }
+            
+            int endIndex = Math.min(startIndex + limit, lines.size());
+            StringBuilder content = new StringBuilder();
+            
+            for (int i = startIndex; i < endIndex; i++) {
+                content.append(lines.get(i)).append("\n");
+            }
+            
+            int linesRead = endIndex - startIndex;
+            String summary = linesRead + " lines";
+            
+            if (findString != null && !findString.trim().isEmpty()) {
+                summary += " starting from \"" + findString + "\"";
+            }
+            
+            String enhancedResult = "DISPLAY_INFO:" + linesRead + "|" + filePath + "\n" + content.toString();
+            
+            return new ToolExecutor.ToolExecutionResult(enhancedResult, summary);
+            
+        } catch (Exception e) {
+            String error = "Error reading file: " + e.getMessage();
+            return new ToolExecutor.ToolExecutionResult(error, error);
+        }
+    }
+    
+    public static ToolExecutor.ToolExecutionResult executeReadFileLinesWithSummary(String toolParams) {
+        try {
+            String filePath = ToolParameterExtractor.extractParameter(toolParams, "file_path");
+            String startLineStr = ToolParameterExtractor.extractParameter(toolParams, "start_line");
+            String endLineStr = ToolParameterExtractor.extractParameter(toolParams, "end_line");
+
+            if (filePath == null || filePath.trim().isEmpty()) {
+                String error = "Error: file_path parameter is required";
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+
+            if (startLineStr == null || startLineStr.trim().isEmpty()) {
+                String error = "Error: start_line parameter is required";
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+
+            if (endLineStr == null || endLineStr.trim().isEmpty()) {
+                String error = "Error: end_line parameter is required";
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+
+            Path path = resolvePath(filePath);
+
+            if (!Files.exists(path)) {
+                String error = "Error: File not found: " + filePath;
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+
+            int startLine, endLine;
+            try {
+                startLine = Integer.parseInt(startLineStr.trim());
+                endLine = Integer.parseInt(endLineStr.trim());
+            } catch (NumberFormatException e) {
+                String error = "Error: start_line and end_line must be valid numbers";
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+
+            if (startLine < 1) {
+                String error = "Error: start_line must be >= 1 (line numbers are 1-indexed)";
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+
+            if (endLine < startLine) {
+                String error = "Error: end_line must be >= start_line";
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+
+            List<String> lines = Files.readAllLines(path);
+
+            // Convert to 0-indexed
+            int startIndex = startLine - 1;
+            int endIndex = Math.min(endLine, lines.size()); // endLine is inclusive, but we use it as exclusive upper bound
+
+            if (startIndex >= lines.size()) {
+                String error = String.format("Error: start_line %d exceeds file length (%d lines)", startLine, lines.size());
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+
+            StringBuilder content = new StringBuilder();
+
+            for (int i = startIndex; i < endIndex; i++) {
+                content.append(String.format("%d: %s\n", i + 1, lines.get(i)));
+            }
+
+            int linesRead = endIndex - startIndex;
+            String summary = String.format("Lines %d-%d (%d lines)", startLine, endIndex, linesRead);
+
+            String enhancedResult = "DISPLAY_INFO:" + linesRead + "|" + filePath + "\n" + content.toString();
+
+            return new ToolExecutor.ToolExecutionResult(enhancedResult, summary);
+
+        } catch (Exception e) {
+            String error = "Error reading file lines: " + e.getMessage();
+            log("ERROR in executeReadFileLinesWithSummary: " + e.getClass().getName() + " - " + e.getMessage());
+            e.printStackTrace();
+            return new ToolExecutor.ToolExecutionResult(error, error);
+        }
+    }
+
+    public static ToolExecutor.ToolExecutionResult executeCreateFileWithSummary(String toolParams) {
+        try {
+            String filePath = ToolParameterExtractor.extractParameter(toolParams, "file_path");
+            String content = ToolParameterExtractor.extractParameter(toolParams, "content");
+
+            if (filePath == null || filePath.trim().isEmpty()) {
+                String error = "Error: file_path parameter is required";
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+
+            if (content == null) {
+                content = "";
+            }
+            
+            Path path = resolvePath(filePath);
+            
+            Path parentDir = path.getParent();
+            if (parentDir != null && !Files.exists(parentDir)) {
+                Files.createDirectories(parentDir);
+            }
+            
+            Files.write(path, content.getBytes());
+            
+            long lines = content.isEmpty() ? 0 : content.split("\n").length;
+            String summary = "Created (" + lines + " lines)";
+            
+            // Generate diff display for new file (all lines are additions)
+            String diffContent = generateCreateFileDiff(content);
+            String enhancedResult = "DISPLAY_INFO:" + lines + "|" + filePath + "\n\n" + diffContent;
+            
+            return new ToolExecutor.ToolExecutionResult(enhancedResult, summary);
+            
+        } catch (Exception e) {
+            String error = "Error creating file: " + e.getMessage();
+            return new ToolExecutor.ToolExecutionResult(error, error);
+        }
+    }
+    
+    public static ToolExecutor.ToolExecutionResult executeDeleteFileWithSummary(String toolParams) {
+        try {
+            String filePath = ToolParameterExtractor.extractParameter(toolParams, "file_path");
+            
+            if (filePath == null || filePath.trim().isEmpty()) {
+                String error = "Error: file_path parameter is required";
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            Path path = resolvePath(filePath);
+            
+            if (!Files.exists(path)) {
+                String error = "Error: File not found: " + filePath;
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            Files.delete(path);
+            
+            String fullResult = String.format("File: %s\nDeleted successfully", filePath);
+            String summary = "File deleted";
+            
+            String enhancedResult = "DISPLAY_INFO:0|" + filePath + "\n" + fullResult;
+            
+            return new ToolExecutor.ToolExecutionResult(enhancedResult, summary);
+            
+        } catch (Exception e) {
+            String error = "Error deleting file: " + e.getMessage();
+            return new ToolExecutor.ToolExecutionResult(error, error);
+        }
+    }
+    
+    public static ToolExecutor.ToolExecutionResult executeMoveFileWithSummary(String toolParams) {
+        try {
+            String sourcePath = ToolParameterExtractor.extractParameter(toolParams, "source_path");
+            String destPath = ToolParameterExtractor.extractParameter(toolParams, "dest_path");
+            
+            if (sourcePath == null || sourcePath.trim().isEmpty()) {
+                String error = "Error: source_path parameter is required";
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            if (destPath == null || destPath.trim().isEmpty()) {
+                String error = "Error: dest_path parameter is required";
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            Path source = resolvePath(sourcePath);
+            Path dest = resolvePath(destPath);
+            
+            if (!Files.exists(source)) {
+                String error = "Error: Source file not found: " + sourcePath;
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            Path destParent = dest.getParent();
+            if (destParent != null && !Files.exists(destParent)) {
+                Files.createDirectories(destParent);
+            }
+            
+            Files.move(source, dest, StandardCopyOption.REPLACE_EXISTING);
+            
+            String fullResult = String.format("File moved successfully\nFrom: %s\nTo: %s", sourcePath, destPath);
+            String summary = "File moved";
+            
+            long fileSize = Files.size(dest);
+            long lines = 0;
+            try {
+                lines = Files.lines(dest).count();
+            } catch (Exception e) {
+                // Non-text file or reading issue, keep lines as 0
+            }
+            
+            String enhancedResult = "DISPLAY_INFO:" + lines + "|" + destPath + "\n" + fullResult;
+            
+            return new ToolExecutor.ToolExecutionResult(enhancedResult, summary);
+            
+        } catch (Exception e) {
+            String error = "Error moving file: " + e.getMessage();
+            return new ToolExecutor.ToolExecutionResult(error, error);
+        }
+    }
+    
+    public static ToolExecutor.ToolExecutionResult executeUpdateFileWithSummary(String toolParams) {
+        try {
+            String filePath = ToolParameterExtractor.extractParameter(toolParams, "file_path");
+            String findString = ToolParameterExtractor.extractParameter(toolParams, "find_string");
+            String replaceString = ToolParameterExtractor.extractParameter(toolParams, "replace_string");
+            
+            if (filePath == null || filePath.trim().isEmpty()) {
+                String error = "Error: file_path parameter is required";
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            if (findString == null || findString.trim().isEmpty()) {
+                String error = "Error: find_string parameter is required";
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            if (replaceString == null) {
+                replaceString = ""; // Allow replacing with empty string
+            }
+            
+            Path path = resolvePath(filePath);
+            
+            if (!Files.exists(path)) {
+                String error = "Error: File not found: " + filePath;
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            // Read the file content
+            String content = new String(Files.readAllBytes(path));
+            
+            // Count occurrences of find_string
+            int occurrences = countOccurrences(content, findString);
+            
+            if (occurrences == 0) {
+                String error = String.format("Error: String '%s' not found in file %s", findString, filePath);
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            if (occurrences > 1) {
+                String error = String.format("Error: String '%s' appears %d times in file %s. The find_string must be unique to avoid ambiguity.", 
+                    findString, occurrences, filePath);
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            // Perform the replacement (we know it's exactly 1 occurrence)
+            String updatedContent = content.replace(findString, replaceString);
+            
+            // Write the updated content back to the file
+            Files.write(path, updatedContent.getBytes());
+            
+            // Calculate line changes
+            long originalLines = content.isEmpty() ? 0 : content.split("\n").length;
+            long updatedLines = updatedContent.isEmpty() ? 0 : updatedContent.split("\n").length;
+            long lineChange = updatedLines - originalLines;
+            
+            String changeInfo = "";
+            if (lineChange > 0) {
+                changeInfo = String.format(" (+%d lines)", lineChange);
+            } else if (lineChange < 0) {
+                changeInfo = String.format(" (%d lines)", lineChange);
+            }
+            
+            String summary = "Updated" + changeInfo;
+            
+            // Generate context diff for display - this is all we need to show
+            String contextDiff = generateContextDiff(content, findString, replaceString);
+            String enhancedResult = "DISPLAY_INFO:" + updatedLines + "|" + filePath + "\n\n" + contextDiff;
+            
+            return new ToolExecutor.ToolExecutionResult(enhancedResult, summary);
+            
+        } catch (Exception e) {
+            String error = "Error updating file: " + e.getMessage();
+            return new ToolExecutor.ToolExecutionResult(error, error);
+        }
+    }
+    
+    private static int countOccurrences(String text, String searchString) {
+        int count = 0;
+        int index = 0;
+        while ((index = text.indexOf(searchString, index)) != -1) {
+            count++;
+            index += searchString.length();
+        }
+        return count;
+    }
+    
+    private static String generateContextDiff(String originalContent, String findString, String replaceString) {
+        try {
+            String[] originalLines = originalContent.split("\n");
+            
+            // Find the line(s) containing the findString
+            int findStartLine = -1;
+            int findEndLine = -1;
+            
+            for (int i = 0; i < originalLines.length; i++) {
+                if (originalLines[i].contains(findString)) {
+                    if (findStartLine == -1) {
+                        findStartLine = i;
+                    }
+                    findEndLine = i;
+                }
+            }
+            
+            if (findStartLine == -1) {
+                // If we can't find the exact string, try to find it in the full content
+                // This handles multi-line replacements better
+                String fullContent = String.join("\n", originalLines);
+                if (fullContent.contains(findString)) {
+                    // Found it in content but line-by-line search failed
+                    // Show a simple before/after diff
+                    StringBuilder diff = new StringBuilder();
+                    String[] findLines = findString.split("\n");
+                    String[] replaceLines = replaceString.split("\n");
+                    
+                    for (String line : findLines) {
+                        diff.append("- ").append(line).append("\n");
+                    }
+                    for (String line : replaceLines) {
+                        diff.append("+ ").append(line).append("\n");
+                    }
+                    return diff.toString().replaceAll("\\s+$", "");
+                } else {
+                    // Last resort fallback - show clean diff format instead of verbose
+                    StringBuilder diff = new StringBuilder();
+                    String[] findLines = findString.split("\n");
+                    String[] replaceLines = replaceString.split("\n");
+                    
+                    for (String line : findLines) {
+                        diff.append("- ").append(line).append("\n");
+                    }
+                    for (String line : replaceLines) {
+                        diff.append("+ ").append(line).append("\n");
+                    }
+                    return diff.toString().replaceAll("\\s+$", "");
+                }
+            }
+            
+            // Show context: 3 lines before and 3 lines after
+            int contextStart = Math.max(0, findStartLine - 3);
+            int contextEnd = Math.min(originalLines.length - 1, findEndLine + 3);
+            
+            StringBuilder diff = new StringBuilder();
+            
+            // Add context lines before the change
+            for (int i = contextStart; i < findStartLine; i++) {
+                diff.append("  ").append(originalLines[i]).append("\n");
+            }
+            
+            // Smart diff: detect insertion vs replacement patterns
+            String[] oldLines = findString.split("\n");
+            String[] newLines = replaceString.split("\n");
+            
+            // Check if this is an insertion pattern (replaceString contains findString + more content)
+            if (oldLines.length == 1 && newLines.length > 1 && replaceString.startsWith(findString)) {
+                // This is an insertion after existing content - show unchanged part and additions only
+                
+                // Show the unchanged content as context (not as removal/addition)
+                diff.append("  ").append(oldLines[0]).append("\n");
+                
+                // Show only the newly added lines (skip the first one which is the unchanged original)
+                for (int i = 1; i < newLines.length; i++) {
+                    diff.append("+ ").append(newLines[i]).append("\n");
+                }
+            } else {
+                // This is a replacement - show removed and added lines only (no duplicate context)
+                
+                // Show removed lines 
+                for (String oldLine : oldLines) {
+                    diff.append("- ").append(oldLine).append("\n");
+                }
+                
+                // Show added lines
+                for (String newLine : newLines) {
+                    diff.append("+ ").append(newLine).append("\n");
+                }
+            }
+            
+            // Add context lines after the change
+            for (int i = findEndLine + 1; i <= contextEnd; i++) {
+                diff.append("  ").append(originalLines[i]).append("\n");
+            }
+            
+            // Don't trim - this would remove the leading spaces from context lines
+            String result = diff.toString();
+            // Only remove trailing whitespace, preserve leading spaces for diff prefixes
+            return result.replaceAll("\\s+$", "");
+            
+        } catch (Exception e) {
+            // Fallback to simple format if anything goes wrong
+            return String.format("Replaced: '%s'\nWith: '%s'", findString, replaceString);
+        }
+    }
+    
+    private static FindResult findStringInLines(List<String> lines, String findString) {
+        for (int i = 0; i < lines.size(); i++) {
+            if (lines.get(i).contains(findString)) {
+                return FindResult.success(i);
+            }
+        }
+        return FindResult.error("String not found: " + findString);
+    }
+    
+    private static class FindResult {
+        boolean isError;
+        String errorMessage;
+        int lineIndex;
+        
+        FindResult(boolean isError, String errorMessage, int lineIndex) {
+            this.isError = isError;
+            this.errorMessage = errorMessage;
+            this.lineIndex = lineIndex;
+        }
+        
+        boolean isError() {
+            return isError;
+        }
+        
+        static FindResult success(int lineIndex) {
+            return new FindResult(false, null, lineIndex);
+        }
+        
+        static FindResult error(String message) {
+            return new FindResult(true, message, -1);
+        }
+    }
+    
+    public static ToolExecutor.ToolExecutionResult executeGitReadWithSummary(String toolParams) {
+        try {
+            String projectPath = ToolParameterExtractor.extractParameter(toolParams, "project_path");
+            String gitArgs = ToolParameterExtractor.extractParameter(toolParams, "git_args");
+            String offsetStr = ToolParameterExtractor.extractParameter(toolParams, "offset");
+            String limitStr = ToolParameterExtractor.extractParameter(toolParams, "limit");
+            
+            if (projectPath == null || projectPath.trim().isEmpty()) {
+                String error = "Error: project_path parameter is required";
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            if (gitArgs == null || gitArgs.trim().isEmpty()) {
+                String error = "Error: git_args parameter is required";
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            Path projectDir = resolvePath(projectPath);
+            if (!Files.exists(projectDir) || !Files.isDirectory(projectDir)) {
+                String error = "Error: Project directory not found: " + projectPath;
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            // Check if it's a git repository
+            Path gitDir = projectDir.resolve(".git");
+            if (!Files.exists(gitDir)) {
+                String error = "Error: Not a git repository: " + projectPath;
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            // Validate git command safety
+            String[] args = gitArgs.trim().split("\\s+");
+            if (args.length == 0) {
+                String error = "Error: git_args cannot be empty";
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            // Check whitelist for first argument (git command)
+            String gitCommand = args[0].toLowerCase();
+            if (!isAllowedGitCommand(gitCommand)) {
+                String error = "Error: Git command '" + gitCommand + "' is not allowed. Only read-only commands are permitted.";
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            // Check blacklist for dangerous arguments
+            for (String arg : args) {
+                if (isBlacklistedGitArg(arg)) {
+                    String error = "Error: Git argument '" + arg + "' is not allowed for security reasons.";
+                    return new ToolExecutor.ToolExecutionResult(error, error);
+                }
+            }
+            
+            // Execute git command
+            ProcessBuilder pb = new ProcessBuilder();
+            pb.command("git", "-C", projectDir.toAbsolutePath().toString());
+            for (String arg : args) {
+                pb.command().add(arg);
+            }
+            pb.redirectErrorStream(true);
+            
+            Process process = pb.start();
+            
+            // Read output
+            StringBuilder output = new StringBuilder();
+            try (java.io.BufferedReader reader = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(process.getInputStream()))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    output.append(line).append("\n");
+                }
+            }
+            
+            int exitCode = process.waitFor();
+            if (exitCode != 0) {
+                String error = "Git command failed with exit code " + exitCode + ":\n" + output.toString();
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            String fullOutput = output.toString();
+            String[] outputLines = fullOutput.split("\n");
+            
+            // Apply offset and limit if provided
+            int offset = 0;
+            int limit = outputLines.length;
+            
+            if (offsetStr != null && !offsetStr.trim().isEmpty()) {
+                try {
+                    offset = Integer.parseInt(offsetStr.trim());
+                } catch (NumberFormatException e) {
+                    String error = "Error: offset parameter must be a valid number: " + offsetStr;
+                    return new ToolExecutor.ToolExecutionResult(error, error);
+                }
+            }
+            
+            if (limitStr != null && !limitStr.trim().isEmpty()) {
+                try {
+                    limit = Integer.parseInt(limitStr.trim());
+                } catch (NumberFormatException e) {
+                    String error = "Error: limit parameter must be a valid number: " + limitStr;
+                    return new ToolExecutor.ToolExecutionResult(error, error);
+                }
+            }
+            
+            // Extract the requested slice of output
+            int startIndex = Math.max(0, Math.min(offset, outputLines.length));
+            int endIndex = Math.min(startIndex + limit, outputLines.length);
+            
+            StringBuilder slicedOutput = new StringBuilder();
+            for (int i = startIndex; i < endIndex; i++) {
+                if (i > startIndex) slicedOutput.append("\n");
+                slicedOutput.append(outputLines[i]);
+            }
+            
+            int linesShown = endIndex - startIndex;
+            String summary = "git " + gitCommand + ": " + linesShown + " lines";
+            if (offset > 0) {
+                summary += " (offset " + offset + ")";
+            }
+            
+            // Use standard 4-part format but put git command info in a way that can be extracted
+            String enhancedResult = "DISPLAY_INFO:" + linesShown + "|" + projectPath + "|GIT:" + gitArgs + "\n" + slicedOutput.toString();
+            
+            return new ToolExecutor.ToolExecutionResult(enhancedResult, summary);
+            
+        } catch (Exception e) {
+            String error = "Error executing git command: " + e.getMessage();
+            return new ToolExecutor.ToolExecutionResult(error, error);
+        }
+    }
+    
+    private static boolean isAllowedGitCommand(String command) {
+        // Whitelist of safe, read-only git commands
+        String[] allowedCommands = {
+            "status", "log", "show", "diff", "branch", "remote", "tag",
+            "ls-files", "ls-tree", "ls-remote", "rev-parse", "describe", 
+            "config", "blame", "annotate", "reflog", "shortlog", "whatchanged",
+            "cat-file", "rev-list", "name-rev", "symbolic-ref", "for-each-ref",
+            "merge-base", "show-branch", "show-ref"
+        };
+        
+        for (String allowed : allowedCommands) {
+            if (command.equals(allowed)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    
+    private static boolean isBlacklistedGitArg(String arg) {
+        // Blacklist of dangerous arguments
+        String[] blacklistedArgs = {
+            "--exec", "--upload-pack", "--receive-pack", "--upload-archive",
+            "--exec=", "--upload-pack=", "--receive-pack=", "--upload-archive="
+        };
+        
+        for (String blacklisted : blacklistedArgs) {
+            if (arg.equals(blacklisted) || arg.startsWith(blacklisted)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    
+    private static String generateCreateFileDiff(String content) {
+        if (content.isEmpty()) {
+            return ""; // Empty file, no diff to show
+        }
+        
+        StringBuilder diff = new StringBuilder();
+        String[] lines = content.split("\n", -1); // -1 to preserve trailing empty strings
+        
+        for (String line : lines) {
+            diff.append("+ ").append(line).append("\n");
+        }
+        
+        return diff.toString();
+    }
+}
+|~|~|~|~|~|~|~|~|~|~|~|
+
+FILE: Logger.java
+|~|~|~|~|~|~|~|~|~|~|~|
+import java.io.*;
+import java.nio.file.*;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+
+public class Logger {
+    
+    public static void log(String message) {
+        try {
+            String logFile = BridgeTestRunner.getLogFile();
+            String timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS"));
+            String logMessage = "[" + timestamp + "] " + message + "\n";
+            Files.write(Paths.get(logFile), logMessage.getBytes(), 
+                       StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+        } catch (Exception e) {
+            System.err.println("Failed to write to log: " + e.getMessage());
+        }
+    }
+}
+|~|~|~|~|~|~|~|~|~|~|~|
+
+FILE: SearchOperations.java
+|~|~|~|~|~|~|~|~|~|~|~|
+import java.io.*;
+import java.nio.file.*;
+import java.util.*;
+
+public class SearchOperations {
+    
+    private static void log(String message) {
+        Logger.log(message);
+    }
+    
+    private static String getWorkingDirectory() {
+        return BridgeTestRunner.getWorkingDirectory();
+    }
+    
+    public static ToolExecutor.ToolExecutionResult executeSearchFilesWithSummary(String toolParams) {
+        try {
+            String query = ToolParameterExtractor.extractParameter(toolParams, "query");
+            
+            if (query == null || query.trim().isEmpty()) {
+                String error = "Error: query parameter is required";
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            Path currentPath = Paths.get(getWorkingDirectory());
+            StringBuilder results = new StringBuilder();
+            int matchCount = 0;
+            
+            try {
+                matchCount = (int) Files.walk(currentPath)
+                    .filter(Files::isRegularFile)
+                    .filter(path -> path.getFileName().toString().toLowerCase().contains(query.toLowerCase()))
+                    .peek(path -> {
+                        try {
+                            long fileSize = Files.size(path);
+                            results.append(String.format("%s (%s)\n", 
+                                path.toString().replace("./", ""), 
+                                ToolParameterExtractor.formatFileSize(fileSize)));
+                        } catch (Exception e) {
+                            results.append(path.toString().replace("./", "")).append("\n");
+                        }
+                    })
+                    .mapToInt(e -> 1)
+                    .sum();
+            } catch (Exception e) {
+                String error = "Error searching files: " + e.getMessage();
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+            
+            String fullResult;
+            String summary;
+            
+            if (matchCount == 0) {
+                fullResult = "No files found matching: " + query;
+                summary = "No files found";
+            } else {
+                fullResult = String.format("Found %d file(s) matching '%s':\n\n%s", 
+                    matchCount, query, results.toString());
+                summary = "Found " + matchCount + " files";
+            }
+            
+            String enhancedResult = "DISPLAY_INFO:" + matchCount + "|search results\n" + fullResult;
+            return new ToolExecutor.ToolExecutionResult(enhancedResult, summary);
+            
+        } catch (Exception e) {
+            String error = "Error searching files: " + e.getMessage();
+            return new ToolExecutor.ToolExecutionResult(error, error);
+        }
+    }
+    
+    public static ToolExecutor.ToolExecutionResult executeSearchContentWithSummary(String toolParams) {
+        try {
+            String query = ToolParameterExtractor.extractParameter(toolParams, "query");
+            String filePattern = ToolParameterExtractor.extractParameter(toolParams, "file_pattern");
+            String maxResultsStr = ToolParameterExtractor.extractParameter(toolParams, "max_results");
+            String maxPerFileStr = ToolParameterExtractor.extractParameter(toolParams, "max_results_per_file");
+
+            if (query == null || query.trim().isEmpty()) {
+                String error = "Error: query parameter is required";
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+
+            // Parse limits with defaults
+            int maxResults = 100; // Default: show up to 100 total results
+            int maxPerFile = 10;  // Default: show up to 10 matches per file
+
+            try {
+                if (maxResultsStr != null && !maxResultsStr.trim().isEmpty()) {
+                    maxResults = Integer.parseInt(maxResultsStr.trim());
+                }
+                if (maxPerFileStr != null && !maxPerFileStr.trim().isEmpty()) {
+                    maxPerFile = Integer.parseInt(maxPerFileStr.trim());
+                }
+            } catch (NumberFormatException e) {
+                log("Invalid max_results or max_results_per_file parameter, using defaults");
+            }
+
+            Path currentPath = Paths.get(getWorkingDirectory());
+            StringBuilder results = new StringBuilder();
+            int totalMatches = 0;
+            int filesWithMatches = 0;
+            boolean truncated = false;
+            final int MAX_OUTPUT_CHARS = 50000; // 50KB limit
+
+            try {
+                List<Path> filesToSearch = Files.walk(currentPath)
+                    .filter(Files::isRegularFile)
+                    .filter(path -> {
+                        if (filePattern == null || filePattern.trim().isEmpty()) {
+                            return true;
+                        }
+                        String fileName = path.getFileName().toString();
+                        String pattern = filePattern.replace("*", ".*").replace("?", ".");
+                        return fileName.matches(pattern);
+                    })
+                    .collect(java.util.stream.Collectors.toList());
+
+                for (Path path : filesToSearch) {
+                    if (totalMatches >= maxResults || results.length() >= MAX_OUTPUT_CHARS) {
+                        truncated = true;
+                        break;
+                    }
+
+                    try {
+                        List<String> lines = Files.readAllLines(path);
+                        int matchesInFile = 0;
+                        boolean foundInFile = false;
+
+                        for (int i = 0; i < lines.size(); i++) {
+                            if (lines.get(i).toLowerCase().contains(query.toLowerCase())) {
+                                if (!foundInFile) {
+                                    results.append("\n=== ").append(path.toString().replace("./", "")).append(" ===\n");
+                                    foundInFile = true;
+                                    filesWithMatches++;
+                                }
+
+                                // Show only the matching line with line number (1-indexed)
+                                results.append(String.format("  Line %d: %s\n", i + 1, lines.get(i)));
+                                matchesInFile++;
+                                totalMatches++;
+
+                                // Check per-file limit
+                                if (matchesInFile >= maxPerFile) {
+                                    int remainingInFile = 0;
+                                    for (int j = i + 1; j < lines.size(); j++) {
+                                        if (lines.get(j).toLowerCase().contains(query.toLowerCase())) {
+                                            remainingInFile++;
+                                        }
+                                    }
+                                    if (remainingInFile > 0) {
+                                        results.append(String.format("  ... (%d more matches in this file)\n", remainingInFile));
+                                    }
+                                    break;
+                                }
+
+                                // Check total limit
+                                if (totalMatches >= maxResults) {
+                                    truncated = true;
+                                    break;
+                                }
+
+                                // Check output size limit
+                                if (results.length() >= MAX_OUTPUT_CHARS) {
+                                    truncated = true;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (truncated) break;
+
+                    } catch (Exception e) {
+                        // Skip files that can't be read
+                        log("Error reading file " + path + ": " + e.getMessage());
+                    }
+                }
+
+            } catch (Exception e) {
+                String error = "Error searching content: " + e.getMessage();
+                return new ToolExecutor.ToolExecutionResult(error, error);
+            }
+
+            String fullResult;
+            String summary;
+
+            if (totalMatches == 0) {
+                String patternInfo = (filePattern != null && !filePattern.trim().isEmpty())
+                    ? " in " + filePattern + " files" : "";
+                fullResult = "No matches found for: " + query + patternInfo;
+                summary = "No matches found";
+            } else {
+                String patternInfo = (filePattern != null && !filePattern.trim().isEmpty())
+                    ? " in " + filePattern + " files" : "";
+
+                StringBuilder resultBuilder = new StringBuilder();
+                resultBuilder.append(String.format("Found %d match(es) for '%s'%s in %d file(s):\n",
+                    totalMatches, query, patternInfo, filesWithMatches));
+                resultBuilder.append(results.toString());
+
+                if (truncated) {
+                    resultBuilder.append("\n⚠ Results truncated. ");
+                    if (totalMatches >= maxResults) {
+                        resultBuilder.append(String.format("Showing first %d matches. ", maxResults));
+                    }
+                    resultBuilder.append("Use file_pattern to narrow search or read_file_lines to see context.");
+                }
+
+                fullResult = resultBuilder.toString();
+                summary = truncated ?
+                    String.format("Found %d+ matches in %d+ files (truncated)", totalMatches, filesWithMatches) :
+                    String.format("Found %d matches in %d files", totalMatches, filesWithMatches);
+            }
+
+            String enhancedResult = "DISPLAY_INFO:" + filesWithMatches + "|search results\n" + fullResult;
+            return new ToolExecutor.ToolExecutionResult(enhancedResult, summary);
+
+        } catch (Exception e) {
+            String error = "Error searching content: " + e.getMessage();
+            return new ToolExecutor.ToolExecutionResult(error, error);
+        }
+    }
+}
+|~|~|~|~|~|~|~|~|~|~|~|
+
+FILE: SystemTrayManager.java
+|~|~|~|~|~|~|~|~|~|~|~|
+import java.awt.*;
+import java.awt.image.BufferedImage;
+
+public class SystemTrayManager {
+    private TrayIcon trayIcon;
+    
+    private static void log(String message) {
+        Logger.log(message);
+    }
+    
+    public void setupSystemTray() {
+        if (!SystemTray.isSupported()) {
+            log("System tray not supported on this platform");
+            return;
+        }
+        
+        try {
+            SystemTray tray = SystemTray.getSystemTray();
+            
+            // Create a simple green icon (16x16)
+            Image image = createTrayIcon();
+            
+            // Create popup menu
+            PopupMenu popup = new PopupMenu();
+            
+            MenuItem statusItem = new MenuItem("Conversation CLI - Running");
+            statusItem.setEnabled(false);
+            popup.add(statusItem);
+            
+            popup.addSeparator();
+            
+            MenuItem exitItem = new MenuItem("Exit");
+            exitItem.addActionListener(e -> {
+                log("Exit requested from system tray");
+                cleanup();
+                System.exit(0);
+            });
+            popup.add(exitItem);
+            
+            // Create tray icon
+            trayIcon = new TrayIcon(image, "Conversation CLI", popup);
+            trayIcon.setImageAutoSize(true);
+            trayIcon.setToolTip("Conversation CLI - Maintaining clipboard access");
+            
+            // Add to system tray
+            tray.add(trayIcon);
+            
+            log("System tray icon added successfully");
+            
+        } catch (Exception e) {
+            log("Failed to setup system tray: " + e.getMessage());
+            System.err.println("Warning: Could not setup system tray: " + e.getMessage());
+        }
+    }
+    
+    private Image createTrayIcon() {
+        BufferedImage image = new BufferedImage(16, 16, BufferedImage.TYPE_INT_ARGB);
+        Graphics2D g2d = image.createGraphics();
+        
+        // Enable antialiasing
+        g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+        
+        // Draw a green circle
+        g2d.setColor(new Color(76, 175, 80)); // Material Design Green
+        g2d.fillOval(2, 2, 12, 12);
+        
+        // Add a white "C" for CLI
+        g2d.setColor(Color.WHITE);
+        g2d.setFont(new Font("Arial", Font.BOLD, 10));
+        FontMetrics fm = g2d.getFontMetrics();
+        String text = "C";
+        int x = (16 - fm.stringWidth(text)) / 2;
+        int y = (16 - fm.getHeight()) / 2 + fm.getAscent();
+        g2d.drawString(text, x, y);
+        
+        g2d.dispose();
+        return image;
+    }
+    
+    public void updateTrayStatus(String status) {
+        if (trayIcon != null) {
+            trayIcon.setToolTip("Conversation CLI - " + status);
+        }
+    }
+    
+    public void cleanup() {
+        if (trayIcon != null) {
+            SystemTray.getSystemTray().remove(trayIcon);
+        }
+    }
+}
+|~|~|~|~|~|~|~|~|~|~|~|
+
+FILE: ToolExecutor.java
+|~|~|~|~|~|~|~|~|~|~|~|
+public class ToolExecutor {
+
+    private static void log(String message) {
+        Logger.log(message);
+    }
+
+    public static ToolExecutionResult executeToolWithSummary(String toolName, String toolParams) {
+        try {
+            switch (toolName) {
+                case "read_file":
+                    return FileOperations.executeReadFileWithSummary(toolParams);
+                case "read_file_lines":
+                    return FileOperations.executeReadFileLinesWithSummary(toolParams);
+                case "create_file":
+                    return FileOperations.executeCreateFileWithSummary(toolParams);
+                case "delete_file":
+                    return FileOperations.executeDeleteFileWithSummary(toolParams);
+                case "move_file":
+                    return FileOperations.executeMoveFileWithSummary(toolParams);
+                case "update_file":
+                    return FileOperations.executeUpdateFileWithSummary(toolParams);
+                case "create_directory":
+                    return DirectoryOperations.executeCreateDirectoryWithSummary(toolParams);
+                case "delete_directory_recursive":
+                    return DirectoryOperations.executeDeleteDirectoryWithSummary(toolParams);
+                case "list_files":
+                    return DirectoryOperations.executeListFilesWithSummary(toolParams);
+                case "list_recursive":
+                    return DirectoryOperations.executeListRecursiveWithSummary(toolParams);
+                case "search_files":
+                    return SearchOperations.executeSearchFilesWithSummary(toolParams);
+                case "search_content":
+                    return SearchOperations.executeSearchContentWithSummary(toolParams);
+                case "git_read":
+                    return FileOperations.executeGitReadWithSummary(toolParams);
+                default:
+                    log("Unknown tool: " + toolName);
+                    String error = "Error: Unknown tool '" + toolName + "'";
+                    return new ToolExecutionResult(error, error);
+            }
+        } catch (Exception e) {
+            log("Error executing tool " + toolName + ": " + e.getMessage());
+            String error = "Error executing " + toolName + ": " + e.getMessage();
+            return new ToolExecutionResult(error, error);
+        }
+    }
+
+    public static class ToolExecutionResult {
+        public String fullResult;
+        public String summary;
+
+        public ToolExecutionResult(String fullResult, String summary) {
+            this.fullResult = fullResult;
+            this.summary = summary;
+        }
+    }
 }
 
-console.log('[4/5] Verifying main class...');
-if (!fs.existsSync('BridgeTestRunner.class')) {
-    console.error('ERROR: BridgeTestRunner.class not found after compilation!');
-    process.exit(1);
+|~|~|~|~|~|~|~|~|~|~|~|
+
+FILE: ToolParameterExtractor.java
+|~|~|~|~|~|~|~|~|~|~|~|
+import java.util.regex.Pattern;
+import java.util.regex.Matcher;
+
+public class ToolParameterExtractor {
+    
+    private static void log(String message) {
+        Logger.log(message);
+    }
+    
+    public static String extractParameter(String toolParams, String paramName) {
+        try {
+            String pattern = "<parameter name=\"" + paramName + "\">(.*?)</parameter>";
+            Pattern p = Pattern.compile(pattern, Pattern.DOTALL);
+            Matcher m = p.matcher(toolParams);
+            
+            if (m.find()) {
+                return m.group(1).trim();
+            }
+            
+        } catch (Exception e) {
+            log("Error extracting parameter " + paramName + ": " + e.getMessage());
+        }
+        
+        return null;
+    }
+    
+    public static String formatFileSize(long bytes) {
+        if (bytes < 1024) return bytes + "B";
+        if (bytes < 1024 * 1024) return String.format("%.1fKB", bytes / 1024.0);
+        if (bytes < 1024 * 1024 * 1024) return String.format("%.1fMB", bytes / (1024.0 * 1024.0));
+        return String.format("%.1fGB", bytes / (1024.0 * 1024.0 * 1024.0));
+    }
 }
-} // End of extraction and compilation block
+|~|~|~|~|~|~|~|~|~|~|~|
 
-console.log('[5/5] Starting BridgeTestRunner...');
-console.log('');
-console.log('=====================================');
-console.log('   Bridge Test Suite Started');
-console.log('=====================================');
-console.log('');
+FILE: bridge-button.js
+|~|~|~|~|~|~|~|~|~|~|~|
+// Claude Bridge Script - Button Interface with Clipboard Protocol
 
-try {
-    execSync(`java BridgeTestRunner "${EXECUTION_DIR}"`, { stdio: 'inherit' });
-} catch (error) {
-    // Java process was terminated, this is normal
-}
+/* DEV_MOCK_PLACEHOLDER */
 
-console.log('');
-console.log('=====================================');
-console.log('   Bridge Test Suite Stopped');
-console.log('=====================================');
+(function() {
+    'use strict';
+    
+    // Init
+    
+    // State management
+    let currentState = 'listening'; // 'listening' or 'response'
+    let isProcessing = false;
+    let currentResponse = '';
+    
+    // Protocol constants
+    const TO_BRIDGE_MARKER = '|||||TO BRIDGE|||||';
+    const TO_JAVA_MARKER = '|||||TO JAVA|||||';
+    
+    // Remove any existing bridge UI
+    const existingBridge = document.getElementById('claude-bridge-ui');
+    if (existingBridge) {
+        existingBridge.remove();
+    }
+    
+    // Create main UI container
+    const bridgeUI = document.createElement('div');
+    bridgeUI.id = 'claude-bridge-ui';
+    bridgeUI.style.cssText = `
+        position: fixed;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        z-index: 999999;
+        background: rgba(0, 0, 0, 0.9);
+        border: 3px solid #4CAF50;
+        border-radius: 20px;
+        padding: 40px;
+        text-align: center;
+        font-family: Arial, sans-serif;
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+        backdrop-filter: blur(10px);
+        user-select: none;
+    `;
+    
+    // Create main button
+    const mainButton = document.createElement('button');
+    mainButton.id = 'bridge-main-button';
+    mainButton.style.cssText = `
+        width: 300px;
+        height: 150px;
+        background: linear-gradient(45deg, #4CAF50, #45a049);
+        color: white;
+        border: none;
+        border-radius: 15px;
+        font-size: 24px;
+        font-weight: bold;
+        cursor: pointer;
+        transition: all 0.3s ease;
+        box-shadow: 0 5px 15px rgba(76, 175, 80, 0.3);
+        margin-bottom: 20px;
+    `;
+    
+    // Create status text
+    const statusText = document.createElement('div');
+    statusText.id = 'bridge-status';
+    statusText.style.cssText = `
+        color: #4CAF50;
+        font-size: 18px;
+        font-weight: bold;
+        margin-bottom: 15px;
+    `;
+    
+    // Create info text
+    const infoText = document.createElement('div');
+    infoText.id = 'bridge-info';
+    infoText.style.cssText = `
+        color: #ccc;
+        font-size: 14px;
+        max-width: 400px;
+        line-height: 1.4;
+    `;
+    
+    // Create close button
+    const closeButton = document.createElement('button');
+    closeButton.textContent = 'X';
+    closeButton.style.cssText = `
+        position: absolute;
+        top: 10px;
+        right: 15px;
+        background: none;
+        border: none;
+        color: #ccc;
+        font-size: 24px;
+        cursor: pointer;
+        width: 30px;
+        height: 30px;
+        border-radius: 50%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        transition: all 0.3s ease;
+    `;
+    
+    closeButton.addEventListener('click', () => {
+        bridgeUI.remove();
+    });
+    
+    closeButton.addEventListener('mouseenter', () => {
+        closeButton.style.background = 'rgba(255, 255, 255, 0.1)';
+    });
+    
+    closeButton.addEventListener('mouseleave', () => {
+        closeButton.style.background = 'none';
+    });
+    
+    // Add hover effects to main button
+    mainButton.addEventListener('mouseenter', () => {
+        if (!isProcessing) {
+            mainButton.style.transform = 'scale(1.05)';
+            mainButton.style.boxShadow = '0 8px 25px rgba(76, 175, 80, 0.4)';
+        }
+    });
+    
+    mainButton.addEventListener('mouseleave', () => {
+        if (!isProcessing) {
+            mainButton.style.transform = 'scale(1)';
+            mainButton.style.boxShadow = '0 5px 15px rgba(76, 175, 80, 0.3)';
+        }
+    });
+    
+    // Main button click handler
+    mainButton.addEventListener('click', async () => {
+        if (isProcessing) return;
+
+        if (currentState === 'listening') {
+            await handleListeningClick();
+        } else if (currentState === 'response') {
+            await handleResponseClick();
+        }
+    });
+    
+    // Handle click in listening mode
+    async function handleListeningClick() {
+        try {
+            const clipboardText = await navigator.clipboard.readText();
+
+            if (!clipboardText.endsWith(TO_BRIDGE_MARKER)) {
+                updateUI('listening', 'No valid request found in clipboard');
+                return;
+            }
+
+            const jsonText = clipboardText.slice(0, -TO_BRIDGE_MARKER.length);
+            let request;
+            try {
+                request = JSON.parse(jsonText);
+                if (!request.messages || !Array.isArray(request.messages)) {
+                    throw new Error('Invalid request format');
+                }
+            } catch (e) {
+                updateUI('listening', 'Invalid JSON in clipboard');
+                return;
+            }
+
+            isProcessing = true;
+            updateUI('processing', 'Processing request...');
+
+            const token = getAuthToken();
+            if (!token) {
+                updateUI('listening', 'No auth token found');
+                isProcessing = false;
+                return;
+            }
+
+            const response = await submitToInternalAPIWithContinuation(request.messages, token);
+
+            if (response === 'TOKEN_LIMIT_EXCEEDED') {
+                currentResponse = response;
+                currentState = 'response';
+                isProcessing = false;
+                updateUI('response', 'Token limit detected - click to copy');
+            } else {
+                currentResponse = response;
+                currentState = 'response';
+                isProcessing = false;
+                updateUI('response', 'Response ready - click to copy');
+            }
+
+        } catch (error) {
+            updateUI('listening', `Error: ${error.message}`);
+            isProcessing = false;
+        }
+    }
+    
+    // Handle click in response mode
+    async function handleResponseClick() {
+        try {
+            const responseWithMarker = currentResponse + TO_JAVA_MARKER;
+            await navigator.clipboard.writeText(responseWithMarker);
+            currentState = 'listening';
+            currentResponse = '';
+            updateUI('listening', 'Response copied - ready for next request');
+        } catch (error) {
+            updateUI('response', `Copy failed: ${error.message}`);
+        }
+    }
+    
+    // Get auth token from localStorage
+    function getAuthToken() {
+        return localStorage.getItem('token');
+    }
+    
+    // Submit to internal API with automatic continuation handling
+    async function submitToInternalAPIWithContinuation(messages, token) {
+        let fullResponse = '';
+        let conversationMessages = [...messages];
+        let attemptCount = 0;
+        const maxAttempts = 10;
+
+        while (attemptCount < maxAttempts) {
+            attemptCount++;
+            const response = await submitToInternalAPI(conversationMessages, token);
+
+            if (response.trim() === '') {
+                return 'TOKEN_LIMIT_EXCEEDED';
+            }
+
+            fullResponse += response;
+            const hasEnd = fullResponse.endsWith('|||||END|||||');
+            console.log(`T${attemptCount}: len=${response.length} total=${fullResponse.length} end=${hasEnd?'Y':'N'}`);
+
+            if (hasEnd) {
+                return fullResponse.slice(0, -13);
+            }
+
+            const lastChars = fullResponse.slice(-30);
+            const continuationContent = `Your previous response was cut off. The last 30 characters were: "${lastChars}". Start writing immediately after these exact characters. We will append your response to the previous output. End with |||||END||||| when complete.`;
+
+            conversationMessages.push({
+                role: 'assistant',
+                content: response
+            });
+            conversationMessages.push({
+                role: 'user',
+                content: continuationContent
+            });
+        }
+
+        console.log(`MAX_ATTEMPTS: total=${fullResponse.length}`);
+        return fullResponse;
+    }
+    
+    // Submit to internal API (original implementation)
+    async function submitToInternalAPI(messages, token) {
+        const timestamp = Date.now();
+        const userMessageId = 'msg-' + timestamp + '-user';
+        const assistantMessageId = 'msg-' + timestamp + '-assistant';
+        const sessionId = 'session-' + Math.random().toString(36).substr(2, 9);
+        const apiBase = window.location.origin;
+
+        // Fire /new in background
+        fetch(`${apiBase}/api/v1/chats/new`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${token}`
+            },
+            body: JSON.stringify({
+                chat: {
+                    id: '',
+                    title: 'Chat Pending',
+                    models: ['Anthropic Claude 4 Sonnet'],
+                    params: {},
+                    history: {
+                        messages: {
+                            [userMessageId]: {
+                                id: userMessageId,
+                                parentId: null,
+                                childrenIds: [],
+                                role: 'user',
+                                content: messages.length > 0 ? messages[messages.length - 1].content : '',
+                                timestamp: Math.floor(timestamp / 1000),
+                                models: ['Anthropic Claude 4 Sonnet']
+                            }
+                        },
+                        currentId: userMessageId
+                    },
+                    messages: [
+                        {
+                            id: userMessageId,
+                            role: 'user',
+                            content: messages.length > 0 ? messages[messages.length - 1].content : '',
+                            timestamp: Math.floor(timestamp / 1000),
+                            models: ['Anthropic Claude 4 Sonnet']
+                        }
+                    ],
+                    files: []
+                }
+            })
+        }).catch(err => {});
+
+        const completionsResponse = await fetch(`${apiBase}/api/chat/completions`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${token}`
+            },
+            body: JSON.stringify({
+                stream: true,
+                model: 'Anthropic Claude 4 Sonnet',
+                messages: messages,
+                params: {},
+                features: {
+                    web_search: false
+                },
+                session_id: sessionId,
+                id: assistantMessageId,
+                background_tasks: {
+                    title_generation: true,
+                    tags_generation: true
+                }
+            })
+        });
+
+        if (!completionsResponse.ok) {
+            throw new Error(`Completions failed: ${completionsResponse.status}`);
+        }
+
+        const reader = completionsResponse.body.getReader();
+        const decoder = new TextDecoder();
+        let finalContent = '';
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            const chunk = decoder.decode(value);
+            const lines = chunk.split('\n');
+
+            for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                    const data = line.slice(6);
+                    if (data === '[DONE]') {
+                        return finalContent;
+                    }
+
+                    try {
+                        const parsed = JSON.parse(data);
+                        if (parsed.choices && parsed.choices[0] && parsed.choices[0].delta && parsed.choices[0].delta.content) {
+                            finalContent += parsed.choices[0].delta.content;
+                        }
+                    } catch (e) {
+                        // Ignore parsing errors
+                    }
+                }
+            }
+        }
+
+        return finalContent;
+    }
+    
+    // Update UI based on state
+    function updateUI(state, statusMessage) {
+        if (state === 'listening') {
+            mainButton.textContent = 'LISTENING';
+            mainButton.style.background = 'linear-gradient(45deg, #4CAF50, #45a049)';
+            statusText.textContent = 'READY TO RECEIVE';
+            infoText.textContent = statusMessage || 'Waiting for request with |||||TO BRIDGE||||| marker';
+        } else if (state === 'processing') {
+            mainButton.textContent = 'PROCESSING...';
+            mainButton.style.background = 'linear-gradient(45deg, #FF9800, #F57C00)';
+            statusText.textContent = 'WORKING...';
+            infoText.textContent = statusMessage || 'Calling /completions (fire-and-forget /new)...';
+        } else if (state === 'response') {
+            mainButton.textContent = 'CLICK TO COPY';
+            mainButton.style.background = 'linear-gradient(45deg, #2196F3, #1976D2)';
+            statusText.textContent = 'RESPONSE READY';
+            infoText.textContent = statusMessage || 'Click to copy response with |||||TO JAVA||||| marker';
+        }
+        
+        // Update button colors
+        if (state === 'listening') {
+            statusText.style.color = '#4CAF50';
+        } else if (state === 'processing') {
+            statusText.style.color = '#FF9800';
+        } else if (state === 'response') {
+            statusText.style.color = '#2196F3';
+        }
+    }
+    
+    // Assemble UI
+    bridgeUI.appendChild(closeButton);
+    bridgeUI.appendChild(statusText);
+    bridgeUI.appendChild(mainButton);
+    bridgeUI.appendChild(infoText);
+    
+    // Add to page
+    document.body.appendChild(bridgeUI);
+    
+    // Initialize UI
+    updateUI('listening', 'Bridge ready - paste requests ending with |||||TO BRIDGE|||||');
+
+    // Keepalive mechanism - send simple request every 5 minutes to keep session alive
+    let keepaliveInterval = setInterval(async () => {
+        try {
+            const token = getAuthToken();
+            if (!token) return;
+
+            const keepaliveMessages = [{
+                role: 'user',
+                content: 'reply "k"'
+            }];
+
+            await submitToInternalAPI(keepaliveMessages, token);
+        } catch (error) {
+            // Silent fail
+        }
+    }, 5 * 60 * 1000);
+    
+})();
+|~|~|~|~|~|~|~|~|~|~|~|
+
