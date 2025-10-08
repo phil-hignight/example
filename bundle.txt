@@ -2468,9 +2468,9 @@ FILE: bridge-button.js
         
         const apiBase = window.location.origin; // Use current page's origin
         
-        // Step 1: Create new chat
-        console.log('[Button Bridge] Step 1: Creating new chat...');
-        const newChatResponse = await fetch(`${apiBase}/api/v1/chats/new`, {
+        // Fire /new in background without waiting (non-blocking for speed)
+        console.log('[Button Bridge] FIRE_AND_FORGET_NEW_v2025: Sending /new in background...');
+        fetch(`${apiBase}/api/v1/chats/new`, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
@@ -2508,18 +2508,10 @@ FILE: bridge-button.js
                     files: []
                 }
             })
-        });
-        
-        if (!newChatResponse.ok) {
-            throw new Error(`Chat creation failed: ${newChatResponse.status}`);
-        }
-        
-        const chatResult = await newChatResponse.json();
-        const chatId = chatResult.id;
-        console.log('[Button Bridge] Chat created with ID:', chatId);
-        
-        // Step 2: Stream completions
-        console.log('[Button Bridge] Step 2: Starting completions stream...');
+        }).catch(err => console.log('[Button Bridge] /new call failed (non-blocking):', err.message));
+
+        // Call /completions immediately without waiting for /new
+        console.log('[Button Bridge] Calling /completions immediately (no chat_id dependency)...');
         const completionsResponse = await fetch(`${apiBase}/api/chat/completions`, {
             method: 'POST',
             headers: {
@@ -2535,7 +2527,6 @@ FILE: bridge-button.js
                     web_search: false
                 },
                 session_id: sessionId,
-                chat_id: chatId,
                 id: assistantMessageId,
                 background_tasks: {
                     title_generation: true,
@@ -2594,7 +2585,7 @@ FILE: bridge-button.js
             mainButton.textContent = 'PROCESSING...';
             mainButton.style.background = 'linear-gradient(45deg, #FF9800, #F57C00)';
             statusText.textContent = 'WORKING...';
-            infoText.textContent = statusMessage || 'Calling /new then /completions...';
+            infoText.textContent = statusMessage || 'Calling /completions (fire-and-forget /new)...';
         } else if (state === 'response') {
             mainButton.textContent = 'CLICK TO COPY';
             mainButton.style.background = 'linear-gradient(45deg, #2196F3, #1976D2)';
