@@ -2194,7 +2194,7 @@ FILE: bridge-button.js
 (function() {
     'use strict';
     
-    console.log('[Button Bridge] Initializing...');
+    // Init
     
     // State management
     let currentState = 'listening'; // 'listening' or 'response'
@@ -2292,7 +2292,6 @@ FILE: bridge-button.js
     
     closeButton.addEventListener('click', () => {
         bridgeUI.remove();
-        console.log('[Button Bridge] Bridge UI closed');
     });
     
     closeButton.addEventListener('mouseenter', () => {
@@ -2320,11 +2319,8 @@ FILE: bridge-button.js
     
     // Main button click handler
     mainButton.addEventListener('click', async () => {
-        if (isProcessing) {
-            console.log('[Button Bridge] Already processing, ignoring click');
-            return;
-        }
-        
+        if (isProcessing) return;
+
         if (currentState === 'listening') {
             await handleListeningClick();
         } else if (currentState === 'response') {
@@ -2334,20 +2330,15 @@ FILE: bridge-button.js
     
     // Handle click in listening mode
     async function handleListeningClick() {
-        console.log('[Button Bridge] Listening mode click - checking clipboard...');
-        
         try {
-            // Read clipboard
             const clipboardText = await navigator.clipboard.readText();
-            
-            // Check for TO_BRIDGE marker
+
             if (!clipboardText.endsWith(TO_BRIDGE_MARKER)) {
-                console.log('[Button Bridge] No TO_BRIDGE marker found');
+                console.log('NoMarker');
                 updateUI('listening', 'No valid request found in clipboard');
                 return;
             }
-            
-            // Remove marker and parse JSON
+
             const jsonText = clipboardText.slice(0, -TO_BRIDGE_MARKER.length);
             let request;
             try {
@@ -2356,41 +2347,40 @@ FILE: bridge-button.js
                     throw new Error('Invalid request format');
                 }
             } catch (e) {
-                console.error('[Button Bridge] Invalid JSON:', e);
+                console.log('BadJSON');
                 updateUI('listening', 'Invalid JSON in clipboard');
                 return;
             }
-            
-            console.log('[Button Bridge] Valid request found, processing...');
+
+            console.log(`Req msgs=${request.messages.length} firstLen=${request.messages[0].content.length}`);
             isProcessing = true;
             updateUI('processing', 'Processing request...');
-            
-            // Get auth token
+
             const token = getAuthToken();
             if (!token) {
                 updateUI('listening', 'No auth token found');
                 isProcessing = false;
                 return;
             }
-            
-            // Submit to API and get response with continuation handling
+
             const response = await submitToInternalAPIWithContinuation(request.messages, token);
 
-            // Check if response indicates token limit exceeded
             if (response === 'TOKEN_LIMIT_EXCEEDED') {
+                console.log('Result=TOKEN_LIMIT');
                 currentResponse = response;
                 currentState = 'response';
                 isProcessing = false;
                 updateUI('response', 'Token limit detected - click to copy');
             } else {
+                console.log(`Result=OK len=${response.length} preview="${response.substring(0,50)}"`);
                 currentResponse = response;
                 currentState = 'response';
                 isProcessing = false;
                 updateUI('response', 'Response ready - click to copy');
             }
-            
+
         } catch (error) {
-            console.error('[Button Bridge] Error in listening click:', error);
+            console.log(`Err: ${error.message}`);
             updateUI('listening', `Error: ${error.message}`);
             isProcessing = false;
         }
@@ -2398,20 +2388,14 @@ FILE: bridge-button.js
     
     // Handle click in response mode
     async function handleResponseClick() {
-        console.log('[Button Bridge] Response mode click - copying to clipboard...');
-        
         try {
-            // Copy response with TO_JAVA marker
             const responseWithMarker = currentResponse + TO_JAVA_MARKER;
             await navigator.clipboard.writeText(responseWithMarker);
-            
-            // Switch back to listening mode
             currentState = 'listening';
             currentResponse = '';
             updateUI('listening', 'Response copied - ready for next request');
-            
         } catch (error) {
-            console.error('[Button Bridge] Error copying response:', error);
+            console.log(`CopyErr: ${error.message}`);
             updateUI('response', `Copy failed: ${error.message}`);
         }
     }
@@ -2420,7 +2404,7 @@ FILE: bridge-button.js
     function getAuthToken() {
         const token = localStorage.getItem('token');
         if (!token) {
-            console.error('[Button Bridge] No auth token found in localStorage');
+            console.log('NoToken');
             return null;
         }
         return token;
@@ -2428,75 +2412,55 @@ FILE: bridge-button.js
     
     // Submit to internal API with automatic continuation handling
     async function submitToInternalAPIWithContinuation(messages, token) {
-        console.log('[Button Bridge] Starting API request with continuation handling...');
-
         let fullResponse = '';
-        let conversationMessages = [...messages]; // Copy original messages
+        let conversationMessages = [...messages];
         let attemptCount = 0;
-        const maxAttempts = 10; // Prevent infinite loops
+        const maxAttempts = 10;
 
         while (attemptCount < maxAttempts) {
             attemptCount++;
-            console.log(`[Button Bridge] Attempt ${attemptCount} - sending request...`);
-
             const response = await submitToInternalAPI(conversationMessages, token);
 
-            // Check if response is empty (token limit exceeded on backend)
-            // This can happen on first attempt OR continuation if the conversation grew too large
+            // LOG: empty=yes/no len=X
+            console.log(`T${attemptCount} empty=${response.trim()===''?'yes':'no'} len=${response.length}`);
+
             if (response.trim() === '') {
-                console.log(`[Button Bridge] EMPTY RESPONSE on attempt ${attemptCount} - Token limit likely exceeded`);
                 return 'TOKEN_LIMIT_EXCEEDED';
             }
 
             fullResponse += response;
 
-            // Check if response ends with completion marker
             if (fullResponse.endsWith('|||||END|||||')) {
-                console.log('[Button Bridge] Found completion marker, response is complete');
-                // Strip the marker and return complete response
-                return fullResponse.slice(0, -13); // Remove |||||END|||||
+                console.log(`Complete marker=yes total=${fullResponse.length}`);
+                return fullResponse.slice(0, -13);
             }
 
-            console.log('[Button Bridge] No completion marker found, response was truncated');
-
-            // Get the last 30 characters for exact continuation
             const lastChars = fullResponse.slice(-30);
-
-            // Create continuation request with exact character positioning
             const continuationContent = `Your previous response was cut off. The last 30 characters were: "${lastChars}". Start writing immediately after these exact characters. We will append your response to the previous output. End with |||||END||||| when complete.`;
 
-            const continuationMessage = {
-                role: 'user',
-                content: continuationContent
-            };
-
-            // Add assistant's partial response and continuation request to conversation
             conversationMessages.push({
                 role: 'assistant',
                 content: response
             });
-            conversationMessages.push(continuationMessage);
-
-            console.log(`[Button Bridge] Requesting continuation... (current response length: ${fullResponse.length} chars)`);
+            conversationMessages.push({
+                role: 'user',
+                content: continuationContent
+            });
         }
 
-        console.log('[Button Bridge] Warning: Reached maximum continuation attempts');
-        return fullResponse; // Return what we have, even if incomplete
+        console.log(`MaxAttempts total=${fullResponse.length}`);
+        return fullResponse;
     }
     
     // Submit to internal API (original implementation)
     async function submitToInternalAPI(messages, token) {
-        console.log('[Button Bridge] Submitting to internal API...');
-        
         const timestamp = Date.now();
         const userMessageId = 'msg-' + timestamp + '-user';
         const assistantMessageId = 'msg-' + timestamp + '-assistant';
         const sessionId = 'session-' + Math.random().toString(36).substr(2, 9);
-        
-        const apiBase = window.location.origin; // Use current page's origin
-        
-        // Fire /new in background without waiting (non-blocking for speed)
-        console.log('[Button Bridge] FIRE_AND_FORGET_NEW_v2025: Sending /new in background...');
+        const apiBase = window.location.origin;
+
+        // Fire /new in background
         fetch(`${apiBase}/api/v1/chats/new`, {
             method: 'POST',
             headers: {
@@ -2535,10 +2499,8 @@ FILE: bridge-button.js
                     files: []
                 }
             })
-        }).catch(err => console.log('[Button Bridge] /new call failed (non-blocking):', err.message));
+        }).catch(err => console.log(`NewErr: ${err.message}`));
 
-        // Call /completions immediately without waiting for /new
-        console.log('[Button Bridge] Calling /completions immediately (no chat_id dependency)...');
         const completionsResponse = await fetch(`${apiBase}/api/chat/completions`, {
             method: 'POST',
             headers: {
@@ -2561,31 +2523,29 @@ FILE: bridge-button.js
                 }
             })
         });
-        
+
         if (!completionsResponse.ok) {
             throw new Error(`Completions failed: ${completionsResponse.status}`);
         }
-        
-        // Read the SSE stream
+
         const reader = completionsResponse.body.getReader();
         const decoder = new TextDecoder();
         let finalContent = '';
-        
+
         while (true) {
             const { done, value } = await reader.read();
             if (done) break;
-            
+
             const chunk = decoder.decode(value);
             const lines = chunk.split('\n');
-            
+
             for (const line of lines) {
                 if (line.startsWith('data: ')) {
                     const data = line.slice(6);
                     if (data === '[DONE]') {
-                        console.log('[Button Bridge] Stream completed');
                         return finalContent;
                     }
-                    
+
                     try {
                         const parsed = JSON.parse(data);
                         if (parsed.choices && parsed.choices[0] && parsed.choices[0].delta && parsed.choices[0].delta.content) {
@@ -2597,7 +2557,7 @@ FILE: bridge-button.js
                 }
             }
         }
-        
+
         return finalContent;
     }
     
@@ -2641,39 +2601,23 @@ FILE: bridge-button.js
     
     // Initialize UI
     updateUI('listening', 'Bridge ready - paste requests ending with |||||TO BRIDGE|||||');
-    
-    console.log('[Button Bridge] Button interface ready!');
-    console.log('[Button Bridge] Protocol: TO_BRIDGE =', TO_BRIDGE_MARKER);
-    console.log('[Button Bridge] Protocol: TO_JAVA =', TO_JAVA_MARKER);
-    
+
     // Keepalive mechanism - send simple request every 5 minutes to keep session alive
     let keepaliveInterval = setInterval(async () => {
         try {
-            console.log('[Button Bridge] Sending keepalive request...');
-            
             const token = getAuthToken();
-            if (!token) {
-                console.log('[Button Bridge] No token for keepalive, skipping');
-                return;
-            }
-            
-            // Simple keepalive message
-            const keepaliveMessages = [
-                {
-                    role: 'user',
-                    content: 'reply "k"'
-                }
-            ];
-            
+            if (!token) return;
+
+            const keepaliveMessages = [{
+                role: 'user',
+                content: 'reply "k"'
+            }];
+
             await submitToInternalAPI(keepaliveMessages, token);
-            console.log('[Button Bridge] Keepalive request completed');
-            
         } catch (error) {
-            console.log('[Button Bridge] Keepalive failed:', error.message);
+            // Silent fail
         }
-    }, 5 * 60 * 1000); // 5 minutes
-    
-    console.log('[Button Bridge] Keepalive timer started (5 minute intervals)');
+    }, 5 * 60 * 1000);
     
 })();
 |~|~|~|~|~|~|~|~|~|~|~|
