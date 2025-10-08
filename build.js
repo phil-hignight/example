@@ -13,7 +13,7 @@ const DELIMITER = '|~|~|~|~|~|~|~|~|~|~|~|';
 // Check for run-only mode
 const RUN_ONLY = process.argv.includes('r');
 
-console.log('=== Manual Coding Agent Build Script ===');
+console.log('=== Bridge Test Suite Build Script ===');
 console.log('');
 
 console.log(`Execution directory (Java app working dir): ${EXECUTION_DIR}`);
@@ -140,26 +140,26 @@ try {
 }
 
 console.log('[4/5] Verifying main class...');
-if (!fs.existsSync('ConversationCLI.class')) {
-    console.error('ERROR: ConversationCLI.class not found after compilation!');
+if (!fs.existsSync('BridgeTestRunner.class')) {
+    console.error('ERROR: BridgeTestRunner.class not found after compilation!');
     process.exit(1);
 }
 } // End of extraction and compilation block
 
-console.log('[5/5] Starting ConversationCLI...');
+console.log('[5/5] Starting BridgeTestRunner...');
 console.log('');
 console.log('=====================================');
-console.log('   Manual Coding Agent Started');
+console.log('   Bridge Test Suite Started');
 console.log('=====================================');
 console.log('');
 
 try {
-    execSync(`java ConversationCLI "${EXECUTION_DIR}"`, { stdio: 'inherit' });
+    execSync(`java BridgeTestRunner "${EXECUTION_DIR}"`, { stdio: 'inherit' });
 } catch (error) {
     // Java process was terminated, this is normal
 }
 
 console.log('');
 console.log('=====================================');
-console.log('   Manual Coding Agent Stopped');
+console.log('   Bridge Test Suite Stopped');
 console.log('=====================================');
