@@ -50,6 +50,10 @@ public class BridgeTestRunner {
             systemTrayManager = new SystemTrayManager();
             systemTrayManager.setupSystemTray();
 
+            // Copy bridge JS to clipboard and prompt user
+            copyBridgeScriptToClipboard();
+            promptUserToSetupBridge();
+
             // Run all tests
             testClipboardAccess();
             testAutoClickSetup();
@@ -364,6 +368,47 @@ public class BridgeTestRunner {
 
     public static String getLogFile() {
         return workingDirectory + "/.agent/debug.log";
+    }
+
+    private static void copyBridgeScriptToClipboard() {
+        try {
+            Path bridgeScriptPath = Paths.get(workingDirectory, "bridge-button.js");
+
+            if (!Files.exists(bridgeScriptPath)) {
+                System.out.println("WARNING: bridge-button.js not found at: " + bridgeScriptPath);
+                return;
+            }
+
+            String bridgeScript = new String(Files.readAllBytes(bridgeScriptPath));
+            ClipboardManager.copyToClipboard(bridgeScript);
+
+            System.out.println("✓ Bridge script copied to clipboard (" + bridgeScript.length() + " chars)");
+
+        } catch (Exception e) {
+            System.out.println("WARNING: Failed to copy bridge script: " + e.getMessage());
+        }
+    }
+
+    private static void promptUserToSetupBridge() {
+        System.out.println();
+        System.out.println("=== Setup Instructions ===");
+        System.out.println("1. Open your browser and navigate to Claude");
+        System.out.println("2. Open browser console (F12 or Cmd+Option+J)");
+        System.out.println("3. Paste the bridge script (already in clipboard)");
+        System.out.println("4. Press Enter in console to run the script");
+        System.out.println("5. You should see the green bridge button appear");
+        System.out.println("6. Come back here and press ENTER to continue");
+        System.out.println();
+        System.out.print("Press ENTER when bridge is ready: ");
+
+        try {
+            Scanner scanner = new Scanner(System.in);
+            scanner.nextLine();
+            System.out.println("✓ Starting tests...");
+            System.out.println();
+        } catch (Exception e) {
+            System.out.println("Error waiting for user input: " + e.getMessage());
+        }
     }
 }
 
