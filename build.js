@@ -64,7 +64,7 @@ try {
             if (currentFile && fileContent.length > 0) {
                 const content = fileContent.join('\n');
                 fs.writeFileSync(currentFile, content, 'utf8');
-                console.log(`  ✓ Wrote ${currentFile} (${content.length} chars)`);
+                console.log(`  [OK] Wrote ${currentFile} (${content.length} chars)`);
                 extractedFiles++;
             }
             
@@ -94,7 +94,7 @@ try {
     if (currentFile && fileContent.length > 0) {
         const content = fileContent.join('\n');
         fs.writeFileSync(currentFile, content, 'utf8');
-        console.log(`  ✓ Wrote ${currentFile} (${content.length} chars)`);
+        console.log(`  [OK] Wrote ${currentFile} (${content.length} chars)`);
         extractedFiles++;
     }
     
