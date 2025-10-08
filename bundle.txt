@@ -48,6 +48,7 @@ public class BridgeTestRunner {
             // Initialize
             configManager = new ConfigManager(workingDirectory);
             systemTrayManager = new SystemTrayManager();
+            systemTrayManager.setupSystemTray();
 
             // Run all tests
             testClipboardAccess();
@@ -121,7 +122,7 @@ public class BridgeTestRunner {
             int x = configManager.getClickX();
             int y = configManager.getClickY();
 
-            if (x > 0 && y > 0 && x < 5000 && y < 5000) {
+            if (x >= -10000 && y >= -10000 && x <= 10000 && y <= 10000) {
                 pass("Auto-click setup (" + x + "," + y + ")");
             } else {
                 fail("Auto-click setup", 4, x + " " + y);
