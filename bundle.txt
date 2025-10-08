@@ -374,7 +374,8 @@ public class BridgeTestRunner {
             } else if (response.length() > 20000 && response.contains("RESPONSE_START") && response.contains("RESPONSE_END")) {
                 pass("Large response (" + response.length() + "ch)");
             } else {
-                fail("Large response", 32, "len=" + response.length() + " start=" + response.contains("RESPONSE_START") + " end=" + response.contains("RESPONSE_END"));
+                String preview = response.length() > 60 ? response.substring(response.length() - 60) : response;
+                fail("Large response", 32, "len=" + response.length() + " start=" + response.contains("RESPONSE_START") + " end=" + response.contains("RESPONSE_END") + " last60=\"" + preview + "\"");
             }
         } catch (Exception e) {
             fail("Large response", 33, e.getMessage());
@@ -454,7 +455,8 @@ public class BridgeTestRunner {
                 if (response.contains("|||||END|||||")) {
                     pass("Continuation END (" + response.length() + "ch)");
                 } else {
-                    fail("Continuation END", 38, "`marker_not_found`");
+                    String last60 = response.length() > 60 ? response.substring(response.length() - 60) : response;
+                    fail("Continuation END", 38, "len=" + response.length() + " last60=\"" + last60 + "\"");
                 }
             } else {
                 fail("Continuation END", 38, "`" + response + "`");
@@ -540,7 +542,7 @@ public class BridgeTestRunner {
 
     private static void copyBridgeScriptToClipboard() {
         try {
-            Path bridgeScriptPath = Paths.get(workingDirectory, "bridge-button.js");
+            Path bridgeScriptPath = Paths.get(workingDirectory, "src", "browser", "bridge-button.js");
 
             if (!Files.exists(bridgeScriptPath)) {
                 System.out.println("WARNING: bridge-button.js not found at: " + bridgeScriptPath);
@@ -2493,7 +2495,6 @@ FILE: bridge-button.js
             const clipboardText = await navigator.clipboard.readText();
 
             if (!clipboardText.endsWith(TO_BRIDGE_MARKER)) {
-                console.log('NoMarker');
                 updateUI('listening', 'No valid request found in clipboard');
                 return;
             }
@@ -2506,12 +2507,10 @@ FILE: bridge-button.js
                     throw new Error('Invalid request format');
                 }
             } catch (e) {
-                console.log('BadJSON');
                 updateUI('listening', 'Invalid JSON in clipboard');
                 return;
             }
 
-            console.log(`Req msgs=${request.messages.length} firstLen=${request.messages[0].content.length}`);
             isProcessing = true;
             updateUI('processing', 'Processing request...');
 
@@ -2525,13 +2524,11 @@ FILE: bridge-button.js
             const response = await submitToInternalAPIWithContinuation(request.messages, token);
 
             if (response === 'TOKEN_LIMIT_EXCEEDED') {
-                console.log('Result=TOKEN_LIMIT');
                 currentResponse = response;
                 currentState = 'response';
                 isProcessing = false;
                 updateUI('response', 'Token limit detected - click to copy');
             } else {
-                console.log(`Result=OK len=${response.length} preview="${response.substring(0,50)}"`);
                 currentResponse = response;
                 currentState = 'response';
                 isProcessing = false;
@@ -2539,7 +2536,6 @@ FILE: bridge-button.js
             }
 
         } catch (error) {
-            console.log(`Err: ${error.message}`);
             updateUI('listening', `Error: ${error.message}`);
             isProcessing = false;
         }
@@ -2554,19 +2550,13 @@ FILE: bridge-button.js
             currentResponse = '';
             updateUI('listening', 'Response copied - ready for next request');
         } catch (error) {
-            console.log(`CopyErr: ${error.message}`);
             updateUI('response', `Copy failed: ${error.message}`);
         }
     }
     
     // Get auth token from localStorage
     function getAuthToken() {
-        const token = localStorage.getItem('token');
-        if (!token) {
-            console.log('NoToken');
-            return null;
-        }
-        return token;
+        return localStorage.getItem('token');
     }
     
     // Submit to internal API with automatic continuation handling
@@ -2580,17 +2570,15 @@ FILE: bridge-button.js
             attemptCount++;
             const response = await submitToInternalAPI(conversationMessages, token);
 
-            // LOG: empty=yes/no len=X
-            console.log(`T${attemptCount} empty=${response.trim()===''?'yes':'no'} len=${response.length}`);
-
             if (response.trim() === '') {
                 return 'TOKEN_LIMIT_EXCEEDED';
             }
 
             fullResponse += response;
+            const hasEnd = fullResponse.endsWith('|||||END|||||');
+            console.log(`T${attemptCount}: len=${response.length} total=${fullResponse.length} end=${hasEnd?'Y':'N'}`);
 
-            if (fullResponse.endsWith('|||||END|||||')) {
-                console.log(`Complete marker=yes total=${fullResponse.length}`);
+            if (hasEnd) {
                 return fullResponse.slice(0, -13);
             }
 
@@ -2607,7 +2595,7 @@ FILE: bridge-button.js
             });
         }
 
-        console.log(`MaxAttempts total=${fullResponse.length}`);
+        console.log(`MAX_ATTEMPTS: total=${fullResponse.length}`);
         return fullResponse;
     }
     
@@ -2658,7 +2646,7 @@ FILE: bridge-button.js
                     files: []
                 }
             })
-        }).catch(err => console.log(`NewErr: ${err.message}`));
+        }).catch(err => {});
 
         const completionsResponse = await fetch(`${apiBase}/api/chat/completions`, {
             method: 'POST',
@@ -2781,7 +2769,7 @@ FILE: bridge-button.js
 })();
 |~|~|~|~|~|~|~|~|~|~|~|
 
-FILE: build.js
+FILE: run-bundle.js
 |~|~|~|~|~|~|~|~|~|~|~|
 const fs = require('fs');
 const path = require('path');
@@ -2798,7 +2786,7 @@ const DELIMITER = '|~|~|~|~|~|~|~|~|~|~|~|';
 // Check for run-only mode
 const RUN_ONLY = process.argv.includes('r');
 
-console.log('=== Bridge Test Suite Build Script ===');
+console.log('=== Manual Coding Agent Build Script ===');
 console.log('');
 
 console.log(`Execution directory (Java app working dir): ${EXECUTION_DIR}`);
@@ -2925,131 +2913,29 @@ try {
 }
 
 console.log('[4/5] Verifying main class...');
-if (!fs.existsSync('BridgeTestRunner.class')) {
-    console.error('ERROR: BridgeTestRunner.class not found after compilation!');
+if (!fs.existsSync('ConversationCLI.class')) {
+    console.error('ERROR: ConversationCLI.class not found after compilation!');
     process.exit(1);
 }
 } // End of extraction and compilation block
 
-console.log('[5/5] Starting BridgeTestRunner...');
+console.log('[5/5] Starting ConversationCLI...');
 console.log('');
 console.log('=====================================');
-console.log('   Bridge Test Suite Started');
+console.log('   Manual Coding Agent Started');
 console.log('=====================================');
 console.log('');
 
 try {
-    execSync(`java BridgeTestRunner "${EXECUTION_DIR}"`, { stdio: 'inherit' });
+    execSync(`java ConversationCLI "${EXECUTION_DIR}"`, { stdio: 'inherit' });
 } catch (error) {
     // Java process was terminated, this is normal
 }
 
 console.log('');
 console.log('=====================================');
-console.log('   Bridge Test Suite Stopped');
+console.log('   Manual Coding Agent Stopped');
 console.log('=====================================');
-|~|~|~|~|~|~|~|~|~|~|~|
 
-FILE: mock-api.js
-|~|~|~|~|~|~|~|~|~|~|~|
-// Mock API for development - intercepts internal API calls and translates to Claude API
-console.log('[Mock API] Mock API script loading...');
-
-// Set a mock token in localStorage if none exists
-if (!localStorage.getItem('token')) {
-    localStorage.setItem('token', 'mock-dev-token-12345');
-    console.log('[Mock API] Set mock token in localStorage');
-}
-
-console.log('[Mock API] Saving original fetch and installing mock...');
-const originalFetch = window.fetch;
-
-window.fetch = async function(url, options) {
-    // Parse URL to get pathname regardless of domain
-    const urlObj = new URL(url);
-    
-    console.log('[Mock API] Intercepting fetch to:', urlObj.href);
-    
-    // Mock /api/v1/chats/new - just return fake chat ID (no Claude API call)
-    if (urlObj.pathname === '/api/v1/chats/new') {
-        console.log('[Mock API] Mocking /new call - returning fake chat ID');
-        const fakeResponse = {
-            id: 'mock-chat-' + Date.now(),
-            title: 'Mock Chat',
-            status: 'created'
-        };
-        return new Response(JSON.stringify(fakeResponse), {
-            status: 200,
-            headers: { 'Content-Type': 'application/json' }
-        });
-    }
-    
-    // Mock /api/chat/completions - translate to Claude API
-    if (urlObj.pathname === '/api/chat/completions') {
-        console.log('[Mock API] Intercepting /completions call');
-        
-        const requestBody = JSON.parse(options.body);
-        const messages = requestBody.messages;
-        
-        // Use hardcoded API key for local development
-        const apiKey = 'f5c8df700ea8f9e68ebe304c8c45f549dd2b41778cc24bf86197046513a59683';
-        
-        console.log('[Mock API] Calling Claude API with', messages.length, 'messages');
-        
-        // Call Claude API
-        const claudeResponse = await originalFetch('https://philhignight.com/api/messages', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'x-api-key': apiKey,
-                'anthropic-version': '2023-06-01'
-            },
-            body: JSON.stringify({
-                model: 'claude-3-5-sonnet-20241022',
-                max_tokens: 8192,
-                messages: messages,
-                stream: false
-            })
-        });
-        
-        if (!claudeResponse.ok) {
-            throw new Error(`Claude API error: ${claudeResponse.status}`);
-        }
-        
-        const claudeData = await claudeResponse.json();
-        let content = claudeData.content[0].text;
-        
-        console.log('[Mock API] Got response from Claude:', content.length, 'chars');
-        
-        // MOCK: Simulate response truncation at 12K characters (actual limit)
-        if (content.length > 12000) {
-            content = content.substring(0, 12000);
-            console.log('[Mock API] SIMULATING TRUNCATION - cut response to 12K chars');
-        }
-        
-        // Transform Claude response to SSE format expected by bridge
-        const sseData = [
-            'data: {"id":"mock-completion","object":"chat.completion.chunk","created":' + Math.floor(Date.now()/1000) + ',"model":"claude-3-5-sonnet","choices":[{"index":0,"delta":{"content":"' + content.replace(/\n/g, '\\n').replace(/"/g, '\\"') + '"},"finish_reason":null}]}',
-            'data: {"id":"mock-completion","object":"chat.completion.chunk","created":' + Math.floor(Date.now()/1000) + ',"model":"claude-3-5-sonnet","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}',
-            'data: [DONE]'
-        ].join('\n\n') + '\n\n';
-        
-        // Return as SSE stream
-        return new Response(sseData, {
-            status: 200,
-            headers: {
-                'Content-Type': 'text/plain',
-                'Cache-Control': 'no-cache',
-                'Connection': 'keep-alive'
-            }
-        });
-    }
-    
-    // For all other requests, use original fetch
-    console.log('[Mock API] Passing through to original fetch:', urlObj.href);
-    return originalFetch.apply(this, arguments);
-};
-
-console.log('[Mock API] Mock fetch installed successfully!');
 |~|~|~|~|~|~|~|~|~|~|~|
 
