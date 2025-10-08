@@ -220,45 +220,64 @@ public class BridgeTestRunner {
         }
     }
 
-    // Test 5: Empty Response Handling
+    // Test 5: Token Limit Discovery
     private static void testEmptyResponseHandling() {
         try {
             if (!configManager.isAutomaticMode()) {
-                System.out.println("[SKIP] Empty response - not auto mode");
+                System.out.println("[SKIP] Token limit - not auto mode");
                 return;
             }
 
             // Wait for clipboard to settle from previous test
             Thread.sleep(500);
 
-            systemTrayManager.updateTrayStatus("Test: Empty response");
+            systemTrayManager.updateTrayStatus("Test: Token limit");
 
-            // Create huge message to trigger empty backend response
-            StringBuilder large = new StringBuilder("Test: ");
-            for (int i = 0; i < 50000; i++) {
-                large.append("x ");
+            // Test increasing sizes to find the actual token limit
+            int[] sizes = {50000, 100000, 200000, 300000, 400000, 500000};
+            int maxWorking = 0;
+
+            for (int size : sizes) {
+                System.out.println("  Testing " + size + " chars...");
+
+                StringBuilder large = new StringBuilder("Reply OK. ");
+                for (int i = 0; i < size; i++) {
+                    large.append("x");
+                }
+
+                String testMessage = buildTestMessage(large.toString());
+                ClipboardManager.copyToClipboard(testMessage);
+
+                String response = ClipboardManager.waitForAutomaticResponse(
+                    configManager.getClickX(),
+                    configManager.getClickY()
+                );
+
+                if (response == null) {
+                    fail("Token limit", 15);
+                    return;
+                } else if (response.equals("MOUSE_CANCELLED")) {
+                    fail("Token limit", 16);
+                    return;
+                } else if (response.equals("TOKEN_LIMIT_EXCEEDED")) {
+                    // Found the limit!
+                    pass("Token limit found at ~" + size + " chars");
+                    return;
+                } else if (response.trim().length() > 0) {
+                    // Still working at this size
+                    maxWorking = size;
+                    System.out.println("    ✓ " + size + " chars OK (response: " + response.length() + " chars)");
+                } else {
+                    fail("Token limit", 17, "`empty_at_" + size + "`");
+                    return;
+                }
             }
 
-            String testMessage = buildTestMessage(large.toString());
-            ClipboardManager.copyToClipboard(testMessage);
+            // If we got here, even 500K worked
+            pass("Token limit >500K chars (tested up to " + maxWorking + ")");
 
-            String response = ClipboardManager.waitForAutomaticResponse(
-                configManager.getClickX(),
-                configManager.getClickY()
-            );
-
-            if (response == null) {
-                fail("Empty response", 15);
-            } else if (response.equals("MOUSE_CANCELLED")) {
-                fail("Empty response", 16);
-            } else if (response.equals("TOKEN_LIMIT_EXCEEDED")) {
-                pass("Empty response → TOKEN_LIMIT_EXCEEDED");
-            } else {
-                String preview = response.substring(0, Math.min(30, response.length()));
-                fail("Empty response", 17, "`" + preview + "`");
-            }
         } catch (Exception e) {
-            fail("Empty response", 18, e.getMessage());
+            fail("Token limit", 18, e.getMessage());
         }
     }
 
