@@ -36,6 +36,22 @@ public class BridgeTestRunner {
     // 21: Mouse cancel expected MOUSE_CANCELLED
     // 22: Mouse cancel exception
     // 23: Response format unexpected
+    // 24: Special chars null response
+    // 25: Special chars mouse cancelled
+    // 26: Special chars token limit
+    // 27: Special chars response missing expected content
+    // 28: Special chars exception
+    // 29: Large response null
+    // 30: Large response mouse cancelled
+    // 31: Large response token limit
+    // 32: Large response too small
+    // 33: Large response exception
+    // 34: Rapid requests null response
+    // 35: Rapid requests mouse cancelled
+    // 36: Rapid requests token limit
+    // 37: Rapid requests exception
+    // 38: Continuation END marker not found
+    // 39: Continuation END marker exception
 
     public static void main(String[] args) {
         try {
@@ -58,9 +74,11 @@ public class BridgeTestRunner {
             testClipboardAccess();
             testAutoClickSetup();
             testSimpleMessageRoundTrip();
-            testContinuationHandling();
+            testSpecialCharacters();
+            testLargeResponse();
+            testRapidRequests();
+            testContinuationEndMarker();
             testEmptyResponseHandling();
-            testInputSizeLimits();
             testMouseCancellation();
 
             // Summary
@@ -234,16 +252,20 @@ public class BridgeTestRunner {
             systemTrayManager.updateTrayStatus("Test: Token limit");
 
             // Test increasing sizes to find the actual token limit
-            int[] sizes = {50000, 100000, 200000, 300000, 400000, 500000};
+            // Starting at 100K to verify no truncation, then go higher
+            int[] sizes = {100000, 200000, 300000, 400000, 500000, 600000, 700000, 800000, 900000, 1000000, 1500000, 2000000};
             int maxWorking = 0;
 
             for (int size : sizes) {
                 System.out.println("  Testing " + size + " chars...");
 
-                StringBuilder large = new StringBuilder("Reply OK. ");
+                // Build message with unique marker at the END to verify full input processing
+                String uniqueMarker = "ENDMARKER_" + System.currentTimeMillis();
+                StringBuilder large = new StringBuilder("Reply with the end marker if you can see it. ");
                 for (int i = 0; i < size; i++) {
                     large.append("x");
                 }
+                large.append(" ").append(uniqueMarker);
 
                 String testMessage = buildTestMessage(large.toString());
                 ClipboardManager.copyToClipboard(testMessage);
@@ -264,42 +286,115 @@ public class BridgeTestRunner {
                     pass("Token limit found at ~" + size + " chars");
                     return;
                 } else if (response.trim().length() > 0) {
-                    // Still working at this size
+                    // Check if response mentions the end marker to verify full input was processed
+                    boolean sawEndMarker = response.contains(uniqueMarker) || response.contains("ENDMARKER");
                     maxWorking = size;
-                    System.out.println("    ✓ " + size + " chars OK (response: " + response.length() + " chars)");
+                    System.out.println("    ✓ " + size + " chars OK (response: " + response.length() + " chars, saw_end_marker: " + sawEndMarker + ")");
+                    if (!sawEndMarker) {
+                        System.out.println("    WARNING: Response doesn't mention end marker - input may be truncated!");
+                    }
                 } else {
                     fail("Token limit", 17, "`empty_at_" + size + "`");
                     return;
                 }
             }
 
-            // If we got here, even 500K worked
-            pass("Token limit >500K chars (tested up to " + maxWorking + ")");
+            // If we got here, even 2M worked
+            pass("Token limit >2M chars (tested up to " + maxWorking + ")");
 
         } catch (Exception e) {
             fail("Token limit", 18, e.getMessage());
         }
     }
 
-    // Test 6: Input Size Limits
-    private static void testInputSizeLimits() {
+    // Test 6: Special Characters
+    private static void testSpecialCharacters() {
         try {
             if (!configManager.isAutomaticMode()) {
-                System.out.println("[SKIP] Size limits - not auto mode");
+                System.out.println("[SKIP] Special chars - not auto mode");
                 return;
             }
 
-            // Wait for clipboard to settle from previous test
             Thread.sleep(500);
+            systemTrayManager.updateTrayStatus("Test: Special chars");
 
-            systemTrayManager.updateTrayStatus("Test: Size limits");
+            // Test message with various special characters, unicode, emojis
+            String specialContent = "Reply PASS_SPECIAL. Test: \n\t\"quotes\" 'apostrophe' \\backslash\\ {braces} [brackets] (parens) <angles> & ampersand | pipe $ dollar % percent @ at # hash ! bang ? question * asterisk ~ tilde ` backtick 你好 مرحبا 😀🎉🚀 ñáéíóú Δφλ";
 
-            int[] sizes = {1000, 5000, 10000, 20000, 50000, 100000};
-            int maxWorking = 0;
+            String testMessage = buildTestMessage(specialContent);
+            ClipboardManager.copyToClipboard(testMessage);
 
-            for (int size : sizes) {
-                String testContent = "x".repeat(size);
-                String testMessage = buildTestMessage("OK. " + testContent);
+            String response = ClipboardManager.waitForAutomaticResponse(
+                configManager.getClickX(),
+                configManager.getClickY()
+            );
+
+            if (response == null) {
+                fail("Special chars", 24);
+            } else if (response.equals("MOUSE_CANCELLED")) {
+                fail("Special chars", 25);
+            } else if (response.equals("TOKEN_LIMIT_EXCEEDED")) {
+                fail("Special chars", 26);
+            } else if (response.contains("PASS_SPECIAL")) {
+                pass("Special chars (" + response.length() + "ch)");
+            } else {
+                fail("Special chars", 27, "`" + response.substring(0, Math.min(50, response.length())) + "`");
+            }
+        } catch (Exception e) {
+            fail("Special chars", 28, e.getMessage());
+        }
+    }
+
+    // Test 7: Large Response (Multi-continuation)
+    private static void testLargeResponse() {
+        try {
+            if (!configManager.isAutomaticMode()) {
+                System.out.println("[SKIP] Large response - not auto mode");
+                return;
+            }
+
+            Thread.sleep(500);
+            systemTrayManager.updateTrayStatus("Test: Large response");
+
+            // Request massive output - bridge should automatically get all continuations
+            String testMessage = buildTestMessage("Generate a 50000 character response (about 10000 words). Start with RESPONSE_START, fill the middle with repeated text, and end with RESPONSE_END. Do not include the END marker - just write RESPONSE_END as the last word.");
+            ClipboardManager.copyToClipboard(testMessage);
+
+            String response = ClipboardManager.waitForAutomaticResponse(
+                configManager.getClickX(),
+                configManager.getClickY()
+            );
+
+            if (response == null) {
+                fail("Large response", 29);
+            } else if (response.equals("MOUSE_CANCELLED")) {
+                fail("Large response", 30);
+            } else if (response.equals("TOKEN_LIMIT_EXCEEDED")) {
+                fail("Large response", 31);
+            } else if (response.length() > 20000 && response.contains("RESPONSE_START") && response.contains("RESPONSE_END")) {
+                pass("Large response (" + response.length() + "ch)");
+            } else {
+                fail("Large response", 32, "len=" + response.length() + " start=" + response.contains("RESPONSE_START") + " end=" + response.contains("RESPONSE_END"));
+            }
+        } catch (Exception e) {
+            fail("Large response", 33, e.getMessage());
+        }
+    }
+
+    // Test 8: Rapid Requests
+    private static void testRapidRequests() {
+        try {
+            if (!configManager.isAutomaticMode()) {
+                System.out.println("[SKIP] Rapid requests - not auto mode");
+                return;
+            }
+
+            Thread.sleep(500);
+            systemTrayManager.updateTrayStatus("Test: Rapid requests");
+
+            // Send 3 requests in quick succession
+            for (int i = 1; i <= 3; i++) {
+                String testMessage = buildTestMessage("Reply: Request " + i + " of 3");
                 ClipboardManager.copyToClipboard(testMessage);
 
                 String response = ClipboardManager.waitForAutomaticResponse(
@@ -307,20 +402,65 @@ public class BridgeTestRunner {
                     configManager.getClickY()
                 );
 
-                if (response != null && !response.equals("TOKEN_LIMIT_EXCEEDED") && !response.equals("MOUSE_CANCELLED")) {
-                    maxWorking = size;
-                } else {
-                    break;
+                if (response == null) {
+                    fail("Rapid requests", 34, "req_" + i);
+                    return;
+                } else if (response.equals("MOUSE_CANCELLED")) {
+                    fail("Rapid requests", 35, "req_" + i);
+                    return;
+                } else if (response.equals("TOKEN_LIMIT_EXCEEDED")) {
+                    fail("Rapid requests", 36, "req_" + i);
+                    return;
                 }
+
+                System.out.println("    ✓ Request " + i + " OK");
+                Thread.sleep(100); // Small delay between requests
             }
 
-            if (maxWorking > 0) {
-                pass("Size limit (~" + maxWorking + "ch)");
+            pass("Rapid requests (3/3)");
+        } catch (Exception e) {
+            fail("Rapid requests", 37, e.getMessage());
+        }
+    }
+
+    // Test 9: Continuation END Marker
+    private static void testContinuationEndMarker() {
+        try {
+            if (!configManager.isAutomaticMode()) {
+                System.out.println("[SKIP] Continuation END - not auto mode");
+                return;
+            }
+
+            Thread.sleep(500);
+            systemTrayManager.updateTrayStatus("Test: Continuation END");
+
+            String testMessage = buildTestMessage(
+                "Write a 500-word essay about Java. End with exactly: |||||END|||||"
+            );
+            ClipboardManager.copyToClipboard(testMessage);
+
+            String response = ClipboardManager.waitForAutomaticResponse(
+                configManager.getClickX(),
+                configManager.getClickY()
+            );
+
+            String formatIssue = validateResponseFormat(response);
+            if (formatIssue != null) {
+                fail("Continuation END", 23, formatIssue);
+                return;
+            }
+
+            if (response != null && !response.equals("MOUSE_CANCELLED") && !response.equals("TOKEN_LIMIT_EXCEEDED")) {
+                if (response.contains("|||||END|||||")) {
+                    pass("Continuation END (" + response.length() + "ch)");
+                } else {
+                    fail("Continuation END", 38, "`marker_not_found`");
+                }
             } else {
-                fail("Size limit", 19);
+                fail("Continuation END", 38, "`" + response + "`");
             }
         } catch (Exception e) {
-            fail("Size limit", 20, e.getMessage());
+            fail("Continuation END", 39, e.getMessage());
         }
     }
 
