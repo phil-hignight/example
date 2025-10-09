@@ -63,11 +63,18 @@ try {
             // Save previous file if we have one
             if (currentFile && fileContent.length > 0) {
                 const content = fileContent.join('\n');
+
+                // Create directory structure if needed
+                const fileDir = path.dirname(currentFile);
+                if (fileDir && fileDir !== '.') {
+                    fs.mkdirSync(fileDir, { recursive: true });
+                }
+
                 fs.writeFileSync(currentFile, content, 'utf8');
                 console.log(`  [OK] Wrote ${currentFile} (${content.length} chars)`);
                 extractedFiles++;
             }
-            
+
             // Start new file
             currentFile = line.substring(6).trim(); // Remove "FILE: "
             fileContent = [];
@@ -93,6 +100,13 @@ try {
     // Save last file
     if (currentFile && fileContent.length > 0) {
         const content = fileContent.join('\n');
+
+        // Create directory structure if needed
+        const fileDir = path.dirname(currentFile);
+        if (fileDir && fileDir !== '.') {
+            fs.mkdirSync(fileDir, { recursive: true });
+        }
+
         fs.writeFileSync(currentFile, content, 'utf8');
         console.log(`  [OK] Wrote ${currentFile} (${content.length} chars)`);
         extractedFiles++;
@@ -100,8 +114,21 @@ try {
     
     console.log(`  Extracted ${extractedFiles} Java files`);
     
-    // Verify files were created
-    const javaFiles = fs.readdirSync('.').filter(f => f.endsWith('.java'));
+    // Verify files were created (recursively check)
+    function findJavaFiles(dir, fileList = []) {
+        const files = fs.readdirSync(dir);
+        for (const file of files) {
+            const filePath = path.join(dir, file);
+            if (fs.statSync(filePath).isDirectory()) {
+                findJavaFiles(filePath, fileList);
+            } else if (file.endsWith('.java')) {
+                fileList.push(filePath);
+            }
+        }
+        return fileList;
+    }
+
+    const javaFiles = findJavaFiles('.');
     if (javaFiles.length === 0) {
         console.error('ERROR: No Java files were extracted!');
         process.exit(1);
@@ -113,23 +140,44 @@ try {
 }
 
 console.log('[2/5] Cleaning previous compilation artifacts...');
-// Clean up any previous .class files
-try {
-    const classFiles = fs.readdirSync('.').filter(f => f.endsWith('.class'));
-    for (const classFile of classFiles) {
-        fs.unlinkSync(classFile);
-        console.log(`  Deleted ${classFile}`);
+// Clean up any previous .class files (recursively)
+function deleteClassFiles(dir) {
+    const files = fs.readdirSync(dir);
+    for (const file of files) {
+        const filePath = path.join(dir, file);
+        if (fs.statSync(filePath).isDirectory()) {
+            deleteClassFiles(filePath);
+        } else if (file.endsWith('.class')) {
+            fs.unlinkSync(filePath);
+            console.log(`  Deleted ${filePath}`);
+        }
     }
+}
+try {
+    deleteClassFiles('.');
 } catch (error) {
     // Ignore errors if no class files exist
 }
 
 console.log('[3/5] Compiling Java files...');
 try {
-    // Get list of Java files explicitly
-    const javaFiles = fs.readdirSync('.').filter(f => f.endsWith('.java'));
+    // Get list of all Java files recursively
+    function findJavaFiles(dir, fileList = []) {
+        const files = fs.readdirSync(dir);
+        for (const file of files) {
+            const filePath = path.join(dir, file);
+            if (fs.statSync(filePath).isDirectory()) {
+                findJavaFiles(filePath, fileList);
+            } else if (file.endsWith('.java')) {
+                fileList.push(filePath);
+            }
+        }
+        return fileList;
+    }
+
+    const javaFiles = findJavaFiles('.');
     console.log(`  Found ${javaFiles.length} Java files to compile`);
-    
+
     const compileCommand = `javac ${javaFiles.join(' ')}`;
     execSync(compileCommand, { stdio: 'inherit' });
     console.log('  Compilation successful!');
@@ -140,8 +188,9 @@ try {
 }
 
 console.log('[4/5] Verifying main class...');
-if (!fs.existsSync('BridgeTestRunner.class')) {
-    console.error('ERROR: BridgeTestRunner.class not found after compilation!');
+const mainClassPath = path.join('com', 'codeboss', 'bridgelayer', 'BridgeTestRunner.class');
+if (!fs.existsSync(mainClassPath)) {
+    console.error(`ERROR: ${mainClassPath} not found after compilation!`);
     process.exit(1);
 }
 } // End of extraction and compilation block
@@ -154,7 +203,7 @@ console.log('=====================================');
 console.log('');
 
 try {
-    execSync(`java BridgeTestRunner "${EXECUTION_DIR}"`, { stdio: 'inherit' });
+    execSync(`java com.codeboss.bridgelayer.BridgeTestRunner "${SCRIPT_DIR}"`, { stdio: 'inherit' });
 } catch (error) {
     // Java process was terminated, this is normal
 }
