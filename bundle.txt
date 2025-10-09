@@ -1,5 +1,7 @@
-FILE: BridgeTestRunner.java
+FILE: com/codeboss/bridgelayer/BridgeTestRunner.java
 |~|~|~|~|~|~|~|~|~|~|~|
+package com.codeboss.bridgelayer;
+
 import java.io.*;
 import java.nio.file.*;
 import java.util.*;
@@ -357,7 +359,7 @@ public class BridgeTestRunner {
             systemTrayManager.updateTrayStatus("Test: Large response");
 
             // Request massive output - bridge should automatically get all continuations
-            String testMessage = buildTestMessage("Generate a 50000 character response (about 10000 words). Start with RESPONSE_START, fill the middle with repeated text, and end with RESPONSE_END. Do not include the END marker - just write RESPONSE_END as the last word.");
+            String testMessage = buildTestMessage("Generate a 50000 character response (about 10000 words). Start with RESPONSE_START, fill the middle with repeated text, end with RESPONSE_END, then finish with |||||END|||||");
             ClipboardManager.copyToClipboard(testMessage);
 
             String response = ClipboardManager.waitForAutomaticResponse(
@@ -436,7 +438,7 @@ public class BridgeTestRunner {
             systemTrayManager.updateTrayStatus("Test: Continuation END");
 
             String testMessage = buildTestMessage(
-                "Write a 500-word essay about Java. End with exactly: |||||END|||||"
+                "Write a 500-word essay about Java. After the essay, you MUST write exactly these 13 characters to signal completion: five pipes, the word END in capital letters, then five more pipes. Do not put it in a code block. Write it as plain text immediately after your essay."
             );
             ClipboardManager.copyToClipboard(testMessage);
 
@@ -585,8 +587,10 @@ public class BridgeTestRunner {
 
 |~|~|~|~|~|~|~|~|~|~|~|
 
-FILE: ClipboardManager.java
+FILE: com/codeboss/bridgelayer/ClipboardManager.java
 |~|~|~|~|~|~|~|~|~|~|~|
+package com.codeboss.bridgelayer;
+
 import java.awt.*;
 import java.awt.datatransfer.*;
 import java.awt.event.InputEvent;
@@ -813,8 +817,10 @@ public class ClipboardManager {
 }
 |~|~|~|~|~|~|~|~|~|~|~|
 
-FILE: ConfigManager.java
+FILE: com/codeboss/bridgelayer/ConfigManager.java
 |~|~|~|~|~|~|~|~|~|~|~|
+package com.codeboss.bridgelayer;
+
 import java.io.*;
 import java.nio.file.*;
 
@@ -995,8 +1001,10 @@ public class ConfigManager {
 }
 |~|~|~|~|~|~|~|~|~|~|~|
 
-FILE: DirectoryOperations.java
+FILE: com/codeboss/bridgelayer/DirectoryOperations.java
 |~|~|~|~|~|~|~|~|~|~|~|
+package com.codeboss.bridgelayer;
+
 import java.io.*;
 import java.nio.file.*;
 import java.util.*;
@@ -1210,8 +1218,10 @@ public class DirectoryOperations {
 }
 |~|~|~|~|~|~|~|~|~|~|~|
 
-FILE: FileOperations.java
+FILE: com/codeboss/bridgelayer/FileOperations.java
 |~|~|~|~|~|~|~|~|~|~|~|
+package com.codeboss.bridgelayer;
+
 import java.io.*;
 import java.nio.file.*;
 import java.nio.file.StandardCopyOption;
@@ -1904,8 +1914,10 @@ public class FileOperations {
 }
 |~|~|~|~|~|~|~|~|~|~|~|
 
-FILE: Logger.java
+FILE: com/codeboss/bridgelayer/Logger.java
 |~|~|~|~|~|~|~|~|~|~|~|
+package com.codeboss.bridgelayer;
+
 import java.io.*;
 import java.nio.file.*;
 import java.time.LocalDateTime;
@@ -1927,8 +1939,10 @@ public class Logger {
 }
 |~|~|~|~|~|~|~|~|~|~|~|
 
-FILE: SearchOperations.java
+FILE: com/codeboss/bridgelayer/SearchOperations.java
 |~|~|~|~|~|~|~|~|~|~|~|
+package com.codeboss.bridgelayer;
+
 import java.io.*;
 import java.nio.file.*;
 import java.util.*;
@@ -2152,8 +2166,10 @@ public class SearchOperations {
 }
 |~|~|~|~|~|~|~|~|~|~|~|
 
-FILE: SystemTrayManager.java
+FILE: com/codeboss/bridgelayer/SystemTrayManager.java
 |~|~|~|~|~|~|~|~|~|~|~|
+package com.codeboss.bridgelayer;
+
 import java.awt.*;
 import java.awt.image.BufferedImage;
 
@@ -2247,8 +2263,10 @@ public class SystemTrayManager {
 }
 |~|~|~|~|~|~|~|~|~|~|~|
 
-FILE: ToolExecutor.java
+FILE: com/codeboss/bridgelayer/ToolExecutor.java
 |~|~|~|~|~|~|~|~|~|~|~|
+package com.codeboss.bridgelayer;
+
 public class ToolExecutor {
 
     private static void log(String message) {
@@ -2309,8 +2327,10 @@ public class ToolExecutor {
 
 |~|~|~|~|~|~|~|~|~|~|~|
 
-FILE: ToolParameterExtractor.java
+FILE: com/codeboss/bridgelayer/ToolParameterExtractor.java
 |~|~|~|~|~|~|~|~|~|~|~|
+package com.codeboss.bridgelayer;
+
 import java.util.regex.Pattern;
 import java.util.regex.Matcher;
 
