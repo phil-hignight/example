@@ -9,7 +9,9 @@ import java.util.*;
 public class BridgeTestRunner {
 
     private static ConfigManager configManager;
+    private static ClipboardManager clipboardManager;
     private static SystemTrayManager systemTrayManager;
+    private static Logger logger;
     private static String workingDirectory;
     private static int passCount = 0;
     private static int failCount = 0;
@@ -64,8 +66,10 @@ public class BridgeTestRunner {
             System.out.println();
 
             // Initialize
-            configManager = new ConfigManager(workingDirectory);
-            systemTrayManager = new SystemTrayManager();
+            logger = new Logger();
+            configManager = new ConfigManager(workingDirectory, logger);
+            clipboardManager = new ClipboardManager();
+            systemTrayManager = new SystemTrayManager(logger);
             systemTrayManager.setupSystemTray();
 
             // Copy bridge JS to clipboard and prompt user
@@ -122,8 +126,8 @@ public class BridgeTestRunner {
     private static void testClipboardAccess() {
         try {
             String testData = "TEST_" + System.currentTimeMillis();
-            ClipboardManager.copyToClipboard(testData);
-            String retrieved = ClipboardManager.getClipboardContent();
+            clipboardManager.copyToClipboard(testData);
+            String retrieved = clipboardManager.getClipboardContent();
 
             if (testData.equals(retrieved)) {
                 pass("Clipboard access");
@@ -138,7 +142,7 @@ public class BridgeTestRunner {
     // Test 2: Auto-click Setup
     private static void testAutoClickSetup() {
         try {
-            if (!configManager.isAutomaticMode()) {
+            if (!true) {
                 fail("Auto-click setup", 3);
                 return;
             }
@@ -159,7 +163,7 @@ public class BridgeTestRunner {
     // Test 3: Simple Message Round-trip
     private static void testSimpleMessageRoundTrip() {
         try {
-            if (!configManager.isAutomaticMode()) {
+            if (!true) {
                 System.out.println("[SKIP] Round-trip - not auto mode");
                 return;
             }
@@ -167,9 +171,9 @@ public class BridgeTestRunner {
             systemTrayManager.updateTrayStatus("Test: Round-trip");
 
             String testMessage = buildTestMessage("Test message");
-            ClipboardManager.copyToClipboard(testMessage);
+            clipboardManager.copyToClipboard(testMessage);
 
-            String response = ClipboardManager.waitForAutomaticResponse(
+            String response = clipboardManager.waitForAutomaticResponse(
                 configManager.getClickX(),
                 configManager.getClickY()
             );
@@ -200,7 +204,7 @@ public class BridgeTestRunner {
     // Test 4: Continuation Handling
     private static void testContinuationHandling() {
         try {
-            if (!configManager.isAutomaticMode()) {
+            if (!true) {
                 System.out.println("[SKIP] Continuation - not auto mode");
                 return;
             }
@@ -213,9 +217,9 @@ public class BridgeTestRunner {
             String testMessage = buildTestMessage(
                 "Write 500-word essay on Java. End with |||||END|||||"
             );
-            ClipboardManager.copyToClipboard(testMessage);
+            clipboardManager.copyToClipboard(testMessage);
 
-            String response = ClipboardManager.waitForAutomaticResponse(
+            String response = clipboardManager.waitForAutomaticResponse(
                 configManager.getClickX(),
                 configManager.getClickY()
             );
@@ -243,7 +247,7 @@ public class BridgeTestRunner {
     // Test 5: Token Limit Discovery
     private static void testEmptyResponseHandling() {
         try {
-            if (!configManager.isAutomaticMode()) {
+            if (!true) {
                 System.out.println("[SKIP] Token limit - not auto mode");
                 return;
             }
@@ -270,9 +274,9 @@ public class BridgeTestRunner {
                 large.append(" ").append(uniqueMarker);
 
                 String testMessage = buildTestMessage(large.toString());
-                ClipboardManager.copyToClipboard(testMessage);
+                clipboardManager.copyToClipboard(testMessage);
 
-                String response = ClipboardManager.waitForAutomaticResponse(
+                String response = clipboardManager.waitForAutomaticResponse(
                     configManager.getClickX(),
                     configManager.getClickY()
                 );
@@ -312,7 +316,7 @@ public class BridgeTestRunner {
     // Test 6: Special Characters
     private static void testSpecialCharacters() {
         try {
-            if (!configManager.isAutomaticMode()) {
+            if (!true) {
                 System.out.println("[SKIP] Special chars - not auto mode");
                 return;
             }
@@ -324,9 +328,9 @@ public class BridgeTestRunner {
             String specialContent = "Reply PASS_SPECIAL. Test: \n\t\"quotes\" 'apostrophe' \\backslash\\ {braces} [brackets] (parens) <angles> & ampersand | pipe $ dollar % percent @ at # hash ! bang ? question * asterisk ~ tilde ` backtick 你好 مرحبا 😀🎉🚀 ñáéíóú Δφλ";
 
             String testMessage = buildTestMessage(specialContent);
-            ClipboardManager.copyToClipboard(testMessage);
+            clipboardManager.copyToClipboard(testMessage);
 
-            String response = ClipboardManager.waitForAutomaticResponse(
+            String response = clipboardManager.waitForAutomaticResponse(
                 configManager.getClickX(),
                 configManager.getClickY()
             );
@@ -350,7 +354,7 @@ public class BridgeTestRunner {
     // Test 7: Large Response (Multi-continuation)
     private static void testLargeResponse() {
         try {
-            if (!configManager.isAutomaticMode()) {
+            if (!true) {
                 System.out.println("[SKIP] Large response - not auto mode");
                 return;
             }
@@ -360,9 +364,9 @@ public class BridgeTestRunner {
 
             // Request massive output - bridge should automatically get all continuations
             String testMessage = buildTestMessage("Generate a 50000 character response (about 10000 words). Start with RESPONSE_START, fill the middle with repeated text, end with RESPONSE_END, then finish with |||||END|||||");
-            ClipboardManager.copyToClipboard(testMessage);
+            clipboardManager.copyToClipboard(testMessage);
 
-            String response = ClipboardManager.waitForAutomaticResponse(
+            String response = clipboardManager.waitForAutomaticResponse(
                 configManager.getClickX(),
                 configManager.getClickY()
             );
@@ -387,7 +391,7 @@ public class BridgeTestRunner {
     // Test 8: Rapid Requests
     private static void testRapidRequests() {
         try {
-            if (!configManager.isAutomaticMode()) {
+            if (!true) {
                 System.out.println("[SKIP] Rapid requests - not auto mode");
                 return;
             }
@@ -398,9 +402,9 @@ public class BridgeTestRunner {
             // Send 3 requests in quick succession
             for (int i = 1; i <= 3; i++) {
                 String testMessage = buildTestMessage("Reply: Request " + i + " of 3");
-                ClipboardManager.copyToClipboard(testMessage);
+                clipboardManager.copyToClipboard(testMessage);
 
-                String response = ClipboardManager.waitForAutomaticResponse(
+                String response = clipboardManager.waitForAutomaticResponse(
                     configManager.getClickX(),
                     configManager.getClickY()
                 );
@@ -429,7 +433,7 @@ public class BridgeTestRunner {
     // Test 9: Continuation END Marker
     private static void testContinuationEndMarker() {
         try {
-            if (!configManager.isAutomaticMode()) {
+            if (!true) {
                 System.out.println("[SKIP] Continuation END - not auto mode");
                 return;
             }
@@ -440,9 +444,9 @@ public class BridgeTestRunner {
             String testMessage = buildTestMessage(
                 "Write a 500-word essay about Java. After the essay, you MUST write exactly these 13 characters to signal completion: five pipes, the word END in capital letters, then five more pipes. Do not put it in a code block. Write it as plain text immediately after your essay."
             );
-            ClipboardManager.copyToClipboard(testMessage);
+            clipboardManager.copyToClipboard(testMessage);
 
-            String response = ClipboardManager.waitForAutomaticResponse(
+            String response = clipboardManager.waitForAutomaticResponse(
                 configManager.getClickX(),
                 configManager.getClickY()
             );
@@ -478,9 +482,9 @@ public class BridgeTestRunner {
             scanner.nextLine();
 
             String testMessage = buildTestMessage("Test");
-            ClipboardManager.copyToClipboard(testMessage);
+            clipboardManager.copyToClipboard(testMessage);
 
-            String response = ClipboardManager.waitForAutomaticResponse(
+            String response = clipboardManager.waitForAutomaticResponse(
                 configManager.getClickX(),
                 configManager.getClickY()
             );
@@ -552,7 +556,7 @@ public class BridgeTestRunner {
             }
 
             String bridgeScript = new String(Files.readAllBytes(bridgeScriptPath));
-            ClipboardManager.copyToClipboard(bridgeScript);
+            clipboardManager.copyToClipboard(bridgeScript);
 
             System.out.println("✓ Bridge script copied to clipboard (" + bridgeScript.length() + " chars)");
 
@@ -596,14 +600,14 @@ import java.awt.datatransfer.*;
 import java.awt.event.InputEvent;
 import java.util.Scanner;
 
-public class ClipboardManager {
-    private static Scanner scanner = new Scanner(System.in);
-    
-    private static void log(String message) {
-        Logger.log(message);
+public class ClipboardManager implements com.codeboss.javalayer.bridge.IClipboardManager {
+    private Scanner scanner = new Scanner(System.in);
+
+    private void log(String message) {
+        System.out.println("[ClipboardManager] " + message);
     }
     
-    public static void copyToClipboard(String text) {
+    public void copyToClipboard(String text) {
         int maxRetries = 3;
         int retryDelay = 100; // Start with 100ms
 
@@ -632,7 +636,7 @@ public class ClipboardManager {
         }
     }
     
-    public static String getClipboardContent() {
+    public String getClipboardContent() {
         try {
             Clipboard clipboard = Toolkit.getDefaultToolkit().getSystemClipboard();
             Transferable contents = clipboard.getContents(null);
@@ -646,7 +650,7 @@ public class ClipboardManager {
         return null;
     }
     
-    public static String getResponseFromClipboard(String originalPrompt) {
+    public String getResponseFromClipboard(String originalPrompt) {
         while (true) {
             try {
                 String input = scanner.nextLine().trim();
@@ -657,13 +661,13 @@ public class ClipboardManager {
                 }
                 
                 if (input.equalsIgnoreCase("c")) {
-                    copyToClipboard(originalPrompt);
+                    this.copyToClipboard(originalPrompt);
                     log("Prompt re-copied to clipboard");
                     System.out.println("~{ Prompt re-copied to clipboard }~");
                     continue;
                 }
-                
-                String clipboardContent = getClipboardContent();
+
+                String clipboardContent = this.getClipboardContent();
                 log("Clipboard read: " + (clipboardContent != null ? clipboardContent.length() : 0) + " characters");
                 
                 // CRITICAL: Log details about what was actually read from clipboard
@@ -703,7 +707,7 @@ public class ClipboardManager {
         }
     }
     
-    public static void clickAtCoordinates(int x, int y) {
+    public void clickAtCoordinates(int x, int y) {
         try {
             Robot robot = new Robot();
             robot.mouseMove(x, y);
@@ -715,7 +719,7 @@ public class ClipboardManager {
         }
     }
     
-    public static void moveMouseTo(int x, int y) {
+    public void moveMouseTo(int x, int y) {
         try {
             Robot robot = new Robot();
             robot.mouseMove(x, y);
@@ -726,19 +730,20 @@ public class ClipboardManager {
         }
     }
     
-    public static String waitForAutomaticResponse(int clickX, int clickY) {
+    public String waitForAutomaticResponse(int clickX, int clickY) {
         log("Starting automatic response polling");
         
         while (true) {
             try {
                 // Move mouse to coordinates and click
-                clickAtCoordinates(clickX, clickY);
-                
+                this.clickAtCoordinates(clickX, clickY);
+
                 // Check clipboard for response with terminator
-                String clipboardContent = getClipboardContent();
-                if (clipboardContent != null && clipboardContent.endsWith("|||||TO JAVA|||||")) {
+                String clipboardContent = this.getClipboardContent();
+                if (clipboardContent != null && (clipboardContent.endsWith("|||||CLIP:TO_JAVA|||||") || clipboardContent.endsWith("|||||CLIP:TO_JAVA_END|||||"))) {
                     // Remove terminator and return response
-                    String response = clipboardContent.substring(0, clipboardContent.length() - "|||||TO JAVA|||||".length());
+                    String marker = clipboardContent.endsWith("|||||CLIP:TO_JAVA_END|||||") ? "|||||CLIP:TO_JAVA_END|||||" : "|||||CLIP:TO_JAVA|||||";
+                    String response = clipboardContent.substring(0, clipboardContent.length() - marker.length());
                     log("Received automatic response: " + response.length() + " characters");
                     
                     // CRITICAL: Log details about empty or problematic responses
@@ -790,7 +795,7 @@ public class ClipboardManager {
         }
     }
     
-    public static String handleAutoCancelRetry(String originalPrompt, int clickX, int clickY) {
+    public String handleAutoCancelRetry(String originalPrompt, int clickX, int clickY) {
         System.out.println("Auto-clicking cancelled (mouse moved too far)");
         System.out.println("Press 'r' to retry auto-clicking or 'a' to abort: ");
         
@@ -801,7 +806,7 @@ public class ClipboardManager {
                 if (input.equals("r")) {
                     log("User chose to retry auto-clicking");
                     System.out.println("Retrying auto-clicking...");
-                    return waitForAutomaticResponse(clickX, clickY);
+                    return this.waitForAutomaticResponse(clickX, clickY);
                 } else if (input.equals("a")) {
                     log("User chose to abort auto-clicking");
                     return null;
@@ -824,25 +829,23 @@ package com.codeboss.bridgelayer;
 import java.io.*;
 import java.nio.file.*;
 
-public class ConfigManager {
+public class ConfigManager implements com.codeboss.javalayer.bridge.IConfigManager {
     private String workingDirectory;
+    private Logger logger;
 
     private String getConfigFile() {
         return Paths.get(workingDirectory, ".agent", "config.json").toString();
     }
 
     private int maxMessageChars = 350000; // Default max message chars
-    private int wrapWidth = 110; // Default wrap width
-    private String mode = "manual"; // Default mode (manual or automatic)
     private int clickX = 500; // Default click X coordinate for automatic mode
     private int clickY = 300; // Default click Y coordinate for automatic mode
+    private int serverPort = 3000; // Default server port
+    private boolean autoLaunchBrowser = true; // Default auto-launch browser setting
 
-    private static void log(String message) {
-        Logger.log(message);
-    }
-
-    public ConfigManager(String workingDirectory) throws IOException {
+    public ConfigManager(String workingDirectory, Logger logger) throws IOException {
         this.workingDirectory = workingDirectory;
+        this.logger = logger;
         loadConfig();
     }
 
@@ -856,14 +859,22 @@ public class ConfigManager {
             }
             
             // Create default config
-            String defaultConfig = "{\"maxMessageChars\": 350000, \"wrapWidth\": 110, \"mode\": \"manual\", \"clickX\": 500, \"clickY\": 300}";
+            String defaultConfig = "{\n" +
+                "  \"maxMessageChars\": 350000,\n" +
+                "  \"clickX\": 500,\n" +
+                "  \"clickY\": 300,\n" +
+                "  \"server\": {\n" +
+                "    \"port\": 3000,\n" +
+                "    \"autoLaunchBrowser\": true\n" +
+                "  }\n" +
+                "}";
             Files.write(configPath, defaultConfig.getBytes());
             maxMessageChars = 350000;
-            wrapWidth = 110;
-            mode = "manual";
             clickX = 500;
             clickY = 300;
-            log("Created default config file");
+            serverPort = 3000;
+            autoLaunchBrowser = true;
+            logger.log("Created default config file");
         } else {
             try {
                 String configContent = new String(Files.readAllBytes(configPath));
@@ -878,160 +889,191 @@ public class ConfigManager {
                     maxMessageChars = 350000; // fallback
                 }
                 
-                // Simple JSON parsing for wrapWidth
-                String wrapPattern = "\"wrapWidth\"\\s*:\\s*(\\d+)";
-                java.util.regex.Pattern p2 = java.util.regex.Pattern.compile(wrapPattern);
-                java.util.regex.Matcher m2 = p2.matcher(configContent);
-                if (m2.find()) {
-                    wrapWidth = Integer.parseInt(m2.group(1));
-                } else {
-                    wrapWidth = 110; // fallback
-                }
-                
-                // Simple JSON parsing for mode
-                String modePattern = "\"mode\"\\s*:\\s*\"([^\"]+)\"";
-                java.util.regex.Pattern p3 = java.util.regex.Pattern.compile(modePattern);
-                java.util.regex.Matcher m3 = p3.matcher(configContent);
-                if (m3.find()) {
-                    mode = m3.group(1);
-                } else {
-                    mode = "manual"; // fallback
-                }
-                
                 // Simple JSON parsing for clickX (support negative numbers)
                 String clickXPattern = "\"clickX\"\\s*:\\s*(-?\\d+)";
-                java.util.regex.Pattern p4 = java.util.regex.Pattern.compile(clickXPattern);
-                java.util.regex.Matcher m4 = p4.matcher(configContent);
-                if (m4.find()) {
-                    clickX = Integer.parseInt(m4.group(1));
+                java.util.regex.Pattern p2 = java.util.regex.Pattern.compile(clickXPattern);
+                java.util.regex.Matcher m2 = p2.matcher(configContent);
+                if (m2.find()) {
+                    clickX = Integer.parseInt(m2.group(1));
                 } else {
                     clickX = 500; // fallback
                 }
-                
+
                 // Simple JSON parsing for clickY (support negative numbers)
                 String clickYPattern = "\"clickY\"\\s*:\\s*(-?\\d+)";
-                java.util.regex.Pattern p5 = java.util.regex.Pattern.compile(clickYPattern);
-                java.util.regex.Matcher m5 = p5.matcher(configContent);
-                if (m5.find()) {
-                    clickY = Integer.parseInt(m5.group(1));
+                java.util.regex.Pattern p3 = java.util.regex.Pattern.compile(clickYPattern);
+                java.util.regex.Matcher m3 = p3.matcher(configContent);
+                if (m3.find()) {
+                    clickY = Integer.parseInt(m3.group(1));
                 } else {
                     clickY = 300; // fallback
                 }
-                
-                log("Loaded config: maxMessageChars = " + maxMessageChars + ", wrapWidth = " + wrapWidth + ", mode = " + mode + ", clickX = " + clickX + ", clickY = " + clickY);
+
+                // Simple JSON parsing for server.port (nested)
+                String portPattern = "\"port\"\\s*:\\s*(\\d+)";
+                java.util.regex.Pattern p4 = java.util.regex.Pattern.compile(portPattern);
+                java.util.regex.Matcher m4 = p4.matcher(configContent);
+                if (m4.find()) {
+                    serverPort = Integer.parseInt(m4.group(1));
+                } else {
+                    serverPort = 3000; // fallback
+                }
+
+                // Simple JSON parsing for server.autoLaunchBrowser (nested)
+                String autoLaunchPattern = "\"autoLaunchBrowser\"\\s*:\\s*(true|false)";
+                java.util.regex.Pattern p5 = java.util.regex.Pattern.compile(autoLaunchPattern);
+                java.util.regex.Matcher m5 = p5.matcher(configContent);
+                if (m5.find()) {
+                    autoLaunchBrowser = Boolean.parseBoolean(m5.group(1));
+                } else {
+                    autoLaunchBrowser = true; // fallback
+                }
+
+                logger.log("Loaded config: maxMessageChars = " + maxMessageChars + ", clickX = " + clickX + ", clickY = " + clickY + ", serverPort = " + serverPort + ", autoLaunchBrowser = " + autoLaunchBrowser);
                 
                 // Validate configuration
                 validateConfig(configContent);
                 
             } catch (Exception e) {
-                log("Error loading config, using defaults: " + e.getMessage());
+                logger.log("Error loading config, using defaults: " + e.getMessage());
                 maxMessageChars = 350000;
-                wrapWidth = 110;
-                mode = "manual";
                 clickX = 500;
                 clickY = 300;
+                serverPort = 3000;
+                autoLaunchBrowser = true;
             }
         }
     }
     
     private void validateConfig(String configContent) throws IOException {
-        if (isAutomaticMode()) {
-            // Check if clickX and clickY are explicitly set in the config
-            boolean hasClickX = configContent.contains("\"clickX\"");
-            boolean hasClickY = configContent.contains("\"clickY\"");
-            
-            if (!hasClickX || !hasClickY) {
-                String error = "Configuration Error: Automatic mode requires 'clickX' and 'clickY' coordinates to be set in config.json";
-                log(error);
-                System.err.println(error);
-                System.err.println("Example config.json:");
-                System.err.println("{");
-                System.err.println("  \"maxMessageChars\": 350000,");
-                System.err.println("  \"wrapWidth\": 110,");
-                System.err.println("  \"mode\": \"automatic\",");
-                System.err.println("  \"clickX\": 500,");
-                System.err.println("  \"clickY\": 300");
-                System.err.println("}");
-                throw new IOException("Invalid configuration for automatic mode");
-            }
-            
-            // Validate coordinates are reasonable (allow negative for multi-monitor setups)
-            if (clickX < -10000 || clickY < -10000 || clickX > 10000 || clickY > 10000) {
-                String error = "Configuration Error: Click coordinates must be between -10000 and 10000. Found clickX=" + clickX + ", clickY=" + clickY;
-                log(error);
-                System.err.println(error);
-                throw new IOException("Invalid click coordinates");
-            }
-            
-            log("Automatic mode validated with coordinates: (" + clickX + ", " + clickY + ")");
+        // Validate coordinates are reasonable (allow negative for multi-monitor setups)
+        if (clickX < -10000 || clickY < -10000 || clickX > 10000 || clickY > 10000) {
+            String error = "Configuration Error: Click coordinates must be between -10000 and 10000. Found clickX=" + clickX + ", clickY=" + clickY;
+            logger.log(error);
+            System.err.println(error);
+            throw new IOException("Invalid click coordinates");
         }
+
+        logger.log("Configuration validated: clickX=" + clickX + ", clickY=" + clickY);
     }
     
     public int getMaxMessageChars() {
         return maxMessageChars;
     }
     
-    public int getWrapWidth() {
-        return wrapWidth;
-    }
-    
     public void setMaxMessageChars(int maxMessageChars) {
         this.maxMessageChars = maxMessageChars;
     }
-    
-    public void setWrapWidth(int wrapWidth) {
-        this.wrapWidth = wrapWidth;
-    }
-    
-    public String getMode() {
-        return mode;
-    }
-    
+
     public int getClickX() {
         return clickX;
     }
-    
+
     public int getClickY() {
         return clickY;
     }
-    
-    public boolean isAutomaticMode() {
-        return "automatic".equals(mode);
+
+    public int getServerPort() {
+        return serverPort;
+    }
+
+    public void setServerPort(int serverPort) {
+        this.serverPort = serverPort;
+    }
+
+    public boolean shouldAutoLaunchBrowser() {
+        return autoLaunchBrowser;
+    }
+
+    public void setAutoLaunchBrowser(boolean autoLaunchBrowser) {
+        this.autoLaunchBrowser = autoLaunchBrowser;
     }
 }
+|~|~|~|~|~|~|~|~|~|~|~|
+
+FILE: com/codeboss/bridgelayer/ConfigManagerAdapter.java
+|~|~|~|~|~|~|~|~|~|~|~|
+package com.codeboss.bridgelayer;
+
+import com.codeboss.javalayer.bridge.IConfigManager;
+import java.io.IOException;
+
+/**
+ * Adapter to make ConfigManager work with IConfigManager interface
+ * Wraps the existing ConfigManager which has a different constructor signature
+ */
+public class ConfigManagerAdapter implements IConfigManager {
+    private final ConfigManager delegate;
+
+    public ConfigManagerAdapter(String workingDirectory, Logger logger) throws IOException {
+        this.delegate = new ConfigManager(workingDirectory, logger);
+    }
+
+    @Override
+    public int getMaxMessageChars() {
+        return delegate.getMaxMessageChars();
+    }
+
+    @Override
+    public int getClickX() {
+        return delegate.getClickX();
+    }
+
+    @Override
+    public int getClickY() {
+        return delegate.getClickY();
+    }
+
+    @Override
+    public int getServerPort() {
+        return delegate.getServerPort();
+    }
+
+    @Override
+    public boolean shouldAutoLaunchBrowser() {
+        return delegate.shouldAutoLaunchBrowser();
+    }
+
+    public void setServerPort(int port) {
+        delegate.setServerPort(port);
+    }
+}
+
 |~|~|~|~|~|~|~|~|~|~|~|
 
 FILE: com/codeboss/bridgelayer/DirectoryOperations.java
 |~|~|~|~|~|~|~|~|~|~|~|
 package com.codeboss.bridgelayer;
 
+import com.codeboss.javalayer.bridge.ILogger;
 import java.io.*;
 import java.nio.file.*;
 import java.util.*;
 import java.util.stream.Collectors;
 
 public class DirectoryOperations {
-    
-    private static void log(String message) {
-        Logger.log(message);
+    private final ILogger logger;
+    private final ToolParameterExtractor extractor;
+    private final String workingDirectory;
+
+    public DirectoryOperations(ILogger logger, ToolParameterExtractor extractor, String workingDirectory) {
+        this.logger = logger;
+        this.extractor = extractor;
+        this.workingDirectory = workingDirectory;
     }
-    
-    private static String getWorkingDirectory() {
-        return BridgeTestRunner.getWorkingDirectory();
-    }
-    
-    private static Path resolvePath(String filePath) {
+
+    private Path resolvePath(String filePath) {
         Path path = Paths.get(filePath);
         if (path.isAbsolute()) {
             return path;
         } else {
-            return Paths.get(getWorkingDirectory()).resolve(path);
+            return Paths.get(workingDirectory).resolve(path);
         }
     }
-    
-    public static ToolExecutor.ToolExecutionResult executeCreateDirectoryWithSummary(String toolParams) {
+
+    public ToolExecutor.ToolExecutionResult executeCreateDirectoryWithSummary(String toolParams) {
         try {
-            String dirPath = ToolParameterExtractor.extractParameter(toolParams, "dir_path");
+            String dirPath = extractor.extractParameter(toolParams, "dir_path");
             
             if (dirPath == null || dirPath.trim().isEmpty()) {
                 String error = "Error: dir_path parameter is required";
@@ -1055,9 +1097,9 @@ public class DirectoryOperations {
         }
     }
     
-    public static ToolExecutor.ToolExecutionResult executeDeleteDirectoryWithSummary(String toolParams) {
+    public ToolExecutor.ToolExecutionResult executeDeleteDirectoryWithSummary(String toolParams) {
         try {
-            String dirPath = ToolParameterExtractor.extractParameter(toolParams, "dir_path");
+            String dirPath = extractor.extractParameter(toolParams, "dir_path");
             
             if (dirPath == null || dirPath.trim().isEmpty()) {
                 String error = "Error: dir_path parameter is required";
@@ -1099,10 +1141,10 @@ public class DirectoryOperations {
         }
     }
     
-    public static ToolExecutor.ToolExecutionResult executeListFilesWithSummary(String toolParams) {
+    public ToolExecutor.ToolExecutionResult executeListFilesWithSummary(String toolParams) {
         try {
-            String pathParam = ToolParameterExtractor.extractParameter(toolParams, "path");
-            String targetPath = (pathParam != null && !pathParam.trim().isEmpty()) ? pathParam : getWorkingDirectory();
+            String pathParam = extractor.extractParameter(toolParams, "path");
+            String targetPath = (pathParam != null && !pathParam.trim().isEmpty()) ? pathParam : workingDirectory;
             
             Path path = resolvePath(targetPath);
             
@@ -1160,10 +1202,10 @@ public class DirectoryOperations {
         }
     }
     
-    public static ToolExecutor.ToolExecutionResult executeListRecursiveWithSummary(String toolParams) {
+    public ToolExecutor.ToolExecutionResult executeListRecursiveWithSummary(String toolParams) {
         try {
-            String pathParam = ToolParameterExtractor.extractParameter(toolParams, "path");
-            String targetPath = (pathParam != null && !pathParam.trim().isEmpty()) ? pathParam : getWorkingDirectory();
+            String pathParam = extractor.extractParameter(toolParams, "path");
+            String targetPath = (pathParam != null && !pathParam.trim().isEmpty()) ? pathParam : workingDirectory;
             
             Path path = resolvePath(targetPath);
             
@@ -1222,35 +1264,37 @@ FILE: com/codeboss/bridgelayer/FileOperations.java
 |~|~|~|~|~|~|~|~|~|~|~|
 package com.codeboss.bridgelayer;
 
+import com.codeboss.javalayer.bridge.ILogger;
 import java.io.*;
 import java.nio.file.*;
 import java.nio.file.StandardCopyOption;
 import java.util.*;
 
 public class FileOperations {
-    
-    private static void log(String message) {
-        Logger.log(message);
+    private final ILogger logger;
+    private final ToolParameterExtractor extractor;
+    private final String workingDirectory;
+
+    public FileOperations(ILogger logger, ToolParameterExtractor extractor, String workingDirectory) {
+        this.logger = logger;
+        this.extractor = extractor;
+        this.workingDirectory = workingDirectory;
     }
-    
-    private static String getWorkingDirectory() {
-        return BridgeTestRunner.getWorkingDirectory();
-    }
-    
-    private static Path resolvePath(String filePath) {
+
+    private Path resolvePath(String filePath) {
         Path path = Paths.get(filePath);
         if (path.isAbsolute()) {
             return path;
         } else {
-            return Paths.get(getWorkingDirectory()).resolve(path);
+            return Paths.get(workingDirectory).resolve(path);
         }
     }
-    
-    public static ToolExecutor.ToolExecutionResult executeReadFileWithSummary(String toolParams) {
+
+    public ToolExecutor.ToolExecutionResult executeReadFileWithSummary(String toolParams) {
         try {
-            String filePath = ToolParameterExtractor.extractParameter(toolParams, "file_path");
-            String findString = ToolParameterExtractor.extractParameter(toolParams, "find_string");
-            String limitStr = ToolParameterExtractor.extractParameter(toolParams, "limit");
+            String filePath = extractor.extractParameter(toolParams, "file_path");
+            String findString = extractor.extractParameter(toolParams, "find_string");
+            String limitStr = extractor.extractParameter(toolParams, "limit");
             
             if (filePath == null || filePath.trim().isEmpty()) {
                 String error = "Error: file_path parameter is required";
@@ -1309,11 +1353,11 @@ public class FileOperations {
         }
     }
     
-    public static ToolExecutor.ToolExecutionResult executeReadFileLinesWithSummary(String toolParams) {
+    public ToolExecutor.ToolExecutionResult executeReadFileLinesWithSummary(String toolParams) {
         try {
-            String filePath = ToolParameterExtractor.extractParameter(toolParams, "file_path");
-            String startLineStr = ToolParameterExtractor.extractParameter(toolParams, "start_line");
-            String endLineStr = ToolParameterExtractor.extractParameter(toolParams, "end_line");
+            String filePath = extractor.extractParameter(toolParams, "file_path");
+            String startLineStr = extractor.extractParameter(toolParams, "start_line");
+            String endLineStr = extractor.extractParameter(toolParams, "end_line");
 
             if (filePath == null || filePath.trim().isEmpty()) {
                 String error = "Error: file_path parameter is required";
@@ -1382,16 +1426,16 @@ public class FileOperations {
 
         } catch (Exception e) {
             String error = "Error reading file lines: " + e.getMessage();
-            log("ERROR in executeReadFileLinesWithSummary: " + e.getClass().getName() + " - " + e.getMessage());
+            logger.log("ERROR in executeReadFileLinesWithSummary: " + e.getClass().getName() + " - " + e.getMessage());
             e.printStackTrace();
             return new ToolExecutor.ToolExecutionResult(error, error);
         }
     }
 
-    public static ToolExecutor.ToolExecutionResult executeCreateFileWithSummary(String toolParams) {
+    public ToolExecutor.ToolExecutionResult executeCreateFileWithSummary(String toolParams) {
         try {
-            String filePath = ToolParameterExtractor.extractParameter(toolParams, "file_path");
-            String content = ToolParameterExtractor.extractParameter(toolParams, "content");
+            String filePath = extractor.extractParameter(toolParams, "file_path");
+            String content = extractor.extractParameter(toolParams, "content");
 
             if (filePath == null || filePath.trim().isEmpty()) {
                 String error = "Error: file_path parameter is required";
@@ -1426,9 +1470,9 @@ public class FileOperations {
         }
     }
     
-    public static ToolExecutor.ToolExecutionResult executeDeleteFileWithSummary(String toolParams) {
+    public ToolExecutor.ToolExecutionResult executeDeleteFileWithSummary(String toolParams) {
         try {
-            String filePath = ToolParameterExtractor.extractParameter(toolParams, "file_path");
+            String filePath = extractor.extractParameter(toolParams, "file_path");
             
             if (filePath == null || filePath.trim().isEmpty()) {
                 String error = "Error: file_path parameter is required";
@@ -1457,10 +1501,10 @@ public class FileOperations {
         }
     }
     
-    public static ToolExecutor.ToolExecutionResult executeMoveFileWithSummary(String toolParams) {
+    public ToolExecutor.ToolExecutionResult executeMoveFileWithSummary(String toolParams) {
         try {
-            String sourcePath = ToolParameterExtractor.extractParameter(toolParams, "source_path");
-            String destPath = ToolParameterExtractor.extractParameter(toolParams, "dest_path");
+            String sourcePath = extractor.extractParameter(toolParams, "source_path");
+            String destPath = extractor.extractParameter(toolParams, "dest_path");
             
             if (sourcePath == null || sourcePath.trim().isEmpty()) {
                 String error = "Error: source_path parameter is required";
@@ -1508,11 +1552,11 @@ public class FileOperations {
         }
     }
     
-    public static ToolExecutor.ToolExecutionResult executeUpdateFileWithSummary(String toolParams) {
+    public ToolExecutor.ToolExecutionResult executeUpdateFileWithSummary(String toolParams) {
         try {
-            String filePath = ToolParameterExtractor.extractParameter(toolParams, "file_path");
-            String findString = ToolParameterExtractor.extractParameter(toolParams, "find_string");
-            String replaceString = ToolParameterExtractor.extractParameter(toolParams, "replace_string");
+            String filePath = extractor.extractParameter(toolParams, "file_path");
+            String findString = extractor.extractParameter(toolParams, "find_string");
+            String replaceString = extractor.extractParameter(toolParams, "replace_string");
             
             if (filePath == null || filePath.trim().isEmpty()) {
                 String error = "Error: file_path parameter is required";
@@ -1734,12 +1778,12 @@ public class FileOperations {
         }
     }
     
-    public static ToolExecutor.ToolExecutionResult executeGitReadWithSummary(String toolParams) {
+    public ToolExecutor.ToolExecutionResult executeGitReadWithSummary(String toolParams) {
         try {
-            String projectPath = ToolParameterExtractor.extractParameter(toolParams, "project_path");
-            String gitArgs = ToolParameterExtractor.extractParameter(toolParams, "git_args");
-            String offsetStr = ToolParameterExtractor.extractParameter(toolParams, "offset");
-            String limitStr = ToolParameterExtractor.extractParameter(toolParams, "limit");
+            String projectPath = extractor.extractParameter(toolParams, "project_path");
+            String gitArgs = extractor.extractParameter(toolParams, "git_args");
+            String offsetStr = extractor.extractParameter(toolParams, "offset");
+            String limitStr = extractor.extractParameter(toolParams, "limit");
             
             if (projectPath == null || projectPath.trim().isEmpty()) {
                 String error = "Error: project_path parameter is required";
@@ -1923,14 +1967,15 @@ import java.nio.file.*;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 
-public class Logger {
-    
-    public static void log(String message) {
+public class Logger implements com.codeboss.javalayer.bridge.ILogger {
+
+    @Override
+    public void log(String message) {
         try {
             String logFile = BridgeTestRunner.getLogFile();
             String timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS"));
             String logMessage = "[" + timestamp + "] " + message + "\n";
-            Files.write(Paths.get(logFile), logMessage.getBytes(), 
+            Files.write(Paths.get(logFile), logMessage.getBytes(),
                        StandardOpenOption.CREATE, StandardOpenOption.APPEND);
         } catch (Exception e) {
             System.err.println("Failed to write to log: " + e.getMessage());
@@ -1943,30 +1988,32 @@ FILE: com/codeboss/bridgelayer/SearchOperations.java
 |~|~|~|~|~|~|~|~|~|~|~|
 package com.codeboss.bridgelayer;
 
+import com.codeboss.javalayer.bridge.ILogger;
 import java.io.*;
 import java.nio.file.*;
 import java.util.*;
 
 public class SearchOperations {
-    
-    private static void log(String message) {
-        Logger.log(message);
+    private final ILogger logger;
+    private final ToolParameterExtractor extractor;
+    private final String workingDirectory;
+
+    public SearchOperations(ILogger logger, ToolParameterExtractor extractor, String workingDirectory) {
+        this.logger = logger;
+        this.extractor = extractor;
+        this.workingDirectory = workingDirectory;
     }
-    
-    private static String getWorkingDirectory() {
-        return BridgeTestRunner.getWorkingDirectory();
-    }
-    
-    public static ToolExecutor.ToolExecutionResult executeSearchFilesWithSummary(String toolParams) {
+
+    public ToolExecutor.ToolExecutionResult executeSearchFilesWithSummary(String toolParams) {
         try {
-            String query = ToolParameterExtractor.extractParameter(toolParams, "query");
+            String query = extractor.extractParameter(toolParams, "query");
             
             if (query == null || query.trim().isEmpty()) {
                 String error = "Error: query parameter is required";
                 return new ToolExecutor.ToolExecutionResult(error, error);
             }
             
-            Path currentPath = Paths.get(getWorkingDirectory());
+            Path currentPath = Paths.get(workingDirectory);
             StringBuilder results = new StringBuilder();
             int matchCount = 0;
             
@@ -2012,12 +2059,12 @@ public class SearchOperations {
         }
     }
     
-    public static ToolExecutor.ToolExecutionResult executeSearchContentWithSummary(String toolParams) {
+    public ToolExecutor.ToolExecutionResult executeSearchContentWithSummary(String toolParams) {
         try {
-            String query = ToolParameterExtractor.extractParameter(toolParams, "query");
-            String filePattern = ToolParameterExtractor.extractParameter(toolParams, "file_pattern");
-            String maxResultsStr = ToolParameterExtractor.extractParameter(toolParams, "max_results");
-            String maxPerFileStr = ToolParameterExtractor.extractParameter(toolParams, "max_results_per_file");
+            String query = extractor.extractParameter(toolParams, "query");
+            String filePattern = extractor.extractParameter(toolParams, "file_pattern");
+            String maxResultsStr = extractor.extractParameter(toolParams, "max_results");
+            String maxPerFileStr = extractor.extractParameter(toolParams, "max_results_per_file");
 
             if (query == null || query.trim().isEmpty()) {
                 String error = "Error: query parameter is required";
@@ -2036,10 +2083,10 @@ public class SearchOperations {
                     maxPerFile = Integer.parseInt(maxPerFileStr.trim());
                 }
             } catch (NumberFormatException e) {
-                log("Invalid max_results or max_results_per_file parameter, using defaults");
+                logger.log("Invalid max_results or max_results_per_file parameter, using defaults");
             }
 
-            Path currentPath = Paths.get(getWorkingDirectory());
+            Path currentPath = Paths.get(workingDirectory);
             StringBuilder results = new StringBuilder();
             int totalMatches = 0;
             int filesWithMatches = 0;
@@ -2115,7 +2162,7 @@ public class SearchOperations {
 
                     } catch (Exception e) {
                         // Skip files that can't be read
-                        log("Error reading file " + path + ": " + e.getMessage());
+                        logger.log("Error reading file " + path + ": " + e.getMessage());
                     }
                 }
 
@@ -2170,57 +2217,59 @@ FILE: com/codeboss/bridgelayer/SystemTrayManager.java
 |~|~|~|~|~|~|~|~|~|~|~|
 package com.codeboss.bridgelayer;
 
+import com.codeboss.javalayer.bridge.ILogger;
 import java.awt.*;
 import java.awt.image.BufferedImage;
 
 public class SystemTrayManager {
+    private final ILogger logger;
     private TrayIcon trayIcon;
-    
-    private static void log(String message) {
-        Logger.log(message);
+
+    public SystemTrayManager(ILogger logger) {
+        this.logger = logger;
     }
-    
+
     public void setupSystemTray() {
         if (!SystemTray.isSupported()) {
-            log("System tray not supported on this platform");
+            logger.log("System tray not supported on this platform");
             return;
         }
-        
+
         try {
             SystemTray tray = SystemTray.getSystemTray();
-            
+
             // Create a simple green icon (16x16)
             Image image = createTrayIcon();
-            
+
             // Create popup menu
             PopupMenu popup = new PopupMenu();
-            
+
             MenuItem statusItem = new MenuItem("Conversation CLI - Running");
             statusItem.setEnabled(false);
             popup.add(statusItem);
-            
+
             popup.addSeparator();
-            
+
             MenuItem exitItem = new MenuItem("Exit");
             exitItem.addActionListener(e -> {
-                log("Exit requested from system tray");
+                logger.log("Exit requested from system tray");
                 cleanup();
                 System.exit(0);
             });
             popup.add(exitItem);
-            
+
             // Create tray icon
             trayIcon = new TrayIcon(image, "Conversation CLI", popup);
             trayIcon.setImageAutoSize(true);
             trayIcon.setToolTip("Conversation CLI - Maintaining clipboard access");
-            
+
             // Add to system tray
             tray.add(trayIcon);
-            
-            log("System tray icon added successfully");
-            
+
+            logger.log("System tray icon added successfully");
+
         } catch (Exception e) {
-            log("Failed to setup system tray: " + e.getMessage());
+            logger.log("Failed to setup system tray: " + e.getMessage());
             System.err.println("Warning: Could not setup system tray: " + e.getMessage());
         }
     }
@@ -2267,61 +2316,18 @@ FILE: com/codeboss/bridgelayer/ToolExecutor.java
 |~|~|~|~|~|~|~|~|~|~|~|
 package com.codeboss.bridgelayer;
 
-public class ToolExecutor {
+import com.codeboss.javalayer.bridge.IToolExecutor;
 
-    private static void log(String message) {
-        Logger.log(message);
+public class ToolExecutor implements IToolExecutor {
+    @Override
+    public ToolExecutionResult executeToolWithSummary(String toolName, String toolParams) {
+        // TODO: Implement tool execution
+        return new ToolExecutionResult("Not implemented", "Not implemented");
     }
-
-    public static ToolExecutionResult executeToolWithSummary(String toolName, String toolParams) {
-        try {
-            switch (toolName) {
-                case "read_file":
-                    return FileOperations.executeReadFileWithSummary(toolParams);
-                case "read_file_lines":
-                    return FileOperations.executeReadFileLinesWithSummary(toolParams);
-                case "create_file":
-                    return FileOperations.executeCreateFileWithSummary(toolParams);
-                case "delete_file":
-                    return FileOperations.executeDeleteFileWithSummary(toolParams);
-                case "move_file":
-                    return FileOperations.executeMoveFileWithSummary(toolParams);
-                case "update_file":
-                    return FileOperations.executeUpdateFileWithSummary(toolParams);
-                case "create_directory":
-                    return DirectoryOperations.executeCreateDirectoryWithSummary(toolParams);
-                case "delete_directory_recursive":
-                    return DirectoryOperations.executeDeleteDirectoryWithSummary(toolParams);
-                case "list_files":
-                    return DirectoryOperations.executeListFilesWithSummary(toolParams);
-                case "list_recursive":
-                    return DirectoryOperations.executeListRecursiveWithSummary(toolParams);
-                case "search_files":
-                    return SearchOperations.executeSearchFilesWithSummary(toolParams);
-                case "search_content":
-                    return SearchOperations.executeSearchContentWithSummary(toolParams);
-                case "git_read":
-                    return FileOperations.executeGitReadWithSummary(toolParams);
-                default:
-                    log("Unknown tool: " + toolName);
-                    String error = "Error: Unknown tool '" + toolName + "'";
-                    return new ToolExecutionResult(error, error);
-            }
-        } catch (Exception e) {
-            log("Error executing tool " + toolName + ": " + e.getMessage());
-            String error = "Error executing " + toolName + ": " + e.getMessage();
-            return new ToolExecutionResult(error, error);
-        }
-    }
-
-    public static class ToolExecutionResult {
-        public String fullResult;
-        public String summary;
-
-        public ToolExecutionResult(String fullResult, String summary) {
-            this.fullResult = fullResult;
-            this.summary = summary;
-        }
+    
+    public String executeTool(String toolName, String toolParams) {
+        ToolExecutionResult result = executeToolWithSummary(toolName, toolParams);
+        return result.fullResult;
     }
 }
 
@@ -2331,32 +2337,34 @@ FILE: com/codeboss/bridgelayer/ToolParameterExtractor.java
 |~|~|~|~|~|~|~|~|~|~|~|
 package com.codeboss.bridgelayer;
 
+import com.codeboss.javalayer.bridge.ILogger;
 import java.util.regex.Pattern;
 import java.util.regex.Matcher;
 
 public class ToolParameterExtractor {
-    
-    private static void log(String message) {
-        Logger.log(message);
+    private final ILogger logger;
+
+    public ToolParameterExtractor(ILogger logger) {
+        this.logger = logger;
     }
-    
-    public static String extractParameter(String toolParams, String paramName) {
+
+    public String extractParameter(String toolParams, String paramName) {
         try {
             String pattern = "<parameter name=\"" + paramName + "\">(.*?)</parameter>";
             Pattern p = Pattern.compile(pattern, Pattern.DOTALL);
             Matcher m = p.matcher(toolParams);
-            
+
             if (m.find()) {
                 return m.group(1).trim();
             }
-            
+
         } catch (Exception e) {
-            log("Error extracting parameter " + paramName + ": " + e.getMessage());
+            logger.log("Error extracting parameter " + paramName + ": " + e.getMessage());
         }
-        
+
         return null;
     }
-    
+
     public static String formatFileSize(long bytes) {
         if (bytes < 1024) return bytes + "B";
         if (bytes < 1024 * 1024) return String.format("%.1fKB", bytes / 1024.0);
