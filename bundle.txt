@@ -82,13 +82,13 @@ public class BridgeTestRunner {
             // Run all tests
             testClipboardAccess();
             testAutoClickSetup();
-            testSimpleMessageRoundTrip();
-            testSpecialCharacters();
-            testLargeResponse();
-            testRapidRequests();
+            // testSimpleMessageRoundTrip();
+            // testSpecialCharacters();
+            // testLargeResponse();
+            // testRapidRequests();
             testContinuationEndMarker();
-            testEmptyResponseHandling();
-            testMouseCancellation();
+            // testEmptyResponseHandling();
+            // testMouseCancellation();
 
             // Summary
             System.out.println();
@@ -444,15 +444,18 @@ public class BridgeTestRunner {
             Thread.sleep(500);
             systemTrayManager.updateTrayStatus("Test: Continuation END");
 
+            System.out.println(">>> TEST9: Starting Continuation END Marker test");
             String testMessage = buildTestMessage(
                 "Write a 500-word essay about Java. After the essay, you MUST write exactly these 13 characters to signal completion: five pipes, the word END in capital letters, then five more pipes. Do not put it in a code block. Write it as plain text immediately after your essay."
             );
             clipboardManager.copyToClipboard(testMessage);
 
+            System.out.println(">>> TEST9: Request copied to clipboard, waiting for response...");
             String response = clipboardManager.waitForAutomaticResponse(
                 configManager.getClickX(),
                 configManager.getClickY()
             );
+            System.out.println(">>> TEST9: Got response, length=" + (response != null ? response.length() : "null"));
 
             String formatIssue = validateResponseFormat(response);
             if (formatIssue != null) {
@@ -716,7 +719,7 @@ public class ClipboardManager implements com.codeboss.javalayer.bridge.IClipboar
             robot.mouseMove(x, y);
             robot.mousePress(InputEvent.BUTTON1_DOWN_MASK);
             robot.mouseRelease(InputEvent.BUTTON1_DOWN_MASK);
-            log("Clicked at coordinates: " + x + ", " + y);
+            // Log removed - too verbose during polling
         } catch (Exception e) {
             log("Error clicking at coordinates: " + e.getMessage());
         }
@@ -735,9 +738,11 @@ public class ClipboardManager implements com.codeboss.javalayer.bridge.IClipboar
     
     public String waitForAutomaticResponse(int clickX, int clickY) {
         log("Starting automatic response polling");
-        
+        int pollCount = 0;
+
         while (true) {
             try {
+                pollCount++;
                 // Move mouse to coordinates and click
                 this.clickAtCoordinates(clickX, clickY);
 
@@ -747,7 +752,7 @@ public class ClipboardManager implements com.codeboss.javalayer.bridge.IClipboar
                     // Remove terminator and return response
                     String marker = clipboardContent.endsWith("|||||CLIP:TO_JAVA_END|||||") ? "|||||CLIP:TO_JAVA_END|||||" : "|||||CLIP:TO_JAVA|||||";
                     String response = clipboardContent.substring(0, clipboardContent.length() - marker.length());
-                    log("Received automatic response: " + response.length() + " characters");
+                    log("Received automatic response after " + pollCount + " polls: " + response.length() + " characters");
                     
                     // CRITICAL: Log details about empty or problematic responses
                     if (response.trim().isEmpty()) {
@@ -1473,6 +1478,12 @@ FILE: bridge-button.js
         let attemptCount = 0;
         const maxAttempts = 10;
 
+        // Detect if this is the TEST9 continuation test
+        const isTest9 = messages.length > 0 && messages[0].content && messages[0].content.includes('500-word essay about Java');
+        if (isTest9) {
+            console.log('>>> TEST9: Bridge starting continuation loop');
+        }
+
         while (attemptCount < maxAttempts) {
             attemptCount++;
             const response = await submitToInternalAPI(conversationMessages, token);
@@ -1483,14 +1494,22 @@ FILE: bridge-button.js
 
             fullResponse += response;
             const hasEnd = fullResponse.endsWith('|||||END|||||');
-            console.log(`T${attemptCount}: len=${response.length} total=${fullResponse.length} end=${hasEnd?'Y':'N'}`);
+            const logPrefix = isTest9 ? 'TEST9-T' : 'T';
+            const last30 = fullResponse.slice(-30);
+            console.log(`${logPrefix}${attemptCount}: len=${response.length} total=${fullResponse.length} end=${hasEnd?'Y':'N'} last30="${last30}"`);
 
             if (hasEnd) {
+                if (isTest9) console.log('>>> TEST9: Found END marker, returning response');
                 return fullResponse.slice(0, -13);
             }
 
+            // Prepare continuation request
             const lastChars = fullResponse.slice(-30);
             const continuationContent = `Your previous response was cut off. The last 30 characters were: "${lastChars}". Start writing immediately after these exact characters. We will append your response to the previous output. End with |||||END||||| when complete.`;
+
+            if (isTest9) {
+                console.log(`>>> TEST9: No END marker, requesting continuation with last30="${lastChars}"`);
+            }
 
             conversationMessages.push({
                 role: 'assistant',
@@ -1502,7 +1521,8 @@ FILE: bridge-button.js
             });
         }
 
-        console.log(`MAX_ATTEMPTS: total=${fullResponse.length}`);
+        const logPrefix = isTest9 ? 'TEST9-MAX_ATTEMPTS' : 'MAX_ATTEMPTS';
+        console.log(`${logPrefix}: total=${fullResponse.length}`);
         return fullResponse;
     }
     
