@@ -2,6 +2,8 @@ FILE: com/codeboss/bridgelayer/BridgeTestRunner.java
 |~|~|~|~|~|~|~|~|~|~|~|
 package com.codeboss.bridgelayer;
 
+import com.codeboss.javalayer.system.*;
+
 import java.io.*;
 import java.nio.file.*;
 import java.util.*;
@@ -66,7 +68,8 @@ public class BridgeTestRunner {
             System.out.println();
 
             // Initialize
-            logger = new Logger();
+            String logFile = workingDirectory + "/.agent/debug.log";
+            logger = new Logger(logFile);
             configManager = new ConfigManager(workingDirectory, logger);
             clipboardManager = new ClipboardManager();
             systemTrayManager = new SystemTrayManager(logger);
@@ -510,11 +513,11 @@ public class BridgeTestRunner {
         }
 
         // Check for unexpected format issues
-        if (response.contains("|||||TO BRIDGE|||||")) {
+        if (response.contains("|||||CLIP:TO_BRIDGE|||||")) {
             return "contains_bridge_marker";
         }
 
-        if (response.contains("|||||TO JAVA|||||")) {
+        if (response.contains("|||||CLIP:TO_JAVA|||||")) {
             return "contains_java_marker";
         }
 
@@ -535,7 +538,7 @@ public class BridgeTestRunner {
             .replace("\r", "\\r")
             .replace("\t", "\\t");
 
-        return "{\"messages\":[{\"role\":\"user\",\"content\":\"" + escaped + "\"}]}|||||TO BRIDGE|||||";
+        return "{\"messages\":[{\"role\":\"user\",\"content\":\"" + escaped + "\"}]}|||||CLIP:TO_BRIDGE|||||";
     }
 
     public static String getWorkingDirectory() {
@@ -822,9 +825,127 @@ public class ClipboardManager implements com.codeboss.javalayer.bridge.IClipboar
 }
 |~|~|~|~|~|~|~|~|~|~|~|
 
-FILE: com/codeboss/bridgelayer/ConfigManager.java
+FILE: com/codeboss/javalayer/bridge/IClipboardManager.java
 |~|~|~|~|~|~|~|~|~|~|~|
-package com.codeboss.bridgelayer;
+package com.codeboss.javalayer.bridge;
+
+/**
+ * Interface for clipboard operations and bridge communication
+ *
+ * This interface abstracts clipboard operations to allow mock implementations
+ * for testing without requiring actual system clipboard access.
+ */
+public interface IClipboardManager {
+    /**
+     * Copy text to system clipboard
+     * @param text Text to copy
+     */
+    void copyToClipboard(String text);
+
+    /**
+     * Get current clipboard content
+     * @return Clipboard text or null if empty
+     */
+    String getClipboardContent();
+
+    /**
+     * Click at specified coordinates (for bridge button)
+     * @param x X coordinate
+     * @param y Y coordinate
+     */
+    void clickAtCoordinates(int x, int y);
+
+    /**
+     * Wait for automatic response from bridge with polling
+     *
+     * This method will:
+     * 1. Click at the specified coordinates
+     * 2. Poll clipboard for response with |||||CLIP:TO_JAVA||||| or |||||CLIP:TO_JAVA_END||||| marker
+     * 3. Return when response is found or timeout occurs
+     *
+     * @param clickX X coordinate to click
+     * @param clickY Y coordinate to click
+     * @return Response text (without marker), "MOUSE_CANCELLED", or null on timeout
+     */
+    String waitForAutomaticResponse(int clickX, int clickY);
+}
+
+|~|~|~|~|~|~|~|~|~|~|~|
+
+FILE: com/codeboss/javalayer/bridge/IConfigManager.java
+|~|~|~|~|~|~|~|~|~|~|~|
+package com.codeboss.javalayer.bridge;
+
+/**
+ * Interface for configuration management
+ *
+ * This interface provides access to application configuration values,
+ * allowing mock implementations for testing.
+ */
+public interface IConfigManager {
+    /**
+     * Get maximum message characters limit
+     * @return Max message chars (e.g., 350000)
+     */
+    int getMaxMessageChars();
+
+    /**
+     * Get X coordinate for auto-click
+     * @return X coordinate in pixels
+     */
+    int getClickX();
+
+    /**
+     * Get Y coordinate for auto-click
+     * @return Y coordinate in pixels
+     */
+    int getClickY();
+
+    /**
+     * Get server port for HTTP server
+     * @return Port number (e.g., 3000)
+     */
+    int getServerPort();
+
+    /**
+     * Get auto-launch browser setting
+     * @return true if browser should launch on startup
+     */
+    boolean shouldAutoLaunchBrowser();
+
+    /**
+     * Set server port (for command-line override)
+     * @param port Port number to set
+     */
+    void setServerPort(int port);
+}
+
+|~|~|~|~|~|~|~|~|~|~|~|
+
+FILE: com/codeboss/javalayer/bridge/ILogger.java
+|~|~|~|~|~|~|~|~|~|~|~|
+package com.codeboss.javalayer.bridge;
+
+/**
+ * Interface for logging
+ *
+ * This interface provides a simple logging abstraction,
+ * allowing mock implementations for testing that capture log messages.
+ */
+public interface ILogger {
+    /**
+     * Log a message
+     *
+     * @param message Message to log (will be timestamped and written to log file)
+     */
+    void log(String message);
+}
+
+|~|~|~|~|~|~|~|~|~|~|~|
+
+FILE: com/codeboss/javalayer/system/ConfigManager.java
+|~|~|~|~|~|~|~|~|~|~|~|
+package com.codeboss.javalayer.system;
 
 import java.io.*;
 import java.nio.file.*;
@@ -991,976 +1112,9 @@ public class ConfigManager implements com.codeboss.javalayer.bridge.IConfigManag
 }
 |~|~|~|~|~|~|~|~|~|~|~|
 
-FILE: com/codeboss/bridgelayer/ConfigManagerAdapter.java
+FILE: com/codeboss/javalayer/system/Logger.java
 |~|~|~|~|~|~|~|~|~|~|~|
-package com.codeboss.bridgelayer;
-
-import com.codeboss.javalayer.bridge.IConfigManager;
-import java.io.IOException;
-
-/**
- * Adapter to make ConfigManager work with IConfigManager interface
- * Wraps the existing ConfigManager which has a different constructor signature
- */
-public class ConfigManagerAdapter implements IConfigManager {
-    private final ConfigManager delegate;
-
-    public ConfigManagerAdapter(String workingDirectory, Logger logger) throws IOException {
-        this.delegate = new ConfigManager(workingDirectory, logger);
-    }
-
-    @Override
-    public int getMaxMessageChars() {
-        return delegate.getMaxMessageChars();
-    }
-
-    @Override
-    public int getClickX() {
-        return delegate.getClickX();
-    }
-
-    @Override
-    public int getClickY() {
-        return delegate.getClickY();
-    }
-
-    @Override
-    public int getServerPort() {
-        return delegate.getServerPort();
-    }
-
-    @Override
-    public boolean shouldAutoLaunchBrowser() {
-        return delegate.shouldAutoLaunchBrowser();
-    }
-
-    public void setServerPort(int port) {
-        delegate.setServerPort(port);
-    }
-}
-
-|~|~|~|~|~|~|~|~|~|~|~|
-
-FILE: com/codeboss/bridgelayer/DirectoryOperations.java
-|~|~|~|~|~|~|~|~|~|~|~|
-package com.codeboss.bridgelayer;
-
-import com.codeboss.javalayer.bridge.ILogger;
-import java.io.*;
-import java.nio.file.*;
-import java.util.*;
-import java.util.stream.Collectors;
-
-public class DirectoryOperations {
-    private final ILogger logger;
-    private final ToolParameterExtractor extractor;
-    private final String workingDirectory;
-
-    public DirectoryOperations(ILogger logger, ToolParameterExtractor extractor, String workingDirectory) {
-        this.logger = logger;
-        this.extractor = extractor;
-        this.workingDirectory = workingDirectory;
-    }
-
-    private Path resolvePath(String filePath) {
-        Path path = Paths.get(filePath);
-        if (path.isAbsolute()) {
-            return path;
-        } else {
-            return Paths.get(workingDirectory).resolve(path);
-        }
-    }
-
-    public ToolExecutor.ToolExecutionResult executeCreateDirectoryWithSummary(String toolParams) {
-        try {
-            String dirPath = extractor.extractParameter(toolParams, "dir_path");
-            
-            if (dirPath == null || dirPath.trim().isEmpty()) {
-                String error = "Error: dir_path parameter is required";
-                return new ToolExecutor.ToolExecutionResult(error, error);
-            }
-            
-            Path path = resolvePath(dirPath);
-            
-            Files.createDirectories(path);
-            
-            String fullResult = String.format("Directory: %s\nCreated successfully", dirPath);
-            String summary = "Directory created";
-            
-            String enhancedResult = "DISPLAY_INFO:0|" + dirPath + "\n" + fullResult;
-            
-            return new ToolExecutor.ToolExecutionResult(enhancedResult, summary);
-            
-        } catch (Exception e) {
-            String error = "Error creating directory: " + e.getMessage();
-            return new ToolExecutor.ToolExecutionResult(error, error);
-        }
-    }
-    
-    public ToolExecutor.ToolExecutionResult executeDeleteDirectoryWithSummary(String toolParams) {
-        try {
-            String dirPath = extractor.extractParameter(toolParams, "dir_path");
-            
-            if (dirPath == null || dirPath.trim().isEmpty()) {
-                String error = "Error: dir_path parameter is required";
-                return new ToolExecutor.ToolExecutionResult(error, error);
-            }
-            
-            Path path = resolvePath(dirPath);
-            
-            if (!Files.exists(path)) {
-                String error = "Error: Directory not found: " + dirPath;
-                return new ToolExecutor.ToolExecutionResult(error, error);
-            }
-            
-            if (!Files.isDirectory(path)) {
-                String error = "Error: Path is not a directory: " + dirPath;
-                return new ToolExecutor.ToolExecutionResult(error, error);
-            }
-            
-            Files.walk(path)
-                .sorted((a, b) -> b.compareTo(a))
-                .forEach(p -> {
-                    try {
-                        Files.delete(p);
-                    } catch (Exception e) {
-                        throw new RuntimeException("Failed to delete: " + p, e);
-                    }
-                });
-            
-            String fullResult = String.format("Directory: %s\nDeleted successfully (recursive)", dirPath);
-            String summary = "Directory deleted (recursive)";
-            
-            String enhancedResult = "DISPLAY_INFO:0|" + dirPath + "\n" + fullResult;
-            
-            return new ToolExecutor.ToolExecutionResult(enhancedResult, summary);
-            
-        } catch (Exception e) {
-            String error = "Error deleting directory: " + e.getMessage();
-            return new ToolExecutor.ToolExecutionResult(error, error);
-        }
-    }
-    
-    public ToolExecutor.ToolExecutionResult executeListFilesWithSummary(String toolParams) {
-        try {
-            String pathParam = extractor.extractParameter(toolParams, "path");
-            String targetPath = (pathParam != null && !pathParam.trim().isEmpty()) ? pathParam : workingDirectory;
-            
-            Path path = resolvePath(targetPath);
-            
-            if (!Files.exists(path)) {
-                String error = "Error: Path not found: " + targetPath;
-                return new ToolExecutor.ToolExecutionResult(error, error);
-            }
-            
-            if (!Files.isDirectory(path)) {
-                String error = "Error: Path is not a directory: " + targetPath;
-                return new ToolExecutor.ToolExecutionResult(error, error);
-            }
-            
-            StringBuilder results = new StringBuilder();
-            int fileCount = 0;
-            int dirCount = 0;
-            
-            try {
-                List<Path> entries = Files.list(path)
-                    .sorted((a, b) -> {
-                        boolean aIsDir = Files.isDirectory(a);
-                        boolean bIsDir = Files.isDirectory(b);
-                        if (aIsDir && !bIsDir) return -1;
-                        if (!aIsDir && bIsDir) return 1;
-                        return a.getFileName().toString().compareToIgnoreCase(b.getFileName().toString());
-                    })
-                    .collect(Collectors.toList());
-                
-                for (Path entry : entries) {
-                    String fileName = entry.getFileName().toString();
-                    if (Files.isDirectory(entry)) {
-                        results.append(String.format("[DIR]  %s/\n", fileName));
-                        dirCount++;
-                    } else {
-                        long fileSize = Files.size(entry);
-                        results.append(String.format("[FILE] %s (%s)\n", fileName, ToolParameterExtractor.formatFileSize(fileSize)));
-                        fileCount++;
-                    }
-                }
-            } catch (Exception e) {
-                String error = "Error listing directory: " + e.getMessage();
-                return new ToolExecutor.ToolExecutionResult(error, error);
-            }
-            
-            String fullResult = String.format("Directory listing for: %s\n\n%s\nTotal: %d directories, %d files", 
-                targetPath, results.toString(), dirCount, fileCount);
-            String summary = "Listed " + dirCount + " dirs, " + fileCount + " files";
-            
-            String enhancedResult = "DISPLAY_INFO:" + (dirCount + fileCount) + "|" + targetPath + "\n" + fullResult;
-            return new ToolExecutor.ToolExecutionResult(enhancedResult, summary);
-            
-        } catch (Exception e) {
-            String error = "Error listing files: " + e.getMessage();
-            return new ToolExecutor.ToolExecutionResult(error, error);
-        }
-    }
-    
-    public ToolExecutor.ToolExecutionResult executeListRecursiveWithSummary(String toolParams) {
-        try {
-            String pathParam = extractor.extractParameter(toolParams, "path");
-            String targetPath = (pathParam != null && !pathParam.trim().isEmpty()) ? pathParam : workingDirectory;
-            
-            Path path = resolvePath(targetPath);
-            
-            if (!Files.exists(path)) {
-                String error = "Error: Path not found: " + targetPath;
-                return new ToolExecutor.ToolExecutionResult(error, error);
-            }
-            
-            if (!Files.isDirectory(path)) {
-                String error = "Error: Path is not a directory: " + targetPath;
-                return new ToolExecutor.ToolExecutionResult(error, error);
-            }
-            
-            StringBuilder results = new StringBuilder();
-            int fileCount = 0;
-            int dirCount = 0;
-            
-            try {
-                List<Path> entries = Files.walk(path)
-                    .filter(p -> !p.equals(path))
-                    .sorted()
-                    .collect(Collectors.toList());
-                
-                for (Path entry : entries) {
-                    String relativePath = path.relativize(entry).toString();
-                    if (Files.isDirectory(entry)) {
-                        results.append(String.format("[DIR]  %s/\n", relativePath));
-                        dirCount++;
-                    } else {
-                        long fileSize = Files.size(entry);
-                        results.append(String.format("[FILE] %s (%s)\n", relativePath, ToolParameterExtractor.formatFileSize(fileSize)));
-                        fileCount++;
-                    }
-                }
-            } catch (Exception e) {
-                String error = "Error listing directory recursively: " + e.getMessage();
-                return new ToolExecutor.ToolExecutionResult(error, error);
-            }
-            
-            String fullResult = String.format("Recursive listing for: %s\n\n%s\nTotal: %d directories, %d files", 
-                targetPath, results.toString(), dirCount, fileCount);
-            String summary = "Listed " + dirCount + " dirs, " + fileCount + " files (recursive)";
-            
-            String enhancedResult = "DISPLAY_INFO:" + (dirCount + fileCount) + "|" + targetPath + "\n" + fullResult;
-            return new ToolExecutor.ToolExecutionResult(enhancedResult, summary);
-            
-        } catch (Exception e) {
-            String error = "Error listing files recursively: " + e.getMessage();
-            return new ToolExecutor.ToolExecutionResult(error, error);
-        }
-    }
-}
-|~|~|~|~|~|~|~|~|~|~|~|
-
-FILE: com/codeboss/bridgelayer/FileOperations.java
-|~|~|~|~|~|~|~|~|~|~|~|
-package com.codeboss.bridgelayer;
-
-import com.codeboss.javalayer.bridge.ILogger;
-import java.io.*;
-import java.nio.file.*;
-import java.nio.file.StandardCopyOption;
-import java.util.*;
-
-public class FileOperations {
-    private final ILogger logger;
-    private final ToolParameterExtractor extractor;
-    private final String workingDirectory;
-
-    public FileOperations(ILogger logger, ToolParameterExtractor extractor, String workingDirectory) {
-        this.logger = logger;
-        this.extractor = extractor;
-        this.workingDirectory = workingDirectory;
-    }
-
-    private Path resolvePath(String filePath) {
-        Path path = Paths.get(filePath);
-        if (path.isAbsolute()) {
-            return path;
-        } else {
-            return Paths.get(workingDirectory).resolve(path);
-        }
-    }
-
-    public ToolExecutor.ToolExecutionResult executeReadFileWithSummary(String toolParams) {
-        try {
-            String filePath = extractor.extractParameter(toolParams, "file_path");
-            String findString = extractor.extractParameter(toolParams, "find_string");
-            String limitStr = extractor.extractParameter(toolParams, "limit");
-            
-            if (filePath == null || filePath.trim().isEmpty()) {
-                String error = "Error: file_path parameter is required";
-                return new ToolExecutor.ToolExecutionResult(error, error);
-            }
-            
-            Path path = resolvePath(filePath);
-            
-            if (!Files.exists(path)) {
-                String error = "Error: File not found: " + filePath;
-                return new ToolExecutor.ToolExecutionResult(error, error);
-            }
-            
-            List<String> lines = Files.readAllLines(path);
-            int startIndex = 0;
-            int limit = lines.size();
-            
-            if (findString != null && !findString.trim().isEmpty()) {
-                FindResult findResult = findStringInLines(lines, findString);
-                if (findResult.isError()) {
-                    return new ToolExecutor.ToolExecutionResult(findResult.errorMessage, findResult.errorMessage);
-                }
-                startIndex = findResult.lineIndex;
-            }
-            
-            if (limitStr != null && !limitStr.trim().isEmpty()) {
-                try {
-                    limit = Integer.parseInt(limitStr.trim());
-                } catch (NumberFormatException e) {
-                    String error = "Error: limit parameter must be a valid number: " + limitStr;
-                    return new ToolExecutor.ToolExecutionResult(error, error);
-                }
-            }
-            
-            int endIndex = Math.min(startIndex + limit, lines.size());
-            StringBuilder content = new StringBuilder();
-            
-            for (int i = startIndex; i < endIndex; i++) {
-                content.append(lines.get(i)).append("\n");
-            }
-            
-            int linesRead = endIndex - startIndex;
-            String summary = linesRead + " lines";
-            
-            if (findString != null && !findString.trim().isEmpty()) {
-                summary += " starting from \"" + findString + "\"";
-            }
-            
-            String enhancedResult = "DISPLAY_INFO:" + linesRead + "|" + filePath + "\n" + content.toString();
-            
-            return new ToolExecutor.ToolExecutionResult(enhancedResult, summary);
-            
-        } catch (Exception e) {
-            String error = "Error reading file: " + e.getMessage();
-            return new ToolExecutor.ToolExecutionResult(error, error);
-        }
-    }
-    
-    public ToolExecutor.ToolExecutionResult executeReadFileLinesWithSummary(String toolParams) {
-        try {
-            String filePath = extractor.extractParameter(toolParams, "file_path");
-            String startLineStr = extractor.extractParameter(toolParams, "start_line");
-            String endLineStr = extractor.extractParameter(toolParams, "end_line");
-
-            if (filePath == null || filePath.trim().isEmpty()) {
-                String error = "Error: file_path parameter is required";
-                return new ToolExecutor.ToolExecutionResult(error, error);
-            }
-
-            if (startLineStr == null || startLineStr.trim().isEmpty()) {
-                String error = "Error: start_line parameter is required";
-                return new ToolExecutor.ToolExecutionResult(error, error);
-            }
-
-            if (endLineStr == null || endLineStr.trim().isEmpty()) {
-                String error = "Error: end_line parameter is required";
-                return new ToolExecutor.ToolExecutionResult(error, error);
-            }
-
-            Path path = resolvePath(filePath);
-
-            if (!Files.exists(path)) {
-                String error = "Error: File not found: " + filePath;
-                return new ToolExecutor.ToolExecutionResult(error, error);
-            }
-
-            int startLine, endLine;
-            try {
-                startLine = Integer.parseInt(startLineStr.trim());
-                endLine = Integer.parseInt(endLineStr.trim());
-            } catch (NumberFormatException e) {
-                String error = "Error: start_line and end_line must be valid numbers";
-                return new ToolExecutor.ToolExecutionResult(error, error);
-            }
-
-            if (startLine < 1) {
-                String error = "Error: start_line must be >= 1 (line numbers are 1-indexed)";
-                return new ToolExecutor.ToolExecutionResult(error, error);
-            }
-
-            if (endLine < startLine) {
-                String error = "Error: end_line must be >= start_line";
-                return new ToolExecutor.ToolExecutionResult(error, error);
-            }
-
-            List<String> lines = Files.readAllLines(path);
-
-            // Convert to 0-indexed
-            int startIndex = startLine - 1;
-            int endIndex = Math.min(endLine, lines.size()); // endLine is inclusive, but we use it as exclusive upper bound
-
-            if (startIndex >= lines.size()) {
-                String error = String.format("Error: start_line %d exceeds file length (%d lines)", startLine, lines.size());
-                return new ToolExecutor.ToolExecutionResult(error, error);
-            }
-
-            StringBuilder content = new StringBuilder();
-
-            for (int i = startIndex; i < endIndex; i++) {
-                content.append(String.format("%d: %s\n", i + 1, lines.get(i)));
-            }
-
-            int linesRead = endIndex - startIndex;
-            String summary = String.format("Lines %d-%d (%d lines)", startLine, endIndex, linesRead);
-
-            String enhancedResult = "DISPLAY_INFO:" + linesRead + "|" + filePath + "\n" + content.toString();
-
-            return new ToolExecutor.ToolExecutionResult(enhancedResult, summary);
-
-        } catch (Exception e) {
-            String error = "Error reading file lines: " + e.getMessage();
-            logger.log("ERROR in executeReadFileLinesWithSummary: " + e.getClass().getName() + " - " + e.getMessage());
-            e.printStackTrace();
-            return new ToolExecutor.ToolExecutionResult(error, error);
-        }
-    }
-
-    public ToolExecutor.ToolExecutionResult executeCreateFileWithSummary(String toolParams) {
-        try {
-            String filePath = extractor.extractParameter(toolParams, "file_path");
-            String content = extractor.extractParameter(toolParams, "content");
-
-            if (filePath == null || filePath.trim().isEmpty()) {
-                String error = "Error: file_path parameter is required";
-                return new ToolExecutor.ToolExecutionResult(error, error);
-            }
-
-            if (content == null) {
-                content = "";
-            }
-            
-            Path path = resolvePath(filePath);
-            
-            Path parentDir = path.getParent();
-            if (parentDir != null && !Files.exists(parentDir)) {
-                Files.createDirectories(parentDir);
-            }
-            
-            Files.write(path, content.getBytes());
-            
-            long lines = content.isEmpty() ? 0 : content.split("\n").length;
-            String summary = "Created (" + lines + " lines)";
-            
-            // Generate diff display for new file (all lines are additions)
-            String diffContent = generateCreateFileDiff(content);
-            String enhancedResult = "DISPLAY_INFO:" + lines + "|" + filePath + "\n\n" + diffContent;
-            
-            return new ToolExecutor.ToolExecutionResult(enhancedResult, summary);
-            
-        } catch (Exception e) {
-            String error = "Error creating file: " + e.getMessage();
-            return new ToolExecutor.ToolExecutionResult(error, error);
-        }
-    }
-    
-    public ToolExecutor.ToolExecutionResult executeDeleteFileWithSummary(String toolParams) {
-        try {
-            String filePath = extractor.extractParameter(toolParams, "file_path");
-            
-            if (filePath == null || filePath.trim().isEmpty()) {
-                String error = "Error: file_path parameter is required";
-                return new ToolExecutor.ToolExecutionResult(error, error);
-            }
-            
-            Path path = resolvePath(filePath);
-            
-            if (!Files.exists(path)) {
-                String error = "Error: File not found: " + filePath;
-                return new ToolExecutor.ToolExecutionResult(error, error);
-            }
-            
-            Files.delete(path);
-            
-            String fullResult = String.format("File: %s\nDeleted successfully", filePath);
-            String summary = "File deleted";
-            
-            String enhancedResult = "DISPLAY_INFO:0|" + filePath + "\n" + fullResult;
-            
-            return new ToolExecutor.ToolExecutionResult(enhancedResult, summary);
-            
-        } catch (Exception e) {
-            String error = "Error deleting file: " + e.getMessage();
-            return new ToolExecutor.ToolExecutionResult(error, error);
-        }
-    }
-    
-    public ToolExecutor.ToolExecutionResult executeMoveFileWithSummary(String toolParams) {
-        try {
-            String sourcePath = extractor.extractParameter(toolParams, "source_path");
-            String destPath = extractor.extractParameter(toolParams, "dest_path");
-            
-            if (sourcePath == null || sourcePath.trim().isEmpty()) {
-                String error = "Error: source_path parameter is required";
-                return new ToolExecutor.ToolExecutionResult(error, error);
-            }
-            
-            if (destPath == null || destPath.trim().isEmpty()) {
-                String error = "Error: dest_path parameter is required";
-                return new ToolExecutor.ToolExecutionResult(error, error);
-            }
-            
-            Path source = resolvePath(sourcePath);
-            Path dest = resolvePath(destPath);
-            
-            if (!Files.exists(source)) {
-                String error = "Error: Source file not found: " + sourcePath;
-                return new ToolExecutor.ToolExecutionResult(error, error);
-            }
-            
-            Path destParent = dest.getParent();
-            if (destParent != null && !Files.exists(destParent)) {
-                Files.createDirectories(destParent);
-            }
-            
-            Files.move(source, dest, StandardCopyOption.REPLACE_EXISTING);
-            
-            String fullResult = String.format("File moved successfully\nFrom: %s\nTo: %s", sourcePath, destPath);
-            String summary = "File moved";
-            
-            long fileSize = Files.size(dest);
-            long lines = 0;
-            try {
-                lines = Files.lines(dest).count();
-            } catch (Exception e) {
-                // Non-text file or reading issue, keep lines as 0
-            }
-            
-            String enhancedResult = "DISPLAY_INFO:" + lines + "|" + destPath + "\n" + fullResult;
-            
-            return new ToolExecutor.ToolExecutionResult(enhancedResult, summary);
-            
-        } catch (Exception e) {
-            String error = "Error moving file: " + e.getMessage();
-            return new ToolExecutor.ToolExecutionResult(error, error);
-        }
-    }
-    
-    public ToolExecutor.ToolExecutionResult executeUpdateFileWithSummary(String toolParams) {
-        try {
-            String filePath = extractor.extractParameter(toolParams, "file_path");
-            String findString = extractor.extractParameter(toolParams, "find_string");
-            String replaceString = extractor.extractParameter(toolParams, "replace_string");
-            
-            if (filePath == null || filePath.trim().isEmpty()) {
-                String error = "Error: file_path parameter is required";
-                return new ToolExecutor.ToolExecutionResult(error, error);
-            }
-            
-            if (findString == null || findString.trim().isEmpty()) {
-                String error = "Error: find_string parameter is required";
-                return new ToolExecutor.ToolExecutionResult(error, error);
-            }
-            
-            if (replaceString == null) {
-                replaceString = ""; // Allow replacing with empty string
-            }
-            
-            Path path = resolvePath(filePath);
-            
-            if (!Files.exists(path)) {
-                String error = "Error: File not found: " + filePath;
-                return new ToolExecutor.ToolExecutionResult(error, error);
-            }
-            
-            // Read the file content
-            String content = new String(Files.readAllBytes(path));
-            
-            // Count occurrences of find_string
-            int occurrences = countOccurrences(content, findString);
-            
-            if (occurrences == 0) {
-                String error = String.format("Error: String '%s' not found in file %s", findString, filePath);
-                return new ToolExecutor.ToolExecutionResult(error, error);
-            }
-            
-            if (occurrences > 1) {
-                String error = String.format("Error: String '%s' appears %d times in file %s. The find_string must be unique to avoid ambiguity.", 
-                    findString, occurrences, filePath);
-                return new ToolExecutor.ToolExecutionResult(error, error);
-            }
-            
-            // Perform the replacement (we know it's exactly 1 occurrence)
-            String updatedContent = content.replace(findString, replaceString);
-            
-            // Write the updated content back to the file
-            Files.write(path, updatedContent.getBytes());
-            
-            // Calculate line changes
-            long originalLines = content.isEmpty() ? 0 : content.split("\n").length;
-            long updatedLines = updatedContent.isEmpty() ? 0 : updatedContent.split("\n").length;
-            long lineChange = updatedLines - originalLines;
-            
-            String changeInfo = "";
-            if (lineChange > 0) {
-                changeInfo = String.format(" (+%d lines)", lineChange);
-            } else if (lineChange < 0) {
-                changeInfo = String.format(" (%d lines)", lineChange);
-            }
-            
-            String summary = "Updated" + changeInfo;
-            
-            // Generate context diff for display - this is all we need to show
-            String contextDiff = generateContextDiff(content, findString, replaceString);
-            String enhancedResult = "DISPLAY_INFO:" + updatedLines + "|" + filePath + "\n\n" + contextDiff;
-            
-            return new ToolExecutor.ToolExecutionResult(enhancedResult, summary);
-            
-        } catch (Exception e) {
-            String error = "Error updating file: " + e.getMessage();
-            return new ToolExecutor.ToolExecutionResult(error, error);
-        }
-    }
-    
-    private static int countOccurrences(String text, String searchString) {
-        int count = 0;
-        int index = 0;
-        while ((index = text.indexOf(searchString, index)) != -1) {
-            count++;
-            index += searchString.length();
-        }
-        return count;
-    }
-    
-    private static String generateContextDiff(String originalContent, String findString, String replaceString) {
-        try {
-            String[] originalLines = originalContent.split("\n");
-            
-            // Find the line(s) containing the findString
-            int findStartLine = -1;
-            int findEndLine = -1;
-            
-            for (int i = 0; i < originalLines.length; i++) {
-                if (originalLines[i].contains(findString)) {
-                    if (findStartLine == -1) {
-                        findStartLine = i;
-                    }
-                    findEndLine = i;
-                }
-            }
-            
-            if (findStartLine == -1) {
-                // If we can't find the exact string, try to find it in the full content
-                // This handles multi-line replacements better
-                String fullContent = String.join("\n", originalLines);
-                if (fullContent.contains(findString)) {
-                    // Found it in content but line-by-line search failed
-                    // Show a simple before/after diff
-                    StringBuilder diff = new StringBuilder();
-                    String[] findLines = findString.split("\n");
-                    String[] replaceLines = replaceString.split("\n");
-                    
-                    for (String line : findLines) {
-                        diff.append("- ").append(line).append("\n");
-                    }
-                    for (String line : replaceLines) {
-                        diff.append("+ ").append(line).append("\n");
-                    }
-                    return diff.toString().replaceAll("\\s+$", "");
-                } else {
-                    // Last resort fallback - show clean diff format instead of verbose
-                    StringBuilder diff = new StringBuilder();
-                    String[] findLines = findString.split("\n");
-                    String[] replaceLines = replaceString.split("\n");
-                    
-                    for (String line : findLines) {
-                        diff.append("- ").append(line).append("\n");
-                    }
-                    for (String line : replaceLines) {
-                        diff.append("+ ").append(line).append("\n");
-                    }
-                    return diff.toString().replaceAll("\\s+$", "");
-                }
-            }
-            
-            // Show context: 3 lines before and 3 lines after
-            int contextStart = Math.max(0, findStartLine - 3);
-            int contextEnd = Math.min(originalLines.length - 1, findEndLine + 3);
-            
-            StringBuilder diff = new StringBuilder();
-            
-            // Add context lines before the change
-            for (int i = contextStart; i < findStartLine; i++) {
-                diff.append("  ").append(originalLines[i]).append("\n");
-            }
-            
-            // Smart diff: detect insertion vs replacement patterns
-            String[] oldLines = findString.split("\n");
-            String[] newLines = replaceString.split("\n");
-            
-            // Check if this is an insertion pattern (replaceString contains findString + more content)
-            if (oldLines.length == 1 && newLines.length > 1 && replaceString.startsWith(findString)) {
-                // This is an insertion after existing content - show unchanged part and additions only
-                
-                // Show the unchanged content as context (not as removal/addition)
-                diff.append("  ").append(oldLines[0]).append("\n");
-                
-                // Show only the newly added lines (skip the first one which is the unchanged original)
-                for (int i = 1; i < newLines.length; i++) {
-                    diff.append("+ ").append(newLines[i]).append("\n");
-                }
-            } else {
-                // This is a replacement - show removed and added lines only (no duplicate context)
-                
-                // Show removed lines 
-                for (String oldLine : oldLines) {
-                    diff.append("- ").append(oldLine).append("\n");
-                }
-                
-                // Show added lines
-                for (String newLine : newLines) {
-                    diff.append("+ ").append(newLine).append("\n");
-                }
-            }
-            
-            // Add context lines after the change
-            for (int i = findEndLine + 1; i <= contextEnd; i++) {
-                diff.append("  ").append(originalLines[i]).append("\n");
-            }
-            
-            // Don't trim - this would remove the leading spaces from context lines
-            String result = diff.toString();
-            // Only remove trailing whitespace, preserve leading spaces for diff prefixes
-            return result.replaceAll("\\s+$", "");
-            
-        } catch (Exception e) {
-            // Fallback to simple format if anything goes wrong
-            return String.format("Replaced: '%s'\nWith: '%s'", findString, replaceString);
-        }
-    }
-    
-    private static FindResult findStringInLines(List<String> lines, String findString) {
-        for (int i = 0; i < lines.size(); i++) {
-            if (lines.get(i).contains(findString)) {
-                return FindResult.success(i);
-            }
-        }
-        return FindResult.error("String not found: " + findString);
-    }
-    
-    private static class FindResult {
-        boolean isError;
-        String errorMessage;
-        int lineIndex;
-        
-        FindResult(boolean isError, String errorMessage, int lineIndex) {
-            this.isError = isError;
-            this.errorMessage = errorMessage;
-            this.lineIndex = lineIndex;
-        }
-        
-        boolean isError() {
-            return isError;
-        }
-        
-        static FindResult success(int lineIndex) {
-            return new FindResult(false, null, lineIndex);
-        }
-        
-        static FindResult error(String message) {
-            return new FindResult(true, message, -1);
-        }
-    }
-    
-    public ToolExecutor.ToolExecutionResult executeGitReadWithSummary(String toolParams) {
-        try {
-            String projectPath = extractor.extractParameter(toolParams, "project_path");
-            String gitArgs = extractor.extractParameter(toolParams, "git_args");
-            String offsetStr = extractor.extractParameter(toolParams, "offset");
-            String limitStr = extractor.extractParameter(toolParams, "limit");
-            
-            if (projectPath == null || projectPath.trim().isEmpty()) {
-                String error = "Error: project_path parameter is required";
-                return new ToolExecutor.ToolExecutionResult(error, error);
-            }
-            
-            if (gitArgs == null || gitArgs.trim().isEmpty()) {
-                String error = "Error: git_args parameter is required";
-                return new ToolExecutor.ToolExecutionResult(error, error);
-            }
-            
-            Path projectDir = resolvePath(projectPath);
-            if (!Files.exists(projectDir) || !Files.isDirectory(projectDir)) {
-                String error = "Error: Project directory not found: " + projectPath;
-                return new ToolExecutor.ToolExecutionResult(error, error);
-            }
-            
-            // Check if it's a git repository
-            Path gitDir = projectDir.resolve(".git");
-            if (!Files.exists(gitDir)) {
-                String error = "Error: Not a git repository: " + projectPath;
-                return new ToolExecutor.ToolExecutionResult(error, error);
-            }
-            
-            // Validate git command safety
-            String[] args = gitArgs.trim().split("\\s+");
-            if (args.length == 0) {
-                String error = "Error: git_args cannot be empty";
-                return new ToolExecutor.ToolExecutionResult(error, error);
-            }
-            
-            // Check whitelist for first argument (git command)
-            String gitCommand = args[0].toLowerCase();
-            if (!isAllowedGitCommand(gitCommand)) {
-                String error = "Error: Git command '" + gitCommand + "' is not allowed. Only read-only commands are permitted.";
-                return new ToolExecutor.ToolExecutionResult(error, error);
-            }
-            
-            // Check blacklist for dangerous arguments
-            for (String arg : args) {
-                if (isBlacklistedGitArg(arg)) {
-                    String error = "Error: Git argument '" + arg + "' is not allowed for security reasons.";
-                    return new ToolExecutor.ToolExecutionResult(error, error);
-                }
-            }
-            
-            // Execute git command
-            ProcessBuilder pb = new ProcessBuilder();
-            pb.command("git", "-C", projectDir.toAbsolutePath().toString());
-            for (String arg : args) {
-                pb.command().add(arg);
-            }
-            pb.redirectErrorStream(true);
-            
-            Process process = pb.start();
-            
-            // Read output
-            StringBuilder output = new StringBuilder();
-            try (java.io.BufferedReader reader = new java.io.BufferedReader(
-                    new java.io.InputStreamReader(process.getInputStream()))) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    output.append(line).append("\n");
-                }
-            }
-            
-            int exitCode = process.waitFor();
-            if (exitCode != 0) {
-                String error = "Git command failed with exit code " + exitCode + ":\n" + output.toString();
-                return new ToolExecutor.ToolExecutionResult(error, error);
-            }
-            
-            String fullOutput = output.toString();
-            String[] outputLines = fullOutput.split("\n");
-            
-            // Apply offset and limit if provided
-            int offset = 0;
-            int limit = outputLines.length;
-            
-            if (offsetStr != null && !offsetStr.trim().isEmpty()) {
-                try {
-                    offset = Integer.parseInt(offsetStr.trim());
-                } catch (NumberFormatException e) {
-                    String error = "Error: offset parameter must be a valid number: " + offsetStr;
-                    return new ToolExecutor.ToolExecutionResult(error, error);
-                }
-            }
-            
-            if (limitStr != null && !limitStr.trim().isEmpty()) {
-                try {
-                    limit = Integer.parseInt(limitStr.trim());
-                } catch (NumberFormatException e) {
-                    String error = "Error: limit parameter must be a valid number: " + limitStr;
-                    return new ToolExecutor.ToolExecutionResult(error, error);
-                }
-            }
-            
-            // Extract the requested slice of output
-            int startIndex = Math.max(0, Math.min(offset, outputLines.length));
-            int endIndex = Math.min(startIndex + limit, outputLines.length);
-            
-            StringBuilder slicedOutput = new StringBuilder();
-            for (int i = startIndex; i < endIndex; i++) {
-                if (i > startIndex) slicedOutput.append("\n");
-                slicedOutput.append(outputLines[i]);
-            }
-            
-            int linesShown = endIndex - startIndex;
-            String summary = "git " + gitCommand + ": " + linesShown + " lines";
-            if (offset > 0) {
-                summary += " (offset " + offset + ")";
-            }
-            
-            // Use standard 4-part format but put git command info in a way that can be extracted
-            String enhancedResult = "DISPLAY_INFO:" + linesShown + "|" + projectPath + "|GIT:" + gitArgs + "\n" + slicedOutput.toString();
-            
-            return new ToolExecutor.ToolExecutionResult(enhancedResult, summary);
-            
-        } catch (Exception e) {
-            String error = "Error executing git command: " + e.getMessage();
-            return new ToolExecutor.ToolExecutionResult(error, error);
-        }
-    }
-    
-    private static boolean isAllowedGitCommand(String command) {
-        // Whitelist of safe, read-only git commands
-        String[] allowedCommands = {
-            "status", "log", "show", "diff", "branch", "remote", "tag",
-            "ls-files", "ls-tree", "ls-remote", "rev-parse", "describe", 
-            "config", "blame", "annotate", "reflog", "shortlog", "whatchanged",
-            "cat-file", "rev-list", "name-rev", "symbolic-ref", "for-each-ref",
-            "merge-base", "show-branch", "show-ref"
-        };
-        
-        for (String allowed : allowedCommands) {
-            if (command.equals(allowed)) {
-                return true;
-            }
-        }
-        return false;
-    }
-    
-    private static boolean isBlacklistedGitArg(String arg) {
-        // Blacklist of dangerous arguments
-        String[] blacklistedArgs = {
-            "--exec", "--upload-pack", "--receive-pack", "--upload-archive",
-            "--exec=", "--upload-pack=", "--receive-pack=", "--upload-archive="
-        };
-        
-        for (String blacklisted : blacklistedArgs) {
-            if (arg.equals(blacklisted) || arg.startsWith(blacklisted)) {
-                return true;
-            }
-        }
-        return false;
-    }
-    
-    private static String generateCreateFileDiff(String content) {
-        if (content.isEmpty()) {
-            return ""; // Empty file, no diff to show
-        }
-        
-        StringBuilder diff = new StringBuilder();
-        String[] lines = content.split("\n", -1); // -1 to preserve trailing empty strings
-        
-        for (String line : lines) {
-            diff.append("+ ").append(line).append("\n");
-        }
-        
-        return diff.toString();
-    }
-}
-|~|~|~|~|~|~|~|~|~|~|~|
-
-FILE: com/codeboss/bridgelayer/Logger.java
-|~|~|~|~|~|~|~|~|~|~|~|
-package com.codeboss.bridgelayer;
+package com.codeboss.javalayer.system;
 
 import java.io.*;
 import java.nio.file.*;
@@ -1968,14 +1122,30 @@ import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 
 public class Logger implements com.codeboss.javalayer.bridge.ILogger {
+    private final String workingDirectory;
+
+    public Logger(String workingDirectory) {
+        this.workingDirectory = workingDirectory;
+    }
+
+    private String getLogFile() {
+        return Paths.get(workingDirectory, ".agent", "debug.log").toString();
+    }
 
     @Override
     public void log(String message) {
         try {
-            String logFile = BridgeTestRunner.getLogFile();
+            String logFile = getLogFile();
             String timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS"));
             String logMessage = "[" + timestamp + "] " + message + "\n";
-            Files.write(Paths.get(logFile), logMessage.getBytes(),
+
+            Path logPath = Paths.get(logFile);
+            Path agentDir = logPath.getParent();
+            if (!Files.exists(agentDir)) {
+                Files.createDirectories(agentDir);
+            }
+
+            Files.write(logPath, logMessage.getBytes(),
                        StandardOpenOption.CREATE, StandardOpenOption.APPEND);
         } catch (Exception e) {
             System.err.println("Failed to write to log: " + e.getMessage());
@@ -1984,238 +1154,9 @@ public class Logger implements com.codeboss.javalayer.bridge.ILogger {
 }
 |~|~|~|~|~|~|~|~|~|~|~|
 
-FILE: com/codeboss/bridgelayer/SearchOperations.java
+FILE: com/codeboss/javalayer/system/SystemTrayManager.java
 |~|~|~|~|~|~|~|~|~|~|~|
-package com.codeboss.bridgelayer;
-
-import com.codeboss.javalayer.bridge.ILogger;
-import java.io.*;
-import java.nio.file.*;
-import java.util.*;
-
-public class SearchOperations {
-    private final ILogger logger;
-    private final ToolParameterExtractor extractor;
-    private final String workingDirectory;
-
-    public SearchOperations(ILogger logger, ToolParameterExtractor extractor, String workingDirectory) {
-        this.logger = logger;
-        this.extractor = extractor;
-        this.workingDirectory = workingDirectory;
-    }
-
-    public ToolExecutor.ToolExecutionResult executeSearchFilesWithSummary(String toolParams) {
-        try {
-            String query = extractor.extractParameter(toolParams, "query");
-            
-            if (query == null || query.trim().isEmpty()) {
-                String error = "Error: query parameter is required";
-                return new ToolExecutor.ToolExecutionResult(error, error);
-            }
-            
-            Path currentPath = Paths.get(workingDirectory);
-            StringBuilder results = new StringBuilder();
-            int matchCount = 0;
-            
-            try {
-                matchCount = (int) Files.walk(currentPath)
-                    .filter(Files::isRegularFile)
-                    .filter(path -> path.getFileName().toString().toLowerCase().contains(query.toLowerCase()))
-                    .peek(path -> {
-                        try {
-                            long fileSize = Files.size(path);
-                            results.append(String.format("%s (%s)\n", 
-                                path.toString().replace("./", ""), 
-                                ToolParameterExtractor.formatFileSize(fileSize)));
-                        } catch (Exception e) {
-                            results.append(path.toString().replace("./", "")).append("\n");
-                        }
-                    })
-                    .mapToInt(e -> 1)
-                    .sum();
-            } catch (Exception e) {
-                String error = "Error searching files: " + e.getMessage();
-                return new ToolExecutor.ToolExecutionResult(error, error);
-            }
-            
-            String fullResult;
-            String summary;
-            
-            if (matchCount == 0) {
-                fullResult = "No files found matching: " + query;
-                summary = "No files found";
-            } else {
-                fullResult = String.format("Found %d file(s) matching '%s':\n\n%s", 
-                    matchCount, query, results.toString());
-                summary = "Found " + matchCount + " files";
-            }
-            
-            String enhancedResult = "DISPLAY_INFO:" + matchCount + "|search results\n" + fullResult;
-            return new ToolExecutor.ToolExecutionResult(enhancedResult, summary);
-            
-        } catch (Exception e) {
-            String error = "Error searching files: " + e.getMessage();
-            return new ToolExecutor.ToolExecutionResult(error, error);
-        }
-    }
-    
-    public ToolExecutor.ToolExecutionResult executeSearchContentWithSummary(String toolParams) {
-        try {
-            String query = extractor.extractParameter(toolParams, "query");
-            String filePattern = extractor.extractParameter(toolParams, "file_pattern");
-            String maxResultsStr = extractor.extractParameter(toolParams, "max_results");
-            String maxPerFileStr = extractor.extractParameter(toolParams, "max_results_per_file");
-
-            if (query == null || query.trim().isEmpty()) {
-                String error = "Error: query parameter is required";
-                return new ToolExecutor.ToolExecutionResult(error, error);
-            }
-
-            // Parse limits with defaults
-            int maxResults = 100; // Default: show up to 100 total results
-            int maxPerFile = 10;  // Default: show up to 10 matches per file
-
-            try {
-                if (maxResultsStr != null && !maxResultsStr.trim().isEmpty()) {
-                    maxResults = Integer.parseInt(maxResultsStr.trim());
-                }
-                if (maxPerFileStr != null && !maxPerFileStr.trim().isEmpty()) {
-                    maxPerFile = Integer.parseInt(maxPerFileStr.trim());
-                }
-            } catch (NumberFormatException e) {
-                logger.log("Invalid max_results or max_results_per_file parameter, using defaults");
-            }
-
-            Path currentPath = Paths.get(workingDirectory);
-            StringBuilder results = new StringBuilder();
-            int totalMatches = 0;
-            int filesWithMatches = 0;
-            boolean truncated = false;
-            final int MAX_OUTPUT_CHARS = 50000; // 50KB limit
-
-            try {
-                List<Path> filesToSearch = Files.walk(currentPath)
-                    .filter(Files::isRegularFile)
-                    .filter(path -> {
-                        if (filePattern == null || filePattern.trim().isEmpty()) {
-                            return true;
-                        }
-                        String fileName = path.getFileName().toString();
-                        String pattern = filePattern.replace("*", ".*").replace("?", ".");
-                        return fileName.matches(pattern);
-                    })
-                    .collect(java.util.stream.Collectors.toList());
-
-                for (Path path : filesToSearch) {
-                    if (totalMatches >= maxResults || results.length() >= MAX_OUTPUT_CHARS) {
-                        truncated = true;
-                        break;
-                    }
-
-                    try {
-                        List<String> lines = Files.readAllLines(path);
-                        int matchesInFile = 0;
-                        boolean foundInFile = false;
-
-                        for (int i = 0; i < lines.size(); i++) {
-                            if (lines.get(i).toLowerCase().contains(query.toLowerCase())) {
-                                if (!foundInFile) {
-                                    results.append("\n=== ").append(path.toString().replace("./", "")).append(" ===\n");
-                                    foundInFile = true;
-                                    filesWithMatches++;
-                                }
-
-                                // Show only the matching line with line number (1-indexed)
-                                results.append(String.format("  Line %d: %s\n", i + 1, lines.get(i)));
-                                matchesInFile++;
-                                totalMatches++;
-
-                                // Check per-file limit
-                                if (matchesInFile >= maxPerFile) {
-                                    int remainingInFile = 0;
-                                    for (int j = i + 1; j < lines.size(); j++) {
-                                        if (lines.get(j).toLowerCase().contains(query.toLowerCase())) {
-                                            remainingInFile++;
-                                        }
-                                    }
-                                    if (remainingInFile > 0) {
-                                        results.append(String.format("  ... (%d more matches in this file)\n", remainingInFile));
-                                    }
-                                    break;
-                                }
-
-                                // Check total limit
-                                if (totalMatches >= maxResults) {
-                                    truncated = true;
-                                    break;
-                                }
-
-                                // Check output size limit
-                                if (results.length() >= MAX_OUTPUT_CHARS) {
-                                    truncated = true;
-                                    break;
-                                }
-                            }
-                        }
-
-                        if (truncated) break;
-
-                    } catch (Exception e) {
-                        // Skip files that can't be read
-                        logger.log("Error reading file " + path + ": " + e.getMessage());
-                    }
-                }
-
-            } catch (Exception e) {
-                String error = "Error searching content: " + e.getMessage();
-                return new ToolExecutor.ToolExecutionResult(error, error);
-            }
-
-            String fullResult;
-            String summary;
-
-            if (totalMatches == 0) {
-                String patternInfo = (filePattern != null && !filePattern.trim().isEmpty())
-                    ? " in " + filePattern + " files" : "";
-                fullResult = "No matches found for: " + query + patternInfo;
-                summary = "No matches found";
-            } else {
-                String patternInfo = (filePattern != null && !filePattern.trim().isEmpty())
-                    ? " in " + filePattern + " files" : "";
-
-                StringBuilder resultBuilder = new StringBuilder();
-                resultBuilder.append(String.format("Found %d match(es) for '%s'%s in %d file(s):\n",
-                    totalMatches, query, patternInfo, filesWithMatches));
-                resultBuilder.append(results.toString());
-
-                if (truncated) {
-                    resultBuilder.append("\n⚠ Results truncated. ");
-                    if (totalMatches >= maxResults) {
-                        resultBuilder.append(String.format("Showing first %d matches. ", maxResults));
-                    }
-                    resultBuilder.append("Use file_pattern to narrow search or read_file_lines to see context.");
-                }
-
-                fullResult = resultBuilder.toString();
-                summary = truncated ?
-                    String.format("Found %d+ matches in %d+ files (truncated)", totalMatches, filesWithMatches) :
-                    String.format("Found %d matches in %d files", totalMatches, filesWithMatches);
-            }
-
-            String enhancedResult = "DISPLAY_INFO:" + filesWithMatches + "|search results\n" + fullResult;
-            return new ToolExecutor.ToolExecutionResult(enhancedResult, summary);
-
-        } catch (Exception e) {
-            String error = "Error searching content: " + e.getMessage();
-            return new ToolExecutor.ToolExecutionResult(error, error);
-        }
-    }
-}
-|~|~|~|~|~|~|~|~|~|~|~|
-
-FILE: com/codeboss/bridgelayer/SystemTrayManager.java
-|~|~|~|~|~|~|~|~|~|~|~|
-package com.codeboss.bridgelayer;
+package com.codeboss.javalayer.system;
 
 import com.codeboss.javalayer.bridge.ILogger;
 import java.awt.*;
@@ -2312,68 +1253,6 @@ public class SystemTrayManager {
 }
 |~|~|~|~|~|~|~|~|~|~|~|
 
-FILE: com/codeboss/bridgelayer/ToolExecutor.java
-|~|~|~|~|~|~|~|~|~|~|~|
-package com.codeboss.bridgelayer;
-
-import com.codeboss.javalayer.bridge.IToolExecutor;
-
-public class ToolExecutor implements IToolExecutor {
-    @Override
-    public ToolExecutionResult executeToolWithSummary(String toolName, String toolParams) {
-        // TODO: Implement tool execution
-        return new ToolExecutionResult("Not implemented", "Not implemented");
-    }
-    
-    public String executeTool(String toolName, String toolParams) {
-        ToolExecutionResult result = executeToolWithSummary(toolName, toolParams);
-        return result.fullResult;
-    }
-}
-
-|~|~|~|~|~|~|~|~|~|~|~|
-
-FILE: com/codeboss/bridgelayer/ToolParameterExtractor.java
-|~|~|~|~|~|~|~|~|~|~|~|
-package com.codeboss.bridgelayer;
-
-import com.codeboss.javalayer.bridge.ILogger;
-import java.util.regex.Pattern;
-import java.util.regex.Matcher;
-
-public class ToolParameterExtractor {
-    private final ILogger logger;
-
-    public ToolParameterExtractor(ILogger logger) {
-        this.logger = logger;
-    }
-
-    public String extractParameter(String toolParams, String paramName) {
-        try {
-            String pattern = "<parameter name=\"" + paramName + "\">(.*?)</parameter>";
-            Pattern p = Pattern.compile(pattern, Pattern.DOTALL);
-            Matcher m = p.matcher(toolParams);
-
-            if (m.find()) {
-                return m.group(1).trim();
-            }
-
-        } catch (Exception e) {
-            logger.log("Error extracting parameter " + paramName + ": " + e.getMessage());
-        }
-
-        return null;
-    }
-
-    public static String formatFileSize(long bytes) {
-        if (bytes < 1024) return bytes + "B";
-        if (bytes < 1024 * 1024) return String.format("%.1fKB", bytes / 1024.0);
-        if (bytes < 1024 * 1024 * 1024) return String.format("%.1fMB", bytes / (1024.0 * 1024.0));
-        return String.format("%.1fGB", bytes / (1024.0 * 1024.0 * 1024.0));
-    }
-}
-|~|~|~|~|~|~|~|~|~|~|~|
-
 FILE: bridge-button.js
 |~|~|~|~|~|~|~|~|~|~|~|
 // Claude Bridge Script - Button Interface with Clipboard Protocol
@@ -2391,8 +1270,8 @@ FILE: bridge-button.js
     let currentResponse = '';
     
     // Protocol constants
-    const TO_BRIDGE_MARKER = '|||||TO BRIDGE|||||';
-    const TO_JAVA_MARKER = '|||||TO JAVA|||||';
+    const TO_BRIDGE_MARKER = '|||||CLIP:TO_BRIDGE|||||';
+    const TO_JAVA_MARKER = '|||||CLIP:TO_JAVA|||||';
     
     // Remove any existing bridge UI
     const existingBridge = document.getElementById('claude-bridge-ui');
