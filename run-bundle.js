@@ -4,7 +4,7 @@ const { execSync } = require('child_process');
 
 // Two separate locations:
 // 1. EXECUTION_DIR - where the build script was run from (for Java app working directory)
-// 2. SCRIPT_DIR - where build.js and bundle.txt are located (for extraction and compilation)
+// 2. SCRIPT_DIR - where run-bundle.js and bundle.txt are located (for extraction and compilation)
 const EXECUTION_DIR = process.cwd();
 const SCRIPT_DIR = __dirname;
 const BUNDLE_FILE = path.join(SCRIPT_DIR, 'bundle.txt');
@@ -13,7 +13,7 @@ const DELIMITER = '|~|~|~|~|~|~|~|~|~|~|~|';
 // Check for run-only mode
 const RUN_ONLY = process.argv.includes('r');
 
-console.log('=== Manual Coding Agent Build Script ===');
+console.log('=== Code Boss Application Runner ===');
 console.log('');
 
 console.log(`Execution directory (Java app working dir): ${EXECUTION_DIR}`);
@@ -33,7 +33,7 @@ if (!fs.existsSync(SCRIPT_DIR)) {
 // Only check bundle file if we're not in run-only mode
 if (!RUN_ONLY && !fs.existsSync(BUNDLE_FILE)) {
     console.error(`ERROR: Bundle file not found: ${BUNDLE_FILE}`);
-    console.error('Please ensure bundle.txt is in the same directory as build.js');
+    console.error('Please ensure bundle.txt is in the same directory as run-bundle.js');
     process.exit(1);
 }
 
@@ -42,22 +42,22 @@ if (RUN_ONLY) {
     console.log('Skipping extraction and compilation - running existing classes...');
     process.chdir(SCRIPT_DIR);
 } else {
-    console.log('[1/5] Unbundling Java files to script directory...');
+    console.log('[1/5] Unbundling files to script directory...');
     process.chdir(SCRIPT_DIR);
 
 try {
     // Read bundle file
     const bundleContent = fs.readFileSync(BUNDLE_FILE, 'utf8');
     const lines = bundleContent.split('\n');
-    
+
     let currentFile = null;
     let fileContent = [];
     let inFileContent = false;
     let extractedFiles = 0;
-    
+
     for (let i = 0; i < lines.length; i++) {
         const line = lines[i].trim();
-        
+
         // Check if line starts with "FILE: "
         if (line.startsWith('FILE: ')) {
             // Save previous file if we have one
@@ -96,7 +96,7 @@ try {
             fileContent.push(lines[i]); // Keep original line with whitespace
         }
     }
-    
+
     // Save last file
     if (currentFile && fileContent.length > 0) {
         const content = fileContent.join('\n');
@@ -111,9 +111,9 @@ try {
         console.log(`  [OK] Wrote ${currentFile} (${content.length} chars)`);
         extractedFiles++;
     }
-    
-    console.log(`  Extracted ${extractedFiles} Java files`);
-    
+
+    console.log(`  Extracted ${extractedFiles} files`);
+
     // Verify files were created (recursively check)
     function findJavaFiles(dir, fileList = []) {
         const files = fs.readdirSync(dir);
@@ -133,7 +133,7 @@ try {
         console.error('ERROR: No Java files were extracted!');
         process.exit(1);
     }
-    
+
 } catch (error) {
     console.error(`ERROR: Failed to parse bundle file: ${error.message}`);
     process.exit(1);
@@ -188,27 +188,28 @@ try {
 }
 
 console.log('[4/5] Verifying main class...');
-const mainClassPath = path.join('com', 'codeboss', 'bridgelayer', 'BridgeTestRunner.class');
+const mainClassPath = path.join('com', 'codeboss', 'Main.class');
 if (!fs.existsSync(mainClassPath)) {
     console.error(`ERROR: ${mainClassPath} not found after compilation!`);
     process.exit(1);
 }
 } // End of extraction and compilation block
 
-console.log('[5/5] Starting BridgeTestRunner...');
+console.log('[5/5] Starting Code Boss Application...');
 console.log('');
 console.log('=====================================');
-console.log('   Bridge Test Suite Started');
+console.log('   Code Boss Application Started');
 console.log('=====================================');
 console.log('');
 
 try {
-    execSync(`java com.codeboss.bridgelayer.BridgeTestRunner "${SCRIPT_DIR}"`, { stdio: 'inherit' });
+    // Run Main.java with the execution directory as working directory
+    execSync(`java com.codeboss.Main "${EXECUTION_DIR}"`, { stdio: 'inherit' });
 } catch (error) {
     // Java process was terminated, this is normal
 }
 
 console.log('');
 console.log('=====================================');
-console.log('   Bridge Test Suite Stopped');
+console.log('   Code Boss Application Stopped');
 console.log('=====================================');
