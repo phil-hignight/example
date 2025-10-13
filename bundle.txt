@@ -1424,7 +1424,7 @@ public class CommandDispatcher {
      * - Commands can only execute in WAITING_FOR_INPUT state
      * - During AI_PROCESSING or TOOL_EXECUTING: must ESC ESC first
      * - Return error if called during wrong state:
-     *   "❌ Cannot execute command while AI is processing
+     *   "[X] Cannot execute command while AI is processing
      *    | Press ESC ESC to interrupt, then try again"
      * - Exception: "copyjs" can execute in any state (setup command)
      */
@@ -1463,9 +1463,9 @@ import com.codeboss.javalayer.bridge.*;
  * 4-level hierarchical compaction system
  *
  * Per context-spec.md:
- * - Level 1→2: Groups 5-15 related messages into message_group_detailed with summary
- * - Level 2→3: Clusters groups into message_group_highlevel with group references
- * - Level 3→4: Consolidates clusters into project_summary with comprehensive content
+ * - Level 1->2: Groups 5-15 related messages into message_group_detailed with summary
+ * - Level 2->3: Clusters groups into message_group_highlevel with group references
+ * - Level 3->4: Consolidates clusters into project_summary with comprehensive content
  * - AI-driven: Uses AI to create logical work chunks based on features/tasks
  */
 public class CompactionEngine {
@@ -1552,7 +1552,7 @@ public class CompactionEngine {
     }
 
     /**
-     * Build Level 1→2 compaction prompt per context-spec.md
+     * Build Level 1->2 compaction prompt per context-spec.md
      *
      * TODO: Format messages as list with ids, types, content
      * TODO: Include prompt template from context-spec.md lines 158-191
@@ -1563,7 +1563,7 @@ public class CompactionEngine {
     }
 
     /**
-     * Build Level 2→3 compaction prompt per context-spec.md
+     * Build Level 2->3 compaction prompt per context-spec.md
      *
      * TODO: Format groups with their summaries and group_ids
      * TODO: Include prompt template from context-spec.md lines 193-226
@@ -1574,7 +1574,7 @@ public class CompactionEngine {
     }
 
     /**
-     * Build Level 3→4 compaction prompt per context-spec.md
+     * Build Level 3->4 compaction prompt per context-spec.md
      *
      * TODO: Format clusters with their summaries
      * TODO: Include existing global summary if present
@@ -1688,9 +1688,9 @@ public class ContextManager {
      * Trigger proactive compaction
      *
      * TODO: 1. Calculate compaction budgets (50% reduction)
-     * TODO: 2. Check Level 1 - if over budget, compact Level 1→2 via compactionEngine
-     * TODO: 3. Check Level 2 - if over budget, compact Level 2→3 via compactionEngine
-     * TODO: 4. Check Level 3 - if over budget, compact Level 3→4 via compactionEngine
+     * TODO: 2. Check Level 1 - if over budget, compact Level 1->2 via compactionEngine
+     * TODO: 3. Check Level 2 - if over budget, compact Level 2->3 via compactionEngine
+     * TODO: 4. Check Level 3 - if over budget, compact Level 3->4 via compactionEngine
      * TODO: 5. Update ConversationState with compacted messages
      * TODO: 6. Write updated conversation to conversation.jsonl
      * TODO: 7. Log compaction completion
@@ -2208,11 +2208,11 @@ public class ConversationManager {
      * 4. Call publishStateUpdate() to send to web UI via SSE
      *
      * State transitions:
-     * - WAITING_FOR_INPUT → AI_PROCESSING (user sends message)
-     * - AI_PROCESSING → TOOL_EXECUTING (AI returns tool uses)
-     * - TOOL_EXECUTING → AI_PROCESSING (tools complete)
-     * - AI_PROCESSING → WAITING_FOR_INPUT (AI response complete)
-     * - Any state → WAITING_FOR_INPUT (ESC ESC interrupt)
+     * - WAITING_FOR_INPUT -> AI_PROCESSING (user sends message)
+     * - AI_PROCESSING -> TOOL_EXECUTING (AI returns tool uses)
+     * - TOOL_EXECUTING -> AI_PROCESSING (tools complete)
+     * - AI_PROCESSING -> WAITING_FOR_INPUT (AI response complete)
+     * - Any state -> WAITING_FOR_INPUT (ESC ESC interrupt)
      */
     public void transitionInputState(String newInputState) {
         throw new RuntimeException("NOT IMPLEMENTED");
@@ -2224,11 +2224,11 @@ public class ConversationManager {
      * TODO: Implementation per user-interface-spec.md lines 227-273
      * 1. Check if awaitingUndoConfirmation is true, else return error
      * 2. Parse response:
-     *    - "y" or "Y" → execute undo
-     *    - "n" or "N" → cancel
-     *    - "+<num>" → increase pendingUndoCount by num, regenerate prompt
-     *    - "-<num>" → decrease pendingUndoCount by num, regenerate prompt
-     *    - anything else → return error "Invalid response"
+     *    - "y" or "Y" -> execute undo
+     *    - "n" or "N" -> cancel
+     *    - "+<num>" -> increase pendingUndoCount by num, regenerate prompt
+     *    - "-<num>" -> decrease pendingUndoCount by num, regenerate prompt
+     *    - anything else -> return error "Invalid response"
      * 3. If y: call undoStack.undo(pendingUndoCount), reset flags, return success
      * 4. If n: reset flags, return "Undo cancelled"
      * 5. If +/-: update count, validate bounds, regenerate prompt from UndoCommand
@@ -2256,7 +2256,7 @@ public class ConversationManager {
      * TODO: Implementation per user-interface-spec.md lines 533-539
      * 1. Check bridge connection health (via BridgeQueue or ClipboardManager)
      * 2. If connection lost: return error message:
-     *    "❌ Cannot send messages to AI yet
+     *    "[X] Cannot send messages to AI yet
      *     | Bridge connection lost. Run \"copyjs\" to re-establish connection"
      * 3. If connection active: return null (no error)
      */
@@ -3264,7 +3264,7 @@ public class ProjectStructure {
                 }
                 
                 boolean isLast = (i == children.size() - 1);
-                String childIndent = indent + (isLast ? "└── " : "├── ");
+                String childIndent = indent + (isLast ? "+-- " : "+-- ");
                 
                 if (Files.isDirectory(child)) {
                     // Second level directory - show count only
@@ -3346,7 +3346,7 @@ public class PromptGenerator {
         }
 
         prompt.append(getToolDefinitions(mode));
-        prompt.append(getImportantRules());
+        prompt.append(getImportantRules(mode));
 
         return prompt.toString();
     }
@@ -3402,9 +3402,9 @@ public class PromptGenerator {
                 instructions.append("4. If you cannot complete it, call mark_failed with a reason\n\n");
                 instructions.append("TASK GRANULARITY EXAMPLES:\n");
                 instructions.append("GOOD task scope (focus on current task only):\n");
-                instructions.append("  - \"Create model classes\" → Create Todo.java and TodoModel.java in this step\n");
-                instructions.append("  - \"Implement view components\" → Create MainFrame.java, InputPanel.java, TodoPanel.java\n");
-                instructions.append("  - \"Clear out project files\" → Delete README, package.json, and src/ directory\n");
+                instructions.append("  - \"Create model classes\" -> Create Todo.java and TodoModel.java in this step\n");
+                instructions.append("  - \"Implement view components\" -> Create MainFrame.java, InputPanel.java, TodoPanel.java\n");
+                instructions.append("  - \"Clear out project files\" -> Delete README, package.json, and src/ directory\n");
                 instructions.append("BAD - doing too much:\n");
                 instructions.append("  - If task is \"Create model classes\", DON'T also create controller or view classes\n");
                 instructions.append("  - If task is \"Implement Todo class\", DON'T create the entire MVC structure\n");
@@ -3740,7 +3740,7 @@ public class PromptGenerator {
 
         if (previousItem != null) {
             task.append("PREVIOUS TASK (completed):\n");
-            task.append("✓ ").append(previousItem.content).append("\n\n");
+            task.append("[PASS] ").append(previousItem.content).append("\n\n");
         }
 
         task.append("CURRENT TASK:\n");
@@ -3770,77 +3770,110 @@ public class PromptGenerator {
 
                "WRONG - Multiple top-level tags:\n" +
                "<execute>...</execute>\n" +
-               "<execute>...</execute>  ❌ DO NOT DO THIS\n" +
+               "<execute>...</execute>  [X] DO NOT DO THIS\n" +
                "<message>...</message>\n\n" +
 
                "WRONG - Both execute and message:\n" +
                "<execute>...</execute>\n" +
-               "<message>...</message>  ❌ INVALID - NEVER send both tags\n\n" +
+               "<message>...</message>  [X] INVALID - NEVER send both tags\n\n" +
 
                "WRONG - Message followed by execute:\n" +
                "<message>Let me check...</message>\n" +
-               "<execute>...</execute>  ❌ INVALID - Choose ONE tag only\n\n" +
+               "<execute>...</execute>  [X] INVALID - Choose ONE tag only\n\n" +
 
                "WRONG - Text outside tags:\n" +
                "Let me help you...\n" +
-               "<execute>...</execute>  ❌ INVALID - All content must be inside tags\n\n";
+               "<execute>...</execute>  [X] INVALID - All content must be inside tags\n\n";
     }
 
-    private String getImportantRules() {
-        return "IMPORTANT RULES:\n\n" +
+    private String getImportantRules(Mode mode) {
+        Set<ToolCategory> availableCategories = mode.getAvailableToolCategories();
+        boolean hasFileOps = availableCategories.contains(ToolCategory.FILE_OPERATIONS);
 
-               "TOOL BATCHING (CRITICAL - READ CAREFULLY):\n" +
-               "ALWAYS batch multiple tool calls in ONE <execute> block. This is MUCH more efficient.\n\n" +
+        StringBuilder rules = new StringBuilder();
+        rules.append("IMPORTANT RULES:\n\n");
+        rules.append("TOOL BATCHING (CRITICAL - READ CAREFULLY):\n");
+        rules.append("ALWAYS batch multiple tool calls in ONE <execute> block. This is MUCH more efficient.\n\n");
 
-               "GOOD Examples (batching many tools):\n" +
-               "  Example 1 - Creating multiple files:\n" +
-               "    <execute>\n" +
-               "      <tool name=\"create_file\"><parameter name=\"file_path\">Todo.js</parameter>...</tool>\n" +
-               "      <tool name=\"create_file\"><parameter name=\"file_path\">TodoList.js</parameter>...</tool>\n" +
-               "      <tool name=\"create_file\"><parameter name=\"file_path\">TodoItem.js</parameter>...</tool>\n" +
-               "      <tool name=\"create_file\"><parameter name=\"file_path\">Footer.js</parameter>...</tool>\n" +
-               "    </execute>\n\n" +
+        if (hasFileOps) {
+            // Only show file operation examples in EXECUTION mode
+            rules.append("GOOD Examples (batching many tools):\n");
+            rules.append("  Example 1 - Creating multiple files:\n");
+            rules.append("    <execute>\n");
+            rules.append("      <tool name=\"create_file\"><parameter name=\"file_path\">Todo.js</parameter>...</tool>\n");
+            rules.append("      <tool name=\"create_file\"><parameter name=\"file_path\">TodoList.js</parameter>...</tool>\n");
+            rules.append("      <tool name=\"create_file\"><parameter name=\"file_path\">TodoItem.js</parameter>...</tool>\n");
+            rules.append("      <tool name=\"create_file\"><parameter name=\"file_path\">Footer.js</parameter>...</tool>\n");
+            rules.append("    </execute>\n\n");
 
-               "  Example 2 - Updating multiple methods in same file:\n" +
-               "    <execute>\n" +
-               "      <tool name=\"update_file\"><parameter name=\"file_path\">app.js</parameter>...addTodo...</tool>\n" +
-               "      <tool name=\"update_file\"><parameter name=\"file_path\">app.js</parameter>...deleteTodo...</tool>\n" +
-               "      <tool name=\"update_file\"><parameter name=\"file_path\">app.js</parameter>...toggleTodo...</tool>\n" +
-               "      <tool name=\"update_file\"><parameter name=\"file_path\">app.js</parameter>...clearCompleted...</tool>\n" +
-               "    </execute>\n\n" +
+            rules.append("  Example 2 - Updating multiple methods in same file:\n");
+            rules.append("    <execute>\n");
+            rules.append("      <tool name=\"update_file\"><parameter name=\"file_path\">app.js</parameter>...addTodo...</tool>\n");
+            rules.append("      <tool name=\"update_file\"><parameter name=\"file_path\">app.js</parameter>...deleteTodo...</tool>\n");
+            rules.append("      <tool name=\"update_file\"><parameter name=\"file_path\">app.js</parameter>...toggleTodo...</tool>\n");
+            rules.append("      <tool name=\"update_file\"><parameter name=\"file_path\">app.js</parameter>...clearCompleted...</tool>\n");
+            rules.append("    </execute>\n\n");
 
-               "  Example 3 - Deleting multiple files:\n" +
-               "    <execute>\n" +
-               "      <tool name=\"delete_file\">...</tool>\n" +
-               "      <tool name=\"delete_file\">...</tool>\n" +
-               "      <tool name=\"delete_file\">...</tool>\n" +
-               "      <tool name=\"mark_complete\"></tool>\n" +
-               "    </execute>\n\n" +
+            rules.append("  Example 3 - Deleting multiple files:\n");
+            rules.append("    <execute>\n");
+            rules.append("      <tool name=\"delete_file\">...</tool>\n");
+            rules.append("      <tool name=\"delete_file\">...</tool>\n");
+            rules.append("      <tool name=\"delete_file\">...</tool>\n");
+            rules.append("      <tool name=\"mark_complete\"></tool>\n");
+            rules.append("    </execute>\n\n");
 
-               "BAD Examples (inefficient - one tool at a time):\n" +
-               "  ❌ <execute><tool name=\"update_file\">...addTodo...</tool></execute>\n" +
-               "     [wait for response]\n" +
-               "  ❌ <execute><tool name=\"update_file\">...deleteTodo...</tool></execute>\n" +
-               "     [wait for response]\n" +
-               "  This is VERY SLOW - batch them all together instead!\n\n" +
+            rules.append("BAD Examples (inefficient - one tool at a time):\n");
+            rules.append("  [X] <execute><tool name=\"update_file\">...addTodo...</tool></execute>\n");
+            rules.append("     [wait for response]\n");
+            rules.append("  [X] <execute><tool name=\"update_file\">...deleteTodo...</tool></execute>\n");
+            rules.append("     [wait for response]\n");
+            rules.append("  This is VERY SLOW - batch them all together instead!\n\n");
 
-               "KEY RULE: If you need to do 5-10 similar operations (create/update/delete multiple files),\n" +
-               "put ALL of them in ONE <execute> block. Don't send one tool, wait for response, send another.\n\n" +
+            rules.append("KEY RULE: If you need to do 5-10 similar operations (create/update/delete multiple files),\n");
+            rules.append("put ALL of them in ONE <execute> block. Don't send one tool, wait for response, send another.\n\n");
+        } else {
+            // Show read-only examples for PLANNING/REVIEW modes
+            rules.append("GOOD Examples (batching many tools):\n");
+            rules.append("  Example 1 - Reading multiple files:\n");
+            rules.append("    <execute>\n");
+            rules.append("      <tool name=\"read_file\"><parameter name=\"file_path\">src/Main.java</parameter></tool>\n");
+            rules.append("      <tool name=\"read_file\"><parameter name=\"file_path\">src/Model.java</parameter></tool>\n");
+            rules.append("      <tool name=\"read_file\"><parameter name=\"file_path\">src/View.java</parameter></tool>\n");
+            rules.append("    </execute>\n\n");
 
-               "OTHER RULES:\n" +
-               "- Always use forward slashes (/) in file paths, even on Windows\n" +
-               "- All file paths must be relative to the current working directory\n" +
-               "- Read files before modifying them to understand the context\n" +
-               "- When updating files, ensure old_content matches exactly\n" +
-               "- Keep responses concise and focused on the task\n" +
-               "- End your final response with: |||||AI:END|||||\n\n" +
+            rules.append("  Example 2 - Searching and listing:\n");
+            rules.append("    <execute>\n");
+            rules.append("      <tool name=\"list_files\"><parameter name=\"directory_path\">src</parameter></tool>\n");
+            rules.append("      <tool name=\"search_files_by_name\"><parameter name=\"pattern\">*.java</parameter></tool>\n");
+            rules.append("    </execute>\n\n");
 
-               "CRITICAL REMINDERS (common mistakes to avoid):\n" +
-               "1. NEVER send both <message> and <execute> - pick ONE only\n" +
-               "2. NEVER put text outside the tags - everything inside <message> or <execute>\n" +
-               "3. NEVER create empty files - always include content in create_file tool\n" +
-               "4. NEVER send one tool at a time when you could batch multiple together\n" +
-               "5. ERROR RECOVERY: If a tool fails 2x with same error, try a different approach\n\n";
+            rules.append("KEY RULE: Batch multiple read/search operations in ONE <execute> block.\n");
+            rules.append("Don't send one tool, wait for response, send another - batch them all together!\n\n");
+        }
+
+        rules.append("OTHER RULES:\n");
+        rules.append("- Always use forward slashes (/) in file paths, even on Windows\n");
+        rules.append("- All file paths must be relative to the current working directory\n");
+        if (hasFileOps) {
+            rules.append("- Read files before modifying them to understand the context\n");
+            rules.append("- When updating files, ensure old_content matches exactly\n");
+        }
+        rules.append("- Keep responses concise and focused on the task\n");
+        rules.append("- End your final response with: |||||AI:END|||||\n\n");
+
+        rules.append("CRITICAL REMINDERS (common mistakes to avoid):\n");
+        rules.append("1. NEVER send both <message> and <execute> - pick ONE only\n");
+        rules.append("2. NEVER put text outside the tags - everything inside <message> or <execute>\n");
+        if (hasFileOps) {
+            rules.append("3. NEVER create empty files - always include content in create_file tool\n");
+            rules.append("4. NEVER send one tool at a time when you could batch multiple together\n");
+            rules.append("5. ERROR RECOVERY: If a tool fails 2x with same error, try a different approach\n\n");
+        } else {
+            rules.append("3. NEVER send one tool at a time when you could batch multiple together\n");
+            rules.append("4. ERROR RECOVERY: If a tool fails 2x with same error, try a different approach\n\n");
+        }
+
+        return rules.toString();
     }
 }
 
@@ -4201,7 +4234,7 @@ public class SetupManager {
      *
      * TODO: Implementation per user-interface-spec.md lines 509-514
      * Returns:
-     * "❌ Cannot send messages to AI yet
+     * "[X] Cannot send messages to AI yet
      *  | Run \"copyjs\" and set up the browser bridge first
      *  | See README.md for setup instructions"
      */
@@ -4298,27 +4331,27 @@ public class UndoCommand implements ICommand {
                 count = Integer.parseInt(args[0]);
                 if (count <= 0) {
                     return new CommandDispatcher.CommandResult(false,
-                        "❌ Invalid parameter: " + args[0] + "\n| Parameter must be a positive number\n| Usage: undo [number]");
+                        "[X] Invalid parameter: " + args[0] + "\n| Parameter must be a positive number\n| Usage: undo [number]");
                 }
                 if (count > 50) {
                     return new CommandDispatcher.CommandResult(false,
-                        "❌ Maximum undo count is 50\n| Usage: undo [number]");
+                        "[X] Maximum undo count is 50\n| Usage: undo [number]");
                 }
             } catch (NumberFormatException e) {
                 return new CommandDispatcher.CommandResult(false,
-                    "❌ Invalid parameter: " + args[0] + "\n| Usage: undo [number]\n| Example: undo 3");
+                    "[X] Invalid parameter: " + args[0] + "\n| Usage: undo [number]\n| Example: undo 3");
             }
         }
 
         // Validate undo stack
         if (undoStack.isEmpty()) {
             return new CommandDispatcher.CommandResult(false,
-                "❌ No operations available to undo\n| The undo history is empty");
+                "[X] No operations available to undo\n| The undo history is empty");
         }
 
         if (count > undoStack.size()) {
             return new CommandDispatcher.CommandResult(false,
-                "❌ Cannot undo " + count + " operations (only " + undoStack.size() + " available)\n| Use \"undo " + undoStack.size() + "\" or less");
+                "[X] Cannot undo " + count + " operations (only " + undoStack.size() + " available)\n| Use \"undo " + undoStack.size() + "\" or less");
         }
 
         // TODO: Build confirmation prompt with operation details
