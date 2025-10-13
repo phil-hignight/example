@@ -874,8 +874,45 @@ public class AIProcessorThread implements Runnable {
                         break; // Break out of tool loop
                     }
 
+                    // Check if plan was auto-approved (single-item plans)
+                    boolean wasAutoApproved = false;
+                    for (ResponseParser.ToolUse tool : toolsToExecute) {
+                        if (tool.name.equals("begin_execution")) {
+                            // Check the last tool result to see if it was auto-approved
+                            List<ConversationState.Message> history = conversationManager.getState().getHistory();
+                            if (!history.isEmpty()) {
+                                ConversationState.Message lastMsg = history.get(history.size() - 1);
+                                if (lastMsg.type.equals("tool_result") && lastMsg.result != null) {
+                                    Object status = lastMsg.result.get("status");
+                                    if ("auto_approved".equals(status)) {
+                                        wasAutoApproved = true;
+                                        logger.log("Plan was auto-approved (single item) - adding task_start notification");
+
+                                        // Add task_start notification
+                                        Object firstTaskObj = lastMsg.result.get("first_task");
+                                        if (firstTaskObj instanceof Map) {
+                                            conversationManager.addToolResult("task_start", (Map<String, Object>) firstTaskObj);
+                                            conversationQueue.publishState(conversationManager.getConversationStateJson());
+                                        }
+
+                                        // Continue the agentic loop - AI needs to start executing the task
+                                        String executeRequest = buildAIRequestFromHistory();
+                                        logger.log("Auto-approved - sending AI to EXECUTION mode");
+                                        BridgeQueue.AIResponse executeResponse = submitToBridge(executeRequest);
+                                        logger.log("Got AI response: " + executeResponse.responseXml);
+
+                                        parsed = parseWithRetry(executeResponse.responseXml, false);
+                                        handleParsingWarnings(parsed);
+                                        // Don't break - continue the agentic loop
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // Check if approval is pending - if so, stop processing and wait
-                    if (conversationManager.isAwaitingApproval()) {
+                    if (!wasAutoApproved && conversationManager.isAwaitingApproval()) {
                         logger.log("Plan submitted for approval - stopping AI processing");
                         String description = conversationManager.getPendingPlanDescription();
                         conversationManager.addSystemMessage("Plan: " + description + "\nProceed with this plan? (yes/no)");
@@ -2962,7 +2999,8 @@ public enum Mode {
                 return EnumSet.of(
                     ToolCategory.FILE_READ,
                     ToolCategory.SEARCH,
-                    ToolCategory.GIT_READ
+                    ToolCategory.GIT_READ,
+                    ToolCategory.CHECKLIST  // For review_pass/review_fail
                 );
             case TESTING:
                 return EnumSet.of(
@@ -7568,11 +7606,44 @@ public class ToolExecutor implements IToolExecutor {
             return new ToolExecutionResult(error, "Error: checklist required");
         }
 
-        // Store for approval (DON'T add to ChecklistManager yet)
-        conversationManager.setPendingApproval(description, checklistJson);
-
         // Parse checklist to validate format and generate preview
         List<Map<String, String>> items = parseChecklistForPreview(checklistJson);
+
+        // AUTO-APPROVE: If there's only 1 item, skip approval and go directly to execution
+        if (items.size() == 1) {
+            // Add checklist items directly to ChecklistManager
+            List<Map<String, String>> addedItems = parseAndAddChecklist(checklistJson);
+
+            // Transition to EXECUTION mode immediately
+            if (modeManager != null) {
+                modeManager.transitionTo(com.codeboss.javalayer.aiprocessor.Mode.EXECUTION);
+            }
+
+            // Get first task to start
+            ChecklistManager.ChecklistItem firstTask = checklistManager != null ?
+                checklistManager.getNextPendingItem() : null;
+
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("status", "auto_approved");
+            result.put("description", description);
+            result.put("checklist_preview", items);
+            result.put("item_count", 1);
+            result.put("reason", "Single-item plan auto-approved");
+
+            if (firstTask != null) {
+                Map<String, Object> taskInfo = new LinkedHashMap<>();
+                taskInfo.put("content", firstTask.content);
+                taskInfo.put("item_type", firstTask.itemType);
+                taskInfo.put("task_number", 1);
+                taskInfo.put("total_items", 1);
+                result.put("first_task", taskInfo);
+            }
+
+            return new ToolExecutionResult(result, "Plan auto-approved (1 item) and execution started");
+        }
+
+        // NORMAL FLOW: Store for approval (DON'T add to ChecklistManager yet)
+        conversationManager.setPendingApproval(description, checklistJson);
 
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("status", "pending_approval");
@@ -8317,7 +8388,7 @@ public class ToolExecutor implements IToolExecutor {
 
 |~|~|~|~|~|~|~|~|~|~|~|
 
-FILE: frontend-ui/index.html
+FILE: src/frontend-ui/index.html
 |~|~|~|~|~|~|~|~|~|~|~|
 <!DOCTYPE html>
 <html lang="en">
@@ -8347,7 +8418,7 @@ FILE: frontend-ui/index.html
 
 |~|~|~|~|~|~|~|~|~|~|~|
 
-FILE: frontend-ui/main.js
+FILE: src/frontend-ui/main.js
 |~|~|~|~|~|~|~|~|~|~|~|
 (function() {
     const { render } = window.module["render.js"];
@@ -8559,7 +8630,7 @@ FILE: frontend-ui/main.js
 
 |~|~|~|~|~|~|~|~|~|~|~|
 
-FILE: frontend-ui/render.js
+FILE: src/frontend-ui/render.js
 |~|~|~|~|~|~|~|~|~|~|~|
 (function() {
     const { h, text } = window.module["vdom.js"];
@@ -9076,7 +9147,7 @@ FILE: frontend-ui/render.js
 
 |~|~|~|~|~|~|~|~|~|~|~|
 
-FILE: frontend-ui/diff.js
+FILE: src/frontend-ui/diff.js
 |~|~|~|~|~|~|~|~|~|~|~|
 (function() {
     const { createDOMNode } = window.module["vdom.js"];
@@ -9238,7 +9309,7 @@ FILE: frontend-ui/diff.js
 
 |~|~|~|~|~|~|~|~|~|~|~|
 
-FILE: frontend-ui/api.js
+FILE: src/frontend-ui/api.js
 |~|~|~|~|~|~|~|~|~|~|~|
 (function() {
     async function getState() {
@@ -9324,7 +9395,7 @@ FILE: frontend-ui/api.js
 
 |~|~|~|~|~|~|~|~|~|~|~|
 
-FILE: frontend-ui/styles.css
+FILE: src/frontend-ui/styles.css
 |~|~|~|~|~|~|~|~|~|~|~|
 * {
     margin: 0;
