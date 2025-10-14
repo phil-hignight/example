@@ -19,14 +19,21 @@ public class Main {
 
             // Parse command line arguments
             int port = 3002;
+            String workingDir = null;
+
+            // First positional argument (if not starting with --) is working directory
             for (String arg : args) {
                 if (arg.startsWith("--port=")) {
                     port = Integer.parseInt(arg.substring(7));
+                } else if (workingDir == null && !arg.startsWith("--")) {
+                    workingDir = arg;
                 }
             }
 
-            // Get working directory
-            String workingDir = System.getProperty("user.dir");
+            // Get working directory - use argument if provided, otherwise use current directory
+            if (workingDir == null) {
+                workingDir = System.getProperty("user.dir");
+            }
             System.out.println("Working directory: " + workingDir);
 
             // Set codeboss.home to the directory containing this jar/classes
@@ -206,8 +213,13 @@ public class ClipboardManager implements com.codeboss.javalayer.bridge.IClipboar
         try {
             Robot robot = new Robot();
             robot.mouseMove(x, y);
+            Thread.sleep(50); // Small delay to ensure mouse has moved
             robot.mousePress(InputEvent.BUTTON1_DOWN_MASK);
             robot.mouseRelease(InputEvent.BUTTON1_DOWN_MASK);
+            // Log on first click only to avoid spam
+            if (System.currentTimeMillis() % 5000 < 100) {
+                log("Click executed at (" + x + ", " + y + ")");
+            }
         } catch (Exception e) {
             log("Error clicking at coordinates (" + x + ", " + y + "): " + e.getMessage());
             e.printStackTrace();
@@ -241,6 +253,9 @@ public class ClipboardManager implements com.codeboss.javalayer.bridge.IClipboar
                 // Move mouse to coordinates and click
                 this.clickAtCoordinates(clickX, clickY);
 
+                // Small delay after click to let browser respond
+                Thread.sleep(100);
+
                 // Check clipboard for response with terminator
                 String clipboardContent = this.getClipboardContent();
 
@@ -252,6 +267,10 @@ public class ClipboardManager implements com.codeboss.javalayer.bridge.IClipboar
                         log("Clipboard content preview: " + preview);
                         log("Clipboard ends with TO_JAVA marker: " + clipboardContent.endsWith("|||||CLIP:TO_JAVA|||||"));
                         log("Clipboard ends with TO_JAVA_END marker: " + clipboardContent.endsWith("|||||CLIP:TO_JAVA_END|||||"));
+                    }
+                } else {
+                    if (pollCount % 5 == 1) {
+                        log("Clipboard is NULL after clicking");
                     }
 
                     if (clipboardContent.endsWith("|||||CLIP:TO_JAVA|||||") || clipboardContent.endsWith("|||||CLIP:TO_JAVA_END|||||")) {
@@ -389,14 +408,20 @@ public class MiddleLayer {
 
         // 2. Create components
         ChecklistManager checklistManager = new ChecklistManager(logger);
-        ConversationManager conversationManager = new ConversationManager(checklistManager, logger, workingDirectory);
+        conversationManager = new ConversationManager(checklistManager, logger, workingDirectory);
         ModeManager modeManager = new ModeManager(logger, conversationManager);
         PromptGenerator promptGenerator = new PromptGenerator();
         FileHashTracker fileHashTracker = new FileHashTracker(logger, workingDirectory);
         UndoStack undoStack = new UndoStack(logger, fileHashTracker, workingDirectory);
 
-        // Note: We don't publish initial conversation state here because it would be empty
-        // The first state will be published when the first message is processed
+        // Publish initial conversation state so frontend can display existing conversation on load
+        try {
+            String initialState = conversationManager.getConversationStateJson();
+            conversationQueue.publishState(initialState);
+            logger.log("Published initial conversation state");
+        } catch (InterruptedException e) {
+            logger.log("Warning: Failed to publish initial conversation state: " + e.getMessage());
+        }
 
         // Wire up ChecklistManager, ModeManager, and ConversationManager to ToolExecutor if it's the concrete implementation
         if (toolExecutor instanceof com.codeboss.javalayer.toolexecutor.ToolExecutor) {
@@ -10339,6 +10364,11 @@ FILE: src/frontend-ui/main.js
         try {
             const initialState = await getState();
             updateUI(initialState);
+            // Scroll to bottom after loading initial conversation
+            if (initialState.messages && initialState.messages.length > 0) {
+                scrollToBottom();
+                lastMessageCountAtBottom = initialState.messages.length;
+            }
         } catch (error) {
             console.error('Failed to load initial state:', error);
             updateUI({
