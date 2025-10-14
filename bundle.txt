@@ -1955,6 +1955,12 @@ public class ConversationManager {
             Path conversationFile = Paths.get(workingDirectory, ".agent", "conversation.jsonl");
             if (Files.exists(conversationFile)) {
                 loadFromFile(conversationFile.toString());
+                // Print startup info about conversation file
+                System.out.println("Conversation file: " + conversationFile.toAbsolutePath());
+                System.out.println("Initial message count: " + state.getHistory().size());
+            } else {
+                System.out.println("Conversation file: " + conversationFile.toAbsolutePath() + " (will be created)");
+                System.out.println("Initial message count: 0");
             }
 
             // If no conversation history exists, add initial greeting message
