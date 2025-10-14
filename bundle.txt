@@ -260,10 +260,6 @@ public class ClipboardManager implements com.codeboss.javalayer.bridge.IClipboar
                         log("Clipboard ends with TO_JAVA marker: " + clipboardContent.endsWith("|||||CLIP:TO_JAVA|||||"));
                         log("Clipboard ends with TO_JAVA_END marker: " + clipboardContent.endsWith("|||||CLIP:TO_JAVA_END|||||"));
                     }
-                } else {
-                    if (pollCount % 5 == 1) {
-                        log("Clipboard is NULL after clicking");
-                    }
 
                     if (clipboardContent.endsWith("|||||CLIP:TO_JAVA|||||") || clipboardContent.endsWith("|||||CLIP:TO_JAVA_END|||||")) {
                         // Remove terminator and return response
@@ -273,11 +269,15 @@ public class ClipboardManager implements com.codeboss.javalayer.bridge.IClipboar
                         // Reject empty or very short responses
                         if (response.trim().isEmpty() || response.length() < 10) {
                             log("Empty/short response, continuing to poll");
-                            return null;
+                            continue;
                         }
 
                         log("SUCCESS: Received valid response (" + response.length() + " chars)");
                         return response;
+                    }
+                } else {
+                    if (pollCount % 5 == 1) {
+                        log("Clipboard is NULL after clicking");
                     }
                 }
 
@@ -1960,6 +1960,7 @@ public class ConversationManager {
             // If no conversation history exists, add initial greeting message
             if (state.getHistory().isEmpty()) {
                 addAssistantMessage("How can I help you today?");
+                state.setStatus("complete"); // Set status to complete so UI doesn't show loading
             }
         } catch (IOException e) {
             logger.log("Warning: Could not create .agent directory: " + e.getMessage());
