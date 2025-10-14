@@ -40,18 +40,10 @@ public class Main {
             // This allows Router to find frontend files regardless of working directory
             String codeBaseHome = System.getProperty("codeboss.home");
             if (codeBaseHome == null) {
-                // Default to parent directory of the working directory if not set
-                // Assumes structure: code_boss/test-run or similar
-                java.io.File workingDirFile = new java.io.File(workingDir);
-                String parentDir = workingDirFile.getParent();
-                if (parentDir != null && new java.io.File(parentDir, "src/frontend-ui").exists()) {
-                    System.setProperty("codeboss.home", parentDir);
-                    System.out.println("Code Boss home: " + parentDir);
-                } else {
-                    // Fall back to working directory
-                    System.setProperty("codeboss.home", workingDir);
-                    System.out.println("Code Boss home: " + workingDir);
-                }
+                // Hard-coded path to Code Boss installation
+                String codeBossHome = "D:\\code_boss";
+                System.setProperty("codeboss.home", codeBossHome);
+                System.out.println("Code Boss home: " + codeBossHome);
             }
 
             // Initialize Layer 2 (Bridge) components
