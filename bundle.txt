@@ -3983,14 +3983,14 @@ public class PromptGenerator {
                "  - CRITICAL: Use \\n for newlines in JSON strings (NOT backslash line continuation!)\n" +
                "  - Add more {\"old_content\":\"...\",\"new_content\":\"...\"} objects as needed\n\n" +
 
-               "  ⚠️ NEWLINE HANDLING (CRITICAL):\n" +
+               "  WARNING: NEWLINE HANDLING (CRITICAL):\n" +
                "  WRONG - Using backslash for line continuation (INVALID JSON!):\n" +
                "    {\"old_content\":\"function hello() {\\\n    console.log('Hi');\\\n}\"}\n" +
                "    [X] This creates INVALID JSON - backslash continuation doesn't work in JSON!\n\n" +
 
                "  CORRECT - Using \\n escape sequence:\n" +
                "    {\"old_content\":\"function hello() {\\n    console.log('Hi');\\n}\"}\n" +
-               "    [✓] The \\n represents a newline character in the JSON string\n\n" +
+               "    [OK] The \\n represents a newline character in the JSON string\n\n" +
 
                "  When to use each:\n" +
                "  - ONE update to a file → use update_file\n" +
@@ -4256,7 +4256,7 @@ public class PromptGenerator {
                "Let me help you...\n" +
                "<execute>...</execute>\n\n" +
 
-               "⚠️ USING TEMPLATES:\n\n" +
+               "WARNING: USING TEMPLATES:\n\n" +
                "Copy templates EXACTLY. Replace only the PLACEHOLDER text (like PUT_FILE_PATH_HERE).\n\n" +
 
                "When you see <![CDATA[PUT_CONTENT_HERE]]>:\n" +
