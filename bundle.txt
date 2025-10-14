@@ -7737,17 +7737,21 @@ public class Logger implements com.codeboss.javalayer.bridge.ILogger {
     @Override
     public void log(String message) {
         try {
-            String logFile = getLogFile();
             String timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS"));
-            String logMessage = "[" + timestamp + "] " + message + "\n";
+            String logMessage = "[" + timestamp + "] " + message;
 
+            // Write to console (stdout)
+            System.out.println(logMessage);
+
+            // Also write to file
+            String logFile = getLogFile();
             Path logPath = Paths.get(logFile);
             Path agentDir = logPath.getParent();
             if (!Files.exists(agentDir)) {
                 Files.createDirectories(agentDir);
             }
 
-            Files.write(logPath, logMessage.getBytes(),
+            Files.write(logPath, (logMessage + "\n").getBytes(),
                        StandardOpenOption.CREATE, StandardOpenOption.APPEND);
         } catch (Exception e) {
             System.err.println("Failed to write to log: " + e.getMessage());
@@ -8661,6 +8665,12 @@ public class ToolExecutor implements IToolExecutor {
             }
         }
 
+        // Create a map from old_content to FileUpdate for preserving original order in result
+        Map<String, FileUpdate> updateMap = new LinkedHashMap<>();
+        for (FileUpdate update : updates) {
+            updateMap.put(update.oldContent, update);
+        }
+
         // Sort updates by position (last to first) for reverse application
         updates.sort((a, b) -> Integer.compare(b.position, a.position));
 
@@ -8696,14 +8706,18 @@ public class ToolExecutor implements IToolExecutor {
         result.put("updates_applied", updatesApplied);
         result.put("updated", true);
 
-        // Add detailed update information including line numbers
+        // Add detailed update information in ORIGINAL ORDER (matching parameters.updates)
         List<Map<String, Object>> updatesDetail = new ArrayList<>();
-        for (FileUpdate update : updates) {
-            Map<String, Object> updateInfo = new LinkedHashMap<>();
-            updateInfo.put("start_line", update.startLineNumber);
-            updateInfo.put("old_content", update.oldContent);
-            updateInfo.put("new_content", update.newContent);
-            updatesDetail.add(updateInfo);
+        for (Map<String, String> originalUpdate : updatesList) {
+            String oldContent = originalUpdate.get("old_content");
+            FileUpdate fileUpdate = updateMap.get(oldContent);
+            if (fileUpdate != null) {
+                Map<String, Object> updateInfo = new LinkedHashMap<>();
+                updateInfo.put("start_line", fileUpdate.startLineNumber);
+                updateInfo.put("old_content", fileUpdate.oldContent);
+                updateInfo.put("new_content", fileUpdate.newContent);
+                updatesDetail.add(updateInfo);
+            }
         }
         result.put("updates_detail", updatesDetail);
 
