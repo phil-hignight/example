@@ -111,7 +111,7 @@ public class ClipboardManager implements com.codeboss.javalayer.bridge.IClipboar
                 Clipboard clipboard = Toolkit.getDefaultToolkit().getSystemClipboard();
                 StringSelection selection = new StringSelection(text);
                 clipboard.setContents(selection, null);
-                // Success - no logging for normal operations
+                log("SUCCESS: Copied " + text.length() + " characters to clipboard");
                 return;
             } catch (Exception e) {
                 log("Error copying to clipboard (attempt " + attempt + "): " + e.getMessage());
@@ -370,6 +370,8 @@ public class MiddleLayer {
         ConversationManager conversationManager = new ConversationManager(checklistManager, logger, workingDirectory);
         ModeManager modeManager = new ModeManager(logger, conversationManager);
         PromptGenerator promptGenerator = new PromptGenerator();
+        FileHashTracker fileHashTracker = new FileHashTracker(logger, workingDirectory);
+        UndoStack undoStack = new UndoStack(logger, fileHashTracker, workingDirectory);
 
         // Note: We don't publish initial conversation state here because it would be empty
         // The first state will be published when the first message is processed
@@ -403,6 +405,9 @@ public class MiddleLayer {
             checklistManager,
             modeManager,
             (com.codeboss.javalayer.toolexecutor.ToolExecutor)toolExecutor,
+            clipboard,
+            config,
+            undoStack,
             logger
         );
         httpServer = new HttpServer(config.getServerPort(), router, logger);
@@ -1512,6 +1517,8 @@ public class CommandDispatcher {
         commands.put("mousecapture", new MouseCaptureCommand(clipboard, config, logger));
         commands.put("quit", new QuitCommand(logger));
         commands.put("undo", new UndoCommand(undoStack, logger));
+
+        logger.log("CommandDispatcher initialized with " + commands.size() + " commands: " + commands.keySet());
     }
 
     /**
@@ -1526,11 +1533,23 @@ public class CommandDispatcher {
      * - Exception: "copyjs" can execute in any state (setup command)
      */
     public CommandResult dispatch(String commandName, String[] args) {
+        logger.log("CommandDispatcher: Dispatching command '" + commandName + "' with " + args.length + " args");
+
         ICommand command = commands.get(commandName);
         if (command == null) {
+            logger.log("CommandDispatcher ERROR: Unknown command '" + commandName + "'");
             return new CommandResult(false, "Unknown command: " + commandName);
         }
-        return command.execute(args);
+
+        try {
+            CommandResult result = command.execute(args);
+            logger.log("CommandDispatcher: Command '" + commandName + "' executed, success=" + result.success);
+            return result;
+        } catch (Exception e) {
+            logger.log("CommandDispatcher ERROR: Exception executing '" + commandName + "': " + e.getMessage());
+            e.printStackTrace();
+            return new CommandResult(false, "Command error: " + e.getMessage());
+        }
     }
 
     public Set<String> getAvailableCommands() {
@@ -1977,6 +1996,19 @@ public class ConversationManager {
         state.addMessage(msg);
         state.incrementMessageCount();
         logger.log("Added assistant message: " + msg.id);
+        persistMessage(msg);
+        return msg;
+    }
+
+    public ConversationState.Message addCommandResultMessage(String clipboardData) {
+        ConversationState.Message msg = new ConversationState.Message("command_result", (String)null);
+        // Store clipboard data in result field
+        Map<String, Object> result = new HashMap<>();
+        result.put("clipboard_data", clipboardData);
+        msg.result = result;
+        state.addMessage(msg);
+        state.incrementMessageCount();
+        logger.log("Added command_result message with " + clipboardData.length() + " bytes: " + msg.id);
         persistMessage(msg);
         return msg;
     }
@@ -2743,6 +2775,8 @@ FILE: com/codeboss/javalayer/aiprocessor/CopyJSCommand.java
 package com.codeboss.javalayer.aiprocessor;
 
 import com.codeboss.javalayer.bridge.*;
+import java.nio.file.*;
+import java.io.IOException;
 
 /**
  * Copy bridge JavaScript to clipboard
@@ -2758,10 +2792,42 @@ public class CopyJSCommand implements ICommand {
 
     @Override
     public CommandDispatcher.CommandResult execute(String[] args) {
-        // TODO: Load bridge-button.js from resources
-        // TODO: Copy to clipboard
-        logger.log("CopyJS command executed");
-        return new CommandDispatcher.CommandResult(true, "Bridge script copied to clipboard");
+        try {
+            // Get codeboss home directory
+            String codeBasePath = System.getProperty("codeboss.home");
+            if (codeBasePath == null) {
+                codeBasePath = ".";
+                logger.log("CopyJS: codeboss.home not set, using current directory");
+            }
+
+            // Load bridge-button.js
+            Path bridgePath = Paths.get(codeBasePath, "src", "browser", "bridge-button.js");
+            logger.log("CopyJS: Loading bridge script from: " + bridgePath.toAbsolutePath());
+
+            if (!Files.exists(bridgePath)) {
+                String errorMsg = "Bridge script not found at: " + bridgePath.toAbsolutePath();
+                logger.log("CopyJS ERROR: " + errorMsg);
+                return new CommandDispatcher.CommandResult(false, errorMsg);
+            }
+
+            String bridgeScript = Files.readString(bridgePath);
+            logger.log("CopyJS: Loaded " + bridgeScript.length() + " bytes, sending to browser for clipboard copy");
+
+            // Return script with special marker so browser can detect and copy to clipboard
+            String message = "CLIPBOARD_COPY:" + bridgeScript;
+
+            logger.log("CopyJS: SUCCESS - returning script to browser");
+            return new CommandDispatcher.CommandResult(true, message);
+
+        } catch (IOException e) {
+            logger.log("CopyJS ERROR: IOException - " + e.getMessage());
+            e.printStackTrace();
+            return new CommandDispatcher.CommandResult(false, "Failed to load bridge script: " + e.getMessage());
+        } catch (Exception e) {
+            logger.log("CopyJS ERROR: Unexpected exception - " + e.getMessage());
+            e.printStackTrace();
+            return new CommandDispatcher.CommandResult(false, "Unexpected error: " + e.getMessage());
+        }
     }
 
     @Override
@@ -5642,6 +5708,8 @@ import com.codeboss.javalayer.shared.*;
 import com.codeboss.javalayer.aiprocessor.ConversationManager;
 import com.codeboss.javalayer.aiprocessor.ChecklistManager;
 import com.codeboss.javalayer.aiprocessor.ModeManager;
+import com.codeboss.javalayer.aiprocessor.CommandDispatcher;
+import com.codeboss.javalayer.aiprocessor.UndoStack;
 import com.codeboss.javalayer.toolexecutor.ToolExecutor;
 import com.sun.net.httpserver.*;
 import java.io.*;
@@ -5662,6 +5730,7 @@ public class Router {
     private final ChecklistManager checklistManager;
     private final ModeManager modeManager;
     private final ToolExecutor toolExecutor;
+    private final CommandDispatcher commandDispatcher;
 
     // Track if an SSE stream is currently active
     private volatile boolean sseStreamActive = false;
@@ -5673,6 +5742,9 @@ public class Router {
         ChecklistManager checklistManager,
         ModeManager modeManager,
         ToolExecutor toolExecutor,
+        IClipboardManager clipboard,
+        IConfigManager config,
+        UndoStack undoStack,
         ILogger logger
     ) {
         this.conversationQueue = conversationQueue;
@@ -5681,6 +5753,9 @@ public class Router {
         this.modeManager = modeManager;
         this.toolExecutor = toolExecutor;
         this.logger = logger;
+
+        // Create CommandDispatcher
+        this.commandDispatcher = new CommandDispatcher(clipboard, config, logger, undoStack);
 
         // Use absolute path to frontend directory
         String codeBasePath = System.getProperty("codeboss.home");
@@ -5754,18 +5829,68 @@ public class Router {
 
             logger.log("Received message: " + userMessage);
 
-            // 3. Set SSE headers FIRST before processing approvals
+            // 3. Check if message is a command (before SSE setup and approval checks)
+            CommandDispatcher.CommandResult commandResult = tryExecuteCommand(userMessage);
+            if (commandResult != null) {
+                // Command was executed - add user message first, then result messages
+                conversationManager.addUserMessage(userMessage);
+                logger.log("Command executed, success=" + commandResult.success + ", message length: " + commandResult.message.length());
+
+                // Check if command returned clipboard data
+                if (commandResult.message.startsWith("CLIPBOARD_COPY:")) {
+                    String clipboardData = commandResult.message.substring(15); // Remove prefix
+                    logger.log("Command returned clipboard data (" + clipboardData.length() + " bytes)");
+
+                    // Add command_result message with clipboard data
+                    conversationManager.addCommandResultMessage(clipboardData);
+
+                    // Add user-friendly assistant message
+                    conversationManager.addAssistantMessage("Bridge script copied to clipboard");
+                } else {
+                    // Regular command result - just add as assistant message
+                    conversationManager.addAssistantMessage(commandResult.message);
+                }
+
+                // Set status to complete (commands execute instantly, no AI processing needed)
+                conversationManager.getState().setStatus("complete");
+
+                // Get and publish state
+                String stateJson = conversationManager.getConversationStateJson();
+                conversationQueue.publishState(stateJson);
+                logger.log("Command response state published, sending SSE response");
+
+                // Set up SSE and send single update
+                exchange.getResponseHeaders().set("Content-Type", "text/event-stream; charset=utf-8");
+                exchange.getResponseHeaders().set("Cache-Control", "no-cache");
+                exchange.getResponseHeaders().set("Connection", "keep-alive");
+                exchange.getResponseHeaders().set("X-Accel-Buffering", "no");
+                exchange.sendResponseHeaders(200, 0);
+
+                java.io.OutputStream outputStream = exchange.getResponseBody();
+                final java.io.PrintWriter writer = new java.io.PrintWriter(outputStream, true);
+
+                // Send current state and close
+                writer.println("event: conversation_state");
+                writer.println("data: " + stateJson);
+                writer.println();
+                writer.flush();
+                writer.close();
+                logger.log("Command SSE response sent and stream closed");
+                return;
+            }
+
+            // 4. Set SSE headers FIRST before processing approvals
             exchange.getResponseHeaders().set("Content-Type", "text/event-stream; charset=utf-8");
             exchange.getResponseHeaders().set("Cache-Control", "no-cache");
             exchange.getResponseHeaders().set("Connection", "keep-alive");
             exchange.getResponseHeaders().set("X-Accel-Buffering", "no");
             exchange.sendResponseHeaders(200, 0); // 0 = unknown length for streaming
 
-            // 4. Get output stream and writer ready
+            // 5. Get output stream and writer ready
             java.io.OutputStream outputStream = exchange.getResponseBody();
             final java.io.PrintWriter writer = new java.io.PrintWriter(outputStream, true);
 
-            // 5. Check for pending approvals and intercept yes/no responses
+            // 6. Check for pending approvals and intercept yes/no responses
             if (conversationManager.isAwaitingTestCommandApproval()) {
                 String normalized = userMessage.trim().toLowerCase();
 
@@ -5803,11 +5928,13 @@ public class Router {
                     conversationQueue.submitMessage(userMessage);
                 }
             } else {
-                // Normal message flow - submit to queue
+                // Normal message flow - clear old states and submit to AI
+                // Note: AIProcessorThread will add the user message when it processes it
+                conversationQueue.clearStateUpdates();
                 conversationQueue.submitMessage(userMessage);
             }
 
-            // 6. Stream conversation state updates
+            // 7. Stream conversation state updates
             // Only allow ONE SSE stream at a time (single-user app)
             synchronized (sseStreamLock) {
                 if (sseStreamActive) {
@@ -6081,6 +6208,33 @@ public class Router {
         try (OutputStream os = exchange.getResponseBody()) {
             os.write(bytes);
         }
+    }
+
+    /**
+     * Try to execute user message as a command
+     * Returns CommandResult if message is a command, null otherwise
+     */
+    private CommandDispatcher.CommandResult tryExecuteCommand(String userMessage) {
+        String trimmed = userMessage.trim();
+
+        // Check if message is a simple command (no args)
+        Set<String> availableCommands = commandDispatcher.getAvailableCommands();
+        if (availableCommands.contains(trimmed)) {
+            logger.log("Detected command (no args): " + trimmed);
+            return commandDispatcher.dispatch(trimmed, new String[0]);
+        }
+
+        // Check if message is a command with args (space-separated)
+        String[] parts = trimmed.split("\\s+", 2);
+        if (parts.length > 0 && availableCommands.contains(parts[0])) {
+            logger.log("Detected command with args: " + parts[0] + " (args: " + (parts.length > 1 ? parts[1] : "none") + ")");
+            String[] args = parts.length > 1 ? parts[1].split("\\s+") : new String[0];
+            return commandDispatcher.dispatch(parts[0], args);
+        }
+
+        // Not a command
+        logger.log("Message is not a command, routing to AI");
+        return null;
     }
 }
 
@@ -6416,6 +6570,15 @@ public class ConversationQueue {
      */
     public void clearInterrupted() {
         interrupted = false;
+    }
+
+    /**
+     * Clear all pending state updates from the queue
+     * Used when starting a new request to ensure SSE stream gets fresh state
+     */
+    public void clearStateUpdates() {
+        stateUpdates.clear();
+        System.out.println("[QUEUE] Cleared all pending state updates");
     }
 
     /**
@@ -9803,13 +9966,15 @@ FILE: src/frontend-ui/main.js
             const message = messageInput.value.trim();
             if (!message) return;
 
+            console.log('[UI] Submitting message:', message);
+
             messageInput.value = '';
             messageInput.style.height = 'auto';
             messageInput.disabled = true;
             isProcessing = true;
 
             sendMessage(message, updateUI).catch(error => {
-                console.error('Error sending message:', error);
+                console.error('[UI] Error sending message:', error);
                 isProcessing = false;
                 messageInput.disabled = false;
                 messageInput.focus();
@@ -9915,6 +10080,8 @@ FILE: src/frontend-ui/render.js
                 return renderError(msg);
             case 'mode_transition':
                 return renderModeTransition(msg);
+            case 'command_result':
+                return renderCommandResult(msg);
             default:
                 return null;
         }
@@ -10659,6 +10826,21 @@ FILE: src/frontend-ui/render.js
         return modeMap[mode] || mode;
     }
 
+    function renderCommandResult(msg) {
+        // This message type is never displayed - it only exists to trigger clipboard copy
+        // The clipboard data is in msg.result.clipboard_data
+        // Copy to clipboard when this message is encountered
+        if (msg.result && msg.result.clipboard_data) {
+            navigator.clipboard.writeText(msg.result.clipboard_data).then(() => {
+                console.log('[UI] Command result: Copied ' + msg.result.clipboard_data.length + ' characters to clipboard');
+            }).catch(err => {
+                console.error('[UI] Command result: Failed to copy to clipboard:', err);
+            });
+        }
+        // Return null so this message is not displayed in the UI
+        return null;
+    }
+
     window.module["render.js"] = {
         render
     };
@@ -10846,6 +11028,7 @@ FILE: src/frontend-ui/api.js
 
     async function sendMessage(message, onStateUpdate) {
         try {
+            console.log('[API] Sending message to /api/message:', message);
             const response = await fetch('/api/message', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -10853,8 +11036,11 @@ FILE: src/frontend-ui/api.js
             });
 
             if (!response.ok) {
+                console.error('[API] Server returned error:', response.status, response.statusText);
                 throw new Error('Failed to send message');
             }
+
+            console.log('[API] Server response OK, starting SSE stream');
 
             const reader = response.body.getReader();
             const decoder = new TextDecoder();
