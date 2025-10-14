@@ -10880,18 +10880,31 @@ FILE: src/frontend-ui/render.js
                 oldLines[oldIndex] === lcs[lcsIndex] &&
                 newLines[newIndex] === lcs[lcsIndex]) {
                 // Line unchanged
-                result.push({ type: 'unchanged', content: oldLines[oldIndex] });
+                result.push({
+                    type: 'unchanged',
+                    content: oldLines[oldIndex],
+                    oldLineNum: oldIndex + 1,
+                    newLineNum: newIndex + 1
+                });
                 oldIndex++;
                 newIndex++;
                 lcsIndex++;
             } else if (oldIndex < oldLines.length &&
                        (lcsIndex >= lcs.length || oldLines[oldIndex] !== lcs[lcsIndex])) {
                 // Line removed
-                result.push({ type: 'removed', content: oldLines[oldIndex] });
+                result.push({
+                    type: 'removed',
+                    content: oldLines[oldIndex],
+                    oldLineNum: oldIndex + 1
+                });
                 oldIndex++;
             } else if (newIndex < newLines.length) {
                 // Line added
-                result.push({ type: 'added', content: newLines[newIndex] });
+                result.push({
+                    type: 'added',
+                    content: newLines[newIndex],
+                    newLineNum: newIndex + 1
+                });
                 newIndex++;
             }
         }
@@ -10969,13 +10982,13 @@ FILE: src/frontend-ui/render.js
             // Show preview (10 lines) or full content based on state
             const linesToShow = showFullContent ? visibleLines : visibleLines.slice(0, maxLines);
 
-            let lineNumber = 1;
             const lineElements = linesToShow.map((line) => {
-                const lineNum = lineNumber.toString().padStart(3, ' ');
+                // Use actual line numbers from the file
+                const lineNum = line.type === 'added' ?
+                    line.newLineNum.toString().padStart(3, ' ') :
+                    line.oldLineNum.toString().padStart(3, ' ');
                 const className = line.type === 'added' ? 'diff-line diff-add' : 'diff-line diff-remove';
                 const prefix = line.type === 'added' ? ' + ' : ' - ';
-
-                lineNumber++;
 
                 return h('div', { className }, [
                     h('span', { className: 'diff-line-number' }, text(lineNum)),
@@ -11010,14 +11023,13 @@ FILE: src/frontend-ui/render.js
             // Show preview (10 lines) or full content based on state
             const linesToShow = showFullContent ? visibleLines : visibleLines.slice(0, maxLines);
 
-            // Track actual line numbers from the original content
-            let lineNumber = 1;
             const lineElements = linesToShow.map((line) => {
-                const lineNum = lineNumber.toString().padStart(3, ' ');
+                // Use actual line numbers from the file
+                const lineNum = line.type === 'added' ?
+                    line.newLineNum.toString().padStart(3, ' ') :
+                    line.oldLineNum.toString().padStart(3, ' ');
                 const className = line.type === 'added' ? 'diff-line diff-add' : 'diff-line diff-remove';
                 const prefix = line.type === 'added' ? ' + ' : ' - ';
-
-                lineNumber++;
 
                 return h('div', { className }, [
                     h('span', { className: 'diff-line-number' }, text(lineNum)),
@@ -11819,5 +11831,427 @@ FILE: src/frontend-ui/vdom.js
     };
 })();
 
+|~|~|~|~|~|~|~|~|~|~|~|
+
+FILE: src/browser/bridge-button.js
+|~|~|~|~|~|~|~|~|~|~|~|
+// Claude Bridge Script - Button Interface with Clipboard Protocol
+
+/* DEV_MOCK_PLACEHOLDER */
+
+(function() {
+    'use strict';
+    
+    // Init
+    
+    // State management
+    let currentState = 'listening'; // 'listening' or 'response'
+    let isProcessing = false;
+    let currentResponse = '';
+    
+    // Protocol constants
+    const TO_BRIDGE_MARKER = '|||||CLIP:TO_BRIDGE|||||';
+    const TO_JAVA_MARKER = '|||||CLIP:TO_JAVA|||||';
+    
+    // Remove any existing bridge UI
+    const existingBridge = document.getElementById('claude-bridge-ui');
+    if (existingBridge) {
+        existingBridge.remove();
+    }
+    
+    // Create main UI container
+    const bridgeUI = document.createElement('div');
+    bridgeUI.id = 'claude-bridge-ui';
+    bridgeUI.style.cssText = `
+        position: fixed;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        z-index: 999999;
+        background: rgba(0, 0, 0, 0.9);
+        border: 3px solid #4CAF50;
+        border-radius: 20px;
+        padding: 40px;
+        text-align: center;
+        font-family: Arial, sans-serif;
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+        backdrop-filter: blur(10px);
+        user-select: none;
+    `;
+    
+    // Create main button
+    const mainButton = document.createElement('button');
+    mainButton.id = 'bridge-main-button';
+    mainButton.style.cssText = `
+        width: 300px;
+        height: 150px;
+        background: linear-gradient(45deg, #4CAF50, #45a049);
+        color: white;
+        border: none;
+        border-radius: 15px;
+        font-size: 24px;
+        font-weight: bold;
+        cursor: pointer;
+        transition: all 0.3s ease;
+        box-shadow: 0 5px 15px rgba(76, 175, 80, 0.3);
+        margin-bottom: 20px;
+    `;
+    
+    // Create status text
+    const statusText = document.createElement('div');
+    statusText.id = 'bridge-status';
+    statusText.style.cssText = `
+        color: #4CAF50;
+        font-size: 18px;
+        font-weight: bold;
+        margin-bottom: 15px;
+    `;
+    
+    // Create info text
+    const infoText = document.createElement('div');
+    infoText.id = 'bridge-info';
+    infoText.style.cssText = `
+        color: #ccc;
+        font-size: 14px;
+        max-width: 400px;
+        line-height: 1.4;
+    `;
+    
+    // Create close button
+    const closeButton = document.createElement('button');
+    closeButton.textContent = 'X';
+    closeButton.style.cssText = `
+        position: absolute;
+        top: 10px;
+        right: 15px;
+        background: none;
+        border: none;
+        color: #ccc;
+        font-size: 24px;
+        cursor: pointer;
+        width: 30px;
+        height: 30px;
+        border-radius: 50%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        transition: all 0.3s ease;
+    `;
+    
+    closeButton.addEventListener('click', () => {
+        bridgeUI.remove();
+    });
+    
+    closeButton.addEventListener('mouseenter', () => {
+        closeButton.style.background = 'rgba(255, 255, 255, 0.1)';
+    });
+    
+    closeButton.addEventListener('mouseleave', () => {
+        closeButton.style.background = 'none';
+    });
+    
+    // Add hover effects to main button
+    mainButton.addEventListener('mouseenter', () => {
+        if (!isProcessing) {
+            mainButton.style.transform = 'scale(1.05)';
+            mainButton.style.boxShadow = '0 8px 25px rgba(76, 175, 80, 0.4)';
+        }
+    });
+    
+    mainButton.addEventListener('mouseleave', () => {
+        if (!isProcessing) {
+            mainButton.style.transform = 'scale(1)';
+            mainButton.style.boxShadow = '0 5px 15px rgba(76, 175, 80, 0.3)';
+        }
+    });
+    
+    // Main button click handler
+    mainButton.addEventListener('click', async () => {
+        if (isProcessing) return;
+
+        if (currentState === 'listening') {
+            await handleListeningClick();
+        } else if (currentState === 'response') {
+            await handleResponseClick();
+        }
+    });
+    
+    // Handle click in listening mode
+    async function handleListeningClick() {
+        try {
+            const clipboardText = await navigator.clipboard.readText();
+
+            if (!clipboardText.endsWith(TO_BRIDGE_MARKER)) {
+                updateUI('listening', 'No valid request found in clipboard');
+                return;
+            }
+
+            const jsonText = clipboardText.slice(0, -TO_BRIDGE_MARKER.length);
+            let request;
+            try {
+                request = JSON.parse(jsonText);
+                if (!request.messages || !Array.isArray(request.messages)) {
+                    throw new Error('Invalid request format');
+                }
+            } catch (e) {
+                updateUI('listening', 'Invalid JSON in clipboard');
+                return;
+            }
+
+            isProcessing = true;
+            updateUI('processing', 'Processing request...');
+
+            const token = getAuthToken();
+            if (!token) {
+                updateUI('listening', 'No auth token found');
+                isProcessing = false;
+                return;
+            }
+
+            const response = await submitToInternalAPIWithContinuation(request.messages, token);
+
+            if (response === 'TOKEN_LIMIT_EXCEEDED') {
+                currentResponse = response;
+                currentState = 'response';
+                isProcessing = false;
+                updateUI('response', 'Token limit detected - click to copy');
+            } else {
+                currentResponse = response;
+                currentState = 'response';
+                isProcessing = false;
+                updateUI('response', 'Response ready - click to copy');
+            }
+
+        } catch (error) {
+            updateUI('listening', `Error: ${error.message}`);
+            isProcessing = false;
+        }
+    }
+    
+    // Handle click in response mode
+    async function handleResponseClick() {
+        try {
+            const responseWithMarker = currentResponse + TO_JAVA_MARKER;
+            await navigator.clipboard.writeText(responseWithMarker);
+            currentState = 'listening';
+            currentResponse = '';
+            updateUI('listening', 'Response copied - ready for next request');
+        } catch (error) {
+            updateUI('response', `Copy failed: ${error.message}`);
+        }
+    }
+    
+    // Get auth token from localStorage
+    function getAuthToken() {
+        return localStorage.getItem('token');
+    }
+    
+    // Submit to internal API with automatic continuation handling
+    async function submitToInternalAPIWithContinuation(messages, token) {
+        let fullResponse = '';
+        let conversationMessages = [...messages];
+        let attemptCount = 0;
+        const maxAttempts = 10;
+
+        while (attemptCount < maxAttempts) {
+            attemptCount++;
+            const response = await submitToInternalAPI(conversationMessages, token);
+
+            if (response.trim() === '') {
+                return 'TOKEN_LIMIT_EXCEEDED';
+            }
+
+            fullResponse += response;
+            const hasEnd = fullResponse.endsWith('|||||END|||||');
+
+            if (hasEnd) {
+                return fullResponse.slice(0, -13);
+            }
+
+            // Prepare continuation request
+            const lastChars = fullResponse.slice(-30);
+            const continuationContent = `Your previous response was cut off. The last 30 characters were: "${lastChars}". Start writing immediately after these exact characters. We will append your response to the previous output. End with |||||END||||| when complete.`;
+
+            conversationMessages.push({
+                role: 'assistant',
+                content: response
+            });
+            conversationMessages.push({
+                role: 'user',
+                content: continuationContent
+            });
+        }
+
+        return fullResponse;
+    }
+    
+    // Submit to internal API (original implementation)
+    async function submitToInternalAPI(messages, token) {
+        const timestamp = Date.now();
+        const userMessageId = 'msg-' + timestamp + '-user';
+        const assistantMessageId = 'msg-' + timestamp + '-assistant';
+        const sessionId = 'session-' + Math.random().toString(36).substr(2, 9);
+        const apiBase = window.location.origin;
+
+        // Fire /new in background
+        fetch(`${apiBase}/api/v1/chats/new`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${token}`
+            },
+            body: JSON.stringify({
+                chat: {
+                    id: '',
+                    title: 'Chat Pending',
+                    models: ['Anthropic Claude 4 Sonnet'],
+                    params: {},
+                    history: {
+                        messages: {
+                            [userMessageId]: {
+                                id: userMessageId,
+                                parentId: null,
+                                childrenIds: [],
+                                role: 'user',
+                                content: messages.length > 0 ? messages[messages.length - 1].content : '',
+                                timestamp: Math.floor(timestamp / 1000),
+                                models: ['Anthropic Claude 4 Sonnet']
+                            }
+                        },
+                        currentId: userMessageId
+                    },
+                    messages: [
+                        {
+                            id: userMessageId,
+                            role: 'user',
+                            content: messages.length > 0 ? messages[messages.length - 1].content : '',
+                            timestamp: Math.floor(timestamp / 1000),
+                            models: ['Anthropic Claude 4 Sonnet']
+                        }
+                    ],
+                    files: []
+                }
+            })
+        }).catch(err => {});
+
+        const completionsResponse = await fetch(`${apiBase}/api/chat/completions`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${token}`
+            },
+            body: JSON.stringify({
+                stream: true,
+                model: 'Anthropic Claude 4 Sonnet',
+                messages: messages,
+                params: {},
+                features: {
+                    web_search: false
+                },
+                session_id: sessionId,
+                id: assistantMessageId,
+                background_tasks: {
+                    title_generation: true,
+                    tags_generation: true
+                }
+            })
+        });
+
+        if (!completionsResponse.ok) {
+            throw new Error(`Completions failed: ${completionsResponse.status}`);
+        }
+
+        const reader = completionsResponse.body.getReader();
+        const decoder = new TextDecoder();
+        let finalContent = '';
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            const chunk = decoder.decode(value);
+            const lines = chunk.split('\n');
+
+            for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                    const data = line.slice(6);
+                    if (data === '[DONE]') {
+                        return finalContent;
+                    }
+
+                    try {
+                        const parsed = JSON.parse(data);
+                        if (parsed.choices && parsed.choices[0] && parsed.choices[0].delta && parsed.choices[0].delta.content) {
+                            finalContent += parsed.choices[0].delta.content;
+                        }
+                    } catch (e) {
+                        // Ignore parsing errors
+                    }
+                }
+            }
+        }
+
+        return finalContent;
+    }
+    
+    // Update UI based on state
+    function updateUI(state, statusMessage) {
+        if (state === 'listening') {
+            mainButton.textContent = 'LISTENING';
+            mainButton.style.background = 'linear-gradient(45deg, #4CAF50, #45a049)';
+            statusText.textContent = 'READY TO RECEIVE';
+            infoText.textContent = statusMessage || 'Waiting for request with |||||TO BRIDGE||||| marker';
+        } else if (state === 'processing') {
+            mainButton.textContent = 'PROCESSING...';
+            mainButton.style.background = 'linear-gradient(45deg, #FF9800, #F57C00)';
+            statusText.textContent = 'WORKING...';
+            infoText.textContent = statusMessage || 'Calling /completions (fire-and-forget /new)...';
+        } else if (state === 'response') {
+            mainButton.textContent = 'CLICK TO COPY';
+            mainButton.style.background = 'linear-gradient(45deg, #2196F3, #1976D2)';
+            statusText.textContent = 'RESPONSE READY';
+            infoText.textContent = statusMessage || 'Click to copy response with |||||TO JAVA||||| marker';
+        }
+        
+        // Update button colors
+        if (state === 'listening') {
+            statusText.style.color = '#4CAF50';
+        } else if (state === 'processing') {
+            statusText.style.color = '#FF9800';
+        } else if (state === 'response') {
+            statusText.style.color = '#2196F3';
+        }
+    }
+    
+    // Assemble UI
+    bridgeUI.appendChild(closeButton);
+    bridgeUI.appendChild(statusText);
+    bridgeUI.appendChild(mainButton);
+    bridgeUI.appendChild(infoText);
+    
+    // Add to page
+    document.body.appendChild(bridgeUI);
+    
+    // Initialize UI
+    updateUI('listening', 'Bridge ready - paste requests ending with |||||TO BRIDGE|||||');
+
+    // Keepalive mechanism - send simple request every 5 minutes to keep session alive
+    let keepaliveInterval = setInterval(async () => {
+        try {
+            const token = getAuthToken();
+            if (!token) return;
+
+            const keepaliveMessages = [{
+                role: 'user',
+                content: 'reply "k"'
+            }];
+
+            await submitToInternalAPI(keepaliveMessages, token);
+        } catch (error) {
+            // Silent fail
+        }
+    }, 5 * 60 * 1000);
+    
+})();
 |~|~|~|~|~|~|~|~|~|~|~|
 
