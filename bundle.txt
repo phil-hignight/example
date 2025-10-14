@@ -208,9 +208,9 @@ public class ClipboardManager implements com.codeboss.javalayer.bridge.IClipboar
             robot.mouseMove(x, y);
             robot.mousePress(InputEvent.BUTTON1_DOWN_MASK);
             robot.mouseRelease(InputEvent.BUTTON1_DOWN_MASK);
-            // Log removed - too verbose during polling
         } catch (Exception e) {
-            log("Error clicking at coordinates: " + e.getMessage());
+            log("Error clicking at coordinates (" + x + ", " + y + "): " + e.getMessage());
+            e.printStackTrace();
         }
     }
     
@@ -226,50 +226,72 @@ public class ClipboardManager implements com.codeboss.javalayer.bridge.IClipboar
     }
     
     public String waitForAutomaticResponse(int clickX, int clickY) {
-        // Minimal logging - only errors
         int pollCount = 0;
+        log("Starting auto-click polling at coordinates: (" + clickX + ", " + clickY + ")");
 
         while (true) {
             try {
                 pollCount++;
+
+                // Log every 5 polls to avoid spam
+                if (pollCount % 5 == 1) {
+                    log("Auto-click poll #" + pollCount + " - clicking at (" + clickX + ", " + clickY + ")");
+                }
+
                 // Move mouse to coordinates and click
                 this.clickAtCoordinates(clickX, clickY);
 
                 // Check clipboard for response with terminator
                 String clipboardContent = this.getClipboardContent();
-                if (clipboardContent != null && (clipboardContent.endsWith("|||||CLIP:TO_JAVA|||||") || clipboardContent.endsWith("|||||CLIP:TO_JAVA_END|||||"))) {
-                    // Remove terminator and return response
-                    String marker = clipboardContent.endsWith("|||||CLIP:TO_JAVA_END|||||") ? "|||||CLIP:TO_JAVA_END|||||" : "|||||CLIP:TO_JAVA|||||";
-                    String response = clipboardContent.substring(0, clipboardContent.length() - marker.length());
 
-                    // Reject empty or very short responses
-                    if (response.trim().isEmpty() || response.length() < 10) {
-                        log("Empty/short response, continuing to poll");
-                        return null;
+                if (clipboardContent != null) {
+                    // Log clipboard content for debugging (first 100 chars)
+                    if (pollCount % 5 == 1) {
+                        String preview = clipboardContent.length() > 100 ?
+                            clipboardContent.substring(0, 100) + "..." : clipboardContent;
+                        log("Clipboard content preview: " + preview);
+                        log("Clipboard ends with TO_JAVA marker: " + clipboardContent.endsWith("|||||CLIP:TO_JAVA|||||"));
+                        log("Clipboard ends with TO_JAVA_END marker: " + clipboardContent.endsWith("|||||CLIP:TO_JAVA_END|||||"));
                     }
 
-                    return response;
+                    if (clipboardContent.endsWith("|||||CLIP:TO_JAVA|||||") || clipboardContent.endsWith("|||||CLIP:TO_JAVA_END|||||")) {
+                        // Remove terminator and return response
+                        String marker = clipboardContent.endsWith("|||||CLIP:TO_JAVA_END|||||") ? "|||||CLIP:TO_JAVA_END|||||" : "|||||CLIP:TO_JAVA|||||";
+                        String response = clipboardContent.substring(0, clipboardContent.length() - marker.length());
+
+                        // Reject empty or very short responses
+                        if (response.trim().isEmpty() || response.length() < 10) {
+                            log("Empty/short response, continuing to poll");
+                            return null;
+                        }
+
+                        log("SUCCESS: Received valid response (" + response.length() + " chars)");
+                        return response;
+                    }
                 }
-                
+
                 // Sleep for 1 second, but check mouse position during this time
                 Thread.sleep(1000);
-                
+
                 // After waiting, check if mouse moved outside the allowed area
                 Point currentMousePos = MouseInfo.getPointerInfo().getLocation();
                 int deltaX = Math.abs(currentMousePos.x - clickX);
                 int deltaY = Math.abs(currentMousePos.y - clickY);
-                
+
                 if (deltaX > 300 || deltaY > 300) {
                     log("Mouse moved outside 300px square from click position - canceling auto-clicking");
+                    log("Current mouse position: (" + currentMousePos.x + ", " + currentMousePos.y + ")");
+                    log("Delta: (" + deltaX + ", " + deltaY + ")");
                     return "MOUSE_CANCELLED";
                 }
-                
+
             } catch (InterruptedException e) {
                 log("Automatic polling interrupted: " + e.getMessage());
                 Thread.currentThread().interrupt();
                 return null;
             } catch (Exception e) {
                 log("Error in automatic polling: " + e.getMessage());
+                e.printStackTrace();
                 try {
                     Thread.sleep(1000);
                 } catch (InterruptedException ie) {
@@ -8489,11 +8511,13 @@ public class ToolExecutor implements IToolExecutor {
         String oldContent;
         String newContent;
         int position;  // Position of old_content in file
+        int startLineNumber;  // Line number where this update starts (1-indexed)
 
-        FileUpdate(String oldContent, String newContent, int position) {
+        FileUpdate(String oldContent, String newContent, int position, int startLineNumber) {
             this.oldContent = oldContent;
             this.newContent = newContent;
             this.position = position;
+            this.startLineNumber = startLineNumber;
         }
     }
 
@@ -8609,7 +8633,10 @@ public class ToolExecutor implements IToolExecutor {
                 return new ToolExecutionResult(error, "Error: old_content must be unique");
             }
 
-            updates.add(new FileUpdate(oldContent, newContent, position));
+            // Calculate the line number where this update starts
+            int lineNumber = calculateLineNumber(fileContent, position);
+
+            updates.add(new FileUpdate(oldContent, newContent, position, lineNumber));
         }
 
         // Check for overlaps between updates
@@ -8662,12 +8689,23 @@ public class ToolExecutor implements IToolExecutor {
         Files.writeString(path, updatedContent);
         long fileSize = Files.size(path);
 
-        // Build structured result
+        // Build structured result with line number information for each update
         Map<String, Object> result = new HashMap<>();
         result.put("file_path", filePath);
         result.put("size", fileSize);
         result.put("updates_applied", updatesApplied);
         result.put("updated", true);
+
+        // Add detailed update information including line numbers
+        List<Map<String, Object>> updatesDetail = new ArrayList<>();
+        for (FileUpdate update : updates) {
+            Map<String, Object> updateInfo = new LinkedHashMap<>();
+            updateInfo.put("start_line", update.startLineNumber);
+            updateInfo.put("old_content", update.oldContent);
+            updateInfo.put("new_content", update.newContent);
+            updatesDetail.add(updateInfo);
+        }
+        result.put("updates_detail", updatesDetail);
 
         String summary = "Applied " + updatesApplied + " update(s) to " + filePath;
 
@@ -9655,6 +9693,19 @@ public class ToolExecutor implements IToolExecutor {
     }
 
     /**
+     * Calculate the line number (1-indexed) for a given position in file content
+     */
+    private int calculateLineNumber(String fileContent, int position) {
+        int lineNumber = 1;
+        for (int i = 0; i < position && i < fileContent.length(); i++) {
+            if (fileContent.charAt(i) == '\n') {
+                lineNumber++;
+            }
+        }
+        return lineNumber;
+    }
+
+    /**
      * Try to find a lenient match for old_content in fileContent.
      * Converts old_content to a regex pattern that's flexible about whitespace.
      * Returns null if no match found.
@@ -10628,7 +10679,7 @@ FILE: src/frontend-ui/render.js
             const toolUseMsg = findToolUseMessage(allMessages, msg.tool_use_id);
             if (toolUseMsg && toolUseMsg.parameters) {
                 const showFullContent = expandedFiles[msg.tool_use_id] === true;
-                return renderBatchFileContent(toolUseMsg.parameters, msg.tool_use_id, showFullContent);
+                return renderBatchFileContent(toolUseMsg.parameters, msg.result, msg.tool_use_id, showFullContent);
             }
         }
 
@@ -11003,9 +11054,12 @@ FILE: src/frontend-ui/render.js
     }
 
     // Render batch file updates with blank line separators between diffs
-    function renderBatchFileContent(parameters, toolUseId, showFullContent) {
+    function renderBatchFileContent(parameters, result, toolUseId, showFullContent) {
         const maxLines = 10;
         const updates = JSON.parse(parameters.updates || '[]');
+
+        // Get updates_detail from result if available (includes line numbers)
+        const updatesDetail = result && result.updates_detail ? result.updates_detail : [];
 
         if (!updates || updates.length === 0) {
             return h('div', { className: 'message tool-result' }, [text('  No updates')]);
@@ -11017,6 +11071,9 @@ FILE: src/frontend-ui/render.js
             const oldContent = update.old_content || '';
             const newContent = update.new_content || '';
 
+            // Get the start line from updates_detail if available
+            const startLine = updatesDetail[updateIndex] ? updatesDetail[updateIndex].start_line : 1;
+
             const diffLines = computeLineDiff(oldContent, newContent);
             const visibleLines = diffLines.filter(line => line.type !== 'unchanged');
 
@@ -11024,15 +11081,21 @@ FILE: src/frontend-ui/render.js
             const linesToShow = showFullContent ? visibleLines : visibleLines.slice(0, maxLines);
 
             const lineElements = linesToShow.map((line) => {
-                // Use actual line numbers from the file
-                const lineNum = line.type === 'added' ?
-                    line.newLineNum.toString().padStart(3, ' ') :
-                    line.oldLineNum.toString().padStart(3, ' ');
+                // Calculate actual file line number using the start line from Java
+                let lineNum;
+                if (line.type === 'added') {
+                    // For added lines, calculate from start line + offset in new content
+                    lineNum = startLine + line.newLineNum - 1;
+                } else {
+                    // For removed lines, use start line + offset in old content
+                    lineNum = startLine + line.oldLineNum - 1;
+                }
+
                 const className = line.type === 'added' ? 'diff-line diff-add' : 'diff-line diff-remove';
                 const prefix = line.type === 'added' ? ' + ' : ' - ';
 
                 return h('div', { className }, [
-                    h('span', { className: 'diff-line-number' }, text(lineNum)),
+                    h('span', { className: 'diff-line-number' }, text(lineNum.toString().padStart(3, ' '))),
                     h('span', { className: 'diff-line-content' }, text(prefix + line.content))
                 ]);
             });
@@ -11967,55 +12030,77 @@ FILE: src/browser/bridge-button.js
     
     // Main button click handler
     mainButton.addEventListener('click', async () => {
-        if (isProcessing) return;
+        console.log('[BRIDGE] Button clicked - state:', currentState, 'isProcessing:', isProcessing);
+
+        if (isProcessing) {
+            console.log('[BRIDGE] Ignoring click - already processing');
+            return;
+        }
 
         if (currentState === 'listening') {
+            console.log('[BRIDGE] Handling listening click');
             await handleListeningClick();
         } else if (currentState === 'response') {
+            console.log('[BRIDGE] Handling response click');
             await handleResponseClick();
         }
     });
     
     // Handle click in listening mode
     async function handleListeningClick() {
+        console.log('[BRIDGE] handleListeningClick called');
         try {
+            console.log('[BRIDGE] Reading clipboard...');
             const clipboardText = await navigator.clipboard.readText();
+            console.log('[BRIDGE] Clipboard read - length:', clipboardText ? clipboardText.length : 0);
+            console.log('[BRIDGE] Clipboard preview (first 200 chars):', clipboardText ? clipboardText.substring(0, 200) : 'null');
+            console.log('[BRIDGE] Clipboard ends with TO_BRIDGE_MARKER:', clipboardText ? clipboardText.endsWith(TO_BRIDGE_MARKER) : false);
 
             if (!clipboardText.endsWith(TO_BRIDGE_MARKER)) {
+                console.log('[BRIDGE] No valid TO_BRIDGE marker found');
                 updateUI('listening', 'No valid request found in clipboard');
                 return;
             }
 
+            console.log('[BRIDGE] Valid TO_BRIDGE marker found, parsing JSON...');
             const jsonText = clipboardText.slice(0, -TO_BRIDGE_MARKER.length);
             let request;
             try {
                 request = JSON.parse(jsonText);
+                console.log('[BRIDGE] JSON parsed successfully:', request);
                 if (!request.messages || !Array.isArray(request.messages)) {
                     throw new Error('Invalid request format');
                 }
             } catch (e) {
+                console.error('[BRIDGE] JSON parse error:', e);
                 updateUI('listening', 'Invalid JSON in clipboard');
                 return;
             }
 
             isProcessing = true;
             updateUI('processing', 'Processing request...');
+            console.log('[BRIDGE] Starting to process request...');
 
             const token = getAuthToken();
             if (!token) {
+                console.error('[BRIDGE] No auth token found in localStorage');
                 updateUI('listening', 'No auth token found');
                 isProcessing = false;
                 return;
             }
+            console.log('[BRIDGE] Auth token found, submitting to API...');
 
             const response = await submitToInternalAPIWithContinuation(request.messages, token);
+            console.log('[BRIDGE] API response received - length:', response.length);
 
             if (response === 'TOKEN_LIMIT_EXCEEDED') {
+                console.log('[BRIDGE] Token limit exceeded detected');
                 currentResponse = response;
                 currentState = 'response';
                 isProcessing = false;
                 updateUI('response', 'Token limit detected - click to copy');
             } else {
+                console.log('[BRIDGE] Normal response received, ready to copy');
                 currentResponse = response;
                 currentState = 'response';
                 isProcessing = false;
@@ -12023,6 +12108,7 @@ FILE: src/browser/bridge-button.js
             }
 
         } catch (error) {
+            console.error('[BRIDGE] Error in handleListeningClick:', error);
             updateUI('listening', `Error: ${error.message}`);
             isProcessing = false;
         }
@@ -12030,13 +12116,17 @@ FILE: src/browser/bridge-button.js
     
     // Handle click in response mode
     async function handleResponseClick() {
+        console.log('[BRIDGE] handleResponseClick called');
         try {
             const responseWithMarker = currentResponse + TO_JAVA_MARKER;
+            console.log('[BRIDGE] Writing response to clipboard - length:', responseWithMarker.length);
             await navigator.clipboard.writeText(responseWithMarker);
+            console.log('[BRIDGE] Response successfully copied to clipboard with TO_JAVA marker');
             currentState = 'listening';
             currentResponse = '';
             updateUI('listening', 'Response copied - ready for next request');
         } catch (error) {
+            console.error('[BRIDGE] Error copying response to clipboard:', error);
             updateUI('response', `Copy failed: ${error.message}`);
         }
     }
@@ -12234,6 +12324,9 @@ FILE: src/browser/bridge-button.js
     
     // Initialize UI
     updateUI('listening', 'Bridge ready - paste requests ending with |||||TO BRIDGE|||||');
+    console.log('[BRIDGE] Bridge button UI initialized and ready');
+    console.log('[BRIDGE] TO_BRIDGE_MARKER:', TO_BRIDGE_MARKER);
+    console.log('[BRIDGE] TO_JAVA_MARKER:', TO_JAVA_MARKER);
 
     // Keepalive mechanism - send simple request every 5 minutes to keep session alive
     let keepaliveInterval = setInterval(async () => {
