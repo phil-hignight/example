@@ -625,8 +625,12 @@ public class AIProcessorThread implements Runnable {
                     boolean firstTool = true;
 
                     // Filter out duplicate mark_complete calls - only keep the first one
+                    // Also detect multiple update_file calls to the same file
                     List<ResponseParser.ToolUse> toolsToExecute = new ArrayList<>();
                     boolean hasMarkComplete = false;
+                    Map<String, Integer> updateFileCount = new HashMap<>();
+                    boolean hasMultipleUpdateFileError = false;
+
                     for (ResponseParser.ToolUse tool : parsed.tools) {
                         if (tool.name.equals("mark_complete")) {
                             if (!hasMarkComplete) {
@@ -635,9 +639,41 @@ public class AIProcessorThread implements Runnable {
                             } else {
                                 logger.log("WARNING: Ignoring duplicate mark_complete call");
                             }
+                        } else if (tool.name.equals("update_file")) {
+                            // Track update_file calls by file_path
+                            String filePath = tool.parameters.get("file_path");
+                            if (filePath != null) {
+                                int count = updateFileCount.getOrDefault(filePath, 0) + 1;
+                                updateFileCount.put(filePath, count);
+
+                                if (count > 1) {
+                                    // Multiple updates to same file detected - flag error
+                                    logger.log("ERROR: Multiple update_file calls detected for: " + filePath);
+                                    hasMultipleUpdateFileError = true;
+
+                                    Map<String, Object> errorContent = new HashMap<>();
+                                    errorContent.put("error", "Multiple update_file calls to same file: " + filePath);
+                                    errorContent.put("hint", "Use update_file_batch instead for multiple updates to the same file");
+                                    errorContent.put("example", "<tool name=\"update_file_batch\"><parameter name=\"file_path\">" + filePath + "</parameter><parameter name=\"updates\"><![CDATA[[{\"old_content\":\"...\",\"new_content\":\"...\"},{\"old_content\":\"...\",\"new_content\":\"...\"}]]]></parameter></tool>");
+                                    conversationManager.addError("multiple_update_file_error", errorContent);
+                                    conversationQueue.publishState(conversationManager.getConversationStateJson());
+                                    break; // Break out of tool filtering loop
+                                }
+                            }
+                            toolsToExecute.add(tool);
                         } else {
                             toolsToExecute.add(tool);
                         }
+                    }
+
+                    // If multiple update_file error detected, send back to AI for correction
+                    if (hasMultipleUpdateFileError) {
+                        String errorRequest = buildAIRequestFromHistory();
+                        logger.log("Sending multiple update_file error back to AI");
+                        BridgeQueue.AIResponse errorResponse = submitToBridge(errorRequest);
+                        parsed = parseWithRetry(errorResponse.responseXml, false);
+                        handleParsingWarnings(parsed);
+                        continue; // Restart while loop with corrected response
                     }
 
                     // Execute each tool and collect results
@@ -745,7 +781,7 @@ public class AIProcessorThread implements Runnable {
 
                         // Add review_start notification for UI visualization
                         Map<String, Object> reviewStartNotification = new java.util.LinkedHashMap<>();
-                        reviewStartNotification.put("message", "Code review checkpoint reached");
+                        reviewStartNotification.put("message", "Reviewing...");
                         conversationManager.addToolResult("review_start", reviewStartNotification);
                         conversationQueue.publishState(conversationManager.getConversationStateJson());
 
@@ -809,22 +845,22 @@ public class AIProcessorThread implements Runnable {
                         logger.log("Final review verdict: " + verdict);
 
                         if ("FAIL".equals(verdict)) {
-                            // Review failed - return to EXECUTION mode to fix issues
-                            logger.log("Review failed - returning to EXECUTION mode to fix issues");
-                            modeManager.transitionTo(Mode.EXECUTION);
+                            // Review failed - return to PLANNING mode to create fix plan
+                            logger.log("Review failed - returning to PLANNING mode to create fix plan");
+                            modeManager.transitionTo(Mode.PLANNING);
 
-                            // Add system message explaining the failure
-                            String failMessage = "System: Review failed. Reason: " + failReason + "\n\nFix the issues mentioned above. When fixes are complete, call mark_complete again. If you cannot fix the issues, call mark_failed with a reason.";
+                            // Add system message explaining the failure and requesting a fix plan
+                            String failMessage = "System: Review failed. Reason: " + failReason + "\n\nPlease create a plan to fix the issues mentioned above. Use begin_execution with a checklist of tasks to address each issue.";
                             conversationManager.addSystemMessage(failMessage);
                             conversationQueue.publishState(conversationManager.getConversationStateJson());
 
-                            // Continue in EXECUTION mode to fix issues
+                            // Continue in PLANNING mode to create fix plan
                             String fixRequest = buildAIRequestFromHistory();
                             BridgeQueue.AIResponse fixResponse = submitToBridge(fixRequest);
                             parsed = parseWithRetry(fixResponse.responseXml, false);
                             continue;
                         } else {
-                            // Review passed - mark review completed and continue
+                            // Review passed - mark review completed
                             checklistManager.markReviewCompleted();
 
                             // Add review_end notification for UI visualization
@@ -833,24 +869,44 @@ public class AIProcessorThread implements Runnable {
                             conversationManager.addToolResult("review_end", reviewEndNotification);
                             conversationQueue.publishState(conversationManager.getConversationStateJson());
 
-                            // Determine next mode based on next checklist item type
-                            String nextItemType = checklistManager.getNextItemType();
-                            if ("testing".equals(nextItemType)) {
-                                logger.log("Review passed - switching to TESTING mode");
-                                modeManager.transitionTo(Mode.TESTING);
+                            // Check if there are more tasks to complete
+                            ChecklistManager.ChecklistItem nextItem = checklistManager.getNextPendingItem();
+                            if (nextItem == null) {
+                                // All tasks complete - return to PLANNING mode
+                                logger.log("Review passed and all tasks complete - returning to PLANNING mode");
+                                modeManager.transitionTo(Mode.PLANNING);
+
+                                conversationManager.addSystemMessage("System: All tasks completed. Please summarize what was accomplished and ask the user what they'd like to do next.");
+                                conversationQueue.publishState(conversationManager.getConversationStateJson());
+
+                                // Continue in PLANNING mode for AI to provide summary
+                                String summaryRequest = buildAIRequestFromHistory();
+                                BridgeQueue.AIResponse summaryResponse = submitToBridge(summaryRequest);
+                                parsed = parseWithRetry(summaryResponse.responseXml, false);
+                                handleParsingWarnings(parsed);
+                                continue;
                             } else {
-                                logger.log("Review passed - returning to EXECUTION mode");
-                                modeManager.transitionTo(Mode.EXECUTION);
+                                // More tasks remain - return to EXECUTION mode and move to next task
+                                logger.log("Review passed - moving to next task: " + nextItem.id);
+
+                                // Determine mode based on next item type
+                                String nextItemType = nextItem.itemType;
+                                if ("testing".equals(nextItemType)) {
+                                    modeManager.transitionTo(Mode.TESTING);
+                                } else {
+                                    modeManager.transitionTo(Mode.EXECUTION);
+                                }
+
+                                conversationManager.addSystemMessage("System: Review passed. Moving to next task.");
+                                conversationQueue.publishState(conversationManager.getConversationStateJson());
+
+                                // Continue with next task
+                                String nextRequest = buildAIRequestFromHistory();
+                                BridgeQueue.AIResponse nextResponse = submitToBridge(nextRequest);
+                                parsed = parseWithRetry(nextResponse.responseXml, false);
+                                handleParsingWarnings(parsed);
+                                continue;
                             }
-
-                            // Continue in the new mode
-                            conversationQueue.publishState(conversationManager.getConversationStateJson());
-
-                            // Continue in the new mode
-                            String nextRequest = buildAIRequestFromHistory();
-                            BridgeQueue.AIResponse nextResponse = submitToBridge(nextRequest);
-                            parsed = parseWithRetry(nextResponse.responseXml, false);
-                            continue;
                         }
                     }
 
@@ -886,7 +942,7 @@ public class AIProcessorThread implements Runnable {
                                     Object status = lastMsg.result.get("status");
                                     if ("auto_approved".equals(status)) {
                                         wasAutoApproved = true;
-                                        logger.log("Plan was auto-approved (single item) - adding task_start notification");
+                                        logger.log("Plan was auto-approved (single item) - adding task_start notification and continuing");
 
                                         // Add task_start notification
                                         Object firstTaskObj = lastMsg.result.get("first_task");
@@ -895,15 +951,12 @@ public class AIProcessorThread implements Runnable {
                                             conversationQueue.publishState(conversationManager.getConversationStateJson());
                                         }
 
-                                        // Continue the agentic loop - AI needs to start executing the task
+                                        // Continue immediately - AI will start working on the first task
                                         String executeRequest = buildAIRequestFromHistory();
-                                        logger.log("Auto-approved - sending AI to EXECUTION mode");
+                                        logger.log("Auto-approved - calling AI in EXECUTION mode to start task");
                                         BridgeQueue.AIResponse executeResponse = submitToBridge(executeRequest);
-                                        logger.log("Got AI response: " + executeResponse.responseXml);
-
                                         parsed = parseWithRetry(executeResponse.responseXml, false);
                                         handleParsingWarnings(parsed);
-                                        // Don't break - continue the agentic loop
                                         continue;
                                     }
                                 }
@@ -1301,6 +1354,13 @@ public class ChecklistManager {
         lastReviewCheckpoint = countCompletedItems();
         codingItemsCompletedSinceReview = 0;
         logger.log("Review completed, checkpoint at item " + lastReviewCheckpoint);
+    }
+
+    public void clearChecklist() {
+        currentChecklist.clear();
+        lastReviewCheckpoint = 0;
+        codingItemsCompletedSinceReview = 0;
+        logger.log("Checklist cleared");
     }
 
     private int countCompletedItems() {
@@ -2900,6 +2960,256 @@ public interface ICommand {
 
 |~|~|~|~|~|~|~|~|~|~|~|
 
+FILE: com/codeboss/javalayer/aiprocessor/LenientXMLParser.java
+|~|~|~|~|~|~|~|~|~|~|~|
+package com.codeboss.javalayer.aiprocessor;
+
+import java.util.*;
+import java.util.regex.*;
+
+/**
+ * Lenient XML parser for AI-generated XML
+ * Parses XML into a tree structure of elements with text content and attributes
+ */
+public class LenientXMLParser {
+
+    public static class Element {
+        public final String name;
+        public final Map<String, String> attributes;
+        public final String textContent;
+        public final List<Element> children;
+
+        public Element(String name, Map<String, String> attributes, String textContent, List<Element> children) {
+            this(name, attributes, textContent, children, true);
+        }
+
+        public Element(String name, Map<String, String> attributes, String textContent, List<Element> children, boolean trimText) {
+            this.name = name;
+            this.attributes = attributes != null ? attributes : new HashMap<>();
+            this.textContent = textContent != null ? (trimText ? textContent.trim() : textContent) : "";
+            this.children = children != null ? children : new ArrayList<>();
+        }
+
+        public Element(String name) {
+            this(name, new HashMap<>(), "", new ArrayList<>());
+        }
+
+        /**
+         * Get first child element with the given name
+         */
+        public Element getChild(String name) {
+            for (Element child : children) {
+                if (child.name.equals(name)) {
+                    return child;
+                }
+            }
+            return null;
+        }
+
+        /**
+         * Get all child elements with the given name
+         */
+        public List<Element> getChildren(String name) {
+            List<Element> result = new ArrayList<>();
+            for (Element child : children) {
+                if (child.name.equals(name)) {
+                    result.add(child);
+                }
+            }
+            return result;
+        }
+
+        /**
+         * Get attribute value by name
+         */
+        public String getAttribute(String name) {
+            return attributes.get(name);
+        }
+
+        /**
+         * Check if element has attribute
+         */
+        public boolean hasAttribute(String name) {
+            return attributes.containsKey(name);
+        }
+    }
+
+    /**
+     * Parse XML string into root element
+     */
+    public static Element parse(String xml) {
+        if (xml == null || xml.trim().isEmpty()) {
+            throw new IllegalArgumentException("XML cannot be null or empty");
+        }
+
+        xml = xml.trim();
+
+        // Find root element
+        Pattern rootPattern = Pattern.compile("^<([a-zA-Z_][a-zA-Z0-9_-]*)([^>]*)>(.*)</\\1>$", Pattern.DOTALL);
+        Matcher rootMatcher = rootPattern.matcher(xml);
+
+        if (!rootMatcher.find()) {
+            throw new IllegalArgumentException("Invalid XML: no root element found");
+        }
+
+        String rootName = rootMatcher.group(1);
+        String rootAttributesStr = rootMatcher.group(2);
+        String rootContent = rootMatcher.group(3);
+
+        Map<String, String> rootAttributes = parseAttributes(rootAttributesStr);
+
+        // Parse content (children or text)
+        ContentResult contentResult = parseContent(rootContent);
+
+        return new Element(rootName, rootAttributes, contentResult.textContent, contentResult.children, !contentResult.preserveWhitespace);
+    }
+
+    /**
+     * Helper class to hold parsing result
+     */
+    private static class ContentResult {
+        final String textContent;
+        final List<Element> children;
+        final boolean preserveWhitespace;
+
+        ContentResult(String textContent, List<Element> children) {
+            this(textContent, children, false);
+        }
+
+        ContentResult(String textContent, List<Element> children, boolean preserveWhitespace) {
+            this.textContent = textContent;
+            this.children = children;
+            this.preserveWhitespace = preserveWhitespace;
+        }
+    }
+
+    /**
+     * Parse content - determine if it's text or child elements
+     * Handles CDATA sections: <![CDATA[...]]>
+     */
+    private static ContentResult parseContent(String content) {
+        List<Element> children = new ArrayList<>();
+        String textContent = "";
+
+        // Check for CDATA section first
+        if (content.trim().startsWith("<![CDATA[")) {
+            // Extract CDATA content (everything between <![CDATA[ and ]]>)
+            Pattern cdataPattern = Pattern.compile("^\\s*<!\\[CDATA\\[(.*?)\\]\\]>\\s*$", Pattern.DOTALL);
+            Matcher cdataMatcher = cdataPattern.matcher(content);
+            if (cdataMatcher.find()) {
+                // Get raw CDATA content
+                textContent = cdataMatcher.group(1);
+                // Normalize AI formatting issues (line continuations, malformed JSON, etc)
+                textContent = normalizeAIFormatting(textContent);
+                return new ContentResult(textContent, children, true); // preserveWhitespace = true
+            }
+        }
+
+        // Try to parse children - if it fails, treat as text
+        if (content.trim().startsWith("<")) {
+            // Starts with a tag, likely has child elements
+            try {
+                children = parseChildren(content);
+                // If parseChildren succeeded but returned empty list, treat as text content
+                if (children.isEmpty()) {
+                    textContent = content;
+                }
+            } catch (Exception e) {
+                // Failed to parse as children, treat as text (preserve original content, don't trim)
+                textContent = content;
+            }
+        } else {
+            // Doesn't start with tag, treat as text content (preserve original, don't trim)
+            textContent = content;
+        }
+
+        return new ContentResult(textContent, children);
+    }
+
+    /**
+     * Parse attributes from attribute string
+     * Example: ' name="value" id="123"' -> {name: value, id: 123}
+     */
+    private static Map<String, String> parseAttributes(String attributeStr) {
+        Map<String, String> attributes = new HashMap<>();
+
+        if (attributeStr == null || attributeStr.trim().isEmpty()) {
+            return attributes;
+        }
+
+        // Match name="value" or name='value'
+        Pattern attrPattern = Pattern.compile("([a-zA-Z_][a-zA-Z0-9_-]*)=[\"']([^\"']*)[\"']");
+        Matcher attrMatcher = attrPattern.matcher(attributeStr);
+
+        while (attrMatcher.find()) {
+            String name = attrMatcher.group(1);
+            String value = attrMatcher.group(2);
+            attributes.put(name, value);
+        }
+
+        return attributes;
+    }
+
+    /**
+     * Parse child elements from content
+     */
+    private static List<Element> parseChildren(String content) {
+        List<Element> children = new ArrayList<>();
+
+        // Match child elements: <tag ...>...</tag>
+        Pattern childPattern = Pattern.compile("<([a-zA-Z_][a-zA-Z0-9_-]*)([^>]*)>(.*?)</\\1>", Pattern.DOTALL);
+        Matcher childMatcher = childPattern.matcher(content);
+
+        while (childMatcher.find()) {
+            String childName = childMatcher.group(1);
+            String childAttributesStr = childMatcher.group(2);
+            String childContent = childMatcher.group(3);
+
+            Map<String, String> childAttributes = parseAttributes(childAttributesStr);
+
+            // Parse content (children or text) using shared logic
+            ContentResult contentResult = parseContent(childContent);
+
+            children.add(new Element(childName, childAttributes, contentResult.textContent, contentResult.children, !contentResult.preserveWhitespace));
+        }
+
+        return children;
+    }
+
+    /**
+     * Normalize AI formatting issues in CDATA content
+     *
+     * Common AI formatting mistakes:
+     * 1. Line continuations: backslash followed by newline (e.g., "text\<newline>more")
+     *    - This is not valid JSON, but AI models sometimes generate it
+     * 2. Mixed line endings
+     * 3. Other formatting inconsistencies
+     *
+     * This method fixes these issues to make AI-generated content parseable.
+     */
+    private static String normalizeAIFormatting(String content) {
+        if (content == null || content.isEmpty()) {
+            return content;
+        }
+
+        // Fix line continuations: backslash followed by newline
+        // AI sometimes sends: "text\<newline>more" instead of: "text\nmore" or "textmore"
+        // We remove the backslash-newline entirely (treating it as line continuation)
+
+        // Handle all line ending variations:
+        // \<CR><LF> (Windows)
+        content = content.replace("\\\r\n", "");
+        // \<LF> (Unix)
+        content = content.replace("\\\n", "");
+        // \<CR> (old Mac)
+        content = content.replace("\\\r", "");
+
+        return content;
+    }
+}
+
+|~|~|~|~|~|~|~|~|~|~|~|
+
 FILE: com/codeboss/javalayer/aiprocessor/MessageFormatter.java
 |~|~|~|~|~|~|~|~|~|~|~|
 package com.codeboss.javalayer.aiprocessor;
@@ -2989,8 +3299,8 @@ public enum Mode {
                 );
             case EXECUTION:
                 return EnumSet.of(
+                    ToolCategory.FILE_READ,
                     ToolCategory.FILE_OPERATIONS,
-                    ToolCategory.SEARCH,
                     ToolCategory.CHECKLIST,
                     ToolCategory.GIT_READ,
                     ToolCategory.GIT_WRITE
@@ -3417,6 +3727,18 @@ public class PromptGenerator {
                 instructions.append("   - Create a plan using begin_execution tool\n");
                 instructions.append("   - Even simple tasks like \"delete one file\" need a 1-item checklist\n");
                 instructions.append("   - CRITICAL: You CANNOT modify/create/delete files in planning mode - you must create a plan first!\n\n");
+                instructions.append("EXECUTION MODE CAPABILITIES (what you'll be able to do):\n");
+                instructions.append("When your plan is approved, you'll enter EXECUTION mode with these tools:\n");
+                instructions.append("  - create_file: Create individual files with content\n");
+                instructions.append("  - update_file: Make a single edit to a file (replace old_content with new_content)\n");
+                instructions.append("  - update_file_batch: Make MULTIPLE edits to the SAME file in one operation\n");
+                instructions.append("  - delete_file: Delete files\n");
+                instructions.append("  - read_file, search_files: Read and search code\n");
+                instructions.append("  - Batch operations: You can call MULTIPLE tools in ONE turn (e.g., create 5 files at once)\n\n");
+                instructions.append("Plan your tasks knowing these capabilities. For example:\n");
+                instructions.append("  - \"Create model classes\" → You'll create Todo.java, TodoList.java, etc. in one step\n");
+                instructions.append("  - \"Update API endpoints\" → You can batch-edit multiple methods in server.js at once\n");
+                instructions.append("  - \"Clear project files\" → You'll delete multiple files in one step\n\n");
                 instructions.append("CREATING A PLAN:\n");
                 instructions.append("  1. Read relevant files to understand the codebase (optional)\n");
                 instructions.append("  2. Create a checklist with COARSE-GRAINED tasks\n");
@@ -3455,11 +3777,11 @@ public class PromptGenerator {
                 instructions.append("- Read files before modifying them\n");
                 instructions.append("- Follow existing code patterns and conventions\n\n");
                 instructions.append("ERROR HANDLING (CRITICAL):\n");
-                instructions.append("- If a tool returns an error, you MUST either fix the issue or call mark_failed\n");
-                instructions.append("- Do NOT call mark_complete if ANY tool call failed during the task\n");
+                instructions.append("- If a tool returns an error, try to fix it or find an alternative approach\n");
                 instructions.append("- If the same error occurs twice, call mark_failed immediately\n");
-                instructions.append("- Never ignore errors and pretend the task succeeded\n");
-                instructions.append("- Explain the blocking error in the mark_failed reason parameter\n\n");
+                instructions.append("- Only call mark_complete if the final outcome meets the task objective\n");
+                instructions.append("- If errors prevent you from achieving the goal, call mark_failed with explanation\n");
+                instructions.append("- Never ignore errors and pretend the task succeeded when it didn't\n\n");
                 break;
 
             case REVIEW:
@@ -3541,60 +3863,97 @@ public class PromptGenerator {
         return "READ FILE:\n" +
                "  <tool name=\"read_file\">\n" +
                "    <parameter name=\"file_path\">path/to/file.java</parameter>\n" +
-               "    <parameter name=\"offset\">0</parameter>  <!-- optional: line to start from -->\n" +
-               "    <parameter name=\"limit\">100</parameter>  <!-- optional: number of lines -->\n" +
+               "    <parameter name=\"offset\">0</parameter>\n" +
+               "    <parameter name=\"limit\">100</parameter>\n" +
                "  </tool>\n" +
+               "  Note: offset and limit are optional\n" +
                "  Returns: File contents with line numbers\n\n" +
 
                "LIST FILES:\n" +
                "  <tool name=\"list_files\">\n" +
-               "    <parameter name=\"directory_path\">src/main</parameter>  <!-- optional: defaults to CWD -->\n" +
+               "    <parameter name=\"directory_path\">src/main</parameter>\n" +
                "  </tool>\n" +
+               "  Note: directory_path is optional (defaults to current directory)\n" +
                "  Returns: List of files and directories\n\n";
     }
 
     private String getFileWriteTools() {
-        return "CREATE FILE:\n" +
+        return "FILE OPERATIONS:\n\n" +
+
+               "CREATE FILE - Use this template:\n" +
                "  <tool name=\"create_file\">\n" +
-               "    <parameter name=\"file_path\">path/to/new/file.java</parameter>\n" +
-               "    <parameter name=\"content\"><![CDATA[actual content\n" +
-               "with real newlines\n" +
-               "not \\n escapes]]></parameter>\n" +
+               "    <parameter name=\"file_path\">PUT_FILE_PATH_HERE</parameter>\n" +
+               "    <parameter name=\"content\"><![CDATA[PUT_FILE_CONTENT_HERE]]></parameter>\n" +
                "  </tool>\n" +
-               "  CRITICAL: Wrap file content in CDATA tags: <![CDATA[...]]>\n" +
-               "  This allows HTML, XML, or any special characters in content without escaping.\n" +
-               "  The 'content' parameter is REQUIRED - NEVER create empty files.\n\n" +
+               "  Instructions:\n" +
+               "  - Replace PUT_FILE_PATH_HERE with the path (e.g., src/Main.java)\n" +
+               "  - Replace PUT_FILE_CONTENT_HERE with your code/text\n" +
+               "  - The <![CDATA[ and ]]> are already there - just replace the placeholder text\n" +
+               "  - Use literal newlines (press Enter) inside CDATA, NOT \\n escapes\n" +
+               "  - NEVER create empty files - always provide content\n\n" +
 
-               "UPDATE FILE:\n" +
+               "UPDATE FILE - Use this template (for ONE update):\n" +
                "  <tool name=\"update_file\">\n" +
-               "    <parameter name=\"file_path\">path/to/file.java</parameter>\n" +
-               "    <parameter name=\"old_content\"><![CDATA[exact text\n" +
-               "with real newlines]]></parameter>\n" +
-               "    <parameter name=\"new_content\"><![CDATA[replacement text\n" +
-               "also with real newlines]]></parameter>\n" +
+               "    <parameter name=\"file_path\">PUT_FILE_PATH_HERE</parameter>\n" +
+               "    <parameter name=\"old_content\"><![CDATA[PUT_OLD_CONTENT_HERE]]></parameter>\n" +
+               "    <parameter name=\"new_content\"><![CDATA[PUT_NEW_CONTENT_HERE]]></parameter>\n" +
                "  </tool>\n" +
-               "  Note: old_content must match exactly (including whitespace). Wrap content in CDATA tags.\n\n" +
+               "  Instructions:\n" +
+               "  - Replace PUT_FILE_PATH_HERE with the path\n" +
+               "  - Replace PUT_OLD_CONTENT_HERE with exact text to find (must match exactly!)\n" +
+               "  - Replace PUT_NEW_CONTENT_HERE with the replacement text\n" +
+               "  - Use literal newlines (press Enter) inside CDATA, NOT \\n escapes\n" +
+               "  - For multiple updates to SAME file, use update_file_batch instead!\n\n" +
 
-               "DELETE FILE:\n" +
+               "UPDATE FILE BATCH - Use this template (for MULTIPLE updates to same file):\n" +
+               "  <tool name=\"update_file_batch\">\n" +
+               "    <parameter name=\"file_path\">PUT_FILE_PATH_HERE</parameter>\n" +
+               "    <parameter name=\"updates\">[{\"old_content\":\"PUT_OLD_1\",\"new_content\":\"PUT_NEW_1\"},{\"old_content\":\"PUT_OLD_2\",\"new_content\":\"PUT_NEW_2\"}]</parameter>\n" +
+               "  </tool>\n" +
+               "  Instructions:\n" +
+               "  - Replace PUT_FILE_PATH_HERE with the path\n" +
+               "  - Replace PUT_OLD_1, PUT_NEW_1, PUT_OLD_2, PUT_NEW_2, etc. with your content\n" +
+               "  - This parameter is JSON format - NO CDATA here!\n" +
+               "  - CRITICAL: Use \\n for newlines in JSON strings (NOT backslash line continuation!)\n" +
+               "  - Add more {\"old_content\":\"...\",\"new_content\":\"...\"} objects as needed\n\n" +
+
+               "  ⚠️ NEWLINE HANDLING (CRITICAL):\n" +
+               "  WRONG - Using backslash for line continuation (INVALID JSON!):\n" +
+               "    {\"old_content\":\"function hello() {\\\n    console.log('Hi');\\\n}\"}\n" +
+               "    [X] This creates INVALID JSON - backslash continuation doesn't work in JSON!\n\n" +
+
+               "  CORRECT - Using \\n escape sequence:\n" +
+               "    {\"old_content\":\"function hello() {\\n    console.log('Hi');\\n}\"}\n" +
+               "    [✓] The \\n represents a newline character in the JSON string\n\n" +
+
+               "  When to use each:\n" +
+               "  - ONE update to a file → use update_file\n" +
+               "  - MULTIPLE updates to SAME file → use update_file_batch\n" +
+               "  - Updates to DIFFERENT files → use multiple update_file calls (one per file)\n\n" +
+
+               "DELETE FILE - Use this template:\n" +
                "  <tool name=\"delete_file\">\n" +
-               "    <parameter name=\"file_path\">path/to/file.java</parameter>\n" +
+               "    <parameter name=\"file_path\">PUT_FILE_PATH_HERE</parameter>\n" +
                "  </tool>\n\n";
     }
 
     private String getSearchTools() {
         return "SEARCH FILES BY NAME:\n" +
                "  <tool name=\"search_files_by_name\">\n" +
-               "    <parameter name=\"pattern\">*.java</parameter>  <!-- glob pattern like *.java, **/*Test.java -->\n" +
-               "    <parameter name=\"directory_path\">src</parameter>  <!-- optional: defaults to CWD -->\n" +
+               "    <parameter name=\"pattern\">*.java</parameter>\n" +
+               "    <parameter name=\"directory_path\">src</parameter>\n" +
                "  </tool>\n" +
+               "  Note: Use glob patterns like *.java, **/*Test.java\n" +
+               "  Note: directory_path is optional (defaults to current directory)\n" +
                "  Returns: List of files matching the name pattern\n\n" +
 
                "SEARCH FILES BY CONTENT:\n" +
                "  <tool name=\"search_files_by_content\">\n" +
-               "    <parameter name=\"pattern\">regex pattern</parameter>  <!-- regex to search file contents -->\n" +
-               "    <parameter name=\"directory_path\">src</parameter>  <!-- optional: defaults to CWD -->\n" +
-               "    <parameter name=\"file_pattern\">*.java</parameter>  <!-- optional: filter files by name -->\n" +
+               "    <parameter name=\"pattern\">regex pattern</parameter>\n" +
+               "    <parameter name=\"directory_path\">src</parameter>\n" +
+               "    <parameter name=\"file_pattern\">*.java</parameter>\n" +
                "  </tool>\n" +
+               "  Note: directory_path and file_pattern are optional\n" +
                "  Returns: List of files containing the pattern with line numbers\n\n";
     }
 
@@ -3648,16 +4007,35 @@ public class PromptGenerator {
             tools.append("    </tool>\n\n");
         } else {
             // Execution and Testing modes: mark_complete or mark_failed
-            tools.append("MARK COMPLETE (call when task is done):\n");
+            tools.append("MARK COMPLETE (call when task is FULLY done):\n");
             tools.append("  <tool name=\"mark_complete\">\n");
             tools.append("  </tool>\n");
-            tools.append("  Call this when you have successfully completed the current task.\n\n");
+            tools.append("  CRITICAL: Only call this if the final outcome fully meets the task requirements.\n");
+            tools.append("  DO NOT call mark_complete if:\n");
+            tools.append("  - The final result doesn't achieve the task objective\n");
+            tools.append("  - You encountered errors you couldn't work around\n");
+            tools.append("  - The task is only partially complete\n");
+            tools.append("  - You're unsure if it worked correctly\n\n");
+            tools.append("  WRONG - Calling mark_complete after an error:\n");
+            tools.append("    <execute>\n");
+            tools.append("      <tool name=\"update_file\">...</tool>  <!-- This fails with 'old_content not found' -->\n");
+            tools.append("      <tool name=\"mark_complete\"></tool>  [X] WRONG - Task didn't complete!\n");
+            tools.append("    </execute>\n\n");
+            tools.append("  CORRECT - Call mark_failed when errors prevent completion:\n");
+            tools.append("    <execute>\n");
+            tools.append("      <tool name=\"mark_failed\">\n");
+            tools.append("        <parameter name=\"reason\">update_file failed: old_content not found in file</parameter>\n");
+            tools.append("      </tool>\n");
+            tools.append("    </execute>\n\n");
+            tools.append("  If tool calls failed but you found another way to complete the task successfully, mark_complete is OK.\n");
+            tools.append("  When in doubt, call mark_failed and explain what prevented completion.\n\n");
 
             tools.append("MARK FAILED (call if you cannot complete task):\n");
             tools.append("  <tool name=\"mark_failed\">\n");
             tools.append("    <parameter name=\"reason\">Explanation of why the task failed</parameter>\n");
             tools.append("  </tool>\n");
-            tools.append("  Call this if you cannot complete the task. Provide a clear reason.\n\n");
+            tools.append("  Call this if you cannot achieve the task objective. Provide a clear reason.\n");
+            tools.append("  Examples: \"old_content not found in file after 2 attempts\", \"file does not exist\", \"syntax error in generated code\"\n\n");
         }
 
         return tools.toString();
@@ -3713,14 +4091,12 @@ public class PromptGenerator {
                "RUN TEST:\n" +
                "  <tool name=\"run_test\">\n" +
                "    <parameter name=\"name\">test-app</parameter>\n" +
-               "    <parameter name=\"background\">false</parameter>  <!-- optional -->\n" +
-               "    <parameter name=\"regex\">Circle area.*: ([\\d.]+)</parameter>  <!-- optional -->\n" +
-               "    <parameter name=\"timeout_ms\">30000</parameter>  <!-- optional -->\n" +
+               "    <parameter name=\"background\">false</parameter>\n" +
+               "    <parameter name=\"regex\">Circle area.*: ([\\d.]+)</parameter>\n" +
+               "    <parameter name=\"timeout_ms\">30000</parameter>\n" +
                "  </tool>\n" +
-               "  Runs a previously created test command. Use list_commands to see available commands.\n" +
-               "  - background: true to run in background and return immediately\n" +
-               "  - regex: extract matches from output\n" +
-               "  - timeout_ms: max time to wait (default 30000)\n\n" +
+               "  Note: background, regex, and timeout_ms are optional\n" +
+               "  Runs a previously created test command. Use list_commands to see available commands.\n\n" +
 
                "LIST PROCESSES:\n" +
                "  <tool name=\"list_processes\">\n" +
@@ -3729,8 +4105,9 @@ public class PromptGenerator {
 
                "STOP TEST:\n" +
                "  <tool name=\"stop_test\">\n" +
-               "    <parameter name=\"pid\">12345</parameter>  <!-- or use name -->\n" +
+               "    <parameter name=\"pid\">12345</parameter>\n" +
                "  </tool>\n" +
+               "  Note: You can use either pid or name parameter\n" +
                "  Stops a running test process by PID or name\n\n";
     }
 
@@ -3791,37 +4168,41 @@ public class PromptGenerator {
 
     private String getResponseFormatRules() {
         return "RESPONSE FORMAT:\n\n" +
-               "CRITICAL: Your response must contain EXACTLY ONE top-level tag - either <execute> OR <message>.\n\n" +
+               "Your response must contain EXACTLY ONE top-level tag:\n" +
+               "- <execute> for tool calls\n" +
+               "- <message> for text responses\n\n" +
 
-               "Option 1 - Execute tools (BATCH multiple tools in ONE <execute> block):\n\n" +
+               "Option 1 - Execute tools:\n" +
                "<execute>\n" +
                "  <tool name=\"tool_name\">\n" +
                "    <parameter name=\"param_name\">value</parameter>\n" +
                "  </tool>\n" +
-               "  <tool name=\"another_tool\">\n" +
-               "    <parameter name=\"param_name\">value</parameter>\n" +
-               "  </tool>\n" +
                "</execute>\n\n" +
 
-               "Option 2 - Send a message (no tools):\n\n" +
+               "Option 2 - Send a message:\n" +
                "<message>Your message here</message>\n\n" +
 
-               "WRONG - Multiple top-level tags:\n" +
+               "[X] WRONG - Sending both:\n" +
                "<execute>...</execute>\n" +
-               "<execute>...</execute>  [X] DO NOT DO THIS\n" +
                "<message>...</message>\n\n" +
 
-               "WRONG - Both execute and message:\n" +
-               "<execute>...</execute>\n" +
-               "<message>...</message>  [X] INVALID - NEVER send both tags\n\n" +
-
-               "WRONG - Message followed by execute:\n" +
-               "<message>Let me check...</message>\n" +
-               "<execute>...</execute>  [X] INVALID - Choose ONE tag only\n\n" +
-
-               "WRONG - Text outside tags:\n" +
+               "[X] WRONG - Text outside tags:\n" +
                "Let me help you...\n" +
-               "<execute>...</execute>  [X] INVALID - All content must be inside tags\n\n";
+               "<execute>...</execute>\n\n" +
+
+               "⚠️ USING TEMPLATES:\n\n" +
+               "Copy templates EXACTLY. Replace only the PLACEHOLDER text (like PUT_FILE_PATH_HERE).\n\n" +
+
+               "When you see <![CDATA[PUT_CONTENT_HERE]]>:\n" +
+               "- Copy the <![CDATA[ and ]]> as-is\n" +
+               "- Replace only PUT_CONTENT_HERE with your code\n" +
+               "- NEVER type \"<![CDATA[\" as part of your code!\n\n" +
+
+               "Example:\n" +
+               "Template:  <parameter name=\"content\"><![CDATA[PUT_CONTENT_HERE]]></parameter>\n" +
+               "You write: <parameter name=\"content\"><![CDATA[function foo() {\n" +
+               "    return 42;\n" +
+               "}]]></parameter>\n\n";
     }
 
     private String getImportantRules(Mode mode) {
@@ -3830,86 +4211,43 @@ public class PromptGenerator {
 
         StringBuilder rules = new StringBuilder();
         rules.append("IMPORTANT RULES:\n\n");
-        rules.append("TOOL BATCHING (CRITICAL - READ CAREFULLY):\n");
-        rules.append("ALWAYS batch multiple tool calls in ONE <execute> block. This is MUCH more efficient.\n\n");
+
+        rules.append("1. TOOL BATCHING:\n");
+        rules.append("   - Batch multiple tool calls in ONE <execute> block (much more efficient)\n");
+        rules.append("   - Don't send one tool, wait for response, then send another\n");
+        if (hasFileOps) {
+            rules.append("   - For multiple updates to SAME file: use update_file_batch (NOT multiple update_file calls)\n");
+        }
+        rules.append("\n");
+
+        rules.append("2. FORMAT RULES:\n");
+        rules.append("   - NEVER send both <message> and <execute> - pick ONE only\n");
+        rules.append("   - NEVER put text outside the tags - everything inside <message> or <execute>\n");
+        rules.append("\n");
 
         if (hasFileOps) {
-            // Only show file operation examples in EXECUTION mode
-            rules.append("GOOD Examples (batching many tools):\n");
-            rules.append("  Example 1 - Creating multiple files:\n");
-            rules.append("    <execute>\n");
-            rules.append("      <tool name=\"create_file\"><parameter name=\"file_path\">Todo.js</parameter>...</tool>\n");
-            rules.append("      <tool name=\"create_file\"><parameter name=\"file_path\">TodoList.js</parameter>...</tool>\n");
-            rules.append("      <tool name=\"create_file\"><parameter name=\"file_path\">TodoItem.js</parameter>...</tool>\n");
-            rules.append("      <tool name=\"create_file\"><parameter name=\"file_path\">Footer.js</parameter>...</tool>\n");
-            rules.append("    </execute>\n\n");
+            rules.append("3. FILE OPERATIONS:\n");
+            rules.append("   - Always use forward slashes (/) in file paths\n");
+            rules.append("   - All file paths are relative to the current working directory\n");
+            rules.append("   - Read files before modifying them to understand context\n");
+            rules.append("   - old_content must match exactly (including whitespace and newlines)\n");
+            rules.append("   - NEVER create empty files - always include content\n");
+            rules.append("\n");
 
-            rules.append("  Example 2 - Updating multiple methods in same file:\n");
-            rules.append("    <execute>\n");
-            rules.append("      <tool name=\"update_file\"><parameter name=\"file_path\">app.js</parameter>...addTodo...</tool>\n");
-            rules.append("      <tool name=\"update_file\"><parameter name=\"file_path\">app.js</parameter>...deleteTodo...</tool>\n");
-            rules.append("      <tool name=\"update_file\"><parameter name=\"file_path\">app.js</parameter>...toggleTodo...</tool>\n");
-            rules.append("      <tool name=\"update_file\"><parameter name=\"file_path\">app.js</parameter>...clearCompleted...</tool>\n");
-            rules.append("    </execute>\n\n");
-
-            rules.append("  Example 3 - Deleting multiple files:\n");
-            rules.append("    <execute>\n");
-            rules.append("      <tool name=\"delete_file\">...</tool>\n");
-            rules.append("      <tool name=\"delete_file\">...</tool>\n");
-            rules.append("      <tool name=\"delete_file\">...</tool>\n");
-            rules.append("      <tool name=\"mark_complete\"></tool>\n");
-            rules.append("    </execute>\n\n");
-
-            rules.append("BAD Examples (inefficient - one tool at a time):\n");
-            rules.append("  [X] <execute><tool name=\"update_file\">...addTodo...</tool></execute>\n");
-            rules.append("     [wait for response]\n");
-            rules.append("  [X] <execute><tool name=\"update_file\">...deleteTodo...</tool></execute>\n");
-            rules.append("     [wait for response]\n");
-            rules.append("  This is VERY SLOW - batch them all together instead!\n\n");
-
-            rules.append("KEY RULE: If you need to do 5-10 similar operations (create/update/delete multiple files),\n");
-            rules.append("put ALL of them in ONE <execute> block. Don't send one tool, wait for response, send another.\n\n");
+            rules.append("4. ERROR RECOVERY:\n");
+            rules.append("   - If a tool fails, try to fix it or find alternative approach\n");
+            rules.append("   - If same error occurs twice, call mark_failed immediately\n");
+            rules.append("   - Only call mark_complete if final outcome meets task objective\n");
         } else {
-            // Show read-only examples for PLANNING/REVIEW modes
-            rules.append("GOOD Examples (batching many tools):\n");
-            rules.append("  Example 1 - Reading multiple files:\n");
-            rules.append("    <execute>\n");
-            rules.append("      <tool name=\"read_file\"><parameter name=\"file_path\">src/Main.java</parameter></tool>\n");
-            rules.append("      <tool name=\"read_file\"><parameter name=\"file_path\">src/Model.java</parameter></tool>\n");
-            rules.append("      <tool name=\"read_file\"><parameter name=\"file_path\">src/View.java</parameter></tool>\n");
-            rules.append("    </execute>\n\n");
+            rules.append("3. FILE PATHS:\n");
+            rules.append("   - Always use forward slashes (/) in file paths\n");
+            rules.append("   - All file paths are relative to the current working directory\n");
+            rules.append("\n");
 
-            rules.append("  Example 2 - Searching and listing:\n");
-            rules.append("    <execute>\n");
-            rules.append("      <tool name=\"list_files\"><parameter name=\"directory_path\">src</parameter></tool>\n");
-            rules.append("      <tool name=\"search_files_by_name\"><parameter name=\"pattern\">*.java</parameter></tool>\n");
-            rules.append("    </execute>\n\n");
-
-            rules.append("KEY RULE: Batch multiple read/search operations in ONE <execute> block.\n");
-            rules.append("Don't send one tool, wait for response, send another - batch them all together!\n\n");
+            rules.append("4. ERROR RECOVERY:\n");
+            rules.append("   - If a tool fails twice with same error, try different approach\n");
         }
-
-        rules.append("OTHER RULES:\n");
-        rules.append("- Always use forward slashes (/) in file paths, even on Windows\n");
-        rules.append("- All file paths must be relative to the current working directory\n");
-        if (hasFileOps) {
-            rules.append("- Read files before modifying them to understand the context\n");
-            rules.append("- When updating files, ensure old_content matches exactly\n");
-        }
-        rules.append("- Keep responses concise and focused on the task\n");
-        rules.append("- End your final response with: |||||AI:END|||||\n\n");
-
-        rules.append("CRITICAL REMINDERS (common mistakes to avoid):\n");
-        rules.append("1. NEVER send both <message> and <execute> - pick ONE only\n");
-        rules.append("2. NEVER put text outside the tags - everything inside <message> or <execute>\n");
-        if (hasFileOps) {
-            rules.append("3. NEVER create empty files - always include content in create_file tool\n");
-            rules.append("4. NEVER send one tool at a time when you could batch multiple together\n");
-            rules.append("5. ERROR RECOVERY: If a tool fails 2x with same error, try a different approach\n\n");
-        } else {
-            rules.append("3. NEVER send one tool at a time when you could batch multiple together\n");
-            rules.append("4. ERROR RECOVERY: If a tool fails 2x with same error, try a different approach\n\n");
-        }
+        rules.append("\n");
 
         return rules.toString();
     }
@@ -3980,7 +4318,7 @@ import java.util.*;
 
 /**
  * Parser for AI response format
- * Uses XMLParser to parse the XML structure, then interprets it
+ * Uses LenientXMLParser to parse the XML structure, then interprets it
  */
 public class ResponseParser {
 
@@ -4038,9 +4376,6 @@ public class ResponseParser {
         response = response.replace("|||||AI:END|||||", "");
         response = response.replace("|||||CLIP:TO_JAVA_END|||||", "");
         response = response.trim();
-
-        // Unescape quotes in XML
-        response = response.replace("\\\"", "\"");
 
         // Check what tags are present
         boolean hasExecute = response.contains("<execute>");
@@ -4103,9 +4438,41 @@ public class ResponseParser {
             }
         }
 
+        // Fix common malformed XML: closing tag without opening tag
+        // Check for </message> or </execute> without corresponding opening tag
+        if (!hasExecute && hasMessage) {
+            // Check if there's a </message> but no <message>
+            int openMessagePos = response.indexOf("<message>");
+            int closeMessagePos = response.indexOf("</message>");
+            if (closeMessagePos >= 0 && openMessagePos < 0) {
+                // Found closing tag but no opening tag - prepend <message>
+                warnings.add("Fixed malformed XML: Found </message> without opening <message> tag. Added missing opening tag.");
+                response = "<message>" + response;
+            } else if (openMessagePos >= 0 && closeMessagePos < 0) {
+                // Found opening tag but no closing tag - append </message>
+                warnings.add("Fixed malformed XML: Found <message> without closing </message> tag. Added missing closing tag.");
+                response = response + "</message>";
+            }
+        }
+
+        if (hasExecute && !hasMessage) {
+            // Check if there's a </execute> but no <execute>
+            int openExecutePos = response.indexOf("<execute>");
+            int closeExecutePos = response.indexOf("</execute>");
+            if (closeExecutePos >= 0 && openExecutePos < 0) {
+                // Found closing tag but no opening tag - prepend <execute>
+                warnings.add("Fixed malformed XML: Found </execute> without opening <execute> tag. Added missing opening tag.");
+                response = "<execute>" + response;
+            } else if (openExecutePos >= 0 && closeExecutePos < 0) {
+                // Found opening tag but no closing tag - append </execute>
+                warnings.add("Fixed malformed XML: Found <execute> without closing </execute> tag. Added missing closing tag.");
+                response = response + "</execute>";
+            }
+        }
+
         // Try to parse as XML
         try {
-            XMLParser.Element root = XMLParser.parse(response);
+            LenientXMLParser.Element root = LenientXMLParser.parse(response);
 
             if (root.name.equals("execute")) {
                 return parseExecuteBlock(root, warnings);
@@ -4157,26 +4524,43 @@ public class ResponseParser {
         return response.replaceAll("<message>.*?</message>", "");
     }
 
-    private static ParsedResponse parseExecuteBlock(XMLParser.Element executeElement, List<String> warnings) {
+    private static ParsedResponse parseExecuteBlock(LenientXMLParser.Element executeElement, List<String> warnings) {
         List<ToolUse> tools = new ArrayList<>();
 
-        List<XMLParser.Element> toolElements = executeElement.getChildren("tool");
+        List<LenientXMLParser.Element> toolElements = executeElement.getChildren("tool");
 
-        for (XMLParser.Element toolElement : toolElements) {
+        for (LenientXMLParser.Element toolElement : toolElements) {
             String toolName = toolElement.getAttribute("name");
-            if (toolName == null) {
-                throw new IllegalArgumentException("Tool element missing 'name' attribute");
+            if (toolName == null || toolName.trim().isEmpty()) {
+                // Skip malformed tool elements without name attribute
+                warnings.add("Skipped malformed <tool> element without 'name' attribute. Tool element: " + toolElement.toString());
+                continue;
             }
 
             Map<String, String> parameters = new HashMap<>();
 
-            List<XMLParser.Element> paramElements = toolElement.getChildren("parameter");
-            for (XMLParser.Element paramElement : paramElements) {
+            List<LenientXMLParser.Element> paramElements = toolElement.getChildren("parameter");
+            for (LenientXMLParser.Element paramElement : paramElements) {
                 String paramName = paramElement.getAttribute("name");
                 if (paramName == null) {
                     throw new IllegalArgumentException("Parameter element missing 'name' attribute");
                 }
+
+                // FIX: Also clean up parameter names (AI sometimes sends malformed attribute values)
+                if (paramName != null) {
+                    paramName = paramName.replace("\\\n", "\\n").replace("\\\r\n", "\\n").replace("\\", "");
+                }
+
                 String paramValue = paramElement.textContent;
+
+                // FIX: Convert backslash line continuation to proper \n escapes
+                // AI sometimes sends: "line1\<newline>line2" which is invalid JSON
+                // We need: "line1\nline2" (the two-character escape sequence)
+                // This fixes it BEFORE logging to conversation.jsonl and sending to UI
+                if (paramValue != null) {
+                    paramValue = paramValue.replace("\\\n", "\\n").replace("\\\r\n", "\\n");
+                }
+
                 parameters.put(paramName, paramValue);
             }
 
@@ -4561,223 +4945,6 @@ public class UndoStack {
             this.description = description;
             this.operationType = operationType;
         }
-    }
-}
-
-|~|~|~|~|~|~|~|~|~|~|~|
-
-FILE: com/codeboss/javalayer/aiprocessor/XMLParser.java
-|~|~|~|~|~|~|~|~|~|~|~|
-package com.codeboss.javalayer.aiprocessor;
-
-import java.util.*;
-import java.util.regex.*;
-
-/**
- * Simple generic XML parser
- * Parses XML into a tree structure of elements with text content and attributes
- */
-public class XMLParser {
-
-    public static class Element {
-        public final String name;
-        public final Map<String, String> attributes;
-        public final String textContent;
-        public final List<Element> children;
-
-        public Element(String name, Map<String, String> attributes, String textContent, List<Element> children) {
-            this(name, attributes, textContent, children, true);
-        }
-
-        public Element(String name, Map<String, String> attributes, String textContent, List<Element> children, boolean trimText) {
-            this.name = name;
-            this.attributes = attributes != null ? attributes : new HashMap<>();
-            this.textContent = textContent != null ? (trimText ? textContent.trim() : textContent) : "";
-            this.children = children != null ? children : new ArrayList<>();
-        }
-
-        public Element(String name) {
-            this(name, new HashMap<>(), "", new ArrayList<>());
-        }
-
-        /**
-         * Get first child element with the given name
-         */
-        public Element getChild(String name) {
-            for (Element child : children) {
-                if (child.name.equals(name)) {
-                    return child;
-                }
-            }
-            return null;
-        }
-
-        /**
-         * Get all child elements with the given name
-         */
-        public List<Element> getChildren(String name) {
-            List<Element> result = new ArrayList<>();
-            for (Element child : children) {
-                if (child.name.equals(name)) {
-                    result.add(child);
-                }
-            }
-            return result;
-        }
-
-        /**
-         * Get attribute value by name
-         */
-        public String getAttribute(String name) {
-            return attributes.get(name);
-        }
-
-        /**
-         * Check if element has attribute
-         */
-        public boolean hasAttribute(String name) {
-            return attributes.containsKey(name);
-        }
-    }
-
-    /**
-     * Parse XML string into root element
-     */
-    public static Element parse(String xml) {
-        if (xml == null || xml.trim().isEmpty()) {
-            throw new IllegalArgumentException("XML cannot be null or empty");
-        }
-
-        xml = xml.trim();
-
-        // Find root element
-        Pattern rootPattern = Pattern.compile("^<([a-zA-Z_][a-zA-Z0-9_-]*)([^>]*)>(.*)</\\1>$", Pattern.DOTALL);
-        Matcher rootMatcher = rootPattern.matcher(xml);
-
-        if (!rootMatcher.find()) {
-            throw new IllegalArgumentException("Invalid XML: no root element found");
-        }
-
-        String rootName = rootMatcher.group(1);
-        String rootAttributesStr = rootMatcher.group(2);
-        String rootContent = rootMatcher.group(3);
-
-        Map<String, String> rootAttributes = parseAttributes(rootAttributesStr);
-
-        // Parse content (children or text)
-        ContentResult contentResult = parseContent(rootContent);
-
-        return new Element(rootName, rootAttributes, contentResult.textContent, contentResult.children, !contentResult.preserveWhitespace);
-    }
-
-    /**
-     * Helper class to hold parsing result
-     */
-    private static class ContentResult {
-        final String textContent;
-        final List<Element> children;
-        final boolean preserveWhitespace;
-
-        ContentResult(String textContent, List<Element> children) {
-            this(textContent, children, false);
-        }
-
-        ContentResult(String textContent, List<Element> children, boolean preserveWhitespace) {
-            this.textContent = textContent;
-            this.children = children;
-            this.preserveWhitespace = preserveWhitespace;
-        }
-    }
-
-    /**
-     * Parse content - determine if it's text or child elements
-     * Handles CDATA sections: <![CDATA[...]]>
-     */
-    private static ContentResult parseContent(String content) {
-        List<Element> children = new ArrayList<>();
-        String textContent = "";
-
-        // Check for CDATA section first
-        if (content.trim().startsWith("<![CDATA[")) {
-            // Extract CDATA content (everything between <![CDATA[ and ]]>)
-            Pattern cdataPattern = Pattern.compile("^\\s*<!\\[CDATA\\[(.*?)\\]\\]>\\s*$", Pattern.DOTALL);
-            Matcher cdataMatcher = cdataPattern.matcher(content);
-            if (cdataMatcher.find()) {
-                // Return CDATA content as-is, without trimming
-                textContent = cdataMatcher.group(1);
-                return new ContentResult(textContent, children, true); // preserveWhitespace = true
-            }
-        }
-
-        // Try to parse children - if it fails, treat as text
-        if (content.trim().startsWith("<")) {
-            // Starts with a tag, likely has child elements
-            try {
-                children = parseChildren(content);
-                // If parseChildren succeeded but returned empty list, treat as text content
-                if (children.isEmpty()) {
-                    textContent = content;
-                }
-            } catch (Exception e) {
-                // Failed to parse as children, treat as text (preserve original content, don't trim)
-                textContent = content;
-            }
-        } else {
-            // Doesn't start with tag, treat as text content (preserve original, don't trim)
-            textContent = content;
-        }
-
-        return new ContentResult(textContent, children);
-    }
-
-    /**
-     * Parse attributes from attribute string
-     * Example: ' name="value" id="123"' -> {name: value, id: 123}
-     */
-    private static Map<String, String> parseAttributes(String attributeStr) {
-        Map<String, String> attributes = new HashMap<>();
-
-        if (attributeStr == null || attributeStr.trim().isEmpty()) {
-            return attributes;
-        }
-
-        // Match name="value" or name='value'
-        Pattern attrPattern = Pattern.compile("([a-zA-Z_][a-zA-Z0-9_-]*)=[\"']([^\"']*)[\"']");
-        Matcher attrMatcher = attrPattern.matcher(attributeStr);
-
-        while (attrMatcher.find()) {
-            String name = attrMatcher.group(1);
-            String value = attrMatcher.group(2);
-            attributes.put(name, value);
-        }
-
-        return attributes;
-    }
-
-    /**
-     * Parse child elements from content
-     */
-    private static List<Element> parseChildren(String content) {
-        List<Element> children = new ArrayList<>();
-
-        // Match child elements: <tag ...>...</tag>
-        Pattern childPattern = Pattern.compile("<([a-zA-Z_][a-zA-Z0-9_-]*)([^>]*)>(.*?)</\\1>", Pattern.DOTALL);
-        Matcher childMatcher = childPattern.matcher(content);
-
-        while (childMatcher.find()) {
-            String childName = childMatcher.group(1);
-            String childAttributesStr = childMatcher.group(2);
-            String childContent = childMatcher.group(3);
-
-            Map<String, String> childAttributes = parseAttributes(childAttributesStr);
-
-            // Parse content (children or text) using shared logic
-            ContentResult contentResult = parseContent(childContent);
-
-            children.add(new Element(childName, childAttributes, contentResult.textContent, contentResult.children, !contentResult.preserveWhitespace));
-        }
-
-        return children;
     }
 }
 
@@ -5718,7 +5885,7 @@ public class Router {
     }
 
     private String parseMessageFromJson(String json) {
-        return SimpleJsonParser.extractString(json, "message");
+        return LenientJsonParser.extractString(json, "message");
     }
 
     private int extractMessageCountFromJson(String json) {
@@ -5750,6 +5917,9 @@ public class Router {
         // Get pending checklist
         String checklistJson = conversationManager.getPendingChecklistJson();
         String description = conversationManager.getPendingPlanDescription();
+
+        // Clear any existing checklist before adding new items
+        checklistManager.clearChecklist();
 
         // Execute the plan: parse checklist and add to ChecklistManager
         toolExecutor.parseAndAddChecklist(checklistJson);
@@ -5911,6 +6081,135 @@ public class Router {
         try (OutputStream os = exchange.getResponseBody()) {
             os.write(bytes);
         }
+    }
+}
+
+|~|~|~|~|~|~|~|~|~|~|~|
+
+FILE: com/codeboss/javalayer/shared/BaseTokenizer.java
+|~|~|~|~|~|~|~|~|~|~|~|
+package com.codeboss.javalayer.shared;
+
+/**
+ * Abstract base class for tokenizers with common functionality
+ * Handles character navigation and lookahead
+ */
+public abstract class BaseTokenizer implements Tokenizer {
+    protected final String source;
+    protected int current = 0;
+    protected Token peeked = null;
+
+    public BaseTokenizer(String source) {
+        this.source = source != null ? source : "";
+    }
+
+    @Override
+    public Token nextToken() {
+        if (peeked != null) {
+            Token token = peeked;
+            peeked = null;
+            return token;
+        }
+        return scanToken();
+    }
+
+    @Override
+    public Token peekToken() {
+        if (peeked == null) {
+            peeked = scanToken();
+        }
+        return peeked;
+    }
+
+    @Override
+    public boolean isAtEnd() {
+        return current >= source.length();
+    }
+
+    @Override
+    public int getPosition() {
+        return current;
+    }
+
+    /**
+     * Subclasses implement this to scan the next token
+     */
+    protected abstract Token scanToken();
+
+    /**
+     * Advance and return current character
+     */
+    protected char advance() {
+        return source.charAt(current++);
+    }
+
+    /**
+     * Return current character without advancing
+     */
+    protected char peek() {
+        if (isAtEnd()) return '\0';
+        return source.charAt(current);
+    }
+
+    /**
+     * Return character at offset without advancing
+     */
+    protected char peek(int offset) {
+        int pos = current + offset;
+        if (pos >= source.length()) return '\0';
+        return source.charAt(pos);
+    }
+
+    /**
+     * Check if current character matches expected, advance if so
+     */
+    protected boolean match(char expected) {
+        if (isAtEnd()) return false;
+        if (source.charAt(current) != expected) return false;
+        current++;
+        return true;
+    }
+
+    /**
+     * Check if current character matches any of the expected characters
+     */
+    protected boolean matchAny(String expected) {
+        if (isAtEnd()) return false;
+        if (expected.indexOf(source.charAt(current)) == -1) return false;
+        current++;
+        return true;
+    }
+
+    /**
+     * Skip whitespace characters
+     */
+    protected void skipWhitespace() {
+        while (!isAtEnd() && Character.isWhitespace(peek())) {
+            advance();
+        }
+    }
+
+    /**
+     * Check if character is a digit
+     */
+    protected boolean isDigit(char c) {
+        return c >= '0' && c <= '9';
+    }
+
+    /**
+     * Check if character can start an identifier/name
+     */
+    protected boolean isAlpha(char c) {
+        return (c >= 'a' && c <= 'z') ||
+               (c >= 'A' && c <= 'Z') ||
+               c == '_';
+    }
+
+    /**
+     * Check if character can be in an identifier/name
+     */
+    protected boolean isAlphaNumeric(char c) {
+        return isAlpha(c) || isDigit(c) || c == '-';
     }
 }
 
@@ -6135,19 +6434,231 @@ public class ConversationQueue {
 
 |~|~|~|~|~|~|~|~|~|~|~|
 
-FILE: com/codeboss/javalayer/shared/SimpleJsonParser.java
+FILE: com/codeboss/javalayer/shared/JSONTokenizer.java
+|~|~|~|~|~|~|~|~|~|~|~|
+package com.codeboss.javalayer.shared;
+
+/**
+ * Lenient JSON tokenizer for AI-generated JSON
+ *
+ * Leniency features:
+ * - Handles both single and double quotes for strings
+ * - Unescapes escape sequences (\\n, \\t, etc.) during tokenization
+ * - Removes line continuations (\\<newline>)
+ * - Produces clean tokens for the parser to consume
+ */
+public class JSONTokenizer extends BaseTokenizer {
+
+    public JSONTokenizer(String source) {
+        super(source);
+    }
+
+    @Override
+    protected Token scanToken() {
+        skipWhitespace();
+
+        if (isAtEnd()) {
+            return new Token(Token.Type.EOF, current);
+        }
+
+        int start = current;
+        char c = advance();
+
+        switch (c) {
+            case '{': return new Token(Token.Type.JSON_LBRACE, start);
+            case '}': return new Token(Token.Type.JSON_RBRACE, start);
+            case '[': return new Token(Token.Type.JSON_LBRACKET, start);
+            case ']': return new Token(Token.Type.JSON_RBRACKET, start);
+            case ':': return new Token(Token.Type.JSON_COLON, start);
+            case ',': return new Token(Token.Type.JSON_COMMA, start);
+
+            case '"':
+            case '\'':
+                return scanString(c, start);
+
+            case '-':
+            case '0': case '1': case '2': case '3': case '4':
+            case '5': case '6': case '7': case '8': case '9':
+                return scanNumber(start);
+
+            case 't':
+                if (match('r') && match('u') && match('e')) {
+                    return new Token(Token.Type.JSON_TRUE, "true", start);
+                }
+                break;
+
+            case 'f':
+                if (match('a') && match('l') && match('s') && match('e')) {
+                    return new Token(Token.Type.JSON_FALSE, "false", start);
+                }
+                break;
+
+            case 'n':
+                if (match('u') && match('l') && match('l')) {
+                    return new Token(Token.Type.JSON_NULL, "null", start);
+                }
+                break;
+        }
+
+        return new Token(Token.Type.ERROR, "Unexpected character: " + c, start);
+    }
+
+    /**
+     * Scan a string token with lenient handling
+     * Supports both double and single quotes
+     * Unescapes escape sequences and handles line continuations
+     */
+    private Token scanString(char quote, int start) {
+        StringBuilder value = new StringBuilder();
+
+        while (!isAtEnd() && peek() != quote) {
+            char c = advance();
+
+            if (c == '\\') {
+                // Handle escape sequences and line continuations
+                if (isAtEnd()) {
+                    return new Token(Token.Type.ERROR, "Unterminated string", start);
+                }
+
+                char next = advance();
+                switch (next) {
+                    case 'n':
+                        value.append('\n');
+                        break;
+                    case 'r':
+                        value.append('\r');
+                        break;
+                    case 't':
+                        value.append('\t');
+                        break;
+                    case '\\':
+                        value.append('\\');
+                        break;
+                    case '"':
+                        value.append('"');
+                        break;
+                    case '\'':
+                        value.append('\'');
+                        break;
+                    case '/':
+                        value.append('/');
+                        break;
+                    case 'b':
+                        value.append('\b');
+                        break;
+                    case 'f':
+                        value.append('\f');
+                        break;
+                    case '\n':
+                        // Line continuation: \<LF> - skip both
+                        break;
+                    case '\r':
+                        // Line continuation: \<CR> or \<CR><LF> - skip
+                        if (peek() == '\n') {
+                            advance(); // Skip the LF in CRLF
+                        }
+                        break;
+                    default:
+                        // Unknown escape - keep the character
+                        value.append(next);
+                }
+            } else {
+                value.append(c);
+            }
+        }
+
+        if (isAtEnd()) {
+            return new Token(Token.Type.ERROR, "Unterminated string", start);
+        }
+
+        // Consume closing quote
+        advance();
+
+        return new Token(Token.Type.JSON_STRING, value.toString(), start);
+    }
+
+    /**
+     * Scan a number token
+     * Supports integers and decimals
+     */
+    private Token scanNumber(int start) {
+        // Handle negative sign (already consumed by advance in scanToken)
+
+        // Consume digits
+        while (isDigit(peek())) {
+            advance();
+        }
+
+        // Look for decimal part
+        if (peek() == '.' && isDigit(peek(1))) {
+            advance(); // Consume '.'
+            while (isDigit(peek())) {
+                advance();
+            }
+        }
+
+        // Look for exponent
+        if (matchAny("eE")) {
+            if (matchAny("+-")) {
+                // Optional sign
+            }
+            while (isDigit(peek())) {
+                advance();
+            }
+        }
+
+        String lexeme = source.substring(start, current);
+        return new Token(Token.Type.JSON_NUMBER, lexeme, start);
+    }
+
+    /**
+     * Peek backwards (override to handle negative offsets relative to current position after advance)
+     */
+    private char peekBack(int offset) {
+        int pos = current + offset - 1; // -1 because we already advanced
+        if (pos < 0 || pos >= source.length()) return '\0';
+        return source.charAt(pos);
+    }
+}
+
+|~|~|~|~|~|~|~|~|~|~|~|
+
+FILE: com/codeboss/javalayer/shared/LenientJsonParser.java
 |~|~|~|~|~|~|~|~|~|~|~|
 package com.codeboss.javalayer.shared;
 
 import java.util.*;
 
 /**
- * Simple JSON parser for basic parsing needs
- * Supports extracting string fields and nested objects
+ * Lenient JSON parser for AI-generated JSON using recursive descent parsing
  *
- * This is a minimal parser - we'll expand it as needed
+ * This parser is designed to handle malformed JSON that AI models commonly generate:
+ * - Missing or extra commas
+ * - Trailing commas
+ * - Single quotes instead of double quotes
+ * - Escaped newlines and other escape sequences
+ * - Extra whitespace
+ *
+ * Architecture:
+ * - Uses JSONTokenizer for lexical analysis (character-level leniency)
+ * - Uses recursive descent parser for structural analysis (context-aware leniency)
+ *
+ * Since this is only used for parsing AI responses, we prioritize leniency over strict compliance.
  */
-public class SimpleJsonParser {
+public class LenientJsonParser {
+
+    private final JSONTokenizer tokenizer;
+    private Token current;
+
+    /**
+     * Private constructor - use static factory methods
+     */
+    private LenientJsonParser(String json) {
+        this.tokenizer = new JSONTokenizer(json);
+        this.current = tokenizer.nextToken();
+    }
+
+    // ========== PUBLIC STATIC API ==========
 
     /**
      * Extract a string field from JSON
@@ -6158,45 +6669,14 @@ public class SimpleJsonParser {
             return null;
         }
 
-        // Look for "fieldName":"value" pattern
-        String searchPattern = "\"" + fieldName + "\"";
-        int fieldStart = json.indexOf(searchPattern);
-        if (fieldStart == -1) {
+        try {
+            LenientJsonParser parser = new LenientJsonParser(json);
+            Map<String, Object> obj = parser.parseObjectInternal();
+            Object value = obj.get(fieldName);
+            return value != null ? value.toString() : null;
+        } catch (Exception e) {
             return null;
         }
-
-        // Find the colon after field name
-        int colonIndex = json.indexOf(":", fieldStart + searchPattern.length());
-        if (colonIndex == -1) {
-            return null;
-        }
-
-        // Skip whitespace after colon
-        int valueStart = colonIndex + 1;
-        while (valueStart < json.length() && Character.isWhitespace(json.charAt(valueStart))) {
-            valueStart++;
-        }
-
-        // Check if value is a string (starts with quote)
-        if (valueStart >= json.length() || json.charAt(valueStart) != '"') {
-            return null;
-        }
-
-        // Find closing quote (handle escaped quotes)
-        valueStart++; // Skip opening quote
-        int valueEnd = valueStart;
-        while (valueEnd < json.length()) {
-            if (json.charAt(valueEnd) == '"' && (valueEnd == 0 || json.charAt(valueEnd - 1) != '\\')) {
-                break;
-            }
-            valueEnd++;
-        }
-
-        if (valueEnd >= json.length()) {
-            return null;
-        }
-
-        return json.substring(valueStart, valueEnd);
     }
 
     /**
@@ -6208,37 +6688,26 @@ public class SimpleJsonParser {
             return null;
         }
 
-        String searchPattern = "\"" + fieldName + "\"";
-        int fieldStart = json.indexOf(searchPattern);
-        if (fieldStart == -1) {
-            return null;
-        }
-
-        int colonIndex = json.indexOf(":", fieldStart + searchPattern.length());
-        if (colonIndex == -1) {
-            return null;
-        }
-
-        // Skip whitespace
-        int valueStart = colonIndex + 1;
-        while (valueStart < json.length() && Character.isWhitespace(json.charAt(valueStart))) {
-            valueStart++;
-        }
-
-        // Find end of number (comma, brace, or whitespace)
-        int valueEnd = valueStart;
-        while (valueEnd < json.length()) {
-            char c = json.charAt(valueEnd);
-            if (c == ',' || c == '}' || c == ']' || Character.isWhitespace(c)) {
-                break;
-            }
-            valueEnd++;
-        }
-
         try {
-            String numberStr = json.substring(valueStart, valueEnd);
-            return Integer.parseInt(numberStr);
-        } catch (NumberFormatException e) {
+            LenientJsonParser parser = new LenientJsonParser(json);
+            Map<String, Object> obj = parser.parseObjectInternal();
+            Object value = obj.get(fieldName);
+
+            if (value == null) {
+                return null;
+            }
+
+            if (value instanceof Integer) {
+                return (Integer) value;
+            }
+
+            // Try parsing as string
+            try {
+                return Integer.parseInt(value.toString());
+            } catch (NumberFormatException e) {
+                return null;
+            }
+        } catch (Exception e) {
             return null;
         }
     }
@@ -6253,158 +6722,634 @@ public class SimpleJsonParser {
     }
 
     /**
-     * Parse a JSON array of objects into a list of maps
-     * Example: parseArray("[{\"name\":\"Alice\"},{\"name\":\"Bob\"}]")
-     * Returns: [{name=Alice}, {name=Bob}]
-     */
-    public static List<Map<String, String>> parseArray(String json) {
-        List<Map<String, String>> result = new ArrayList<>();
-
-        if (json == null || json.trim().isEmpty()) {
-            return result;
-        }
-
-        json = json.trim();
-        if (!json.startsWith("[") || !json.endsWith("]")) {
-            return result;
-        }
-
-        // Remove outer brackets
-        json = json.substring(1, json.length() - 1).trim();
-
-        if (json.isEmpty()) {
-            return result;
-        }
-
-        // Split by "},{"  to separate objects
-        // We use this pattern to avoid splitting on commas within field values
-        List<String> objects = new ArrayList<>();
-        int depth = 0;
-        int start = 0;
-
-        for (int i = 0; i < json.length(); i++) {
-            char c = json.charAt(i);
-            if (c == '{') {
-                depth++;
-            } else if (c == '}') {
-                depth--;
-                if (depth == 0) {
-                    // Found end of an object
-                    objects.add(json.substring(start, i + 1));
-                    // Skip comma and whitespace
-                    i++;
-                    while (i < json.length() && (json.charAt(i) == ',' || Character.isWhitespace(json.charAt(i)))) {
-                        i++;
-                    }
-                    start = i;
-                    i--; // Adjust for loop increment
-                }
-            }
-        }
-
-        // Parse each object
-        for (String objStr : objects) {
-            Map<String, String> obj = parseObject(objStr);
-            if (!obj.isEmpty()) {
-                result.add(obj);
-            }
-        }
-
-        return result;
-    }
-
-    /**
      * Parse a JSON object into a map
      * Example: parseObject("{\"name\":\"Alice\",\"age\":\"30\"}")
      * Returns: {name=Alice, age=30}
      */
     public static Map<String, String> parseObject(String json) {
-        Map<String, String> result = new LinkedHashMap<>();
-
         if (json == null || json.trim().isEmpty()) {
+            return new LinkedHashMap<>();
+        }
+
+        try {
+            LenientJsonParser parser = new LenientJsonParser(json);
+            Map<String, Object> result = parser.parseObjectInternal();
+
+            // Convert all values to strings for backward compatibility
+            Map<String, String> stringMap = new LinkedHashMap<>();
+            for (Map.Entry<String, Object> entry : result.entrySet()) {
+                Object value = entry.getValue();
+                stringMap.put(entry.getKey(), value != null ? value.toString() : null);
+            }
+            return stringMap;
+        } catch (Exception e) {
+            return new LinkedHashMap<>();
+        }
+    }
+
+    /**
+     * Parse a JSON array of objects into a list of maps
+     * Example: parseArray("[{\"name\":\"Alice\"},{\"name\":\"Bob\"}]")
+     * Returns: [{name=Alice}, {name=Bob}]
+     */
+    public static List<Map<String, String>> parseArray(String json) {
+        if (json == null || json.trim().isEmpty()) {
+            return new ArrayList<>();
+        }
+
+        try {
+            LenientJsonParser parser = new LenientJsonParser(json);
+            List<Object> result = parser.parseArrayInternal();
+
+            // Convert to list of string maps
+            List<Map<String, String>> stringMaps = new ArrayList<>();
+            for (Object item : result) {
+                if (item instanceof Map) {
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> objMap = (Map<String, Object>) item;
+                    Map<String, String> stringMap = new LinkedHashMap<>();
+                    for (Map.Entry<String, Object> entry : objMap.entrySet()) {
+                        Object value = entry.getValue();
+                        stringMap.put(entry.getKey(), value != null ? value.toString() : null);
+                    }
+                    stringMaps.add(stringMap);
+                }
+            }
+            return stringMaps;
+        } catch (Exception e) {
+            return new ArrayList<>();
+        }
+    }
+
+    // ========== PRIVATE RECURSIVE DESCENT PARSER ==========
+
+    /**
+     * Parse any JSON value
+     */
+    private Object parseValue() {
+        if (current == null) {
+            return null;
+        }
+
+        switch (current.type) {
+            case JSON_LBRACE:
+                return parseObjectInternal();
+            case JSON_LBRACKET:
+                return parseArrayInternal();
+            case JSON_STRING:
+                return parseString();
+            case JSON_NUMBER:
+                return parseNumber();
+            case JSON_TRUE:
+                advance();
+                return true;
+            case JSON_FALSE:
+                advance();
+                return false;
+            case JSON_NULL:
+                advance();
+                return null;
+            default:
+                throw new RuntimeException("Unexpected token: " + current.type);
+        }
+    }
+
+    /**
+     * Parse a JSON object: { "key": value, ... }
+     */
+    private Map<String, Object> parseObjectInternal() {
+        Map<String, Object> result = new LinkedHashMap<>();
+
+        consume(Token.Type.JSON_LBRACE);
+
+        // Empty object
+        if (current != null && current.type == Token.Type.JSON_RBRACE) {
+            advance();
             return result;
         }
 
-        json = json.trim();
-        if (!json.startsWith("{") || !json.endsWith("}")) {
+        while (current != null && current.type != Token.Type.JSON_RBRACE) {
+            // Parse key (must be string)
+            if (current.type != Token.Type.JSON_STRING) {
+                throw new RuntimeException("Expected string key, got: " + current.type);
+            }
+            String key = current.lexeme;
+            advance();
+
+            // Expect colon
+            consume(Token.Type.JSON_COLON);
+
+            // Parse value
+            Object value = parseValue();
+            result.put(key, value);
+
+            // Handle comma (with leniency)
+            if (current != null && current.type == Token.Type.JSON_COMMA) {
+                skipCommas(); // Skip one or more commas (leniency for multiple commas)
+
+                // LENIENCY: Trailing comma before }
+                if (current != null && current.type == Token.Type.JSON_RBRACE) {
+                    // Just continue to consume the }
+                }
+            } else if (current != null && current.type == Token.Type.JSON_STRING) {
+                // LENIENCY: Missing comma - we see another string key where we expect comma or }
+                // Just continue parsing the next field
+                // (This handles {"a":"v1""b":"v2"} -> {"a":"v1","b":"v2"})
+            } else if (current != null && current.type != Token.Type.JSON_RBRACE) {
+                // Unexpected token
+                throw new RuntimeException("Expected comma or }, got: " + current.type);
+            }
+        }
+
+        consume(Token.Type.JSON_RBRACE);
+        return result;
+    }
+
+    /**
+     * Parse a JSON array: [ value, ... ]
+     */
+    private List<Object> parseArrayInternal() {
+        List<Object> result = new ArrayList<>();
+
+        consume(Token.Type.JSON_LBRACKET);
+
+        // Empty array
+        if (current != null && current.type == Token.Type.JSON_RBRACKET) {
+            advance();
             return result;
         }
 
-        // Remove outer braces
-        json = json.substring(1, json.length() - 1).trim();
+        while (current != null && current.type != Token.Type.JSON_RBRACKET) {
+            // Parse value
+            Object value = parseValue();
+            result.add(value);
 
-        if (json.isEmpty()) {
-            return result;
+            // Handle comma (with leniency)
+            if (current != null && current.type == Token.Type.JSON_COMMA) {
+                skipCommas(); // Skip one or more commas (leniency for multiple commas)
+
+                // LENIENCY: Trailing comma before ]
+                if (current != null && current.type == Token.Type.JSON_RBRACKET) {
+                    // Just continue to consume the ]
+                }
+            } else if (current != null && current.type != Token.Type.JSON_RBRACKET) {
+                // In arrays, we're stricter about missing commas
+                // (Arrays typically have consistent types, so missing commas are less common)
+                throw new RuntimeException("Expected comma or ], got: " + current.type);
+            }
         }
 
-        // Parse fields by looking for "key":"value" patterns
-        // Handle commas within quoted strings properly
-        int i = 0;
-        while (i < json.length()) {
-            // Skip whitespace
-            while (i < json.length() && Character.isWhitespace(json.charAt(i))) {
-                i++;
+        consume(Token.Type.JSON_RBRACKET);
+        return result;
+    }
+
+    /**
+     * Parse a string value
+     */
+    private String parseString() {
+        if (current == null || current.type != Token.Type.JSON_STRING) {
+            throw new RuntimeException("Expected string");
+        }
+        String value = current.lexeme;
+        advance();
+        return value;
+    }
+
+    /**
+     * Parse a number value
+     */
+    private Object parseNumber() {
+        if (current == null || current.type != Token.Type.JSON_NUMBER) {
+            throw new RuntimeException("Expected number");
+        }
+        String lexeme = current.lexeme;
+        advance();
+
+        // Try to parse as integer first, then as double
+        try {
+            return Integer.parseInt(lexeme);
+        } catch (NumberFormatException e1) {
+            try {
+                return Double.parseDouble(lexeme);
+            } catch (NumberFormatException e2) {
+                throw new RuntimeException("Invalid number: " + lexeme);
+            }
+        }
+    }
+
+    /**
+     * Consume expected token type
+     */
+    private void consume(Token.Type expected) {
+        if (current == null || current.type != expected) {
+            throw new RuntimeException("Expected " + expected + ", got: " +
+                (current != null ? current.type : "EOF"));
+        }
+        advance();
+    }
+
+    /**
+     * Move to next token
+     */
+    private void advance() {
+        current = tokenizer.nextToken();
+    }
+
+    /**
+     * Skip one or more consecutive commas (leniency for multiple commas)
+     */
+    private void skipCommas() {
+        while (current != null && current.type == Token.Type.JSON_COMMA) {
+            advance();
+        }
+    }
+}
+
+|~|~|~|~|~|~|~|~|~|~|~|
+
+FILE: com/codeboss/javalayer/shared/Token.java
+|~|~|~|~|~|~|~|~|~|~|~|
+package com.codeboss.javalayer.shared;
+
+/**
+ * Represents a token produced by a lexical tokenizer
+ * Immutable value class
+ */
+public class Token {
+    public enum Type {
+        // Common tokens
+        EOF,
+        ERROR,
+
+        // XML tokens
+        XML_TAG_OPEN,        // <
+        XML_TAG_CLOSE,       // >
+        XML_TAG_END_OPEN,    // </
+        XML_TAG_SELF_CLOSE,  // />
+        XML_EQUALS,          // =
+        XML_NAME,            // tag/attribute name
+        XML_STRING,          // attribute value
+        XML_TEXT,            // text content
+        XML_CDATA,           // CDATA content (entire section)
+        XML_EOF,             // End of file
+
+        // JSON tokens
+        JSON_LBRACE,         // {
+        JSON_RBRACE,         // }
+        JSON_LBRACKET,       // [
+        JSON_RBRACKET,       // ]
+        JSON_COLON,          // :
+        JSON_COMMA,          // ,
+        JSON_STRING,         // "value" or 'value'
+        JSON_NUMBER,         // 123, 123.45
+        JSON_TRUE,           // true
+        JSON_FALSE,          // false
+        JSON_NULL            // null
+    }
+
+    public final Type type;
+    public final String lexeme;  // The actual text
+    public final int position;   // Position in source
+
+    public Token(Type type, String lexeme, int position) {
+        this.type = type;
+        this.lexeme = lexeme != null ? lexeme : "";
+        this.position = position;
+    }
+
+    public Token(Type type, int position) {
+        this(type, "", position);
+    }
+
+    @Override
+    public String toString() {
+        if (lexeme.isEmpty()) {
+            return type.toString() + "@" + position;
+        }
+        return type + "(" + lexeme + ")@" + position;
+    }
+
+    @Override
+    public boolean equals(Object obj) {
+        if (!(obj instanceof Token)) return false;
+        Token other = (Token) obj;
+        return type == other.type && lexeme.equals(other.lexeme);
+    }
+
+    @Override
+    public int hashCode() {
+        return type.hashCode() * 31 + lexeme.hashCode();
+    }
+}
+
+|~|~|~|~|~|~|~|~|~|~|~|
+
+FILE: com/codeboss/javalayer/shared/Tokenizer.java
+|~|~|~|~|~|~|~|~|~|~|~|
+package com.codeboss.javalayer.shared;
+
+/**
+ * Base interface for lenient tokenizers
+ * Tokenizers read source text character-by-character and emit tokens
+ */
+public interface Tokenizer {
+    /**
+     * Get the next token from the source
+     * Returns EOF token when no more tokens available
+     */
+    Token nextToken();
+
+    /**
+     * Peek at the next token without consuming it
+     */
+    Token peekToken();
+
+    /**
+     * Check if we're at the end of the source
+     */
+    boolean isAtEnd();
+
+    /**
+     * Get current position in source
+     */
+    int getPosition();
+}
+
+|~|~|~|~|~|~|~|~|~|~|~|
+
+FILE: com/codeboss/javalayer/shared/XMLTokenizer.java
+|~|~|~|~|~|~|~|~|~|~|~|
+package com.codeboss.javalayer.shared;
+
+import java.util.*;
+
+/**
+ * Stateful tokenizer for XML with lenient CDATA handling
+ *
+ * Uses state stack to distinguish:
+ * - CONTENT: Between tags (> and <), return raw text
+ * - IN_TAG: Inside tags (< and >), tokenize structure
+ *
+ * Handles:
+ * - Basic XML tokens: <, >, </,/>, =, names, strings
+ * - CDATA sections with AI formatting normalization
+ * - Line continuations: \<newline> → removed
+ * - Preserves legitimate backslashes (Windows paths, escape sequences)
+ */
+public class XMLTokenizer extends BaseTokenizer {
+
+    private enum State {
+        CONTENT,    // Between tags - everything is text until <
+        IN_TAG      // Inside a tag - tokenize names/attributes/etc
+    }
+
+    private final Deque<State> stateStack;
+
+    public XMLTokenizer(String input) {
+        super(input);
+        this.stateStack = new ArrayDeque<>();
+        this.stateStack.push(State.CONTENT); // Start in content mode
+    }
+
+    private State currentState() {
+        return stateStack.isEmpty() ? State.CONTENT : stateStack.peek();
+    }
+
+    @Override
+    protected Token scanToken() {
+        if (isAtEnd()) {
+            return new Token(Token.Type.XML_EOF, "", current);
+        }
+
+        // Behavior depends on current state
+        if (currentState() == State.CONTENT) {
+            return scanInContentMode();
+        } else {
+            return scanInTagMode();
+        }
+    }
+
+    /**
+     * Scan while in CONTENT state (between tags)
+     * Only looking for:
+     * - < (start of tag or CDATA)
+     * - Plain text
+     */
+    private Token scanInContentMode() {
+        char c = peek();
+
+        // Check for tag/CDATA start
+        if (c == '<') {
+            // Peek ahead to see if it's CDATA
+            if (peek(1) == '!' && peek(2) == '[') {
+                return scanCDATA();
             }
 
-            if (i >= json.length()) break;
+            // It's a tag, switch to IN_TAG state
+            stateStack.push(State.IN_TAG);
+            return scanTagStart();
+        }
 
-            // Expect a quote for field name
-            if (json.charAt(i) != '"') {
+        // Otherwise, scan plain text until we hit <
+        return scanText();
+    }
+
+    /**
+     * Scan while in IN_TAG state (inside a tag)
+     * Looking for: names, attributes, =, strings, >, />, etc
+     */
+    private Token scanInTagMode() {
+        // Skip whitespace in tags
+        if (Character.isWhitespace(peek())) {
+            skipWhitespace();
+            if (isAtEnd()) {
+                return new Token(Token.Type.XML_EOF, "", current);
+            }
+        }
+
+        char c = peek();
+
+        // Check for tag close - return to CONTENT state
+        if (c == '>') {
+            int pos = current;
+            advance();
+            stateStack.pop(); // Back to CONTENT state
+            return new Token(Token.Type.XML_TAG_CLOSE, ">", pos);
+        }
+
+        // Check for self-close tag: />
+        if (c == '/' && peek(1) == '>') {
+            int pos = current;
+            advance(); // /
+            advance(); // >
+            stateStack.pop(); // Back to CONTENT state
+            return new Token(Token.Type.XML_TAG_SELF_CLOSE, "/>", pos);
+        }
+
+        // Check for equals (in attributes)
+        if (c == '=') {
+            int pos = current;
+            advance();
+            return new Token(Token.Type.XML_EQUALS, "=", pos);
+        }
+
+        // Check for quoted string (attribute value)
+        if (c == '"' || c == '\'') {
+            return scanString();
+        }
+
+        // Otherwise, scan as name (element/attribute name)
+        if (isAlpha(c) || c == '_') {
+            return scanName();
+        }
+
+        // Unexpected character
+        throw new RuntimeException("Unexpected character '" + c + "' at position " + current +
+            " in IN_TAG state. Expected one of: >, =, \", ', or name character.");
+    }
+
+    /**
+     * Scan tag start: < or </
+     * NOTE: We're already in IN_TAG state when this is called
+     */
+    private Token scanTagStart() {
+        int pos = current;
+        advance(); // consume <
+
+        // Check for closing tag: </
+        if (match('/')) {
+            return new Token(Token.Type.XML_TAG_END_OPEN, "</", pos);
+        }
+
+        // Opening tag: <
+        return new Token(Token.Type.XML_TAG_OPEN, "<", pos);
+    }
+
+    /**
+     * Scan plain text content (in CONTENT mode)
+     * Returns everything until we hit <
+     */
+    private Token scanText() {
+        int pos = current;
+        StringBuilder text = new StringBuilder();
+
+        while (!isAtEnd() && peek() != '<') {
+            text.append(advance());
+        }
+
+        return new Token(Token.Type.XML_TEXT, text.toString(), pos);
+    }
+
+    /**
+     * Scan CDATA section with AI formatting normalization
+     * Format: <![CDATA[content]]>
+     *
+     * AI Leniency:
+     * - Line continuations: \<newline> → removed
+     * - Handles all line ending types: \r\n, \n, \r
+     * - Preserves legitimate backslashes
+     */
+    private Token scanCDATA() {
+        int pos = current;
+
+        // Consume <![CDATA[
+        advance(); // <
+        advance(); // !
+        advance(); // [
+        advance(); // C
+        advance(); // D
+        advance(); // A
+        advance(); // T
+        advance(); // A
+        advance(); // [
+
+        StringBuilder content = new StringBuilder();
+
+        // Scan until we find ]]>
+        while (!isAtEnd()) {
+            // Check for CDATA end: ]]>
+            if (peek() == ']' && peek(1) == ']' && peek(2) == '>') {
+                advance(); // ]
+                advance(); // ]
+                advance(); // >
                 break;
             }
 
-            // Find field name
-            i++; // Skip opening quote
-            int fieldStart = i;
-            while (i < json.length() && json.charAt(i) != '"') {
-                if (json.charAt(i) == '\\') i++; // Skip escaped char
-                i++;
+            // Check for line continuation: backslash followed by newline
+            if (peek() == '\\') {
+                char next = peek(1);
+
+                // Line continuation with CRLF: \r\n
+                if (next == '\r' && peek(2) == '\n') {
+                    advance(); // \
+                    advance(); // \r
+                    advance(); // \n
+                    // Skip (line continuation removed)
+                    continue;
+                }
+
+                // Line continuation with LF: \n
+                if (next == '\n') {
+                    advance(); // \
+                    advance(); // \n
+                    // Skip (line continuation removed)
+                    continue;
+                }
+
+                // Line continuation with CR: \r
+                if (next == '\r') {
+                    advance(); // \
+                    advance(); // \r
+                    // Skip (line continuation removed)
+                    continue;
+                }
             }
 
-            if (i >= json.length()) break;
+            // Normal character - keep it
+            content.append(advance());
+        }
 
-            String fieldName = json.substring(fieldStart, i);
-            i++; // Skip closing quote
+        return new Token(Token.Type.XML_CDATA, content.toString(), pos);
+    }
 
-            // Skip whitespace and colon
-            while (i < json.length() && (Character.isWhitespace(json.charAt(i)) || json.charAt(i) == ':')) {
-                i++;
-            }
+    /**
+     * Scan XML name (element name or attribute name)
+     */
+    private Token scanName() {
+        int pos = current;
+        StringBuilder name = new StringBuilder();
 
-            if (i >= json.length()) break;
-
-            // Parse value
-            String value = "";
-            if (json.charAt(i) == '"') {
-                // String value
-                i++; // Skip opening quote
-                int valueStart = i;
-                while (i < json.length() && json.charAt(i) != '"') {
-                    if (json.charAt(i) == '\\') i++; // Skip escaped char
-                    i++;
-                }
-                if (i < json.length()) {
-                    value = json.substring(valueStart, i);
-                    i++; // Skip closing quote
-                }
+        // XML name: [a-zA-Z_][a-zA-Z0-9_-]*
+        while (!isAtEnd()) {
+            char c = peek();
+            if (isAlpha(c) || isDigit(c) || c == '_' || c == '-') {
+                name.append(advance());
             } else {
-                // Number, boolean, or null
-                int valueStart = i;
-                while (i < json.length() && json.charAt(i) != ',' && json.charAt(i) != '}') {
-                    i++;
-                }
-                value = json.substring(valueStart, i).trim();
-            }
-
-            result.put(fieldName, value);
-
-            // Skip comma
-            while (i < json.length() && (Character.isWhitespace(json.charAt(i)) || json.charAt(i) == ',')) {
-                i++;
+                break;
             }
         }
 
-        return result;
+        return new Token(Token.Type.XML_NAME, name.toString(), pos);
+    }
+
+    /**
+     * Scan quoted string (attribute value)
+     * Supports both double and single quotes
+     */
+    private Token scanString() {
+        int pos = current;
+        char quote = advance(); // " or '
+        StringBuilder value = new StringBuilder();
+
+        while (!isAtEnd() && peek() != quote) {
+            value.append(advance());
+        }
+
+        if (!isAtEnd()) {
+            advance(); // closing quote
+        }
+
+        return new Token(Token.Type.XML_STRING, value.toString(), pos);
     }
 }
 
@@ -7086,6 +8031,8 @@ public class ToolExecutor implements IToolExecutor {
                     return createFile(params);
                 case "update_file":
                     return updateFile(params);
+                case "update_file_batch":
+                    return updateFileBatch(params);
                 case "delete_file":
                     return deleteFile(params);
                 case "manage_checklist":
@@ -7324,14 +8271,27 @@ public class ToolExecutor implements IToolExecutor {
         }
 
         String fileContent = Files.readString(path);
-        if (!fileContent.contains(oldContent)) {
-            Map<String, Object> error = new HashMap<>();
-            error.put("error", "old_content not found in file");
-            return new ToolExecutionResult(error, "Error: Content not found");
+
+        // Try exact match first
+        int firstIndex = fileContent.indexOf(oldContent);
+
+        // If exact match fails, try lenient matching
+        if (firstIndex == -1) {
+            LenientMatch lenientResult = findLenientMatch(fileContent, oldContent);
+            if (lenientResult != null) {
+                firstIndex = lenientResult.position;
+                // Replace oldContent with what we actually found so replacement works correctly
+                oldContent = lenientResult.matchedText;
+            } else {
+                Map<String, Object> error = new HashMap<>();
+                error.put("error", "old_content not found in file");
+                error.put("hint", "Make sure old_content matches exactly (check whitespace, newlines, and special characters)");
+                error.put("old_content_escaped", oldContent.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t"));
+                return new ToolExecutionResult(error, "Error: Content not found");
+            }
         }
 
         // Check for multiple occurrences
-        int firstIndex = fileContent.indexOf(oldContent);
         int secondIndex = fileContent.indexOf(oldContent, firstIndex + oldContent.length());
 
         if (secondIndex != -1) {
@@ -7353,6 +8313,195 @@ public class ToolExecutor implements IToolExecutor {
         result.put("updated", true);
 
         String summary = "Updated " + filePath;
+
+        return new ToolExecutionResult(result, summary);
+    }
+
+    private static class FileUpdate {
+        String oldContent;
+        String newContent;
+        int position;  // Position of old_content in file
+
+        FileUpdate(String oldContent, String newContent, int position) {
+            this.oldContent = oldContent;
+            this.newContent = newContent;
+            this.position = position;
+        }
+    }
+
+    private static class LenientMatch {
+        int position;
+        String matchedText;  // The actual text from the file that matched
+
+        LenientMatch(int position, String matchedText) {
+            this.position = position;
+            this.matchedText = matchedText;
+        }
+    }
+
+    private ToolExecutionResult updateFileBatch(Map<String, String> params) throws IOException {
+        String filePath = params.get("file_path");
+        String updatesJson = params.get("updates");
+
+        if (filePath == null || filePath.isEmpty()) {
+            Map<String, Object> error = new HashMap<>();
+            error.put("error", "file_path parameter required");
+            return new ToolExecutionResult(error, "Error: file_path required");
+        }
+
+        if (updatesJson == null || updatesJson.isEmpty()) {
+            Map<String, Object> error = new HashMap<>();
+            error.put("error", "updates parameter required");
+            error.put("hint", "updates should be a JSON array: [{\"old_content\":\"...\",\"new_content\":\"...\"}, ...]");
+            return new ToolExecutionResult(error, "Error: updates parameter required");
+        }
+
+        // FIX: Convert backslash line continuation to proper \n escapes
+        // AI sometimes sends: "line1\<newline>line2" which is invalid JSON
+        // We need: "line1\nline2" (the two-character escape sequence)
+        updatesJson = updatesJson.replace("\\\n", "\\n").replace("\\\r\n", "\\n");
+
+        Path path = resolvePath(filePath);
+        if (!Files.exists(path)) {
+            Map<String, Object> error = new HashMap<>();
+            error.put("error", "File not found: " + filePath);
+            return new ToolExecutionResult(error, "Error: File not found");
+        }
+
+        String fileContent = Files.readString(path);
+
+        // Parse updates array
+        List<Map<String, String>> updatesList;
+        try {
+            updatesList = com.codeboss.javalayer.shared.LenientJsonParser.parseArray(updatesJson);
+        } catch (Exception e) {
+            Map<String, Object> error = new HashMap<>();
+            error.put("error", "Failed to parse updates JSON: " + e.getMessage());
+            error.put("hint", "updates should be a JSON array: [{\"old_content\":\"...\",\"new_content\":\"...\"}, ...]");
+            return new ToolExecutionResult(error, "Error: Invalid JSON format");
+        }
+
+        if (updatesList.isEmpty()) {
+            Map<String, Object> error = new HashMap<>();
+            error.put("error", "updates array cannot be empty");
+            return new ToolExecutionResult(error, "Error: Empty updates array");
+        }
+
+        // Validate and find positions for all updates
+        List<FileUpdate> updates = new ArrayList<>();
+
+        for (int i = 0; i < updatesList.size(); i++) {
+            Map<String, String> update = updatesList.get(i);
+            String oldContent = update.get("old_content");
+            String newContent = update.get("new_content");
+
+            if (oldContent == null || newContent == null) {
+                Map<String, Object> error = new HashMap<>();
+                error.put("error", "Update #" + (i + 1) + " missing old_content or new_content");
+                return new ToolExecutionResult(error, "Error: Missing required fields in update");
+            }
+
+            if (oldContent.isEmpty() || oldContent.trim().isEmpty()) {
+                Map<String, Object> error = new HashMap<>();
+                error.put("error", "Update #" + (i + 1) + ": old_content cannot be empty or whitespace-only");
+                return new ToolExecutionResult(error, "Error: old_content cannot be empty");
+            }
+
+            // Check if old_content exists in file (exact match first)
+            int position = fileContent.indexOf(oldContent);
+
+            // If exact match fails, try lenient matching
+            if (position == -1) {
+                LenientMatch lenientResult = findLenientMatch(fileContent, oldContent);
+                if (lenientResult != null) {
+                    position = lenientResult.position;
+                    // Replace oldContent with what we actually found so replacements work correctly
+                    oldContent = lenientResult.matchedText;
+                } else {
+                    Map<String, Object> error = new HashMap<>();
+                    error.put("error", "Update #" + (i + 1) + ": old_content not found in file");
+                    error.put("old_content_preview", oldContent.length() > 100 ? oldContent.substring(0, 100) + "..." : oldContent);
+                    error.put("old_content_length", oldContent.length());
+                    error.put("file_content_preview", fileContent.length() > 200 ? fileContent.substring(0, 200) + "..." : fileContent);
+                    error.put("file_content_length", fileContent.length());
+                    // Show escape sequences visually
+                    error.put("old_content_escaped", oldContent.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t"));
+                    error.put("hint", "Make sure old_content matches exactly (check whitespace, newlines, and special characters)");
+                    return new ToolExecutionResult(error, "Error: Content not found");
+                }
+            }
+
+            // Check for uniqueness (multiple occurrences)
+            int secondOccurrence = fileContent.indexOf(oldContent, position + oldContent.length());
+            if (secondOccurrence != -1) {
+                Map<String, Object> error = new HashMap<>();
+                error.put("error", "Update #" + (i + 1) + ": old_content appears multiple times in file");
+                error.put("hint", "Provide more context in old_content to make it unique");
+                error.put("occurrences", countOccurrences(fileContent, oldContent));
+                return new ToolExecutionResult(error, "Error: old_content must be unique");
+            }
+
+            updates.add(new FileUpdate(oldContent, newContent, position));
+        }
+
+        // Check for overlaps between updates
+        for (int i = 0; i < updates.size(); i++) {
+            FileUpdate update1 = updates.get(i);
+            int end1 = update1.position + update1.oldContent.length();
+
+            for (int j = i + 1; j < updates.size(); j++) {
+                FileUpdate update2 = updates.get(j);
+                int end2 = update2.position + update2.oldContent.length();
+
+                // Check if regions overlap
+                boolean overlaps = (update1.position >= update2.position && update1.position < end2) ||
+                                 (update2.position >= update1.position && update2.position < end1);
+
+                if (overlaps) {
+                    Map<String, Object> error = new HashMap<>();
+                    error.put("error", "Updates #" + (i + 1) + " and #" + (j + 1) + " have overlapping regions");
+                    error.put("hint", "Ensure old_content regions don't overlap. Consider combining them into a single update.");
+                    return new ToolExecutionResult(error, "Error: Overlapping updates");
+                }
+            }
+        }
+
+        // Sort updates by position (last to first) for reverse application
+        updates.sort((a, b) -> Integer.compare(b.position, a.position));
+
+        // Apply updates in reverse order
+        String updatedContent = fileContent;
+        int updatesApplied = 0;
+
+        for (FileUpdate update : updates) {
+            // Find the old content in the current state (positions may have shifted)
+            int currentPos = updatedContent.indexOf(update.oldContent);
+            if (currentPos == -1) {
+                // This shouldn't happen since we validated earlier, but check anyway
+                Map<String, Object> error = new HashMap<>();
+                error.put("error", "Failed to apply update: old_content not found during application");
+                error.put("updates_applied", updatesApplied);
+                return new ToolExecutionResult(error, "Error: Update application failed");
+            }
+
+            updatedContent = updatedContent.substring(0, currentPos) +
+                           update.newContent +
+                           updatedContent.substring(currentPos + update.oldContent.length());
+            updatesApplied++;
+        }
+
+        // Write updated content back to file
+        Files.writeString(path, updatedContent);
+        long fileSize = Files.size(path);
+
+        // Build structured result
+        Map<String, Object> result = new HashMap<>();
+        result.put("file_path", filePath);
+        result.put("size", fileSize);
+        result.put("updates_applied", updatesApplied);
+        result.put("updated", true);
+
+        String summary = "Applied " + updatesApplied + " update(s) to " + filePath;
 
         return new ToolExecutionResult(result, summary);
     }
@@ -7611,6 +8760,11 @@ public class ToolExecutor implements IToolExecutor {
 
         // AUTO-APPROVE: If there's only 1 item, skip approval and go directly to execution
         if (items.size() == 1) {
+            // Clear any existing checklist before adding new items
+            if (checklistManager != null) {
+                checklistManager.clearChecklist();
+            }
+
             // Add checklist items directly to ChecklistManager
             List<Map<String, String>> addedItems = parseAndAddChecklist(checklistJson);
 
@@ -7689,7 +8843,7 @@ public class ToolExecutor implements IToolExecutor {
 
         try {
             // Use SimpleJsonParser to properly handle commas in field values
-            List<Map<String, String>> items = com.codeboss.javalayer.shared.SimpleJsonParser.parseArray(checklistJson);
+            List<Map<String, String>> items = com.codeboss.javalayer.shared.LenientJsonParser.parseArray(checklistJson);
 
             // Ensure defaults for missing fields
             for (Map<String, String> item : items) {
@@ -7729,7 +8883,7 @@ public class ToolExecutor implements IToolExecutor {
 
         try {
             // Use SimpleJsonParser to properly handle commas in field values
-            List<Map<String, String>> items = com.codeboss.javalayer.shared.SimpleJsonParser.parseArray(checklistJson);
+            List<Map<String, String>> items = com.codeboss.javalayer.shared.LenientJsonParser.parseArray(checklistJson);
 
             for (Map<String, String> item : items) {
                 String content = item.get("content");
@@ -8333,6 +9487,92 @@ public class ToolExecutor implements IToolExecutor {
     }
 
     /**
+     * Try to find a lenient match for old_content in fileContent.
+     * Converts old_content to a regex pattern that's flexible about whitespace.
+     * Returns null if no match found.
+     */
+    private LenientMatch findLenientMatch(String fileContent, String oldContent) {
+        // Strategy: Tokenize by character class transitions AND split long alphanumeric sequences
+        // This handles cases like "modulesconst" which should match "modules\nconst"
+
+        // Tokenize by character class transitions
+        List<String> tokens = new ArrayList<>();
+        int i = 0;
+        while (i < oldContent.length()) {
+            // Skip whitespace
+            while (i < oldContent.length() && Character.isWhitespace(oldContent.charAt(i))) {
+                i++;
+            }
+            if (i >= oldContent.length()) break;
+
+            int start = i;
+            char startChar = oldContent.charAt(i);
+            boolean isAlphaNum = Character.isLetterOrDigit(startChar);
+
+            // Collect characters of the same class
+            i++;
+            while (i < oldContent.length()) {
+                char c = oldContent.charAt(i);
+                if (Character.isWhitespace(c)) {
+                    break; // Stop at whitespace
+                }
+                boolean currentIsAlphaNum = Character.isLetterOrDigit(c);
+                if (currentIsAlphaNum != isAlphaNum) {
+                    break; // Stop at class transition
+                }
+                // ALSO stop on CamelCase transitions (lowercase to uppercase)
+                if (isAlphaNum && i > start &&
+                    Character.isLowerCase(oldContent.charAt(i-1)) &&
+                    Character.isUpperCase(c)) {
+                    break;
+                }
+                i++;
+            }
+
+            String token = oldContent.substring(start, i);
+
+            // If token is very long (>8 chars) and alphanumeric, it might be missing whitespace
+            // Split it into smaller chunks to increase match chances
+            if (isAlphaNum && token.length() > 8) {
+                // Try to split on likely word boundaries
+                // For now, just add the whole token and hope regex matching helps
+                tokens.add(token);
+            } else {
+                tokens.add(token);
+            }
+        }
+
+        if (tokens.isEmpty()) {
+            return null; // Nothing to match
+        }
+
+        // Build regex: token1 .+? token2 .+? token3 ...
+        // Use .+? (non-greedy any character) to match anything between tokens
+        // This handles cases where AI concatenates words: "modulesconst" matches "modules\nconst"
+        StringBuilder regexBuilder = new StringBuilder();
+        for (int j = 0; j < tokens.size(); j++) {
+            if (j > 0) {
+                regexBuilder.append(".*?"); // Match any characters (non-greedy) between tokens
+            }
+            regexBuilder.append(java.util.regex.Pattern.quote(tokens.get(j)));
+        }
+
+        try {
+            java.util.regex.Pattern pattern = java.util.regex.Pattern.compile(regexBuilder.toString());
+            java.util.regex.Matcher matcher = pattern.matcher(fileContent);
+
+            if (matcher.find()) {
+                return new LenientMatch(matcher.start(), matcher.group());
+            }
+        } catch (java.util.regex.PatternSyntaxException e) {
+            // If regex fails, return null
+            return null;
+        }
+
+        return null;
+    }
+
+    /**
      * Maps tool names to their required ToolCategory
      * Returns null for tools that don't require category validation
      */
@@ -8346,6 +9586,7 @@ public class ToolExecutor implements IToolExecutor {
             // FILE_OPERATIONS category (write operations)
             case "create_file":
             case "update_file":
+            case "update_file_batch":
             case "delete_file":
                 return com.codeboss.javalayer.aiprocessor.ToolCategory.FILE_OPERATIONS;
 
@@ -8623,8 +9864,15 @@ FILE: src/frontend-ui/main.js
         messageInput.focus();
     }
 
+    function refreshRender() {
+        if (currentState) {
+            updateUI(currentState);
+        }
+    }
+
     window.module["main.js"] = {
-        start
+        start,
+        refreshRender
     };
 })();
 
@@ -8764,8 +10012,11 @@ FILE: src/frontend-ui/render.js
             return null;
         }
 
-        // Hide begin_execution and mark_complete tool use
-        if (msg.toolName === 'begin_execution' || msg.toolName === 'mark_complete') {
+        // Hide begin_execution, mark_complete, review_pass, and review_fail tool use
+        if (msg.toolName === 'begin_execution' ||
+            msg.toolName === 'mark_complete' ||
+            msg.toolName === 'review_pass' ||
+            msg.toolName === 'review_fail') {
             return null;
         }
 
@@ -8792,6 +10043,97 @@ FILE: src/frontend-ui/render.js
             }
         }
 
+        // Special rendering for create_file, update_file, and update_file_batch with chevron instead of bullet
+        if (msg.toolName === 'create_file' || msg.toolName === 'update_file' || msg.toolName === 'update_file_batch') {
+            // Check if result has error or if there are enough lines to show chevron
+            let hasError = false;
+            let shouldShowChevron = false;
+
+            // Look ahead to check for errors and line count
+            for (let i = index + 1; i < allMessages.length; i++) {
+                const nextMsg = allMessages[i];
+                if (nextMsg.type === 'tool_result' && nextMsg.tool_use_id === msg.id) {
+                    hasError = nextMsg.result && nextMsg.result.error;
+
+                    // Calculate line count for this tool
+                    if (!hasError && msg.parameters) {
+                        let lineCount = 0;
+                        if (msg.toolName === 'create_file' && msg.parameters.content) {
+                            lineCount = msg.parameters.content.split('\n').length;
+                        } else if (msg.toolName === 'update_file') {
+                            const oldContent = msg.parameters.old_content || '';
+                            const newContent = msg.parameters.new_content || '';
+                            const diffLines = computeLineDiff(oldContent, newContent);
+                            lineCount = diffLines.filter(line => line.type !== 'unchanged').length;
+                        } else if (msg.toolName === 'update_file_batch' && msg.parameters.updates) {
+                            try {
+                                const updates = JSON.parse(msg.parameters.updates || '[]');
+                                updates.forEach(update => {
+                                    const oldContent = update.old_content || '';
+                                    const newContent = update.new_content || '';
+                                    const diffLines = computeLineDiff(oldContent, newContent);
+                                    lineCount += diffLines.filter(line => line.type !== 'unchanged').length;
+                                });
+                            } catch (e) {
+                                // JSON parse error, don't show chevron
+                            }
+                        }
+                        shouldShowChevron = lineCount > 10;
+                    }
+                    break;
+                }
+                // Stop looking if we hit another tool_use
+                if (nextMsg.type === 'tool_use') {
+                    break;
+                }
+            }
+
+            // Display name overrides
+            let displayName;
+            if (msg.toolName === 'update_file_batch') {
+                displayName = 'MULTI_EDIT_FILE';
+            } else if (msg.toolName === 'update_file') {
+                displayName = 'EDIT_FILE';
+            } else {
+                displayName = msg.toolName.toUpperCase();
+            }
+
+            // Only show chevron if no error and > 10 lines
+            if (shouldShowChevron) {
+                const showFullContent = expandedFiles[msg.id] === true;
+                const chevron = showFullContent ? '▼' : '▶';
+
+                return h('div', { className: 'message tool-message' }, [
+                    h('div', {
+                        className: 'message-prefix file-chevron ' + bulletClass,
+                        onclick: () => {
+                            expandedFiles[msg.id] = !expandedFiles[msg.id];
+                            window.module["main.js"].refreshRender();
+                        }
+                    }, text(chevron + ' ')),
+                    h('div', {
+                        className: 'tool-header clickable-header',
+                        onclick: () => {
+                            expandedFiles[msg.id] = !expandedFiles[msg.id];
+                            window.module["main.js"].refreshRender();
+                        }
+                    }, [
+                        text('[' + displayName + ']'),
+                        params ? text(' ' + params) : null
+                    ])
+                ]);
+            } else {
+                // Show regular bullet without chevron
+                return h('div', { className: 'message tool-message' }, [
+                    h('div', { className: 'message-prefix ' + bulletClass }, text('• ')),
+                    h('div', { className: 'tool-header' }, [
+                        text('[' + displayName + ']'),
+                        params ? text(' ' + params) : null
+                    ])
+                ]);
+            }
+        }
+
         return h('div', { className: 'message tool-message' }, [
             h('div', { className: 'message-prefix ' + bulletClass }, text('• ')),
             h('div', { className: 'tool-header' }, [
@@ -8810,6 +10152,16 @@ FILE: src/frontend-ui/render.js
         // Custom rendering for begin_execution with pending approval
         if (msg.toolName === 'begin_execution' && msg.result && msg.result.status === 'pending_approval') {
             return renderPlanApproval(msg.result);
+        }
+
+        // Hide begin_execution result when auto-approved
+        if (msg.toolName === 'begin_execution' && msg.result && msg.result.status === 'auto_approved') {
+            return null;
+        }
+
+        // Hide review_pass and review_fail tool results (we show custom bars instead)
+        if (msg.toolName === 'review_pass' || msg.toolName === 'review_fail') {
+            return null;
         }
 
         // Custom rendering for begin_execution
@@ -8841,7 +10193,18 @@ FILE: src/frontend-ui/render.js
         if ((msg.toolName === 'create_file' || msg.toolName === 'update_file') && msg.result && !msg.result.error) {
             const toolUseMsg = findToolUseMessage(allMessages, msg.tool_use_id);
             if (toolUseMsg && toolUseMsg.parameters) {
-                return renderFileContent(msg.toolName, toolUseMsg.parameters);
+                // Always show content (either preview or full)
+                const showFullContent = expandedFiles[msg.tool_use_id] === true;
+                return renderFileContent(msg.toolName, toolUseMsg.parameters, msg.tool_use_id, showFullContent);
+            }
+        }
+
+        // Custom rendering for update_file_batch - show all diffs with separators
+        if (msg.toolName === 'update_file_batch' && msg.result && !msg.result.error) {
+            const toolUseMsg = findToolUseMessage(allMessages, msg.tool_use_id);
+            if (toolUseMsg && toolUseMsg.parameters) {
+                const showFullContent = expandedFiles[msg.tool_use_id] === true;
+                return renderBatchFileContent(toolUseMsg.parameters, msg.tool_use_id, showFullContent);
             }
         }
 
@@ -9074,25 +10437,181 @@ FILE: src/frontend-ui/render.js
         return allMessages.find(m => m.type === 'tool_use' && m.id === toolUseId);
     }
 
-    // Render file content for create_file and update_file
-    function renderFileContent(toolName, parameters) {
-        let content = '';
+    // Simple line-by-line diff algorithm
+    function computeLineDiff(oldText, newText) {
+        const oldLines = oldText.split('\n');
+        const newLines = newText.split('\n');
+        const result = [];
 
-        if (toolName === 'create_file') {
-            // Show the content parameter
-            content = parameters.content || '';
-        } else if (toolName === 'update_file') {
-            // Show old_content concatenated with new_content
-            const oldContent = parameters.old_content || '';
-            const newContent = parameters.new_content || '';
-            // Concatenate with separator
-            content = oldContent + newContent;
+        // Simple LCS-based diff
+        const lcs = computeLCS(oldLines, newLines);
+        let oldIndex = 0;
+        let newIndex = 0;
+        let lcsIndex = 0;
+
+        while (oldIndex < oldLines.length || newIndex < newLines.length) {
+            if (lcsIndex < lcs.length &&
+                oldIndex < oldLines.length &&
+                newIndex < newLines.length &&
+                oldLines[oldIndex] === lcs[lcsIndex] &&
+                newLines[newIndex] === lcs[lcsIndex]) {
+                // Line unchanged
+                result.push({ type: 'unchanged', content: oldLines[oldIndex] });
+                oldIndex++;
+                newIndex++;
+                lcsIndex++;
+            } else if (oldIndex < oldLines.length &&
+                       (lcsIndex >= lcs.length || oldLines[oldIndex] !== lcs[lcsIndex])) {
+                // Line removed
+                result.push({ type: 'removed', content: oldLines[oldIndex] });
+                oldIndex++;
+            } else if (newIndex < newLines.length) {
+                // Line added
+                result.push({ type: 'added', content: newLines[newIndex] });
+                newIndex++;
+            }
         }
 
-        // Use a pre element to preserve indentation
-        return h('div', { className: 'message tool-result file-content-result' }, [
-            h('pre', { className: 'file-content' }, text(content))
-        ]);
+        return result;
+    }
+
+    // Compute longest common subsequence for diff
+    function computeLCS(arr1, arr2) {
+        const m = arr1.length;
+        const n = arr2.length;
+        const dp = Array(m + 1).fill(null).map(() => Array(n + 1).fill(0));
+
+        for (let i = 1; i <= m; i++) {
+            for (let j = 1; j <= n; j++) {
+                if (arr1[i - 1] === arr2[j - 1]) {
+                    dp[i][j] = dp[i - 1][j - 1] + 1;
+                } else {
+                    dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);
+                }
+            }
+        }
+
+        // Backtrack to find LCS
+        const lcs = [];
+        let i = m;
+        let j = n;
+        while (i > 0 && j > 0) {
+            if (arr1[i - 1] === arr2[j - 1]) {
+                lcs.unshift(arr1[i - 1]);
+                i--;
+                j--;
+            } else if (dp[i - 1][j] > dp[i][j - 1]) {
+                i--;
+            } else {
+                j--;
+            }
+        }
+
+        return lcs;
+    }
+
+    // Track expanded state for file contents (keyed by tool_use_id)
+    const expandedFiles = {};
+
+    // Render file content for create_file and update_file
+    function renderFileContent(toolName, parameters, toolUseId, showFullContent) {
+        const maxLines = 10;
+
+        if (toolName === 'create_file') {
+            // Show each line with green "+" prefix like a diff
+            const content = parameters.content || '';
+            const lines = content.split('\n');
+
+            // Show preview (10 lines) or full content based on state
+            const linesToShow = showFullContent ? lines : lines.slice(0, maxLines);
+
+            const lineElements = linesToShow.map((line, index) => {
+                const lineNum = (index + 1).toString().padStart(3, ' ');
+                return h('div', { className: 'diff-line diff-add' }, [
+                    h('span', { className: 'diff-line-number' }, text(lineNum)),
+                    h('span', { className: 'diff-line-content' }, text(' + ' + line))
+                ]);
+            });
+
+            return h('div', { className: 'message tool-result file-content-result' }, lineElements);
+        } else if (toolName === 'update_file') {
+            // Show line-by-line diff with + for additions and - for removals
+            const oldContent = parameters.old_content || '';
+            const newContent = parameters.new_content || '';
+
+            const diffLines = computeLineDiff(oldContent, newContent);
+            const visibleLines = diffLines.filter(line => line.type !== 'unchanged');
+
+            // Show preview (10 lines) or full content based on state
+            const linesToShow = showFullContent ? visibleLines : visibleLines.slice(0, maxLines);
+
+            let lineNumber = 1;
+            const lineElements = linesToShow.map((line) => {
+                const lineNum = lineNumber.toString().padStart(3, ' ');
+                const className = line.type === 'added' ? 'diff-line diff-add' : 'diff-line diff-remove';
+                const prefix = line.type === 'added' ? ' + ' : ' - ';
+
+                lineNumber++;
+
+                return h('div', { className }, [
+                    h('span', { className: 'diff-line-number' }, text(lineNum)),
+                    h('span', { className: 'diff-line-content' }, text(prefix + line.content))
+                ]);
+            });
+
+            return h('div', { className: 'message tool-result file-content-result' }, lineElements);
+        }
+
+        return null;
+    }
+
+    // Render batch file updates with blank line separators between diffs
+    function renderBatchFileContent(parameters, toolUseId, showFullContent) {
+        const maxLines = 10;
+        const updates = JSON.parse(parameters.updates || '[]');
+
+        if (!updates || updates.length === 0) {
+            return h('div', { className: 'message tool-result' }, [text('  No updates')]);
+        }
+
+        const allElements = [];
+
+        updates.forEach((update, updateIndex) => {
+            const oldContent = update.old_content || '';
+            const newContent = update.new_content || '';
+
+            const diffLines = computeLineDiff(oldContent, newContent);
+            const visibleLines = diffLines.filter(line => line.type !== 'unchanged');
+
+            // Show preview (10 lines) or full content based on state
+            const linesToShow = showFullContent ? visibleLines : visibleLines.slice(0, maxLines);
+
+            // Track actual line numbers from the original content
+            let lineNumber = 1;
+            const lineElements = linesToShow.map((line) => {
+                const lineNum = lineNumber.toString().padStart(3, ' ');
+                const className = line.type === 'added' ? 'diff-line diff-add' : 'diff-line diff-remove';
+                const prefix = line.type === 'added' ? ' + ' : ' - ';
+
+                lineNumber++;
+
+                return h('div', { className }, [
+                    h('span', { className: 'diff-line-number' }, text(lineNum)),
+                    h('span', { className: 'diff-line-content' }, text(prefix + line.content))
+                ]);
+            });
+
+            // Add all line elements for this update
+            allElements.push(...lineElements);
+
+            // Add 2 blank lines between updates (but not after the last one)
+            if (updateIndex < updates.length - 1) {
+                allElements.push(h('div', { className: 'batch-separator' }));
+                allElements.push(h('div', { className: 'batch-separator' }));
+            }
+        });
+
+        return h('div', { className: 'message tool-result file-content-result' }, allElements);
     }
 
     function renderTaskStart(result) {
@@ -9601,14 +11120,75 @@ body {
     line-height: 1.4;
 }
 
+.diff-line {
+    margin: 0;
+    padding: 0;
+    white-space: pre;
+    font-family: 'Consolas', 'Courier New', monospace;
+    display: flex;
+    line-height: 1.4;
+}
+
+.diff-line-number {
+    color: var(--text-muted);
+    user-select: none;
+    flex-shrink: 0;
+    text-align: right;
+    min-width: 3ch;
+    padding-right: 1ch;
+    border-right: 1px solid var(--border-color);
+    margin-right: 1ch;
+}
+
+.diff-line-content {
+    flex: 1;
+    white-space: pre;
+}
+
 .diff-add {
     color: var(--success);
-    margin: 2px 0;
+}
+
+.diff-add .diff-line-content {
+    color: var(--success);
 }
 
 .diff-remove {
     color: var(--error);
-    margin: 2px 0;
+}
+
+.diff-remove .diff-line-content {
+    color: var(--error);
+}
+
+.batch-separator {
+    height: 1.4em;
+}
+
+.show-more-link {
+    color: var(--info);
+    cursor: pointer;
+    text-decoration: underline;
+    font-weight: 500;
+}
+
+.show-more-link:hover {
+    color: var(--text-primary);
+}
+
+.file-chevron {
+    cursor: pointer;
+    user-select: none;
+    font-size: 0.75em;
+}
+
+.clickable-header {
+    cursor: pointer;
+    user-select: none;
+}
+
+.clickable-header:hover {
+    opacity: 0.8;
 }
 
 .success {
