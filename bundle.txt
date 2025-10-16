@@ -2579,7 +2579,6 @@ public class ConversationRenderer {
             if (!firstMessage) {
                 json.append(",");
             }
-            firstMessage = false;
 
             // Render message based on type
             switch (msg.type) {
@@ -2599,6 +2598,9 @@ public class ConversationRenderer {
                     json.append(renderError(msg));
                     break;
             }
+
+            // Only mark firstMessage as false after successfully rendering a message
+            firstMessage = false;
         }
 
         return json.toString();
@@ -11116,8 +11118,10 @@ FILE: src/frontend-ui/render.js
             const content = parameters.content || '';
             const lines = content.split('\n');
 
-            // Show preview (10 lines) or full content based on state
-            const linesToShow = showFullContent ? lines : lines.slice(0, maxLines);
+            // If file has <= 10 lines, always show full content (no preview mode)
+            // Otherwise, show preview (10 lines) or full content based on showFullContent state
+            const linesToShow = lines.length <= maxLines ? lines :
+                               (showFullContent ? lines : lines.slice(0, maxLines));
 
             const lineElements = linesToShow.map((line, index) => {
                 const lineNum = (index + 1).toString().padStart(3, ' ');
@@ -11136,8 +11140,10 @@ FILE: src/frontend-ui/render.js
             const diffLines = computeLineDiff(oldContent, newContent);
             const visibleLines = diffLines.filter(line => line.type !== 'unchanged');
 
-            // Show preview (10 lines) or full content based on state
-            const linesToShow = showFullContent ? visibleLines : visibleLines.slice(0, maxLines);
+            // If diff has <= 10 lines, always show full content (no preview mode)
+            // Otherwise, show preview (10 lines) or full content based on showFullContent state
+            const linesToShow = visibleLines.length <= maxLines ? visibleLines :
+                               (showFullContent ? visibleLines : visibleLines.slice(0, maxLines));
 
             const lineElements = linesToShow.map((line) => {
                 // Use actual line numbers from the file
@@ -11171,7 +11177,21 @@ FILE: src/frontend-ui/render.js
             return h('div', { className: 'message tool-result' }, [text('  No updates')]);
         }
 
+        // Calculate total visible lines across all updates to determine if we should preview
+        let totalVisibleLines = 0;
+        const allVisibleLines = [];
+
+        updates.forEach((update) => {
+            const oldContent = update.old_content || '';
+            const newContent = update.new_content || '';
+            const diffLines = computeLineDiff(oldContent, newContent);
+            const visibleLines = diffLines.filter(line => line.type !== 'unchanged');
+            allVisibleLines.push(visibleLines);
+            totalVisibleLines += visibleLines.length;
+        });
+
         const allElements = [];
+        let linesSoFar = 0;
 
         updates.forEach((update, updateIndex) => {
             const oldContent = update.old_content || '';
@@ -11180,11 +11200,27 @@ FILE: src/frontend-ui/render.js
             // Get the start line from updates_detail if available
             const startLine = updatesDetail[updateIndex] ? updatesDetail[updateIndex].start_line : 1;
 
-            const diffLines = computeLineDiff(oldContent, newContent);
-            const visibleLines = diffLines.filter(line => line.type !== 'unchanged');
+            const visibleLines = allVisibleLines[updateIndex];
 
-            // Show preview (10 lines) or full content based on state
-            const linesToShow = showFullContent ? visibleLines : visibleLines.slice(0, maxLines);
+            // Determine lines to show for this update
+            // If total lines <= 10, show all lines
+            // If collapsed mode and we've shown 10 lines already, skip this update
+            // If collapsed mode and we haven't hit the limit, show what we can
+            let linesToShow;
+            if (totalVisibleLines <= maxLines) {
+                linesToShow = visibleLines;
+            } else if (showFullContent) {
+                linesToShow = visibleLines;
+            } else {
+                const remainingLines = maxLines - linesSoFar;
+                if (remainingLines <= 0) {
+                    // Already shown 10 lines, skip this update
+                    return;
+                }
+                linesToShow = visibleLines.slice(0, remainingLines);
+            }
+
+            linesSoFar += linesToShow.length;
 
             const lineElements = linesToShow.map((line) => {
                 // Calculate actual file line number using the start line from Java
@@ -11210,7 +11246,8 @@ FILE: src/frontend-ui/render.js
             allElements.push(...lineElements);
 
             // Add 2 blank lines between updates (but not after the last one)
-            if (updateIndex < updates.length - 1) {
+            // Only add separator if we're not at the end and haven't hit the preview limit
+            if (updateIndex < updates.length - 1 && (showFullContent || totalVisibleLines <= maxLines || linesSoFar < maxLines)) {
                 allElements.push(h('div', { className: 'batch-separator' }));
                 allElements.push(h('div', { className: 'batch-separator' }));
             }
