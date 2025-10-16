@@ -5820,7 +5820,7 @@ public class BridgePollingThread implements Runnable {
 
                 // 3. Format request with request ID and bridge marker
                 String markedRequest = "REQUEST_ID:" + currentRequestId + "\n" +
-                                     request.messageJson + "\n|||||CLIP:TO_BRIDGE|||||";
+                                     request.messageJson + "|||||CLIP:TO_BRIDGE|||||";
 
                 // 4. Write to clipboard
                 clipboardManager.copyToClipboard(markedRequest);
