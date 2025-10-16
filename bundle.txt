@@ -2588,6 +2588,9 @@ public class ConversationRenderer {
                 case "assistant_msg":
                     json.append(renderAssistantMessage(msg));
                     break;
+                case "system_msg":
+                    json.append(renderSystemMessage(msg));
+                    break;
                 case "tool_use":
                     json.append(renderToolUse(msg));
                     break;
@@ -2610,7 +2613,9 @@ public class ConversationRenderer {
      * Check if message type is a meta message that should be filtered out
      */
     private boolean isMetaMessage(String type) {
-        return "loading".equals(type);
+        return "loading".equals(type) ||
+               "command_result".equals(type) ||
+               "mode_transition".equals(type);
     }
 
     /**
@@ -2627,6 +2632,14 @@ public class ConversationRenderer {
      */
     private String renderAssistantMessage(ConversationState.Message msg) {
         return "{\"role\":\"assistant\",\"content\":\"" + escapeJson(msg.content) + "\"}";
+    }
+
+    /**
+     * Render system message
+     * Format: {"role":"user","content":"..."}
+     */
+    private String renderSystemMessage(ConversationState.Message msg) {
+        return "{\"role\":\"user\",\"content\":\"" + escapeJson(msg.content) + "\"}";
     }
 
     /**
@@ -12340,6 +12353,10 @@ If your response was CUT OFF mid-sentence, continue writing immediately after th
         const sessionId = 'session-' + Math.random().toString(36).substr(2, 9);
         const apiBase = window.location.origin;
 
+        // OPTIMIZATION: Commented out /new call for normal requests
+        // Testing shows /completions works independently without needing prior /new call
+        // /new is kept only in keepalive to maintain session warmth
+        /*
         // Fire /new in background
         fetch(`${apiBase}/api/v1/chats/new`, {
             method: 'POST',
@@ -12380,6 +12397,7 @@ If your response was CUT OFF mid-sentence, continue writing immediately after th
                 }
             })
         }).catch(err => {});
+        */
 
         const completionsResponse = await fetch(`${apiBase}/api/chat/completions`, {
             method: 'POST',
