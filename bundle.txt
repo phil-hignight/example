@@ -606,6 +606,7 @@ public class AIProcessorThread implements Runnable {
     private final String workingDirectory;
     private final ProjectStructure projectStructure;
     private volatile boolean running = true;
+    private String lastAIRequest = null;  // Store last request for retry
 
     public AIProcessorThread(
         ConversationQueue conversationQueue,
@@ -641,10 +642,45 @@ public class AIProcessorThread implements Runnable {
                 ConversationQueue.UserMessage userMsg = conversationQueue.takeMessage();
                 logger.log("Processing message: " + userMsg.text);
 
-                // 2. Add user message to conversation first
-                conversationManager.getState().setStatus("processing");
-                conversationManager.addUserMessage(userMsg.text);
-                conversationQueue.publishState(conversationManager.getConversationStateJson());
+                // 2. Check for retry/abort commands (when lastAIRequest is set, we're in retry mode)
+                String aiRequest;
+                if (lastAIRequest != null) {
+                    String trimmed = userMsg.text.trim().toLowerCase();
+                    if (trimmed.equals("retry") || trimmed.equals("r")) {
+                        // User wants to retry - add message and use stored request
+                        conversationManager.getState().setStatus("processing");
+                        conversationManager.addUserMessage(userMsg.text);
+                        conversationQueue.publishState(conversationManager.getConversationStateJson());
+
+                        logger.log("Retrying last AI request");
+                        aiRequest = lastAIRequest;
+                        lastAIRequest = null;  // Clear after using
+
+                    } else if (trimmed.equals("abort") || trimmed.equals("a")) {
+                        // User wants to abort - clear retry state and add message
+                        lastAIRequest = null;
+                        conversationManager.getState().setStatus("processing");
+                        conversationManager.addUserMessage(userMsg.text);
+                        conversationManager.addAssistantMessage("Request aborted.");
+                        conversationManager.getState().setStatus("complete");
+                        conversationQueue.publishState(conversationManager.getConversationStateJson());
+                        logger.log("User aborted request");
+                        continue;
+                    } else {
+                        // If not retry/abort, clear the retry state and process normally
+                        lastAIRequest = null;
+                        conversationManager.getState().setStatus("processing");
+                        conversationManager.addUserMessage(userMsg.text);
+                        conversationQueue.publishState(conversationManager.getConversationStateJson());
+                        aiRequest = buildAIRequestFromHistory();
+                    }
+                } else {
+                    // Normal flow - add user message to conversation first
+                    conversationManager.getState().setStatus("processing");
+                    conversationManager.addUserMessage(userMsg.text);
+                    conversationQueue.publishState(conversationManager.getConversationStateJson());
+                    aiRequest = buildAIRequestFromHistory();
+                }
 
                 // 3. Check if we just started execution after approval - add task notification AFTER "yes"
                 if (conversationManager.isJustStartedExecution()) {
@@ -667,8 +703,7 @@ public class AIProcessorThread implements Runnable {
                     conversationManager.clearJustStartedExecution();
                 }
 
-                // 4. Build AI request with full conversation history and send to AI via bridge
-                String aiRequest = buildAIRequestFromHistory();
+                // 4. Send AI request to bridge (aiRequest already built above based on retry or normal flow)
                 logger.log("Sending to AI: " + aiRequest);
                 BridgeQueue.AIResponse aiResponse = submitToBridge(aiRequest);
                 logger.log("Got AI response: " + aiResponse.responseXml);
@@ -1133,14 +1168,25 @@ public class AIProcessorThread implements Runnable {
 
     /**
      * Submit request to AI bridge and check for errors
-     * @throws RuntimeException if bridge returns an error
+     * @throws RuntimeException if bridge returns a non-recoverable error
      */
     private BridgeQueue.AIResponse submitToBridge(String request) throws InterruptedException {
         BridgeQueue.AIResponse response = bridgeQueue.submitRequest(request);
 
         // Check if response is an error from the bridge
         if (response.responseXml != null && response.responseXml.startsWith("ERROR:")) {
-            throw new RuntimeException("AI Bridge error: " + response.responseXml.substring(7).trim());
+            String errorMsg = response.responseXml.substring(7).trim();
+
+            // Check if this is a mouse cancelled error (recoverable)
+            if (errorMsg.startsWith("Mouse cancelled")) {
+                // Store the request for potential retry
+                lastAIRequest = request;
+                // Throw exception with the full message (includes retry/abort instructions)
+                throw new RuntimeException("AI Bridge error: " + errorMsg);
+            }
+
+            // Other errors are not recoverable
+            throw new RuntimeException("AI Bridge error: " + errorMsg);
         }
 
         return response;
@@ -4165,7 +4211,7 @@ public class PromptGenerator {
                "  Note: directory_path is optional (defaults to current directory)\n" +
                "  Note: By default, excludes node_modules, .git, bin, obj, target, build, dist, .vscode\n" +
                "  Note: Set include_excluded=true to search these directories\n" +
-               "  Note: Timeout is 5 minutes; returns partial results with warning if timeout occurs\n" +
+               "  Note: Timeout is 30 seconds; returns partial results with warning if timeout occurs\n" +
                "  Returns: List of files matching the name pattern\n\n" +
 
                "SEARCH FILES BY CONTENT:\n" +
@@ -4180,7 +4226,7 @@ public class PromptGenerator {
                "  Note: max_results defaults to 100, maximum is 500. Use specific patterns instead of broad searches.\n" +
                "  Note: By default, excludes node_modules, .git, bin, obj, target, build, dist, .vscode\n" +
                "  Note: Set include_excluded=true to search these directories\n" +
-               "  Note: Timeout is 10 minutes; returns partial results with warning if timeout occurs\n" +
+               "  Note: Timeout is 30 seconds; returns partial results with warning if timeout occurs\n" +
                "  Returns: List of files containing the pattern with line numbers\n\n";
     }
 
@@ -5782,8 +5828,8 @@ public class BridgePollingThread implements Runnable {
                 // 5. Handle special responses
                 // NOTE: clipboardManager.waitForAutomaticResponse() already appends markers
                 if ("MOUSE_CANCELLED".equals(response)) {
-                    // User moved mouse - submit error or retry
-                    bridgeQueue.submitResponse("ERROR: Mouse cancelled");
+                    // User moved mouse - submit error with retry/abort instructions
+                    bridgeQueue.submitResponse("ERROR: Mouse cancelled. Type 'retry' or 'abort'.");
                 } else if ("TOKEN_LIMIT_EXCEEDED".equals(response)) {
                     // Token limit reached
                     bridgeQueue.submitResponse("ERROR: Token limit exceeded");
@@ -9652,8 +9698,8 @@ public class ToolExecutor implements IToolExecutor {
             pb.directory(new File(workingDirectory));
             Process process = pb.start();
 
-            // 5 minute timeout for file name search
-            boolean completed = process.waitFor(300, java.util.concurrent.TimeUnit.SECONDS);
+            // 30 second timeout for file name search
+            boolean completed = process.waitFor(30, java.util.concurrent.TimeUnit.SECONDS);
             boolean timedOut = !completed;
             if (timedOut) {
                 process.destroyForcibly();
@@ -9696,7 +9742,7 @@ public class ToolExecutor implements IToolExecutor {
             result.put("directory", directoryPath);
 
             if (timedOut) {
-                result.put("warning", "Search timed out after 5 minutes. Showing partial results. To search more thoroughly, narrow the scope by specifying a more specific directory_path.");
+                result.put("warning", "Search timed out after 30 seconds. Showing partial results. To search more thoroughly, narrow the scope by specifying a more specific directory_path.");
                 result.put("timed_out", true);
             }
 
@@ -9787,8 +9833,8 @@ public class ToolExecutor implements IToolExecutor {
             pb.directory(new File(workingDirectory));
             Process process = pb.start();
 
-            // 10 minute timeout for content search
-            boolean completed = process.waitFor(600, java.util.concurrent.TimeUnit.SECONDS);
+            // 30 second timeout for content search
+            boolean completed = process.waitFor(30, java.util.concurrent.TimeUnit.SECONDS);
             boolean timedOut = !completed;
             if (timedOut) {
                 process.destroyForcibly();
@@ -9861,7 +9907,7 @@ public class ToolExecutor implements IToolExecutor {
             boolean resultsLimited = matches.size() >= maxResults;
 
             if (timedOut) {
-                result.put("warning", "Search timed out after 10 minutes. Showing partial results. To search more thoroughly, narrow the scope by specifying a more specific directory_path.");
+                result.put("warning", "Search timed out after 30 seconds. Showing partial results. To search more thoroughly, narrow the scope by specifying a more specific directory_path.");
                 result.put("timed_out", true);
             } else if (resultsLimited) {
                 result.put("warning", "Results limited to " + maxResults + " matches (max_results=" + maxResults + "). Use a more specific pattern, narrow directory_path, or increase max_results (up to 500) to see more.");
@@ -11465,38 +11511,29 @@ FILE: src/frontend-ui/render.js
 
             const lineElements = linesToShow.map((line, index) => {
                 const lineNum = (index + 1).toString().padStart(3, ' ');
+                const isLastLine = index === linesToShow.length - 1;
+                const shouldShowMore = lines.length > maxLines && !showFullContent && isLastLine;
+
                 return h('div', {
                     className: 'diff-line diff-add',
                     key: `${toolUseId}-line-${index + 1}`  // Unique key for proper VDOM diffing
                 }, [
                     h('span', { className: 'diff-line-number' }, text(lineNum)),
-                    h('span', { className: 'diff-line-content' }, text(' + ' + line))
+                    h('span', { className: 'diff-line-content' }, text(' + ' + line)),
+                    shouldShowMore ? h('span', {
+                        className: 'show-more-link',
+                        onclick: () => {
+                            if (window.module["main.js"] && window.module["main.js"].localState) {
+                                const expandedFiles = window.module["main.js"].localState.expandedFiles;
+                                expandedFiles[toolUseId] = true;
+                                window.module["main.js"].refreshRender();
+                            }
+                        }
+                    }, text('show more')) : null
                 ]);
             });
 
             console.log('[CREATE_FILE] toolUseId:', toolUseId, 'linesToShow.length:', linesToShow.length, 'lineElements.length:', lineElements.length, 'showFullContent:', showFullContent);
-
-            // Add "show more" link if content is truncated
-            if (lines.length > maxLines && !showFullContent) {
-                console.log('[CREATE_FILE] Adding show more link');
-                lineElements.push(
-                    h('div', {
-                        style: 'margin-top: 4px;',
-                        key: `${toolUseId}-show-more`  // Add key to prevent VDOM confusion
-                    }, [
-                        h('span', {
-                            className: 'show-more-link',
-                            onclick: () => {
-                                if (window.module["main.js"] && window.module["main.js"].localState) {
-                                    const expandedFiles = window.module["main.js"].localState.expandedFiles;
-                                    expandedFiles[toolUseId] = true;
-                                    window.module["main.js"].refreshRender();
-                                }
-                            }
-                        }, text('show more'))
-                    ])
-                );
-            }
 
             console.log('[CREATE_FILE] Returning lineElements.length:', lineElements.length, 'keys:', lineElements.map(el => el.props?.key).join(', '));
 
@@ -11528,35 +11565,27 @@ FILE: src/frontend-ui/render.js
                 // Use actual line number for key to ensure proper VDOM diffing
                 const actualLineNum = line.type === 'added' ? line.newLineNum : line.oldLineNum;
 
+                const isLastLine = index === linesToShow.length - 1;
+                const shouldShowMore = visibleLines.length > maxLines && !showFullContent && isLastLine;
+
                 return h('div', {
                     className,
                     key: `${toolUseId}-${line.type}-${actualLineNum}`  // Unique key for proper VDOM diffing
                 }, [
                     h('span', { className: 'diff-line-number' }, text(lineNum)),
-                    h('span', { className: 'diff-line-content' }, text(prefix + line.content))
+                    h('span', { className: 'diff-line-content' }, text(prefix + line.content)),
+                    shouldShowMore ? h('span', {
+                        className: 'show-more-link',
+                        onclick: () => {
+                            if (window.module["main.js"] && window.module["main.js"].localState) {
+                                const expandedFiles = window.module["main.js"].localState.expandedFiles;
+                                expandedFiles[toolUseId] = true;
+                                window.module["main.js"].refreshRender();
+                            }
+                        }
+                    }, text('show more')) : null
                 ]);
             });
-
-            // Add "show more" link if content is truncated
-            if (visibleLines.length > maxLines && !showFullContent) {
-                lineElements.push(
-                    h('div', {
-                        style: 'margin-top: 4px;',
-                        key: `${toolUseId}-show-more`  // Add key to prevent VDOM confusion
-                    }, [
-                        h('span', {
-                            className: 'show-more-link',
-                            onclick: () => {
-                                if (window.module["main.js"] && window.module["main.js"].localState) {
-                                    const expandedFiles = window.module["main.js"].localState.expandedFiles;
-                                    expandedFiles[toolUseId] = true;
-                                    window.module["main.js"].refreshRender();
-                                }
-                            }
-                        }, text('show more'))
-                    ])
-                );
-            }
 
             return h('div', {
                 className: 'message tool-result file-content-result',
@@ -11594,6 +11623,7 @@ FILE: src/frontend-ui/render.js
 
         const allElements = [];
         let linesSoFar = 0;
+        const shouldShowMore = totalVisibleLines > maxLines && !showFullContent;
 
         updates.forEach((update, updateIndex) => {
             const oldContent = update.old_content || '';
@@ -11654,12 +11684,25 @@ FILE: src/frontend-ui/render.js
                 // Create unique key for proper VDOM diffing
                 const uniqueKey = `${toolUseId}-update${updateIndex}-${line.type}-${lineNum}`;
 
+                // Check if this is the very last line that will be shown (for "show more" link)
+                const isVeryLastLine = shouldShowMore && linesSoFar === maxLines && lineIndex === linesToShow.length - 1;
+
                 return h('div', {
                     className,
                     key: uniqueKey  // Unique key for proper VDOM diffing
                 }, [
                     h('span', { className: 'diff-line-number' }, text(lineNum.toString().padStart(3, ' '))),
-                    h('span', { className: 'diff-line-content' }, text(prefix + line.content))
+                    h('span', { className: 'diff-line-content' }, text(prefix + line.content)),
+                    isVeryLastLine ? h('span', {
+                        className: 'show-more-link',
+                        onclick: () => {
+                            if (window.module["main.js"] && window.module["main.js"].localState) {
+                                const expandedFiles = window.module["main.js"].localState.expandedFiles;
+                                expandedFiles[toolUseId] = true;
+                                window.module["main.js"].refreshRender();
+                            }
+                        }
+                    }, text('show more')) : null
                 ]);
             });
 
@@ -11672,28 +11715,6 @@ FILE: src/frontend-ui/render.js
                 allElements.push(h('div', { className: 'batch-separator' }));
             }
         });
-
-        // Add "show more" link if content is truncated
-        if (totalVisibleLines > maxLines && !showFullContent) {
-            console.log('[SHOW_MORE] Adding show more link. totalVisibleLines:', totalVisibleLines, 'maxLines:', maxLines, 'showFullContent:', showFullContent);
-            allElements.push(
-                h('div', {
-                    style: 'margin-top: 4px;',
-                    key: `${toolUseId}-show-more`  // Add key to prevent VDOM confusion
-                }, [
-                    h('span', {
-                        className: 'show-more-link',
-                        onclick: () => {
-                            if (window.module["main.js"] && window.module["main.js"].localState) {
-                                const expandedFiles = window.module["main.js"].localState.expandedFiles;
-                                expandedFiles[toolUseId] = true;
-                                window.module["main.js"].refreshRender();
-                            }
-                        }
-                    }, text('show more'))
-                ])
-            );
-        }
 
         return h('div', {
             className: 'message tool-result file-content-result',
@@ -12022,14 +12043,15 @@ body {
 }
 
 .show-more-link {
-    color: var(--info);
+    color: var(--text-muted);
     cursor: pointer;
-    text-decoration: underline;
+    text-decoration: none;
     font-weight: 500;
 }
 
 .show-more-link:hover {
     color: var(--text-primary);
+    text-decoration: underline;
 }
 
 .file-chevron {
