@@ -5790,6 +5790,7 @@ public class BridgePollingThread implements Runnable {
     private final IConfigManager configManager;
     private final ILogger logger;
     private volatile boolean running = true;
+    private String currentRequestId = null;  // Track current request ID for validation
 
     public BridgePollingThread(
         BridgeQueue bridgeQueue,
@@ -5813,32 +5814,49 @@ public class BridgePollingThread implements Runnable {
                 BridgeQueue.AIRequest request = bridgeQueue.takeRequest();
                 logger.log("Bridge received AI request");
 
-                // 2. Format request with bridge marker
-                String markedRequest = request.messageJson + "\n|||||CLIP:TO_BRIDGE|||||";
+                // 2. Generate unique request ID (timestamp + random component for uniqueness)
+                currentRequestId = System.currentTimeMillis() + "-" + ((int)(Math.random() * 10000));
+                logger.log("Generated request ID: " + currentRequestId);
 
-                // 3. Write to clipboard
+                // 3. Format request with request ID and bridge marker
+                String markedRequest = "REQUEST_ID:" + currentRequestId + "\n" +
+                                     request.messageJson + "\n|||||CLIP:TO_BRIDGE|||||";
+
+                // 4. Write to clipboard
                 clipboardManager.copyToClipboard(markedRequest);
 
-                // 4. Wait for AI response via clipboard polling
+                // 5. Wait for AI response via clipboard polling
                 String response = clipboardManager.waitForAutomaticResponse(
                     configManager.getClickX(),
                     configManager.getClickY()
                 );
 
-                // 5. Handle special responses
+                // 6. Handle special responses
                 // NOTE: clipboardManager.waitForAutomaticResponse() already appends markers
                 if ("MOUSE_CANCELLED".equals(response)) {
                     // User moved mouse - submit error with retry/abort instructions
                     bridgeQueue.submitResponse("ERROR: Mouse cancelled. Type 'retry' or 'abort'.");
                 } else if ("TOKEN_LIMIT_EXCEEDED".equals(response)) {
-                    // Token limit reached
-                    bridgeQueue.submitResponse("ERROR: Token limit exceeded");
+                    // Token limit reached - validate ID and submit
+                    if (validateResponseId(response)) {
+                        bridgeQueue.submitResponse("ERROR: Token limit exceeded");
+                    } else {
+                        logger.log("Token limit response ID mismatch - ignoring stale response");
+                        bridgeQueue.submitResponse("ERROR: Stale response detected. Please retry.");
+                    }
                 } else if (response == null) {
                     // Timeout or error
                     bridgeQueue.submitResponse("ERROR: No response received");
                 } else {
-                    // Normal response (includes |||||CLIP:TO_JAVA_END||||| marker from clipboard)
-                    bridgeQueue.submitResponse(response);
+                    // Normal response - validate request ID matches
+                    if (validateResponseId(response)) {
+                        // Strip REQUEST_ID line before submitting
+                        String responseWithoutId = stripRequestId(response);
+                        bridgeQueue.submitResponse(responseWithoutId);
+                    } else {
+                        logger.log("Response ID mismatch - ignoring stale response");
+                        bridgeQueue.submitResponse("ERROR: Stale response detected. Please retry.");
+                    }
                 }
 
             } catch (Exception e) {
@@ -5861,6 +5879,41 @@ public class BridgePollingThread implements Runnable {
 
     public void shutdown() {
         running = false;
+    }
+
+    /**
+     * Validate that the response contains the expected request ID
+     * @param response The response from the bridge
+     * @return true if response ID matches current request ID
+     */
+    private boolean validateResponseId(String response) {
+        if (currentRequestId == null || response == null) {
+            return false;
+        }
+
+        // Response should start with "REQUEST_ID:xxxxx\n"
+        String expectedPrefix = "REQUEST_ID:" + currentRequestId + "\n";
+        return response.startsWith(expectedPrefix);
+    }
+
+    /**
+     * Strip the REQUEST_ID line from the response
+     * @param response The response with REQUEST_ID line
+     * @return The response without the REQUEST_ID line
+     */
+    private String stripRequestId(String response) {
+        if (response == null) {
+            return null;
+        }
+
+        // Find the first newline (end of REQUEST_ID line)
+        int firstNewline = response.indexOf('\n');
+        if (firstNewline == -1) {
+            return response;
+        }
+
+        // Return everything after the first newline
+        return response.substring(firstNewline + 1);
     }
 }
 
@@ -12568,6 +12621,7 @@ FILE: src/browser/bridge-button.js
     let currentState = 'listening'; // 'listening' or 'response'
     let isProcessing = false;
     let currentResponse = '';
+    let currentRequestId = null;  // Track current request ID
     
     // Protocol constants
     const TO_BRIDGE_MARKER = '|||||CLIP:TO_BRIDGE|||||';
@@ -12719,8 +12773,23 @@ FILE: src/browser/bridge-button.js
                 return;
             }
 
-            console.log('[BRIDGE] Valid TO_BRIDGE marker found, parsing JSON...');
-            const jsonText = clipboardText.slice(0, -TO_BRIDGE_MARKER.length);
+            console.log('[BRIDGE] Valid TO_BRIDGE marker found, extracting request ID...');
+            let textWithoutMarker = clipboardText.slice(0, -TO_BRIDGE_MARKER.length);
+
+            // Extract REQUEST_ID from first line
+            let requestId = null;
+            let jsonText = textWithoutMarker;
+            if (textWithoutMarker.startsWith('REQUEST_ID:')) {
+                const firstNewline = textWithoutMarker.indexOf('\n');
+                if (firstNewline !== -1) {
+                    requestId = textWithoutMarker.substring(11, firstNewline); // Extract ID after "REQUEST_ID:"
+                    jsonText = textWithoutMarker.substring(firstNewline + 1); // JSON is after the newline
+                    console.log('[BRIDGE] Extracted request ID:', requestId);
+                }
+            }
+
+            currentRequestId = requestId;
+
             let request;
             try {
                 request = JSON.parse(jsonText);
@@ -12787,12 +12856,47 @@ FILE: src/browser/bridge-button.js
     async function handleResponseClick() {
         console.log('[BRIDGE] handleResponseClick called');
         try {
-            const responseWithMarker = currentResponse + TO_JAVA_MARKER;
-            console.log('[BRIDGE] Writing response to clipboard - length:', responseWithMarker.length);
-            await navigator.clipboard.writeText(responseWithMarker);
-            console.log('[BRIDGE] Response successfully copied to clipboard with TO_JAVA marker');
+            // IMPORTANT: Check if clipboard has a new request before overwriting with response
+            console.log('[BRIDGE] Checking clipboard for new request...');
+            const clipboardText = await navigator.clipboard.readText();
+
+            // Check if there's a new request with a different ID
+            if (clipboardText && clipboardText.endsWith(TO_BRIDGE_MARKER)) {
+                console.log('[BRIDGE] Found TO_BRIDGE marker in clipboard, checking request ID...');
+                let textWithoutMarker = clipboardText.slice(0, -TO_BRIDGE_MARKER.length);
+
+                // Extract REQUEST_ID from clipboard
+                if (textWithoutMarker.startsWith('REQUEST_ID:')) {
+                    const firstNewline = textWithoutMarker.indexOf('\n');
+                    if (firstNewline !== -1) {
+                        const clipboardRequestId = textWithoutMarker.substring(11, firstNewline);
+                        console.log('[BRIDGE] Clipboard has request ID:', clipboardRequestId, 'Current response is for ID:', currentRequestId);
+
+                        // If IDs don't match, this is a NEW request - reset and process it
+                        if (clipboardRequestId !== currentRequestId) {
+                            console.log('[BRIDGE] NEW REQUEST DETECTED - resetting to listening mode and processing new request');
+                            currentState = 'listening';
+                            currentResponse = '';
+                            currentRequestId = null;
+                            updateUI('listening', 'New request detected - processing...');
+                            // Process the new request
+                            await handleListeningClick();
+                            return;
+                        }
+                    }
+                }
+            }
+
+            // No new request detected, proceed with writing response
+            const responseWithId = currentRequestId ?
+                'REQUEST_ID:' + currentRequestId + '\n' + currentResponse + TO_JAVA_MARKER :
+                currentResponse + TO_JAVA_MARKER;
+            console.log('[BRIDGE] Writing response to clipboard - length:', responseWithId.length);
+            await navigator.clipboard.writeText(responseWithId);
+            console.log('[BRIDGE] Response successfully copied to clipboard with REQUEST_ID and TO_JAVA marker');
             currentState = 'listening';
             currentResponse = '';
+            currentRequestId = null;
             updateUI('listening', 'Response copied - ready for next request');
         } catch (error) {
             console.error('[BRIDGE] Error copying response to clipboard:', error);
