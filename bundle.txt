@@ -272,7 +272,19 @@ public class ClipboardManager implements com.codeboss.javalayer.bridge.IClipboar
                             continue;
                         }
 
+                        // Log detailed info about the response for debugging
                         log("SUCCESS: Received valid response (" + response.length() + " chars)");
+                        log("Response first 200 chars: " + (response.length() > 200 ? response.substring(0, 200) : response));
+                        log("Response last 100 chars: " + (response.length() > 100 ? response.substring(response.length() - 100) : response));
+
+                        // Check for common issues
+                        if (response.contains("<execute>") && !response.contains("</execute>")) {
+                            log("WARNING: Response has <execute> but missing </execute> - may be truncated");
+                        }
+                        if (response.contains("<tool") && !response.contains("</tool>")) {
+                            log("WARNING: Response has <tool> but missing </tool> - may be truncated");
+                        }
+
                         return response;
                     }
                 } else {
@@ -1958,6 +1970,8 @@ public class ConversationManager {
                 // Print startup info about conversation file
                 System.out.println("Conversation file: " + conversationFile.toAbsolutePath());
                 System.out.println("Initial message count: " + state.getHistory().size());
+                // Set status to complete when loading existing conversation
+                state.setStatus("complete");
             } else {
                 System.out.println("Conversation file: " + conversationFile.toAbsolutePath() + " (will be created)");
                 System.out.println("Initial message count: 0");
@@ -2337,6 +2351,9 @@ public class ConversationManager {
 
         String toolName = extractJsonString(json, "toolName");
         if (toolName != null) msg.toolName = toolName;
+
+        String toolUseId = extractJsonString(json, "tool_use_id");
+        if (toolUseId != null) msg.tool_use_id = toolUseId;
 
         String modeTransition = extractJsonString(json, "mode_transition");
         if (modeTransition != null) msg.mode_transition = modeTransition;
@@ -4285,27 +4302,57 @@ public class PromptGenerator {
 
     private String getResponseFormatRules() {
         return "RESPONSE FORMAT:\n\n" +
+
+               "=== CRITICAL: RESPONSE TERMINATOR ===\n" +
+               "EVERY response MUST end with the terminator: |||||END|||||\n\n" +
+
+               "This terminator signals your response is complete. Without it, the system assumes your response was cut off and will ask you to continue.\n\n" +
+
+               "ALWAYS end your response with |||||END||||| - even for short messages!\n\n" +
+
+               "=== RESPONSE STRUCTURE ===\n" +
                "Your response must contain EXACTLY ONE top-level tag:\n" +
                "- <execute> for tool calls\n" +
                "- <message> for text responses\n\n" +
 
-               "Option 1 - Execute tools:\n" +
+               "Option 1 - Execute tools (use this template):\n" +
                "<execute>\n" +
                "  <tool name=\"tool_name\">\n" +
                "    <parameter name=\"param_name\">value</parameter>\n" +
                "  </tool>\n" +
-               "</execute>\n\n" +
+               "</execute>\n" +
+               "|||||END|||||\n\n" +
 
-               "Option 2 - Send a message:\n" +
-               "<message>Your message here</message>\n\n" +
+               "Option 2 - Send a message (use this template):\n" +
+               "<message>Your message here</message>\n" +
+               "|||||END|||||\n\n" +
 
-               "[X] WRONG - Sending both:\n" +
+               "Example with multiple tools:\n" +
+               "<execute>\n" +
+               "  <tool name=\"read_file\">\n" +
+               "    <parameter name=\"file_path\">src/Main.java</parameter>\n" +
+               "  </tool>\n" +
+               "  <tool name=\"create_file\">\n" +
+               "    <parameter name=\"file_path\">test.txt</parameter>\n" +
+               "    <parameter name=\"content\"><![CDATA[Hello World]]></parameter>\n" +
+               "  </tool>\n" +
+               "  <tool name=\"mark_complete\"></tool>\n" +
+               "</execute>\n" +
+               "|||||END|||||\n\n" +
+
+               "[X] WRONG - Missing terminator:\n" +
+               "<message>Hello!</message>\n" +
+               "[This will trigger unwanted continuation requests!]\n\n" +
+
+               "[X] WRONG - Sending both tags:\n" +
                "<execute>...</execute>\n" +
-               "<message>...</message>\n\n" +
+               "<message>...</message>\n" +
+               "|||||END|||||\n\n" +
 
                "[X] WRONG - Text outside tags:\n" +
                "Let me help you...\n" +
-               "<execute>...</execute>\n\n" +
+               "<execute>...</execute>\n" +
+               "|||||END|||||\n\n" +
 
                "WARNING: USING TEMPLATES:\n\n" +
                "Copy templates EXACTLY. Replace only the PLACEHOLDER text (like PUT_FILE_PATH_HERE).\n\n" +
@@ -4685,7 +4732,23 @@ public class ResponseParser {
         }
 
         if (tools.isEmpty()) {
-            throw new IllegalArgumentException("No tools found in <execute> block");
+            // Enhanced error message with debugging info
+            String debugInfo = "Execute element details: " +
+                "name=" + executeElement.name +
+                ", children=" + executeElement.children.size() +
+                ", textContent='" + (executeElement.textContent.length() > 100 ? executeElement.textContent.substring(0, 100) + "..." : executeElement.textContent) + "'";
+
+            // List all child element names to help debug
+            if (!executeElement.children.isEmpty()) {
+                debugInfo += ", child elements: [";
+                for (int i = 0; i < executeElement.children.size(); i++) {
+                    if (i > 0) debugInfo += ", ";
+                    debugInfo += executeElement.children.get(i).name;
+                }
+                debugInfo += "]";
+            }
+
+            throw new IllegalArgumentException("No tools found in <execute> block. " + debugInfo);
         }
 
         return new ParsedResponse(tools, warnings);
@@ -12194,6 +12257,12 @@ FILE: src/browser/bridge-button.js
                 return 'TOKEN_LIMIT_EXCEEDED';
             }
 
+            // Check if AI responded with COMPLETED signal
+            if (response.trim() === 'COMPLETED|||||END|||||') {
+                console.log('[BRIDGE] AI confirmed response was complete - returning fullResponse without appending');
+                return fullResponse;
+            }
+
             fullResponse += response;
             const hasEnd = fullResponse.endsWith('|||||END|||||');
 
@@ -12203,7 +12272,12 @@ FILE: src/browser/bridge-button.js
 
             // Prepare continuation request
             const lastChars = fullResponse.slice(-30);
-            const continuationContent = `Your previous response was cut off. The last 30 characters were: "${lastChars}". Start writing immediately after these exact characters. We will append your response to the previous output. End with |||||END||||| when complete.`;
+            const continuationContent = `Your previous response did not end with the required |||||END||||| terminator. The last 30 characters were: "${lastChars}".
+
+If your response WAS actually complete, respond with ONLY:
+COMPLETED|||||END|||||
+
+If your response was CUT OFF mid-sentence, continue writing immediately after those exact characters. We will append your continuation to the previous output. End with |||||END||||| when complete.`;
 
             conversationMessages.push({
                 role: 'assistant',
@@ -12237,7 +12311,7 @@ FILE: src/browser/bridge-button.js
                 chat: {
                     id: '',
                     title: 'Chat Pending',
-                    models: ['Anthropic Claude 4 Sonnet'],
+                    models: ['claude-sonnet-4-20250514'],
                     params: {},
                     history: {
                         messages: {
