@@ -1101,7 +1101,10 @@ public class AIProcessorThread implements Runnable {
                 }
                 logger.log("AI Processor error: " + e.getMessage());
 
-                // Send error state and stop
+                // Check if this is a recoverable error (mouse cancelled)
+                boolean isRecoverable = e.getMessage() != null && e.getMessage().contains("Mouse cancelled");
+
+                // Send error state
                 try {
                     // Remove loading message, add error as assistant message, set complete
                     conversationManager.addAssistantMessage("Error: " + e.getMessage());
@@ -1111,7 +1114,12 @@ public class AIProcessorThread implements Runnable {
                 } catch (InterruptedException ie) {
                     logger.log("Interrupted while sending error state");
                 }
-                break; // Stop processing after error
+
+                // Only break if error is not recoverable
+                if (!isRecoverable) {
+                    break; // Stop processing after non-recoverable error
+                }
+                // For recoverable errors (mouse cancelled), continue loop to wait for retry/abort
             }
         }
 
@@ -5815,6 +5823,7 @@ public class BridgePollingThread implements Runnable {
                 logger.log("Bridge received AI request");
 
                 // 2. Generate unique request ID (timestamp + random component for uniqueness)
+                // IMPORTANT: Always generate a NEW ID, even for retries, so bridge sees it as fresh
                 currentRequestId = System.currentTimeMillis() + "-" + ((int)(Math.random() * 10000));
                 logger.log("Generated request ID: " + currentRequestId);
 
@@ -5822,8 +5831,12 @@ public class BridgePollingThread implements Runnable {
                 String markedRequest = "REQUEST_ID:" + currentRequestId + "\n" +
                                      request.messageJson + "|||||CLIP:TO_BRIDGE|||||";
 
-                // 4. Write to clipboard
+                // 4. Write to clipboard (this overwrites any stale requests from previous attempts)
                 clipboardManager.copyToClipboard(markedRequest);
+                logger.log("Request written to clipboard with new ID");
+
+                // Small delay to ensure clipboard write completes before clicking starts
+                Thread.sleep(200);
 
                 // 5. Wait for AI response via clipboard polling
                 String response = clipboardManager.waitForAutomaticResponse(
@@ -5835,6 +5848,8 @@ public class BridgePollingThread implements Runnable {
                 // NOTE: clipboardManager.waitForAutomaticResponse() already appends markers
                 if ("MOUSE_CANCELLED".equals(response)) {
                     // User moved mouse - submit error with retry/abort instructions
+                    // Clear currentRequestId since this attempt failed
+                    currentRequestId = null;
                     bridgeQueue.submitResponse("ERROR: Mouse cancelled. Type 'retry' or 'abort'.");
                 } else if ("TOKEN_LIMIT_EXCEEDED".equals(response)) {
                     // Token limit reached - validate ID and submit
@@ -10977,7 +10992,9 @@ FILE: src/frontend-ui/render.js
         const params = formatParams(msg.parameters);
 
         // Look ahead to find the next tool_result or error to determine bullet status
+        // Also check if there's a timeout warning for search tools
         let bulletClass = 'tool-bullet-pending'; // default: flashing gray
+        let hasTimeout = false;
         for (let i = index + 1; i < allMessages.length; i++) {
             const nextMsg = allMessages[i];
             if (nextMsg.type === 'tool_result' || nextMsg.type === 'error') {
@@ -10988,6 +11005,10 @@ FILE: src/frontend-ui/render.js
                     bulletClass = 'tool-bullet-error'; // red
                 } else {
                     bulletClass = 'tool-bullet-success'; // green
+                }
+                // Check for timeout warning in search results
+                if (nextMsg.result && nextMsg.result.warning) {
+                    hasTimeout = true;
                 }
                 break;
             }
@@ -11045,11 +11066,11 @@ FILE: src/frontend-ui/render.js
             // Display name overrides
             let displayName;
             if (msg.toolName === 'update_file_batch') {
-                displayName = 'MULTI_EDIT_FILE';
+                displayName = 'Multi Edit File';
             } else if (msg.toolName === 'update_file') {
-                displayName = 'EDIT_FILE';
+                displayName = 'Edit File';
             } else {
-                displayName = msg.toolName.toUpperCase();
+                displayName = formatToolName(msg.toolName);
             }
 
             // Only show chevron if no error and > 10 lines
@@ -11084,7 +11105,7 @@ FILE: src/frontend-ui/render.js
                             }
                         }
                     }, [
-                        text('[' + displayName + ']'),
+                        h('span', { className: 'tool-name-bold' }, text(displayName)),
                         params ? text(' ' + params) : null
                     ])
                 ]);
@@ -11093,7 +11114,7 @@ FILE: src/frontend-ui/render.js
                 return h('div', { className: 'message tool-message' }, [
                     h('div', { className: 'message-prefix ' + bulletClass }, text('• ')),
                     h('div', { className: 'tool-header' }, [
-                        text('[' + displayName + ']'),
+                        h('span', { className: 'tool-name-bold' }, text(displayName)),
                         params ? text(' ' + params) : null
                     ])
                 ]);
@@ -11103,8 +11124,9 @@ FILE: src/frontend-ui/render.js
         return h('div', { className: 'message tool-message' }, [
             h('div', { className: 'message-prefix ' + bulletClass }, text('• ')),
             h('div', { className: 'tool-header' }, [
-                text('[' + msg.toolName.toUpperCase() + ']'),
-                params ? text(' ' + params) : null
+                h('span', { className: 'tool-name-bold' }, text(formatToolName(msg.toolName))),
+                params ? text(' ' + params) : null,
+                hasTimeout ? h('span', { className: 'timeout-indicator' }, text(' (timed out)')) : null
             ])
         ]);
     }
@@ -11232,8 +11254,41 @@ FILE: src/frontend-ui/render.js
         return h('div', { className: 'message error-message' }, lines);
     }
 
+    function formatToolName(toolName) {
+        // Convert snake_case to Title Case
+        // e.g., "search_files_by_name" -> "Search Files By Name"
+        return toolName
+            .split('_')
+            .map(word => word.charAt(0).toUpperCase() + word.slice(1))
+            .join(' ');
+    }
+
     function formatParams(params) {
         if (!params) return '';
+
+        // Special formatting for search tools - show what we're searching for
+        if (params.pattern) {
+            const pattern = '"' + params.pattern + '"';
+            const dir = params.directory_path || '.';
+            return pattern + ' in ' + dir;
+        }
+
+        // Test/process management tools - show name
+        if (params.name) {
+            return params.name;
+        }
+
+        // Stop test - show pid or name
+        if (params.pid) {
+            return 'PID ' + params.pid;
+        }
+
+        // Git tools - show the command
+        if (params.git_args) {
+            return 'git ' + params.git_args;
+        }
+
+        // Fall back to file_path or directory_path
         if (params.file_path) return params.file_path;
         if (params.directory_path) return params.directory_path;
         return '';
@@ -11304,19 +11359,17 @@ FILE: src/frontend-ui/render.js
 
             case 'search_files_by_name':
                 if (result.count !== undefined) {
-                    lines.push('  Found ' + result.count + ' file(s)');
-                    if (result.warning) {
-                        lines.push('  ⚠ ' + result.warning);
-                    }
+                    const fileWord = result.count === 1 ? 'file' : 'files';
+                    lines.push('  Found ' + result.count + ' ' + fileWord);
+                    // Don't show warning in UI (it's shown in tool header as "(timed out)")
                 }
                 break;
 
             case 'search_files_by_content':
                 if (result.count !== undefined) {
-                    lines.push('  Found ' + result.count + ' match(es)');
-                    if (result.warning) {
-                        lines.push('  ⚠ ' + result.warning);
-                    }
+                    const matchWord = result.count === 1 ? 'match' : 'matches';
+                    lines.push('  Found ' + result.count + ' ' + matchWord);
+                    // Don't show warning in UI (it's shown in tool header as "(timed out)")
                 }
                 break;
 
@@ -12022,6 +12075,15 @@ body {
     font-family: 'Consolas', 'Courier New', monospace;
     font-size: 0.9em;
     word-break: break-word;
+}
+
+.tool-name-bold {
+    font-weight: bold;
+}
+
+.timeout-indicator {
+    color: var(--text-muted);
+    font-style: italic;
 }
 
 .tool-result {
