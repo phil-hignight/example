@@ -4544,11 +4544,14 @@ public class ResponseParser {
         response = response.trim();
 
         // Check what tags are present
-        boolean hasExecute = response.contains("<execute>");
-        boolean hasMessage = response.contains("<message>");
+        boolean hasExecute = response.contains("<execute>") || response.contains("</execute>");
+        boolean hasMessage = response.contains("<message>") || response.contains("</message>");
 
+        // Auto-wrap in <message> tags if neither tag is present
         if (!hasExecute && !hasMessage) {
-            throw new IllegalArgumentException("No valid <execute> or <message> tag found in response.");
+            warnings.add("FORMAT VIOLATION: Response did not contain <execute> or <message> tags. Auto-wrapped in <message> tags. ALWAYS wrap responses in either <message> or <execute> tags!");
+            response = "<message>" + response + "</message>";
+            hasMessage = true;
         }
 
         // Handle case where both execute and message are present
