@@ -10992,9 +10992,7 @@ FILE: src/frontend-ui/render.js
         const params = formatParams(msg.parameters);
 
         // Look ahead to find the next tool_result or error to determine bullet status
-        // Also check if there's a timeout warning for search tools
         let bulletClass = 'tool-bullet-pending'; // default: flashing gray
-        let hasTimeout = false;
         for (let i = index + 1; i < allMessages.length; i++) {
             const nextMsg = allMessages[i];
             if (nextMsg.type === 'tool_result' || nextMsg.type === 'error') {
@@ -11005,10 +11003,6 @@ FILE: src/frontend-ui/render.js
                     bulletClass = 'tool-bullet-error'; // red
                 } else {
                     bulletClass = 'tool-bullet-success'; // green
-                }
-                // Check for timeout warning in search results
-                if (nextMsg.result && nextMsg.result.warning) {
-                    hasTimeout = true;
                 }
                 break;
             }
@@ -11125,8 +11119,7 @@ FILE: src/frontend-ui/render.js
             h('div', { className: 'message-prefix ' + bulletClass }, text('• ')),
             h('div', { className: 'tool-header' }, [
                 h('span', { className: 'tool-name-bold' }, text(formatToolName(msg.toolName))),
-                params ? text(' ' + params) : null,
-                hasTimeout ? h('span', { className: 'timeout-indicator' }, text(' (timed out)')) : null
+                params ? text(' ' + params) : null
             ])
         ]);
     }
@@ -11360,16 +11353,18 @@ FILE: src/frontend-ui/render.js
             case 'search_files_by_name':
                 if (result.count !== undefined) {
                     const fileWord = result.count === 1 ? 'file' : 'files';
-                    lines.push('  Found ' + result.count + ' ' + fileWord);
-                    // Don't show warning in UI (it's shown in tool header as "(timed out)")
+                    const hasTimeout = result.warning && result.warning.toLowerCase().includes('timeout');
+                    const timeoutText = hasTimeout ? ' (timed out)' : '';
+                    lines.push('  Found ' + result.count + ' ' + fileWord + timeoutText);
                 }
                 break;
 
             case 'search_files_by_content':
                 if (result.count !== undefined) {
                     const matchWord = result.count === 1 ? 'match' : 'matches';
-                    lines.push('  Found ' + result.count + ' ' + matchWord);
-                    // Don't show warning in UI (it's shown in tool header as "(timed out)")
+                    const hasTimeout = result.warning && result.warning.toLowerCase().includes('timeout');
+                    const timeoutText = hasTimeout ? ' (timed out)' : '';
+                    lines.push('  Found ' + result.count + ' ' + matchWord + timeoutText);
                 }
                 break;
 
