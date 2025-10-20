@@ -361,6 +361,7 @@ import com.codeboss.javalayer.httpserver.*;
 import com.codeboss.javalayer.aiprocessor.*;
 import com.codeboss.javalayer.shared.*;
 import com.codeboss.javalayer.bridgepolling.*;
+import com.codeboss.javalayer.filecache.*;
 
 /**
  * Main entry point for Layer 3 (Middle Layer)
@@ -414,6 +415,16 @@ public class MiddleLayer {
         ChecklistManager checklistManager = new ChecklistManager(logger);
         conversationManager = new ConversationManager(checklistManager, logger, workingDirectory);
         ModeManager modeManager = new ModeManager(logger, conversationManager);
+
+        // Initialize file structure cache if enabled
+        FileStructureCache fileCache = null;
+        if (config.isFileCacheEnabled()) {
+            fileCache = new FileStructureCache();
+            int budgetChars = config.getPromptBudgetChars();
+            fileCache.initialize(workingDirectory, budgetChars);
+            logger.log("File structure cache initialized with budget: " + budgetChars + " chars");
+        }
+
         PromptGenerator promptGenerator = new PromptGenerator();
         FileHashTracker fileHashTracker = new FileHashTracker(logger, workingDirectory);
         UndoStack undoStack = new UndoStack(logger, fileHashTracker, workingDirectory);
@@ -427,17 +438,21 @@ public class MiddleLayer {
             logger.log("Warning: Failed to publish initial conversation state: " + e.getMessage());
         }
 
-        // Wire up ChecklistManager, ModeManager, and ConversationManager to ToolExecutor if it's the concrete implementation
+        // Wire up ChecklistManager, ModeManager, ConversationManager, and FileCache to ToolExecutor if it's the concrete implementation
         if (toolExecutor instanceof com.codeboss.javalayer.toolexecutor.ToolExecutor) {
             ((com.codeboss.javalayer.toolexecutor.ToolExecutor)toolExecutor).setChecklistManager(checklistManager);
             ((com.codeboss.javalayer.toolexecutor.ToolExecutor)toolExecutor).setModeManager(modeManager);
             ((com.codeboss.javalayer.toolexecutor.ToolExecutor)toolExecutor).setConversationManager(conversationManager);
+            if (fileCache != null) {
+                ((com.codeboss.javalayer.toolexecutor.ToolExecutor)toolExecutor).setFileCache(fileCache);
+                logger.log("File cache wired to ToolExecutor");
+            }
         }
 
         // 3. Create and start Thread 2 (AI Processor)
         AIProcessorThread aiProcessor = new AIProcessorThread(
             conversationQueue, bridgeQueue, conversationManager, checklistManager, modeManager,
-            promptGenerator, toolExecutor, logger, workingDirectory
+            promptGenerator, toolExecutor, logger, workingDirectory, fileCache
         );
         aiProcessorThread = new Thread(aiProcessor, "AI-Processor");
         aiProcessorThread.start();
@@ -582,6 +597,7 @@ package com.codeboss.javalayer.aiprocessor;
 
 import com.codeboss.javalayer.bridge.*;
 import com.codeboss.javalayer.shared.*;
+import com.codeboss.javalayer.filecache.FileStructureCache;
 import java.util.*;
 
 /**
@@ -605,6 +621,7 @@ public class AIProcessorThread implements Runnable {
     private final ILogger logger;
     private final String workingDirectory;
     private final ProjectStructure projectStructure;
+    private final FileStructureCache fileCache;
     private volatile boolean running = true;
     private String lastAIRequest = null;  // Store last request for retry
 
@@ -617,7 +634,8 @@ public class AIProcessorThread implements Runnable {
         PromptGenerator promptGenerator,
         IToolExecutor toolExecutor,
         ILogger logger,
-        String workingDirectory
+        String workingDirectory,
+        FileStructureCache fileCache
     ) {
         this.conversationQueue = conversationQueue;
         this.bridgeQueue = bridgeQueue;
@@ -630,6 +648,7 @@ public class AIProcessorThread implements Runnable {
         this.toolExecutor = toolExecutor;
         this.logger = logger;
         this.workingDirectory = workingDirectory;
+        this.fileCache = fileCache;
     }
 
     @Override
@@ -1132,7 +1151,19 @@ public class AIProcessorThread implements Runnable {
 
     private String buildAIRequest(String userMessage) {
         Mode currentMode = modeManager.getCurrentMode();
-        String systemPrompt = promptGenerator.generatePrompt(currentMode, checklistManager, projectStructure);
+
+        // Generate system prompt using FileStructureCache if available
+        String systemPrompt;
+        if (fileCache != null) {
+            // Calculate base prompt and conversation history
+            String basePrompt = promptGenerator.generatePrompt(currentMode, checklistManager, projectStructure, null, 0);
+            String conversationHistory = conversationRenderer.renderMessages(conversationManager.getState().getHistory());
+
+            systemPrompt = promptGenerator.generatePrompt(currentMode, checklistManager, fileCache, basePrompt, conversationHistory);
+        } else {
+            // Fallback to old ProjectStructure
+            systemPrompt = promptGenerator.generatePrompt(currentMode, checklistManager, projectStructure);
+        }
 
         StringBuilder request = new StringBuilder();
         request.append("{");
@@ -1147,7 +1178,22 @@ public class AIProcessorThread implements Runnable {
 
     private String buildAIRequestFromHistory() {
         Mode currentMode = modeManager.getCurrentMode();
-        String systemPrompt = promptGenerator.generatePrompt(currentMode, checklistManager, projectStructure);
+
+        // Get conversation history
+        List<ConversationState.Message> history = conversationManager.getState().getHistory();
+        String conversationHistory = conversationRenderer.renderMessages(history);
+
+        // Generate system prompt using FileStructureCache if available
+        String systemPrompt;
+        if (fileCache != null) {
+            // Calculate base prompt (without file cache section)
+            String basePrompt = promptGenerator.generatePrompt(currentMode, checklistManager, projectStructure, null, 0);
+
+            systemPrompt = promptGenerator.generatePrompt(currentMode, checklistManager, fileCache, basePrompt, conversationHistory);
+        } else {
+            // Fallback to old ProjectStructure
+            systemPrompt = promptGenerator.generatePrompt(currentMode, checklistManager, projectStructure);
+        }
 
         StringBuilder request = new StringBuilder();
         request.append("{");
@@ -1155,8 +1201,7 @@ public class AIProcessorThread implements Runnable {
         request.append("\"messages\":[");
 
         // Use renderer to format conversation history
-        List<ConversationState.Message> history = conversationManager.getState().getHistory();
-        request.append(conversationRenderer.renderMessages(history));
+        request.append(conversationHistory);
 
         request.append("]");
         request.append("}");
@@ -3926,6 +3971,7 @@ FILE: com/codeboss/javalayer/aiprocessor/PromptGenerator.java
 package com.codeboss.javalayer.aiprocessor;
 
 import java.util.*;
+import com.codeboss.javalayer.filecache.FileStructureCache;
 
 public class PromptGenerator {
 
@@ -3934,10 +3980,36 @@ public class PromptGenerator {
     }
 
     public String generatePrompt(Mode mode, ChecklistManager checklistManager) {
-        return generatePrompt(mode, checklistManager, null);
+        return generatePrompt(mode, checklistManager, (ProjectStructure)null, (FileStructureCache)null, (Integer)null);
     }
 
     public String generatePrompt(Mode mode, ChecklistManager checklistManager, ProjectStructure projectStructure) {
+        return generatePrompt(mode, checklistManager, projectStructure, null, null);
+    }
+
+    public String generatePrompt(Mode mode, ChecklistManager checklistManager, FileStructureCache fileCache, String basePrompt, String conversationHistory) {
+        return generatePrompt(mode, checklistManager, null, fileCache, calculateAvailableBudget(basePrompt, conversationHistory, fileCache));
+    }
+
+    private int calculateAvailableBudget(String basePrompt, String conversationHistory, FileStructureCache fileCache) {
+        if (fileCache == null) {
+            return 0;
+        }
+
+        // Total budget from config (in characters)
+        int totalBudget = 500000; // This will come from config via fileCache
+
+        // Calculate used budget
+        int basePromptChars = (basePrompt != null) ? basePrompt.length() : 0;
+        int conversationChars = (conversationHistory != null) ? conversationHistory.length() : 0;
+
+        // Available budget = total - base - conversation
+        int available = totalBudget - basePromptChars - conversationChars;
+
+        return Math.max(0, available);
+    }
+
+    public String generatePrompt(Mode mode, ChecklistManager checklistManager, ProjectStructure projectStructure, FileStructureCache fileCache, Integer availableBudget) {
         if (mode == null) {
             throw new IllegalArgumentException("Mode cannot be null");
         }
@@ -3948,8 +4020,14 @@ public class PromptGenerator {
         prompt.append(getResponseFormatRules());  // CRITICAL: Put format rules early!
         prompt.append(getModeSpecificInstructions(mode));
 
-        // Include project structure if available
-        if (projectStructure != null) {
+        // Include file structure cache if available (preferred over ProjectStructure)
+        if (fileCache != null && availableBudget != null && availableBudget > 0) {
+            String fileCacheSection = fileCache.getPromptSection(availableBudget);
+            if (!fileCacheSection.isEmpty()) {
+                prompt.append(fileCacheSection).append("\n");
+            }
+        } else if (projectStructure != null) {
+            // Fallback to old ProjectStructure if cache not available
             prompt.append(projectStructure.getStructure()).append("\n");
         }
 
@@ -4209,33 +4287,21 @@ public class PromptGenerator {
     }
 
     private String getSearchTools() {
-        return "SEARCH FILES BY NAME:\n" +
-               "  <tool name=\"search_files_by_name\">\n" +
-               "    <parameter name=\"pattern\">*.java</parameter>\n" +
-               "    <parameter name=\"directory_path\">src</parameter>\n" +
-               "    <parameter name=\"include_excluded\">false</parameter>\n" +
-               "  </tool>\n" +
-               "  Note: Use glob patterns like *.java, **/*Test.java\n" +
-               "  Note: directory_path is optional (defaults to current directory)\n" +
-               "  Note: By default, excludes node_modules, .git, bin, obj, target, build, dist, .vscode\n" +
-               "  Note: Set include_excluded=true to search these directories\n" +
-               "  Note: Timeout is 30 seconds; returns partial results with warning if timeout occurs\n" +
-               "  Returns: List of files matching the name pattern\n\n" +
-
-               "SEARCH FILES BY CONTENT:\n" +
+        return "SEARCH FILES BY CONTENT:\n" +
                "  <tool name=\"search_files_by_content\">\n" +
                "    <parameter name=\"pattern\">regex pattern</parameter>\n" +
-               "    <parameter name=\"directory_path\">src</parameter>\n" +
-               "    <parameter name=\"file_pattern\">*.java</parameter>\n" +
-               "    <parameter name=\"include_excluded\">false</parameter>\n" +
+               "    <parameter name=\"file_paths\">src/Main.java,src/Utils.java,src/Helper.js</parameter>\n" +
                "    <parameter name=\"max_results\">100</parameter>\n" +
                "  </tool>\n" +
-               "  Note: directory_path and file_pattern are optional\n" +
-               "  Note: max_results defaults to 100, maximum is 500. Use specific patterns instead of broad searches.\n" +
-               "  Note: By default, excludes node_modules, .git, bin, obj, target, build, dist, .vscode\n" +
-               "  Note: Set include_excluded=true to search these directories\n" +
+               "  Note: file_paths is REQUIRED - provide comma-separated list of files to search\n" +
+               "  Note: The file structure is provided in your prompt, so you know which files exist\n" +
+               "  Note: Use specific files instead of searching entire directories\n" +
+               "  Note: max_results defaults to 100, maximum is 500\n" +
                "  Note: Timeout is 30 seconds; returns partial results with warning if timeout occurs\n" +
-               "  Returns: List of files containing the pattern with line numbers\n\n";
+               "  Returns: List of matches with file paths, line numbers, and content\n" +
+               "  Example: Search for \"function\" in specific JavaScript files:\n" +
+               "    <parameter name=\"pattern\">function\\s+\\w+</parameter>\n" +
+               "    <parameter name=\"file_paths\">src/app.js,src/utils.js</parameter>\n\n";
     }
 
     private String getChecklistTools(Mode mode) {
@@ -5373,6 +5439,18 @@ public interface IConfigManager {
      * @param port Port number to set
      */
     void setServerPort(int port);
+
+    /**
+     * Check if file cache is enabled
+     * @return true if file structure cache should be used
+     */
+    boolean isFileCacheEnabled();
+
+    /**
+     * Get the prompt budget in characters for file cache
+     * @return Budget in characters (e.g., 500000)
+     */
+    int getPromptBudgetChars();
 }
 
 |~|~|~|~|~|~|~|~|~|~|~|
@@ -5585,7 +5663,10 @@ public class MockClipboardManager implements IClipboardManager {
         }
 
         try {
+            // Extract REQUEST_ID from clipboard for response validation
+            String requestId = extractRequestId(clipboard);
             String userMessage = extractUserMessage(clipboard);
+
             Class<?> clazz = aiBridge.getClass();
             java.lang.reflect.Method method = clazz.getMethod("sendMessage", String.class, String.class);
             String response = (String) method.invoke(aiBridge, systemPrompt, userMessage);
@@ -5602,7 +5683,8 @@ public class MockClipboardManager implements IClipboardManager {
                 logger.log("AI call #" + aiCallCount + " completed in " + duration + "ms (total: " + totalAiTimeMs + "ms)");
             }
 
-            return response + "\n|||||CLIP:TO_JAVA_END|||||";
+            // Return response with REQUEST_ID prefix so BridgePollingThread can validate it
+            return requestId + "\n" + response + "\n|||||CLIP:TO_JAVA_END|||||";
         } catch (RuntimeException re) {
             long duration = System.currentTimeMillis() - startTime;
             totalAiTimeMs += duration;
@@ -5637,9 +5719,34 @@ public class MockClipboardManager implements IClipboardManager {
         }
     }
 
+    private String extractRequestId(String clipboardContent) {
+        if (clipboardContent == null || clipboardContent.isEmpty()) {
+            return "";
+        }
+
+        // Extract "REQUEST_ID:xxxxx" from first line
+        int firstNewline = clipboardContent.indexOf('\n');
+        if (firstNewline == -1) {
+            return "";
+        }
+
+        String firstLine = clipboardContent.substring(0, firstNewline);
+        if (firstLine.startsWith("REQUEST_ID:")) {
+            return firstLine;
+        }
+
+        return "";
+    }
+
     private String extractUserMessage(String clipboardContent) {
         if (clipboardContent == null || clipboardContent.isEmpty()) {
             return "";
+        }
+
+        // Skip REQUEST_ID line if present
+        int firstNewline = clipboardContent.indexOf('\n');
+        if (firstNewline != -1 && clipboardContent.startsWith("REQUEST_ID:")) {
+            clipboardContent = clipboardContent.substring(firstNewline + 1);
         }
 
         int markerIndex = clipboardContent.indexOf("|||||CLIP:TO_BRIDGE|||||");
@@ -5666,6 +5773,8 @@ public class MockConfigManager implements IConfigManager {
     private int serverPort = 3000;
     private boolean autoLaunchBrowser = false;
     private int maxMessageChars = 350000;
+    private boolean fileCacheEnabled = true;
+    private int promptBudgetChars = 500000;
 
     public void setServerPort(int port) {
         this.serverPort = port;
@@ -5698,6 +5807,16 @@ public class MockConfigManager implements IConfigManager {
     @Override
     public boolean shouldAutoLaunchBrowser() {
         return autoLaunchBrowser;
+    }
+
+    @Override
+    public boolean isFileCacheEnabled() {
+        return fileCacheEnabled;
+    }
+
+    @Override
+    public int getPromptBudgetChars() {
+        return promptBudgetChars;
     }
 }
 
@@ -5929,6 +6048,1650 @@ public class BridgePollingThread implements Runnable {
 
         // Return everything after the first newline
         return response.substring(firstNewline + 1);
+    }
+}
+
+|~|~|~|~|~|~|~|~|~|~|~|
+
+FILE: com/codeboss/javalayer/filecache/BudgetManager.java
+|~|~|~|~|~|~|~|~|~|~|~|
+package com.codeboss.javalayer.filecache;
+
+/**
+ * Manages token budget and decides which detail levels to include in the prompt
+ */
+public class BudgetManager {
+
+    public enum DetailLevel {
+        FILE_STRUCTURE,      // Level 1: Just files/folders with counts
+        PUBLIC_SIGNATURES,   // Level 2: + Public method signatures
+        PUBLIC_DESCRIPTIONS, // Level 3: + Public method descriptions
+        PRIVATE_SIGNATURES,  // Level 4: + Private method signatures
+        PRIVATE_DESCRIPTIONS // Level 5: + Private method descriptions
+    }
+
+    /**
+     * Decide which detail level to include based on available budget
+     *
+     * @param availableTokens How many tokens we can use
+     * @param fileStructureTokens Tokens needed for basic structure
+     * @param publicSigTokens Additional tokens for public signatures
+     * @param publicDescTokens Additional tokens for public descriptions
+     * @param privateSigTokens Additional tokens for private signatures
+     * @param privateDescTokens Additional tokens for private descriptions
+     * @return The highest detail level that fits
+     */
+    public DetailLevel decideDetailLevel(
+            int availableTokens,
+            int fileStructureTokens,
+            int publicSigTokens,
+            int publicDescTokens,
+            int privateSigTokens,
+            int privateDescTokens) {
+
+        // TODO: Implement progressive budget allocation
+        // TODO: Return highest level that fits within budget
+
+        int totalUsed = fileStructureTokens;
+
+        if (totalUsed > availableTokens) {
+            return null; // Won't fit at all
+        }
+
+        DetailLevel currentLevel = DetailLevel.FILE_STRUCTURE;
+
+        // Try adding each level incrementally, stopping when budget exceeded
+        if (totalUsed + publicSigTokens <= availableTokens) {
+            totalUsed += publicSigTokens;
+            currentLevel = DetailLevel.PUBLIC_SIGNATURES;
+        } else {
+            return currentLevel; // Can't fit public signatures
+        }
+
+        if (totalUsed + publicDescTokens <= availableTokens) {
+            totalUsed += publicDescTokens;
+            currentLevel = DetailLevel.PUBLIC_DESCRIPTIONS;
+        } else {
+            return currentLevel; // Can't fit public descriptions
+        }
+
+        if (totalUsed + privateSigTokens <= availableTokens) {
+            totalUsed += privateSigTokens;
+            currentLevel = DetailLevel.PRIVATE_SIGNATURES;
+        } else {
+            return currentLevel; // Can't fit private signatures
+        }
+
+        if (totalUsed + privateDescTokens <= availableTokens) {
+            totalUsed += privateDescTokens;
+            currentLevel = DetailLevel.PRIVATE_DESCRIPTIONS;
+        }
+
+        return currentLevel;
+    }
+
+    /**
+     * Calculate how many tokens are remaining after allocating for a detail level
+     */
+    public int calculateRemainingBudget(int availableTokens, int usedTokens) {
+        return Math.max(0, availableTokens - usedTokens);
+    }
+}
+
+|~|~|~|~|~|~|~|~|~|~|~|
+
+FILE: com/codeboss/javalayer/filecache/FileNode.java
+|~|~|~|~|~|~|~|~|~|~|~|
+package com.codeboss.javalayer.filecache;
+
+import java.util.*;
+
+/**
+ * Represents a file or directory in the cached file structure
+ */
+public class FileNode {
+    public enum NodeType {
+        FILE,
+        DIRECTORY
+    }
+
+    private final String name;
+    private final String path;
+    private final NodeType type;
+
+    // For directories
+    private final Map<String, FileNode> children;
+    private int fileCount;
+
+    // For files
+    private int lineCount;
+    private final List<MethodSignature> publicMethods;
+    private final List<MethodSignature> privateMethods;
+
+    public FileNode(String path, NodeType type) {
+        this.path = path;
+        this.type = type;
+
+        // Extract name from path
+        int lastSeparator = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+        this.name = lastSeparator >= 0 ? path.substring(lastSeparator + 1) : path;
+
+        if (type == NodeType.DIRECTORY) {
+            this.children = new HashMap<>();
+            this.fileCount = 0;
+            this.publicMethods = null;
+            this.privateMethods = null;
+        } else {
+            this.children = null;
+            this.lineCount = 0;
+            this.publicMethods = new ArrayList<>();
+            this.privateMethods = new ArrayList<>();
+        }
+    }
+
+    // Getters
+    public String getName() { return name; }
+    public String getPath() { return path; }
+    public NodeType getType() { return type; }
+    public boolean isDirectory() { return type == NodeType.DIRECTORY; }
+    public boolean isFile() { return type == NodeType.FILE; }
+
+    // Directory methods
+    public Map<String, FileNode> getChildren() { return children; }
+    public int getFileCount() { return fileCount; }
+    public void setFileCount(int count) { this.fileCount = count; }
+
+    public void addChild(FileNode child) {
+        if (!isDirectory()) {
+            throw new IllegalStateException("Cannot add children to a file node");
+        }
+        children.put(child.getName(), child);
+    }
+
+    public FileNode getChild(String name) {
+        return isDirectory() ? children.get(name) : null;
+    }
+
+    public void removeChild(String name) {
+        if (isDirectory()) {
+            children.remove(name);
+        }
+    }
+
+    // File methods
+    public int getLineCount() { return lineCount; }
+    public void setLineCount(int count) { this.lineCount = count; }
+
+    public List<MethodSignature> getPublicMethods() { return publicMethods; }
+    public List<MethodSignature> getPrivateMethods() { return privateMethods; }
+
+    public void addPublicMethod(MethodSignature method) {
+        if (isFile()) {
+            publicMethods.add(method);
+        }
+    }
+
+    public void addPrivateMethod(MethodSignature method) {
+        if (isFile()) {
+            privateMethods.add(method);
+        }
+    }
+
+    public void clearMethods() {
+        if (isFile()) {
+            publicMethods.clear();
+            privateMethods.clear();
+        }
+    }
+
+    /**
+     * Recursively count all files under this node
+     */
+    public int countAllFiles() {
+        if (isFile()) {
+            return 1;
+        }
+
+        int count = 0;
+        for (FileNode child : children.values()) {
+            count += child.countAllFiles();
+        }
+        return count;
+    }
+
+    /**
+     * Recursively count all directories under this node
+     */
+    public int countAllDirectories() {
+        if (isFile()) {
+            return 0;
+        }
+
+        int count = 1; // Count this directory
+        for (FileNode child : children.values()) {
+            if (child.isDirectory()) {
+                count += child.countAllDirectories();
+            }
+        }
+        return count;
+    }
+
+    @Override
+    public String toString() {
+        if (isFile()) {
+            return String.format("File[%s, %d lines, %d methods]",
+                name, lineCount, publicMethods.size() + privateMethods.size());
+        } else {
+            return String.format("Directory[%s, %d children]",
+                name, children.size());
+        }
+    }
+}
+
+|~|~|~|~|~|~|~|~|~|~|~|
+
+FILE: com/codeboss/javalayer/filecache/FileStructureCache.java
+|~|~|~|~|~|~|~|~|~|~|~|
+package com.codeboss.javalayer.filecache;
+
+import java.util.*;
+import java.io.*;
+import java.nio.file.*;
+
+/**
+ * Main file structure cache that maintains an in-memory representation of the project
+ * structure with progressive detail levels based on available prompt budget.
+ *
+ * This module is self-contained and testable in isolation.
+ */
+public class FileStructureCache {
+    private final TokenEstimator tokenEstimator;
+    private final BudgetManager budgetManager;
+    private final MethodSignatureExtractor signatureExtractor;
+    private final FileSystem fileSystem;
+
+    private FileNode rootNode;
+    private String workingDirectory;
+    private int totalBudgetTokens;
+
+    public FileStructureCache() {
+        this(new FileSystem());
+    }
+
+    /**
+     * Constructor that allows injecting a custom FileSystem (for testing or caching)
+     */
+    public FileStructureCache(FileSystem fileSystem) {
+        this.tokenEstimator = new TokenEstimator();
+        this.budgetManager = new BudgetManager();
+        this.signatureExtractor = new MethodSignatureExtractor();
+        this.fileSystem = fileSystem;
+        this.rootNode = null;
+    }
+
+    /**
+     * Build/rebuild the cache from the working directory
+     *
+     * @param workingDir The root directory to scan
+     * @param budgetTokens Maximum tokens to use in prompt
+     */
+    public void initialize(String workingDir, int budgetTokens) {
+        this.workingDirectory = workingDir;
+        this.totalBudgetTokens = budgetTokens;
+
+        // Create root node
+        this.rootNode = new FileNode(workingDir, FileNode.NodeType.DIRECTORY);
+
+        // Define excluded directories
+        Set<String> excludedDirs = new HashSet<>();
+        excludedDirs.add("node_modules");
+        excludedDirs.add(".git");
+        excludedDirs.add("bin");
+        excludedDirs.add("obj");
+        excludedDirs.add("target");
+        excludedDirs.add("build");
+        excludedDirs.add("dist");
+        excludedDirs.add(".vscode");
+
+        // Only process Java and JavaScript files
+        Set<String> includedExtensions = new HashSet<>();
+        includedExtensions.add(".java");
+        includedExtensions.add(".js");
+
+        // Recursively scan directory tree
+        try {
+            scanDirectory(workingDir, rootNode, excludedDirs, includedExtensions);
+        } catch (Exception e) {
+            // Log error but don't fail initialization
+            System.err.println("Error scanning directory: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Recursively scan a directory and build the file tree
+     */
+    private void scanDirectory(String dirPath, FileNode dirNode, Set<String> excludedDirs, Set<String> includedExtensions) {
+        try {
+            List<String> entries = fileSystem.listDirectory(dirPath);
+
+            int fileCount = 0;
+
+            for (String entryName : entries) {
+                String fullPath = dirPath + "/" + entryName;
+
+                // Check if this directory should be excluded
+                if (fileSystem.isDirectory(fullPath)) {
+                    if (excludedDirs.contains(entryName)) {
+                        // Skip excluded directories
+                        continue;
+                    }
+
+                    // Create directory node and recurse
+                    FileNode childDir = new FileNode(fullPath, FileNode.NodeType.DIRECTORY);
+                    dirNode.addChild(childDir);
+                    scanDirectory(fullPath, childDir, excludedDirs, includedExtensions);
+
+                    // Add this child's file count to parent
+                    fileCount += childDir.getFileCount();
+
+                } else if (fileSystem.isFile(fullPath)) {
+                    // Check if file should be included
+                    if (!fileSystem.shouldIncludeFile(entryName, includedExtensions)) {
+                        continue;
+                    }
+
+                    // Create file node
+                    FileNode fileNode = new FileNode(fullPath, FileNode.NodeType.FILE);
+
+                    // Count lines
+                    try {
+                        int lineCount = fileSystem.countLines(fullPath);
+                        fileNode.setLineCount(lineCount);
+                    } catch (Exception e) {
+                        // If line counting fails, set to 0
+                        fileNode.setLineCount(0);
+                    }
+
+                    // Extract method signatures
+                    try {
+                        String content = fileSystem.readFile(fullPath);
+                        List<MethodSignature> methods = signatureExtractor.extract(entryName, content);
+
+                        for (MethodSignature method : methods) {
+                            if (method.isPublic()) {
+                                fileNode.addPublicMethod(method);
+                            } else {
+                                fileNode.addPrivateMethod(method);
+                            }
+                        }
+                    } catch (Exception e) {
+                        // If extraction fails, continue without methods
+                    }
+
+                    dirNode.addChild(fileNode);
+                    fileCount++;
+                }
+            }
+
+            // Update directory file count
+            dirNode.setFileCount(fileCount);
+
+        } catch (Exception e) {
+            // If directory cannot be read, leave it empty
+        }
+    }
+
+    /**
+     * Generate the prompt section with as much detail as fits in the budget
+     *
+     * Progressive levels:
+     * 1. File/folder structure with counts
+     * 2. Public method/function signatures
+     * 3. Public method descriptions (1-2 sentences)
+     * 4. Private method/function signatures
+     * 5. Private method descriptions
+     *
+     * @param availableTokens How many tokens we can use
+     * @return Formatted prompt text
+     */
+    public String getPromptSection(int availableTokens) {
+        if (rootNode == null || availableTokens <= 0) {
+            return "";
+        }
+
+        // Calculate token costs for each detail level
+        int structureTokens = tokenEstimator.estimateFileStructureTokens(rootNode);
+        int publicSigTokens = estimatePublicSignatureTokens(rootNode);
+        int publicDescTokens = 0; // TODO: Implement when descriptions are added
+        int privateSigTokens = estimatePrivateSignatureTokens(rootNode);
+        int privateDescTokens = 0; // TODO: Implement when descriptions are added
+
+        // Decide which detail level to include
+        BudgetManager.DetailLevel level = budgetManager.decideDetailLevel(
+            availableTokens,
+            structureTokens,
+            publicSigTokens,
+            publicDescTokens,
+            privateSigTokens,
+            privateDescTokens
+        );
+
+        if (level == null) {
+            // Not even structure fits
+            return "";
+        }
+
+        // Build prompt based on chosen level
+        StringBuilder prompt = new StringBuilder();
+        prompt.append("PROJECT STRUCTURE:\n\n");
+
+        // Always include file structure (Level 1)
+        renderFileStructure(rootNode, prompt, 0);
+
+        // Add method signatures based on level
+        if (level.compareTo(BudgetManager.DetailLevel.PUBLIC_SIGNATURES) >= 0) {
+            prompt.append("\nMETHOD SIGNATURES:\n\n");
+            renderMethodSignatures(rootNode, prompt, level);
+        }
+
+        return prompt.toString();
+    }
+
+    /**
+     * Render the file structure tree
+     */
+    private void renderFileStructure(FileNode node, StringBuilder output, int depth) {
+        String indent = "  ".repeat(depth);
+
+        if (node.isDirectory()) {
+            output.append(indent).append(node.getName()).append("/");
+            if (node.getFileCount() > 0) {
+                output.append(" (").append(node.getFileCount()).append(" files)");
+            }
+            output.append("\n");
+
+            // Render children
+            for (FileNode child : node.getChildren().values()) {
+                renderFileStructure(child, output, depth + 1);
+            }
+        } else {
+            output.append(indent).append(node.getName());
+            if (node.getLineCount() > 0) {
+                output.append(" (").append(node.getLineCount()).append(" lines)");
+            }
+            output.append("\n");
+        }
+    }
+
+    /**
+     * Render method signatures based on detail level
+     */
+    private void renderMethodSignatures(FileNode node, StringBuilder output, BudgetManager.DetailLevel level) {
+        if (node.isFile()) {
+            List<MethodSignature> publicMethods = node.getPublicMethods();
+            List<MethodSignature> privateMethods = node.getPrivateMethods();
+
+            if (!publicMethods.isEmpty() || !privateMethods.isEmpty()) {
+                output.append(node.getName()).append(":\n");
+
+                // Always show public methods at this level
+                for (MethodSignature method : publicMethods) {
+                    output.append("  ").append(method.toSignatureString()).append("\n");
+                }
+
+                // Show private methods if level includes them
+                if (level.compareTo(BudgetManager.DetailLevel.PRIVATE_SIGNATURES) >= 0) {
+                    for (MethodSignature method : privateMethods) {
+                        output.append("  ").append(method.toSignatureString()).append("\n");
+                    }
+                }
+
+                output.append("\n");
+            }
+        } else {
+            // Recurse into directories
+            for (FileNode child : node.getChildren().values()) {
+                renderMethodSignatures(child, output, level);
+            }
+        }
+    }
+
+    /**
+     * Estimate tokens needed for all public method signatures
+     */
+    private int estimatePublicSignatureTokens(FileNode node) {
+        if (node.isFile()) {
+            return tokenEstimator.estimateMethodSignatureTokens(node.getPublicMethods());
+        }
+
+        int total = 0;
+        for (FileNode child : node.getChildren().values()) {
+            total += estimatePublicSignatureTokens(child);
+        }
+        return total;
+    }
+
+    /**
+     * Estimate tokens needed for all private method signatures
+     */
+    private int estimatePrivateSignatureTokens(FileNode node) {
+        if (node.isFile()) {
+            return tokenEstimator.estimateMethodSignatureTokens(node.getPrivateMethods());
+        }
+
+        int total = 0;
+        for (FileNode child : node.getChildren().values()) {
+            total += estimatePrivateSignatureTokens(child);
+        }
+        return total;
+    }
+
+    /**
+     * Update cache when a file is created
+     *
+     * @param filePath Relative path to the created file
+     * @param content File content for signature extraction
+     */
+    public void onFileCreated(String filePath, String content) {
+        if (rootNode == null) {
+            return;
+        }
+
+        // Navigate to parent directory and create file node
+        FileNode parentDir = findOrCreateParentDirectory(filePath);
+        if (parentDir == null) {
+            return;
+        }
+
+        // Extract filename from path
+        String fileName = extractFileName(filePath);
+
+        // Create file node
+        FileNode fileNode = new FileNode(filePath, FileNode.NodeType.FILE);
+
+        // Count lines
+        int lineCount = countLinesInString(content);
+        fileNode.setLineCount(lineCount);
+
+        // Extract method signatures
+        List<MethodSignature> methods = signatureExtractor.extract(fileName, content);
+        for (MethodSignature method : methods) {
+            if (method.isPublic()) {
+                fileNode.addPublicMethod(method);
+            } else {
+                fileNode.addPrivateMethod(method);
+            }
+        }
+
+        // Add to parent
+        parentDir.addChild(fileNode);
+
+        // Update parent file counts
+        updateParentFileCounts(filePath, 1);
+
+        // Save cache to disk
+        saveToDisk();
+    }
+
+    /**
+     * Update cache when a file is modified
+     *
+     * @param filePath Relative path to the modified file
+     * @param content New file content for signature extraction
+     */
+    public void onFileUpdated(String filePath, String content) {
+        if (rootNode == null) {
+            return;
+        }
+
+        // Find the file node
+        FileNode fileNode = findFileNode(filePath);
+        if (fileNode == null) {
+            // File doesn't exist in cache, create it
+            onFileCreated(filePath, content);
+            return;
+        }
+
+        // Update line count
+        int lineCount = countLinesInString(content);
+        fileNode.setLineCount(lineCount);
+
+        // Clear and re-extract method signatures
+        fileNode.clearMethods();
+        String fileName = extractFileName(filePath);
+        List<MethodSignature> methods = signatureExtractor.extract(fileName, content);
+        for (MethodSignature method : methods) {
+            if (method.isPublic()) {
+                fileNode.addPublicMethod(method);
+            } else {
+                fileNode.addPrivateMethod(method);
+            }
+        }
+
+        // Save cache to disk
+        saveToDisk();
+    }
+
+    /**
+     * Update cache when a file is deleted
+     *
+     * @param filePath Relative path to the deleted file
+     */
+    public void onFileDeleted(String filePath) {
+        if (rootNode == null) {
+            return;
+        }
+
+        // Find parent directory
+        String parentPath = extractParentPath(filePath);
+        FileNode parentDir = findDirectoryNode(parentPath);
+        if (parentDir == null) {
+            return; // Parent doesn't exist, nothing to delete
+        }
+
+        // Remove file from parent
+        String fileName = extractFileName(filePath);
+        FileNode fileNode = parentDir.getChild(fileName);
+        if (fileNode != null && fileNode.isFile()) {
+            parentDir.removeChild(fileName);
+
+            // Update parent file counts
+            updateParentFileCounts(filePath, -1);
+
+            // Save cache to disk
+            saveToDisk();
+        }
+    }
+
+    /**
+     * Find or create parent directory for a file path
+     */
+    private FileNode findOrCreateParentDirectory(String filePath) {
+        String parentPath = extractParentPath(filePath);
+
+        if (parentPath.isEmpty() || parentPath.equals(workingDirectory)) {
+            return rootNode;
+        }
+
+        // Split path and navigate/create directories
+        String[] parts = parentPath.replace(workingDirectory + "/", "").split("/");
+        FileNode current = rootNode;
+
+        for (String part : parts) {
+            if (part.isEmpty()) continue;
+
+            FileNode child = current.getChild(part);
+            if (child == null) {
+                // Create missing directory
+                String childPath = current.getPath() + "/" + part;
+                child = new FileNode(childPath, FileNode.NodeType.DIRECTORY);
+                current.addChild(child);
+            }
+
+            if (!child.isDirectory()) {
+                return null; // Path conflict
+            }
+
+            current = child;
+        }
+
+        return current;
+    }
+
+    /**
+     * Find a file node by path
+     */
+    private FileNode findFileNode(String filePath) {
+        String parentPath = extractParentPath(filePath);
+        FileNode parentDir = findDirectoryNode(parentPath);
+        if (parentDir == null) {
+            return null;
+        }
+
+        String fileName = extractFileName(filePath);
+        FileNode fileNode = parentDir.getChild(fileName);
+        return (fileNode != null && fileNode.isFile()) ? fileNode : null;
+    }
+
+    /**
+     * Find a directory node by path
+     */
+    private FileNode findDirectoryNode(String dirPath) {
+        if (dirPath.isEmpty() || dirPath.equals(workingDirectory)) {
+            return rootNode;
+        }
+
+        String[] parts = dirPath.replace(workingDirectory + "/", "").split("/");
+        FileNode current = rootNode;
+
+        for (String part : parts) {
+            if (part.isEmpty()) continue;
+
+            FileNode child = current.getChild(part);
+            if (child == null || !child.isDirectory()) {
+                return null;
+            }
+            current = child;
+        }
+
+        return current;
+    }
+
+    /**
+     * Update file counts for all parent directories
+     */
+    private void updateParentFileCounts(String filePath, int delta) {
+        String parentPath = extractParentPath(filePath);
+
+        while (!parentPath.isEmpty() && !parentPath.equals(workingDirectory)) {
+            FileNode dir = findDirectoryNode(parentPath);
+            if (dir != null) {
+                dir.setFileCount(dir.getFileCount() + delta);
+            }
+            parentPath = extractParentPath(parentPath);
+        }
+
+        // Update root
+        if (rootNode != null) {
+            rootNode.setFileCount(rootNode.getFileCount() + delta);
+        }
+    }
+
+    /**
+     * Extract filename from path
+     */
+    private String extractFileName(String filePath) {
+        int lastSlash = Math.max(filePath.lastIndexOf('/'), filePath.lastIndexOf('\\'));
+        return lastSlash >= 0 ? filePath.substring(lastSlash + 1) : filePath;
+    }
+
+    /**
+     * Extract parent directory path
+     */
+    private String extractParentPath(String filePath) {
+        int lastSlash = Math.max(filePath.lastIndexOf('/'), filePath.lastIndexOf('\\'));
+        return lastSlash >= 0 ? filePath.substring(0, lastSlash) : "";
+    }
+
+    /**
+     * Count lines in a string
+     */
+    private int countLinesInString(String content) {
+        if (content == null || content.isEmpty()) {
+            return 0;
+        }
+        int lines = 1;
+        for (int i = 0; i < content.length(); i++) {
+            if (content.charAt(i) == '\n') {
+                lines++;
+            }
+        }
+        return lines;
+    }
+
+    /**
+     * Get tool definitions for file-aware search tools
+     *
+     * Returns new tools like:
+     * - search_file_content: Search within specific file(s)
+     * - search_method_content: Search within specific method/function(s)
+     *
+     * @return Map of tool name to tool definition
+     */
+    public Map<String, ToolDefinition> getFileAwareTools() {
+        // TODO: Create tool definitions for targeted search
+        // TODO: Return map of tool name -> ToolDefinition
+        return new HashMap<>();
+    }
+
+    /**
+     * Estimate how many tokens the current cache would use in the prompt
+     *
+     * @return Estimated token count
+     */
+    public int estimateTokenUsage() {
+        if (rootNode == null) {
+            return 0;
+        }
+
+        // Calculate total tokens including structure and all methods
+        int structureTokens = tokenEstimator.estimateFileStructureTokens(rootNode);
+        int publicSigTokens = estimatePublicSignatureTokens(rootNode);
+        int privateSigTokens = estimatePrivateSignatureTokens(rootNode);
+
+        // Return total (structure + all method signatures)
+        return structureTokens + publicSigTokens + privateSigTokens;
+    }
+
+    /**
+     * Get statistics about the cached structure
+     *
+     * @return Map of stat name to value (for debugging/testing)
+     */
+    public Map<String, Object> getStatistics() {
+        Map<String, Object> stats = new HashMap<>();
+
+        if (rootNode == null) {
+            stats.put("total_files", 0);
+            stats.put("total_directories", 0);
+            stats.put("total_methods", 0);
+            stats.put("estimated_tokens", 0);
+            return stats;
+        }
+
+        stats.put("total_files", rootNode.countAllFiles());
+        stats.put("total_directories", rootNode.countAllDirectories());
+        stats.put("total_methods", countAllMethods(rootNode));
+        stats.put("estimated_tokens", estimateTokenUsage());
+        return stats;
+    }
+
+    /**
+     * Recursively count all methods in the tree
+     */
+    private int countAllMethods(FileNode node) {
+        if (node.isFile()) {
+            return node.getPublicMethods().size() + node.getPrivateMethods().size();
+        }
+
+        int count = 0;
+        for (FileNode child : node.getChildren().values()) {
+            count += countAllMethods(child);
+        }
+        return count;
+    }
+
+    /**
+     * Save cache to disk at .agent/file-cache.json
+     * Called automatically after every cache modification
+     */
+    public void saveToDisk() {
+        if (rootNode == null || workingDirectory == null) {
+            return;
+        }
+
+        try {
+            // Ensure .agent directory exists
+            Path agentDir = Paths.get(workingDirectory, ".agent");
+            if (!Files.exists(agentDir)) {
+                Files.createDirectories(agentDir);
+            }
+
+            // Serialize cache to JSON
+            String json = serializeToJson();
+
+            // Write to file
+            Path cacheFile = agentDir.resolve("file-cache.json");
+            Files.writeString(cacheFile, json);
+
+        } catch (Exception e) {
+            // Log error but don't fail - cache is not critical
+            System.err.println("Warning: Failed to save file cache: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Load cache from disk if available
+     * Called during initialization if cache file exists
+     *
+     * @return true if cache was loaded successfully, false otherwise
+     */
+    public boolean loadFromDisk() {
+        if (workingDirectory == null) {
+            return false;
+        }
+
+        try {
+            Path cacheFile = Paths.get(workingDirectory, ".agent", "file-cache.json");
+            if (!Files.exists(cacheFile)) {
+                return false;
+            }
+
+            // Read JSON from file
+            String json = Files.readString(cacheFile);
+
+            // Deserialize and restore cache
+            // TODO: Implement deserialization
+            // For now, just return false to force rebuild
+            return false;
+
+        } catch (Exception e) {
+            // If loading fails, cache will be rebuilt
+            System.err.println("Warning: Failed to load file cache: " + e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Serialize cache to simple JSON format
+     * Format: {"version":1,"working_dir":"...","budget":500000,"files":[...]}
+     */
+    private String serializeToJson() {
+        StringBuilder json = new StringBuilder();
+        json.append("{\n");
+        json.append("  \"version\": 1,\n");
+        json.append("  \"working_dir\": \"").append(escapeJson(workingDirectory)).append("\",\n");
+        json.append("  \"budget\": ").append(totalBudgetTokens).append(",\n");
+        json.append("  \"timestamp\": \"").append(java.time.Instant.now().toString()).append("\",\n");
+        json.append("  \"files\": [\n");
+
+        // Serialize all files in tree
+        List<String> fileEntries = new ArrayList<>();
+        serializeNode(rootNode, fileEntries);
+
+        json.append(String.join(",\n", fileEntries));
+        json.append("\n  ]\n");
+        json.append("}\n");
+
+        return json.toString();
+    }
+
+    /**
+     * Recursively serialize file nodes
+     */
+    private void serializeNode(FileNode node, List<String> entries) {
+        if (node.isFile()) {
+            // Serialize file node
+            StringBuilder entry = new StringBuilder();
+            entry.append("    {\n");
+            entry.append("      \"path\": \"").append(escapeJson(node.getPath())).append("\",\n");
+            entry.append("      \"type\": \"file\",\n");
+            entry.append("      \"line_count\": ").append(node.getLineCount()).append(",\n");
+
+            // Serialize public methods
+            entry.append("      \"public_methods\": [");
+            List<String> pubMethods = new ArrayList<>();
+            for (MethodSignature m : node.getPublicMethods()) {
+                pubMethods.add("\"" + escapeJson(m.toSignatureString()) + "\"");
+            }
+            entry.append(String.join(", ", pubMethods));
+            entry.append("],\n");
+
+            // Serialize private methods
+            entry.append("      \"private_methods\": [");
+            List<String> privMethods = new ArrayList<>();
+            for (MethodSignature m : node.getPrivateMethods()) {
+                privMethods.add("\"" + escapeJson(m.toSignatureString()) + "\"");
+            }
+            entry.append(String.join(", ", privMethods));
+            entry.append("]\n");
+
+            entry.append("    }");
+            entries.add(entry.toString());
+
+        } else {
+            // Recurse into directories
+            for (FileNode child : node.getChildren().values()) {
+                serializeNode(child, entries);
+            }
+        }
+    }
+
+    /**
+     * Escape special characters for JSON
+     */
+    private String escapeJson(String s) {
+        if (s == null) return "";
+        return s.replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("\n", "\\n")
+                .replace("\r", "\\r")
+                .replace("\t", "\\t");
+    }
+}
+
+|~|~|~|~|~|~|~|~|~|~|~|
+
+FILE: com/codeboss/javalayer/filecache/FileSystem.java
+|~|~|~|~|~|~|~|~|~|~|~|
+package com.codeboss.javalayer.filecache;
+
+import java.io.*;
+import java.nio.file.*;
+import java.security.*;
+import java.util.*;
+
+/**
+ * Abstraction over file system operations for the file cache module.
+ *
+ * This allows for easy testing and potential caching layer in the future.
+ * All file operations should go through this class rather than using
+ * java.nio.file directly.
+ */
+public class FileSystem {
+
+    /**
+     * Check if a path exists
+     */
+    public boolean exists(String path) {
+        return Files.exists(Paths.get(path));
+    }
+
+    /**
+     * Check if a path is a directory
+     */
+    public boolean isDirectory(String path) {
+        return Files.isDirectory(Paths.get(path));
+    }
+
+    /**
+     * Check if a path is a regular file
+     */
+    public boolean isFile(String path) {
+        return Files.isRegularFile(Paths.get(path));
+    }
+
+    /**
+     * List all files and directories in a directory
+     *
+     * @param directoryPath Path to directory
+     * @return List of file/directory names (not full paths)
+     * @throws IOException if directory cannot be read
+     */
+    public List<String> listDirectory(String directoryPath) throws IOException {
+        List<String> entries = new ArrayList<>();
+        Path dirPath = Paths.get(directoryPath);
+
+        if (!Files.isDirectory(dirPath)) {
+            throw new IOException("Not a directory: " + directoryPath);
+        }
+
+        try (var stream = Files.list(dirPath)) {
+            stream.forEach(path -> {
+                entries.add(path.getFileName().toString());
+            });
+        }
+
+        return entries;
+    }
+
+    /**
+     * Read entire file content as a string
+     *
+     * @param filePath Path to file
+     * @return File content
+     * @throws IOException if file cannot be read
+     */
+    public String readFile(String filePath) throws IOException {
+        return Files.readString(Paths.get(filePath));
+    }
+
+    /**
+     * Count lines in a file
+     *
+     * @param filePath Path to file
+     * @return Number of lines
+     * @throws IOException if file cannot be read
+     */
+    public int countLines(String filePath) throws IOException {
+        Path path = Paths.get(filePath);
+        try (var lines = Files.lines(path)) {
+            return (int) lines.count();
+        }
+    }
+
+    /**
+     * Get file size in bytes
+     *
+     * @param filePath Path to file
+     * @return File size in bytes
+     * @throws IOException if file cannot be read
+     */
+    public long getFileSize(String filePath) throws IOException {
+        return Files.size(Paths.get(filePath));
+    }
+
+    /**
+     * Get last modified timestamp
+     *
+     * @param filePath Path to file
+     * @return Last modified time in milliseconds since epoch
+     * @throws IOException if file cannot be read
+     */
+    public long getLastModified(String filePath) throws IOException {
+        return Files.getLastModifiedTime(Paths.get(filePath)).toMillis();
+    }
+
+    /**
+     * Calculate SHA-256 hash of file content
+     *
+     * @param filePath Path to file
+     * @return Hex string of file hash
+     * @throws IOException if file cannot be read
+     */
+    public String getFileHash(String filePath) throws IOException {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] fileBytes = Files.readAllBytes(Paths.get(filePath));
+            byte[] hashBytes = digest.digest(fileBytes);
+
+            // Convert to hex string
+            StringBuilder hexString = new StringBuilder();
+            for (byte b : hashBytes) {
+                String hex = Integer.toHexString(0xff & b);
+                if (hex.length() == 1) {
+                    hexString.append('0');
+                }
+                hexString.append(hex);
+            }
+            return hexString.toString();
+
+        } catch (NoSuchAlgorithmException e) {
+            throw new RuntimeException("SHA-256 algorithm not available", e);
+        }
+    }
+
+    /**
+     * Recursively list all files in a directory tree
+     *
+     * @param directoryPath Root directory to scan
+     * @param excludeDirs Set of directory names to exclude (e.g., "node_modules", ".git")
+     * @return List of relative file paths
+     * @throws IOException if directory cannot be read
+     */
+    public List<String> listFilesRecursive(String directoryPath, Set<String> excludeDirs) throws IOException {
+        List<String> allFiles = new ArrayList<>();
+        Path rootPath = Paths.get(directoryPath);
+        listFilesRecursiveHelper(rootPath, rootPath, excludeDirs, allFiles);
+        return allFiles;
+    }
+
+    private void listFilesRecursiveHelper(Path root, Path current, Set<String> excludeDirs, List<String> results) throws IOException {
+        if (!Files.isDirectory(current)) {
+            return;
+        }
+
+        // Check if this directory should be excluded
+        String dirName = current.getFileName() != null ? current.getFileName().toString() : "";
+        if (excludeDirs.contains(dirName)) {
+            return; // Skip this directory
+        }
+
+        try (var stream = Files.list(current)) {
+            for (Path entry : stream.toArray(Path[]::new)) {
+                if (Files.isDirectory(entry)) {
+                    // Recurse into subdirectory
+                    listFilesRecursiveHelper(root, entry, excludeDirs, results);
+                } else if (Files.isRegularFile(entry)) {
+                    // Add relative path to results
+                    Path relativePath = root.relativize(entry);
+                    results.add(relativePath.toString().replace('\\', '/'));
+                }
+            }
+        }
+    }
+
+    /**
+     * Check if a file should be excluded based on extension or name
+     *
+     * @param fileName File name
+     * @param includedExtensions Set of extensions to include (e.g., ".java", ".js")
+     * @return true if file should be included
+     */
+    public boolean shouldIncludeFile(String fileName, Set<String> includedExtensions) {
+        if (includedExtensions == null || includedExtensions.isEmpty()) {
+            return true; // Include all files if no filter specified
+        }
+
+        for (String ext : includedExtensions) {
+            if (fileName.endsWith(ext)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+}
+
+|~|~|~|~|~|~|~|~|~|~|~|
+
+FILE: com/codeboss/javalayer/filecache/MethodSignature.java
+|~|~|~|~|~|~|~|~|~|~|~|
+package com.codeboss.javalayer.filecache;
+
+/**
+ * Represents a method or function signature extracted from a source file
+ */
+public class MethodSignature {
+    private final String name;
+    private final String returnType;
+    private final String parameters;
+    private final boolean isPublic;
+    private final int lineNumber;
+    private String description; // Optional 1-2 sentence description
+
+    public MethodSignature(String name, String returnType, String parameters,
+                          boolean isPublic, int lineNumber) {
+        this.name = name;
+        this.returnType = returnType;
+        this.parameters = parameters;
+        this.isPublic = isPublic;
+        this.lineNumber = lineNumber;
+        this.description = null;
+    }
+
+    // Getters
+    public String getName() { return name; }
+    public String getReturnType() { return returnType; }
+    public String getParameters() { return parameters; }
+    public boolean isPublic() { return isPublic; }
+    public int getLineNumber() { return lineNumber; }
+    public String getDescription() { return description; }
+
+    public void setDescription(String description) {
+        this.description = description;
+    }
+
+    /**
+     * Format as a single-line signature
+     * e.g., "public String getName()" or "function handleClick(event)"
+     */
+    public String toSignatureString() {
+        StringBuilder sb = new StringBuilder();
+
+        if (isPublic) {
+            sb.append("public ");
+        } else {
+            sb.append("private ");
+        }
+
+        if (returnType != null && !returnType.isEmpty()) {
+            sb.append(returnType).append(" ");
+        }
+
+        sb.append(name).append("(").append(parameters).append(")");
+
+        return sb.toString();
+    }
+
+    @Override
+    public String toString() {
+        return toSignatureString() + " [line " + lineNumber + "]";
+    }
+}
+
+|~|~|~|~|~|~|~|~|~|~|~|
+
+FILE: com/codeboss/javalayer/filecache/MethodSignatureExtractor.java
+|~|~|~|~|~|~|~|~|~|~|~|
+package com.codeboss.javalayer.filecache;
+
+import java.util.*;
+import java.util.regex.*;
+
+/**
+ * Extracts method/function signatures from source files (Java and JavaScript)
+ */
+public class MethodSignatureExtractor {
+
+    /**
+     * Extract method signatures from file content
+     *
+     * @param filePath Path to the file (used to determine language)
+     * @param content File content
+     * @return List of extracted method signatures
+     */
+    public List<MethodSignature> extract(String filePath, String content) {
+        if (filePath.endsWith(".java")) {
+            return extractJavaMethods(content);
+        } else if (filePath.endsWith(".js")) {
+            return extractJavaScriptFunctions(content);
+        }
+
+        return new ArrayList<>();
+    }
+
+    /**
+     * Extract Java method signatures
+     *
+     * Pattern: [public|private|protected] [static] [final] ReturnType methodName(params)
+     */
+    private List<MethodSignature> extractJavaMethods(String content) {
+        List<MethodSignature> methods = new ArrayList<>();
+
+        // Regex pattern to match Java methods
+        // We need to carefully separate access modifiers from return types
+        // Strategy: Match lines that look like method declarations
+
+        Pattern pattern = Pattern.compile(
+            "\\b(public|private|protected)?\\s*" +   // Access modifier (group 1)
+            "(static)?\\s*" +                         // static modifier (group 2)
+            "(final)?\\s*" +                          // final modifier (group 3)
+            "([\\w<>,\\[\\]]+(?:\\s*<[^>]+>)?)\\s+" + // Return type (group 4)
+            "(\\w+)\\s*" +                            // Method name (group 5)
+            "\\(([^)]*)\\)" +                         // Parameters (group 6)
+            "\\s*\\{",                                // Opening brace
+            Pattern.MULTILINE
+        );
+
+        Matcher matcher = pattern.matcher(content);
+
+        while (matcher.find()) {
+            String accessModifier = matcher.group(1);
+            String staticMod = matcher.group(2);
+            String finalMod = matcher.group(3);
+            String returnType = matcher.group(4);
+            String methodName = matcher.group(5);
+            String parameters = matcher.group(6);
+
+            if (returnType == null || methodName == null) {
+                continue; // Skip invalid matches
+            }
+
+            returnType = returnType.trim();
+            parameters = parameters != null ? parameters.trim() : "";
+
+            // Filter out class declarations (which also have { after name)
+            if ("class".equals(returnType) || "interface".equals(returnType) || "enum".equals(returnType)) {
+                continue;
+            }
+
+            // Determine if public
+            boolean isPublic = "public".equals(accessModifier);
+
+            // Calculate line number
+            int position = matcher.start();
+            int lineNumber = countLinesUpTo(content, position);
+
+            methods.add(new MethodSignature(methodName, returnType, parameters, isPublic, lineNumber));
+        }
+
+        return methods;
+    }
+
+    /**
+     * Extract JavaScript function signatures
+     *
+     * Patterns:
+     * - function functionName(params)
+     * - const functionName = (params) => {}
+     * - functionName(params) {}  (object method)
+     */
+    private List<MethodSignature> extractJavaScriptFunctions(String content) {
+        List<MethodSignature> functions = new ArrayList<>();
+
+        // Pattern 1: Regular function declarations
+        // function functionName(params) {
+        Pattern regularFunction = Pattern.compile(
+            "function\\s+(\\w+)\\s*\\(([^)]*)\\)\\s*\\{"
+        );
+
+        // Pattern 2: Arrow functions
+        // const functionName = (params) => {
+        Pattern arrowFunction = Pattern.compile(
+            "const\\s+(\\w+)\\s*=\\s*\\(([^)]*)\\)\\s*=>"
+        );
+
+        // Pattern 3: Object method shorthand
+        // methodName(params) {
+        Pattern methodShorthand = Pattern.compile(
+            "\\b(\\w+)\\s*\\(([^)]*)\\)\\s*\\{"
+        );
+
+        // Extract regular functions
+        Matcher matcher1 = regularFunction.matcher(content);
+        while (matcher1.find()) {
+            String name = matcher1.group(1);
+            String params = matcher1.group(2).trim();
+            int lineNumber = countLinesUpTo(content, matcher1.start());
+
+            // JavaScript functions are generally considered "public" (exported)
+            functions.add(new MethodSignature(name, null, params, true, lineNumber));
+        }
+
+        // Extract arrow functions
+        Matcher matcher2 = arrowFunction.matcher(content);
+        while (matcher2.find()) {
+            String name = matcher2.group(1);
+            String params = matcher2.group(2).trim();
+            int lineNumber = countLinesUpTo(content, matcher2.start());
+
+            functions.add(new MethodSignature(name, null, params, true, lineNumber));
+        }
+
+        // Extract method shorthand (avoid duplicates with regular functions)
+        Matcher matcher3 = methodShorthand.matcher(content);
+        while (matcher3.find()) {
+            String name = matcher3.group(1);
+            String params = matcher3.group(2).trim();
+            int lineNumber = countLinesUpTo(content, matcher3.start());
+
+            // Avoid duplicates with regular functions
+            boolean isDuplicate = false;
+            for (MethodSignature existing : functions) {
+                if (existing.getName().equals(name) && existing.getLineNumber() == lineNumber) {
+                    isDuplicate = true;
+                    break;
+                }
+            }
+
+            if (!isDuplicate) {
+                functions.add(new MethodSignature(name, null, params, true, lineNumber));
+            }
+        }
+
+        return functions;
+    }
+
+    /**
+     * Determine if a Java method is public based on modifiers
+     */
+    private boolean isPublicMethod(String modifiers) {
+        // TODO: Parse modifiers string
+        return modifiers.contains("public");
+    }
+
+    /**
+     * Count lines in content up to a given position
+     */
+    private int countLinesUpTo(String content, int position) {
+        int lines = 1;
+        for (int i = 0; i < position && i < content.length(); i++) {
+            if (content.charAt(i) == '\n') {
+                lines++;
+            }
+        }
+        return lines;
+    }
+}
+
+|~|~|~|~|~|~|~|~|~|~|~|
+
+FILE: com/codeboss/javalayer/filecache/TokenEstimator.java
+|~|~|~|~|~|~|~|~|~|~|~|
+package com.codeboss.javalayer.filecache;
+
+import java.util.*;
+
+/**
+ * Estimates token counts for various prompt elements
+ *
+ * Uses rough approximation: 1 token ~= 4 characters
+ */
+public class TokenEstimator {
+
+    private static final double CHARS_PER_TOKEN = 4.0;
+
+    /**
+     * Estimate tokens for a text string
+     */
+    public int estimateTokens(String text) {
+        if (text == null || text.isEmpty()) {
+            return 0;
+        }
+        return (int) Math.ceil(text.length() / CHARS_PER_TOKEN);
+    }
+
+    /**
+     * Estimate tokens for the file structure tree
+     *
+     * Format:
+     * src/
+     *   main/
+     *     java/
+     *       Main.java (123 lines)
+     */
+    public int estimateFileStructureTokens(FileNode root) {
+        // TODO: Recursively calculate tokens for tree representation
+        // TODO: Account for indentation and formatting
+
+        if (root == null) {
+            return 0;
+        }
+
+        return estimateNodeTokens(root, 0);
+    }
+
+    private int estimateNodeTokens(FileNode node, int depth) {
+        // TODO: Calculate tokens for this node + all children
+        // Each line: "  " (indent) + name + " (N lines)" or " (N files)"
+
+        int tokens = 0;
+
+        // This node's line
+        String indent = "  ".repeat(depth);
+        String line = indent + node.getName();
+
+        if (node.isFile()) {
+            line += " (" + node.getLineCount() + " lines)";
+        } else {
+            line += " (" + node.getFileCount() + " files)";
+        }
+
+        tokens += estimateTokens(line + "\n");
+
+        // Children
+        if (node.isDirectory()) {
+            for (FileNode child : node.getChildren().values()) {
+                tokens += estimateNodeTokens(child, depth + 1);
+            }
+        }
+
+        return tokens;
+    }
+
+    /**
+     * Estimate tokens for method signatures
+     */
+    public int estimateMethodSignatureTokens(List<MethodSignature> methods) {
+        // TODO: Calculate tokens for all method signatures
+
+        int tokens = 0;
+        for (MethodSignature method : methods) {
+            tokens += estimateTokens(method.toSignatureString() + "\n");
+        }
+        return tokens;
+    }
+
+    /**
+     * Estimate tokens for method descriptions
+     */
+    public int estimateMethodDescriptionTokens(List<MethodSignature> methods) {
+        // TODO: Calculate tokens for all method descriptions
+
+        int tokens = 0;
+        for (MethodSignature method : methods) {
+            if (method.getDescription() != null) {
+                tokens += estimateTokens(method.getDescription() + "\n");
+            }
+        }
+        return tokens;
+    }
+
+    /**
+     * Recursively estimate all tokens for a file tree including all methods
+     */
+    public int estimateAllTokens(FileNode root, BudgetManager.DetailLevel maxLevel) {
+        // TODO: Calculate total tokens based on detail level
+
+        int total = estimateFileStructureTokens(root);
+
+        // TODO: Add method signature tokens based on detail level
+        // TODO: Add description tokens if appropriate
+
+        return total;
+    }
+}
+
+|~|~|~|~|~|~|~|~|~|~|~|
+
+FILE: com/codeboss/javalayer/filecache/ToolDefinition.java
+|~|~|~|~|~|~|~|~|~|~|~|
+package com.codeboss.javalayer.filecache;
+
+import java.util.*;
+
+/**
+ * Represents a tool definition for file-aware search tools
+ *
+ * This will be used to generate new tools like:
+ * - search_file_content
+ * - search_method_content
+ */
+public class ToolDefinition {
+    private final String name;
+    private final String description;
+    private final List<ToolParameter> parameters;
+    private final String exampleUsage;
+
+    public ToolDefinition(String name, String description, List<ToolParameter> parameters, String exampleUsage) {
+        this.name = name;
+        this.description = description;
+        this.parameters = parameters;
+        this.exampleUsage = exampleUsage;
+    }
+
+    public String getName() { return name; }
+    public String getDescription() { return description; }
+    public List<ToolParameter> getParameters() { return parameters; }
+    public String getExampleUsage() { return exampleUsage; }
+
+    /**
+     * Format this tool definition for inclusion in the AI prompt
+     */
+    public String toPromptString() {
+        StringBuilder sb = new StringBuilder();
+
+        sb.append(description).append("\n");
+        sb.append("  <tool name=\"").append(name).append("\">\n");
+
+        for (ToolParameter param : parameters) {
+            sb.append("    <parameter name=\"").append(param.getName()).append("\">");
+            sb.append(param.getExampleValue());
+            sb.append("</parameter>\n");
+        }
+
+        sb.append("  </tool>\n");
+
+        if (exampleUsage != null && !exampleUsage.isEmpty()) {
+            sb.append("  Example: ").append(exampleUsage).append("\n");
+        }
+
+        sb.append("\n");
+
+        return sb.toString();
+    }
+
+    public static class ToolParameter {
+        private final String name;
+        private final String type;
+        private final boolean required;
+        private final String exampleValue;
+        private final String description;
+
+        public ToolParameter(String name, String type, boolean required, String exampleValue, String description) {
+            this.name = name;
+            this.type = type;
+            this.required = required;
+            this.exampleValue = exampleValue;
+            this.description = description;
+        }
+
+        public String getName() { return name; }
+        public String getType() { return type; }
+        public boolean isRequired() { return required; }
+        public String getExampleValue() { return exampleValue; }
+        public String getDescription() { return description; }
     }
 }
 
@@ -7882,6 +9645,8 @@ public class ConfigManager implements com.codeboss.javalayer.bridge.IConfigManag
     private int clickY = 300; // Default click Y coordinate for automatic mode
     private int serverPort = 3000; // Default server port
     private boolean autoLaunchBrowser = true; // Default auto-launch browser setting
+    private boolean fileCacheEnabled = true; // Default file cache enabled
+    private int promptBudgetChars = 500000; // Default prompt budget in characters
 
     public ConfigManager(String workingDirectory, Logger logger) throws IOException {
         this.workingDirectory = workingDirectory;
@@ -7969,7 +9734,27 @@ public class ConfigManager implements com.codeboss.javalayer.bridge.IConfigManag
                     autoLaunchBrowser = true; // fallback
                 }
 
-                logger.log("Loaded config: maxMessageChars = " + maxMessageChars + ", clickX = " + clickX + ", clickY = " + clickY + ", serverPort = " + serverPort + ", autoLaunchBrowser = " + autoLaunchBrowser);
+                // Simple JSON parsing for fileCache.enabled
+                String fileCacheEnabledPattern = "\"enabled\"\\s*:\\s*(true|false)";
+                java.util.regex.Pattern p6 = java.util.regex.Pattern.compile(fileCacheEnabledPattern);
+                java.util.regex.Matcher m6 = p6.matcher(configContent);
+                if (m6.find()) {
+                    fileCacheEnabled = Boolean.parseBoolean(m6.group(1));
+                } else {
+                    fileCacheEnabled = true; // fallback
+                }
+
+                // Simple JSON parsing for fileCache.promptBudgetChars
+                String promptBudgetPattern = "\"promptBudgetChars\"\\s*:\\s*(\\d+)";
+                java.util.regex.Pattern p7 = java.util.regex.Pattern.compile(promptBudgetPattern);
+                java.util.regex.Matcher m7 = p7.matcher(configContent);
+                if (m7.find()) {
+                    promptBudgetChars = Integer.parseInt(m7.group(1));
+                } else {
+                    promptBudgetChars = 500000; // fallback
+                }
+
+                logger.log("Loaded config: maxMessageChars = " + maxMessageChars + ", clickX = " + clickX + ", clickY = " + clickY + ", serverPort = " + serverPort + ", autoLaunchBrowser = " + autoLaunchBrowser + ", fileCacheEnabled = " + fileCacheEnabled + ", promptBudgetChars = " + promptBudgetChars);
                 
                 // Validate configuration
                 validateConfig(configContent);
@@ -8027,6 +9812,14 @@ public class ConfigManager implements com.codeboss.javalayer.bridge.IConfigManag
 
     public void setAutoLaunchBrowser(boolean autoLaunchBrowser) {
         this.autoLaunchBrowser = autoLaunchBrowser;
+    }
+
+    public boolean isFileCacheEnabled() {
+        return fileCacheEnabled;
+    }
+
+    public int getPromptBudgetChars() {
+        return promptBudgetChars;
     }
 }
 |~|~|~|~|~|~|~|~|~|~|~|
@@ -8477,6 +10270,7 @@ import com.codeboss.javalayer.aiprocessor.ChecklistManager;
 import com.codeboss.javalayer.aiprocessor.ModeManager;
 import com.codeboss.javalayer.aiprocessor.ConversationManager;
 import com.codeboss.javalayer.aiprocessor.ToolCategory;
+import com.codeboss.javalayer.filecache.FileStructureCache;
 import java.io.*;
 import java.nio.file.*;
 import java.util.*;
@@ -8490,6 +10284,7 @@ public class ToolExecutor implements IToolExecutor {
     private ChecklistManager checklistManager;  // Optional, for manage_checklist tool
     private ModeManager modeManager;  // Optional, for begin_execution tool
     private ConversationManager conversationManager;  // Optional, for begin_execution approval flow
+    private FileStructureCache fileCache;  // Optional, for cache updates
 
     public ToolExecutor(ILogger logger, String workingDirectory) {
         this.logger = logger;
@@ -8508,6 +10303,10 @@ public class ToolExecutor implements IToolExecutor {
 
     public void setConversationManager(ConversationManager conversationManager) {
         this.conversationManager = conversationManager;
+    }
+
+    public void setFileCache(FileStructureCache fileCache) {
+        this.fileCache = fileCache;
     }
 
     @Override
@@ -8570,8 +10369,6 @@ public class ToolExecutor implements IToolExecutor {
                     return stopTest(params);
                 case "list_processes":
                     return listProcesses(params);
-                case "search_files_by_name":
-                    return searchFilesByName(params);
                 case "search_files_by_content":
                     return searchFilesByContent(params);
                 case "git_read":
@@ -8743,6 +10540,16 @@ public class ToolExecutor implements IToolExecutor {
         Files.writeString(path, content);
         long fileSize = Files.size(path);
 
+        // Update file cache if available
+        if (fileCache != null) {
+            try {
+                fileCache.onFileCreated(filePath, content);
+                logger.log("Updated file cache: created " + filePath);
+            } catch (Exception e) {
+                logger.log("Warning: Failed to update file cache: " + e.getMessage());
+            }
+        }
+
         // Build structured result
         Map<String, Object> result = new HashMap<>();
         result.put("file_path", filePath);
@@ -8816,6 +10623,16 @@ public class ToolExecutor implements IToolExecutor {
         String updatedContent = fileContent.replace(oldContent, newContent);
         Files.writeString(path, updatedContent);
         long fileSize = Files.size(path);
+
+        // Update file cache if available
+        if (fileCache != null) {
+            try {
+                fileCache.onFileUpdated(filePath, updatedContent);
+                logger.log("Updated file cache: modified " + filePath);
+            } catch (Exception e) {
+                logger.log("Warning: Failed to update file cache: " + e.getMessage());
+            }
+        }
 
         // Build structured result
         Map<String, Object> result = new HashMap<>();
@@ -9016,6 +10833,16 @@ public class ToolExecutor implements IToolExecutor {
         Files.writeString(path, updatedContent);
         long fileSize = Files.size(path);
 
+        // Update file cache if available
+        if (fileCache != null) {
+            try {
+                fileCache.onFileUpdated(filePath, updatedContent);
+                logger.log("Updated file cache: modified " + filePath + " (" + updatesApplied + " updates)");
+            } catch (Exception e) {
+                logger.log("Warning: Failed to update file cache: " + e.getMessage());
+            }
+        }
+
         // Build structured result with line number information for each update
         Map<String, Object> result = new HashMap<>();
         result.put("file_path", filePath);
@@ -9060,6 +10887,16 @@ public class ToolExecutor implements IToolExecutor {
         }
 
         Files.delete(path);
+
+        // Update file cache if available
+        if (fileCache != null) {
+            try {
+                fileCache.onFileDeleted(filePath);
+                logger.log("Updated file cache: deleted " + filePath);
+            } catch (Exception e) {
+                logger.log("Warning: Failed to update file cache: " + e.getMessage());
+            }
+        }
 
         // Build structured result
         Map<String, Object> result = new HashMap<>();
@@ -9712,132 +11549,16 @@ public class ToolExecutor implements IToolExecutor {
     // ============================================================================
 
     /**
-     * Search files by name using glob patterns
-     * Uses PowerShell Get-ChildItem for recursive file search
-     *
-     * See: specs/tools-spec.md (search_files_by_name)
-     */
-    private ToolExecutionResult searchFilesByName(Map<String, String> params) {
-        try {
-            String directoryPath = params.getOrDefault("directory_path", ".");
-            String pattern = params.get("pattern");
-            String includeExcluded = params.get("include_excluded");
-
-            if (pattern == null || pattern.isEmpty()) {
-                Map<String, Object> result = new HashMap<>();
-                result.put("error", "Parameter 'pattern' is required");
-                return new ToolExecutionResult(result, "Error: 'pattern' parameter required");
-            }
-
-            Path searchPath = resolvePath(directoryPath);
-            if (!Files.exists(searchPath)) {
-                Map<String, Object> result = new HashMap<>();
-                result.put("error", "Directory not found: " + directoryPath);
-                return new ToolExecutionResult(result, "Error: Directory not found");
-            }
-
-            // Build exclusion filter unless include_excluded is true
-            boolean shouldIncludeExcluded = "true".equalsIgnoreCase(includeExcluded);
-            String exclusionFilter = "";
-            if (!shouldIncludeExcluded) {
-                // Exclude common build/dependency directories
-                exclusionFilter = " | Where-Object { " +
-                    "$path = $_.FullName; " +
-                    "-not ($path -like '*\\node_modules\\*' -or " +
-                    "$path -like '*\\.git\\*' -or " +
-                    "$path -like '*\\bin\\*' -or " +
-                    "$path -like '*\\obj\\*' -or " +
-                    "$path -like '*\\target\\*' -or " +
-                    "$path -like '*\\build\\*' -or " +
-                    "$path -like '*\\dist\\*' -or " +
-                    "$path -like '*\\.vscode\\*') " +
-                    "}";
-            }
-
-            // Use PowerShell Get-ChildItem for glob pattern matching
-            String psCommand = String.format(
-                "Get-ChildItem -Path '%s' -Filter '%s' -Recurse -File%s | ForEach-Object { $_.FullName }",
-                searchPath.toString().replace("'", "''"),
-                pattern.replace("'", "''"),
-                exclusionFilter
-            );
-
-            ProcessBuilder pb = new ProcessBuilder("pwsh", "-Command", psCommand);
-            pb.directory(new File(workingDirectory));
-            Process process = pb.start();
-
-            // 30 second timeout for file name search
-            boolean completed = process.waitFor(30, java.util.concurrent.TimeUnit.SECONDS);
-            boolean timedOut = !completed;
-            if (timedOut) {
-                process.destroyForcibly();
-                // Don't return immediately - we'll collect partial results
-            }
-
-            String output = new String(process.getInputStream().readAllBytes());
-            String errorOutput = new String(process.getErrorStream().readAllBytes());
-
-            // Check exit code only if not timed out
-            if (!timedOut && process.exitValue() != 0 && !errorOutput.isEmpty()) {
-                Map<String, Object> result = new HashMap<>();
-                result.put("error", "Search failed: " + errorOutput);
-                return new ToolExecutionResult(result, "Error: " + errorOutput);
-            }
-
-            List<String> files = new ArrayList<>();
-            if (!output.trim().isEmpty()) {
-                String[] lines = output.trim().split("\n");
-                Path workDir = Paths.get(workingDirectory);
-                for (String line : lines) {
-                    String trimmed = line.trim();
-                    if (!trimmed.isEmpty()) {
-                        // Convert to relative path if possible
-                        Path filePath = Paths.get(trimmed);
-                        try {
-                            Path relative = workDir.relativize(filePath);
-                            files.add(relative.toString());
-                        } catch (IllegalArgumentException e) {
-                            files.add(trimmed);
-                        }
-                    }
-                }
-            }
-
-            Map<String, Object> result = new HashMap<>();
-            result.put("files", files);
-            result.put("count", files.size());
-            result.put("pattern", pattern);
-            result.put("directory", directoryPath);
-
-            if (timedOut) {
-                result.put("warning", "Search timed out after 30 seconds. Showing partial results. To search more thoroughly, narrow the scope by specifying a more specific directory_path.");
-                result.put("timed_out", true);
-            }
-
-            String summary = timedOut
-                ? "Found " + files.size() + " file(s) matching '" + pattern + "' (search timed out, showing partial results)"
-                : "Found " + files.size() + " file(s) matching '" + pattern + "'";
-            return new ToolExecutionResult(result, summary);
-
-        } catch (Exception e) {
-            Map<String, Object> result = new HashMap<>();
-            result.put("error", "Search failed: " + e.getMessage());
-            return new ToolExecutionResult(result, "Error: " + e.getMessage());
-        }
-    }
-
-    /**
      * Search file contents using regex patterns
      * Uses PowerShell with ripgrep (rg) for fast content search
+     * Requires file_paths parameter to limit search scope
      *
      * See: specs/tools-spec.md (search_files_by_content)
      */
     private ToolExecutionResult searchFilesByContent(Map<String, String> params) {
         try {
-            String directoryPath = params.getOrDefault("directory_path", ".");
             String pattern = params.get("pattern");
-            String filePattern = params.get("file_pattern");
-            String includeExcluded = params.get("include_excluded");
+            String filePathsParam = params.get("file_paths");
             String maxResultsStr = params.get("max_results");
 
             // Parse and validate max_results (default: 100, max: 500)
@@ -9862,37 +11583,44 @@ public class ToolExecutor implements IToolExecutor {
                 return new ToolExecutionResult(result, "Error: 'pattern' parameter required");
             }
 
-            Path searchPath = resolvePath(directoryPath);
-            if (!Files.exists(searchPath)) {
+            if (filePathsParam == null || filePathsParam.isEmpty()) {
                 Map<String, Object> result = new HashMap<>();
-                result.put("error", "Directory not found: " + directoryPath);
-                return new ToolExecutionResult(result, "Error: Directory not found");
+                result.put("error", "Parameter 'file_paths' is required");
+                result.put("hint", "Provide comma-separated list of file paths to search. The file structure is provided in the prompt, so you should know which files to search.");
+                result.put("example", "file_paths: \"src/Main.java,src/Utils.java,src/Helper.js\"");
+                return new ToolExecutionResult(result, "Error: 'file_paths' parameter required");
             }
 
-            // Build ripgrep command with exclusions unless include_excluded is true
-            boolean shouldIncludeExcluded = "true".equalsIgnoreCase(includeExcluded);
+            // Parse file paths (comma-separated)
+            String[] filePaths = filePathsParam.split(",");
+            List<String> validPaths = new ArrayList<>();
+
+            for (String filePath : filePaths) {
+                filePath = filePath.trim();
+                if (!filePath.isEmpty()) {
+                    Path path = resolvePath(filePath);
+                    if (Files.exists(path) && !Files.isDirectory(path)) {
+                        validPaths.add(path.toString());
+                    }
+                }
+            }
+
+            if (validPaths.isEmpty()) {
+                Map<String, Object> result = new HashMap<>();
+                result.put("error", "None of the specified files exist");
+                result.put("file_paths_provided", filePathsParam);
+                return new ToolExecutionResult(result, "Error: No valid files to search");
+            }
+
+            // Build ripgrep command to search only specified files
             StringBuilder rgCmd = new StringBuilder();
             rgCmd.append("rg --line-number --no-heading --color never");
-
-            // Add exclusion globs by default
-            if (!shouldIncludeExcluded) {
-                rgCmd.append(" --glob '!node_modules/**'");
-                rgCmd.append(" --glob '!.git/**'");
-                rgCmd.append(" --glob '!bin/**'");
-                rgCmd.append(" --glob '!obj/**'");
-                rgCmd.append(" --glob '!target/**'");
-                rgCmd.append(" --glob '!build/**'");
-                rgCmd.append(" --glob '!dist/**'");
-                rgCmd.append(" --glob '!.vscode/**'");
-            }
-
             rgCmd.append(" --regexp '").append(pattern.replace("'", "''")).append("'");
 
-            if (filePattern != null && !filePattern.isEmpty()) {
-                rgCmd.append(" --glob '").append(filePattern.replace("'", "''")).append("'");
+            // Add each file path
+            for (String path : validPaths) {
+                rgCmd.append(" '").append(path.replace("'", "''")).append("'");
             }
-
-            rgCmd.append(" '").append(searchPath.toString().replace("'", "''")).append("'");
 
             // Limit total results using PowerShell Select-Object
             rgCmd.append(" | Select-Object -First ").append(maxResults);
@@ -9965,20 +11693,17 @@ public class ToolExecutor implements IToolExecutor {
             result.put("matches", matches);
             result.put("count", matches.size());
             result.put("pattern", pattern);
-            result.put("directory", directoryPath);
+            result.put("files_searched", validPaths.size());
             result.put("max_results", maxResults);
-            if (filePattern != null) {
-                result.put("file_pattern", filePattern);
-            }
 
             // Check if results were truncated due to max_results limit
             boolean resultsLimited = matches.size() >= maxResults;
 
             if (timedOut) {
-                result.put("warning", "Search timed out after 30 seconds. Showing partial results. To search more thoroughly, narrow the scope by specifying a more specific directory_path.");
+                result.put("warning", "Search timed out after 30 seconds. Showing partial results. Try reducing the number of files to search.");
                 result.put("timed_out", true);
             } else if (resultsLimited) {
-                result.put("warning", "Results limited to " + maxResults + " matches (max_results=" + maxResults + "). Use a more specific pattern, narrow directory_path, or increase max_results (up to 500) to see more.");
+                result.put("warning", "Results limited to " + maxResults + " matches (max_results=" + maxResults + "). Use a more specific pattern, fewer files, or increase max_results (up to 500) to see more.");
                 result.put("results_limited", true);
             }
 
@@ -10226,7 +11951,6 @@ public class ToolExecutor implements IToolExecutor {
                 return com.codeboss.javalayer.aiprocessor.ToolCategory.FILE_OPERATIONS;
 
             // SEARCH category
-            case "search_files_by_name":
             case "search_files_by_content":
                 return com.codeboss.javalayer.aiprocessor.ToolCategory.SEARCH;
 
