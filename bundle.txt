@@ -1746,116 +1746,409 @@ public class CompactionEngine {
     }
 
     /**
+     * Hook for AI interaction - can be overridden in tests
+     * In real implementation, this would call BridgeQueue
+     */
+    protected String sendToAI(String prompt) {
+        // TODO: In real implementation, send to BridgeQueue and wait for response
+        throw new RuntimeException("sendToAI not implemented - override in subclass or implement with BridgeQueue");
+    }
+
+    /**
      * Compact Level 1 messages into Level 2 message groups
      *
-     * TODO: 1. Get oldest Level 1 messages that exceed budget
-     * TODO: 2. Build AI prompt with message list (context-spec.md lines 158-191)
-     * TODO: 3. Send prompt to AI via BridgeQueue (blocking call)
-     * TODO: 4. Parse AI response JSON array of groups:
-     *    [
-     *      {
-     *        "id": "grp_001",
-     *        "summary": "User requested circle area calculation...",
-     *        "message_ids": ["msg_045", "msg_046", ...]
-     *      }
-     *    ]
-     * TODO: 5. Create ConversationState.Message objects with type=message_group_detailed
-     * TODO: 6. Set fields: id (use grp_XXX format), summary, messages (array of grouped message objects)
-     * TODO: 7. Remove original Level 1 messages from state
-     * TODO: 8. Add Level 2 group messages to state
-     * TODO: 9. Return list of created group messages
+     * 1. Build AI prompt with message list
+     * 2. Send prompt to AI (blocking call)
+     * 3. Parse AI response JSON array
+     * 4. Create message_group_detailed objects
+     * 5. Remove original messages, add groups
      */
     public java.util.List<ConversationState.Message> compactLevel1ToLevel2(
         ConversationState state,
         java.util.List<ConversationState.Message> oldestMessages
     ) {
-        throw new RuntimeException("NOT IMPLEMENTED");
+        logger.log("Compacting " + oldestMessages.size() + " Level 1 messages to Level 2 groups");
+
+        // 1. Build prompt
+        String prompt = buildLevel1CompactionPrompt(oldestMessages);
+
+        // 2. Send to AI
+        String aiResponse = sendToAI(prompt);
+
+        // 3. Parse JSON response - expect array of groups
+        java.util.List<ConversationState.Message> newGroups = new java.util.ArrayList<>();
+
+        try {
+            // Simple JSON parsing for array of objects
+            // Response format: [{"id":"grp_001","summary":"...","message_ids":["msg_001",...]}]
+            aiResponse = aiResponse.trim();
+            if (aiResponse.startsWith("[") && aiResponse.endsWith("]")) {
+                aiResponse = aiResponse.substring(1, aiResponse.length() - 1);
+            }
+
+            // Split by },{ to get individual group objects
+            String[] groupStrings = aiResponse.split("\\},\\{");
+
+            for (String groupStr : groupStrings) {
+                groupStr = groupStr.trim();
+                if (!groupStr.startsWith("{")) groupStr = "{" + groupStr;
+                if (!groupStr.endsWith("}")) groupStr = groupStr + "}";
+
+                // Extract id, summary, message_ids
+                String id = extractJsonField(groupStr, "id");
+                String summary = extractJsonField(groupStr, "summary");
+                String messageIdsStr = extractJsonArray(groupStr, "message_ids");
+
+                // Create Level 2 group message
+                ConversationState.Message group = new ConversationState.Message("message_group_detailed", "");
+                group.id = id;
+                group.summary = summary;
+
+                // Find and add the actual message objects
+                group.messages = new java.util.ArrayList<>();
+                if (messageIdsStr != null) {
+                    String[] msgIds = messageIdsStr.split(",");
+                    for (String msgId : msgIds) {
+                        msgId = msgId.trim().replace("\"", "");
+                        for (ConversationState.Message msg : oldestMessages) {
+                            if (msgId.equals(msg.id)) {
+                                group.messages.add(msg);
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                newGroups.add(group);
+            }
+
+        } catch (Exception e) {
+            logger.log("Error parsing AI response for Level 1->2 compaction: " + e.getMessage());
+            throw new RuntimeException("Failed to parse AI compaction response", e);
+        }
+
+        // 4. Remove original messages from state
+        for (ConversationState.Message msg : oldestMessages) {
+            state.removeMessage(msg.id);
+        }
+
+        // 5. Add new groups to state
+        for (ConversationState.Message group : newGroups) {
+            state.addMessage(group);
+        }
+
+        logger.log("Created " + newGroups.size() + " Level 2 groups");
+        return newGroups;
     }
 
     /**
      * Compact Level 2 groups into Level 3 high-level summaries
-     *
-     * TODO: 1. Get oldest Level 2 groups that exceed budget
-     * TODO: 2. Build AI prompt with group summaries (context-spec.md lines 193-226)
-     * TODO: 3. Send prompt to AI via BridgeQueue
-     * TODO: 4. Parse AI response for Level 3 groups:
-     *    {
-     *      "id": "hlg_001",
-     *      "summary": "Calculator feature development phase...",
-     *      "groups": ["grp_001", "grp_002", "grp_003"]
-     *    }
-     * TODO: 5. Create ConversationState.Message with type=message_group_highlevel
-     * TODO: 6. Set fields: id (use hlg_XXX format), summary, groups (array of group ids), file_changes (optional)
-     * TODO: 7. Remove original Level 2 groups from state
-     * TODO: 8. Add Level 3 cluster to state
-     * TODO: 9. Return list of created cluster messages
      */
     public java.util.List<ConversationState.Message> compactLevel2ToLevel3(
         ConversationState state,
         java.util.List<ConversationState.Message> oldestGroups
     ) {
-        throw new RuntimeException("NOT IMPLEMENTED");
+        logger.log("Compacting " + oldestGroups.size() + " Level 2 groups to Level 3 cluster");
+
+        // 1. Build prompt
+        String prompt = buildLevel2CompactionPrompt(oldestGroups);
+
+        // 2. Send to AI
+        String aiResponse = sendToAI(prompt);
+
+        // 3. Parse JSON response - expect single object
+        java.util.List<ConversationState.Message> newClusters = new java.util.ArrayList<>();
+
+        try {
+            aiResponse = aiResponse.trim();
+
+            // Extract id, summary, groups array
+            String id = extractJsonField(aiResponse, "id");
+            String summary = extractJsonField(aiResponse, "summary");
+            String groupsStr = extractJsonArray(aiResponse, "groups");
+
+            // Create Level 3 cluster message
+            ConversationState.Message cluster = new ConversationState.Message("message_group_highlevel", "");
+            cluster.id = id;
+            cluster.summary = summary;
+
+            // Parse groups array
+            cluster.groups = new java.util.ArrayList<>();
+            if (groupsStr != null) {
+                String[] groupIds = groupsStr.split(",");
+                for (String groupId : groupIds) {
+                    groupId = groupId.trim().replace("\"", "");
+                    cluster.groups.add(groupId);
+                }
+            }
+
+            newClusters.add(cluster);
+
+        } catch (Exception e) {
+            logger.log("Error parsing AI response for Level 2->3 compaction: " + e.getMessage());
+            throw new RuntimeException("Failed to parse AI compaction response", e);
+        }
+
+        // 4. Remove original groups from state
+        for (ConversationState.Message group : oldestGroups) {
+            state.removeMessage(group.id);
+        }
+
+        // 5. Add new cluster to state
+        for (ConversationState.Message cluster : newClusters) {
+            state.addMessage(cluster);
+        }
+
+        logger.log("Created " + newClusters.size() + " Level 3 cluster(s)");
+        return newClusters;
     }
 
     /**
      * Compact Level 3 clusters into Level 4 project summary
-     *
-     * TODO: 1. Get existing Level 4 summary (if any) and oldest Level 3 clusters
-     * TODO: 2. Build AI prompt with cluster summaries and current global summary
-     * TODO: 3. Send prompt to AI via BridgeQueue
-     * TODO: 4. Parse AI response for updated global summary:
-     *    {
-     *      "summary": "Extended calculator application with geometric shape calculations..."
-     *    }
-     * TODO: 5. Create or update ConversationState.Message with type=project_summary
-     * TODO: 6. Set content field with comprehensive ultra-compact summary
-     * TODO: 7. Remove compacted Level 3 clusters from state
-     * TODO: 8. Update or add Level 4 summary in state
-     * TODO: 9. Return the project summary message
      */
     public ConversationState.Message compactLevel3ToLevel4(
         ConversationState state,
         java.util.List<ConversationState.Message> oldestClusters,
         ConversationState.Message existingSummary
     ) {
-        throw new RuntimeException("NOT IMPLEMENTED");
+        logger.log("Compacting " + oldestClusters.size() + " Level 3 clusters to Level 4 summary");
+
+        // 1. Build prompt
+        String prompt = buildLevel3CompactionPrompt(oldestClusters, existingSummary);
+
+        // 2. Send to AI
+        String aiResponse = sendToAI(prompt);
+
+        // 3. Parse JSON response
+        ConversationState.Message newSummary = null;
+
+        try {
+            aiResponse = aiResponse.trim();
+
+            // Extract summary
+            String summary = extractJsonField(aiResponse, "summary");
+
+            // Create or update Level 4 project summary
+            if (existingSummary != null) {
+                // Update existing
+                newSummary = existingSummary;
+                newSummary.content = summary;
+            } else {
+                // Create new
+                newSummary = new ConversationState.Message("project_summary", summary);
+                newSummary.id = "summary_001";
+            }
+
+        } catch (Exception e) {
+            logger.log("Error parsing AI response for Level 3->4 compaction: " + e.getMessage());
+            throw new RuntimeException("Failed to parse AI compaction response", e);
+        }
+
+        // 4. Remove compacted clusters from state
+        for (ConversationState.Message cluster : oldestClusters) {
+            state.removeMessage(cluster.id);
+        }
+
+        // 5. Add/update summary in state
+        if (existingSummary == null) {
+            state.addMessage(newSummary);
+        }
+        // If updating existing, it's already in state, just modified in place
+
+        logger.log("Updated Level 4 project summary");
+        return newSummary;
     }
 
     /**
      * Build Level 1->2 compaction prompt per context-spec.md
      *
-     * TODO: Format messages as list with ids, types, content
-     * TODO: Include prompt template from context-spec.md lines 158-191
-     * TODO: Return formatted prompt string
+     * Format messages as list with ids, types, content
+     * Include prompt template from context-spec.md lines 158-191
      */
-    private String buildLevel1CompactionPrompt(java.util.List<ConversationState.Message> messages) {
-        throw new RuntimeException("NOT IMPLEMENTED");
+    public String buildLevel1CompactionPrompt(java.util.List<ConversationState.Message> messages) {
+        StringBuilder prompt = new StringBuilder();
+
+        prompt.append("Your conversation history has grown too large. Analyze the following messages and group them into logical work chunks, creating detailed summaries for each group.\n\n");
+
+        prompt.append("Messages to consolidate (oldest first):\n");
+        for (ConversationState.Message msg : messages) {
+            prompt.append("- ID: ").append(msg.id);
+            prompt.append(", Type: ").append(msg.type);
+
+            if (msg.content != null && !msg.content.isEmpty()) {
+                // Truncate long content
+                String content = msg.content;
+                if (content.length() > 200) {
+                    content = content.substring(0, 200) + "...";
+                }
+                prompt.append(", Content: \"").append(content).append("\"");
+            }
+
+            if (msg.toolName != null) {
+                prompt.append(", Tool: ").append(msg.toolName);
+            }
+
+            prompt.append("\n");
+        }
+
+        prompt.append("\nCreate groups based on logical units of work (features, bug fixes, discussions). Each group should have:\n");
+        prompt.append("1. A unique id (format: grp_XXX)\n");
+        prompt.append("2. A detailed summary (2-3 sentences describing what was accomplished)\n");
+        prompt.append("3. The message IDs to include in the group\n\n");
+
+        prompt.append("Return a JSON array of groups, ordered from oldest to newest:\n");
+        prompt.append("[\n");
+        prompt.append("  {\n");
+        prompt.append("    \"id\": \"grp_001\",\n");
+        prompt.append("    \"summary\": \"User requested circle area calculation. AI implemented Calculator.circleArea() method with Math.PI, added input validation for negative radius, updated main.java with test demonstration, and verified output.\",\n");
+        prompt.append("    \"message_ids\": [\"msg_045\", \"msg_046\", \"msg_047\", \"msg_048\", \"msg_049\"]\n");
+        prompt.append("  }\n");
+        prompt.append("]\n\n");
+
+        prompt.append("Guidelines:\n");
+        prompt.append("- Group 5-15 related messages together\n");
+        prompt.append("- Focus on feature/task completion boundaries\n");
+        prompt.append("- Include what was implemented, tested, and validated\n");
+        prompt.append("- Summaries should be detailed enough to answer specific questions\n");
+
+        return prompt.toString();
     }
 
     /**
      * Build Level 2->3 compaction prompt per context-spec.md
      *
-     * TODO: Format groups with their summaries and group_ids
-     * TODO: Include prompt template from context-spec.md lines 193-226
-     * TODO: Return formatted prompt string
+     * Format groups with their summaries and group_ids
+     * Include prompt template from context-spec.md lines 193-226
      */
-    private String buildLevel2CompactionPrompt(java.util.List<ConversationState.Message> groups) {
-        throw new RuntimeException("NOT IMPLEMENTED");
+    public String buildLevel2CompactionPrompt(java.util.List<ConversationState.Message> groups) {
+        StringBuilder prompt = new StringBuilder();
+
+        prompt.append("Your conversation history needs further compaction. Process the following Level 2 groups:\n\n");
+
+        prompt.append("Level 2 Groups (detailed summaries):\n");
+        for (ConversationState.Message group : groups) {
+            prompt.append("- ID: ").append(group.id);
+            prompt.append(", Summary: \"").append(group.summary != null ? group.summary : "").append("\"\n");
+        }
+
+        prompt.append("\nInstructions:\n");
+        prompt.append("Merge the Level 2 groups into Level 3 high-level summaries.\n");
+        prompt.append("Cluster related groups together based on feature development phases.\n\n");
+
+        prompt.append("Return a JSON object for the Level 3 high-level group:\n");
+        prompt.append("{\n");
+        prompt.append("  \"id\": \"hlg_001\",\n");
+        prompt.append("  \"summary\": \"Calculator feature development phase - implemented circle, square, and triangle area calculations with comprehensive input validation and testing\",\n");
+        prompt.append("  \"groups\": [\"grp_001\", \"grp_002\", \"grp_003\"]\n");
+        prompt.append("}\n\n");
+
+        prompt.append("The summary should be high-level but still informative about what features were developed.\n");
+
+        return prompt.toString();
     }
 
     /**
      * Build Level 3->4 compaction prompt per context-spec.md
      *
-     * TODO: Format clusters with their summaries
-     * TODO: Include existing global summary if present
-     * TODO: Include prompt template from context-spec.md lines 193-226
-     * TODO: Return formatted prompt string
+     * Format clusters with their summaries
+     * Include existing global summary if present
      */
-    private String buildLevel3CompactionPrompt(
+    public String buildLevel3CompactionPrompt(
         java.util.List<ConversationState.Message> clusters,
         ConversationState.Message existingSummary
     ) {
-        throw new RuntimeException("NOT IMPLEMENTED");
+        StringBuilder prompt = new StringBuilder();
+
+        prompt.append("Your conversation history needs final compaction into a global project summary.\n\n");
+
+        if (existingSummary != null && existingSummary.content != null) {
+            prompt.append("Current Global Summary:\n");
+            prompt.append(existingSummary.content).append("\n\n");
+        }
+
+        prompt.append("Level 3 Groups (high-level summaries) to merge:\n");
+        for (ConversationState.Message cluster : clusters) {
+            prompt.append("- ID: ").append(cluster.id);
+            prompt.append(", Summary: \"").append(cluster.summary != null ? cluster.summary : "").append("\"\n");
+        }
+
+        prompt.append("\nInstructions:\n");
+        if (existingSummary != null) {
+            prompt.append("Update the global summary to incorporate the new Level 3 groups.\n");
+        } else {
+            prompt.append("Create a comprehensive global project summary.\n");
+        }
+        prompt.append("The summary should be ultra-compact but capture:\n");
+        prompt.append("- Core features and capabilities\n");
+        prompt.append("- Architecture and key patterns\n");
+        prompt.append("- Testing and quality measures\n");
+        prompt.append("- Current project status\n\n");
+
+        prompt.append("Return a JSON object:\n");
+        prompt.append("{\n");
+        prompt.append("  \"summary\": \"Extended calculator application with geometric shape calculations (circle, square, triangle, rectangle), comprehensive input validation using ValidationUtils, unit testing coverage, and code quality improvements. Implemented 8 calculation methods with proper error handling and edge case coverage.\"\n");
+        prompt.append("}\n");
+
+        return prompt.toString();
+    }
+
+    /**
+     * Simple JSON field extractor
+     * Extracts value of "field":"value" from JSON string
+     */
+    private String extractJsonField(String json, String fieldName) {
+        // Look for "fieldName":"value" or "fieldName" : "value" (with optional whitespace)
+        String searchFor = "\"" + fieldName + "\"";
+        int fieldIdx = json.indexOf(searchFor);
+        if (fieldIdx == -1) return null;
+
+        // Find the colon after the field name
+        int colonIdx = json.indexOf(":", fieldIdx);
+        if (colonIdx == -1) return null;
+
+        // Find the opening quote after the colon
+        int startIdx = json.indexOf("\"", colonIdx);
+        if (startIdx == -1) return null;
+        startIdx++; // Move past the opening quote
+
+        // Find the closing quote
+        int endIdx = startIdx;
+        while (endIdx < json.length()) {
+            endIdx = json.indexOf("\"", endIdx);
+            if (endIdx == -1) return null;
+
+            // Check if it's escaped
+            if (endIdx > 0 && json.charAt(endIdx - 1) == '\\') {
+                endIdx++; // Skip escaped quote
+                continue;
+            }
+            break; // Found unescaped closing quote
+        }
+
+        if (endIdx == -1) return null;
+
+        return json.substring(startIdx, endIdx);
+    }
+
+    /**
+     * Simple JSON array extractor
+     * Extracts contents of "field":[...] from JSON string
+     */
+    private String extractJsonArray(String json, String fieldName) {
+        // Look for "fieldName":[...] or "fieldName" : [...] (with optional whitespace)
+        String searchFor = "\"" + fieldName + "\"";
+        int fieldIdx = json.indexOf(searchFor);
+        if (fieldIdx == -1) return null;
+
+        // Find the opening bracket after the field name
+        int startIdx = json.indexOf("[", fieldIdx);
+        if (startIdx == -1) return null;
+
+        // Find the matching closing bracket
+        int endIdx = json.indexOf("]", startIdx);
+        if (endIdx == -1) return null;
+
+        return json.substring(startIdx + 1, endIdx);
     }
 }
 
@@ -1886,87 +2179,393 @@ public class ContextManager {
     public ContextManager(IConfigManager config, ILogger logger) {
         this.config = config;
         this.logger = logger;
-        this.compactionEngine = new CompactionEngine(logger);
+        this.compactionEngine = createCompactionEngine(logger);
         this.maxMessageChars = config.getMaxMessageChars();
         this.currentCharCount = 0;
     }
 
     /**
+     * Factory method for CompactionEngine - can be overridden in tests
+     */
+    protected CompactionEngine createCompactionEngine(ILogger logger) {
+        return new CompactionEngine(logger);
+    }
+
+    /**
      * Calculate total character count of conversation
      *
-     * TODO: Iterate through all messages in ConversationState.history
-     * TODO: Count characters in: content, result, parameters fields
-     * TODO: Include JSON overhead (ids, timestamps, type fields)
-     * TODO: Exclude: mode_transition messages, internal system messages
-     * TODO: Return total character count
+     * Counts characters in: content, result, parameters fields
+     * Includes JSON overhead (ids, timestamps, type fields)
+     * Excludes: mode_transition messages, internal system messages
      */
     public int calculateTotalCharacterCount(ConversationState state) {
-        throw new RuntimeException("NOT IMPLEMENTED");
+        int totalChars = 0;
+
+        for (ConversationState.Message msg : state.getHistory()) {
+            // Skip mode transitions and internal messages
+            if ("mode_transition".equals(msg.type) || "loading".equals(msg.type)) {
+                continue;
+            }
+
+            // Count message type field
+            totalChars += msg.type != null ? msg.type.length() : 0;
+
+            // Count id field
+            totalChars += msg.id != null ? msg.id.length() : 0;
+
+            // Count content field
+            totalChars += msg.content != null ? msg.content.length() : 0;
+
+            // Count summary field (for compacted messages)
+            totalChars += msg.summary != null ? msg.summary.length() : 0;
+
+            // Count toolName field
+            totalChars += msg.toolName != null ? msg.toolName.length() : 0;
+
+            // Count parameters (convert map to string representation)
+            if (msg.parameters != null) {
+                totalChars += mapToCharCount(msg.parameters);
+            }
+
+            // Count result (convert map to string representation)
+            if (msg.result != null) {
+                totalChars += mapToCharCount(msg.result);
+            }
+
+            // Count groups array (for Level 3 messages)
+            if (msg.groups != null) {
+                for (String groupId : msg.groups) {
+                    totalChars += groupId.length();
+                }
+            }
+
+            // Count file_changes array (for Level 3 messages)
+            if (msg.file_changes != null) {
+                for (String file : msg.file_changes) {
+                    totalChars += file.length();
+                }
+            }
+
+            // Count JSON overhead: brackets, quotes, colons, commas (rough estimate)
+            totalChars += 50; // Average overhead per message
+        }
+
+        return totalChars;
+    }
+
+    /**
+     * Helper: Count characters in a map (parameters or results)
+     */
+    private int mapToCharCount(java.util.Map<String, Object> map) {
+        int count = 0;
+        for (java.util.Map.Entry<String, Object> entry : map.entrySet()) {
+            count += entry.getKey().length();
+            if (entry.getValue() != null) {
+                count += entry.getValue().toString().length();
+            }
+        }
+        return count;
     }
 
     /**
      * Check if compaction should be triggered (95% threshold)
-     *
-     * TODO: Calculate current character count via calculateTotalCharacterCount()
-     * TODO: Calculate threshold = (int)(maxMessageChars * 0.95)
-     * TODO: Return true if currentCount >= threshold
      */
     public boolean shouldCompact(ConversationState state) {
-        throw new RuntimeException("NOT IMPLEMENTED");
+        int currentCount = calculateTotalCharacterCount(state);
+        int threshold = (int)(maxMessageChars * 0.95);
+        return currentCount >= threshold;
     }
 
     /**
      * Calculate normal operation budgets (before compaction)
-     *
-     * TODO: Level 1 budget = maxMessageChars * 0.75 (75%)
-     * TODO: Level 2 budget = maxMessageChars * 0.175 (17.5%)
-     * TODO: Level 3 budget = maxMessageChars * 0.05 (5%)
-     * TODO: Level 4 budget = maxMessageChars * 0.025 (2.5%)
-     * TODO: Return as array [level1, level2, level3, level4]
+     * Returns: [level1, level2, level3, level4]
      */
     public int[] calculateNormalBudgets() {
-        throw new RuntimeException("NOT IMPLEMENTED");
+        int[] budgets = new int[4];
+        budgets[0] = (int)(maxMessageChars * 0.75);   // Level 1: 75%
+        budgets[1] = (int)(maxMessageChars * 0.175);  // Level 2: 17.5%
+        budgets[2] = (int)(maxMessageChars * 0.05);   // Level 3: 5%
+        budgets[3] = (int)(maxMessageChars * 0.025);  // Level 4: 2.5%
+        return budgets;
     }
 
     /**
      * Calculate compaction budgets (50% reduction for Levels 1-3)
-     *
-     * TODO: Level 1 budget = maxMessageChars * 0.375 (37.5%, half of 75%)
-     * TODO: Level 2 budget = maxMessageChars * 0.0875 (8.75%, half of 17.5%)
-     * TODO: Level 3 budget = maxMessageChars * 0.025 (2.5%, half of 5%)
-     * TODO: Level 4 budget = maxMessageChars * 0.025 (2.5%, unchanged)
-     * TODO: Return as array [level1, level2, level3, level4]
+     * Returns: [level1, level2, level3, level4]
      */
     public int[] calculateCompactionBudgets() {
-        throw new RuntimeException("NOT IMPLEMENTED");
+        int[] budgets = new int[4];
+        budgets[0] = (int)(maxMessageChars * 0.375);  // Level 1: 37.5% (half of 75%)
+        budgets[1] = (int)(maxMessageChars * 0.0875); // Level 2: 8.75% (half of 17.5%)
+        budgets[2] = (int)(maxMessageChars * 0.025);  // Level 3: 2.5% (half of 5%)
+        budgets[3] = (int)(maxMessageChars * 0.025);  // Level 4: 2.5% (unchanged)
+        return budgets;
     }
 
     /**
      * Calculate character count for specific level
      *
-     * TODO: Level 1: Sum characters in messages with type=user_msg, assistant_msg, tool_use, tool_result
-     * TODO: Level 2: Sum characters in messages with type=message_group_detailed
-     * TODO: Level 3: Sum characters in messages with type=message_group_highlevel
-     * TODO: Level 4: Sum characters in messages with type=project_summary
-     * TODO: Return character count for specified level
+     * Level 1: user_msg, assistant_msg, tool_use, tool_result
+     * Level 2: message_group_detailed
+     * Level 3: message_group_highlevel
+     * Level 4: project_summary
      */
     public int calculateLevelCharacterCount(ConversationState state, int level) {
-        throw new RuntimeException("NOT IMPLEMENTED");
+        int totalChars = 0;
+
+        for (ConversationState.Message msg : state.getHistory()) {
+            boolean includeMessage = false;
+
+            switch (level) {
+                case 1:
+                    // Level 1: Raw messages
+                    includeMessage = "user_msg".equals(msg.type) ||
+                                   "assistant_msg".equals(msg.type) ||
+                                   "tool_use".equals(msg.type) ||
+                                   "tool_result".equals(msg.type) ||
+                                   "system_msg".equals(msg.type) ||
+                                   "error".equals(msg.type);
+                    break;
+                case 2:
+                    // Level 2: Detailed message groups
+                    includeMessage = "message_group_detailed".equals(msg.type);
+                    break;
+                case 3:
+                    // Level 3: High-level summaries
+                    includeMessage = "message_group_highlevel".equals(msg.type);
+                    break;
+                case 4:
+                    // Level 4: Global project summary
+                    includeMessage = "project_summary".equals(msg.type);
+                    break;
+            }
+
+            if (includeMessage) {
+                // Use same counting logic as calculateTotalCharacterCount
+                totalChars += msg.type != null ? msg.type.length() : 0;
+                totalChars += msg.id != null ? msg.id.length() : 0;
+                totalChars += msg.content != null ? msg.content.length() : 0;
+                totalChars += msg.summary != null ? msg.summary.length() : 0;
+                totalChars += msg.toolName != null ? msg.toolName.length() : 0;
+
+                if (msg.parameters != null) {
+                    totalChars += mapToCharCount(msg.parameters);
+                }
+
+                if (msg.result != null) {
+                    totalChars += mapToCharCount(msg.result);
+                }
+
+                if (msg.groups != null) {
+                    for (String groupId : msg.groups) {
+                        totalChars += groupId.length();
+                    }
+                }
+
+                if (msg.file_changes != null) {
+                    for (String file : msg.file_changes) {
+                        totalChars += file.length();
+                    }
+                }
+
+                totalChars += 50; // JSON overhead
+            }
+        }
+
+        return totalChars;
     }
 
     /**
      * Trigger proactive compaction
      *
-     * TODO: 1. Calculate compaction budgets (50% reduction)
-     * TODO: 2. Check Level 1 - if over budget, compact Level 1->2 via compactionEngine
-     * TODO: 3. Check Level 2 - if over budget, compact Level 2->3 via compactionEngine
-     * TODO: 4. Check Level 3 - if over budget, compact Level 3->4 via compactionEngine
-     * TODO: 5. Update ConversationState with compacted messages
-     * TODO: 6. Write updated conversation to conversation.jsonl
-     * TODO: 7. Log compaction completion
+     * Sequential process:
+     * 1. Calculate compaction budgets (50% reduction)
+     * 2. Check Level 1 - if over budget, compact Level 1->2
+     * 3. Check Level 2 - if over budget, compact Level 2->3
+     * 4. Check Level 3 - if over budget, compact Level 3->4
+     * 5. Messages are updated in-place by CompactionEngine
      */
     public void compact(ConversationState state) {
-        throw new RuntimeException("NOT IMPLEMENTED");
+        logger.log("=== Starting proactive compaction ===");
+
+        // 1. Calculate compaction budgets (50% reduction)
+        int[] budgets = calculateCompactionBudgets();
+        int level1Budget = budgets[0];
+        int level2Budget = budgets[1];
+        int level3Budget = budgets[2];
+        int level4Budget = budgets[3];
+
+        logger.log("Compaction budgets: L1=" + level1Budget + ", L2=" + level2Budget +
+                   ", L3=" + level3Budget + ", L4=" + level4Budget);
+
+        // 2. Check Level 1 - compact if over budget
+        int level1Chars = calculateLevelCharacterCount(state, 1);
+        logger.log("Level 1 character count: " + level1Chars + " / " + level1Budget);
+
+        if (level1Chars > level1Budget) {
+            logger.log("Level 1 over budget - compacting to Level 2");
+
+            // Get oldest Level 1 messages until we're under budget
+            java.util.List<ConversationState.Message> oldestLevel1 = getOldestMessagesOverBudget(state, 1, level1Budget);
+
+            if (oldestLevel1.size() > 0) {
+                logger.log("Compacting " + oldestLevel1.size() + " Level 1 messages");
+                compactionEngine.compactLevel1ToLevel2(state, oldestLevel1);
+            }
+        }
+
+        // 3. Check Level 2 - compact if over budget
+        int level2Chars = calculateLevelCharacterCount(state, 2);
+        logger.log("Level 2 character count: " + level2Chars + " / " + level2Budget);
+
+        if (level2Chars > level2Budget) {
+            logger.log("Level 2 over budget - compacting to Level 3");
+
+            // Get oldest Level 2 groups until we're under budget
+            java.util.List<ConversationState.Message> oldestLevel2 = getOldestMessagesOverBudget(state, 2, level2Budget);
+
+            if (oldestLevel2.size() > 0) {
+                logger.log("Compacting " + oldestLevel2.size() + " Level 2 groups");
+                compactionEngine.compactLevel2ToLevel3(state, oldestLevel2);
+            }
+        }
+
+        // 4. Check Level 3 - compact if over budget
+        int level3Chars = calculateLevelCharacterCount(state, 3);
+        logger.log("Level 3 character count: " + level3Chars + " / " + level3Budget);
+
+        if (level3Chars > level3Budget) {
+            logger.log("Level 3 over budget - compacting to Level 4");
+
+            // Get oldest Level 3 clusters until we're under budget
+            java.util.List<ConversationState.Message> oldestLevel3 = getOldestMessagesOverBudget(state, 3, level3Budget);
+
+            if (oldestLevel3.size() > 0) {
+                // Get existing Level 4 summary (if any)
+                ConversationState.Message existingSummary = getLevel4Summary(state);
+
+                logger.log("Compacting " + oldestLevel3.size() + " Level 3 clusters");
+                compactionEngine.compactLevel3ToLevel4(state, oldestLevel3, existingSummary);
+            }
+        }
+
+        // Calculate final totals
+        int finalTotal = calculateTotalCharacterCount(state);
+        logger.log("=== Compaction complete ===");
+        logger.log("Final total character count: " + finalTotal + " / " + maxMessageChars);
+    }
+
+    /**
+     * Get oldest messages of specified level that exceed budget
+     * Returns messages to compact (oldest first) until remaining would fit in budget
+     */
+    private java.util.List<ConversationState.Message> getOldestMessagesOverBudget(
+        ConversationState state,
+        int level,
+        int budget
+    ) {
+        java.util.List<ConversationState.Message> result = new java.util.ArrayList<>();
+        java.util.List<ConversationState.Message> levelMessages = new java.util.ArrayList<>();
+
+        // Collect all messages of this level
+        for (ConversationState.Message msg : state.getHistory()) {
+            if (isMessageAtLevel(msg, level)) {
+                levelMessages.add(msg);
+            }
+        }
+
+        // Calculate how many chars we need to remove
+        int currentChars = calculateLevelCharacterCount(state, level);
+        int charsToRemove = currentChars - budget;
+
+        if (charsToRemove <= 0) {
+            return result; // Already under budget
+        }
+
+        // Add oldest messages until we've removed enough chars
+        int removedChars = 0;
+        for (ConversationState.Message msg : levelMessages) {
+            result.add(msg);
+            removedChars += calculateMessageCharCount(msg);
+
+            if (removedChars >= charsToRemove) {
+                break;
+            }
+        }
+
+        return result;
+    }
+
+    /**
+     * Check if message belongs to specified level
+     */
+    private boolean isMessageAtLevel(ConversationState.Message msg, int level) {
+        switch (level) {
+            case 1:
+                return "user_msg".equals(msg.type) ||
+                       "assistant_msg".equals(msg.type) ||
+                       "tool_use".equals(msg.type) ||
+                       "tool_result".equals(msg.type) ||
+                       "system_msg".equals(msg.type) ||
+                       "error".equals(msg.type);
+            case 2:
+                return "message_group_detailed".equals(msg.type);
+            case 3:
+                return "message_group_highlevel".equals(msg.type);
+            case 4:
+                return "project_summary".equals(msg.type);
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * Calculate character count for a single message
+     */
+    private int calculateMessageCharCount(ConversationState.Message msg) {
+        int totalChars = 0;
+
+        totalChars += msg.type != null ? msg.type.length() : 0;
+        totalChars += msg.id != null ? msg.id.length() : 0;
+        totalChars += msg.content != null ? msg.content.length() : 0;
+        totalChars += msg.summary != null ? msg.summary.length() : 0;
+        totalChars += msg.toolName != null ? msg.toolName.length() : 0;
+
+        if (msg.parameters != null) {
+            totalChars += mapToCharCount(msg.parameters);
+        }
+
+        if (msg.result != null) {
+            totalChars += mapToCharCount(msg.result);
+        }
+
+        if (msg.groups != null) {
+            for (String groupId : msg.groups) {
+                totalChars += groupId.length();
+            }
+        }
+
+        if (msg.file_changes != null) {
+            for (String file : msg.file_changes) {
+                totalChars += file.length();
+            }
+        }
+
+        totalChars += 50; // JSON overhead
+
+        return totalChars;
+    }
+
+    /**
+     * Get existing Level 4 project summary (if any)
+     */
+    private ConversationState.Message getLevel4Summary(ConversationState state) {
+        for (ConversationState.Message msg : state.getHistory()) {
+            if ("project_summary".equals(msg.type)) {
+                return msg;
+            }
+        }
+        return null;
     }
 
     public int getCurrentCharCount() {
@@ -2097,6 +2696,15 @@ public class ConversationManager {
         state.addMessage(msg);
         state.incrementMessageCount();
         logger.log("Added user message: " + msg.id);
+        persistMessage(msg);
+        return msg;
+    }
+
+    public ConversationState.Message addCommandMessage(String text) {
+        ConversationState.Message msg = new ConversationState.Message("command", text);
+        state.addMessage(msg);
+        state.incrementMessageCount();
+        logger.log("Added command message: " + msg.id);
         persistMessage(msg);
         return msg;
     }
@@ -2812,6 +3420,7 @@ public class ConversationRenderer {
      */
     private boolean isMetaMessage(String type) {
         return "loading".equals(type) ||
+               "command".equals(type) ||
                "command_result".equals(type) ||
                "mode_transition".equals(type);
     }
@@ -2955,6 +3564,13 @@ public class ConversationState {
 
     public List<Message> getHistory() { return history; }
     public void addMessage(Message message) { this.history.add(message); }
+
+    /**
+     * Remove message by ID (for compaction)
+     */
+    public void removeMessage(String messageId) {
+        history.removeIf(msg -> messageId.equals(msg.id));
+    }
 
     public static class Message {
         public String id;
@@ -3385,6 +4001,23 @@ public class LenientXMLParser {
      * Parse XML string into root element
      */
     public static Element parse(String xml) {
+        return parse(xml, new ArrayList<>());
+    }
+
+    /**
+     * Parse XML string into root element with raw text content paths.
+     *
+     * @param xml The XML string to parse
+     * @param rawContentPaths List of element paths where content should be treated as raw text.
+     *                        Example: [["execute", "tool", "parameter"]] means any <parameter>
+     *                        inside <tool> inside <execute> will have its content treated as raw text,
+     *                        not parsed as XML structure.
+     *
+     *                        This is useful for elements that may contain XML/code as content.
+     *                        Limitation: The raw text content cannot contain the element's closing tag
+     *                        (e.g., </parameter>) as this would close the element prematurely.
+     */
+    public static Element parse(String xml, List<List<String>> rawContentPaths) {
         if (xml == null || xml.trim().isEmpty()) {
             throw new IllegalArgumentException("XML cannot be null or empty");
         }
@@ -3405,8 +4038,12 @@ public class LenientXMLParser {
 
         Map<String, String> rootAttributes = parseAttributes(rootAttributesStr);
 
+        // Start parsing with path [rootName]
+        List<String> currentPath = new ArrayList<>();
+        currentPath.add(rootName);
+
         // Parse content (children or text)
-        ContentResult contentResult = parseContent(rootContent);
+        ContentResult contentResult = parseContent(rootContent, currentPath, rawContentPaths);
 
         return new Element(rootName, rootAttributes, contentResult.textContent, contentResult.children, !contentResult.preserveWhitespace);
     }
@@ -3433,10 +4070,22 @@ public class LenientXMLParser {
     /**
      * Parse content - determine if it's text or child elements
      * Handles CDATA sections: <![CDATA[...]]>
+     *
+     * @param content The content to parse
+     * @param currentPath The current element path (e.g., ["execute", "tool"])
+     * @param rawContentPaths Paths where content should be treated as raw text
      */
-    private static ContentResult parseContent(String content) {
+    private static ContentResult parseContent(String content, List<String> currentPath, List<List<String>> rawContentPaths) {
         List<Element> children = new ArrayList<>();
         String textContent = "";
+
+        // Check if current path matches any raw content path
+        if (matchesAnyPath(currentPath, rawContentPaths)) {
+            // Treat all content as raw text, don't parse children
+            // Normalize AI formatting issues (same as CDATA)
+            textContent = normalizeAIFormatting(content);
+            return new ContentResult(textContent, children, true); // preserveWhitespace = true
+        }
 
         // Check for CDATA section first
         if (content.trim().startsWith("<![CDATA[")) {
@@ -3456,7 +4105,7 @@ public class LenientXMLParser {
         if (content.trim().startsWith("<")) {
             // Starts with a tag, likely has child elements
             try {
-                children = parseChildren(content);
+                children = parseChildren(content, currentPath, rawContentPaths);
                 // If parseChildren succeeded but returned empty list, treat as text content
                 if (children.isEmpty()) {
                     textContent = content;
@@ -3471,6 +4120,33 @@ public class LenientXMLParser {
         }
 
         return new ContentResult(textContent, children);
+    }
+
+    /**
+     * Check if current path matches any of the raw content paths
+     */
+    private static boolean matchesAnyPath(List<String> currentPath, List<List<String>> rawContentPaths) {
+        for (List<String> rawPath : rawContentPaths) {
+            if (pathsMatch(currentPath, rawPath)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Check if two paths match
+     */
+    private static boolean pathsMatch(List<String> path1, List<String> path2) {
+        if (path1.size() != path2.size()) {
+            return false;
+        }
+        for (int i = 0; i < path1.size(); i++) {
+            if (!path1.get(i).equals(path2.get(i))) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**
@@ -3499,25 +4175,47 @@ public class LenientXMLParser {
 
     /**
      * Parse child elements from content
+     *
+     * @param content The content to parse
+     * @param currentPath The current element path
+     * @param rawContentPaths Paths where content should be treated as raw text
      */
-    private static List<Element> parseChildren(String content) {
+    private static List<Element> parseChildren(String content, List<String> currentPath, List<List<String>> rawContentPaths) {
         List<Element> children = new ArrayList<>();
 
-        // Match child elements: <tag ...>...</tag>
-        Pattern childPattern = Pattern.compile("<([a-zA-Z_][a-zA-Z0-9_-]*)([^>]*)>(.*?)</\\1>", Pattern.DOTALL);
+        // Match both regular and self-closing child elements
+        // Regular: <tag ...>...</tag>
+        // Self-closing: <tag ... />
+        String combinedPattern = "(<([a-zA-Z_][a-zA-Z0-9_-]*)([^>]*?)/>)|(<([a-zA-Z_][a-zA-Z0-9_-]*)([^>]*)>(.*?)</\\5>)";
+        Pattern childPattern = Pattern.compile(combinedPattern, Pattern.DOTALL);
         Matcher childMatcher = childPattern.matcher(content);
 
         while (childMatcher.find()) {
-            String childName = childMatcher.group(1);
-            String childAttributesStr = childMatcher.group(2);
-            String childContent = childMatcher.group(3);
+            if (childMatcher.group(1) != null) {
+                // Self-closing tag: <tag ... />
+                String childName = childMatcher.group(2);
+                String childAttributesStr = childMatcher.group(3);
+                Map<String, String> childAttributes = parseAttributes(childAttributesStr);
 
-            Map<String, String> childAttributes = parseAttributes(childAttributesStr);
+                // Self-closing tags have no content
+                children.add(new Element(childName, childAttributes, "", new ArrayList<>()));
+            } else {
+                // Regular tag: <tag ...>...</tag>
+                String childName = childMatcher.group(5);
+                String childAttributesStr = childMatcher.group(6);
+                String childContent = childMatcher.group(7);
 
-            // Parse content (children or text) using shared logic
-            ContentResult contentResult = parseContent(childContent);
+                Map<String, String> childAttributes = parseAttributes(childAttributesStr);
 
-            children.add(new Element(childName, childAttributes, contentResult.textContent, contentResult.children, !contentResult.preserveWhitespace));
+                // Build child path
+                List<String> childPath = new ArrayList<>(currentPath);
+                childPath.add(childName);
+
+                // Parse content (children or text) using shared logic
+                ContentResult contentResult = parseContent(childContent, childPath, rawContentPaths);
+
+                children.add(new Element(childName, childAttributes, contentResult.textContent, contentResult.children, !contentResult.preserveWhitespace));
+            }
         }
 
         return children;
@@ -4120,7 +4818,9 @@ public class PromptGenerator {
                 instructions.append("  - \"Update API endpoints\" -> You can batch-edit multiple methods in server.js at once\n");
                 instructions.append("  - \"Clear project files\" -> You'll delete multiple files in one step\n\n");
                 instructions.append("CREATING A PLAN:\n");
-                instructions.append("  1. Read relevant files to understand the codebase (optional)\n");
+                instructions.append("  1. IMMEDIATELY use read/search tools to understand the codebase\n");
+                instructions.append("     - Don't ask for permission - just read the files you need\n");
+                instructions.append("     - You can batch multiple read_file calls in one <execute> block\n");
                 instructions.append("  2. Create a checklist with COARSE-GRAINED tasks\n");
                 instructions.append("     - Each checklist item should be a logical unit of work that may involve MULTIPLE tool calls\n");
                 instructions.append("     - Example: \"Clear out project files\" (deletes many files), NOT \"Delete file X\", \"Delete file Y\"\n");
@@ -4254,7 +4954,20 @@ public class PromptGenerator {
                "    <parameter name=\"directory_path\">src/main</parameter>\n" +
                "  </tool>\n" +
                "  Note: directory_path is optional (defaults to current directory)\n" +
-               "  Returns: List of files and directories\n\n";
+               "  Returns: List of files and directories\n\n" +
+
+               "REFRESH FILE CACHE:\n" +
+               "  <tool name=\"refresh_file_cache\">\n" +
+               "  </tool>\n" +
+               "  Rescans the project directory to rebuild the file structure cache.\n" +
+               "  WHEN TO USE:\n" +
+               "  - User explicitly asks you to refresh or rescan the file structure\n" +
+               "  - You suspect files have been modified outside your control (e.g., by git, build tools, or external editors)\n" +
+               "  - You notice a mismatch between what you expect and what tools return\n" +
+               "  WHEN NOT TO USE:\n" +
+               "  - During normal operations - the cache auto-updates when you create/modify/delete files\n" +
+               "  - Do NOT call this proactively unless you have a specific reason to believe the cache is stale\n" +
+               "  Returns: Confirmation that cache was refreshed\n\n";
     }
 
     private String getFileWriteTools() {
@@ -4620,7 +5333,13 @@ public class PromptGenerator {
         StringBuilder rules = new StringBuilder();
         rules.append("IMPORTANT RULES:\n\n");
 
-        rules.append("1. TOOL BATCHING:\n");
+        rules.append("1. PROACTIVE TOOL USE:\n");
+        rules.append("   - NEVER ask permission before using tools - just use them\n");
+        rules.append("   - Don't say \"Let me examine...\" and stop - execute the tools immediately\n");
+        rules.append("   - If you need information, read the files - don't announce your intentions first\n");
+        rules.append("\n");
+
+        rules.append("2. TOOL BATCHING:\n");
         rules.append("   - Batch multiple tool calls in ONE <execute> block (much more efficient)\n");
         rules.append("   - Don't send one tool, wait for response, then send another\n");
         if (hasFileOps) {
@@ -4628,13 +5347,13 @@ public class PromptGenerator {
         }
         rules.append("\n");
 
-        rules.append("2. FORMAT RULES:\n");
+        rules.append("3. FORMAT RULES:\n");
         rules.append("   - NEVER send both <message> and <execute> - pick ONE only\n");
         rules.append("   - NEVER put text outside the tags - everything inside <message> or <execute>\n");
         rules.append("\n");
 
         if (hasFileOps) {
-            rules.append("3. FILE OPERATIONS:\n");
+            rules.append("4. FILE OPERATIONS:\n");
             rules.append("   - Always use forward slashes (/) in file paths\n");
             rules.append("   - All file paths are relative to the current working directory\n");
             rules.append("   - Read files before modifying them to understand context\n");
@@ -4642,17 +5361,17 @@ public class PromptGenerator {
             rules.append("   - NEVER create empty files - always include content\n");
             rules.append("\n");
 
-            rules.append("4. ERROR RECOVERY:\n");
+            rules.append("5. ERROR RECOVERY:\n");
             rules.append("   - If a tool fails, try to fix it or find alternative approach\n");
             rules.append("   - If same error occurs twice, call mark_failed immediately\n");
             rules.append("   - Only call mark_complete if final outcome meets task objective\n");
         } else {
-            rules.append("3. FILE PATHS:\n");
+            rules.append("4. FILE PATHS:\n");
             rules.append("   - Always use forward slashes (/) in file paths\n");
             rules.append("   - All file paths are relative to the current working directory\n");
             rules.append("\n");
 
-            rules.append("4. ERROR RECOVERY:\n");
+            rules.append("5. ERROR RECOVERY:\n");
             rules.append("   - If a tool fails twice with same error, try different approach\n");
         }
         rules.append("\n");
@@ -4882,8 +5601,13 @@ public class ResponseParser {
         }
 
         // Try to parse as XML
+        // Define paths where content should be treated as raw text (not parsed as XML structure)
+        // This allows <parameter> elements to contain XML/code without using CDATA blocks
+        List<List<String>> rawContentPaths = new ArrayList<>();
+        rawContentPaths.add(Arrays.asList("execute", "tool", "parameter"));
+
         try {
-            LenientXMLParser.Element root = LenientXMLParser.parse(response);
+            LenientXMLParser.Element root = LenientXMLParser.parse(response, rawContentPaths);
 
             if (root.name.equals("execute")) {
                 return parseExecuteBlock(root, warnings);
@@ -7950,8 +8674,8 @@ public class Router {
             // 3. Check if message is a command (before SSE setup and approval checks)
             CommandDispatcher.CommandResult commandResult = tryExecuteCommand(userMessage);
             if (commandResult != null) {
-                // Command was executed - add user message first, then result messages
-                conversationManager.addUserMessage(userMessage);
+                // Command was executed - add command message first, then result messages
+                conversationManager.addCommandMessage(userMessage);
                 logger.log("Command executed, success=" + commandResult.success + ", message length: " + commandResult.message.length());
 
                 // Check if command returned clipboard data
@@ -10406,6 +11130,8 @@ public class ToolExecutor implements IToolExecutor {
                     return gitRead(params);
                 case "git_write":
                     return gitWrite(params);
+                case "refresh_file_cache":
+                    return refreshFileCache(params);
                 default:
                     Map<String, Object> error = new HashMap<>();
                     error.put("error", "Unknown tool: " + toolName);
@@ -11964,6 +12690,44 @@ public class ToolExecutor implements IToolExecutor {
     }
 
     /**
+     * Refresh the file structure cache by rescanning the project directory
+     * This is useful when files have been modified outside of the AI's control
+     * (e.g., by external editors, git operations, or build tools)
+     */
+    private ToolExecutionResult refreshFileCache(Map<String, String> params) {
+        if (fileCache == null) {
+            Map<String, Object> error = new HashMap<>();
+            error.put("error", "File cache not available");
+            error.put("hint", "File cache may be disabled in configuration");
+            return new ToolExecutionResult(error, "Error: File cache not available");
+        }
+
+        try {
+            logger.log("Refreshing file cache...");
+
+            // Re-initialize the cache by rescanning the working directory
+            // This will rebuild the entire file tree, line counts, and method signatures
+            int budgetChars = 500000; // Default budget - this could be made configurable
+            fileCache.initialize(workingDirectory, budgetChars);
+
+            logger.log("File cache refreshed successfully");
+
+            Map<String, Object> result = new HashMap<>();
+            result.put("refreshed", true);
+            result.put("working_directory", workingDirectory);
+
+            String summary = "File cache refreshed - rescanned project structure";
+            return new ToolExecutionResult(result, summary);
+
+        } catch (Exception e) {
+            logger.log("Error refreshing file cache: " + e.getMessage());
+            Map<String, Object> error = new HashMap<>();
+            error.put("error", "Failed to refresh file cache: " + e.getMessage());
+            return new ToolExecutionResult(error, "Error: " + e.getMessage());
+        }
+    }
+
+    /**
      * Maps tool names to their required ToolCategory
      * Returns null for tools that don't require category validation
      */
@@ -12000,6 +12764,10 @@ public class ToolExecutor implements IToolExecutor {
             // GIT_WRITE category
             case "git_write":
                 return com.codeboss.javalayer.aiprocessor.ToolCategory.GIT_WRITE;
+
+            // FILE_READ category (cache refresh is read-only, available in all modes)
+            case "refresh_file_cache":
+                return com.codeboss.javalayer.aiprocessor.ToolCategory.FILE_READ;
 
             // CHECKLIST category (mode management tools - no validation needed)
             case "manage_checklist":
@@ -12419,13 +13187,16 @@ FILE: src/frontend-ui/main.js
     }
 
     function isNearBottom() {
-        const threshold = 40;
+        // Increased threshold to make auto-scroll more "sticky"
+        // If you're within 150px of bottom, we consider you "at bottom"
+        const threshold = 150;
         return chatContainer.scrollHeight - chatContainer.scrollTop - chatContainer.clientHeight < threshold;
     }
 
     function handleScroll() {
         // If user manually scrolls significantly away from bottom, release the lock
-        const significantlyAwayFromBottom = chatContainer.scrollHeight - chatContainer.scrollTop - chatContainer.clientHeight > 150;
+        // Need to scroll more than 300px away to break the lock
+        const significantlyAwayFromBottom = chatContainer.scrollHeight - chatContainer.scrollTop - chatContainer.clientHeight > 300;
         if (significantlyAwayFromBottom) {
             shouldMaintainScrollLock = false;
         }
