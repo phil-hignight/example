@@ -5333,6 +5333,38 @@ public class PromptGenerator {
         StringBuilder rules = new StringBuilder();
         rules.append("IMPORTANT RULES:\n\n");
 
+        rules.append("=== DECISION PROCESS FOR EVERY REQUEST ===\n");
+        rules.append("For EVERY user request, follow these steps IN ORDER:\n\n");
+        rules.append("STEP 1: DECIDE IF YOU NEED TO USE TOOLS\n");
+        rules.append("Ask yourself: \"Do I have ALL the information I need to give a complete response?\"\n");
+        rules.append("- If NO -> You need to use tools (read files, search, list files, etc.)\n");
+        rules.append("- If YES -> Skip to Step 2\n\n");
+        rules.append("If you need tools:\n");
+        rules.append("- Return ONLY an <execute> block with your tool calls\n");
+        rules.append("- DO NOT send a <message> saying what you're about to do\n");
+        rules.append("- DO NOT say \"Let me read...\" or \"Let me examine...\" and stop\n");
+        rules.append("- Just send the <execute> block with read_file, search_files_by_content, etc.\n");
+        rules.append("- After the tools execute, you'll get the results and can respond in the next turn\n\n");
+        rules.append("STEP 2: RESPOND WITH A MESSAGE\n");
+        rules.append("Now you have all the information. Send a <message> with your complete response.\n");
+        rules.append("- Provide the information the user asked for\n");
+        rules.append("- Answer their question\n");
+        rules.append("- Explain what you did (if relevant)\n\n");
+        rules.append("EXAMPLES:\n");
+        rules.append("User: \"What files are in my project?\"\n");
+        rules.append("Step 1: I don't know what files exist -> I need list_files\n");
+        rules.append("Response: <execute><tool name=\"list_files\"></tool></execute>|||||END|||||\n");
+        rules.append("[After getting results, Step 2:]\n");
+        rules.append("<message>Your project contains: src/Main.java, README.md, ...</message>|||||END|||||\n\n");
+        rules.append("User: \"What is 2+2?\"\n");
+        rules.append("Step 1: I know the answer, no tools needed -> Skip to Step 2\n");
+        rules.append("Response: <message>2+2 equals 4.</message>|||||END|||||\n\n");
+        rules.append("User: \"Show me the Main.java file\"\n");
+        rules.append("Step 1: I don't have the file contents -> I need read_file\n");
+        rules.append("Response: <execute><tool name=\"read_file\"><parameter name=\"file_path\">Main.java</parameter></tool></execute>|||||END|||||\n");
+        rules.append("[After getting results, Step 2:]\n");
+        rules.append("<message>Here's Main.java: [file contents]</message>|||||END|||||\n\n");
+
         rules.append("1. PROACTIVE TOOL USE:\n");
         rules.append("   - NEVER ask permission before using tools - just use them\n");
         rules.append("   - Don't say \"Let me examine...\" and stop - execute the tools immediately\n");
