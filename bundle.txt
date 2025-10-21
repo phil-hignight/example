@@ -4094,27 +4094,30 @@ public class LenientXMLParser {
         // Check if current path matches any raw content path
         if (matchesAnyPath(currentPath, rawContentPaths)) {
             // Treat all content as raw text, don't parse children
-            // Normalize AI formatting issues (same as CDATA)
-            textContent = normalizeAIFormatting(content);
+            textContent = content;
+
+            // Strip ALL CDATA markers from raw content
+            if (textContent.contains("<![CDATA[")) {
+                Pattern cdataPattern = Pattern.compile("<!\\[CDATA\\[(.*?)\\]\\]>", Pattern.DOTALL);
+                Matcher cdataMatcher = cdataPattern.matcher(textContent);
+                StringBuffer result = new StringBuffer();
+
+                while (cdataMatcher.find()) {
+                    String cdataContent = cdataMatcher.group(1);
+                    cdataMatcher.appendReplacement(result, Matcher.quoteReplacement(cdataContent));
+                }
+                cdataMatcher.appendTail(result);
+                textContent = result.toString();
+            }
+
+            // Normalize AI formatting issues
+            textContent = normalizeAIFormatting(textContent);
             return new ContentResult(textContent, children, true); // preserveWhitespace = true
         }
 
-        // Check for CDATA section first
-        if (content.trim().startsWith("<![CDATA[")) {
-            // Extract CDATA content (everything between <![CDATA[ and ]]>)
-            Pattern cdataPattern = Pattern.compile("^\\s*<!\\[CDATA\\[(.*?)\\]\\]>\\s*$", Pattern.DOTALL);
-            Matcher cdataMatcher = cdataPattern.matcher(content);
-            if (cdataMatcher.find()) {
-                // Get raw CDATA content
-                textContent = cdataMatcher.group(1);
-                // Normalize AI formatting issues (line continuations, malformed JSON, etc)
-                textContent = normalizeAIFormatting(textContent);
-                return new ContentResult(textContent, children, true); // preserveWhitespace = true
-            }
-        }
-
-        // Try to parse children - if it fails, treat as text
-        if (content.trim().startsWith("<")) {
+        // First, try to parse as child elements
+        // If content contains tags, try to parse them as children
+        if (content.trim().startsWith("<") && !content.trim().startsWith("<![CDATA[")) {
             // Starts with a tag, likely has child elements
             try {
                 children = parseChildren(content, currentPath, rawContentPaths);
@@ -4127,8 +4130,26 @@ public class LenientXMLParser {
                 textContent = content;
             }
         } else {
-            // Doesn't start with tag, treat as text content (preserve original, don't trim)
+            // Doesn't start with tag (or starts with CDATA), treat as text content
             textContent = content;
+
+            // Strip ALL CDATA markers from text content
+            if (textContent.contains("<![CDATA[")) {
+                Pattern cdataPattern = Pattern.compile("<!\\[CDATA\\[(.*?)\\]\\]>", Pattern.DOTALL);
+                Matcher cdataMatcher = cdataPattern.matcher(textContent);
+                StringBuffer result = new StringBuffer();
+
+                while (cdataMatcher.find()) {
+                    String cdataContent = cdataMatcher.group(1);
+                    cdataMatcher.appendReplacement(result, Matcher.quoteReplacement(cdataContent));
+                }
+                cdataMatcher.appendTail(result);
+
+                textContent = result.toString();
+                // Normalize AI formatting issues
+                textContent = normalizeAIFormatting(textContent);
+                return new ContentResult(textContent, children, true); // preserveWhitespace = true
+            }
         }
 
         return new ContentResult(textContent, children);
