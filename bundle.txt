@@ -739,72 +739,7 @@ public class AIProcessorThread implements Runnable {
                 logger.log("=== RAW AI XML ===\n" + aiResponse.responseXml + "\n=== END RAW XML ===");
 
                 // 5. Handle continuation if response was truncated (no |||||END||||| terminator)
-                String fullResponseXml = aiResponse.responseXml;
-                int continuationAttempt = 0;
-                final int MAX_CONTINUATION_ATTEMPTS = 5;
-
-                logger.log("[CONTINUATION_CHECK] Response length: " + fullResponseXml.length() + " chars");
-                logger.log("[CONTINUATION_CHECK] Ends with |||||END|||||? " + fullResponseXml.endsWith("|||||END|||||"));
-                if (fullResponseXml.length() >= 50) {
-                    logger.log("[CONTINUATION_CHECK] Last 50 chars: \"" + fullResponseXml.substring(fullResponseXml.length() - 50) + "\"");
-                } else {
-                    logger.log("[CONTINUATION_CHECK] Full response (< 50 chars): \"" + fullResponseXml + "\"");
-                }
-
-                while (!fullResponseXml.endsWith("|||||END|||||") && continuationAttempt < MAX_CONTINUATION_ATTEMPTS) {
-                    logger.log("[CONTINUATION_TRIGGERED] Response truncated (attempt " + (continuationAttempt + 1) + "/" + MAX_CONTINUATION_ATTEMPTS + ") - missing terminator");
-
-                    // Add partial response to conversation
-                    conversationManager.addAssistantMessage(fullResponseXml);
-                    conversationQueue.publishState(conversationManager.getConversationStateJson());
-
-                    // Check if we need compaction for continuation
-                    if (contextManager.shouldCompact(conversationManager.getState())) {
-                        logger.log("Context near limit - performing progressive compaction for continuation");
-                        conversationManager.addSystemMessage("Compacting history to make room for continuation...");
-                        conversationQueue.publishState(conversationManager.getConversationStateJson());
-
-                        contextManager.compactForContinuation(conversationManager.getState(), continuationAttempt);
-
-                        conversationManager.addSystemMessage("Compaction complete");
-                        conversationQueue.publishState(conversationManager.getConversationStateJson());
-                    }
-
-                    // Request continuation
-                    String continuationPrompt = "Continue your previous response immediately after where you left off. End with |||||END||||| when complete.";
-                    conversationManager.addUserMessage(continuationPrompt);
-                    conversationQueue.publishState(conversationManager.getConversationStateJson());
-
-                    continuationAttempt++;
-
-                    // Get continuation from bridge
-                    String continuationRequest = buildAIRequestFromHistory();
-                    logger.log("Requesting continuation (attempt " + continuationAttempt + "/" + MAX_CONTINUATION_ATTEMPTS + ")");
-                    BridgeQueue.AIResponse continuationResponse = submitToBridge(continuationRequest);
-                    logger.log("Got continuation response - length: " + continuationResponse.responseXml.length());
-
-                    // IMPORTANT: Use continuation response as-is (it's the FULL continuation, not appended)
-                    // The AI sees the partial response in conversation history and continues from there
-                    fullResponseXml = continuationResponse.responseXml;
-                }
-
-                // Check if we exceeded max attempts
-                if (continuationAttempt >= MAX_CONTINUATION_ATTEMPTS && !fullResponseXml.endsWith("|||||END|||||")) {
-                    logger.log("ERROR: Max continuation attempts reached - response still truncated");
-                    throw new RuntimeException("Response too large - exceeded continuation limit after " + MAX_CONTINUATION_ATTEMPTS + " attempts. The content is too large even with progressive compaction. Please split into smaller chunks.");
-                }
-
-                // Strip |||||END||||| terminator before parsing
-                String responseXml = fullResponseXml;
-                if (responseXml.endsWith("|||||END|||||")) {
-                    responseXml = responseXml.substring(0, responseXml.length() - 13);
-                    logger.log("Stripped |||||END||||| terminator from response");
-                }
-
-                // Log continuation summary if any occurred
-                if (continuationAttempt > 0) {
-                    logger.log("Continuation complete after " + continuationAttempt + " attempts - total response length: " + responseXml.length());
-                }
+                String responseXml = handleContinuation(aiResponse.responseXml);
 
                 // 6. Agentic loop: parse response, execute tools, loop until AI returns message
                 ResponseParser.ParsedResponse parsed = parseWithRetry(responseXml, true);
@@ -860,7 +795,8 @@ public class AIProcessorThread implements Runnable {
                         String errorRequest = buildAIRequestFromHistory();
                         logger.log("Sending multiple update_file error back to AI");
                         BridgeQueue.AIResponse errorResponse = submitToBridge(errorRequest);
-                        parsed = parseWithRetry(errorResponse.responseXml, false);
+                        String errorResponseXml = handleContinuation(errorResponse.responseXml);
+                        parsed = parseWithRetry(errorResponseXml, false);
                         handleParsingWarnings(parsed);
                         continue; // Restart while loop with corrected response
                     }
@@ -925,7 +861,8 @@ public class AIProcessorThread implements Runnable {
                                     // Continue in PLANNING mode for AI to provide summary
                                     String summaryRequest = buildAIRequestFromHistory();
                                     BridgeQueue.AIResponse summaryResponse = submitToBridge(summaryRequest);
-                                    parsed = parseWithRetry(summaryResponse.responseXml, false);
+                                    String summaryResponseXml = handleContinuation(summaryResponse.responseXml);
+                                    parsed = parseWithRetry(summaryResponseXml, false);
                                     handleParsingWarnings(parsed);
                                     continue;
                                 } else {
@@ -937,7 +874,8 @@ public class AIProcessorThread implements Runnable {
                                     // Continue agentic loop with next item
                                     String nextRequest = buildAIRequestFromHistory();
                                     BridgeQueue.AIResponse nextResponse = submitToBridge(nextRequest);
-                                    parsed = parseWithRetry(nextResponse.responseXml, false);
+                                    String nextResponseXml = handleContinuation(nextResponse.responseXml);
+                                    parsed = parseWithRetry(nextResponseXml, false);
                                     handleParsingWarnings(parsed);
                                     continue;
                                 }
@@ -957,7 +895,8 @@ public class AIProcessorThread implements Runnable {
                             // Continue in PLANNING mode
                             String planRequest = buildAIRequestFromHistory();
                             BridgeQueue.AIResponse planResponse = submitToBridge(planRequest);
-                            parsed = parseWithRetry(planResponse.responseXml, false);
+                            String planResponseXml = handleContinuation(planResponse.responseXml);
+                            parsed = parseWithRetry(planResponseXml, false);
                             handleParsingWarnings(parsed);
                             continue;
                         }
@@ -989,7 +928,8 @@ public class AIProcessorThread implements Runnable {
                         logger.log("Got review response: " + reviewResponse.responseXml);
                         logger.log("=== RAW AI XML ===\n" + reviewResponse.responseXml + "\n=== END RAW XML ===");
 
-                        ResponseParser.ParsedResponse reviewParsed = parseWithRetry(reviewResponse.responseXml, false);
+                        String reviewResponseXml = handleContinuation(reviewResponse.responseXml);
+                        ResponseParser.ParsedResponse reviewParsed = parseWithRetry(reviewResponseXml, false);
 
                         // Review agentic loop: execute tools until AI calls review_pass or review_fail
                         String verdict = null;
@@ -1031,7 +971,8 @@ public class AIProcessorThread implements Runnable {
                             // Continue review loop
                             String reviewContinue = buildAIRequestFromHistory();
                             BridgeQueue.AIResponse reviewContinueResponse = submitToBridge(reviewContinue);
-                            reviewParsed = parseWithRetry(reviewContinueResponse.responseXml, false);
+                            String reviewContinueResponseXml = handleContinuation(reviewContinueResponse.responseXml);
+                            reviewParsed = parseWithRetry(reviewContinueResponseXml, false);
                         }
 
                         // If no verdict tool was called, default to PASS
@@ -1055,7 +996,8 @@ public class AIProcessorThread implements Runnable {
                             // Continue in PLANNING mode to create fix plan
                             String fixRequest = buildAIRequestFromHistory();
                             BridgeQueue.AIResponse fixResponse = submitToBridge(fixRequest);
-                            parsed = parseWithRetry(fixResponse.responseXml, false);
+                            String fixResponseXml = handleContinuation(fixResponse.responseXml);
+                            parsed = parseWithRetry(fixResponseXml, false);
                             continue;
                         } else {
                             // Review passed - mark review completed
@@ -1080,7 +1022,8 @@ public class AIProcessorThread implements Runnable {
                                 // Continue in PLANNING mode for AI to provide summary
                                 String summaryRequest = buildAIRequestFromHistory();
                                 BridgeQueue.AIResponse summaryResponse = submitToBridge(summaryRequest);
-                                parsed = parseWithRetry(summaryResponse.responseXml, false);
+                                String summaryResponseXml = handleContinuation(summaryResponse.responseXml);
+                                parsed = parseWithRetry(summaryResponseXml, false);
                                 handleParsingWarnings(parsed);
                                 continue;
                             } else {
@@ -1101,7 +1044,8 @@ public class AIProcessorThread implements Runnable {
                                 // Continue with next task
                                 String nextRequest = buildAIRequestFromHistory();
                                 BridgeQueue.AIResponse nextResponse = submitToBridge(nextRequest);
-                                parsed = parseWithRetry(nextResponse.responseXml, false);
+                                String nextResponseXml = handleContinuation(nextResponse.responseXml);
+                                parsed = parseWithRetry(nextResponseXml, false);
                                 handleParsingWarnings(parsed);
                                 continue;
                             }
@@ -1153,7 +1097,8 @@ public class AIProcessorThread implements Runnable {
                                         String executeRequest = buildAIRequestFromHistory();
                                         logger.log("Auto-approved - calling AI in EXECUTION mode to start task");
                                         BridgeQueue.AIResponse executeResponse = submitToBridge(executeRequest);
-                                        parsed = parseWithRetry(executeResponse.responseXml, false);
+                                        String executeResponseXml = handleContinuation(executeResponse.responseXml);
+                                        parsed = parseWithRetry(executeResponseXml, false);
                                         handleParsingWarnings(parsed);
                                         continue;
                                     }
@@ -1179,7 +1124,10 @@ public class AIProcessorThread implements Runnable {
                     logger.log("Got AI response: " + nextResponse.responseXml);
                     logger.log("=== RAW AI XML ===\n" + nextResponse.responseXml + "\n=== END RAW XML ===");
 
-                    parsed = parseWithRetry(nextResponse.responseXml, false);
+                    // Handle continuation for agentic loop responses
+                    String agenticResponseXml = handleContinuation(nextResponse.responseXml);
+
+                    parsed = parseWithRetry(agenticResponseXml, false);
 
                     // Handle any parsing warnings
                     handleParsingWarnings(parsed);
@@ -1233,6 +1181,85 @@ public class AIProcessorThread implements Runnable {
 
     public void shutdown() {
         running = false;
+    }
+
+    /**
+     * Handle continuation if response is truncated (missing |||||END||||| terminator)
+     * This is a reusable method for both initial responses and agentic loop responses
+     *
+     * @param initialResponseXml The initial AI response
+     * @return The complete response (after any continuations)
+     * @throws InterruptedException if interrupted while processing
+     */
+    private String handleContinuation(String initialResponseXml) throws InterruptedException {
+        String fullResponseXml = initialResponseXml;
+        int continuationAttempt = 0;
+        final int MAX_CONTINUATION_ATTEMPTS = 5;
+
+        logger.log("[CONTINUATION_CHECK] Response length: " + fullResponseXml.length() + " chars");
+        logger.log("[CONTINUATION_CHECK] Ends with |||||END|||||? " + fullResponseXml.endsWith("|||||END|||||"));
+        if (fullResponseXml.length() >= 50) {
+            logger.log("[CONTINUATION_CHECK] Last 50 chars: \"" + fullResponseXml.substring(fullResponseXml.length() - 50) + "\"");
+        } else {
+            logger.log("[CONTINUATION_CHECK] Full response (< 50 chars): \"" + fullResponseXml + "\"");
+        }
+
+        while (!fullResponseXml.endsWith("|||||END|||||") && continuationAttempt < MAX_CONTINUATION_ATTEMPTS) {
+            logger.log("[CONTINUATION_TRIGGERED] Response truncated (attempt " + (continuationAttempt + 1) + "/" + MAX_CONTINUATION_ATTEMPTS + ") - missing terminator");
+
+            // Add partial response to conversation
+            conversationManager.addAssistantMessage(fullResponseXml);
+            conversationQueue.publishState(conversationManager.getConversationStateJson());
+
+            // Check if we need compaction for continuation
+            if (contextManager.shouldCompact(conversationManager.getState())) {
+                logger.log("Context near limit - performing progressive compaction for continuation");
+                conversationManager.addSystemMessage("Compacting history to make room for continuation...");
+                conversationQueue.publishState(conversationManager.getConversationStateJson());
+
+                contextManager.compactForContinuation(conversationManager.getState(), continuationAttempt);
+
+                conversationManager.addSystemMessage("Compaction complete");
+                conversationQueue.publishState(conversationManager.getConversationStateJson());
+            }
+
+            // Request continuation
+            String continuationPrompt = "Continue your previous response immediately after where you left off. End with |||||END||||| when complete.";
+            conversationManager.addUserMessage(continuationPrompt);
+            conversationQueue.publishState(conversationManager.getConversationStateJson());
+
+            continuationAttempt++;
+
+            // Get continuation from bridge
+            String continuationRequest = buildAIRequestFromHistory();
+            logger.log("Requesting continuation (attempt " + continuationAttempt + "/" + MAX_CONTINUATION_ATTEMPTS + ")");
+            BridgeQueue.AIResponse continuationResponse = submitToBridge(continuationRequest);
+            logger.log("Got continuation response - length: " + continuationResponse.responseXml.length());
+
+            // IMPORTANT: Use continuation response as-is (it's the FULL continuation, not appended)
+            // The AI sees the partial response in conversation history and continues from there
+            fullResponseXml = continuationResponse.responseXml;
+        }
+
+        // Check if we exceeded max attempts
+        if (continuationAttempt >= MAX_CONTINUATION_ATTEMPTS && !fullResponseXml.endsWith("|||||END|||||")) {
+            logger.log("ERROR: Max continuation attempts reached - response still truncated");
+            throw new RuntimeException("Response too large - exceeded continuation limit after " + MAX_CONTINUATION_ATTEMPTS + " attempts. The content is too large even with progressive compaction. Please split into smaller chunks.");
+        }
+
+        // Strip |||||END||||| terminator before returning
+        String responseXml = fullResponseXml;
+        if (responseXml.endsWith("|||||END|||||")) {
+            responseXml = responseXml.substring(0, responseXml.length() - 13);
+            logger.log("Stripped |||||END||||| terminator from response");
+        }
+
+        // Log continuation summary if any occurred
+        if (continuationAttempt > 0) {
+            logger.log("Continuation complete after " + continuationAttempt + " attempts - total response length: " + responseXml.length());
+        }
+
+        return responseXml;
     }
 
     /**
