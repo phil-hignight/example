@@ -735,10 +735,9 @@ public class AIProcessorThread implements Runnable {
                 // 4. Send AI request to bridge (aiRequest already built above based on retry or normal flow)
                 logger.log("Sending to AI: " + aiRequest);
                 BridgeQueue.AIResponse aiResponse = submitToBridge(aiRequest);
-                logger.log("Got AI response: " + aiResponse.responseXml);
-                logger.log("=== RAW AI XML ===\n" + aiResponse.responseXml + "\n=== END RAW XML ===");
 
                 // 5. Handle continuation if response was truncated (no |||||END||||| terminator)
+                // (handleContinuation will log the raw XML)
                 String responseXml = handleContinuation(aiResponse.responseXml);
 
                 // 6. Agentic loop: parse response, execute tools, loop until AI returns message
@@ -925,9 +924,8 @@ public class AIProcessorThread implements Runnable {
                         String reviewRequest = buildAIRequestFromHistory();
                         logger.log("Requesting code review from AI");
                         BridgeQueue.AIResponse reviewResponse = submitToBridge(reviewRequest);
-                        logger.log("Got review response: " + reviewResponse.responseXml);
-                        logger.log("=== RAW AI XML ===\n" + reviewResponse.responseXml + "\n=== END RAW XML ===");
 
+                        // handleContinuation will log the raw XML
                         String reviewResponseXml = handleContinuation(reviewResponse.responseXml);
                         ResponseParser.ParsedResponse reviewParsed = parseWithRetry(reviewResponseXml, false);
 
@@ -1121,10 +1119,8 @@ public class AIProcessorThread implements Runnable {
                     String nextRequest = buildAIRequestFromHistory();
                     logger.log("Continuing agentic loop with AI");
                     BridgeQueue.AIResponse nextResponse = submitToBridge(nextRequest);
-                    logger.log("Got AI response: " + nextResponse.responseXml);
-                    logger.log("=== RAW AI XML ===\n" + nextResponse.responseXml + "\n=== END RAW XML ===");
 
-                    // Handle continuation for agentic loop responses
+                    // Handle continuation for agentic loop responses (will log the raw XML)
                     String agenticResponseXml = handleContinuation(nextResponse.responseXml);
 
                     parsed = parseWithRetry(agenticResponseXml, false);
@@ -1196,6 +1192,9 @@ public class AIProcessorThread implements Runnable {
         int continuationAttempt = 0;
         final int MAX_CONTINUATION_ATTEMPTS = 5;
 
+        // Log the initial raw response XML
+        logger.log("=== RAW AI XML ===\n" + initialResponseXml + "\n=== END RAW XML ===");
+
         logger.log("[CONTINUATION_CHECK] Response length: " + fullResponseXml.length() + " chars");
         logger.log("[CONTINUATION_CHECK] Ends with |||||END|||||? " + fullResponseXml.endsWith("|||||END|||||"));
         if (fullResponseXml.length() >= 50) {
@@ -1233,7 +1232,9 @@ public class AIProcessorThread implements Runnable {
             String continuationRequest = buildContinuationRequest(fullResponseXml);
             logger.log("Requesting continuation (attempt " + continuationAttempt + "/" + MAX_CONTINUATION_ATTEMPTS + ")");
             BridgeQueue.AIResponse continuationResponse = submitToBridge(continuationRequest);
-            logger.log("Got continuation response - length: " + continuationResponse.responseXml.length());
+
+            // Log the continuation response XML
+            logger.log("=== CONTINUATION " + continuationAttempt + " XML ===\n" + continuationResponse.responseXml + "\n=== END CONTINUATION XML ===");
 
             // IMPORTANT: Append continuation to fullResponseXml (the continuation picks up where it left off)
             fullResponseXml = fullResponseXml + continuationResponse.responseXml;
@@ -1491,8 +1492,7 @@ public class AIProcessorThread implements Runnable {
                 String retryRequest = buildAIRequestFromHistory();
                 logger.log("Sending formatting error back to AI for correction (attempt " + (attempt + 1) + ")");
                 BridgeQueue.AIResponse retryResponse = submitToBridge(retryRequest);
-                logger.log("Got AI response: " + retryResponse.responseXml);
-                logger.log("=== RAW AI XML ===\n" + retryResponse.responseXml + "\n=== END RAW XML ===");
+                logger.log("=== RAW AI RETRY RESPONSE ===\n" + retryResponse.responseXml + "\n=== END RAW XML ===");
 
                 // Update responseXml for next iteration
                 responseXml = retryResponse.responseXml;
