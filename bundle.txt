@@ -806,18 +806,26 @@ public class AIProcessorThread implements Runnable {
                         IToolExecutor.ToolExecutionResult result =
                             toolExecutor.executeToolWithSummary(tool.name, tool.parameters);
 
-                        // Inject warnings into first tool result if present
-                        Map<String, Object> resultWithWarnings = new HashMap<>(result.result);
-                        if (firstTool && parsed.warnings != null && !parsed.warnings.isEmpty()) {
-                            resultWithWarnings.put("_warnings", parsed.warnings);
-                            logger.log("Added format warnings to first tool result: " + parsed.warnings.size() + " warnings");
+                        // Check if tool requires approval (don't add tool_result yet)
+                        Object status = result.result.get("status");
+                        if ("pending_approval".equals(status)) {
+                            logger.log("Tool " + tool.name + " requires approval - not adding tool_result yet");
+                            // Don't add tool_result - will be added after user approval/rejection
+                            // Continue to approval check below
+                        } else {
+                            // Inject warnings into first tool result if present
+                            Map<String, Object> resultWithWarnings = new HashMap<>(result.result);
+                            if (firstTool && parsed.warnings != null && !parsed.warnings.isEmpty()) {
+                                resultWithWarnings.put("_warnings", parsed.warnings);
+                                logger.log("Added format warnings to first tool result: " + parsed.warnings.size() + " warnings");
+                            }
+
+                            // Add tool_result message with reference to tool_use ID, and publish state
+                            conversationManager.addToolResult(tool.name, resultWithWarnings, toolUseMsg.id);
+                            conversationQueue.publishState(conversationManager.getConversationStateJson());
+
+                            logger.log("Tool completed: " + tool.name + " - " + result.summary);
                         }
-
-                        // Add tool_result message with reference to tool_use ID, and publish state
-                        conversationManager.addToolResult(tool.name, resultWithWarnings, toolUseMsg.id);
-                        conversationQueue.publishState(conversationManager.getConversationStateJson());
-
-                        logger.log("Tool completed: " + tool.name + " - " + result.summary);
                         firstTool = false;
 
                         // Handle mark_complete: move to next item or trigger final review
@@ -1030,13 +1038,13 @@ public class AIProcessorThread implements Runnable {
                         String command = conversationManager.getPendingTestCommand();
                         String description = conversationManager.getPendingTestDescription();
 
-                        String message = "Test command '" + name + "': " + command;
+                        String message = "Create Test Command: " + name + "\n" + command;
                         if (description != null && !description.isEmpty()) {
-                            message += "\n" + description;
+                            message += "\n\n" + description;
                         }
                         message += "\n\nCreate this test command? (yes/no)";
 
-                        conversationManager.addSystemMessage(message);
+                        conversationManager.addApprovalRequest(message);
                         conversationManager.getState().setStatus("awaiting_approval");
                         conversationQueue.publishState(conversationManager.getConversationStateJson());
                         break; // Break out of tool loop
@@ -1794,14 +1802,13 @@ public class CompactionEngine {
                 if (!groupStr.startsWith("{")) groupStr = "{" + groupStr;
                 if (!groupStr.endsWith("}")) groupStr = groupStr + "}";
 
-                // Extract id, summary, message_ids
-                String id = extractJsonField(groupStr, "id");
+                // Extract summary, message_ids (system generates ID)
                 String summary = extractJsonField(groupStr, "summary");
                 String messageIdsStr = extractJsonArray(groupStr, "message_ids");
 
-                // Create Level 2 group message
+                // Create Level 2 group message with system-generated UUID
                 ConversationState.Message group = new ConversationState.Message("message_group_detailed", "");
-                group.id = id;
+                group.id = java.util.UUID.randomUUID().toString();
                 group.summary = summary;
 
                 // Find and add the actual message objects
@@ -1862,14 +1869,13 @@ public class CompactionEngine {
         try {
             aiResponse = aiResponse.trim();
 
-            // Extract id, summary, groups array
-            String id = extractJsonField(aiResponse, "id");
+            // Extract summary, group_ids array (system generates ID)
             String summary = extractJsonField(aiResponse, "summary");
-            String groupsStr = extractJsonArray(aiResponse, "groups");
+            String groupsStr = extractJsonArray(aiResponse, "group_ids");
 
-            // Create Level 3 cluster message
+            // Create Level 3 cluster message with system-generated UUID
             ConversationState.Message cluster = new ConversationState.Message("message_group_highlevel", "");
-            cluster.id = id;
+            cluster.id = java.util.UUID.randomUUID().toString();
             cluster.summary = summary;
 
             // Parse groups array
@@ -1934,9 +1940,9 @@ public class CompactionEngine {
                 newSummary = existingSummary;
                 newSummary.content = summary;
             } else {
-                // Create new
+                // Create new with system-generated UUID
                 newSummary = new ConversationState.Message("project_summary", summary);
-                newSummary.id = "summary_001";
+                newSummary.id = java.util.UUID.randomUUID().toString();
             }
 
         } catch (Exception e) {
@@ -1992,14 +1998,12 @@ public class CompactionEngine {
         }
 
         prompt.append("\nCreate groups based on logical units of work (features, bug fixes, discussions). Each group should have:\n");
-        prompt.append("1. A unique id (format: grp_XXX)\n");
-        prompt.append("2. A detailed summary (2-3 sentences describing what was accomplished)\n");
-        prompt.append("3. The message IDs to include in the group\n\n");
+        prompt.append("1. A detailed summary (2-3 sentences describing what was accomplished)\n");
+        prompt.append("2. The message IDs to include in the group\n\n");
 
         prompt.append("Return a JSON array of groups, ordered from oldest to newest:\n");
         prompt.append("[\n");
         prompt.append("  {\n");
-        prompt.append("    \"id\": \"grp_001\",\n");
         prompt.append("    \"summary\": \"User requested circle area calculation. AI implemented Calculator.circleArea() method with Math.PI, added input validation for negative radius, updated main.java with test demonstration, and verified output.\",\n");
         prompt.append("    \"message_ids\": [\"msg_045\", \"msg_046\", \"msg_047\", \"msg_048\", \"msg_049\"]\n");
         prompt.append("  }\n");
@@ -2037,9 +2041,8 @@ public class CompactionEngine {
 
         prompt.append("Return a JSON object for the Level 3 high-level group:\n");
         prompt.append("{\n");
-        prompt.append("  \"id\": \"hlg_001\",\n");
         prompt.append("  \"summary\": \"Calculator feature development phase - implemented circle, square, and triangle area calculations with comprehensive input validation and testing\",\n");
-        prompt.append("  \"groups\": [\"grp_001\", \"grp_002\", \"grp_003\"]\n");
+        prompt.append("  \"group_ids\": [\"<group_id_1>\", \"<group_id_2>\", \"<group_id_3>\"]\n");
         prompt.append("}\n\n");
 
         prompt.append("The summary should be high-level but still informative about what features were developed.\n");
@@ -2794,6 +2797,15 @@ public class ConversationManager {
         state.addMessage(msg);
         state.incrementMessageCount();
         logger.log("Added system message: " + msg.id);
+        persistMessage(msg);
+        return msg;
+    }
+
+    public ConversationState.Message addApprovalRequest(String text) {
+        ConversationState.Message msg = new ConversationState.Message("approval_request", text);
+        state.addMessage(msg);
+        state.incrementMessageCount();
+        logger.log("Added approval_request message: " + msg.id);
         persistMessage(msg);
         return msg;
     }
@@ -8966,23 +8978,31 @@ public class Router {
         String description = conversationManager.getPendingTestDescription();
 
         // Save command to .agent/commands/<name>.txt
+        Map<String, Object> toolResult = new HashMap<>();
         try {
             String workingDir = conversationManager.getWorkingDirectory();
             com.codeboss.javalayer.toolexecutor.CommandManager cmdMgr =
                 new com.codeboss.javalayer.toolexecutor.CommandManager(workingDir);
             cmdMgr.saveCommand(name, command);
 
-            // Add system message confirming creation
-            String msg = "Test command '" + name + "' created successfully";
-            if (description != null && !description.isEmpty()) {
-                msg += ": " + description;
+            // Add tool_result for AI (success)
+            toolResult.put("created", true);
+            toolResult.put("name", name);
+            toolResult.put("command", command);
+            if (description != null) {
+                toolResult.put("description", description);
             }
-            conversationManager.addSystemMessage(msg);
+            conversationManager.addToolResult("create_test_command", toolResult);
+
+            logger.log("Test command '" + name + "' created successfully");
 
         } catch (Exception e) {
-            conversationManager.addSystemMessage(
-                "Error creating test command: " + e.getMessage()
-            );
+            // Add tool_result for AI (error)
+            toolResult.put("created", false);
+            toolResult.put("error", "Failed to create command: " + e.getMessage());
+            conversationManager.addToolResult("create_test_command", toolResult);
+
+            logger.log("Error creating test command: " + e.getMessage());
         }
 
         // Clear approval state
@@ -8997,10 +9017,13 @@ public class Router {
     private void handleTestCommandApprovalNo(String userMessage) throws InterruptedException {
         String name = conversationManager.getPendingTestCommandName();
 
-        // Add system message about rejection
-        conversationManager.addSystemMessage(
-            "Test command '" + name + "' rejected. Please revise if needed."
-        );
+        // Add tool_result for AI (rejected)
+        Map<String, Object> toolResult = new HashMap<>();
+        toolResult.put("created", false);
+        toolResult.put("rejected", true);
+        toolResult.put("name", name);
+        toolResult.put("reason", "User rejected the command");
+        conversationManager.addToolResult("create_test_command", toolResult);
 
         // Clear approval state
         conversationManager.clearPendingTestCommand();
@@ -10427,7 +10450,7 @@ public class ConfigManager implements com.codeboss.javalayer.bridge.IConfigManag
         return Paths.get(workingDirectory, ".agent", "config.json").toString();
     }
 
-    private int maxMessageChars = 350000; // Default max message chars
+    private int maxMessageChars = 500000; // Default max message chars
     private int clickX = 500; // Default click X coordinate for automatic mode
     private int clickY = 300; // Default click Y coordinate for automatic mode
     private int serverPort = 3000; // Default server port
@@ -10452,7 +10475,7 @@ public class ConfigManager implements com.codeboss.javalayer.bridge.IConfigManag
             
             // Create default config
             String defaultConfig = "{\n" +
-                "  \"maxMessageChars\": 350000,\n" +
+                "  \"maxMessageChars\": 500000,\n" +
                 "  \"clickX\": 500,\n" +
                 "  \"clickY\": 300,\n" +
                 "  \"server\": {\n" +
@@ -10461,7 +10484,7 @@ public class ConfigManager implements com.codeboss.javalayer.bridge.IConfigManag
                 "  }\n" +
                 "}";
             Files.write(configPath, defaultConfig.getBytes());
-            maxMessageChars = 350000;
+            maxMessageChars = 500000;
             clickX = 500;
             clickY = 300;
             serverPort = 3000;
@@ -10478,7 +10501,7 @@ public class ConfigManager implements com.codeboss.javalayer.bridge.IConfigManag
                 if (m1.find()) {
                     maxMessageChars = Integer.parseInt(m1.group(1));
                 } else {
-                    maxMessageChars = 350000; // fallback
+                    maxMessageChars = 500000; // fallback
                 }
                 
                 // Simple JSON parsing for clickX (support negative numbers)
@@ -10548,7 +10571,7 @@ public class ConfigManager implements com.codeboss.javalayer.bridge.IConfigManag
                 
             } catch (Exception e) {
                 logger.log("Error loading config, using defaults: " + e.getMessage());
-                maxMessageChars = 350000;
+                maxMessageChars = 500000;
                 clickX = 500;
                 clickY = 300;
                 serverPort = 3000;
@@ -13442,6 +13465,8 @@ FILE: src/frontend-ui/render.js
                 return renderModeTransition(msg);
             case 'command_result':
                 return renderCommandResult(msg);
+            case 'approval_request':
+                return renderApprovalRequest(msg);
             default:
                 return null;
         }
@@ -14439,6 +14464,16 @@ FILE: src/frontend-ui/render.js
         }
         // Return null so this message is not displayed in the UI
         return null;
+    }
+
+    function renderApprovalRequest(msg) {
+        // Render approval request as an assistant message with special styling
+        const content = msg.content || '';
+        const lines = content.split('\n');
+
+        return h('div', { className: 'message approval-request-message' },
+            lines.map(line => h('div', { className: 'approval-line' }, text(line)))
+        );
     }
 
     window.module["render.js"] = {
