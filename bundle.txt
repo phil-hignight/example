@@ -449,10 +449,14 @@ public class MiddleLayer {
             }
         }
 
+        // Create ContextManager for history compaction
+        ContextManager contextManager = new ContextManager(config, logger);
+        logger.log("ContextManager initialized with maxMessageChars: " + config.getMaxMessageChars());
+
         // 3. Create and start Thread 2 (AI Processor)
         AIProcessorThread aiProcessor = new AIProcessorThread(
             conversationQueue, bridgeQueue, conversationManager, checklistManager, modeManager,
-            promptGenerator, toolExecutor, logger, workingDirectory, fileCache
+            promptGenerator, toolExecutor, logger, workingDirectory, fileCache, contextManager
         );
         aiProcessorThread = new Thread(aiProcessor, "AI-Processor");
         aiProcessorThread.start();
@@ -622,6 +626,7 @@ public class AIProcessorThread implements Runnable {
     private final String workingDirectory;
     private final ProjectStructure projectStructure;
     private final FileStructureCache fileCache;
+    private final ContextManager contextManager;
     private volatile boolean running = true;
     private String lastAIRequest = null;  // Store last request for retry
 
@@ -635,7 +640,8 @@ public class AIProcessorThread implements Runnable {
         IToolExecutor toolExecutor,
         ILogger logger,
         String workingDirectory,
-        FileStructureCache fileCache
+        FileStructureCache fileCache,
+        ContextManager contextManager
     ) {
         this.conversationQueue = conversationQueue;
         this.bridgeQueue = bridgeQueue;
@@ -649,6 +655,7 @@ public class AIProcessorThread implements Runnable {
         this.logger = logger;
         this.workingDirectory = workingDirectory;
         this.fileCache = fileCache;
+        this.contextManager = contextManager;
     }
 
     @Override
@@ -661,7 +668,10 @@ public class AIProcessorThread implements Runnable {
                 ConversationQueue.UserMessage userMsg = conversationQueue.takeMessage();
                 logger.log("Processing message: " + userMsg.text);
 
-                // 2. Check for retry/abort commands (when lastAIRequest is set, we're in retry mode)
+                // 2. Check if compaction is needed before adding message
+                checkAndCompact();
+
+                // 3. Check for retry/abort commands (when lastAIRequest is set, we're in retry mode)
                 String aiRequest;
                 if (lastAIRequest != null) {
                     String trimmed = userMsg.text.trim().toLowerCase();
@@ -1157,6 +1167,29 @@ public class AIProcessorThread implements Runnable {
         running = false;
     }
 
+    /**
+     * Check if compaction is needed and perform it if necessary
+     * Adds user notifications before and after compaction
+     */
+    private void checkAndCompact() throws InterruptedException {
+        if (contextManager.shouldCompact(conversationManager.getState())) {
+            logger.log("Compaction threshold reached - starting history compaction");
+
+            // Notify user compaction is starting
+            conversationManager.addSystemMessage("Compacting conversation history...");
+            conversationQueue.publishState(conversationManager.getConversationStateJson());
+
+            // Perform compaction
+            contextManager.compact(conversationManager.getState());
+
+            // Notify user compaction completed
+            conversationManager.addSystemMessage("History compaction complete");
+            conversationQueue.publishState(conversationManager.getConversationStateJson());
+
+            logger.log("Compaction complete");
+        }
+    }
+
     private String buildAIRequest(String userMessage) {
         Mode currentMode = modeManager.getCurrentMode();
 
@@ -1296,7 +1329,7 @@ public class AIProcessorThread implements Runnable {
                 // Provide better hints based on the error type
                 String hint;
                 if (isTruncated) {
-                    hint = "Response was truncated at token limit (unclosed XML tags detected). To fix: Split large files into smaller chunks, or create files one at a time in separate <execute> blocks";
+                    hint = "Response was truncated even after automatic continuations (unclosed XML tags detected). The content is too large for a single response. To fix: Split large files into smaller chunks, use update_file to modify existing files incrementally, or create files one at a time in separate tool calls";
                 } else if (parseError.getMessage().contains("no root element") ||
                            parseError.getMessage().contains("unexpected end")) {
                     hint = "Invalid XML structure. Use <execute> for tools or <message> for text responses";
@@ -15581,17 +15614,22 @@ FILE: src/browser/bridge-button.js
     }
     
     // Submit to internal API with automatic continuation handling
+    // Continues requesting chunks until response is complete (ends with |||||END|||||)
     async function submitToInternalAPIWithContinuation(messages, token) {
         let fullResponse = '';
         let conversationMessages = [...messages];
         let attemptCount = 0;
-        const maxAttempts = 10;
 
-        while (attemptCount < maxAttempts) {
+        // Keep requesting continuations until response is complete
+        // No arbitrary limit - will continue as long as needed
+        while (true) {
             attemptCount++;
+            console.log(`[BRIDGE] Continuation attempt ${attemptCount}`);
+
             const response = await submitToInternalAPI(conversationMessages, token);
 
             if (response.trim() === '') {
+                console.log('[BRIDGE] Empty response received - token limit exceeded');
                 return 'TOKEN_LIMIT_EXCEEDED';
             }
 
@@ -15605,6 +15643,7 @@ FILE: src/browser/bridge-button.js
             const hasEnd = fullResponse.endsWith('|||||END|||||');
 
             if (hasEnd) {
+                console.log(`[BRIDGE] Response complete after ${attemptCount} chunks - length: ${fullResponse.length}`);
                 return fullResponse.slice(0, -13);
             }
 
@@ -15625,9 +15664,9 @@ If your response was CUT OFF mid-sentence, continue writing immediately after th
                 role: 'user',
                 content: continuationContent
             });
-        }
 
-        return fullResponse;
+            console.log(`[BRIDGE] Response not complete yet - requesting continuation (${fullResponse.length} chars so far)`);
+        }
     }
     
     // Submit to internal API (original implementation)
