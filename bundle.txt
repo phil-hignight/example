@@ -743,8 +743,16 @@ public class AIProcessorThread implements Runnable {
                 int continuationAttempt = 0;
                 final int MAX_CONTINUATION_ATTEMPTS = 5;
 
+                logger.log("[CONTINUATION_CHECK] Response length: " + fullResponseXml.length() + " chars");
+                logger.log("[CONTINUATION_CHECK] Ends with |||||END|||||? " + fullResponseXml.endsWith("|||||END|||||"));
+                if (fullResponseXml.length() >= 50) {
+                    logger.log("[CONTINUATION_CHECK] Last 50 chars: \"" + fullResponseXml.substring(fullResponseXml.length() - 50) + "\"");
+                } else {
+                    logger.log("[CONTINUATION_CHECK] Full response (< 50 chars): \"" + fullResponseXml + "\"");
+                }
+
                 while (!fullResponseXml.endsWith("|||||END|||||") && continuationAttempt < MAX_CONTINUATION_ATTEMPTS) {
-                    logger.log("Response truncated (attempt " + (continuationAttempt + 1) + ") - missing |||||END||||| terminator");
+                    logger.log("[CONTINUATION_TRIGGERED] Response truncated (attempt " + (continuationAttempt + 1) + "/" + MAX_CONTINUATION_ATTEMPTS + ") - missing terminator");
 
                     // Add partial response to conversation
                     conversationManager.addAssistantMessage(fullResponseXml);
@@ -775,6 +783,8 @@ public class AIProcessorThread implements Runnable {
                     BridgeQueue.AIResponse continuationResponse = submitToBridge(continuationRequest);
                     logger.log("Got continuation response - length: " + continuationResponse.responseXml.length());
 
+                    // IMPORTANT: Use continuation response as-is (it's the FULL continuation, not appended)
+                    // The AI sees the partial response in conversation history and continues from there
                     fullResponseXml = continuationResponse.responseXml;
                 }
 
