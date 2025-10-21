@@ -738,8 +738,66 @@ public class AIProcessorThread implements Runnable {
                 logger.log("Got AI response: " + aiResponse.responseXml);
                 logger.log("=== RAW AI XML ===\n" + aiResponse.responseXml + "\n=== END RAW XML ===");
 
-                // 4. Agentic loop: parse response, execute tools, loop until AI returns message
-                ResponseParser.ParsedResponse parsed = parseWithRetry(aiResponse.responseXml, true);
+                // 5. Handle continuation if response was truncated (no |||||END||||| terminator)
+                String fullResponseXml = aiResponse.responseXml;
+                int continuationAttempt = 0;
+                final int MAX_CONTINUATION_ATTEMPTS = 5;
+
+                while (!fullResponseXml.endsWith("|||||END|||||") && continuationAttempt < MAX_CONTINUATION_ATTEMPTS) {
+                    logger.log("Response truncated (attempt " + (continuationAttempt + 1) + ") - missing |||||END||||| terminator");
+
+                    // Add partial response to conversation
+                    conversationManager.addAssistantMessage(fullResponseXml);
+                    conversationQueue.publishState(conversationManager.getConversationStateJson());
+
+                    // Check if we need compaction for continuation
+                    if (contextManager.shouldCompact(conversationManager.getState())) {
+                        logger.log("Context near limit - performing progressive compaction for continuation");
+                        conversationManager.addSystemMessage("Compacting history to make room for continuation...");
+                        conversationQueue.publishState(conversationManager.getConversationStateJson());
+
+                        contextManager.compactForContinuation(conversationManager.getState(), continuationAttempt);
+
+                        conversationManager.addSystemMessage("Compaction complete");
+                        conversationQueue.publishState(conversationManager.getConversationStateJson());
+                    }
+
+                    // Request continuation
+                    String continuationPrompt = "Continue your previous response immediately after where you left off. End with |||||END||||| when complete.";
+                    conversationManager.addUserMessage(continuationPrompt);
+                    conversationQueue.publishState(conversationManager.getConversationStateJson());
+
+                    continuationAttempt++;
+
+                    // Get continuation from bridge
+                    String continuationRequest = buildAIRequestFromHistory();
+                    logger.log("Requesting continuation (attempt " + continuationAttempt + "/" + MAX_CONTINUATION_ATTEMPTS + ")");
+                    BridgeQueue.AIResponse continuationResponse = submitToBridge(continuationRequest);
+                    logger.log("Got continuation response - length: " + continuationResponse.responseXml.length());
+
+                    fullResponseXml = continuationResponse.responseXml;
+                }
+
+                // Check if we exceeded max attempts
+                if (continuationAttempt >= MAX_CONTINUATION_ATTEMPTS && !fullResponseXml.endsWith("|||||END|||||")) {
+                    logger.log("ERROR: Max continuation attempts reached - response still truncated");
+                    throw new RuntimeException("Response too large - exceeded continuation limit after " + MAX_CONTINUATION_ATTEMPTS + " attempts. The content is too large even with progressive compaction. Please split into smaller chunks.");
+                }
+
+                // Strip |||||END||||| terminator before parsing
+                String responseXml = fullResponseXml;
+                if (responseXml.endsWith("|||||END|||||")) {
+                    responseXml = responseXml.substring(0, responseXml.length() - 13);
+                    logger.log("Stripped |||||END||||| terminator from response");
+                }
+
+                // Log continuation summary if any occurred
+                if (continuationAttempt > 0) {
+                    logger.log("Continuation complete after " + continuationAttempt + " attempts - total response length: " + responseXml.length());
+                }
+
+                // 6. Agentic loop: parse response, execute tools, loop until AI returns message
+                ResponseParser.ParsedResponse parsed = parseWithRetry(responseXml, true);
 
                 while (parsed.hasTools) {
                     boolean shouldTriggerReview = false;
@@ -2339,6 +2397,43 @@ public class ContextManager {
     }
 
     /**
+     * Calculate progressive compaction budgets for continuations
+     *
+     * Target percentages based on continuation attempt:
+     * - Attempt 0 (normal): 90% of max (allows 10% headroom)
+     * - Attempt 1: 80% of max
+     * - Attempt 2: 70% of max
+     * - Attempt 3: 60% of max
+     * - Attempt 4+: 50% of max (same as standard compaction)
+     *
+     * @param continuationAttempt 0 for first continuation compaction, 1 for second, etc.
+     * @return budgets array [level1, level2, level3, level4]
+     */
+    public int[] calculateProgressiveCompactionBudgets(int continuationAttempt) {
+        // Target total budget based on attempt
+        double targetPercentage;
+        switch (continuationAttempt) {
+            case 0: targetPercentage = 0.90; break; // 90%
+            case 1: targetPercentage = 0.80; break; // 80%
+            case 2: targetPercentage = 0.70; break; // 70%
+            case 3: targetPercentage = 0.60; break; // 60%
+            default: targetPercentage = 0.50; break; // 50% (standard compaction)
+        }
+
+        int targetTotal = (int)(maxMessageChars * targetPercentage);
+
+        // Distribute using same proportions as normal budgets
+        // Normal: 75%, 17.5%, 5%, 2.5% (total 100%)
+        int[] budgets = new int[4];
+        budgets[0] = (int)(targetTotal * 0.75);   // Level 1: 75% of target
+        budgets[1] = (int)(targetTotal * 0.175);  // Level 2: 17.5% of target
+        budgets[2] = (int)(targetTotal * 0.05);   // Level 3: 5% of target
+        budgets[3] = (int)(targetTotal * 0.025);  // Level 4: 2.5% of target
+
+        return budgets;
+    }
+
+    /**
      * Calculate character count for specific level
      *
      * Level 1: user_msg, assistant_msg, tool_use, tool_result
@@ -2412,7 +2507,7 @@ public class ContextManager {
     }
 
     /**
-     * Trigger proactive compaction
+     * Trigger proactive compaction (standard 50% reduction)
      *
      * Sequential process:
      * 1. Calculate compaction budgets (50% reduction)
@@ -2422,10 +2517,38 @@ public class ContextManager {
      * 5. Messages are updated in-place by CompactionEngine
      */
     public void compact(ConversationState state) {
-        logger.log("=== Starting proactive compaction ===");
+        compactWithBudgets(state, calculateCompactionBudgets(), "standard compaction (50% reduction)");
+    }
 
-        // 1. Calculate compaction budgets (50% reduction)
-        int[] budgets = calculateCompactionBudgets();
+    /**
+     * Trigger progressive compaction for continuations
+     *
+     * Uses gentler compaction on first attempts, getting more aggressive with each attempt:
+     * - Attempt 0: compact to 90% of max
+     * - Attempt 1: compact to 80% of max
+     * - Attempt 2: compact to 70% of max
+     * - Attempt 3: compact to 60% of max
+     * - Attempt 4+: compact to 50% of max
+     *
+     * @param state conversation state
+     * @param continuationAttempt 0 for first continuation compaction, 1 for second, etc.
+     */
+    public void compactForContinuation(ConversationState state, int continuationAttempt) {
+        int[] budgets = calculateProgressiveCompactionBudgets(continuationAttempt);
+        double targetPercent = 90.0 - (continuationAttempt * 10.0);
+        if (targetPercent < 50.0) targetPercent = 50.0;
+
+        String description = "continuation compaction attempt " + (continuationAttempt + 1) +
+                           " (target: " + (int)targetPercent + "% of max)";
+        compactWithBudgets(state, budgets, description);
+    }
+
+    /**
+     * Internal method to perform compaction with specified budgets
+     */
+    private void compactWithBudgets(ConversationState state, int[] budgets, String description) {
+        logger.log("=== Starting " + description + " ===");
+
         int level1Budget = budgets[0];
         int level2Budget = budgets[1];
         int level3Budget = budgets[2];
@@ -15532,17 +15655,18 @@ FILE: src/browser/bridge-button.js
             }
             console.log('[BRIDGE] Auth token found, submitting to API...');
 
-            const response = await submitToInternalAPIWithContinuation(request.messages, token);
+            const response = await submitToInternalAPI(request.messages, token);
             console.log('[BRIDGE] API response received - length:', response.length);
 
-            if (response === 'TOKEN_LIMIT_EXCEEDED') {
-                console.log('[BRIDGE] Token limit exceeded detected');
-                currentResponse = response;
+            // Check for empty response (token limit)
+            if (response.trim() === '') {
+                console.log('[BRIDGE] Empty response - token limit exceeded');
+                currentResponse = 'TOKEN_LIMIT_EXCEEDED';
                 currentState = 'response';
                 isProcessing = false;
                 updateUI('response', 'Token limit detected - click to copy');
             } else {
-                console.log('[BRIDGE] Normal response received, ready to copy');
+                console.log('[BRIDGE] Response received, ready to copy');
                 currentResponse = response;
                 currentState = 'response';
                 isProcessing = false;
@@ -15612,64 +15736,9 @@ FILE: src/browser/bridge-button.js
     function getAuthToken() {
         return localStorage.getItem('token');
     }
-    
-    // Submit to internal API with automatic continuation handling
-    // Continues requesting chunks until response is complete (ends with |||||END|||||)
-    async function submitToInternalAPIWithContinuation(messages, token) {
-        let fullResponse = '';
-        let conversationMessages = [...messages];
-        let attemptCount = 0;
 
-        // Keep requesting continuations until response is complete
-        // No arbitrary limit - will continue as long as needed
-        while (true) {
-            attemptCount++;
-            console.log(`[BRIDGE] Continuation attempt ${attemptCount}`);
-
-            const response = await submitToInternalAPI(conversationMessages, token);
-
-            if (response.trim() === '') {
-                console.log('[BRIDGE] Empty response received - token limit exceeded');
-                return 'TOKEN_LIMIT_EXCEEDED';
-            }
-
-            // Check if AI responded with COMPLETED signal
-            if (response.trim() === 'COMPLETED|||||END|||||') {
-                console.log('[BRIDGE] AI confirmed response was complete - returning fullResponse without appending');
-                return fullResponse;
-            }
-
-            fullResponse += response;
-            const hasEnd = fullResponse.endsWith('|||||END|||||');
-
-            if (hasEnd) {
-                console.log(`[BRIDGE] Response complete after ${attemptCount} chunks - length: ${fullResponse.length}`);
-                return fullResponse.slice(0, -13);
-            }
-
-            // Prepare continuation request
-            const lastChars = fullResponse.slice(-30);
-            const continuationContent = `Your previous response did not end with the required |||||END||||| terminator. The last 30 characters were: "${lastChars}".
-
-If your response WAS actually complete, respond with ONLY:
-COMPLETED|||||END|||||
-
-If your response was CUT OFF mid-sentence, continue writing immediately after those exact characters. We will append your continuation to the previous output. End with |||||END||||| when complete.`;
-
-            conversationMessages.push({
-                role: 'assistant',
-                content: response
-            });
-            conversationMessages.push({
-                role: 'user',
-                content: continuationContent
-            });
-
-            console.log(`[BRIDGE] Response not complete yet - requesting continuation (${fullResponse.length} chars so far)`);
-        }
-    }
-    
-    // Submit to internal API (original implementation)
+    // Submit to internal API
+    // Bridge now returns response as-is - Java layer handles continuation logic
     async function submitToInternalAPI(messages, token) {
         const timestamp = Date.now();
         const userMessageId = 'msg-' + timestamp + '-user';
