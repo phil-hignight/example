@@ -1207,9 +1207,8 @@ public class AIProcessorThread implements Runnable {
         while (!fullResponseXml.endsWith("|||||END|||||") && continuationAttempt < MAX_CONTINUATION_ATTEMPTS) {
             logger.log("[CONTINUATION_TRIGGERED] Response truncated (attempt " + (continuationAttempt + 1) + "/" + MAX_CONTINUATION_ATTEMPTS + ") - missing terminator");
 
-            // Add partial response to conversation
-            conversationManager.addAssistantMessage(fullResponseXml);
-            conversationQueue.publishState(conversationManager.getConversationStateJson());
+            // DON'T add partial XML to conversation - we'll parse and add it properly AFTER we have the complete response
+            // Just keep accumulating the XML and request continuation
 
             // Check if we need compaction for continuation
             if (contextManager.shouldCompact(conversationManager.getState())) {
@@ -1223,22 +1222,22 @@ public class AIProcessorThread implements Runnable {
                 conversationQueue.publishState(conversationManager.getConversationStateJson());
             }
 
-            // Request continuation
-            String continuationPrompt = "Continue your previous response immediately after where you left off. End with |||||END||||| when complete.";
-            conversationManager.addUserMessage(continuationPrompt);
+            // Add a system message to indicate continuation is happening (for UI feedback)
+            conversationManager.addSystemMessage("Response truncated - requesting continuation (" + (continuationAttempt + 1) + "/" + MAX_CONTINUATION_ATTEMPTS + ")...");
             conversationQueue.publishState(conversationManager.getConversationStateJson());
 
             continuationAttempt++;
 
-            // Get continuation from bridge
-            String continuationRequest = buildAIRequestFromHistory();
+            // Request continuation - BUT don't add it as a user message to conversation history
+            // The AI will receive a special continuation marker in the request
+            String continuationRequest = buildContinuationRequest(fullResponseXml);
             logger.log("Requesting continuation (attempt " + continuationAttempt + "/" + MAX_CONTINUATION_ATTEMPTS + ")");
             BridgeQueue.AIResponse continuationResponse = submitToBridge(continuationRequest);
             logger.log("Got continuation response - length: " + continuationResponse.responseXml.length());
 
-            // IMPORTANT: Use continuation response as-is (it's the FULL continuation, not appended)
-            // The AI sees the partial response in conversation history and continues from there
-            fullResponseXml = continuationResponse.responseXml;
+            // IMPORTANT: Append continuation to fullResponseXml (the continuation picks up where it left off)
+            fullResponseXml = fullResponseXml + continuationResponse.responseXml;
+            logger.log("Accumulated response length: " + fullResponseXml.length());
         }
 
         // Check if we exceeded max attempts
@@ -1338,6 +1337,51 @@ public class AIProcessorThread implements Runnable {
 
         // Use renderer to format conversation history
         request.append(conversationHistory);
+
+        request.append("]");
+        request.append("}");
+
+        return request.toString();
+    }
+
+    /**
+     * Build a continuation request that includes the truncated response
+     * This DOES NOT add the truncated response to conversation history
+     */
+    private String buildContinuationRequest(String truncatedResponse) {
+        Mode currentMode = modeManager.getCurrentMode();
+
+        // Get conversation history
+        List<ConversationState.Message> history = conversationManager.getState().getHistory();
+        String conversationHistory = conversationRenderer.renderMessages(history);
+
+        // Generate system prompt
+        String systemPrompt;
+        if (fileCache != null) {
+            String basePrompt = promptGenerator.generatePrompt(currentMode, checklistManager, projectStructure, null, 0);
+            systemPrompt = promptGenerator.generatePrompt(currentMode, checklistManager, fileCache, basePrompt, conversationHistory);
+        } else {
+            systemPrompt = promptGenerator.generatePrompt(currentMode, checklistManager, projectStructure);
+        }
+
+        StringBuilder request = new StringBuilder();
+        request.append("{");
+        request.append("\"system\":\"").append(escapeJson(systemPrompt)).append("\",");
+        request.append("\"messages\":[");
+
+        // Include conversation history
+        request.append(conversationHistory);
+
+        // Add a separator if history is not empty
+        if (!conversationHistory.isEmpty()) {
+            request.append(",");
+        }
+
+        // Add the assistant's truncated response
+        request.append("{\"role\":\"assistant\",\"content\":\"").append(escapeJson(truncatedResponse)).append("\"},");
+
+        // Add continuation prompt
+        request.append("{\"role\":\"user\",\"content\":\"Continue your previous response immediately after where you left off. End with |||||END||||| when complete.\"}");
 
         request.append("]");
         request.append("}");
