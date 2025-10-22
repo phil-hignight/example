@@ -1629,7 +1629,7 @@ public class AgentConfigLoader {
      */
     private void loadHomeConfig() {
         try {
-            // On Windows, this will be something like C:\Users\username\AGENT.md
+            // On Windows, this will be something like C:\Users\[username]\AGENT.md
             String homeDir = System.getProperty("user.home");
             if (homeDir == null || homeDir.isEmpty()) {
                 homeConfig = null;
@@ -6087,8 +6087,6 @@ public class ResponseParser {
             // <execute><tool name="create_file"><parameter name="content"><![CDATA[content here
             // And forgets to close with ]]></parameter></tool></execute>
             if (hasExecute) {
-                String originalResponse = response;
-
                 // Try appending closing tags if they're missing
                 if (!response.trim().endsWith("</execute>")) {
                     response = response + "]]></parameter></tool></execute>";
