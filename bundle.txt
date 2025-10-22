@@ -827,26 +827,19 @@ public class AIProcessorThread implements Runnable {
                         IToolExecutor.ToolExecutionResult result =
                             toolExecutor.executeToolWithSummary(tool.name, tool.parameters);
 
-                        // Check if tool requires approval (don't add tool_result yet)
-                        Object status = result.result.get("status");
-                        if ("pending_approval".equals(status)) {
-                            logger.log("Tool " + tool.name + " requires approval - not adding tool_result yet");
-                            // Don't add tool_result - will be added after user approval/rejection
-                            // Continue to approval check below
-                        } else {
-                            // Inject warnings into first tool result if present
-                            Map<String, Object> resultWithWarnings = new HashMap<>(result.result);
-                            if (firstTool && parsed.warnings != null && !parsed.warnings.isEmpty()) {
-                                resultWithWarnings.put("_warnings", parsed.warnings);
-                                logger.log("Added format warnings to first tool result: " + parsed.warnings.size() + " warnings");
-                            }
-
-                            // Add tool_result message with reference to tool_use ID, and publish state
-                            conversationManager.addToolResult(tool.name, resultWithWarnings, toolUseMsg.id);
-                            conversationQueue.publishState(conversationManager.getConversationStateJson());
-
-                            logger.log("Tool completed: " + tool.name + " - " + result.summary);
+                        // Inject warnings into first tool result if present
+                        Map<String, Object> resultWithWarnings = new HashMap<>(result.result);
+                        if (firstTool && parsed.warnings != null && !parsed.warnings.isEmpty()) {
+                            resultWithWarnings.put("_warnings", parsed.warnings);
+                            logger.log("Added format warnings to first tool result: " + parsed.warnings.size() + " warnings");
                         }
+
+                        // Add tool_result message with reference to tool_use ID, and publish state
+                        // (Even for pending_approval - frontend needs this to render the plan UI)
+                        conversationManager.addToolResult(tool.name, resultWithWarnings, toolUseMsg.id);
+                        conversationQueue.publishState(conversationManager.getConversationStateJson());
+
+                        logger.log("Tool completed: " + tool.name + " - " + result.summary);
                         firstTool = false;
 
                         // Handle mark_complete: move to next item or trigger final review
@@ -1116,8 +1109,7 @@ public class AIProcessorThread implements Runnable {
                     // Check if approval is pending - if so, stop processing and wait
                     if (!wasAutoApproved && conversationManager.isAwaitingApproval()) {
                         logger.log("Plan submitted for approval - stopping AI processing");
-                        String description = conversationManager.getPendingPlanDescription();
-                        conversationManager.addSystemMessage("Plan: " + description + "\nProceed with this plan? (yes/no)");
+                        // Tool result already added above with all plan data - just set status
                         conversationManager.getState().setStatus("awaiting_approval");
                         conversationQueue.publishState(conversationManager.getConversationStateJson());
                         break; // Break out of tool loop - will skip to end of conversation turn
