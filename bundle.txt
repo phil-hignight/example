@@ -1292,10 +1292,10 @@ public class AIProcessorThread implements Runnable {
         String systemPrompt;
         if (fileCache != null) {
             // Calculate base prompt and conversation history
-            String basePrompt = promptGenerator.generatePrompt(currentMode, checklistManager, projectStructure, null, 0);
+            String basePrompt = promptGenerator.generatePrompt(currentMode, checklistManager, (ProjectStructure)null, (FileStructureCache)null, (Integer)0, null);
             String conversationHistory = conversationRenderer.renderMessages(conversationManager.getState().getHistory());
 
-            systemPrompt = promptGenerator.generatePrompt(currentMode, checklistManager, fileCache, basePrompt, conversationHistory);
+            systemPrompt = promptGenerator.generatePrompt(currentMode, checklistManager, fileCache, basePrompt, conversationHistory, conversationManager);
         } else {
             // Fallback to old ProjectStructure
             systemPrompt = promptGenerator.generatePrompt(currentMode, checklistManager, projectStructure);
@@ -1323,9 +1323,9 @@ public class AIProcessorThread implements Runnable {
         String systemPrompt;
         if (fileCache != null) {
             // Calculate base prompt (without file cache section)
-            String basePrompt = promptGenerator.generatePrompt(currentMode, checklistManager, projectStructure, null, 0);
+            String basePrompt = promptGenerator.generatePrompt(currentMode, checklistManager, (ProjectStructure)null, (FileStructureCache)null, (Integer)0, null);
 
-            systemPrompt = promptGenerator.generatePrompt(currentMode, checklistManager, fileCache, basePrompt, conversationHistory);
+            systemPrompt = promptGenerator.generatePrompt(currentMode, checklistManager, fileCache, basePrompt, conversationHistory, conversationManager);
         } else {
             // Fallback to old ProjectStructure
             systemPrompt = promptGenerator.generatePrompt(currentMode, checklistManager, projectStructure);
@@ -1359,8 +1359,8 @@ public class AIProcessorThread implements Runnable {
         // Generate system prompt
         String systemPrompt;
         if (fileCache != null) {
-            String basePrompt = promptGenerator.generatePrompt(currentMode, checklistManager, projectStructure, null, 0);
-            systemPrompt = promptGenerator.generatePrompt(currentMode, checklistManager, fileCache, basePrompt, conversationHistory);
+            String basePrompt = promptGenerator.generatePrompt(currentMode, checklistManager, (ProjectStructure)null, (FileStructureCache)null, (Integer)0, null);
+            systemPrompt = promptGenerator.generatePrompt(currentMode, checklistManager, fileCache, basePrompt, conversationHistory, conversationManager);
         } else {
             systemPrompt = promptGenerator.generatePrompt(currentMode, checklistManager, projectStructure);
         }
@@ -1807,15 +1807,21 @@ public class ChecklistManager {
         int completedItems = countCompletedItems();
         int totalItems = currentChecklist.size();
 
+        // ALWAYS trigger review when ALL items are complete (final review)
         if (completedItems == totalItems) {
             return true;
         }
 
+        // For intermediate checkpoints: only trigger if there are items remaining AFTER the checkpoint
+        // This prevents triggering review on the last checkpoint when there's only 1 item left
         if (totalItems > 5) {
             int checkpointInterval = 5;
             int nextCheckpoint = lastReviewCheckpoint + checkpointInterval;
 
-            if (completedItems >= nextCheckpoint) {
+            // Only trigger checkpoint review if:
+            // 1. We've reached the checkpoint
+            // 2. There are at least 2 items remaining (worth reviewing before continuing)
+            if (completedItems >= nextCheckpoint && (totalItems - completedItems) >= 2) {
                 return true;
             }
         }
@@ -3728,6 +3734,38 @@ public class ConversationManager {
     public String getWorkingDirectory() {
         return workingDirectory;
     }
+
+    /**
+     * Check if the last write operation (create_file, update_file, update_file_batch, delete_file) failed
+     * Used to prevent mark_complete when writes failed
+     */
+    public boolean hasLastWriteOperationFailed() {
+        List<ConversationState.Message> history = state.getHistory();
+
+        // Search backwards for the most recent write operation tool_result
+        for (int i = history.size() - 1; i >= 0; i--) {
+            ConversationState.Message msg = history.get(i);
+
+            if ("tool_result".equals(msg.type) && msg.toolName != null) {
+                // Check if this is a write operation
+                if (msg.toolName.equals("create_file") ||
+                    msg.toolName.equals("update_file") ||
+                    msg.toolName.equals("update_file_batch") ||
+                    msg.toolName.equals("delete_file")) {
+
+                    // Check if the result contains an error
+                    if (msg.result != null && msg.result.containsKey("error")) {
+                        return true;  // Last write operation failed
+                    } else {
+                        return false; // Last write operation succeeded
+                    }
+                }
+            }
+        }
+
+        // No write operations found in history
+        return false;
+    }
 }
 
 |~|~|~|~|~|~|~|~|~|~|~|
@@ -5118,19 +5156,23 @@ public class PromptGenerator {
     }
 
     public String generatePrompt(Mode mode) {
-        return generatePrompt(mode, null, null);
+        return generatePrompt(mode, null, (ProjectStructure)null, (FileStructureCache)null, (Integer)null, null);
     }
 
     public String generatePrompt(Mode mode, ChecklistManager checklistManager) {
-        return generatePrompt(mode, checklistManager, (ProjectStructure)null, (FileStructureCache)null, (Integer)null);
+        return generatePrompt(mode, checklistManager, (ProjectStructure)null, (FileStructureCache)null, (Integer)null, null);
     }
 
     public String generatePrompt(Mode mode, ChecklistManager checklistManager, ProjectStructure projectStructure) {
-        return generatePrompt(mode, checklistManager, projectStructure, null, null);
+        return generatePrompt(mode, checklistManager, projectStructure, null, null, null);
     }
 
     public String generatePrompt(Mode mode, ChecklistManager checklistManager, FileStructureCache fileCache, String basePrompt, String conversationHistory) {
-        return generatePrompt(mode, checklistManager, null, fileCache, calculateAvailableBudget(basePrompt, conversationHistory, fileCache));
+        return generatePrompt(mode, checklistManager, null, fileCache, calculateAvailableBudget(basePrompt, conversationHistory, fileCache), null);
+    }
+
+    public String generatePrompt(Mode mode, ChecklistManager checklistManager, FileStructureCache fileCache, String basePrompt, String conversationHistory, ConversationManager conversationManager) {
+        return generatePrompt(mode, checklistManager, null, fileCache, calculateAvailableBudget(basePrompt, conversationHistory, fileCache), conversationManager);
     }
 
     private int calculateAvailableBudget(String basePrompt, String conversationHistory, FileStructureCache fileCache) {
@@ -5151,7 +5193,7 @@ public class PromptGenerator {
         return Math.max(0, available);
     }
 
-    public String generatePrompt(Mode mode, ChecklistManager checklistManager, ProjectStructure projectStructure, FileStructureCache fileCache, Integer availableBudget) {
+    public String generatePrompt(Mode mode, ChecklistManager checklistManager, ProjectStructure projectStructure, FileStructureCache fileCache, Integer availableBudget, ConversationManager conversationManager) {
         if (mode == null) {
             throw new IllegalArgumentException("Mode cannot be null");
         }
@@ -5184,7 +5226,7 @@ public class PromptGenerator {
             }
         }
 
-        prompt.append(getToolDefinitions(mode));
+        prompt.append(getToolDefinitions(mode, conversationManager));
         prompt.append(getImportantRules(mode));
 
         // Append custom AGENT.md instructions if available
@@ -5320,7 +5362,7 @@ public class PromptGenerator {
         return instructions.toString();
     }
 
-    private String getToolDefinitions(Mode mode) {
+    private String getToolDefinitions(Mode mode, ConversationManager conversationManager) {
         Set<ToolCategory> availableCategories = mode.getAvailableToolCategories();
         StringBuilder tools = new StringBuilder();
 
@@ -5340,7 +5382,7 @@ public class PromptGenerator {
         }
 
         if (availableCategories.contains(ToolCategory.CHECKLIST)) {
-            tools.append(getChecklistTools(mode));
+            tools.append(getChecklistTools(mode, conversationManager));
         }
 
         if (availableCategories.contains(ToolCategory.GIT_READ) ||
@@ -5469,7 +5511,7 @@ public class PromptGenerator {
                "    <parameter name=\"file_paths\">src/app.js,src/utils.js</parameter>\n\n";
     }
 
-    private String getChecklistTools(Mode mode) {
+    private String getChecklistTools(Mode mode, ConversationManager conversationManager) {
         StringBuilder tools = new StringBuilder();
 
         if (mode == Mode.PLANNING) {
@@ -5522,28 +5564,43 @@ public class PromptGenerator {
             tools.append("    </tool>\n\n");
         } else {
             // Execution and Testing modes: mark_complete or mark_failed
-            tools.append("MARK COMPLETE (call when task is FULLY done):\n");
-            tools.append("  <tool name=\"mark_complete\">\n");
-            tools.append("  </tool>\n");
-            tools.append("  CRITICAL: Only call this if the final outcome fully meets the task requirements.\n");
-            tools.append("  DO NOT call mark_complete if:\n");
-            tools.append("  - The final result doesn't achieve the task objective\n");
-            tools.append("  - You encountered errors you couldn't work around\n");
-            tools.append("  - The task is only partially complete\n");
-            tools.append("  - You're unsure if it worked correctly\n\n");
-            tools.append("  WRONG - Calling mark_complete after an error:\n");
-            tools.append("    <execute>\n");
-            tools.append("      <tool name=\"update_file\">...</tool>  <!-- This fails with 'old_content not found' -->\n");
-            tools.append("      <tool name=\"mark_complete\"></tool>  [X] WRONG - Task didn't complete!\n");
-            tools.append("    </execute>\n\n");
-            tools.append("  CORRECT - Call mark_failed when errors prevent completion:\n");
-            tools.append("    <execute>\n");
-            tools.append("      <tool name=\"mark_failed\">\n");
-            tools.append("        <parameter name=\"reason\">update_file failed: old_content not found in file</parameter>\n");
-            tools.append("      </tool>\n");
-            tools.append("    </execute>\n\n");
-            tools.append("  If tool calls failed but you found another way to complete the task successfully, mark_complete is OK.\n");
-            tools.append("  When in doubt, call mark_failed and explain what prevented completion.\n\n");
+            // Check if last write operation failed - if so, hide mark_complete tool
+            boolean lastWriteFailed = (conversationManager != null && conversationManager.hasLastWriteOperationFailed());
+
+            if (lastWriteFailed) {
+                // Last write operation failed - mark_complete is NOT available
+                tools.append("!!! WARNING: mark_complete is currently UNAVAILABLE !!!\n\n");
+                tools.append("Your last file write operation (create_file, update_file, update_file_batch, or delete_file) failed with an error.\n\n");
+                tools.append("You MUST do ONE of the following before you can mark the task complete:\n");
+                tools.append("1. Fix the error by retrying the operation with corrected parameters\n");
+                tools.append("2. Find an alternative approach to complete the task successfully\n");
+                tools.append("3. Call mark_failed if you cannot recover from the error\n\n");
+                tools.append("The mark_complete tool will become available again after your next successful write operation.\n\n");
+            } else {
+                // Normal case - mark_complete is available
+                tools.append("MARK COMPLETE (call when task is FULLY done):\n");
+                tools.append("  <tool name=\"mark_complete\">\n");
+                tools.append("  </tool>\n");
+                tools.append("  CRITICAL: Only call this if the final outcome fully meets the task requirements.\n");
+                tools.append("  DO NOT call mark_complete if:\n");
+                tools.append("  - The final result doesn't achieve the task objective\n");
+                tools.append("  - You encountered errors you couldn't work around\n");
+                tools.append("  - The task is only partially complete\n");
+                tools.append("  - You're unsure if it worked correctly\n\n");
+                tools.append("  WRONG - Calling mark_complete after an error:\n");
+                tools.append("    <execute>\n");
+                tools.append("      <tool name=\"update_file\">...</tool>  <!-- This fails with 'old_content not found' -->\n");
+                tools.append("      <tool name=\"mark_complete\"></tool>  [X] WRONG - Task didn't complete!\n");
+                tools.append("    </execute>\n\n");
+                tools.append("  CORRECT - Call mark_failed when errors prevent completion:\n");
+                tools.append("    <execute>\n");
+                tools.append("      <tool name=\"mark_failed\">\n");
+                tools.append("        <parameter name=\"reason\">update_file failed: old_content not found in file</parameter>\n");
+                tools.append("      </tool>\n");
+                tools.append("    </execute>\n\n");
+                tools.append("  If tool calls failed but you found another way to complete the task successfully, mark_complete is OK.\n");
+                tools.append("  When in doubt, call mark_failed and explain what prevented completion.\n\n");
+            }
 
             tools.append("MARK FAILED (call if you cannot complete task):\n");
             tools.append("  <tool name=\"mark_failed\">\n");
@@ -12263,6 +12320,14 @@ public class ToolExecutor implements IToolExecutor {
             return new ToolExecutionResult(error, "Error: ChecklistManager not set");
         }
 
+        // Check if the last write operation failed - if so, don't allow marking complete
+        if (conversationManager != null && conversationManager.hasLastWriteOperationFailed()) {
+            Map<String, Object> error = new HashMap<>();
+            error.put("error", "Cannot mark task complete - the last file write operation failed");
+            error.put("hint", "Review the error from the previous tool call and fix the issue before marking complete. If you cannot fix it, use mark_failed instead.");
+            return new ToolExecutionResult(error, "Error: Last write operation failed");
+        }
+
         // Get the current pending item and mark it complete
         ChecklistManager.ChecklistItem currentItem = checklistManager.getNextPendingItem();
         if (currentItem == null) {
@@ -14139,7 +14204,7 @@ FILE: src/frontend-ui/render.js
                             }
                         }
                     }, [
-                        h('span', { className: 'tool-name-bold' }, text(displayName)),
+                        h('span', { className: 'tool-name tool-name-bold' }, text(displayName)),
                         params ? text(' ' + params) : null
                     ])
                 ]);
@@ -14148,7 +14213,7 @@ FILE: src/frontend-ui/render.js
                 return h('div', { className: 'message tool-message' }, [
                     h('div', { className: 'message-prefix ' + bulletClass }, text('• ')),
                     h('div', { className: 'tool-header' }, [
-                        h('span', { className: 'tool-name-bold' }, text(displayName)),
+                        h('span', { className: 'tool-name tool-name-bold' }, text(displayName)),
                         params ? text(' ' + params) : null
                     ])
                 ]);
@@ -14158,7 +14223,7 @@ FILE: src/frontend-ui/render.js
         return h('div', { className: 'message tool-message' }, [
             h('div', { className: 'message-prefix ' + bulletClass }, text('• ')),
             h('div', { className: 'tool-header' }, [
-                h('span', { className: 'tool-name-bold' }, text(formatToolName(msg.toolName))),
+                h('span', { className: 'tool-name tool-name-bold' }, text(formatToolName(msg.toolName))),
                 params ? text(' ' + params) : null
             ])
         ]);
@@ -15120,6 +15185,10 @@ body {
     font-family: 'Consolas', 'Courier New', monospace;
     font-size: 0.9em;
     word-break: break-word;
+}
+
+.tool-name {
+    color: #909090; /* Lighter gray than --text-muted (#707070) */
 }
 
 .tool-name-bold {
