@@ -746,10 +746,12 @@ public class AIProcessorThread implements Runnable {
 
                 // 5. Handle continuation if response was truncated (no |||||END||||| terminator)
                 // (handleContinuation will log the raw XML)
-                String responseXml = handleContinuation(aiResponse.responseXml);
+                Object[] continuationResult = handleContinuation(aiResponse.responseXml);
+                String responseXml = (String) continuationResult[0];
+                boolean hadTerminator = (Boolean) continuationResult[1];
 
                 // 6. Agentic loop: parse response, execute tools, loop until AI returns message
-                ResponseParser.ParsedResponse parsed = parseWithRetry(responseXml, true);
+                ResponseParser.ParsedResponse parsed = parseWithRetry(responseXml, true, hadTerminator);
 
                 while (parsed.hasTools) {
                     boolean shouldTriggerReview = false;
@@ -802,8 +804,10 @@ public class AIProcessorThread implements Runnable {
                         String errorRequest = buildAIRequestFromHistory();
                         logger.log("Sending multiple update_file error back to AI");
                         BridgeQueue.AIResponse errorResponse = submitToBridge(errorRequest);
-                        String errorResponseXml = handleContinuation(errorResponse.responseXml);
-                        parsed = parseWithRetry(errorResponseXml, false);
+                        Object[] errorResult = handleContinuation(errorResponse.responseXml);
+                        String errorResponseXml = (String) errorResult[0];
+                        boolean errorHadTerminator = (Boolean) errorResult[1];
+                        parsed = parseWithRetry(errorResponseXml, false, errorHadTerminator);
                         handleParsingWarnings(parsed);
                         continue; // Restart while loop with corrected response
                     }
@@ -861,8 +865,10 @@ public class AIProcessorThread implements Runnable {
                                     // Continue in PLANNING mode for AI to provide summary
                                     String summaryRequest = buildAIRequestFromHistory();
                                     BridgeQueue.AIResponse summaryResponse = submitToBridge(summaryRequest);
-                                    String summaryResponseXml = handleContinuation(summaryResponse.responseXml);
-                                    parsed = parseWithRetry(summaryResponseXml, false);
+                                    Object[] summaryResult = handleContinuation(summaryResponse.responseXml);
+                                    String summaryResponseXml = (String) summaryResult[0];
+                                    boolean summaryHadTerminator = (Boolean) summaryResult[1];
+                                    parsed = parseWithRetry(summaryResponseXml, false, summaryHadTerminator);
                                     handleParsingWarnings(parsed);
                                     continue;
                                 } else {
@@ -874,8 +880,10 @@ public class AIProcessorThread implements Runnable {
                                     // Continue agentic loop with next item
                                     String nextRequest = buildAIRequestFromHistory();
                                     BridgeQueue.AIResponse nextResponse = submitToBridge(nextRequest);
-                                    String nextResponseXml = handleContinuation(nextResponse.responseXml);
-                                    parsed = parseWithRetry(nextResponseXml, false);
+                                    Object[] nextResult = handleContinuation(nextResponse.responseXml);
+                                    String nextResponseXml = (String) nextResult[0];
+                                    boolean nextHadTerminator = (Boolean) nextResult[1];
+                                    parsed = parseWithRetry(nextResponseXml, false, nextHadTerminator);
                                     handleParsingWarnings(parsed);
                                     continue;
                                 }
@@ -895,8 +903,10 @@ public class AIProcessorThread implements Runnable {
                             // Continue in PLANNING mode
                             String planRequest = buildAIRequestFromHistory();
                             BridgeQueue.AIResponse planResponse = submitToBridge(planRequest);
-                            String planResponseXml = handleContinuation(planResponse.responseXml);
-                            parsed = parseWithRetry(planResponseXml, false);
+                            Object[] planResult = handleContinuation(planResponse.responseXml);
+                            String planResponseXml = (String) planResult[0];
+                            boolean planHadTerminator = (Boolean) planResult[1];
+                            parsed = parseWithRetry(planResponseXml, false, planHadTerminator);
                             handleParsingWarnings(parsed);
                             continue;
                         }
@@ -927,8 +937,10 @@ public class AIProcessorThread implements Runnable {
                         BridgeQueue.AIResponse reviewResponse = submitToBridge(reviewRequest);
 
                         // handleContinuation will log the raw XML
-                        String reviewResponseXml = handleContinuation(reviewResponse.responseXml);
-                        ResponseParser.ParsedResponse reviewParsed = parseWithRetry(reviewResponseXml, false);
+                        Object[] reviewResult = handleContinuation(reviewResponse.responseXml);
+                        String reviewResponseXml = (String) reviewResult[0];
+                        boolean reviewHadTerminator = (Boolean) reviewResult[1];
+                        ResponseParser.ParsedResponse reviewParsed = parseWithRetry(reviewResponseXml, false, reviewHadTerminator);
 
                         // Review agentic loop: execute tools until AI calls review_pass or review_fail
                         String verdict = null;
@@ -970,8 +982,10 @@ public class AIProcessorThread implements Runnable {
                             // Continue review loop
                             String reviewContinue = buildAIRequestFromHistory();
                             BridgeQueue.AIResponse reviewContinueResponse = submitToBridge(reviewContinue);
-                            String reviewContinueResponseXml = handleContinuation(reviewContinueResponse.responseXml);
-                            reviewParsed = parseWithRetry(reviewContinueResponseXml, false);
+                            Object[] reviewContinueResult = handleContinuation(reviewContinueResponse.responseXml);
+                            String reviewContinueResponseXml = (String) reviewContinueResult[0];
+                            boolean reviewContinueHadTerminator = (Boolean) reviewContinueResult[1];
+                            reviewParsed = parseWithRetry(reviewContinueResponseXml, false, reviewContinueHadTerminator);
                         }
 
                         // If no verdict tool was called, default to PASS
@@ -995,8 +1009,10 @@ public class AIProcessorThread implements Runnable {
                             // Continue in PLANNING mode to create fix plan
                             String fixRequest = buildAIRequestFromHistory();
                             BridgeQueue.AIResponse fixResponse = submitToBridge(fixRequest);
-                            String fixResponseXml = handleContinuation(fixResponse.responseXml);
-                            parsed = parseWithRetry(fixResponseXml, false);
+                            Object[] fixResult = handleContinuation(fixResponse.responseXml);
+                            String fixResponseXml = (String) fixResult[0];
+                            boolean fixHadTerminator = (Boolean) fixResult[1];
+                            parsed = parseWithRetry(fixResponseXml, false, fixHadTerminator);
                             continue;
                         } else {
                             // Review passed - mark review completed
@@ -1021,8 +1037,10 @@ public class AIProcessorThread implements Runnable {
                                 // Continue in PLANNING mode for AI to provide summary
                                 String summaryRequest = buildAIRequestFromHistory();
                                 BridgeQueue.AIResponse summaryResponse = submitToBridge(summaryRequest);
-                                String summaryResponseXml = handleContinuation(summaryResponse.responseXml);
-                                parsed = parseWithRetry(summaryResponseXml, false);
+                                Object[] summaryResult2 = handleContinuation(summaryResponse.responseXml);
+                                String summaryResponseXml = (String) summaryResult2[0];
+                                boolean summaryHadTerminator2 = (Boolean) summaryResult2[1];
+                                parsed = parseWithRetry(summaryResponseXml, false, summaryHadTerminator2);
                                 handleParsingWarnings(parsed);
                                 continue;
                             } else {
@@ -1043,8 +1061,10 @@ public class AIProcessorThread implements Runnable {
                                 // Continue with next task
                                 String nextRequest = buildAIRequestFromHistory();
                                 BridgeQueue.AIResponse nextResponse = submitToBridge(nextRequest);
-                                String nextResponseXml = handleContinuation(nextResponse.responseXml);
-                                parsed = parseWithRetry(nextResponseXml, false);
+                                Object[] nextResult2 = handleContinuation(nextResponse.responseXml);
+                                String nextResponseXml = (String) nextResult2[0];
+                                boolean nextHadTerminator2 = (Boolean) nextResult2[1];
+                                parsed = parseWithRetry(nextResponseXml, false, nextHadTerminator2);
                                 handleParsingWarnings(parsed);
                                 continue;
                             }
@@ -1096,8 +1116,10 @@ public class AIProcessorThread implements Runnable {
                                         String executeRequest = buildAIRequestFromHistory();
                                         logger.log("Auto-approved - calling AI in EXECUTION mode to start task");
                                         BridgeQueue.AIResponse executeResponse = submitToBridge(executeRequest);
-                                        String executeResponseXml = handleContinuation(executeResponse.responseXml);
-                                        parsed = parseWithRetry(executeResponseXml, false);
+                                        Object[] executeResult = handleContinuation(executeResponse.responseXml);
+                                        String executeResponseXml = (String) executeResult[0];
+                                        boolean executeHadTerminator = (Boolean) executeResult[1];
+                                        parsed = parseWithRetry(executeResponseXml, false, executeHadTerminator);
                                         handleParsingWarnings(parsed);
                                         continue;
                                     }
@@ -1121,9 +1143,11 @@ public class AIProcessorThread implements Runnable {
                     BridgeQueue.AIResponse nextResponse = submitToBridge(nextRequest);
 
                     // Handle continuation for agentic loop responses (will log the raw XML)
-                    String agenticResponseXml = handleContinuation(nextResponse.responseXml);
+                    Object[] agenticResult = handleContinuation(nextResponse.responseXml);
+                    String agenticResponseXml = (String) agenticResult[0];
+                    boolean agenticHadTerminator = (Boolean) agenticResult[1];
 
-                    parsed = parseWithRetry(agenticResponseXml, false);
+                    parsed = parseWithRetry(agenticResponseXml, false, agenticHadTerminator);
 
                     // Handle any parsing warnings
                     handleParsingWarnings(parsed);
@@ -1184,13 +1208,12 @@ public class AIProcessorThread implements Runnable {
      * This is a reusable method for both initial responses and agentic loop responses
      *
      * @param initialResponseXml The initial AI response
-     * @return The complete response (after any continuations)
+     * @return Array with [responseXml, hadTerminator] - responseXml is the complete response, hadTerminator is true if it had the terminator
      * @throws InterruptedException if interrupted while processing
      */
-    private String handleContinuation(String initialResponseXml) throws InterruptedException {
+    private Object[] handleContinuation(String initialResponseXml) throws InterruptedException {
         String fullResponseXml = initialResponseXml;
         int continuationAttempt = 0;
-        final int MAX_CONTINUATION_ATTEMPTS = 5;
 
         // Log the initial raw response XML
         logger.log("=== RAW AI XML ===\n" + initialResponseXml + "\n=== END RAW XML ===");
@@ -1203,8 +1226,9 @@ public class AIProcessorThread implements Runnable {
             logger.log("[CONTINUATION_CHECK] Full response (< 50 chars): \"" + fullResponseXml + "\"");
         }
 
-        while (!fullResponseXml.endsWith("|||||END|||||") && continuationAttempt < MAX_CONTINUATION_ATTEMPTS) {
-            logger.log("[CONTINUATION_TRIGGERED] Response truncated (attempt " + (continuationAttempt + 1) + "/" + MAX_CONTINUATION_ATTEMPTS + ") - missing terminator");
+        // Continue indefinitely until we get the terminator, compacting when needed
+        while (!fullResponseXml.endsWith("|||||END|||||")) {
+            logger.log("[CONTINUATION_TRIGGERED] Response truncated (continuation " + (continuationAttempt + 1) + ") - missing terminator");
 
             // DON'T add partial XML to conversation - we'll parse and add it properly AFTER we have the complete response
             // Just keep accumulating the XML and request continuation
@@ -1222,7 +1246,7 @@ public class AIProcessorThread implements Runnable {
             }
 
             // Add a system message to indicate continuation is happening (for UI feedback)
-            conversationManager.addSystemMessage("Response truncated - requesting continuation (" + (continuationAttempt + 1) + "/" + MAX_CONTINUATION_ATTEMPTS + ")...");
+            conversationManager.addSystemMessage("Response truncated - requesting continuation " + (continuationAttempt + 1) + "...");
             conversationQueue.publishState(conversationManager.getConversationStateJson());
 
             continuationAttempt++;
@@ -1230,7 +1254,7 @@ public class AIProcessorThread implements Runnable {
             // Request continuation - BUT don't add it as a user message to conversation history
             // The AI will receive a special continuation marker in the request
             String continuationRequest = buildContinuationRequest(fullResponseXml);
-            logger.log("Requesting continuation (attempt " + continuationAttempt + "/" + MAX_CONTINUATION_ATTEMPTS + ")");
+            logger.log("Requesting continuation " + continuationAttempt);
             BridgeQueue.AIResponse continuationResponse = submitToBridge(continuationRequest);
 
             // Log the continuation response XML
@@ -1241,25 +1265,20 @@ public class AIProcessorThread implements Runnable {
             logger.log("Accumulated response length: " + fullResponseXml.length());
         }
 
-        // Check if we exceeded max attempts
-        if (continuationAttempt >= MAX_CONTINUATION_ATTEMPTS && !fullResponseXml.endsWith("|||||END|||||")) {
-            logger.log("ERROR: Max continuation attempts reached - response still truncated");
-            throw new RuntimeException("Response too large - exceeded continuation limit after " + MAX_CONTINUATION_ATTEMPTS + " attempts. The content is too large even with progressive compaction. Please split into smaller chunks.");
-        }
-
-        // Strip |||||END||||| terminator before returning
+        // Check if we got the terminator and strip it
+        boolean hadTerminator = fullResponseXml.endsWith("|||||END|||||");
         String responseXml = fullResponseXml;
-        if (responseXml.endsWith("|||||END|||||")) {
+        if (hadTerminator) {
             responseXml = responseXml.substring(0, responseXml.length() - 13);
             logger.log("Stripped |||||END||||| terminator from response");
         }
 
         // Log continuation summary if any occurred
         if (continuationAttempt > 0) {
-            logger.log("Continuation complete after " + continuationAttempt + " attempts - total response length: " + responseXml.length());
+            logger.log("Continuation complete after " + continuationAttempt + " continuations - total response length: " + responseXml.length());
         }
 
-        return responseXml;
+        return new Object[] { responseXml, hadTerminator };
     }
 
     /**
@@ -1427,14 +1446,15 @@ public class AIProcessorThread implements Runnable {
     }
 
     /**
-     * Parse AI response with retry logic for formatting errors
+     * Parse AI response with retry logic and auto-recovery for truncated responses
      *
-     * @param responseXml The AI response to parse
-     * @param isInitialParse True if this is the first parse (manages loading message differently)
+     * @param responseXml The AI response to parse (should have already gone through continuation handling)
+     * @param isInitialParse True if this is the first parse (vs parsing a retry from AI)
+     * @param hadTerminator True if the response had the |||||END||||| terminator (came from handleContinuation)
      * @return Parsed response
      * @throws IllegalArgumentException if parsing fails after max retries
      */
-    private ResponseParser.ParsedResponse parseWithRetry(String responseXml, boolean isInitialParse)
+    private ResponseParser.ParsedResponse parseWithRetry(String responseXml, boolean isInitialParse, boolean hadTerminator)
             throws IllegalArgumentException, InterruptedException {
         final int MAX_RETRIES = 5;
 
@@ -1446,6 +1466,54 @@ public class AIProcessorThread implements Runnable {
                 logger.log("XML parse error (" + errorContext + ", attempt " + attempt + "/" + MAX_RETRIES + "): "
                           + parseError.getMessage());
 
+                // Try auto-recovery by appending closing tags
+                // ONLY if the response had the terminator (meaning AI finished, but forgot closing tags)
+                // This handles: AI sent continuations with terminator, but forgot to close XML tags at the end
+                if (hadTerminator) {
+                    String recoveryXml = responseXml + "</parameter></tool></execute>";
+                    try {
+                        logger.log("Attempting auto-recovery with closing tags (response had |||||END||||| terminator)...");
+                        ResponseParser.ParsedResponse recovered = ResponseParser.parse(recoveryXml);
+                        logger.log("Auto-recovery SUCCESSFUL - response parsed with added closing tags");
+                        return recovered;
+                    } catch (IllegalArgumentException recoveryError) {
+                        logger.log("Auto-recovery failed: " + recoveryError.getMessage());
+                        // Continue to normal error handling below
+                    }
+                }
+
+                // Log detailed diagnostic information
+                logger.log("=== PARSE FAILURE DIAGNOSTIC ===");
+                logger.log("Response length: " + responseXml.length() + " chars");
+                logger.log("Error message: " + parseError.getMessage());
+                if (parseError.getCause() != null) {
+                    logger.log("Root cause: " + parseError.getCause().getMessage());
+                }
+                logger.log("Last 200 chars of response: " +
+                    (responseXml.length() > 200
+                        ? responseXml.substring(responseXml.length() - 200)
+                        : responseXml));
+                logger.log("First 200 chars of response: " +
+                    (responseXml.length() > 200
+                        ? responseXml.substring(0, 200)
+                        : responseXml));
+
+                // Count key XML elements
+                int executeOpen = countOccurrences(responseXml, "<execute>");
+                int executeClose = countOccurrences(responseXml, "</execute>");
+                int toolOpen = countOccurrences(responseXml, "<tool");
+                int toolClose = countOccurrences(responseXml, "</tool>");
+                int paramOpen = countOccurrences(responseXml, "<parameter");
+                int paramClose = countOccurrences(responseXml, "</parameter>");
+                int messageOpen = countOccurrences(responseXml, "<message>");
+                int messageClose = countOccurrences(responseXml, "</message>");
+
+                logger.log("Tag counts: <execute>=" + executeOpen + " </execute>=" + executeClose +
+                          " <tool>=" + toolOpen + " </tool>=" + toolClose +
+                          " <parameter>=" + paramOpen + " </parameter>=" + paramClose +
+                          " <message>=" + messageOpen + " </message>=" + messageClose);
+                logger.log("=== END DIAGNOSTIC ===");
+
                 if (attempt >= MAX_RETRIES) {
                     // Max retries exceeded - give up
                     logger.log("Max retries exceeded for XML parsing");
@@ -1455,36 +1523,16 @@ public class AIProcessorThread implements Runnable {
                     );
                 }
 
-                // Remove loading message before adding error (only on first attempt for initial parse)
-                if (isInitialParse && attempt == 1) {
-                }
-
                 // Add formatting error so AI can see it
                 Map<String, Object> errorContent = new HashMap<>();
                 errorContent.put("error", parseError.getMessage());
-
-                // Check if response was truncated by counting tags
-                boolean isTruncated = detectTruncation(responseXml);
-
-                // Provide better hints based on the error type
-                String hint;
-                if (isTruncated) {
-                    hint = "Response was truncated even after automatic continuations (unclosed XML tags detected). The content is too large for a single response. To fix: Split large files into smaller chunks, use update_file to modify existing files incrementally, or create files one at a time in separate tool calls";
-                } else if (parseError.getMessage().contains("no root element") ||
-                           parseError.getMessage().contains("unexpected end")) {
-                    hint = "Invalid XML structure. Use <execute> for tools or <message> for text responses";
-                } else {
-                    hint = "Use <execute> for tools or <message> for text responses";
-                }
-
-                errorContent.put("hint", hint);
+                errorContent.put("hint", "Invalid XML structure. Use <execute> for tools or <message> for text responses. " +
+                    "Tag counts: <execute>=" + executeOpen + "/" + executeClose +
+                    " <tool>=" + toolOpen + "/" + toolClose +
+                    " <parameter>=" + paramOpen + "/" + paramClose);
                 errorContent.put("attempt", attempt);
                 errorContent.put("max_attempts", MAX_RETRIES);
                 conversationManager.addError("formatting_error", errorContent);
-
-                // Re-add loading message (only on first attempt for initial parse)
-                if (isInitialParse && attempt == 1) {
-                }
 
                 conversationQueue.publishState(conversationManager.getConversationStateJson());
 
@@ -1492,10 +1540,12 @@ public class AIProcessorThread implements Runnable {
                 String retryRequest = buildAIRequestFromHistory();
                 logger.log("Sending formatting error back to AI for correction (attempt " + (attempt + 1) + ")");
                 BridgeQueue.AIResponse retryResponse = submitToBridge(retryRequest);
-                logger.log("=== RAW AI RETRY RESPONSE ===\n" + retryResponse.responseXml + "\n=== END RAW XML ===");
 
-                // Update responseXml for next iteration
-                responseXml = retryResponse.responseXml;
+                // Handle continuation for retry response (may need multiple continuations)
+                Object[] retryResult = handleContinuation(retryResponse.responseXml);
+                responseXml = (String) retryResult[0];
+                hadTerminator = (Boolean) retryResult[1];
+                logger.log("Retry response handled - hadTerminator: " + hadTerminator);
             }
         }
 
@@ -1537,37 +1587,6 @@ public class AIProcessorThread implements Runnable {
         }
     }
 
-    /**
-     * Detect if XML response was truncated by checking for unmatched tags
-     *
-     * @param xml The XML string to check
-     * @return true if truncation is detected (more opening tags than closing tags)
-     */
-    private boolean detectTruncation(String xml) {
-        if (xml == null || xml.isEmpty()) {
-            return false;
-        }
-
-        // Count opening and closing tags for main XML elements
-        int executeOpen = countOccurrences(xml, "<execute>");
-        int executeClose = countOccurrences(xml, "</execute>");
-        int messageOpen = countOccurrences(xml, "<message>");
-        int messageClose = countOccurrences(xml, "</message>");
-        int toolOpen = countOccurrences(xml, "<tool");
-        int toolClose = countOccurrences(xml, "</tool>");
-        int parameterOpen = countOccurrences(xml, "<parameter");
-        int parameterClose = countOccurrences(xml, "</parameter>");
-
-        // If any opening tags exceed closing tags, it's truncated
-        if (executeOpen > executeClose ||
-            messageOpen > messageClose ||
-            toolOpen > toolClose ||
-            parameterOpen > parameterClose) {
-            return true;
-        }
-
-        return false;
-    }
 
     /**
      * Count occurrences of a substring in a string
@@ -5275,11 +5294,14 @@ public class PromptGenerator {
                 instructions.append("  - update_file_batch: Make MULTIPLE edits to the SAME file in one operation\n");
                 instructions.append("  - delete_file: Delete files\n");
                 instructions.append("  - read_file, search_files: Read and search code\n");
-                instructions.append("  - Batch operations: You can call MULTIPLE tools in ONE turn (e.g., create 5 files at once)\n\n");
+                instructions.append("  - Batch operations: Call MULTIPLE tools in ONE turn (reads, deletes), but use ONLY ONE create/update operation per response\n");
+                instructions.append("  - CRITICAL LIMIT: Use create_file, update_file, OR update_file_batch ONLY ONCE per response\n");
+                instructions.append("  - This prevents losing 15+ minutes of work if a large response fails - you can retry individual file creations/updates\n");
+                instructions.append("  - You CAN batch multiple delete_file calls in one response (deletes are fast and less error-prone)\n\n");
                 instructions.append("Plan your tasks knowing these capabilities. For example:\n");
-                instructions.append("  - \"Create model classes\" -> You'll create Todo.java, TodoList.java, etc. in one step\n");
-                instructions.append("  - \"Update API endpoints\" -> You can batch-edit multiple methods in server.js at once\n");
-                instructions.append("  - \"Clear project files\" -> You'll delete multiple files in one step\n\n");
+                instructions.append("  - \"Create model classes\" -> You'll create ONE file per turn: Todo.java, then TodoList.java, etc.\n");
+                instructions.append("  - \"Update API endpoints\" -> You can use update_file_batch to edit multiple methods in ONE file\n");
+                instructions.append("  - \"Clear project files\" -> You CAN delete multiple files in one step (delete_file is allowed multiple times)\n\n");
                 instructions.append("CREATING A PLAN:\n");
                 instructions.append("  1. IMMEDIATELY use read/search tools to understand the codebase\n");
                 instructions.append("     - Don't ask for permission - just read the files you need\n");
@@ -5300,22 +5322,26 @@ public class PromptGenerator {
                 instructions.append("Your job is to complete ONE checklist item, then report success or failure.\n\n");
                 instructions.append("WORKFLOW:\n");
                 instructions.append("1. Read the CURRENT TASK below\n");
-                instructions.append("2. Use MULTIPLE tools to complete the task (create/update/delete many files as needed)\n");
+                instructions.append("2. Use tools to complete the task - IMPORTANT: Only ONE create/update operation per response\n");
+                instructions.append("   - Use create_file, update_file, OR update_file_batch ONCE per turn\n");
+                instructions.append("   - You CAN batch multiple delete_file and read_file calls\n");
+                instructions.append("   - Tasks may require MULTIPLE turns to complete (create files one at a time)\n");
                 instructions.append("3. When ALL work for the task is done, call mark_complete tool ONCE\n");
                 instructions.append("4. If you cannot complete it, call mark_failed with a reason\n\n");
                 instructions.append("TASK GRANULARITY EXAMPLES:\n");
-                instructions.append("GOOD task scope (focus on current task only):\n");
-                instructions.append("  - \"Create model classes\" -> Create Todo.java and TodoModel.java in this step\n");
-                instructions.append("  - \"Implement view components\" -> Create MainFrame.java, InputPanel.java, TodoPanel.java\n");
-                instructions.append("  - \"Clear out project files\" -> Delete README, package.json, and src/ directory\n");
+                instructions.append("GOOD task execution (one create/update per turn):\n");
+                instructions.append("  - \"Create model classes\" -> Turn 1: create_file Todo.java, Turn 2: create_file TodoModel.java, Turn 3: mark_complete\n");
+                instructions.append("  - \"Update API endpoints\" -> Turn 1: update_file_batch server.js (edit multiple methods in ONE file), Turn 2: mark_complete\n");
+                instructions.append("  - \"Clear out project files\" -> Turn 1: delete_file README + package.json + src/ (multiple deletes OK), Turn 2: mark_complete\n");
                 instructions.append("BAD - doing too much:\n");
                 instructions.append("  - If task is \"Create model classes\", DON'T also create controller or view classes\n");
                 instructions.append("  - If task is \"Implement Todo class\", DON'T create the entire MVC structure\n");
                 instructions.append("  - Only work on what the CURRENT TASK describes - nothing more!\n\n");
                 instructions.append("IMPORTANT:\n");
-                instructions.append("- ONE task may require MANY tool calls (e.g., \"Clear project\" = delete 10+ files)\n");
+                instructions.append("- ONE task may require MANY TURNS (e.g., \"Create 5 files\" = 5 turns of create_file + 1 turn for mark_complete)\n");
                 instructions.append("- Only call mark_complete ONCE at the end when the entire task is finished\n");
                 instructions.append("- Do NOT call mark_complete multiple times in one response\n");
+                instructions.append("- Do NOT call create_file or update_file more than once per response\n");
                 instructions.append("- Focus on completing the current task only\n");
                 instructions.append("- Read files before modifying them\n");
                 instructions.append("- Follow existing code patterns and conventions\n\n");
@@ -5853,10 +5879,14 @@ public class PromptGenerator {
         rules.append("\n");
 
         rules.append("2. TOOL BATCHING:\n");
-        rules.append("   - Batch multiple tool calls in ONE <execute> block (much more efficient)\n");
-        rules.append("   - Don't send one tool, wait for response, then send another\n");
+        rules.append("   - Batch multiple tool calls in ONE <execute> block (more efficient)\n");
         if (hasFileOps) {
+            rules.append("   - CRITICAL LIMIT: Use create_file, update_file, OR update_file_batch ONLY ONCE per response\n");
+            rules.append("   - You CAN batch multiple delete_file and read_file calls in one response\n");
             rules.append("   - For multiple updates to SAME file: use update_file_batch (NOT multiple update_file calls)\n");
+            rules.append("   - For creating multiple files: create ONE per turn, then continue in next turn\n");
+        } else {
+            rules.append("   - Batch read operations together for efficiency\n");
         }
         rules.append("\n");
 
