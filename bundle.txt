@@ -426,6 +426,12 @@ public class MiddleLayer {
         }
 
         PromptGenerator promptGenerator = new PromptGenerator();
+
+        // Initialize AgentConfigLoader and set it on PromptGenerator
+        AgentConfigLoader agentConfigLoader = new AgentConfigLoader(workingDirectory);
+        promptGenerator.setAgentConfigLoader(agentConfigLoader);
+        logger.log(agentConfigLoader.getLoadedConfigsInfo());
+
         FileHashTracker fileHashTracker = new FileHashTracker(logger, workingDirectory);
         UndoStack undoStack = new UndoStack(logger, fileHashTracker, workingDirectory);
 
@@ -438,7 +444,7 @@ public class MiddleLayer {
             logger.log("Warning: Failed to publish initial conversation state: " + e.getMessage());
         }
 
-        // Wire up ChecklistManager, ModeManager, ConversationManager, and FileCache to ToolExecutor if it's the concrete implementation
+        // Wire up ChecklistManager, ModeManager, ConversationManager, FileCache, and AgentConfigLoader to ToolExecutor if it's the concrete implementation
         if (toolExecutor instanceof com.codeboss.javalayer.toolexecutor.ToolExecutor) {
             ((com.codeboss.javalayer.toolexecutor.ToolExecutor)toolExecutor).setChecklistManager(checklistManager);
             ((com.codeboss.javalayer.toolexecutor.ToolExecutor)toolExecutor).setModeManager(modeManager);
@@ -447,6 +453,8 @@ public class MiddleLayer {
                 ((com.codeboss.javalayer.toolexecutor.ToolExecutor)toolExecutor).setFileCache(fileCache);
                 logger.log("File cache wired to ToolExecutor");
             }
+            ((com.codeboss.javalayer.toolexecutor.ToolExecutor)toolExecutor).setAgentConfigLoader(agentConfigLoader);
+            logger.log("AgentConfigLoader wired to ToolExecutor");
         }
 
         // Create ContextManager for history compaction
@@ -1580,6 +1588,140 @@ public class AIProcessorThread implements Runnable {
             index += substring.length();
         }
         return count;
+    }
+}
+
+|~|~|~|~|~|~|~|~|~|~|~|
+
+FILE: com/codeboss/javalayer/aiprocessor/AgentConfigLoader.java
+|~|~|~|~|~|~|~|~|~|~|~|
+package com.codeboss.javalayer.aiprocessor;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+
+/**
+ * Loads AGENT.md configuration files from home directory and project directory.
+ * These files contain custom instructions that are appended to the AI prompt.
+ */
+public class AgentConfigLoader {
+    private String homeConfig = null;
+    private String projectConfig = null;
+    private String workingDirectory;
+
+    public AgentConfigLoader(String workingDirectory) {
+        this.workingDirectory = workingDirectory;
+        loadConfigs();
+    }
+
+    /**
+     * Load both AGENT.md files (home and project)
+     */
+    public void loadConfigs() {
+        loadHomeConfig();
+        loadProjectConfig();
+    }
+
+    /**
+     * Load AGENT.md from user's home directory
+     */
+    private void loadHomeConfig() {
+        try {
+            // On Windows, this will be something like C:\Users\username\AGENT.md
+            String homeDir = System.getProperty("user.home");
+            if (homeDir == null || homeDir.isEmpty()) {
+                homeConfig = null;
+                return;
+            }
+
+            Path homePath = Paths.get(homeDir, "AGENT.md");
+            if (Files.exists(homePath) && Files.isRegularFile(homePath)) {
+                homeConfig = Files.readString(homePath);
+                System.out.println("Loaded AGENT.md from home directory: " + homePath);
+            } else {
+                homeConfig = null;
+            }
+        } catch (IOException e) {
+            System.err.println("Error reading AGENT.md from home directory: " + e.getMessage());
+            homeConfig = null;
+        }
+    }
+
+    /**
+     * Load AGENT.md from project directory
+     */
+    private void loadProjectConfig() {
+        try {
+            if (workingDirectory == null || workingDirectory.isEmpty()) {
+                projectConfig = null;
+                return;
+            }
+
+            Path projectPath = Paths.get(workingDirectory, "AGENT.md");
+            if (Files.exists(projectPath) && Files.isRegularFile(projectPath)) {
+                projectConfig = Files.readString(projectPath);
+                System.out.println("Loaded AGENT.md from project directory: " + projectPath);
+            } else {
+                projectConfig = null;
+            }
+        } catch (IOException e) {
+            System.err.println("Error reading AGENT.md from project directory: " + e.getMessage());
+            projectConfig = null;
+        }
+    }
+
+    /**
+     * Get the combined configuration to append to prompt
+     * Returns null if no configs are loaded
+     */
+    public String getCombinedConfig() {
+        StringBuilder combined = new StringBuilder();
+
+        if (homeConfig != null && !homeConfig.trim().isEmpty()) {
+            combined.append("\n\n# Custom Instructions (from ~/AGENT.md)\n\n");
+            combined.append(homeConfig.trim());
+        }
+
+        if (projectConfig != null && !projectConfig.trim().isEmpty()) {
+            combined.append("\n\n# Project-Specific Instructions (from AGENT.md in project root)\n\n");
+            combined.append(projectConfig.trim());
+        }
+
+        String result = combined.toString();
+        return result.isEmpty() ? null : result;
+    }
+
+    /**
+     * Check if any configs are loaded
+     */
+    public boolean hasConfigs() {
+        return (homeConfig != null && !homeConfig.trim().isEmpty()) ||
+               (projectConfig != null && !projectConfig.trim().isEmpty());
+    }
+
+    /**
+     * Get info about which configs are loaded (for logging)
+     */
+    public String getLoadedConfigsInfo() {
+        if (!hasConfigs()) {
+            return "No AGENT.md files found";
+        }
+
+        StringBuilder info = new StringBuilder("Loaded AGENT.md files: ");
+        boolean hasHome = homeConfig != null && !homeConfig.trim().isEmpty();
+        boolean hasProject = projectConfig != null && !projectConfig.trim().isEmpty();
+
+        if (hasHome && hasProject) {
+            info.append("home directory and project directory");
+        } else if (hasHome) {
+            info.append("home directory only");
+        } else if (hasProject) {
+            info.append("project directory only");
+        }
+
+        return info.toString();
     }
 }
 
@@ -4973,6 +5115,15 @@ import java.util.*;
 import com.codeboss.javalayer.filecache.FileStructureCache;
 
 public class PromptGenerator {
+    private AgentConfigLoader agentConfigLoader;
+
+    public PromptGenerator() {
+        this.agentConfigLoader = null;
+    }
+
+    public void setAgentConfigLoader(AgentConfigLoader loader) {
+        this.agentConfigLoader = loader;
+    }
 
     public String generatePrompt(Mode mode) {
         return generatePrompt(mode, null, null);
@@ -5043,6 +5194,14 @@ public class PromptGenerator {
 
         prompt.append(getToolDefinitions(mode));
         prompt.append(getImportantRules(mode));
+
+        // Append custom AGENT.md instructions if available
+        if (agentConfigLoader != null && agentConfigLoader.hasConfigs()) {
+            String customConfig = agentConfigLoader.getCombinedConfig();
+            if (customConfig != null) {
+                prompt.append(customConfig).append("\n\n");
+            }
+        }
 
         return prompt.toString();
     }
@@ -5324,6 +5483,8 @@ public class PromptGenerator {
         if (mode == Mode.PLANNING) {
             // Planning mode: begin_execution with checklist as parameter
             tools.append("BEGIN EXECUTION (propose plan for approval):\n");
+            tools.append("  REQUIRED FOR: Creating, updating, or deleting files and folders\n");
+            tools.append("  This tool transitions from PLANNING mode to EXECUTION mode where file modifications are allowed.\n");
             tools.append("  <tool name=\"begin_execution\">\n");
             tools.append("    <parameter name=\"approval_message\">Question asking user for approval (e.g., \"May I proceed with implementing these changes?\")</parameter>\n");
             tools.append("    <parameter name=\"description\">Brief summary of what this plan will do</parameter>\n");
@@ -5332,6 +5493,7 @@ public class PromptGenerator {
             tools.append("  Checklist format: [{\"content\":\"task description\",\"item_type\":\"coding\",\"priority\":\"high\"},...]\n");
             tools.append("  - item_type must be \"coding\" or \"testing\"\n");
             tools.append("  - priority can be \"high\", \"medium\", or \"low\"\n");
+            tools.append("  IMPORTANT: You MUST call this tool BEFORE using create_file, update_file, or delete_file.\n");
             tools.append("  Call this tool immediately after creating your plan. The system will handle next steps.\n\n");
         } else if (mode == Mode.REVIEW) {
             // Review mode: Pass or fail the review
@@ -5908,6 +6070,7 @@ public class ResponseParser {
         List<List<String>> rawContentPaths = new ArrayList<>();
         rawContentPaths.add(Arrays.asList("execute", "tool", "parameter"));
 
+        // First parsing attempt
         try {
             LenientXMLParser.Element root = LenientXMLParser.parse(response, rawContentPaths);
 
@@ -5919,6 +6082,33 @@ public class ResponseParser {
                 throw new IllegalArgumentException("Response must contain either <execute> or <message> tag");
             }
         } catch (Exception e) {
+            // If parsing failed and we have an execute block, try auto-closing unclosed tags
+            // This handles cases where AI sends truncated responses like:
+            // <execute><tool name="create_file"><parameter name="content"><![CDATA[content here
+            // And forgets to close with ]]></parameter></tool></execute>
+            if (hasExecute) {
+                String originalResponse = response;
+
+                // Try appending closing tags if they're missing
+                if (!response.trim().endsWith("</execute>")) {
+                    response = response + "]]></parameter></tool></execute>";
+                    warnings.add("Auto-closed unclosed XML tags (added ]]></parameter></tool></execute>). Always properly close all XML tags!");
+
+                    try {
+                        LenientXMLParser.Element root = LenientXMLParser.parse(response, rawContentPaths);
+
+                        if (root.name.equals("execute")) {
+                            return parseExecuteBlock(root, warnings);
+                        } else {
+                            throw new IllegalArgumentException("Response must contain either <execute> or <message> tag");
+                        }
+                    } catch (Exception retryError) {
+                        // If auto-closing didn't work, throw the original error
+                        throw new IllegalArgumentException("Failed to parse AI response: " + e.getMessage());
+                    }
+                }
+            }
+
             throw new IllegalArgumentException("Failed to parse AI response: " + e.getMessage());
         }
     }
@@ -11353,6 +11543,7 @@ public class ToolExecutor implements IToolExecutor {
     private ModeManager modeManager;  // Optional, for begin_execution tool
     private ConversationManager conversationManager;  // Optional, for begin_execution approval flow
     private FileStructureCache fileCache;  // Optional, for cache updates
+    private com.codeboss.javalayer.aiprocessor.AgentConfigLoader agentConfigLoader;  // Optional, for AGENT.md reload
 
     public ToolExecutor(ILogger logger, String workingDirectory) {
         this.logger = logger;
@@ -11375,6 +11566,10 @@ public class ToolExecutor implements IToolExecutor {
 
     public void setFileCache(FileStructureCache fileCache) {
         this.fileCache = fileCache;
+    }
+
+    public void setAgentConfigLoader(com.codeboss.javalayer.aiprocessor.AgentConfigLoader loader) {
+        this.agentConfigLoader = loader;
     }
 
     @Override
@@ -13023,13 +13218,27 @@ public class ToolExecutor implements IToolExecutor {
             int budgetChars = 500000; // Default budget - this could be made configurable
             fileCache.initialize(workingDirectory, budgetChars);
 
+            // Also reload AGENT.md files if agentConfigLoader is available
+            if (agentConfigLoader != null) {
+                logger.log("Reloading AGENT.md configuration files...");
+                agentConfigLoader.loadConfigs();
+                logger.log(agentConfigLoader.getLoadedConfigsInfo());
+            }
+
             logger.log("File cache refreshed successfully");
 
             Map<String, Object> result = new HashMap<>();
             result.put("refreshed", true);
             result.put("working_directory", workingDirectory);
 
-            String summary = "File cache refreshed - rescanned project structure";
+            // Add info about which AGENT.md files were loaded
+            if (agentConfigLoader != null && agentConfigLoader.hasConfigs()) {
+                result.put("agent_config_reloaded", true);
+                result.put("agent_config_info", agentConfigLoader.getLoadedConfigsInfo());
+            }
+
+            String summary = "File cache refreshed - rescanned project structure" +
+                           (agentConfigLoader != null && agentConfigLoader.hasConfigs() ? " and reloaded AGENT.md files" : "");
             return new ToolExecutionResult(result, summary);
 
         } catch (Exception e) {
