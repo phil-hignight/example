@@ -728,12 +728,12 @@ public class AIProcessorThread implements Runnable {
                         Map<String, Object> firstTaskNotification = new java.util.LinkedHashMap<>();
                         firstTaskNotification.put("task_number", 1);
                         firstTaskNotification.put("total_items", allItems.size());
-                        firstTaskNotification.put("content", firstTask.content);
+                        firstTaskNotification.put("content", firstTask.shortDesc);
                         firstTaskNotification.put("item_type", firstTask.itemType);
 
                         conversationManager.addToolResult("task_start", firstTaskNotification);
                         conversationQueue.publishState(conversationManager.getConversationStateJson());
-                        logger.log("Added first task notification: " + firstTask.content);
+                        logger.log("Added first task notification: " + firstTask.shortDesc);
                     }
 
                     // Clear the flag
@@ -752,6 +752,10 @@ public class AIProcessorThread implements Runnable {
 
                 // 6. Agentic loop: parse response, execute tools, loop until AI returns message
                 ResponseParser.ParsedResponse parsed = parseWithRetry(responseXml, true, hadTerminator);
+
+                // Circuit breaker: track consecutive error correction attempts to prevent infinite loops
+                int consecutiveErrorAttempts = 0;
+                final int MAX_ERROR_CORRECTION_ATTEMPTS = 5;
 
                 while (parsed.hasTools) {
                     boolean shouldTriggerReview = false;
@@ -801,16 +805,66 @@ public class AIProcessorThread implements Runnable {
 
                     // If multiple update_file error detected, send back to AI for correction
                     if (hasMultipleUpdateFileError) {
+                        consecutiveErrorAttempts++;
+
+                        if (consecutiveErrorAttempts > MAX_ERROR_CORRECTION_ATTEMPTS) {
+                            // Circuit breaker triggered - AI keeps making the same mistake
+                            logger.log("=== CIRCUIT BREAKER TRIGGERED ===");
+                            logger.log("ERROR: AI failed to correct multiple_update_file error after " + MAX_ERROR_CORRECTION_ATTEMPTS + " attempts");
+                            logger.log("This usually indicates:");
+                            logger.log("  1. Error message not being sent correctly to AI");
+                            logger.log("  2. AI response has parsing issues (check parseWithRetry logs above)");
+                            logger.log("  3. AI is genuinely stuck in a pattern");
+                            logger.log("=== END CIRCUIT BREAKER ===");
+                            conversationManager.addSystemMessage(
+                                "System: AI repeatedly made the same error (multiple update_file calls to same file). " +
+                                "Stopping execution. Please review the task and try a different approach."
+                            );
+                            modeManager.transitionTo(Mode.PLANNING);
+                            conversationManager.getState().setStatus("complete");
+                            conversationQueue.publishState(conversationManager.getConversationStateJson());
+                            break; // Exit agentic loop
+                        }
+
+                        logger.log("=== MULTIPLE UPDATE_FILE ERROR CORRECTION - ATTEMPT " + consecutiveErrorAttempts + "/" + MAX_ERROR_CORRECTION_ATTEMPTS + " ===");
+                        logger.log("Error was added to conversation. Now sending full conversation back to AI for correction.");
+
                         String errorRequest = buildAIRequestFromHistory();
-                        logger.log("Sending multiple update_file error back to AI");
+                        logger.log("Request includes " + conversationManager.getState().getHistory().size() + " messages in history");
+                        logger.log("Submitting error correction request to AI bridge...");
+
                         BridgeQueue.AIResponse errorResponse = submitToBridge(errorRequest);
+                        logger.log("Received AI response, length: " + errorResponse.responseXml.length() + " chars");
+                        logger.log("First 200 chars of AI response: " + errorResponse.responseXml.substring(0, Math.min(200, errorResponse.responseXml.length())));
+
                         Object[] errorResult = handleContinuation(errorResponse.responseXml);
                         String errorResponseXml = (String) errorResult[0];
                         boolean errorHadTerminator = (Boolean) errorResult[1];
-                        parsed = parseWithRetry(errorResponseXml, false, errorHadTerminator);
-                        handleParsingWarnings(parsed);
-                        continue; // Restart while loop with corrected response
+                        logger.log("After continuation handling: length=" + errorResponseXml.length() + " hadTerminator=" + errorHadTerminator);
+
+                        logger.log("Attempting to parse AI's correction response...");
+                        try {
+                            parsed = parseWithRetry(errorResponseXml, false, errorHadTerminator);
+                            logger.log("Parse succeeded! AI provided: hasTools=" + parsed.hasTools + ", tools count=" +
+                                      (parsed.tools != null ? parsed.tools.size() : 0));
+                            if (parsed.messageContent != null) {
+                                logger.log("Message content (first 100 chars): " + parsed.messageContent.substring(0, Math.min(100, parsed.messageContent.length())));
+                            }
+                            handleParsingWarnings(parsed);
+                            logger.log("=== END MULTIPLE UPDATE_FILE ERROR CORRECTION (SUCCESS) ===");
+                            continue; // Restart while loop with corrected response
+                        } catch (Exception parseException) {
+                            logger.log("!!! PARSE FAILED in error correction: " + parseException.getMessage());
+                            logger.log("This means parseWithRetry exhausted all retries (5 attempts)");
+                            logger.log("Last 500 chars of response that failed to parse:");
+                            logger.log(errorResponseXml.substring(Math.max(0, errorResponseXml.length() - 500)));
+                            logger.log("=== END MULTIPLE UPDATE_FILE ERROR CORRECTION (PARSE FAILED) ===");
+                            throw parseException; // Re-throw to exit the loop
+                        }
                     }
+
+                    // Reset error counter if we got past error checking (AI corrected the issue)
+                    consecutiveErrorAttempts = 0;
 
                     // Execute each tool and collect results
                     for (ResponseParser.ToolUse tool : toolsToExecute) {
@@ -846,16 +900,17 @@ public class AIProcessorThread implements Runnable {
                         logger.log("Tool completed: " + tool.name + " - " + result.summary);
                         firstTool = false;
 
-                        // Handle mark_complete: move to next item or trigger final review
+                        // Handle mark_complete: move to next item or trigger review
                         if (tool.name.equals("mark_complete")) {
-                            // Check if final review should be triggered
-                            if (result.shouldTriggerReview) {
-                                shouldTriggerReview = true;
-                                // Don't move to next item yet - review will be triggered below
-                            } else {
-                                ChecklistManager.ChecklistItem nextItem = checklistManager.getNextPendingItem();
-                                if (nextItem == null) {
-                                    // No more items - return to PLANNING mode for AI to summarize
+                            ChecklistManager.ChecklistItem nextItem = checklistManager.getNextPendingItem();
+
+                            if (nextItem == null) {
+                                // No more items - check if we should do a final review
+                                if (result.shouldTriggerReview) {
+                                    shouldTriggerReview = true;
+                                    // Don't move to next item - review will be triggered below
+                                } else {
+                                    // All done, no review needed - return to PLANNING mode
                                     logger.log("All checklist items completed - returning to PLANNING mode");
                                     modeManager.transitionTo(Mode.PLANNING);
 
@@ -871,11 +926,18 @@ public class AIProcessorThread implements Runnable {
                                     parsed = parseWithRetry(summaryResponseXml, false, summaryHadTerminator);
                                     handleParsingWarnings(parsed);
                                     continue;
+                                }
+                            } else {
+                                // There's a next item - check if we should review BEFORE starting it
+                                if (result.shouldTriggerReview) {
+                                    shouldTriggerReview = true;
+                                    // Don't move to next item yet - review will be triggered below
+                                    // After review passes, we'll start the next item
                                 } else {
-                                // Move to next item - send AI back with new current task
-                                logger.log("Moving to next item: " + nextItem.id);
-                                conversationManager.addSystemMessage("System: Task completed. Moving to next item.");
-                                conversationQueue.publishState(conversationManager.getConversationStateJson());
+                                    // No review needed - move to next item immediately
+                                    logger.log("Moving to next item: " + nextItem.id);
+                                    conversationManager.addSystemMessage("System: Task completed. Moving to next item.");
+                                    conversationQueue.publishState(conversationManager.getConversationStateJson());
 
                                     // Continue agentic loop with next item
                                     String nextRequest = buildAIRequestFromHistory();
@@ -1051,12 +1113,32 @@ public class AIProcessorThread implements Runnable {
                                 String nextItemType = nextItem.itemType;
                                 if ("testing".equals(nextItemType)) {
                                     modeManager.transitionTo(Mode.TESTING);
+                                } else if ("analyzing".equals(nextItemType) || "researching".equals(nextItemType) || "reviewing".equals(nextItemType)) {
+                                    // Read-only tasks go to EXECUTION mode (they can't modify files)
+                                    modeManager.transitionTo(Mode.EXECUTION);
                                 } else {
+                                    // "coding" and any other types go to EXECUTION mode
                                     modeManager.transitionTo(Mode.EXECUTION);
                                 }
 
                                 conversationManager.addSystemMessage("System: Review passed. Moving to next task.");
                                 conversationQueue.publishState(conversationManager.getConversationStateJson());
+
+                                // Add task_start notification for next task (BEFORE sending AI request)
+                                // This ensures proper ordering: review_end -> task_start -> AI starts work
+                                List<ChecklistManager.ChecklistItem> allItems = checklistManager.getItems();
+                                int completedCount = 0;
+                                for (ChecklistManager.ChecklistItem item : allItems) {
+                                    if (item.completed) completedCount++;
+                                }
+                                Map<String, Object> nextTaskNotification = new java.util.LinkedHashMap<>();
+                                nextTaskNotification.put("task_number", completedCount + 1);
+                                nextTaskNotification.put("total_items", allItems.size());
+                                nextTaskNotification.put("content", nextItem.shortDesc);
+                                nextTaskNotification.put("item_type", nextItem.itemType);
+                                conversationManager.addToolResult("task_start", nextTaskNotification);
+                                conversationQueue.publishState(conversationManager.getConversationStateJson());
+                                logger.log("Added task_start notification for next task after review: " + nextItem.shortDesc);
 
                                 // Continue with next task
                                 String nextRequest = buildAIRequestFromHistory();
@@ -1312,19 +1394,28 @@ public class AIProcessorThread implements Runnable {
         if (fileCache != null) {
             // Calculate base prompt and conversation history
             String basePrompt = promptGenerator.generatePrompt(currentMode, checklistManager, (ProjectStructure)null, (FileStructureCache)null, (Integer)0, null);
-            String conversationHistory = conversationRenderer.renderMessages(conversationManager.getState().getHistory());
+            List<ConversationState.Message> tempHistory = conversationManager.getState().getHistory();
+            String tempConvHistory = conversationRenderer.renderMessages(tempHistory, "");  // Empty system for token estimation
 
-            systemPrompt = promptGenerator.generatePrompt(currentMode, checklistManager, fileCache, basePrompt, conversationHistory, conversationManager);
+            systemPrompt = promptGenerator.generatePrompt(currentMode, checklistManager, fileCache, basePrompt, tempConvHistory, conversationManager);
         } else {
             // Fallback to old ProjectStructure
             systemPrompt = promptGenerator.generatePrompt(currentMode, checklistManager, projectStructure);
         }
 
+        // Build single-message history with system prompt prepended using renderer
+        List<ConversationState.Message> singleMessage = new ArrayList<>();
+        ConversationState.Message userMsg = new ConversationState.Message("user_msg", userMessage);
+        singleMessage.add(userMsg);
+
+        String conversationHistory = conversationRenderer.renderMessages(singleMessage, systemPrompt);
+
         StringBuilder request = new StringBuilder();
         request.append("{");
-        request.append("\"system\":\"").append(escapeJson(systemPrompt)).append("\",");
+        request.append("\"model\":\"claude-sonnet-4-5-20250929\",");
+        request.append("\"max_tokens\":8192,");
         request.append("\"messages\":[");
-        request.append("{\"role\":\"user\",\"content\":\"").append(escapeJson(userMessage)).append("\"}");
+        request.append(conversationHistory);
         request.append("]");
         request.append("}");
 
@@ -1336,32 +1427,40 @@ public class AIProcessorThread implements Runnable {
 
         // Get conversation history
         List<ConversationState.Message> history = conversationManager.getState().getHistory();
-        String conversationHistory = conversationRenderer.renderMessages(history);
 
         // Generate system prompt using FileStructureCache if available
         String systemPrompt;
         if (fileCache != null) {
             // Calculate base prompt (without file cache section)
             String basePrompt = promptGenerator.generatePrompt(currentMode, checklistManager, (ProjectStructure)null, (FileStructureCache)null, (Integer)0, null);
+            String tempConvHistory = conversationRenderer.renderMessages(history, "");  // Empty system for token estimation
 
-            systemPrompt = promptGenerator.generatePrompt(currentMode, checklistManager, fileCache, basePrompt, conversationHistory, conversationManager);
+            systemPrompt = promptGenerator.generatePrompt(currentMode, checklistManager, fileCache, basePrompt, tempConvHistory, conversationManager);
         } else {
             // Fallback to old ProjectStructure
             systemPrompt = promptGenerator.generatePrompt(currentMode, checklistManager, projectStructure);
         }
 
+        // Use renderer to prepend system prompt to first user message (matches production)
+        String conversationHistory = conversationRenderer.renderMessages(history, systemPrompt);
+
         StringBuilder request = new StringBuilder();
         request.append("{");
-        request.append("\"system\":\"").append(escapeJson(systemPrompt)).append("\",");
+        request.append("\"model\":\"claude-sonnet-4-5-20250929\",");
+        request.append("\"max_tokens\":8192,");
         request.append("\"messages\":[");
-
-        // Use renderer to format conversation history
         request.append(conversationHistory);
-
         request.append("]");
         request.append("}");
 
-        return request.toString();
+        // Log details about what we're sending
+        String result = request.toString();
+        logger.log("[REQUEST_BUILD] System prompt length: " + systemPrompt.length() + " chars");
+        logger.log("[REQUEST_BUILD] System prompt contains terminator instruction? " + systemPrompt.contains("|||||END|||||"));
+        logger.log("[REQUEST_BUILD] Full request JSON length: " + result.length() + " chars");
+        logger.log("[REQUEST_BUILD] Prepended system to first user message (matching production)");
+
+        return result;
     }
 
     /**
@@ -1373,23 +1472,27 @@ public class AIProcessorThread implements Runnable {
 
         // Get conversation history
         List<ConversationState.Message> history = conversationManager.getState().getHistory();
-        String conversationHistory = conversationRenderer.renderMessages(history);
 
         // Generate system prompt
         String systemPrompt;
         if (fileCache != null) {
             String basePrompt = promptGenerator.generatePrompt(currentMode, checklistManager, (ProjectStructure)null, (FileStructureCache)null, (Integer)0, null);
-            systemPrompt = promptGenerator.generatePrompt(currentMode, checklistManager, fileCache, basePrompt, conversationHistory, conversationManager);
+            String tempConvHistory = conversationRenderer.renderMessages(history, "");  // Empty system for token estimation
+            systemPrompt = promptGenerator.generatePrompt(currentMode, checklistManager, fileCache, basePrompt, tempConvHistory, conversationManager);
         } else {
             systemPrompt = promptGenerator.generatePrompt(currentMode, checklistManager, projectStructure);
         }
 
+        // Use renderer to prepend system prompt to first user message (matches production)
+        String conversationHistory = conversationRenderer.renderMessages(history, systemPrompt);
+
         StringBuilder request = new StringBuilder();
         request.append("{");
-        request.append("\"system\":\"").append(escapeJson(systemPrompt)).append("\",");
+        request.append("\"model\":\"claude-sonnet-4-5-20250929\",");
+        request.append("\"max_tokens\":8192,");
         request.append("\"messages\":[");
 
-        // Include conversation history
+        // Include conversation history (with system prepended to first message)
         request.append(conversationHistory);
 
         // Add a separator if history is not empty
@@ -1406,7 +1509,16 @@ public class AIProcessorThread implements Runnable {
         request.append("]");
         request.append("}");
 
-        return request.toString();
+        // Log details about continuation request
+        String result = request.toString();
+        logger.log("[CONTINUATION_REQUEST] System prompt length: " + systemPrompt.length() + " chars");
+        logger.log("[CONTINUATION_REQUEST] Truncated response length: " + truncatedResponse.length() + " chars");
+        logger.log("[CONTINUATION_REQUEST] Last 100 chars of truncated response: " +
+            (truncatedResponse.length() > 100 ? truncatedResponse.substring(truncatedResponse.length() - 100) : truncatedResponse).replace("\n", "\\n"));
+        logger.log("[CONTINUATION_REQUEST] Full request JSON length: " + result.length() + " chars");
+        logger.log("[CONTINUATION_REQUEST] Prepended system to first user message (matching production)");
+
+        return result;
     }
 
 
@@ -1771,9 +1883,9 @@ public class ChecklistManager {
         return currentChecklist;
     }
 
-    public ChecklistItem addItem(String content, String priority, String itemType) {
+    public ChecklistItem addItem(String shortDesc, String detailedDesc, String priority, String itemType) {
         String id = "todo-" + (currentChecklist.size() + 1);
-        ChecklistItem item = new ChecklistItem(id, content, itemType);
+        ChecklistItem item = new ChecklistItem(id, shortDesc, detailedDesc, itemType);
         item.priority = priority;
         currentChecklist.add(item);
         logger.log("Added checklist item: " + id);
@@ -1808,6 +1920,8 @@ public class ChecklistManager {
                 item.status = "completed";
                 logger.log("Completed checklist item: " + id);
 
+                // Count coding items for review checkpoint
+                // Only "coding" items count toward review checkpoints (not analyzing/reviewing/researching/testing)
                 if ("coding".equals(item.itemType)) {
                     codingItemsCompletedSinceReview++;
                 }
@@ -1941,15 +2055,19 @@ public class ChecklistManager {
 
     public static class ChecklistItem {
         public String id;
-        public String content;
+        public String shortDesc;     // Short description shown in UI checklist
+        public String detailedDesc;  // Detailed description for agent execution context
+        public String content;       // Alias for shortDesc (for backwards compatibility with UI)
         public boolean completed;
         public String status;  // "pending", "in_progress", "completed"
         public String priority;  // "high", "medium", "low"
-        public String itemType; // "coding" or "testing"
+        public String itemType; // "coding", "testing", "analyzing", "reviewing", "researching"
 
-        public ChecklistItem(String id, String content, String itemType) {
+        public ChecklistItem(String id, String shortDesc, String detailedDesc, String itemType) {
             this.id = id;
-            this.content = content;
+            this.shortDesc = shortDesc;
+            this.detailedDesc = detailedDesc;
+            this.content = shortDesc;  // Set content as alias for backwards compatibility
             this.completed = false;
             this.status = "pending";
             this.priority = "medium";
@@ -3808,13 +3926,16 @@ public class ConversationRenderer {
 
     /**
      * Render conversation history as JSON messages array for AI
+     * Prepends system prompt to first user message (matches production bridge-button.js behavior)
      *
      * @param history List of conversation messages
+     * @param systemPrompt System prompt to prepend to first user message
      * @return JSON string representing the messages array (without outer brackets)
      */
-    public String renderMessages(List<ConversationState.Message> history) {
+    public String renderMessages(List<ConversationState.Message> history, String systemPrompt) {
         StringBuilder json = new StringBuilder();
         boolean firstMessage = true;
+        boolean systemPromptPrepended = false;
 
         for (ConversationState.Message msg : history) {
             // Skip meta messages (loading, etc.)
@@ -3829,7 +3950,13 @@ public class ConversationRenderer {
             // Render message based on type
             switch (msg.type) {
                 case "user_msg":
-                    json.append(renderUserMessage(msg));
+                    // Prepend system prompt to first user message (matches production bridge-button.js)
+                    if (!systemPromptPrepended) {
+                        json.append(renderUserMessageWithSystemPrompt(msg, systemPrompt));
+                        systemPromptPrepended = true;
+                    } else {
+                        json.append(renderUserMessage(msg));
+                    }
                     break;
                 case "assistant_msg":
                     json.append(renderAssistantMessage(msg));
@@ -3871,6 +3998,15 @@ public class ConversationRenderer {
      */
     private String renderUserMessage(ConversationState.Message msg) {
         return "{\"role\":\"user\",\"content\":\"" + escapeJson(msg.content) + "\"}";
+    }
+
+    /**
+     * Render user message with system prompt prepended
+     * Format: {"role":"user","content":"SYSTEM_PROMPT\n\nUSER_CONTENT"}
+     */
+    private String renderUserMessageWithSystemPrompt(ConversationState.Message msg, String systemPrompt) {
+        String combinedContent = systemPrompt + "\n\n" + msg.content;
+        return "{\"role\":\"user\",\"content\":\"" + escapeJson(combinedContent) + "\"}";
     }
 
     /**
@@ -4525,7 +4661,8 @@ public class LenientXMLParser {
             textContent = content;
 
             // Strip ALL CDATA markers from raw content
-            if (textContent.contains("<![CDATA[")) {
+            if (textContent.contains("<![CDATA[") || textContent.contains("]]>")) {
+                // First try to match complete CDATA sections
                 Pattern cdataPattern = Pattern.compile("<!\\[CDATA\\[(.*?)\\]\\]>", Pattern.DOTALL);
                 Matcher cdataMatcher = cdataPattern.matcher(textContent);
                 StringBuffer result = new StringBuffer();
@@ -4536,6 +4673,11 @@ public class LenientXMLParser {
                 }
                 cdataMatcher.appendTail(result);
                 textContent = result.toString();
+
+                // Also handle incomplete CDATA tags (opening or closing tags without counterpart)
+                // This happens when AI forgets to close CDATA or when content is truncated
+                textContent = textContent.replaceAll("<!\\[CDATA\\[", "");
+                textContent = textContent.replaceAll("\\]\\]>", "");
             }
 
             // Normalize AI formatting issues
@@ -4562,7 +4704,8 @@ public class LenientXMLParser {
             textContent = content;
 
             // Strip ALL CDATA markers from text content
-            if (textContent.contains("<![CDATA[")) {
+            if (textContent.contains("<![CDATA[") || textContent.contains("]]>")) {
+                // First try to match complete CDATA sections
                 Pattern cdataPattern = Pattern.compile("<!\\[CDATA\\[(.*?)\\]\\]>", Pattern.DOTALL);
                 Matcher cdataMatcher = cdataPattern.matcher(textContent);
                 StringBuffer result = new StringBuffer();
@@ -4574,6 +4717,12 @@ public class LenientXMLParser {
                 cdataMatcher.appendTail(result);
 
                 textContent = result.toString();
+
+                // Also handle incomplete CDATA tags (opening or closing tags without counterpart)
+                // This happens when AI forgets to close CDATA or when content is truncated
+                textContent = textContent.replaceAll("<!\\[CDATA\\[", "");
+                textContent = textContent.replaceAll("\\]\\]>", "");
+
                 // Normalize AI formatting issues
                 textContent = normalizeAIFormatting(textContent);
                 return new ContentResult(textContent, children, true); // preserveWhitespace = true
@@ -4959,6 +5108,8 @@ FILE: com/codeboss/javalayer/aiprocessor/MouseCaptureCommand.java
 package com.codeboss.javalayer.aiprocessor;
 
 import com.codeboss.javalayer.bridge.*;
+import java.awt.MouseInfo;
+import java.awt.Point;
 
 /**
  * Calibrate mouse coordinates for bridge button
@@ -4980,15 +5131,35 @@ public class MouseCaptureCommand implements ICommand {
 
     @Override
     public CommandDispatcher.CommandResult execute(String[] args) {
-        // TODO: Capture mouse position
-        // TODO: Save to config
-        logger.log("MouseCapture command executed");
-        return new CommandDispatcher.CommandResult(true, "Mouse coordinates captured");
+        try {
+            // Get current mouse position
+            Point mouseLocation = MouseInfo.getPointerInfo().getLocation();
+            int x = (int) mouseLocation.getX();
+            int y = (int) mouseLocation.getY();
+
+            logger.log("Captured mouse position: x=" + x + ", y=" + y);
+
+            // Save to config
+            config.setClickX(x);
+            config.setClickY(y);
+
+            String message = "Mouse coordinates captured and saved:\n" +
+                           "  X: " + x + "\n" +
+                           "  Y: " + y + "\n" +
+                           "These coordinates will be used for bridge button clicks.";
+
+            logger.log("Mouse capture successful");
+            return new CommandDispatcher.CommandResult(true, message);
+
+        } catch (Exception e) {
+            logger.log("ERROR: Failed to capture mouse coordinates: " + e.getMessage());
+            return new CommandDispatcher.CommandResult(false, "Failed to capture mouse coordinates: " + e.getMessage());
+        }
     }
 
     @Override
     public String getHelp() {
-        return "Calibrate bridge button click coordinates";
+        return "Capture current mouse position and save as bridge button click coordinates";
     }
 }
 
@@ -5321,11 +5492,35 @@ public class PromptGenerator {
                 instructions.append("EXECUTION MODE:\n\n");
                 instructions.append("Your job is to complete ONE checklist item, then report success or failure.\n\n");
                 instructions.append("WORKFLOW:\n");
-                instructions.append("1. Read the CURRENT TASK below\n");
-                instructions.append("2. Use tools to complete the task - IMPORTANT: Only ONE create/update operation per response\n");
+                instructions.append("1. Read the CURRENT TASK below (check both Summary and Details)\n");
+                instructions.append("2. Follow the guidance for the task Type:\n\n");
+                instructions.append("   ANALYZING tasks (item_type: analyzing):\n");
+                instructions.append("   - Read and examine existing code/files\n");
+                instructions.append("   - Search for patterns, dependencies, or specific code elements\n");
+                instructions.append("   - You CANNOT modify files (read-only)\n");
+                instructions.append("   - Call mark_complete when analysis is done\n\n");
+                instructions.append("   RESEARCHING tasks (item_type: researching):\n");
+                instructions.append("   - Investigate requirements, documentation, or gather information\n");
+                instructions.append("   - List files, read documentation, search for examples\n");
+                instructions.append("   - You CANNOT modify files (read-only)\n");
+                instructions.append("   - Call mark_complete when research is done\n\n");
+                instructions.append("   CODING tasks (item_type: coding):\n");
+                instructions.append("   - Create, modify, or delete files\n");
+                instructions.append("   - IMPORTANT: Only ONE create/update operation per response\n");
                 instructions.append("   - Use create_file, update_file, OR update_file_batch ONCE per turn\n");
                 instructions.append("   - You CAN batch multiple delete_file and read_file calls\n");
                 instructions.append("   - Tasks may require MULTIPLE turns to complete (create files one at a time)\n");
+                instructions.append("   - Call mark_complete when all file operations are done\n\n");
+                instructions.append("   TESTING tasks (item_type: testing):\n");
+                instructions.append("   - Run tests using run_command tool\n");
+                instructions.append("   - Validate behavior matches requirements\n");
+                instructions.append("   - You CANNOT modify files (read-only)\n");
+                instructions.append("   - Call mark_complete if tests pass, mark_failed if tests fail\n\n");
+                instructions.append("   REVIEWING tasks (item_type: reviewing):\n");
+                instructions.append("   - Review code quality, naming conventions, error handling\n");
+                instructions.append("   - Read files to check for issues\n");
+                instructions.append("   - You CANNOT modify files (read-only)\n");
+                instructions.append("   - Call mark_complete when review is done\n\n");
                 instructions.append("3. When ALL work for the task is done, call mark_complete tool ONCE\n");
                 instructions.append("4. If you cannot complete it, call mark_failed with a reason\n\n");
                 instructions.append("TASK GRANULARITY EXAMPLES:\n");
@@ -5550,8 +5745,15 @@ public class PromptGenerator {
             tools.append("    <parameter name=\"description\">Brief summary of what this plan will do</parameter>\n");
             tools.append("    <parameter name=\"checklist\">JSON array of todo items</parameter>\n");
             tools.append("  </tool>\n");
-            tools.append("  Checklist format: [{\"content\":\"task description\",\"item_type\":\"coding\",\"priority\":\"high\"},...]\n");
-            tools.append("  - item_type must be \"coding\" or \"testing\"\n");
+            tools.append("  Checklist format: [{\"short_desc\":\"Brief summary\",\"detailed_desc\":\"Full context and requirements\",\"item_type\":\"coding\",\"priority\":\"high\"},...]\n");
+            tools.append("  - short_desc: Brief summary shown in UI (e.g., \"Create model classes\")\n");
+            tools.append("  - detailed_desc: Detailed instructions for agent (e.g., \"Create Todo.java and TodoList.java model classes with proper getters/setters and validation\")\n");
+            tools.append("  - item_type must be one of: \"analyzing\", \"researching\", \"coding\", \"testing\", \"reviewing\"\n");
+            tools.append("    * analyzing: Reading and understanding existing code/files\n");
+            tools.append("    * researching: Investigating requirements, docs, or gathering information\n");
+            tools.append("    * coding: Creating, modifying, or deleting files\n");
+            tools.append("    * testing: Running tests and validating behavior\n");
+            tools.append("    * reviewing: Code review or quality check\n");
             tools.append("  - priority can be \"high\", \"medium\", or \"low\"\n");
             tools.append("  IMPORTANT: You MUST call this tool BEFORE using create_file, update_file, or delete_file.\n");
             tools.append("  Call this tool immediately after creating your plan. The system will handle next steps.\n\n");
@@ -5722,7 +5924,7 @@ public class PromptGenerator {
         for (ChecklistManager.ChecklistItem item : items) {
             state.append("  [" + item.id + "] ");
             state.append(item.status.toUpperCase()).append(" - ");
-            state.append(item.content);
+            state.append(item.shortDesc);
             state.append(" (" + item.priority + ", " + item.itemType + ")\n");
         }
         state.append("\n");
@@ -5753,13 +5955,14 @@ public class PromptGenerator {
 
         if (previousItem != null) {
             task.append("PREVIOUS TASK (completed):\n");
-            task.append("[PASS] ").append(previousItem.content).append("\n\n");
+            task.append("[PASS] ").append(previousItem.shortDesc).append("\n\n");
         }
 
         task.append("CURRENT TASK:\n");
         task.append("ID: ").append(nextItem.id).append("\n");
         task.append("Type: ").append(nextItem.itemType).append("\n");
-        task.append("Description: ").append(nextItem.content).append("\n\n");
+        task.append("Summary: ").append(nextItem.shortDesc).append("\n");
+        task.append("Details: ").append(nextItem.detailedDesc).append("\n\n");
 
         return task.toString();
     }
@@ -6775,6 +6978,18 @@ public interface IConfigManager {
      * @return Budget in characters (e.g., 500000)
      */
     int getPromptBudgetChars();
+
+    /**
+     * Set click X coordinate and save to config file
+     * @param x X coordinate in pixels
+     */
+    void setClickX(int x) throws Exception;
+
+    /**
+     * Set click Y coordinate and save to config file
+     * @param y Y coordinate in pixels
+     */
+    void setClickY(int y) throws Exception;
 }
 
 |~|~|~|~|~|~|~|~|~|~|~|
@@ -6931,14 +7146,12 @@ import com.codeboss.javalayer.bridge.*;
 public class MockClipboardManager implements IClipboardManager {
     private String clipboard = "";
     private Object aiBridge = null;
-    private String systemPrompt = "";
     private ILogger logger = null;
     private int aiCallCount = 0;
     private long totalAiTimeMs = 0;
 
-    public void setAIBridge(Object aiBridge, String systemPrompt) {
+    public void setAIBridge(Object aiBridge) {
         this.aiBridge = aiBridge;
-        this.systemPrompt = systemPrompt;
     }
 
     public void setLogger(ILogger logger) {
@@ -6989,11 +7202,13 @@ public class MockClipboardManager implements IClipboardManager {
         try {
             // Extract REQUEST_ID from clipboard for response validation
             String requestId = extractRequestId(clipboard);
-            String userMessage = extractUserMessage(clipboard);
+            String jsonRequest = extractUserMessage(clipboard);
 
+            // The jsonRequest is ALWAYS a complete JSON request from AIProcessorThread
+            // (either initial request or continuation request with full conversation history)
             Class<?> clazz = aiBridge.getClass();
-            java.lang.reflect.Method method = clazz.getMethod("sendMessage", String.class, String.class);
-            String response = (String) method.invoke(aiBridge, systemPrompt, userMessage);
+            java.lang.reflect.Method method = clazz.getMethod("sendRequest", String.class);
+            String response = (String) method.invoke(aiBridge, jsonRequest);
 
             // Check if response is null
             if (response == null) {
@@ -7005,10 +7220,22 @@ public class MockClipboardManager implements IClipboardManager {
 
             if (logger != null) {
                 logger.log("AI call #" + aiCallCount + " completed in " + duration + "ms (total: " + totalAiTimeMs + "ms)");
+                logger.log("[MOCK_CLIP] Response length: " + response.length() + " chars");
+                logger.log("[MOCK_CLIP] Response ends with |||||END|||||? " + response.endsWith("|||||END|||||"));
+                logger.log("[MOCK_CLIP] Last 50 chars of response: " + response.substring(Math.max(0, response.length() - 50)).replace("\n", "\\n"));
             }
 
-            // Return response with REQUEST_ID prefix so BridgePollingThread can validate it
-            return requestId + "\n" + response + "\n|||||CLIP:TO_JAVA_END|||||";
+            // Return response with REQUEST_ID prefix - match production bridge-button.js behavior EXACTLY
+            // Production does: 'REQUEST_ID:' + currentRequestId + '\n' + currentResponse + TO_JAVA_MARKER
+            // No special handling needed - just direct concatenation like production
+            String fullResponse = requestId + "\n" + response;
+
+            if (logger != null) {
+                logger.log("[MOCK_CLIP] Full response length: " + fullResponse.length() + " chars");
+                logger.log("[MOCK_CLIP] Last 80 chars of full response: " + fullResponse.substring(Math.max(0, fullResponse.length() - 80)).replace("\n", "\\n"));
+            }
+
+            return fullResponse;
         } catch (RuntimeException re) {
             long duration = System.currentTimeMillis() - startTime;
             totalAiTimeMs += duration;
@@ -7098,7 +7325,7 @@ public class MockConfigManager implements IConfigManager {
     private boolean autoLaunchBrowser = false;
     private int maxMessageChars = 350000;
     private boolean fileCacheEnabled = true;
-    private int promptBudgetChars = 500000;
+    private int promptBudgetChars = 5000;  // Low budget for testing compaction
 
     public void setServerPort(int port) {
         this.serverPort = port;
@@ -7141,6 +7368,16 @@ public class MockConfigManager implements IConfigManager {
     @Override
     public int getPromptBudgetChars() {
         return promptBudgetChars;
+    }
+
+    @Override
+    public void setClickX(int x) throws Exception {
+        // Mock implementation - does nothing
+    }
+
+    @Override
+    public void setClickY(int y) throws Exception {
+        // Mock implementation - does nothing
     }
 }
 
@@ -7355,13 +7592,20 @@ public class BridgePollingThread implements Runnable {
     }
 
     /**
-     * Strip the REQUEST_ID line from the response
-     * @param response The response with REQUEST_ID line
-     * @return The response without the REQUEST_ID line
+     * Strip the REQUEST_ID line and clipboard markers from the response
+     * @param response The response with REQUEST_ID line and markers
+     * @return The response without the REQUEST_ID line and markers
      */
     private String stripRequestId(String response) {
         if (response == null) {
             return null;
+        }
+
+        logger.log("[STRIP_DEBUG] Input response length: " + response.length());
+        if (response.length() < 200) {
+            logger.log("[STRIP_DEBUG] Full input: " + response.replace("\n", "\\n"));
+        } else {
+            logger.log("[STRIP_DEBUG] Last 100 chars: " + response.substring(response.length() - 100).replace("\n", "\\n"));
         }
 
         // Find the first newline (end of REQUEST_ID line)
@@ -7370,8 +7614,16 @@ public class BridgePollingThread implements Runnable {
             return response;
         }
 
-        // Return everything after the first newline
-        return response.substring(firstNewline + 1);
+        // Get everything after the REQUEST_ID line - match production behavior EXACTLY
+        // Production bridge-button.js writes: 'REQUEST_ID:xxx\n' + response
+        // So we just strip the first line, nothing else
+        String content = response.substring(firstNewline + 1);
+
+        logger.log("[STRIP_DEBUG] After removing REQUEST_ID, length: " + content.length());
+        logger.log("[STRIP_DEBUG] Final output ends with |||||END|||||? " + content.endsWith("|||||END|||||"));
+        logger.log("[STRIP_DEBUG] Final last 50 chars: " + content.substring(Math.max(0, content.length() - 50)).replace("\n", "\\n"));
+
+        return content;
     }
 }
 
@@ -11156,6 +11408,39 @@ public class ConfigManager implements com.codeboss.javalayer.bridge.IConfigManag
     public int getPromptBudgetChars() {
         return promptBudgetChars;
     }
+
+    public void setClickX(int x) throws Exception {
+        this.clickX = x;
+        saveConfig();
+    }
+
+    public void setClickY(int y) throws Exception {
+        this.clickY = y;
+        saveConfig();
+    }
+
+    private void saveConfig() throws Exception {
+        Path configPath = Paths.get(getConfigFile());
+
+        // Read current config
+        String configContent = new String(Files.readAllBytes(configPath));
+
+        // Update clickX
+        configContent = configContent.replaceAll(
+            "\"clickX\"\\s*:\\s*-?\\d+",
+            "\"clickX\": " + clickX
+        );
+
+        // Update clickY
+        configContent = configContent.replaceAll(
+            "\"clickY\"\\s*:\\s*-?\\d+",
+            "\"clickY\": " + clickY
+        );
+
+        // Write back to file
+        Files.write(configPath, configContent.getBytes());
+        logger.log("Config saved: clickX=" + clickX + ", clickY=" + clickY);
+    }
 }
 |~|~|~|~|~|~|~|~|~|~|~|
 
@@ -12270,13 +12555,24 @@ public class ToolExecutor implements IToolExecutor {
             switch (action) {
                 case "add":
                     String content = params.get("content");
+                    String shortDesc = params.get("short_desc");
+                    String detailedDesc = params.get("detailed_desc");
+
+                    // Backwards compatibility: use content for both if short_desc not provided
+                    if (shortDesc == null && content != null) {
+                        shortDesc = content;
+                    }
+                    if (detailedDesc == null && content != null) {
+                        detailedDesc = content;
+                    }
+
                     String priority = params.getOrDefault("priority", "medium");
                     String itemType = params.getOrDefault("item_type", "coding");
 
-                    ChecklistManager.ChecklistItem item = checklistManager.addItem(content, priority, itemType);
+                    ChecklistManager.ChecklistItem item = checklistManager.addItem(shortDesc, detailedDesc, priority, itemType);
                     result.put("action", "add");
                     result.put("id", item.id);
-                    result.put("content", item.content);
+                    result.put("content", item.shortDesc);
                     return new ToolExecutionResult(result, "Added checklist item: " + item.id);
 
                 case "list":
@@ -12285,7 +12581,9 @@ public class ToolExecutor implements IToolExecutor {
                     for (ChecklistManager.ChecklistItem it : items) {
                         Map<String, Object> itemMap = new HashMap<>();
                         itemMap.put("id", it.id);
-                        itemMap.put("content", it.content);
+                        itemMap.put("content", it.shortDesc);  // Use shortDesc for display
+                        itemMap.put("short_desc", it.shortDesc);
+                        itemMap.put("detailed_desc", it.detailedDesc);
                         itemMap.put("status", it.status);
                         itemMap.put("priority", it.priority);
                         itemMap.put("item_type", it.itemType);
@@ -12370,7 +12668,7 @@ public class ToolExecutor implements IToolExecutor {
 
         Map<String, Object> result = new HashMap<>();
         result.put("id", currentItem.id);
-        result.put("content", currentItem.content);
+        result.put("content", currentItem.shortDesc);
         result.put("completed", true);
 
         // Add stats and next task info
@@ -12388,13 +12686,13 @@ public class ToolExecutor implements IToolExecutor {
         if (nextItem != null) {
             Map<String, Object> nextTaskInfo = new LinkedHashMap<>();
             nextTaskInfo.put("id", nextItem.id);
-            nextTaskInfo.put("content", nextItem.content);
+            nextTaskInfo.put("content", nextItem.shortDesc);
             nextTaskInfo.put("item_type", nextItem.itemType);
             nextTaskInfo.put("priority", nextItem.priority);
             result.put("next_task", nextTaskInfo);
         }
 
-        String summary = "Completed: " + currentItem.content;
+        String summary = "Completed: " + currentItem.shortDesc;
 
         // Check if review should be triggered
         boolean shouldTriggerReview = checklistManager.shouldTriggerReview();
@@ -12426,11 +12724,11 @@ public class ToolExecutor implements IToolExecutor {
 
         Map<String, Object> result = new HashMap<>();
         result.put("id", currentItem.id);
-        result.put("content", currentItem.content);
+        result.put("content", currentItem.shortDesc);
         result.put("failed", true);
         result.put("reason", reason);
 
-        String summary = "Task failed: " + currentItem.content + " - " + reason;
+        String summary = "Task failed: " + currentItem.shortDesc + " - " + reason;
 
         // Return to planning mode will be handled by AIProcessorThread
         return new ToolExecutionResult(result, summary, false);
@@ -12510,7 +12808,7 @@ public class ToolExecutor implements IToolExecutor {
 
             if (firstTask != null) {
                 Map<String, Object> taskInfo = new LinkedHashMap<>();
-                taskInfo.put("content", firstTask.content);
+                taskInfo.put("content", firstTask.shortDesc);
                 taskInfo.put("item_type", firstTask.itemType);
                 taskInfo.put("task_number", 1);
                 taskInfo.put("total_items", 1);
@@ -12577,6 +12875,14 @@ public class ToolExecutor implements IToolExecutor {
                 if (!item.containsKey("priority")) {
                     item.put("priority", "medium");
                 }
+                // For backwards compatibility: if only "content" is provided, use it for both short and detailed
+                if (item.containsKey("content") && !item.containsKey("short_desc")) {
+                    item.put("short_desc", item.get("content"));
+                }
+                if (item.containsKey("content") && !item.containsKey("detailed_desc")) {
+                    item.put("detailed_desc", item.get("content"));
+                }
+                // If neither content nor short_desc is provided, this is an error (will be caught by validation)
             }
 
             return items;
@@ -12610,17 +12916,31 @@ public class ToolExecutor implements IToolExecutor {
             List<Map<String, String>> items = com.codeboss.javalayer.shared.LenientJsonParser.parseArray(checklistJson);
 
             for (Map<String, String> item : items) {
+                // Support both old format (content) and new format (short_desc + detailed_desc)
+                String shortDesc = item.get("short_desc");
+                String detailedDesc = item.get("detailed_desc");
                 String content = item.get("content");
+
+                // Backwards compatibility: use content for both if short_desc not provided
+                if (shortDesc == null && content != null) {
+                    shortDesc = content;
+                }
+                if (detailedDesc == null && content != null) {
+                    detailedDesc = content;
+                }
+
                 String itemType = item.getOrDefault("item_type", "coding");
                 String priority = item.getOrDefault("priority", "medium");
 
-                if (content != null && !content.isEmpty()) {
+                if (shortDesc != null && !shortDesc.isEmpty() && detailedDesc != null && !detailedDesc.isEmpty()) {
                     // Add to ChecklistManager
                     if (checklistManager != null) {
-                        checklistManager.addItem(content, priority, itemType);
+                        checklistManager.addItem(shortDesc, detailedDesc, priority, itemType);
                     }
 
-                    // Ensure defaults are in the returned map
+                    // Ensure defaults and both description fields are in the returned map
+                    item.put("short_desc", shortDesc);
+                    item.put("detailed_desc", detailedDesc);
                     item.put("item_type", itemType);
                     item.put("priority", priority);
                 }
@@ -14344,8 +14664,8 @@ FILE: src/frontend-ui/render.js
     }
 
     function renderError(msg) {
-        // Special rendering for formatting_error (recoverable AI errors)
-        if (msg.toolName === 'formatting_error') {
+        // Special rendering for recoverable AI errors (formatting_error and multiple_update_file_error)
+        if (msg.toolName === 'formatting_error' || msg.toolName === 'multiple_update_file_error') {
             const lines = [];
             if (msg.result && msg.result.error) {
                 // Build main message with friendly tone
@@ -14561,7 +14881,7 @@ FILE: src/frontend-ui/render.js
             const checklistItems = result.checklist_preview.map(item =>
                 h('div', { className: 'plan-checklist-item' }, [
                     h('span', { className: 'plan-checkbox' }, text('☐ ')),
-                    h('span', { className: 'plan-item-content' }, text(item.content))
+                    h('span', { className: 'plan-item-content' }, text(item.content || item.short_desc || '(no description)'))
                 ])
             );
 
@@ -14596,7 +14916,7 @@ FILE: src/frontend-ui/render.js
                 const checkbox = item.completed ? '[\u2713]' : '[ ]';
                 return h('div', { className: 'execution-checklist-item' }, [
                     h('span', { className: 'execution-checkbox' }, text(checkbox + ' ')),
-                    text(item.content)
+                    text(item.content || item.short_desc || item.shortDesc || '(no description)')
                 ]);
             })
         );
@@ -15762,10 +16082,19 @@ FILE: src/frontend-ui/vdom.js
         };
     }
 
+    function convertUnicodeToHtmlEntities(str) {
+        return str.replace(/[\u0080-\uFFFF]/g, function(char) {
+            return '&#' + char.charCodeAt(0) + ';';
+        });
+    }
+
     function text(content) {
+        const strContent = String(content);
+        // Convert unicode characters to HTML entities for proper browser display
+        const converted = convertUnicodeToHtmlEntities(strContent);
         return {
             type: 'text',
-            content: String(content)
+            content: converted
         };
     }
 
@@ -15773,6 +16102,15 @@ FILE: src/frontend-ui/vdom.js
         if (!vnode) return null;
 
         if (vnode.type === 'text') {
+            // If content contains HTML entities, we need to parse them
+            // Check if the content has HTML entities (&#xxx; pattern)
+            if (vnode.content.includes('&#')) {
+                // Create a span to parse HTML entities
+                const span = document.createElement('span');
+                span.innerHTML = vnode.content;
+                // Return the text content as a text node
+                return document.createTextNode(span.textContent);
+            }
             return document.createTextNode(vnode.content);
         }
 
