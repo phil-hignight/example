@@ -5,7 +5,7 @@
  * Uses File System Access API for file operations.
  *
  * @version 1.0.0-browser
- * @generated 2025-11-11T22:08:20.464Z
+ * @generated 2025-11-11T22:11:35.576Z
  * @license MIT
  *
  * Usage:
@@ -4157,7 +4157,7 @@
   
     const { TokenEstimator } = window.module;
     const { Logger } = window.module;
-    const logger = Logger.getLogger('BudgetManager');
+    const logger = window.module.createLogger('BudgetManager');
   
     /**
      * Budget manager
@@ -6148,7 +6148,7 @@
   
     const { FSManager } = window.module;
     const { Logger } = window.module;
-    const logger = Logger.getLogger('ProjectManager');
+    const logger = window.module.createLogger('ProjectManager');
   
     /**
      * Project status enum
@@ -6391,7 +6391,7 @@
     const { FSManager } = window.module;
     const { Logger } = window.module;
     const { MessageType } = window.module;
-    const logger = Logger.getLogger('TaskManager');
+    const logger = window.module.createLogger('TaskManager');
   
     /**
      * Task manager
@@ -8622,7 +8622,7 @@
   
     const { FSManager } = window.module;
     const { Logger } = window.module;
-    const logger = Logger.getLogger('SearchEngine');
+    const logger = window.module.createLogger('SearchEngine');
   
     /**
      * Search result object
@@ -9492,7 +9492,7 @@
     const { FileNode } = window.module;
     const { TokenEstimator } = window.module;
     const { Logger } = window.module;
-    const logger = Logger.getLogger('FileCache');
+    const logger = window.module.createLogger('FileCache');
   
     /**
      * File structure cache
@@ -9679,7 +9679,7 @@
     'use strict';
   
     const { Logger } = window.module;
-    const logger = Logger.getLogger('MethodSignatureExtractor');
+    const logger = window.module.createLogger('MethodSignatureExtractor');
   
     /**
      * Method signature class
@@ -9836,7 +9836,7 @@
   
     const { TokenEstimator } = window.module;
     const { Logger } = window.module;
-    const logger = Logger.getLogger('BudgetManager');
+    const logger = window.module.createLogger('BudgetManager');
   
     /**
      * Budget manager
@@ -10031,7 +10031,7 @@
   
     const { TokenEstimator } = window.module;
     const { Logger } = window.module;
-    const logger = Logger.getLogger('CompactionEngine');
+    const logger = window.module.createLogger('CompactionEngine');
   
     /**
      * Compaction strategy enum
