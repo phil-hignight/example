@@ -5,7 +5,7 @@
  * Uses File System Access API for file operations.
  *
  * @version 1.0.0-browser
- * @generated 2025-11-11T21:13:28.439Z
+ * @generated 2025-11-11T22:08:20.464Z
  * @license MIT
  *
  * Usage:
@@ -10186,7 +10186,8 @@
   // src/ui/vdom.js
   // ============================================================================
 
-  function h(tag, props, ...children) {
+  (function() {
+      function h(tag, props, ...children) {
           return {
               tag,
               props: props || {},
@@ -10258,12 +10259,14 @@
           text,
           createDOMNode
       };
+  })();
 
   // ============================================================================
   // src/ui/diff.js
   // ============================================================================
 
-  const { createDOMNode } = window.module["vdom.js"];
+  (function() {
+      const { createDOMNode } = window.module["vdom.js"];
   
       function diff(oldVNode, newVNode) {
           const patches = [];
@@ -10464,12 +10467,14 @@
           diff,
           patch
       };
+  })();
 
   // ============================================================================
   // src/ui/render.js
   // ============================================================================
 
-  const { h, text } = window.module["vdom.js"];
+  (function() {
+      const { h, text } = window.module["vdom.js"];
   
       function render(state) {
           if (!state || !state.messages) {
@@ -11517,6 +11522,7 @@
       window.module["render.js"] = {
           render
       };
+  })();
 
   // ============================================================================
   // src/ui/ui-injector.js
