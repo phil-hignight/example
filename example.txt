@@ -5,7 +5,7 @@
  * Uses File System Access API for file operations.
  *
  * @version 1.0.0-browser
- * @generated 2025-11-11T22:11:35.576Z
+ * @generated 2025-11-12T18:01:48.084Z
  * @license MIT
  *
  * Usage:
@@ -10215,14 +10215,13 @@
           if (!vnode) return null;
   
           if (vnode.type === 'text') {
-              // If content contains HTML entities, we need to parse them
-              // Check if the content has HTML entities (&#xxx; pattern)
+              // If content contains HTML entities, parse them manually (Trusted Types compliant)
               if (vnode.content.includes('&#')) {
-                  // Create a span to parse HTML entities
-                  const span = document.createElement('span');
-                  span.innerHTML = vnode.content;
-                  // Return the text content as a text node
-                  return document.createTextNode(span.textContent);
+                  // Parse HTML entities like &#8595; without using innerHTML
+                  const parsed = vnode.content.replace(/&#(\d+);/g, (match, dec) => {
+                      return String.fromCharCode(parseInt(dec, 10));
+                  });
+                  return document.createTextNode(parsed);
               }
               return document.createTextNode(vnode.content);
           }
@@ -10476,11 +10475,41 @@
   (function() {
       const { h, text } = window.module["vdom.js"];
   
+      /**
+       * Main render function - renders entire app based on current screen
+       */
       function render(state) {
-          if (!state || !state.messages) {
-              return h('div', { className: 'chat-history' }, []);
+          if (!state) {
+              return h('div', { id: 'app-root' }, []);
           }
   
+          if (state.currentScreen === 'welcome') {
+              return renderWelcomeScreen(state);
+          } else {
+              return renderChatScreen(state);
+          }
+      }
+  
+      /**
+       * Render welcome screen
+       */
+      function renderWelcomeScreen(state) {
+          return h('div', { id: 'welcome-screen', className: 'screen' }, [
+              h('div', { className: 'welcome-content' }, [
+                  h('div', { className: 'welcome-header' }, text('Code Boss MVP')),
+                  h('div', { className: 'welcome-message' }, text('AI-powered coding assistant')),
+                  h('button', {
+                      id: 'select-directory-btn',
+                      className: 'primary-button'
+                  }, text('Select Working Directory'))
+              ])
+          ]);
+      }
+  
+      /**
+       * Render chat screen with message history
+       */
+      function renderChatScreen(state) {
           const messageNodes = state.messages
               .map((msg, index) => renderMessage(msg, state.messages, index, state))
               .filter(node => node !== null);
@@ -10491,7 +10520,19 @@
               messageNodes.push(renderLoading());
           }
   
-          return h('div', { className: 'chat-history' }, messageNodes);
+          const chatHistory = h('div', { className: 'chat-history' }, messageNodes);
+  
+          return h('div', { id: 'chat-screen', className: 'screen' }, [
+              h('div', { id: 'chat-container' }, [chatHistory]),
+              h('div', { id: 'input-container' }, [
+                  h('textarea', {
+                      id: 'message-input',
+                      placeholder: 'Type your message...',
+                      autocomplete: 'off',
+                      rows: '1'
+                  }, text(''))
+              ])
+          ]);
       }
   
       function renderMessage(msg, allMessages, index, state) {
@@ -12255,27 +12296,14 @@
        * @param {string} containerId - ID of container element
        */
       initialize(containerId) {
+        this.containerId = containerId;
         const container = document.getElementById(containerId);
         if (!container) {
           throw new Error(`Container #${containerId} not found`);
         }
   
-        // Create UI structure with both screens
-        container.innerHTML = `
-          <div id="welcome-screen" style="display: none;">
-            <div class="welcome-content">
-              <div class="welcome-header">Code Boss MVP</div>
-              <div class="welcome-message">AI-powered coding assistant</div>
-              <button id="select-directory-btn" class="primary-button">Select Working Directory</button>
-            </div>
-          </div>
-          <div id="chat-screen" style="display: none;">
-            <div id="chat-container"></div>
-            <div id="input-container">
-              <textarea id="message-input" placeholder="Type your message..." autocomplete="off" rows="1"></textarea>
-            </div>
-          </div>
-        `;
+        // Initial render of the app using VDOM
+        this.renderApp();
   
         this.injectStyles();
         this.setupEventListeners();
@@ -12285,33 +12313,15 @@
       }
   
       /**
-       * Set up event listeners
+       * Set up event listeners (called once during init)
        * @private
        */
       setupEventListeners() {
-        const input = document.getElementById('message-input');
-        const chatContainer = document.getElementById('chat-container');
-        const inputContainer = document.getElementById('input-container');
-  
-        // Auto-grow textarea
-        input.addEventListener('input', () => {
-          input.style.height = 'auto';
-          input.style.height = input.scrollHeight + 'px';
-        });
-  
-        // Enter to send
-        input.addEventListener('keydown', (e) => {
-          if (e.key === 'Enter' && !e.shiftKey) {
-            e.preventDefault();
-            this.handleSend();
-          }
-        });
-  
-        // Scroll tracking for smart auto-scroll
-        chatContainer.addEventListener('scroll', () => this.handleScroll());
-  
-        // Track mouse position to show scroll button near bottom
+        // Global mouse tracking for scroll button
         document.addEventListener('mousemove', (e) => {
+          const inputContainer = document.getElementById('input-container');
+          if (!inputContainer) return;
+  
           const buttonY = window.innerHeight - 100;
           const inputContainerTop = inputContainer.getBoundingClientRect().top;
           this.mouseNearBottom = e.clientY >= buttonY || e.clientY >= inputContainerTop;
@@ -12321,21 +12331,75 @@
           }
         });
   
-        // Focus input when clicking in input container
-        inputContainer.addEventListener('click', (e) => {
-          if (e.target === inputContainer) {
-            input.focus();
-          }
-        });
+        // Attach initial screen listeners based on state
+        if (this.state.currentScreen === 'welcome') {
+          this.attachWelcomeEventListeners();
+        } else {
+          this.attachChatEventListeners();
+        }
+      }
   
-        // Directory selection button
+      /**
+       * Attach event listeners for welcome screen
+       * @private
+       */
+      attachWelcomeEventListeners() {
         const dirButton = document.getElementById('select-directory-btn');
-        if (dirButton) {
-          dirButton.onclick = () => {
+        if (dirButton && !dirButton._hasListener) {
+          dirButton._hasListener = true;
+          dirButton.addEventListener('click', () => {
             if (this.onDirectorySelect) {
               this.onDirectorySelect();
             }
-          };
+          });
+        }
+      }
+  
+      /**
+       * Attach event listeners for chat screen
+       * @private
+       */
+      attachChatEventListeners() {
+        const input = document.getElementById('message-input');
+        const chatContainer = document.getElementById('chat-container');
+        const inputContainer = document.getElementById('input-container');
+  
+        if (!input || !chatContainer || !inputContainer) return;
+  
+        // Auto-grow textarea
+        if (!input._hasInputListener) {
+          input._hasInputListener = true;
+          input.addEventListener('input', () => {
+            input.style.height = 'auto';
+            input.style.height = input.scrollHeight + 'px';
+          });
+        }
+  
+        // Enter to send
+        if (!input._hasKeydownListener) {
+          input._hasKeydownListener = true;
+          input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+              e.preventDefault();
+              this.handleSend();
+            }
+          });
+        }
+  
+        // Scroll tracking for smart auto-scroll
+        if (!chatContainer._hasScrollListener) {
+          chatContainer._hasScrollListener = true;
+          chatContainer.addEventListener('scroll', () => this.handleScroll());
+        }
+  
+        // Focus input when clicking in input container
+        if (!inputContainer._hasClickListener) {
+          inputContainer._hasClickListener = true;
+          inputContainer.addEventListener('click', (e) => {
+            if (e.target === inputContainer) {
+              input.focus();
+            }
+          });
         }
       }
   
@@ -12345,57 +12409,53 @@
        */
       updateUI(newState) {
         this.state = { ...this.state, ...newState };
-  
-        if (this.state.currentScreen === 'welcome') {
-          this.renderWelcomeScreen();
-        } else {
-          this.renderChatScreen();
-        }
+        this.renderApp();
       }
   
       /**
-       * Render welcome screen
+       * Render the entire app using VDOM
        * @private
        */
-      renderWelcomeScreen() {
-        document.getElementById('welcome-screen').style.display = 'flex';
-        document.getElementById('chat-screen').style.display = 'none';
-      }
+      renderApp() {
+        const container = document.getElementById(this.containerId);
+        if (!container) return;
   
-      /**
-       * Render chat screen with VDOM
-       * @private
-       */
-      renderChatScreen() {
-        document.getElementById('welcome-screen').style.display = 'none';
-        document.getElementById('chat-screen').style.display = 'flex';
-  
+        // Check scroll state before render (for chat screen)
         const chatContainer = document.getElementById('chat-container');
+        const wasNearBottom = chatContainer ? this.isNearBottom() : false;
+        if (wasNearBottom) {
+          this.shouldMaintainScrollLock = true;
+        }
   
-        // Check if we should maintain scroll lock BEFORE updating DOM
-        const wasNearBottom = this.isNearBottom();
-        this.shouldMaintainScrollLock = wasNearBottom;
-  
-        // Generate virtual DOM
+        // Generate virtual DOM for entire app
         const { render } = window.module["render.js"];
         const { createDOMNode } = window.module["vdom.js"];
         const vnode = render(this.state);
         const newDOM = createDOMNode(vnode);
   
         // Efficiently patch DOM with morphdom
-        if (chatContainer.children.length === 0) {
-          chatContainer.appendChild(newDOM);
+        if (container.children.length === 0) {
+          container.appendChild(newDOM);
         } else {
-          window.morphdom(chatContainer.firstChild, newDOM);
+          window.morphdom(container.firstChild, newDOM);
         }
   
-        // After DOM update, scroll if needed
-        if (this.shouldMaintainScrollLock || wasNearBottom) {
-          this.scrollToBottom();
-        }
+        // After DOM update, handle scroll and event listeners
+        if (this.state.currentScreen === 'chat') {
+          // Re-attach event listeners that may have been lost during morph
+          this.attachChatEventListeners();
   
-        // Update button visibility after scrolling
-        this.updateScrollButtonVisibility();
+          // Scroll if needed
+          if (this.shouldMaintainScrollLock || wasNearBottom) {
+            this.scrollToBottom();
+          }
+  
+          // Update button visibility
+          this.updateScrollButtonVisibility();
+        } else if (this.state.currentScreen === 'welcome') {
+          // Re-attach welcome screen event listeners
+          this.attachWelcomeEventListeners();
+        }
       }
   
       /**
@@ -12453,9 +12513,7 @@
        * Used by diff expand/collapse functionality
        */
       refreshRender() {
-        if (this.state.currentScreen === 'chat') {
-          this.renderChatScreen();
-        }
+        this.renderApp();
       }
   
       /**
@@ -12570,7 +12628,7 @@
       createScrollButton() {
         this.scrollButton = document.createElement('div');
         this.scrollButton.id = 'scroll-to-bottom';
-        this.scrollButton.innerHTML = '↓';
+        this.scrollButton.textContent = '↓';  // Use textContent instead of innerHTML for Trusted Types
         this.scrollButton.style.display = 'none';
         this.scrollButton.addEventListener('click', () => this.scrollToBottom());
         document.body.appendChild(this.scrollButton);
@@ -13308,16 +13366,14 @@
           // 1. Initialize storage manager
           this.components.storageManager = new window.module.StorageManager();
   
-          // 2. Check for auth credentials (auth token OR API key)
+          // 2. Get auth credentials (default to production mode)
+          // In production (internal AI tool), token is automatically available in localStorage
+          // In development, user can set API key via prompt
           const authToken = window.module.getAuthToken();
           const apiKey = window.module.getApiKey();
-          const hasAuth = authToken !== null || apiKey !== null;
   
-          if (!hasAuth) {
-            // Prompt for auth - try auth token first (production), fallback to API key
-            this.promptForAuth();
-            return;
-          }
+          // Don't prompt - just proceed with whatever auth is available
+          // If neither is available, we'll use production mode and let the internal API handle auth
   
           // 3. Initialize file system manager
           this.components.fsManager = new window.module.FileSystemManager();
@@ -13574,17 +13630,35 @@
   })();
 
   // Auto-start when DOM ready
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', function() {
-      if (window.module.CodeBossApp && window.module.CodeBossApp.initialize) {
-        window.module.CodeBossApp.initialize();
+  (async function() {
+    try {
+      console.log('Code Boss MVP - Browser Edition');
+      console.log('Initializing...');
+
+      // Create app instance
+      const app = new window.module.CodeBossApp();
+
+      // Create container div if it doesn't exist
+      let container = document.getElementById('app');
+      if (!container) {
+        container = document.createElement('div');
+        container.id = 'app';
+        document.body.appendChild(container);
       }
-    });
-  } else {
-    if (window.module.CodeBossApp && window.module.CodeBossApp.initialize) {
-      window.module.CodeBossApp.initialize();
+
+      // Initialize with container
+      await app.initialize('app');
+
+      console.log('Code Boss initialized successfully');
+
+      // Export to window for debugging
+      window.CodeBossApp = app;
+
+    } catch (error) {
+      console.error('Failed to initialize Code Boss:', error);
+      alert('Failed to initialize Code Boss: ' + error.message);
     }
-  }
+  })();
 
   console.log('Code Boss bundle loaded successfully');
 
