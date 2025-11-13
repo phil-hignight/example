@@ -5,7 +5,7 @@
  * Uses File System Access API for file operations.
  *
  * @version 1.0.0-browser
- * @generated 2025-11-12T18:01:48.084Z
+ * @generated 2025-11-13T22:38:23.002Z
  * @license MIT
  *
  * Usage:
@@ -14,7 +14,7 @@
  *   3. Paste this entire script
  *   4. Follow prompts to select working directory
  *
- * Files bundled: 48
+ * Files bundled: 47
  * Total size: [calculated at build time]
  */
 
@@ -1790,6 +1790,8 @@
       MENTAL_MODEL_UPDATE: 'mental_model_update',
       CHECKLIST_APPROVED: 'checklist_approved',
       SYSTEM_MSG: 'system_msg',  // System messages (phase transitions, etc.)
+      GREETING: 'greeting',      // Initial greeting messages (not sent to API)
+      TASK_COMPLETE: 'task_complete', // Task completion with continuation prompt (not sent to API)
       LOADING: 'loading'  // In-memory only, not persisted
     };
   
@@ -1935,11 +1937,33 @@
     }
   
     /**
+     * Creates a greeting message (display only, not sent to API)
+     * @param {string} content - Greeting message content
+     * @returns {Object} Greeting message object
+     */
+    function createGreetingMessage(content) {
+      return createMessage(MessageType.GREETING, { content });
+    }
+  
+    /**
      * Creates a loading message (in-memory only)
      * @returns {Object} Loading message object
      */
     function createLoadingMessage() {
       return createMessage(MessageType.LOADING, { content: '' });
+    }
+  
+    /**
+     * Creates a task completion message (display only, not sent to API)
+     * @param {string} completionMessage - Message to display at end of task
+     * @param {string} continuationPrompt - Prompt to show when starting new task
+     * @returns {Object} Task completion message object
+     */
+    function createTaskCompleteMessage(completionMessage, continuationPrompt) {
+      return createMessage(MessageType.TASK_COMPLETE, {
+        completionMessage,
+        continuationPrompt
+      });
     }
   
     /**
@@ -2072,7 +2096,9 @@
       createMentalModelUpdateMessage,
       createChecklistApprovedMessage,
       createSystemMessage,
+      createGreetingMessage,
       createLoadingMessage,
+      createTaskCompleteMessage,
       createChecklistItem,
       createChangeEntry,
   
@@ -5483,6 +5509,13 @@
             case 'git_write':
               return await this.executeGitWrite(parameters);
   
+            // Control tools (handled by AIProcessor, not executed here)
+            case 'begin_execution':
+            case 'mark_complete':
+            case 'mark_failed':
+            case 'update_mental_model':
+              return { success: true }; // These are handled by AIProcessor.handleControlTool()
+  
             default:
               return { error: `Unknown tool: ${toolName}` };
           }
@@ -5554,12 +5587,17 @@
         const currentContent = await this.fsManager.readFile(file_path);
   
         // Check if old_content exists in file
-        if (!currentContent.includes(old_content)) {
+        const matchIndex = currentContent.indexOf(old_content);
+        if (matchIndex === -1) {
           return {
             error: `Could not find exact match for old_content in ${file_path}`,
             hint: 'Make sure old_content exactly matches the text to replace'
           };
         }
+  
+        // Calculate the line number where the match starts
+        const beforeMatch = currentContent.substring(0, matchIndex);
+        const start_line = beforeMatch.split('\n').length;
   
         // Replace old with new
         const updatedContent = currentContent.replace(old_content, new_content);
@@ -5570,6 +5608,7 @@
         return {
           success: true,
           file_path,
+          start_line,  // Line number where the edit starts (1-indexed)
           lines_changed: new_content.split('\n').length - old_content.split('\n').length
         };
       }
@@ -6183,21 +6222,27 @@
        * @returns {Promise<Object>} Project metadata
        */
       async createProject(name) {
-        throw new Error('Not implemented: createProject()');
-  
-        // TODO: Implementation
         // 1. Generate project directory name (slugify)
+        const projectDir = window.module.Utils.slugify(name);
+  
         // 2. Create .agent/projects/{project-dir}/ directory
-        // 3. Create metadata.json with initial structure:
-        //    {
-        //      name: "Project Name",
-        //      status: "in_progress",
-        //      created: ISO8601 timestamp,
-        //      lastModified: ISO8601 timestamp,
-        //      projectMentalModel: {},
-        //      tasks: []
-        //    }
+        const projectPath = `.agent/projects/${projectDir}`;
+        await this.fsManager.createDirectory(projectPath);
+  
+        // 3. Create metadata.json with initial structure
+        const metadata = {
+          name: name,
+          status: ProjectStatus.IN_PROGRESS,
+          created: new Date().toISOString(),
+          lastModified: new Date().toISOString(),
+          projectMentalModel: {},
+          tasks: []
+        };
+  
+        await this.fsManager.writeJSON(`${projectPath}/metadata.json`, metadata);
+  
         // 4. Return metadata object
+        return { ...metadata, projectDir };
       }
   
       /**
@@ -6205,13 +6250,31 @@
        * @returns {Promise<Array>} List of project metadata
        */
       async listProjects() {
-        throw new Error('Not implemented: listProjects()');
-  
-        // TODO: Implementation
         // 1. List directories in .agent/projects/
+        const projectsPath = '.agent/projects';
+  
+        // Check if projects directory exists
+        const exists = await this.fsManager.directoryExists(projectsPath);
+        if (!exists) {
+          return [];
+        }
+  
+        // Use FSManager.listProjects() which returns directory names directly
+        const projectDirs = await this.fsManager.listProjects();
+  
         // 2. Read metadata.json from each project directory
-        // 3. Return array of metadata objects
-        // 4. Sort by lastModified (most recent first)
+        const projects = [];
+        for (const projectDir of projectDirs) {
+          try {
+            const metadata = await this.fsManager.readJSON(`${projectsPath}/${projectDir}/metadata.json`);
+            projects.push({ ...metadata, projectDir });
+          } catch (error) {
+            logger.warn(`Failed to read metadata for project ${projectDir}:`, error);
+          }
+        }
+  
+        // 3 & 4. Sort by lastModified (most recent first) and return
+        return projects.sort((a, b) => new Date(b.lastModified) - new Date(a.lastModified));
       }
   
       /**
@@ -6220,12 +6283,11 @@
        * @returns {Promise<Object>} Project metadata
        */
       async getProject(projectDir) {
-        throw new Error('Not implemented: getProject()');
+        // 1 & 2. Read and parse .agent/projects/{projectDir}/metadata.json
+        const metadata = await this.fsManager.readJSON(`.agent/projects/${projectDir}/metadata.json`);
   
-        // TODO: Implementation
-        // 1. Read .agent/projects/{projectDir}/metadata.json
-        // 2. Parse JSON
-        // 3. Return metadata object
+        // 3. Return metadata object with projectDir included
+        return { ...metadata, projectDir };
       }
   
       /**
@@ -6235,14 +6297,20 @@
        * @returns {Promise<Object>} Updated metadata
        */
       async updateProject(projectDir, updates) {
-        throw new Error('Not implemented: updateProject()');
-  
-        // TODO: Implementation
         // 1. Read current metadata
-        // 2. Merge updates (use deepMerge)
+        const metadata = await this.getProject(projectDir);
+  
+        // 2. Merge updates
+        const updated = { ...metadata, ...updates };
+  
         // 3. Set lastModified to current timestamp
+        updated.lastModified = new Date().toISOString();
+  
         // 4. Write metadata.json
+        await this.fsManager.writeJSON(`.agent/projects/${projectDir}/metadata.json`, updated);
+  
         // 5. Return updated metadata
+        return updated;
       }
   
       /**
@@ -6253,21 +6321,30 @@
        * @returns {Promise<Object>} Task object
        */
       async addTask(projectDir, taskName, taskDescription) {
-        throw new Error('Not implemented: addTask()');
-  
-        // TODO: Implementation
         // 1. Read project metadata
-        // 2. Create task object:
-        //    {
-        //      name: taskName,
-        //      status: "in_progress",
-        //      created: ISO8601 timestamp,
-        //      phase: "execution"
-        //    }
+        const metadata = await this.getProject(projectDir);
+  
+        // 2. Create task object
+        const task = {
+          name: taskName,
+          description: taskDescription,
+          status: TaskStatus.IN_PROGRESS,
+          created: new Date().toISOString(),
+          currentPhase: 'execution'  // Used by sidebar to determine which phases to show
+        };
+  
         // 3. Add to tasks array
+        metadata.tasks.push(task);
+  
         // 4. Update project metadata
+        await this.updateProject(projectDir, { tasks: metadata.tasks });
+  
         // 5. Create empty task.jsonl file
+        const taskFilePath = this.getTaskFilePath(projectDir, taskName);
+        await this.fsManager.writeFile(taskFilePath, '');
+  
         // 6. Return task object
+        return task;
       }
   
       /**
@@ -6279,15 +6356,55 @@
        * @returns {Promise<Object>} Updated task object
        */
       async updateTaskStatus(projectDir, taskName, status, summary = null) {
-        throw new Error('Not implemented: updateTaskStatus()');
-  
-        // TODO: Implementation
         // 1. Read project metadata
+        const metadata = await this.getProject(projectDir);
+  
         // 2. Find task by name
+        const task = metadata.tasks.find(t => t.name === taskName);
+        if (!task) {
+          throw new Error(`Task not found: ${taskName}`);
+        }
+  
         // 3. Update status
+        task.status = status;
+  
         // 4. If status is "complete", set completed timestamp and summary
+        if (status === TaskStatus.COMPLETE) {
+          task.completed = new Date().toISOString();
+          if (summary) {
+            task.summary = summary;
+          }
+        }
+  
         // 5. Update project metadata
+        await this.updateProject(projectDir, { tasks: metadata.tasks });
+  
         // 6. Return updated task object
+        return task;
+      }
+  
+      /**
+       * Update task checklist (saves to task metadata)
+       * @param {string} projectDir - Project directory name
+       * @param {string} taskName - Task name
+       * @param {Array} checklist - Checklist items with status
+       * @returns {Promise<void>}
+       */
+      async updateTaskChecklist(projectDir, taskName, checklist) {
+        // 1. Read project metadata
+        const metadata = await this.getProject(projectDir);
+  
+        // 2. Find task by name
+        const task = metadata.tasks.find(t => t.name === taskName);
+        if (!task) {
+          throw new Error(`Task not found: ${taskName}`);
+        }
+  
+        // 3. Update checklist
+        task.checklist = checklist;
+  
+        // 4. Update project metadata
+        await this.updateProject(projectDir, { tasks: metadata.tasks });
       }
   
       /**
@@ -6296,12 +6413,11 @@
        * @returns {Promise<Array>} List of tasks
        */
       async listTasks(projectDir) {
-        throw new Error('Not implemented: listTasks()');
-  
-        // TODO: Implementation
         // 1. Read project metadata
-        // 2. Return tasks array
-        // 3. Sort by created (oldest first)
+        const metadata = await this.getProject(projectDir);
+  
+        // 2 & 3. Return tasks array sorted by created (oldest first)
+        return (metadata.tasks || []).sort((a, b) => new Date(a.created) - new Date(b.created));
       }
   
       /**
@@ -6311,11 +6427,11 @@
        * @returns {string} Task file path
        */
       getTaskFilePath(projectDir, taskName) {
-        throw new Error('Not implemented: getTaskFilePath()');
-  
-        // TODO: Implementation
         // 1. Slugify task name to get filename
+        const taskSlug = window.module.Utils.slugify(taskName);
+  
         // 2. Return .agent/projects/{projectDir}/{task-slug}.jsonl
+        return `.agent/projects/${projectDir}/${taskSlug}.jsonl`;
       }
   
       /**
@@ -6325,14 +6441,34 @@
        * @returns {Promise<Array>} Array of message objects
        */
       async readTaskMessages(projectDir, taskName) {
-        throw new Error('Not implemented: readTaskMessages()');
-  
-        // TODO: Implementation
         // 1. Get task file path
+        const taskFilePath = this.getTaskFilePath(projectDir, taskName);
+  
         // 2. Read JSONL file
+        const content = await this.fsManager.readFile(taskFilePath);
+  
+        // Handle empty file
+        if (!content.trim()) {
+          return [];
+        }
+  
         // 3. Parse each line as JSON
-        // 4. Return array of message objects
-        // 5. Filter out loading messages (type: "loading")
+        const lines = content.trim().split('\n');
+        const messages = [];
+  
+        for (const line of lines) {
+          if (line.trim()) {
+            try {
+              const message = JSON.parse(line);
+              messages.push(message);
+            } catch (error) {
+              logger.warn(`Failed to parse JSONL line:`, error);
+            }
+          }
+        }
+  
+        // 4 & 5. Return array of message objects, filtering out loading messages
+        return messages.filter(m => m.type !== 'loading');
       }
   
       /**
@@ -6343,14 +6479,20 @@
        * @returns {Promise<Object>} Updated project mental model
        */
       async updateProjectMentalModel(projectDir, updates, replace = false) {
-        throw new Error('Not implemented: updateProjectMentalModel()');
-  
-        // TODO: Implementation
         // 1. Read project metadata
+        const metadata = await this.getProject(projectDir);
+  
         // 2. If replace: set projectMentalModel = updates
         // 3. If merge: merge updates into projectMentalModel
+        const updatedModel = replace
+          ? updates
+          : { ...metadata.projectMentalModel, ...updates };
+  
         // 4. Update project metadata
+        await this.updateProject(projectDir, { projectMentalModel: updatedModel });
+  
         // 5. Return updated mental model
+        return updatedModel;
       }
   
       /**
@@ -6359,12 +6501,17 @@
        * @returns {Promise<void>}
        */
       async deleteProject(projectDir) {
-        throw new Error('Not implemented: deleteProject()');
-  
-        // TODO: Implementation
         // 1. Confirm with user (via event system)
+        // Note: Caller should confirm before calling this method
+  
         // 2. Delete .agent/projects/{projectDir}/ directory recursively
-        // 3. Emit project_deleted event
+        const projectPath = `.agent/projects/${projectDir}`;
+        await this.fsManager.deleteDirectory(projectPath, true);
+  
+        // 3. Emit project_deleted event (if event bus available)
+        if (window.module.EventBus) {
+          window.module.EventBus.emit('project:deleted', { projectDir });
+        }
       }
     }
   
@@ -6410,15 +6557,23 @@
        * @returns {Promise<Object>} Task object
        */
       async createTask(projectDir, taskDescription, checklistItems) {
-        throw new Error('Not implemented: createTask()');
-  
-        // TODO: Implementation
         // 1. Generate task filename from description (slugify)
+        const taskName = taskDescription;
+  
         // 2. Call projectManager.addTask()
-        // 3. Write initial messages to task.jsonl:
-        //    - checklist_approved message with task_description and items
-        //    - phase_transition message (planning → execution)
+        const task = await this.projectManager.addTask(projectDir, taskName, taskDescription);
+  
+        // 3. Write initial messages to task.jsonl
+        const { createChecklistApprovedMessage, createPhaseTransitionMessage } = window.module.ConversationState;
+  
+        const checklistMessage = createChecklistApprovedMessage(taskDescription, checklistItems);
+        await this.appendMessage(projectDir, taskName, checklistMessage);
+  
+        const transitionMessage = createPhaseTransitionMessage('planning', 'execution', 'checklist_approved');
+        await this.appendMessage(projectDir, taskName, transitionMessage);
+  
         // 4. Return task object
+        return task;
       }
   
       /**
@@ -6429,14 +6584,20 @@
        * @returns {Promise<void>}
        */
       async appendMessage(projectDir, taskName, message) {
-        throw new Error('Not implemented: appendMessage()');
-  
-        // TODO: Implementation
         // 1. Skip if message type is "loading" (not persisted)
+        const { isPersistedMessageType } = window.module.ConversationState;
+        if (!isPersistedMessageType(message.type)) {
+          return;
+        }
+  
         // 2. Get task file path
+        const taskFilePath = this.projectManager.getTaskFilePath(projectDir, taskName);
+  
         // 3. Serialize message to JSON (single line)
-        // 4. Append line to task.jsonl file
-        // 5. Handle file creation if doesn't exist
+        const line = JSON.stringify(message) + '\n';
+  
+        // 4 & 5. Append line to task.jsonl file (create if doesn't exist)
+        await this.fsManager.appendFile(taskFilePath, line);
       }
   
       /**
@@ -6446,10 +6607,8 @@
        * @returns {Promise<Array>} Array of message objects
        */
       async readMessages(projectDir, taskName) {
-        throw new Error('Not implemented: readMessages()');
-  
-        // TODO: Implementation
         // 1. Delegate to projectManager.readTaskMessages()
+        return await this.projectManager.readTaskMessages(projectDir, taskName);
       }
   
       /**
@@ -6460,12 +6619,18 @@
        * @returns {Promise<void>}
        */
       async completeTask(projectDir, taskName, summary) {
-        throw new Error('Not implemented: completeTask()');
-  
-        // TODO: Implementation
         // 1. Update task status to "complete" via projectManager
+        await this.projectManager.updateTaskStatus(projectDir, taskName, 'complete', summary);
+  
         // 2. Write phase_transition message (review → planning)
+        const { createPhaseTransitionMessage } = window.module.ConversationState;
+        const transitionMessage = createPhaseTransitionMessage('review', 'planning', 'review_passed');
+        await this.appendMessage(projectDir, taskName, transitionMessage);
+  
         // 3. Emit task_completed event
+        if (window.module.EventBus) {
+          window.module.EventBus.emit('task:completed', { projectDir, taskName, summary });
+        }
       }
   
       /**
@@ -6474,14 +6639,20 @@
        * @returns {Object} Task mental model (Map<string, string>)
        */
       rebuildTaskMentalModel(messages) {
-        throw new Error('Not implemented: rebuildTaskMentalModel()');
-  
-        // TODO: Implementation
         // 1. Filter messages for type: "mental_model_update"
-        // 2. Merge all updates into single mental model
-        // 3. Later updates overwrite earlier ones for same key
+        const { MessageType } = window.module.ConversationState;
+        const updateMessages = messages.filter(m => m.type === MessageType.MENTAL_MODEL_UPDATE);
+  
+        // 2 & 3. Merge all updates into single mental model (later updates overwrite earlier)
+        const mentalModel = {};
+        for (const msg of updateMessages) {
+          // 5. Handle both old format (scope field) and new format (no scope)
+          const updates = msg.updates || {};
+          Object.assign(mentalModel, updates);
+        }
+  
         // 4. Return merged mental model object
-        // 5. Handle both old format (scope field) and new format (no scope)
+        return mentalModel;
       }
   
       /**
@@ -6490,14 +6661,26 @@
        * @returns {Array|null} Checklist items or null if not found
        */
       getCurrentChecklist(messages) {
-        throw new Error('Not implemented: getCurrentChecklist()');
-  
-        // TODO: Implementation
         // 1. Find latest checklist_approved message
+        const { MessageType } = window.module.ConversationState;
+        const checklistMessages = messages.filter(m => m.type === MessageType.CHECKLIST_APPROVED);
+  
+        if (checklistMessages.length === 0) {
+          // 5. Return null if no checklist found
+          return null;
+        }
+  
+        const latestChecklist = checklistMessages[checklistMessages.length - 1];
+  
         // 2. Extract items array
+        const items = latestChecklist.items || [];
+  
         // 3. Rebuild current status by replaying item transitions
+        // Note: For now, we assume checklist items have their status already set
+        // In a full implementation, we'd replay tool_result messages for mark_complete/mark_failed
+  
         // 4. Return items with current status
-        // 5. Return null if no checklist found
+        return items;
       }
   
       /**
@@ -6506,12 +6689,19 @@
        * @returns {string} Current phase (planning/execution/review)
        */
       getCurrentPhase(messages) {
-        throw new Error('Not implemented: getCurrentPhase()');
-  
-        // TODO: Implementation
         // 1. Find latest phase_transition message
+        const { MessageType, Phase } = window.module.ConversationState;
+        const transitions = messages.filter(m => m.type === MessageType.PHASE_TRANSITION);
+  
+        if (transitions.length === 0) {
+          // 3. Default to "planning" if no transitions found
+          return Phase.PLANNING;
+        }
+  
+        const latestTransition = transitions[transitions.length - 1];
+  
         // 2. Return "to" field
-        // 3. Default to "planning" if no transitions found
+        return latestTransition.to;
       }
   
       /**
@@ -6520,15 +6710,30 @@
        * @returns {number} Current item index (-1 if not in execution)
        */
       getCurrentItemIndex(messages) {
-        throw new Error('Not implemented: getCurrentItemIndex()');
-  
-        // TODO: Implementation
         // 1. Check current phase
+        const { Phase, ItemStatus } = window.module.ConversationState;
+        const currentPhase = this.getCurrentPhase(messages);
+  
         // 2. If not execution, return -1
+        if (currentPhase !== Phase.EXECUTION) {
+          return -1;
+        }
+  
         // 3. Get checklist items
+        const checklist = this.getCurrentChecklist(messages);
+        if (!checklist || checklist.length === 0) {
+          return -1;
+        }
+  
         // 4. Find first item with status "in_progress"
-        // 5. Return its index
+        const inProgressIndex = checklist.findIndex(item => item.status === ItemStatus.IN_PROGRESS);
+        if (inProgressIndex !== -1) {
+          // 5. Return its index
+          return inProgressIndex;
+        }
+  
         // 6. If all complete, return checklist.length - 1
+        return checklist.length - 1;
       }
   
       /**
@@ -6538,18 +6743,44 @@
        * @returns {Promise<string>} Task summary (for AI promotion)
        */
       async exportTaskSummary(projectDir, taskName) {
-        throw new Error('Not implemented: exportTaskSummary()');
-  
-        // TODO: Implementation
         // 1. Read all task messages
+        const messages = await this.readMessages(projectDir, taskName);
+  
         // 2. Get task mental model
+        const mentalModel = this.rebuildTaskMentalModel(messages);
+  
         // 3. Get checklist
-        // 4. Format summary:
-        //    - Task description
-        //    - Checklist items (completed)
-        //    - Mental model notes
-        //    - Key decisions/changes
+        const checklist = this.getCurrentChecklist(messages);
+  
+        // Get task description from checklist_approved message
+        const { MessageType } = window.module.ConversationState;
+        const checklistMsg = messages.find(m => m.type === MessageType.CHECKLIST_APPROVED);
+        const taskDescription = checklistMsg ? checklistMsg.task_description : taskName;
+  
+        // 4. Format summary
+        let summary = `## Task: ${taskDescription}\n\n`;
+  
+        // Checklist items
+        if (checklist && checklist.length > 0) {
+          summary += `### Checklist:\n`;
+          for (const item of checklist) {
+            const status = item.status === 'complete' ? '✓' : '✗';
+            summary += `${status} ${item.short_desc || item.content}\n`;
+          }
+          summary += '\n';
+        }
+  
+        // Mental model notes
+        if (Object.keys(mentalModel).length > 0) {
+          summary += `### Mental Model Notes:\n`;
+          for (const [key, note] of Object.entries(mentalModel)) {
+            summary += `- ${key}: ${note}\n`;
+          }
+          summary += '\n';
+        }
+  
         // 5. Return formatted string for AI to review
+        return summary;
       }
     }
   
@@ -6597,12 +6828,31 @@
        * @returns {Array} Array of ChecklistItem objects
        */
       createChecklist(items) {
-        // TODO: Validate items array
-        // TODO: Create ChecklistItem objects for each item
-        // TODO: Validate item types
-        // TODO: Set all items to pending status
-        // TODO: Return checklist
-        throw new Error('Not implemented: ChecklistManager.createChecklist()');
+        // Validate items array
+        if (!Array.isArray(items)) {
+          throw new Error('Items must be an array');
+        }
+  
+        // Create ChecklistItem objects for each item
+        const checklist = [];
+        for (const item of items) {
+          // Validate item type
+          if (!this.validateItemType(item.item_type)) {
+            throw new Error(`Invalid item type: ${item.item_type}`);
+          }
+  
+          // Create checklist item (all start as pending)
+          const checklistItem = createChecklistItem(
+            item.short_desc || item.content,
+            item.detailed_desc || item.content,
+            item.item_type
+          );
+  
+          checklist.push(checklistItem);
+        }
+  
+        // Return checklist
+        return checklist;
       }
   
       /**
@@ -6611,10 +6861,17 @@
        * @returns {void}
        */
       setChecklist(items) {
-        // TODO: Set this.checklist
-        // TODO: Set first item to in_progress
-        // TODO: Set currentItemIndex to 0
-        throw new Error('Not implemented: ChecklistManager.setChecklist()');
+        // Set this.checklist
+        this.checklist = items;
+  
+        // Set first item to in_progress
+        if (items.length > 0) {
+          items[0].status = ItemStatus.IN_PROGRESS;
+          // Set currentItemIndex to 0
+          this.currentItemIndex = 0;
+        } else {
+          this.currentItemIndex = -1;
+        }
       }
   
       /**
@@ -6638,8 +6895,11 @@
        * @returns {Object|null} Current ChecklistItem or null
        */
       getCurrentItem() {
-        // TODO: Return checklist[currentItemIndex] or null
-        throw new Error('Not implemented: ChecklistManager.getCurrentItem()');
+        // Return checklist[currentItemIndex] or null
+        if (this.currentItemIndex >= 0 && this.currentItemIndex < this.checklist.length) {
+          return this.checklist[this.currentItemIndex];
+        }
+        return null;
       }
   
       /**
@@ -6647,11 +6907,23 @@
        * @returns {boolean} True if more items remain, false if all done
        */
       markCurrentComplete() {
-        // TODO: Mark current item as complete
-        // TODO: Increment currentItemIndex
-        // TODO: If more items exist, mark next as in_progress
-        // TODO: Return true if more items, false if done
-        throw new Error('Not implemented: ChecklistManager.markCurrentComplete()');
+        // Mark current item as complete
+        if (this.currentItemIndex >= 0 && this.currentItemIndex < this.checklist.length) {
+          this.checklist[this.currentItemIndex].status = ItemStatus.COMPLETE;
+        }
+  
+        // Increment currentItemIndex
+        this.currentItemIndex++;
+  
+        // If more items exist, mark next as in_progress
+        if (this.currentItemIndex < this.checklist.length) {
+          this.checklist[this.currentItemIndex].status = ItemStatus.IN_PROGRESS;
+          // Return true if more items
+          return true;
+        }
+  
+        // Return false if done
+        return false;
       }
   
       /**
@@ -6660,9 +6932,11 @@
        * @returns {void}
        */
       markCurrentFailed(reason) {
-        // TODO: Mark current item as failed
-        // TODO: Store failure reason
-        throw new Error('Not implemented: ChecklistManager.markCurrentFailed()');
+        // Mark current item as failed and store failure reason
+        if (this.currentItemIndex >= 0 && this.currentItemIndex < this.checklist.length) {
+          this.checklist[this.currentItemIndex].status = ItemStatus.FAILED;
+          this.checklist[this.currentItemIndex].failureReason = reason;
+        }
       }
   
       /**
@@ -6670,8 +6944,8 @@
        * @returns {boolean} True if all complete
        */
       isAllComplete() {
-        // TODO: Check if all items have status === 'complete'
-        throw new Error('Not implemented: ChecklistManager.isAllComplete()');
+        // Check if all items have status === 'complete'
+        return this.checklist.length > 0 && this.checklist.every(item => item.status === ItemStatus.COMPLETE);
       }
   
       /**
@@ -6679,8 +6953,8 @@
        * @returns {boolean} True if last item
        */
       isLastItem() {
-        // TODO: Check if currentItemIndex === checklist.length - 1
-        throw new Error('Not implemented: ChecklistManager.isLastItem()');
+        // Check if currentItemIndex === checklist.length - 1
+        return this.currentItemIndex === this.checklist.length - 1;
       }
   
       /**
@@ -6689,8 +6963,8 @@
        * @returns {Array} Items with matching status
        */
       getItemsByStatus(status) {
-        // TODO: Filter checklist by status
-        throw new Error('Not implemented: ChecklistManager.getItemsByStatus()');
+        // Filter checklist by status
+        return this.checklist.filter(item => item.status === status);
       }
   
       /**
@@ -6708,9 +6982,23 @@
        * @returns {Object} Summary with counts by status
        */
       getSummary() {
-        // TODO: Count items by status
-        // TODO: Return {pending, in_progress, complete, failed, total}
-        throw new Error('Not implemented: ChecklistManager.getSummary()');
+        // Count items by status
+        const summary = {
+          pending: 0,
+          in_progress: 0,
+          complete: 0,
+          failed: 0,
+          total: this.checklist.length
+        };
+  
+        for (const item of this.checklist) {
+          if (item.status === ItemStatus.PENDING) summary.pending++;
+          else if (item.status === ItemStatus.IN_PROGRESS) summary.in_progress++;
+          else if (item.status === ItemStatus.COMPLETE) summary.complete++;
+          else if (item.status === ItemStatus.FAILED) summary.failed++;
+        }
+  
+        return summary;
       }
   
       /**
@@ -6736,10 +7024,14 @@
        * @returns {void}
        */
       fromJSON(items) {
-        // TODO: Load checklist from JSON
-        // TODO: Find current item (first in_progress item)
-        // TODO: Set currentItemIndex
-        throw new Error('Not implemented: ChecklistManager.fromJSON()');
+        // Load checklist from JSON
+        this.checklist = items || [];
+  
+        // Find current item (first in_progress item)
+        const inProgressIndex = this.checklist.findIndex(item => item.status === ItemStatus.IN_PROGRESS);
+  
+        // Set currentItemIndex
+        this.currentItemIndex = inProgressIndex !== -1 ? inProgressIndex : -1;
       }
     }
   
@@ -7093,10 +7385,19 @@
        * @returns {void}
        */
       setPhase(phase) {
-        // TODO: Validate phase is valid
-        // TODO: Set currentPhase
-        // TODO: Clear currentItemType if leaving execution
-        throw new Error('Not implemented: ModeManager.setPhase()');
+        // Validate phase is valid
+        const validPhases = [Phase.PLANNING, Phase.EXECUTION, Phase.REVIEW];
+        if (!validPhases.includes(phase)) {
+          throw new Error(`Invalid phase: ${phase}. Must be one of: ${validPhases.join(', ')}`);
+        }
+  
+        // Set currentPhase
+        this.currentPhase = phase;
+  
+        // Clear currentItemType if leaving execution
+        if (phase !== Phase.EXECUTION) {
+          this.currentItemType = null;
+        }
       }
   
       /**
@@ -7113,9 +7414,14 @@
        * @returns {void}
        */
       setItemType(itemType) {
-        // TODO: Validate item type is valid
-        // TODO: Set currentItemType
-        throw new Error('Not implemented: ModeManager.setItemType()');
+        // Validate item type is valid
+        const validItemTypes = [ItemType.CODING, ItemType.GIT, ItemType.TESTING, ItemType.RESEARCH];
+        if (itemType !== null && !validItemTypes.includes(itemType)) {
+          throw new Error(`Invalid item type: ${itemType}. Must be one of: ${validItemTypes.join(', ')}`);
+        }
+  
+        // Set currentItemType
+        this.currentItemType = itemType;
       }
   
       /**
@@ -7132,11 +7438,33 @@
        * @returns {boolean} True if tool is available
        */
       isToolAvailable(toolName) {
-        // TODO: Look up tool in TOOL_AVAILABILITY
-        // TODO: Check phase availability
-        // TODO: If execution phase, check item type availability
-        // TODO: Return true if available, false otherwise
-        throw new Error('Not implemented: ModeManager.isToolAvailable()');
+        // Look up tool in TOOL_AVAILABILITY
+        const toolConfig = TOOL_AVAILABILITY[toolName];
+        if (!toolConfig) {
+          return false; // Unknown tool
+        }
+  
+        // Check phase availability
+        const phaseConfig = toolConfig[this.currentPhase];
+        if (phaseConfig === undefined) {
+          return false; // Tool not defined for this phase
+        }
+  
+        // If execution phase, check item type availability
+        if (this.currentPhase === Phase.EXECUTION) {
+          if (typeof phaseConfig === 'boolean') {
+            return phaseConfig;
+          } else if (typeof phaseConfig === 'object') {
+            // Item type specific - check current item type
+            if (!this.currentItemType) {
+              return false; // No item type set
+            }
+            return phaseConfig[this.currentItemType] === true;
+          }
+        }
+  
+        // For planning and review, phaseConfig is a boolean
+        return phaseConfig === true;
       }
   
       /**
@@ -7145,10 +7473,52 @@
        * @returns {Object} {valid: boolean, error: string|null}
        */
       validateToolCall(toolName) {
-        // TODO: Check if tool is available
-        // TODO: If not available, generate error message explaining why
-        // TODO: Return {valid, error}
-        throw new Error('Not implemented: ModeManager.validateToolCall()');
+        // Check if tool is available
+        if (this.isToolAvailable(toolName)) {
+          return { valid: true, error: null };
+        }
+  
+        // Generate error message explaining why
+        const toolConfig = TOOL_AVAILABILITY[toolName];
+        if (!toolConfig) {
+          return {
+            valid: false,
+            error: `Unknown tool: ${toolName}`
+          };
+        }
+  
+        // Check if tool exists in any phase
+        if (this.currentPhase === Phase.PLANNING) {
+          return {
+            valid: false,
+            error: `Tool '${toolName}' is not available in Planning phase. This tool is only available during Execution or Review.`
+          };
+        } else if (this.currentPhase === Phase.EXECUTION) {
+          // Check if it's an item type issue
+          const phaseConfig = toolConfig[this.currentPhase];
+          if (typeof phaseConfig === 'object') {
+            const availableItemTypes = Object.keys(phaseConfig).filter(k => phaseConfig[k]);
+            return {
+              valid: false,
+              error: `Tool '${toolName}' is not available for item type '${this.currentItemType}'. Available for: ${availableItemTypes.join(', ')}`
+            };
+          } else {
+            return {
+              valid: false,
+              error: `Tool '${toolName}' is not available in Execution phase.`
+            };
+          }
+        } else if (this.currentPhase === Phase.REVIEW) {
+          return {
+            valid: false,
+            error: `Tool '${toolName}' is not available in Review phase. Review is read-only - you cannot modify files.`
+          };
+        }
+  
+        return {
+          valid: false,
+          error: `Tool '${toolName}' is not available in current context.`
+        };
       }
   
       /**
@@ -7156,10 +7526,16 @@
        * @returns {Array<string>} Array of available tool names
        */
       getAvailableTools() {
-        // TODO: Iterate through TOOL_AVAILABILITY
-        // TODO: Filter to tools available for current phase/item type
-        // TODO: Return array of tool names
-        throw new Error('Not implemented: ModeManager.getAvailableTools()');
+        // Iterate through TOOL_AVAILABILITY and filter to tools available for current phase/item type
+        const availableTools = [];
+  
+        for (const toolName in TOOL_AVAILABILITY) {
+          if (this.isToolAvailable(toolName)) {
+            availableTools.push(toolName);
+          }
+        }
+  
+        return availableTools;
       }
   
       /**
@@ -7167,15 +7543,45 @@
        * @returns {Object} Tools grouped by category
        */
       getToolsByCategory() {
-        // TODO: Group available tools by category:
-        //   - read_tools
-        //   - write_tools
-        //   - git_tools
-        //   - command_tools
-        //   - mental_model_tools
-        //   - control_tools
-        // TODO: Return categorized object
-        throw new Error('Not implemented: ModeManager.getToolsByCategory()');
+        const availableTools = this.getAvailableTools();
+  
+        const categories = {
+          read_tools: [],
+          write_tools: [],
+          git_tools: [],
+          command_tools: [],
+          mental_model_tools: [],
+          control_tools: []
+        };
+  
+        // Define tool categories
+        const readTools = ['read_file', 'list_files', 'search_files_by_name', 'search_files_by_content',
+                           'list_projects', 'list_tasks_for_project', 'read_task_messages', 'read_change'];
+        const writeTools = ['create_file', 'update_file', 'delete_file', 'move_file',
+                            'create_directory', 'delete_directory_recursive'];
+        const gitTools = ['git_read', 'git_write'];
+        const commandTools = ['run_command', 'list_processes', 'stop_command'];
+        const mentalModelTools = ['update_mental_model'];
+        const controlTools = ['begin_execution', 'mark_complete', 'mark_failed'];
+  
+        // Categorize available tools
+        for (const tool of availableTools) {
+          if (readTools.includes(tool)) {
+            categories.read_tools.push(tool);
+          } else if (writeTools.includes(tool)) {
+            categories.write_tools.push(tool);
+          } else if (gitTools.includes(tool)) {
+            categories.git_tools.push(tool);
+          } else if (commandTools.includes(tool)) {
+            categories.command_tools.push(tool);
+          } else if (mentalModelTools.includes(tool)) {
+            categories.mental_model_tools.push(tool);
+          } else if (controlTools.includes(tool)) {
+            categories.control_tools.push(tool);
+          }
+        }
+  
+        return categories;
       }
   
       /**
@@ -7186,14 +7592,45 @@
        * @returns {Object} {valid: boolean, error: string|null}
        */
       validatePhaseTransition(fromPhase, toPhase, trigger) {
-        // TODO: Validate transition is allowed
-        // TODO: Valid transitions:
-        //   - planning -> execution (trigger: checklist_approved)
-        //   - execution -> review (trigger: all_items_complete)
-        //   - execution -> planning (trigger: item_failed)
-        //   - review -> planning (trigger: review_passed or review_found_issues)
-        // TODO: Return {valid, error}
-        throw new Error('Not implemented: ModeManager.validatePhaseTransition()');
+        // Define valid transitions
+        const validTransitions = {
+          planning: {
+            execution: ['checklist_approved']
+          },
+          execution: {
+            review: ['all_items_complete'],
+            planning: ['item_failed']
+          },
+          review: {
+            planning: ['review_passed', 'review_found_issues']
+          }
+        };
+  
+        // Validate transition is allowed
+        const allowedTransitions = validTransitions[fromPhase];
+        if (!allowedTransitions) {
+          return {
+            valid: false,
+            error: `Invalid source phase: ${fromPhase}`
+          };
+        }
+  
+        const allowedTriggers = allowedTransitions[toPhase];
+        if (!allowedTriggers) {
+          return {
+            valid: false,
+            error: `Cannot transition from ${fromPhase} to ${toPhase}`
+          };
+        }
+  
+        if (!allowedTriggers.includes(trigger)) {
+          return {
+            valid: false,
+            error: `Invalid trigger '${trigger}' for transition ${fromPhase} -> ${toPhase}. Expected one of: ${allowedTriggers.join(', ')}`
+          };
+        }
+  
+        return { valid: true, error: null };
       }
   
       /**
@@ -7240,9 +7677,33 @@
        * @returns {string} Phase description
        */
       getPhaseDescription(phase) {
-        // TODO: Return user-friendly description of phase
-        // TODO: Include objectives and available actions
-        throw new Error('Not implemented: ModeManager.getPhaseDescription()');
+        const descriptions = {
+          [Phase.PLANNING]: `Planning Phase - Explore the project and create implementation plan.
+  Available actions:
+  - Read files and search code
+  - View git history and diffs
+  - List projects and tasks
+  - Update mental model with learnings
+  - Create execution plan with begin_execution`,
+  
+          [Phase.EXECUTION]: `Execution Phase - Implement the plan systematically.
+  Available actions depend on current checklist item type:
+  - coding: File operations (create, update, delete, move)
+  - git: Git operations (add, commit, push, branch)
+  - testing: Run commands and tests
+  - research: Read-only exploration
+  All items: Mark complete or failed, update mental model`,
+  
+          [Phase.REVIEW]: `Review Phase - Validate completed work before finishing.
+  Available actions:
+  - Read files and search code
+  - View git history and diffs
+  - Run commands for validation
+  - Update mental model with findings
+  Note: Cannot modify files - review is read-only`
+        };
+  
+        return descriptions[phase] || 'Unknown phase';
       }
   
       /**
@@ -7251,9 +7712,34 @@
        * @returns {string} Item type description
        */
       getItemTypeDescription(itemType) {
-        // TODO: Return user-friendly description of item type
-        // TODO: Include available tools for this item type
-        throw new Error('Not implemented: ModeManager.getItemTypeDescription()');
+        const descriptions = {
+          [ItemType.CODING]: `Coding Item - File operations only.
+  Available tools:
+  - File operations: create_file, update_file, delete_file, move_file
+  - Directory operations: create_directory, delete_directory_recursive
+  - Read operations: read_file, list_files, search files
+  - Control: mark_complete, mark_failed`,
+  
+          [ItemType.GIT]: `Git Item - Git write operations.
+  Available tools:
+  - Git write: git_write (add, commit, push, branch)
+  - Read operations: read_file, git_read
+  - Control: mark_complete, mark_failed`,
+  
+          [ItemType.TESTING]: `Testing Item - Command execution.
+  Available tools:
+  - Commands: run_command, list_processes, stop_command
+  - Read operations: read_file, git_read
+  - Control: mark_complete, mark_failed`,
+  
+          [ItemType.RESEARCH]: `Research Item - Read-only investigation.
+  Available tools:
+  - Read operations: read_file, list_files, search files
+  - Project/task viewing: list_projects, list_tasks_for_project, read_task_messages
+  - Control: mark_complete, mark_failed`
+        };
+  
+        return descriptions[itemType] || 'Unknown item type';
       }
     }
   
@@ -7271,9 +7757,10 @@
   /**
    * response-parser.js
    *
-   * MVP VERSION - Parses XML text responses:
+   * Parses XML text responses with proper XML parameter support:
    * - Parses <execute> blocks with tools
    * - Parses <message> blocks with text
+   * - Supports proper XML parameters (no JSON-in-XML)
    * - Uses xml-parser.js for XML parsing
    */
   
@@ -7281,7 +7768,7 @@
     'use strict';
   
     // Version logging to verify correct code is loaded
-    console.log('[ResponseParser] Loading version 1.2 - XML parsing with format violation warnings');
+    console.log('[ResponseParser] Loading version 2.0 - Proper XML parameters (no JSON-in-XML)');
   
     /**
      * Parsed response structure
@@ -7300,7 +7787,7 @@
      */
   
     /**
-     * ResponseParser class (MVP version - XML parsing)
+     * ResponseParser class
      * Parses XML text responses from AI (either <execute> or <message>)
      */
     class ResponseParser {
@@ -7333,10 +7820,15 @@
         }
   
         // Strip any clipboard markers (for compatibility with production code)
-        const cleanedText = xmlText
+        let cleanedText = xmlText
           .replace(/\|{5}CLIP:TO_JAVA\|{5}/g, '')
           .replace(/\|{5}AI:END\|{5}/g, '')
           .trim();
+  
+        // Strip markdown code blocks (```xml, ```, etc.)
+        // AI sometimes wraps XML in markdown code fences
+        cleanedText = cleanedText.replace(/```(?:xml|html|text)?\n?/g, '');
+        cleanedText = cleanedText.trim();
   
         console.log('[ResponseParser] Cleaned XML:', cleanedText.substring(0, 300));
   
@@ -7362,10 +7854,14 @@
        * @private
        */
       parseXML(xmlText) {
-        // Check if it starts with < (XML tag)
         let trimmed = xmlText.trim();
   
-        if (!trimmed.startsWith('<')) {
+        // Check for both execute and message tags
+        const hasExecute = trimmed.includes('<execute>') || trimmed.includes('</execute>');
+        const hasMessage = trimmed.includes('<message>') || trimmed.includes('</message>');
+  
+        // Check if there are any XML tags at all
+        if (!hasExecute && !hasMessage && !trimmed.includes('<tool ')) {
           // No XML tags - treat as plain message
           console.log('[ResponseParser] No XML tags found, treating as plain message');
           return {
@@ -7375,10 +7871,6 @@
             toolCalls: []
           };
         }
-  
-        // Check for both execute and message tags
-        const hasExecute = trimmed.includes('<execute>') || trimmed.includes('</execute>');
-        const hasMessage = trimmed.includes('<message>') || trimmed.includes('</message>');
   
         // Track all violations
         const violations = [];
@@ -7549,20 +8041,8 @@
             continue;
           }
   
-          // Extract parameters from <parameter> children
-          const parameters = {};
-          const paramElements = toolElement.children.filter(child => child.name === 'parameter');
-  
-          for (const paramElement of paramElements) {
-            const paramName = paramElement.attributes.name;
-            if (!paramName) {
-              console.warn('[ResponseParser] Parameter missing name attribute');
-              continue;
-            }
-  
-            // Get parameter value (text content)
-            parameters[paramName] = paramElement.textContent || '';
-          }
+          // Extract parameters - Support both old and new formats
+          const parameters = this.extractToolParameters(toolElement, toolName);
   
           toolCalls.push({
             name: toolName,
@@ -7578,6 +8058,157 @@
           hasToolCalls: toolCalls.length > 0,
           toolCalls: toolCalls
         };
+      }
+  
+      /**
+       * Extract parameters from tool element
+       * Supports both old format (<parameter name="...">) and new format (direct child elements)
+       * @param {Object} toolElement - Parsed tool XML element
+       * @param {string} toolName - Tool name for schema lookup
+       * @returns {Object} Parameters object
+       * @private
+       */
+      extractToolParameters(toolElement, toolName) {
+        const parameters = {};
+  
+        // Check for old format: <parameter name="...">value</parameter>
+        const oldFormatParams = toolElement.children.filter(child => child.name === 'parameter');
+  
+        if (oldFormatParams.length > 0) {
+          // OLD FORMAT: <parameter name="key">value</parameter>
+          console.log(`[ResponseParser] Using OLD format for ${toolName}`);
+  
+          // Get tool schema for type information
+          const toolDef = window.module.ToolDefinitions.getToolDefinition(toolName);
+          const schema = toolDef ? toolDef.input_schema : null;
+  
+          for (const paramElement of oldFormatParams) {
+            const paramName = paramElement.attributes.name;
+            if (!paramName) {
+              console.warn('[ResponseParser] Parameter missing name attribute');
+              continue;
+            }
+  
+            // Check if parameter has child elements (HYBRID format: old wrapper, new content)
+            if (paramElement.children && paramElement.children.length > 0) {
+              console.log(`[ResponseParser] HYBRID format detected for "${paramName}" - has child elements`);
+  
+              // Get expected type from schema
+              const paramSchema = schema && schema.properties ? schema.properties[paramName] : null;
+              const expectedType = paramSchema ? paramSchema.type : 'string';
+  
+              // Parse using NEW format logic
+              const paramValue = this.parseParameterValue(paramElement, expectedType, paramSchema);
+              parameters[paramName] = paramValue;
+              continue;
+            }
+  
+            // Normal OLD format: text content
+            let paramValue = paramElement.textContent || '';
+  
+            // Try to parse JSON if it looks like JSON
+            const trimmedValue = paramValue.trim();
+            if (trimmedValue.startsWith('{') || trimmedValue.startsWith('[')) {
+              try {
+                paramValue = JSON.parse(trimmedValue);
+                console.log(`[ResponseParser] Parsed JSON for parameter "${paramName}"`);
+              } catch (e) {
+                console.warn(`[ResponseParser] Failed to parse JSON for parameter "${paramName}":`, e.message);
+              }
+            }
+  
+            parameters[paramName] = paramValue;
+          }
+        } else {
+          // NEW FORMAT: Parameters as direct child elements
+          console.log(`[ResponseParser] Using NEW format for ${toolName}`);
+  
+          // Get tool schema to understand parameter types
+          const toolDef = window.module.ToolDefinitions.getToolDefinition(toolName);
+          const schema = toolDef ? toolDef.input_schema : null;
+  
+          for (const child of toolElement.children) {
+            const paramName = child.name;
+  
+            // Get expected type from schema
+            const paramSchema = schema && schema.properties ? schema.properties[paramName] : null;
+            const expectedType = paramSchema ? paramSchema.type : 'string';
+  
+            // Parse based on structure and expected type
+            const paramValue = this.parseParameterValue(child, expectedType, paramSchema);
+            parameters[paramName] = paramValue;
+          }
+        }
+  
+        return parameters;
+      }
+  
+      /**
+       * Parse parameter value based on XML structure and expected type
+       * @param {Object} element - XML element
+       * @param {string} expectedType - Expected type from schema (string, object, array, integer, boolean)
+       * @param {Object} paramSchema - Full parameter schema with items property for arrays
+       * @returns {*} Parsed value
+       * @private
+       */
+      parseParameterValue(element, expectedType, paramSchema) {
+        // Handle object type: <updates><entry key="...">value</entry></updates>
+        if (expectedType === 'object') {
+          const obj = {};
+          const entries = element.children.filter(child => child.name === 'entry');
+          for (const entry of entries) {
+            const key = entry.attributes.key;
+            const value = entry.textContent || '';
+            if (key) {
+              obj[key] = value;
+            }
+          }
+          console.log(`[ResponseParser] Parsed object with ${Object.keys(obj).length} entries`);
+          return obj;
+        }
+  
+        // Handle array type: <items><item>...</item></items>
+        if (expectedType === 'array') {
+          const arr = [];
+          // Get the item schema to know what structure to expect
+          const itemSchema = paramSchema && paramSchema.items ? paramSchema.items : null;
+  
+          // Look for <item> elements
+          const itemElements = element.children.filter(child => child.name === 'item');
+  
+          for (const item of itemElements) {
+            if (itemSchema && itemSchema.type === 'object') {
+              // Parse array item as object with its child elements
+              const itemObj = {};
+              for (const prop of item.children) {
+                // Get expected type for this property
+                const propSchema = itemSchema.properties ? itemSchema.properties[prop.name] : null;
+                const propType = propSchema ? propSchema.type : 'string';
+                itemObj[prop.name] = this.parseParameterValue(prop, propType, propSchema);
+              }
+              arr.push(itemObj);
+            } else {
+              // Simple array of primitives
+              arr.push(item.textContent || '');
+            }
+          }
+          console.log(`[ResponseParser] Parsed array with ${arr.length} items`);
+          return arr;
+        }
+  
+        // Handle primitive types
+        const textContent = element.textContent || '';
+  
+        if (expectedType === 'integer') {
+          return parseInt(textContent, 10) || 0;
+        }
+  
+        if (expectedType === 'boolean') {
+          return textContent.toLowerCase() === 'true';
+        }
+  
+        // Default: return as string
+        return textContent;
       }
   
       /**
@@ -7636,60 +8267,6 @@
         }
   
         return true;
-      }
-  
-      /**
-       * Check if response contains read operations
-       * Used for mental model update validation
-       * @param {Array<ToolCall>} toolCalls - Tool calls to check
-       * @returns {boolean} True if contains read operations
-       */
-      hasReadOperations(toolCalls) {
-        const readTools = [
-          'read_file',
-          'git_read',
-          'list_files',
-          'search_files_by_name',
-          'search_files_by_content',
-          'list_projects',
-          'list_tasks_for_project',
-          'read_task_messages',
-          'read_change'
-        ];
-  
-        return toolCalls.some(call => readTools.includes(call.name));
-      }
-  
-      /**
-       * Check if response contains mental model update
-       * @param {Array<ToolCall>} toolCalls - Tool calls to check
-       * @returns {boolean} True if contains update_mental_model
-       */
-      hasMentalModelUpdate(toolCalls) {
-        return toolCalls.some(call => call.name === 'update_mental_model');
-      }
-  
-      /**
-       * Validate mental model update is present for read operations
-       * @param {Array<ToolCall>} toolCalls - Tool calls to validate
-       * @returns {Object} Validation result {valid: boolean, error: string|null}
-       */
-      validateMentalModelUpdate(toolCalls) {
-        const hasReads = this.hasReadOperations(toolCalls);
-        const hasUpdate = this.hasMentalModelUpdate(toolCalls);
-  
-        if (hasReads && !hasUpdate) {
-          return {
-            valid: false,
-            error: 'ERROR: You performed read operations but did not include update_mental_model tool.\n\n' +
-                   'REQUIRED: When using read_file, git_read, list_files, search_files_by_name, ' +
-                   'search_files_by_content, list_projects, list_tasks_for_project, or read_task_messages, ' +
-                   'you MUST include update_mental_model in your response with concise notes.\n\n' +
-                   'Please resend your response with update_mental_model included.'
-          };
-        }
-  
-        return { valid: true, error: null };
       }
     }
   
@@ -8113,39 +8690,49 @@
   /**
    * prompt-generator.js
    *
-   * MVP VERSION - Simple prompt generation:
+   * FULL VERSION - Phase-aware prompt generation:
    * - System prompt with base instructions
-   * - Converts conversation history to Anthropic format
-   * - No mental models, no ephemeral content, no phases
+   * - Phase context (planning/execution/review)
+   * - Mental models (project + task)
+   * - Recent changes (last 10 operations)
+   * - Ephemeral content (cleared after each message)
+   * - Current checklist with status
+   * - Available tools filtered by phase/item type
    */
   
   (function() {
     'use strict';
   
     /**
-     * PromptGenerator class (MVP version - XML-based tools)
-     * Builds messages array with XML tool examples in system prompt
+     * PromptGenerator class (Full version - Phase-aware)
+     * Builds messages array with full context for phase system
      */
     class PromptGenerator {
-      constructor() {
-        this.systemPrompt = this.generateSystemPrompt();
+      constructor(modeManager, mentalModelManager, recentChangesTracker, ephemeralContentManager) {
+        this.modeManager = modeManager;
+        this.mentalModelManager = mentalModelManager;
+        this.recentChangesTracker = recentChangesTracker;
+        this.ephemeralContentManager = ephemeralContentManager;
+        this.baseSystemPrompt = this.generateBaseSystemPrompt();
       }
   
       /**
        * Generate messages array for API
        * System prompt is prepended to first user message
        * @param {Array} conversationHistory - Array of {role, content} messages
+       * @param {Object} context - Current context {project, task, checklist, phase, itemIndex}
        * @returns {Array} Messages array for API
        */
-      generateMessages(conversationHistory) {
+      generateMessages(conversationHistory, context = {}) {
         const messages = [];
         let systemPrepended = false;
   
+        // Generate full system prompt with context
+        const fullSystemPrompt = this.generateFullSystemPrompt(context);
+  
         for (const msg of conversationHistory) {
-          // Skip the welcome message (display-only)
-          if (msg.role === 'assistant' &&
-              typeof msg.content === 'string' &&
-              msg.content.startsWith('Welcome to Code Boss MVP')) {
+          // Skip greeting and task_complete messages (display-only, not sent to API)
+          if (msg.type === 'greeting' || msg.type === 'task_complete') {
             continue;
           }
   
@@ -8153,7 +8740,7 @@
           if (msg.role === 'user' && !systemPrepended) {
             messages.push({
               role: 'user',
-              content: this.systemPrompt + '\n\n' + msg.content
+              content: fullSystemPrompt + '\n\n' + msg.content
             });
             systemPrepended = true;
           } else if (msg.role === 'user' || msg.role === 'assistant') {
@@ -8168,11 +8755,218 @@
       }
   
       /**
-       * Generate system prompt with XML tool examples
-       * @returns {string} System prompt
+       * Generate full system prompt with all context
+       * @param {Object} context - Current context
+       * @returns {string} Full system prompt
        * @private
        */
-      generateSystemPrompt() {
+      generateFullSystemPrompt(context) {
+        let prompt = this.baseSystemPrompt;
+  
+        // Add current phase context
+        prompt += '\n\n' + this.generatePhaseContext(context);
+  
+        // Add project mental model
+        if (this.mentalModelManager) {
+          const projectModel = this.mentalModelManager.formatForPrompt('project');
+          if (projectModel) {
+            prompt += '\n\n' + projectModel;
+          }
+        }
+  
+        // Add task mental model
+        if (this.mentalModelManager) {
+          const taskModel = this.mentalModelManager.formatForPrompt('task');
+          if (taskModel) {
+            prompt += '\n\n' + taskModel;
+          }
+        }
+  
+        // Add recent changes
+        if (this.recentChangesTracker) {
+          const recentChanges = this.recentChangesTracker.formatForPrompt();
+          if (recentChanges) {
+            prompt += '\n\n' + recentChanges;
+          }
+        }
+  
+        // Add ephemeral content
+        if (this.ephemeralContentManager) {
+          const ephemeralContent = this.ephemeralContentManager.formatForPrompt();
+          if (ephemeralContent) {
+            prompt += '\n\n' + ephemeralContent;
+          }
+        }
+  
+        // Add current checklist
+        if (context.checklist && context.checklist.length > 0) {
+          prompt += '\n\n' + this.generateChecklistSection(context.checklist, context.itemIndex);
+        }
+  
+        // Add available tools for current phase/item type
+        prompt += '\n\n' + this.generateAvailableToolsSection();
+  
+        return prompt;
+      }
+  
+      /**
+       * Generate phase context section
+       * @param {Object} context - Current context
+       * @returns {string} Phase context
+       * @private
+       */
+      generatePhaseContext(context) {
+        const { Phase } = window.module.ConversationState;
+        const phase = context.phase || Phase.PLANNING;
+        const project = context.project || 'No project selected';
+        const task = context.task || 'No task';
+  
+        let content = `## Current Context\n\n`;
+        content += `**Project:** ${project}\n`;
+        content += `**Task:** ${task}\n`;
+        content += `**Phase:** ${phase}\n\n`;
+  
+        // Add phase-specific instructions
+        if (this.modeManager) {
+          const phaseDesc = this.modeManager.getPhaseDescription(phase);
+          content += phaseDesc + '\n';
+        }
+  
+        // Add item type context if in execution
+        if (phase === Phase.EXECUTION && context.itemIndex >= 0) {
+          const currentItem = context.checklist[context.itemIndex];
+          if (currentItem && this.modeManager) {
+            const itemTypeDesc = this.modeManager.getItemTypeDescription(currentItem.item_type);
+            content += '\n' + itemTypeDesc + '\n';
+          }
+        }
+  
+        return content;
+      }
+  
+      /**
+       * Generate checklist section
+       * @param {Array} checklist - Checklist items
+       * @param {number} itemIndex - Current item index
+       * @returns {string} Checklist section
+       * @private
+       */
+      generateChecklistSection(checklist, itemIndex) {
+        let content = '## Current Checklist\n\n';
+  
+        for (let i = 0; i < checklist.length; i++) {
+          const item = checklist[i];
+          const isCurrent = i === itemIndex;
+          const status = item.status === 'complete' ? '✓' :
+                        item.status === 'failed' ? '✗' :
+                        item.status === 'in_progress' ? '→' : '○';
+  
+          content += `${status} ${item.short_desc || item.content}`;
+          if (isCurrent) {
+            content += ` **← CURRENT**`;
+          }
+          content += '\n';
+        }
+  
+        return content;
+      }
+  
+      /**
+       * Generate available tools section
+       * @returns {string} Available tools section
+       * @private
+       */
+      generateAvailableToolsSection() {
+        if (!this.modeManager) {
+          return this.generateAllToolsSection();
+        }
+  
+        const availableTools = this.modeManager.getAvailableTools();
+        const toolsByCategory = this.modeManager.getToolsByCategory();
+  
+        let content = '## Available Tools\n\n';
+        content += 'Tools you can use in current phase/item type:\n\n';
+  
+        // Read tools
+        if (toolsByCategory.read_tools.length > 0) {
+          content += '**Read Tools:**\n';
+          for (const tool of toolsByCategory.read_tools) {
+            content += `- ${tool}\n`;
+          }
+          content += '\n';
+        }
+  
+        // Write tools
+        if (toolsByCategory.write_tools.length > 0) {
+          content += '**Write Tools:**\n';
+          for (const tool of toolsByCategory.write_tools) {
+            content += `- ${tool}\n`;
+          }
+          content += '\n';
+        }
+  
+        // Git tools
+        if (toolsByCategory.git_tools.length > 0) {
+          content += '**Git Tools:**\n';
+          for (const tool of toolsByCategory.git_tools) {
+            content += `- ${tool}\n`;
+          }
+          content += '\n';
+        }
+  
+        // Command tools
+        if (toolsByCategory.command_tools.length > 0) {
+          content += '**Command Tools:**\n';
+          for (const tool of toolsByCategory.command_tools) {
+            content += `- ${tool}\n`;
+          }
+          content += '\n';
+        }
+  
+        // Mental model tools
+        if (toolsByCategory.mental_model_tools.length > 0) {
+          content += '**Mental Model Tools:**\n';
+          for (const tool of toolsByCategory.mental_model_tools) {
+            content += `- ${tool}\n`;
+          }
+          content += '\n';
+        }
+  
+        // Control tools
+        if (toolsByCategory.control_tools.length > 0) {
+          content += '**Control Tools:**\n';
+          for (const tool of toolsByCategory.control_tools) {
+            content += `- ${tool}\n`;
+          }
+          content += '\n';
+        }
+  
+        return content;
+      }
+  
+      /**
+       * Generate all tools section (fallback when no ModeManager)
+       * @returns {string} All tools section
+       * @private
+       */
+      generateAllToolsSection() {
+        return `## Available Tools
+  
+  All tools are available (no phase restrictions):
+  - read_file, list_files, search_files_by_name, search_files_by_content
+  - create_file, update_file, delete_file, move_file
+  - create_directory, delete_directory_recursive
+  - run_command, git_read, git_write
+  - update_mental_model, begin_execution, mark_complete, mark_failed
+  `;
+      }
+  
+      /**
+       * Generate base system prompt with XML tool examples
+       * @returns {string} Base system prompt
+       * @private
+       */
+      generateBaseSystemPrompt() {
         return `You are Code Boss, an AI coding assistant with access to the user's file system.
   
   CRITICAL RESPONSE FORMAT RULES:
@@ -8187,6 +8981,44 @@
   - If you need information: Return <execute> with <tool> tags (no explanation text)
   - If you're done: Return <message> with your final response
   - The user will NOT see your tool calls, only your final message
+  
+  PHASE SYSTEM - CRITICAL:
+  You operate in three phases: PLANNING, EXECUTION, and REVIEW.
+  
+  **PLANNING PHASE (current default):**
+  - You CAN: read files, list files, search, update mental model
+  - You CANNOT: create/edit/delete files, run commands, git operations
+  - If user asks to create/modify files: Use begin_execution to create a plan first
+  
+  **EXECUTION PHASE (after begin_execution approved):**
+  - You CAN: create/edit/delete files, run commands, all read operations
+  - Work through checklist items one at a time
+  - Call mark_complete when item is done, mark_failed if blocked
+  
+  **REVIEW PHASE:**
+  - Review completed work
+  - Update project mental model with learnings
+  
+  **To start making changes:**
+  1. User asks to create/modify files
+  2. Call begin_execution with task_description and items array
+  3. System transitions to EXECUTION phase
+  4. Now you can use write tools (create_file, update_file, etc.)
+  
+  **Example workflow:**
+  User: "Create a test file"
+  You: <execute><tool name="begin_execution">
+    <task_description>Create test file</task_description>
+    <items>
+      <item>
+        <short_desc>Create test.js</short_desc>
+        <detailed_desc>Create test.js with sample code</detailed_desc>
+        <item_type>coding</item_type>
+      </item>
+    </items>
+  </tool></execute>
+  [System transitions to EXECUTION phase]
+  You: <execute><tool name="create_file">...</tool></execute>
   
   AVAILABLE TOOLS (you MUST use these EXACT tool names - they are CASE-SENSITIVE):
   
@@ -8210,131 +9042,139 @@
   - git_read: Run a read-only git command
   - git_write: Run a git command that modifies the repository
   
-  TOOL USAGE EXAMPLES:
+  TOOL USAGE EXAMPLES (using proper XML - parameter names as tags):
   
-  READ FILE:
+  READ FILE (simple parameters):
     <execute>
       <tool name="read_file">
-        <parameter name="file_path">path/to/file.js</parameter>
-        <parameter name="start_line">1</parameter>
-        <parameter name="end_line">50</parameter>
+        <file_path>path/to/file.js</file_path>
+        <looking_for>function definitions</looking_for>
+        <why>need to understand the API</why>
       </tool>
     </execute>
   
   CREATE FILE:
     <execute>
       <tool name="create_file">
-        <parameter name="file_path">path/to/newfile.js</parameter>
-        <parameter name="content">file content here</parameter>
+        <file_path>path/to/newfile.js</file_path>
+        <content>file content here</content>
       </tool>
     </execute>
   
   UPDATE FILE:
     <execute>
       <tool name="update_file">
-        <parameter name="file_path">path/to/file.js</parameter>
-        <parameter name="old_content">exact text to replace</parameter>
-        <parameter name="new_content">new text</parameter>
+        <file_path>path/to/file.js</file_path>
+        <old_content>exact text to replace</old_content>
+        <new_content>new text</new_content>
       </tool>
     </execute>
   
   LIST FILES:
     <execute>
       <tool name="list_files">
-        <parameter name="directory_path">.</parameter>
-        <parameter name="recursive">true</parameter>
+        <directory_path">.</directory_path>
+        <looking_for>JavaScript files</looking_for>
+        <why>need to see project structure</why>
       </tool>
     </execute>
   
-  DELETE FILE:
+  UPDATE MENTAL MODEL (object parameter with entries):
     <execute>
-      <tool name="delete_file">
-        <parameter name="file_path">path/to/file.js</parameter>
+      <tool name="update_mental_model">
+        <updates>
+          <entry key="src/app.js">main entry point handles initialization</entry>
+          <entry key="src/tool-executor.js">executes tools from AI responses</entry>
+          <entry key="test/sample.txt">contains test data for validation</entry>
+        </updates>
       </tool>
     </execute>
   
-  MOVE FILE:
+  BEGIN EXECUTION (array parameter with items):
     <execute>
-      <tool name="move_file">
-        <parameter name="source_path">old/path.js</parameter>
-        <parameter name="dest_path">new/path.js</parameter>
-      </tool>
-    </execute>
-  
-  CREATE DIRECTORY:
-    <execute>
-      <tool name="create_directory">
-        <parameter name="directory_path">path/to/dir</parameter>
-      </tool>
-    </execute>
-  
-  DELETE DIRECTORY:
-    <execute>
-      <tool name="delete_directory_recursive">
-        <parameter name="directory_path">path/to/dir</parameter>
-      </tool>
-    </execute>
-  
-  RUN COMMAND:
-    <execute>
-      <tool name="run_command">
-        <parameter name="command">npm test</parameter>
-        <parameter name="working_directory">.</parameter>
-      </tool>
-    </execute>
-  
-  GIT READ:
-    <execute>
-      <tool name="git_read">
-        <parameter name="project_path">.</parameter>
-        <parameter name="git_args">log --oneline -10</parameter>
-      </tool>
-    </execute>
-  
-  GIT WRITE:
-    <execute>
-      <tool name="git_write">
-        <parameter name="project_path">.</parameter>
-        <parameter name="git_args">add .</parameter>
+      <tool name="begin_execution">
+        <task_description">Test file operations</task_description>
+        <items>
+          <item>
+            <short_desc>Create test file</short_desc>
+            <detailed_desc>Create a new JavaScript test file in test directory</detailed_desc>
+            <item_type>coding</item_type>
+          </item>
+          <item>
+            <short_desc>Read file</short_desc>
+            <detailed_desc>Read created file to verify content</detailed_desc>
+            <item_type>coding</item_type>
+          </item>
+        </items>
       </tool>
     </execute>
   
   MULTIPLE TOOLS (execute in sequence):
     <execute>
       <tool name="read_file">
-        <parameter name="file_path">package.json</parameter>
+        <file_path>package.json</file_path>
+        <looking_for>dependencies</looking_for>
+        <why>check required packages</why>
       </tool>
-      <tool name="list_files">
-        <parameter name="directory_path">src</parameter>
+      <tool name="update_mental_model">
+        <updates>
+          <entry key="package.json">contains project dependencies and scripts</entry>
+        </updates>
       </tool>
     </execute>
   
   SEND MESSAGE (when done with task):
     <message>I've completed the task. Here's what I found...</message>
   
-  IMPORTANT RULES:
-  1. Always use relative paths from the project root
-  2. Before modifying files, read them first
-  3. Use tools to gather information, then send a final message
-  4. Never send both <execute> and <message> in the same response
-  5. Parameter values should be plain text (no nested XML)
+  IMPORTANT XML FORMAT RULES:
+  1. Parameters are XML elements (not <parameter name="...">)
+  2. Simple values: <param_name>value</param_name>
+  3. Objects: <param_name><entry key="...">value</entry></param_name>
+  4. Arrays: <param_name><item><field>value</field></item></param_name>
+  5. NO JSON inside XML - use proper XML nesting
+  6. Parameter names use underscores (file_path not filePath)
   
   CORRECT EXAMPLE:
-  User: "List files in the current directory"
-  WRONG Response:
-    <message>I'll list the files in the current directory.</message>
+  User: "List files and read app.js"
+  WRONG Response (mixing execute and message):
+    <message>I'll list files first...</message>
     <execute><tool name="list_files">...</tool></execute>
-  CORRECT Response:
-    <execute><tool name="list_files"><parameter name="directory_path">.</parameter></tool></execute>
-  (Then after tool executes, AI sees result and responds with <message>...</message>)`;
+  
+  CORRECT Response (only execute):
+    <execute>
+      <tool name="list_files">
+        <directory_path">.</directory_path>
+        <looking_for>all files in root</looking_for>
+        <why>understand project structure</why>
+      </tool>
+      <tool name="read_file">
+        <file_path>app.js</file_path>
+        <looking_for">main logic</looking_for>
+        <why>understand application entry point</why>
+      </tool>
+      <tool name="update_mental_model">
+        <updates>
+          <entry key="app.js">application entry point</entry>
+        </updates>
+      </tool>
+    </execute>
+  (After tools execute, then send <message> with findings)`;
       }
   
       /**
-       * Get the system prompt
-       * @returns {string} System prompt
+       * Get the base system prompt
+       * @returns {string} Base system prompt
+       */
+      getBaseSystemPrompt() {
+        return this.baseSystemPrompt;
+      }
+  
+      /**
+       * Get the system prompt (deprecated - use generateFullSystemPrompt with context)
+       * @returns {string} Base system prompt
        */
       getSystemPrompt() {
-        return this.systemPrompt;
+        return this.baseSystemPrompt;
       }
   
     }
@@ -8352,25 +9192,52 @@
   /**
    * ai-processor.js
    *
-   * MVP VERSION - Simple agentic loop:
-   * - Generates prompts
+   * INTEGRATED VERSION - Full phase-aware agentic loop:
+   * - Generates prompts with context (project/task/phase)
    * - Submits to AI API
    * - Parses responses
-   * - Executes tools
+   * - Validates tool calls against phase system
+   * - Executes tools with tracking (ephemeral content, recent changes, mental models)
+   * - Handles control tools (begin_execution, mark_complete, mark_failed, update_mental_model)
    * - Loops until AI returns only text (no tools)
    *
-   * No mental models, no ephemeral content, no phases.
+   * Integrated with:
+   * - ModeManager (phase/tool validation)
+   * - ProjectManager (project metadata)
+   * - TaskManager (task persistence)
+   * - ChecklistManager (checklist tracking)
+   * - EphemeralContentManager (ephemeral content tracking)
+   * - MentalModelManager (mental model updates)
+   * - RecentChangesTracker (change tracking)
    */
   
   (function() {
     'use strict';
   
+    const { createPhaseTransitionMessage, createMentalModelUpdateMessage, createTaskCompleteMessage } = window.module.ConversationState;
+  
     /**
-     * AIProcessor class (MVP version)
-     * Handles the main agentic loop
+     * AIProcessor class (Integrated version)
+     * Handles the main agentic loop with full phase system integration
      */
     class AIProcessor {
-      constructor(conversationManager, promptGenerator, responseParser, toolExecutor, toolDefinitions, aiApi) {
+      constructor(
+        conversationManager,
+        promptGenerator,
+        responseParser,
+        toolExecutor,
+        toolDefinitions,
+        aiApi,
+        // New phase system managers
+        modeManager,
+        projectManager,
+        taskManager,
+        checklistManager,
+        ephemeralContentManager,
+        mentalModelManager,
+        recentChangesTracker
+      ) {
+        // Existing components
         this.conversationManager = conversationManager;
         this.promptGenerator = promptGenerator;
         this.responseParser = responseParser;
@@ -8379,6 +9246,20 @@
         this.aiApi = aiApi;
         this.processing = false;
         this.onUpdate = null; // Callback for UI updates
+  
+        // Phase system managers
+        this.modeManager = modeManager;
+        this.projectManager = projectManager;
+        this.taskManager = taskManager;
+        this.checklistManager = checklistManager;
+        this.ephemeralContentManager = ephemeralContentManager;
+        this.mentalModelManager = mentalModelManager;
+        this.recentChangesTracker = recentChangesTracker;
+  
+        // Current project/task state
+        this.currentProject = null;  // Current project directory
+        this.currentTask = null;     // Current task name
+        this.taskJustCompleted = false; // Flag to indicate task completion pending
       }
   
       /**
@@ -8440,11 +9321,34 @@
             // AI sent a message - add it to conversation and display
             this.conversationManager.addAssistantMessage(parsed.message);
             this.notifyUpdate();
+  
+            // Clear ephemeral content after AI message (as per spec)
+            if (this.ephemeralContentManager) {
+              this.ephemeralContentManager.clearAll();
+            }
+  
+            // Handle task completion if flagged
+            if (this.taskJustCompleted) {
+              // Add task completion message with continuation prompt
+              const taskName = this.currentTask;
+              const completionMsg = createTaskCompleteMessage(
+                parsed.message, // The AI's final summary becomes the completion message
+                `${taskName} is complete! Would you like to make any improvements or start something else?`
+              );
+              this.conversationManager.addMessage(completionMsg);
+  
+              // Return to planning mode
+              this.modeManager.setPhase('planning');
+              this.currentTask = null;
+              this.checklistManager.clear();
+              this.taskJustCompleted = false;
+  
+              this.notifyUpdate();
+            }
+  
             continueLoop = false; // Done - AI sent final message
           } else if (parsed.hasToolCalls) {
             // AI called tools - add CLEANED XML to conversation for API
-            // The parser has already stripped any text outside <execute> tags
-            // We need to reconstruct clean XML from the parsed tools
             const cleanedXML = this.reconstructToolXML(parsed.toolCalls);
   
             this.conversationManager.addMessage({
@@ -8452,7 +9356,6 @@
               content: cleanedXML,
               display: false  // Don't display this in the UI
             });
-            // Don't call notifyUpdate() - XML is not shown to user
   
             // Execute tools
             await this.executeToolCalls(parsed.toolCalls);
@@ -8471,7 +9374,7 @@
   
       /**
        * Call AI API with current conversation
-       * NOTE: XML-based approach - tools are in system prompt, not sent as parameter
+       * Passes context object to PromptGenerator
        * @returns {Promise<Object>} API response {content: string (XML text)}
        * @private
        */
@@ -8479,17 +9382,26 @@
         // Get conversation history
         const conversationHistory = this.conversationManager.getMessages();
   
-        // Generate messages array for API (system prompt prepended to first user message)
-        const messages = this.promptGenerator.generateMessages(conversationHistory);
+        // Build context object for prompt generator
+        const context = {
+          project: this.currentProject,
+          task: this.currentTask,
+          phase: this.modeManager.getPhase(),
+          itemIndex: this.checklistManager.getCurrentItemIndex(),
+          checklist: this.checklistManager.getChecklist()
+        };
   
-        // Call AI API (no tools parameter - tools are in system prompt as XML examples)
+        // Generate messages array for API (with context)
+        const messages = this.promptGenerator.generateMessages(conversationHistory, context);
+  
+        // Call AI API
         const response = await this.aiApi.sendMessage(messages);
   
         return response;
       }
   
       /**
-       * Execute tool calls
+       * Execute tool calls with phase system integration
        * @param {Array} toolCalls - Array of tool calls {name, parameters}
        * @returns {Promise<void>}
        * @private
@@ -8500,17 +9412,45 @@
   
         for (const toolCall of toolCalls) {
           let toolUseMsg;
+          let toolUseDisplayed = false; // Declare at top of loop scope
           try {
-            // Add tool use indicator for display (matching Java behavior)
-            toolUseMsg = this.conversationManager.addToolUse(toolCall.name, toolCall.parameters);
-            this.notifyUpdate();
+            // PHASE VALIDATION: Check if tool is allowed in current phase/item type
+            const validation = this.modeManager.validateToolCall(toolCall.name);
+            if (!validation.valid) {
+              const error = new Error(validation.error);
+              error.recoverable = true; // Mark as recoverable so UI can hide it
+              throw error;
+            }
+  
+            // Add tool use indicator for display (skip control tools - they're internal)
+            const isControlTool = ['begin_execution', 'mark_complete', 'mark_failed', 'update_mental_model'].includes(toolCall.name);
+            if (!isControlTool) {
+              toolUseMsg = this.conversationManager.addToolUse(toolCall.name, toolCall.parameters);
+              toolUseDisplayed = true;
+              this.notifyUpdate();
+            }
   
             // Execute the tool
             const result = await this.toolExecutor.execute(toolCall.name, toolCall.parameters);
   
-            // Add tool result for display
-            this.conversationManager.addToolResult(toolCall.name, result, toolUseMsg.id);
-            this.notifyUpdate();
+            // EPHEMERAL TRACKING: Track ephemeral content
+            if (this.ephemeralContentManager.isEphemeralTool(toolCall.name)) {
+              this.ephemeralContentManager.trackToolExecution(toolCall.name, toolCall.parameters, result);
+            }
+  
+            // CHANGE TRACKING: Record changes for write operations
+            if (this.modeManager.isWriteOperation(toolCall.name)) {
+              this.recordChange(toolCall.name, toolCall.parameters, result);
+            }
+  
+            // CONTROL TOOLS: Handle special control tools
+            await this.handleControlTool(toolCall.name, toolCall.parameters, result);
+  
+            // Add tool result for display (skip control tools)
+            if (!isControlTool) {
+              this.conversationManager.addToolResult(toolCall.name, result, toolUseMsg.id);
+              this.notifyUpdate();
+            }
   
             // Add tool result to conversation as user message (plain text for AI)
             let toolResultText = `Tool result for ${toolCall.name}: ${JSON.stringify(result, null, 2)}`;
@@ -8531,10 +9471,31 @@
           } catch (error) {
             console.error(`[AIProcessor] Tool execution error (${toolCall.name}):`, error);
   
-            // Add error result for display
-            const errorResult = { error: error.message || 'Tool execution failed' };
-            this.conversationManager.addToolResult(toolCall.name, errorResult, toolUseMsg ? toolUseMsg.id : null);
-            this.notifyUpdate();
+            // Handle recoverable errors - hide the tool_use message we just added
+            if (error.recoverable && toolUseDisplayed && toolUseMsg) {
+              // Remove the tool_use message from conversation display
+              const messages = this.conversationManager.getMessages();
+              const msgIndex = messages.findIndex(m => m.id === toolUseMsg.id);
+              if (msgIndex !== -1) {
+                messages.splice(msgIndex, 1);
+              }
+            }
+  
+            // Add error result for display (skip control tools and recoverable errors)
+            const errorResult = {
+              error: error.message || 'Tool execution failed',
+              recoverable: error.recoverable || false
+            };
+            const isControlToolError = ['begin_execution', 'mark_complete', 'mark_failed', 'update_mental_model'].includes(toolCall.name);
+            const shouldDisplay = !isControlToolError && !error.recoverable;
+  
+            if (shouldDisplay) {
+              this.conversationManager.addToolResult(toolCall.name, errorResult, toolUseMsg ? toolUseMsg.id : null);
+              this.notifyUpdate();
+            } else if (error.recoverable) {
+              // Just update UI to reflect the removed tool_use
+              this.notifyUpdate();
+            }
   
             // Add error as tool result for AI
             let errorText = `Tool result for ${toolCall.name} (ERROR): ${error.message || 'Tool execution failed'}`;
@@ -8553,11 +9514,234 @@
             });
           }
         }
+  
+        // MENTAL MODEL VALIDATION: Check if mental model update is required
+        const hasReads = toolCalls.some(tc => this.ephemeralContentManager.isEphemeralTool(tc.name));
+        const hasUpdate = toolCalls.some(tc => tc.name === 'update_mental_model');
+  
+        if (hasReads && !hasUpdate) {
+          // Add error about missing mental model update
+          const errorMsg = this.mentalModelManager.generateMissingUpdateError();
+          this.conversationManager.addMessage({
+            role: 'user',
+            content: errorMsg,
+            display: false
+          });
+        }
       }
   
       /**
-       * Reconstruct clean XML from parsed tool calls
+       * Record change for recent changes tracker
+       * @param {string} toolName - Tool name
+       * @param {Object} parameters - Tool parameters
+       * @param {*} result - Tool result
+       * @returns {void}
+       * @private
+       */
+      recordChange(toolName, parameters, result) {
+        if (toolName === 'create_file') {
+          this.recentChangesTracker.recordCreate(parameters.path, parameters.content);
+        }
+        else if (toolName === 'update_file') {
+          // Need old content - for MVP, record with empty old content
+          // In full implementation, we'd read the file first
+          this.recentChangesTracker.recordUpdate(parameters.path, '', parameters.new_content);
+        }
+        else if (toolName === 'delete_file') {
+          this.recentChangesTracker.recordDelete(parameters.path);
+        }
+        else if (toolName === 'move_file') {
+          this.recentChangesTracker.recordMove(parameters.source_path, parameters.dest_path);
+        }
+        else if (toolName === 'git_write' && result.success) {
+          // Extract commit message from git args
+          const isCommit = parameters.command && parameters.command.includes('commit');
+          if (isCommit) {
+            this.recentChangesTracker.recordGitCommit('Git commit', []);
+          }
+        }
+      }
+  
+      /**
+       * Handle control tools (begin_execution, mark_complete, mark_failed, update_mental_model)
+       * @param {string} toolName - Tool name
+       * @param {Object} parameters - Tool parameters
+       * @param {*} result - Tool result
+       * @returns {Promise<void>}
+       * @private
+       */
+      async handleControlTool(toolName, parameters, result) {
+        // Handle begin_execution
+        if (toolName === 'begin_execution') {
+          console.log('[AIProcessor] begin_execution called with parameters:', JSON.stringify(parameters, null, 2));
+  
+          const { task_description, items } = parameters;
+          console.log('[AIProcessor] task_description:', task_description);
+          console.log('[AIProcessor] items type:', typeof items, 'isArray:', Array.isArray(items));
+          console.log('[AIProcessor] items:', JSON.stringify(items, null, 2));
+  
+          // Check if checklist contains any coding items
+          const hasCodingItems = items.some(item => item.item_type === 'coding');
+  
+          // If there are coding items, automatically add a review step at the end
+          let finalItems = [...items];
+          if (hasCodingItems) {
+            finalItems.push({
+              short_desc: 'Review changes',
+              detailed_desc: 'Review all code changes, ensure quality, and verify tests pass',
+              item_type: 'testing'
+            });
+          }
+  
+          // Create checklist
+          const checklist = this.checklistManager.createChecklist(finalItems);
+  
+          // Show to user for approval
+          // TODO: Add approval UI in future
+          const approved = true; // For now, auto-approve
+  
+          if (approved) {
+            // Create task (with review item if coding was involved)
+            await this.taskManager.createTask(this.currentProject, task_description, finalItems);
+            this.currentTask = task_description;
+  
+            // Set checklist
+            this.checklistManager.setChecklist(checklist);
+  
+            // Transition to execution
+            this.modeManager.setPhase('execution');
+  
+            // Set item type for first item
+            const firstItem = this.checklistManager.getCurrentItem();
+            if (firstItem) {
+              this.modeManager.setItemType(firstItem.item_type);
+            }
+  
+            // Add phase transition message
+            const msg = createPhaseTransitionMessage('planning', 'execution', 'checklist_approved');
+            await this.taskManager.appendMessage(this.currentProject, this.currentTask, msg);
+  
+            // Notify UI to reload sidebar (show new task)
+            this.notifyUpdate();
+          }
+        }
+  
+        // Handle mark_complete
+        else if (toolName === 'mark_complete') {
+          const hasMore = this.checklistManager.markCurrentComplete();
+  
+          // Save checklist after EVERY mark_complete (including the last one)
+          const updatedChecklist = this.checklistManager.getChecklist();
+          await this.projectManager.updateTaskChecklist(this.currentProject, this.currentTask, updatedChecklist);
+  
+          // Notify UI to update checklist display
+          this.notifyUpdate();
+  
+          if (hasMore) {
+            // More items - set item type for next item
+            const nextItem = this.checklistManager.getCurrentItem();
+            if (nextItem) {
+              this.modeManager.setItemType(nextItem.item_type);
+            }
+          } else {
+            // All complete - set flag to handle after AI's final message
+            this.taskJustCompleted = true;
+            // Don't transition yet - let AI send final summary message first
+          }
+        }
+  
+        // Handle mark_failed
+        else if (toolName === 'mark_failed') {
+          const { reason } = parameters;
+          this.checklistManager.markCurrentFailed(reason);
+  
+          // Return to planning
+          this.modeManager.setPhase('planning');
+  
+          const msg = createPhaseTransitionMessage('execution', 'planning', 'item_failed');
+          await this.taskManager.appendMessage(this.currentProject, this.currentTask, msg);
+        }
+  
+        // Handle update_mental_model
+        else if (toolName === 'update_mental_model') {
+          console.log('[AIProcessor] update_mental_model called with parameters:', JSON.stringify(parameters, null, 2));
+  
+          const { updates } = parameters;
+          console.log('[AIProcessor] Extracted updates:', typeof updates, updates);
+  
+          // Validate
+          const validation = this.mentalModelManager.validateUpdate(updates);
+          if (!validation.valid) {
+            console.error('[AIProcessor] Mental model validation failed:', validation.error);
+            throw new Error(validation.error);
+          }
+  
+          // Update task mental model
+          this.mentalModelManager.updateTaskMentalModel(updates);
+  
+          // Add mental model update message ONLY if we have an active task
+          if (this.currentTask) {
+            const msg = createMentalModelUpdateMessage(updates);
+            await this.taskManager.appendMessage(this.currentProject, this.currentTask, msg);
+          } else {
+            console.log('[AIProcessor] Mental model updated (no active task, not persisted to task log)');
+          }
+        }
+      }
+  
+      /**
+       * Set current project
+       * @param {string} projectDir - Project directory name
+       * @returns {Promise<void>}
+       */
+      async setProject(projectDir) {
+        this.currentProject = projectDir;
+  
+        // Load project mental model
+        const project = await this.projectManager.getProject(projectDir);
+        this.mentalModelManager.setProjectMentalModel(project.projectMentalModel || {});
+  
+        // Set phase to planning
+        this.modeManager.setPhase('planning');
+        this.currentTask = null;
+      }
+  
+      /**
+       * Complete current task
+       * @param {string} summary - Task completion summary
+       * @returns {Promise<void>}
+       */
+      async completeTask(summary) {
+        if (!this.currentTask) {
+          throw new Error('No task to complete');
+        }
+  
+        // Stage 2: Promote mental model to project level
+        // TODO: In full implementation, call AI to review and promote
+        // For now, just copy all task notes to project
+        const taskModel = this.mentalModelManager.getTaskMentalModel();
+        this.mentalModelManager.promoteToProjectMentalModel(taskModel);
+  
+        // Update project metadata with new mental model
+        const projectModel = this.mentalModelManager.getProjectMentalModel();
+        await this.projectManager.updateProjectMentalModel(this.currentProject, projectModel, true);
+  
+        // Complete task
+        await this.taskManager.completeTask(this.currentProject, this.currentTask, summary);
+  
+        // Clear task mental model
+        this.mentalModelManager.clearTaskMentalModel();
+  
+        // Return to planning
+        this.modeManager.setPhase('planning');
+        this.currentTask = null;
+        this.checklistManager.clear();
+      }
+  
+      /**
+       * Reconstruct clean XML from parsed tool calls using NEW format
        * This removes any text the AI added outside <execute> tags
+       * Uses proper XML structure (parameters as elements, not <parameter name="...">)
        * @param {Array} toolCalls - Array of parsed tool calls
        * @returns {string} Clean XML string
        * @private
@@ -8567,12 +9751,32 @@
         for (const tool of toolCalls) {
           xml += `  <tool name="${tool.name}">\n`;
           for (const [paramName, paramValue] of Object.entries(tool.parameters)) {
-            xml += `    <parameter name="${paramName}">${paramValue}</parameter>\n`;
+            // Use NEW format: parameter names as direct child elements
+            xml += `    <${paramName}>${this.escapeXML(paramValue)}</${paramName}>\n`;
           }
           xml += '  </tool>\n';
         }
         xml += '</execute>';
         return xml;
+      }
+  
+      /**
+       * Escape XML special characters
+       * @param {*} value - Value to escape
+       * @returns {string} Escaped string
+       * @private
+       */
+      escapeXML(value) {
+        if (typeof value === 'object') {
+          return JSON.stringify(value); // Fallback for complex objects
+        }
+        const str = String(value);
+        return str
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+          .replace(/"/g, '&quot;')
+          .replace(/'/g, '&apos;');
       }
   
       /**
@@ -8599,6 +9803,30 @@
        */
       isProcessing() {
         return this.processing;
+      }
+  
+      /**
+       * Get current project
+       * @returns {string|null} Current project directory or null
+       */
+      getCurrentProject() {
+        return this.currentProject;
+      }
+  
+      /**
+       * Get current task
+       * @returns {string|null} Current task name or null
+       */
+      getCurrentTask() {
+        return this.currentTask;
+      }
+  
+      /**
+       * Get current phase
+       * @returns {string} Current phase
+       */
+      getCurrentPhase() {
+        return this.modeManager.getPhase();
       }
     }
   
@@ -10507,32 +11735,68 @@
       }
   
       /**
-       * Render chat screen with message history
+       * Render chat screen with split-panel layout (sidebar + chat)
        */
       function renderChatScreen(state) {
-          const messageNodes = state.messages
-              .map((msg, index) => renderMessage(msg, state.messages, index, state))
+          const messages = state.messages || [];
+          const messageNodes = messages
+              .map((msg, index) => renderMessage(msg, messages, index, state))
               .filter(node => node !== null);
   
-          // Add loading indicator if backend is processing (not waiting for user input)
-          const shouldShowLoading = state.status === 'processing';
-          if (shouldShowLoading) {
+          // Add loading indicator if backend is processing
+          if (state.isProcessing) {
+              console.log('[render] isProcessing=true, adding loading animation');
               messageNodes.push(renderLoading());
+          } else {
+              console.log('[render] isProcessing=false, no loading animation');
           }
   
           const chatHistory = h('div', { className: 'chat-history' }, messageNodes);
   
+          // Render sidebar if sidebar module is available
+          const { renderSidebar } = window.module["sidebar.js"] || {};
+          const sidebarNode = renderSidebar ? renderSidebar(state.sidebar || {
+              projects: [],
+              currentProject: state.currentProject,
+              currentTask: state.currentTask,
+              isMinimized: false
+          }) : null;
+  
+          // Render modals if modal module is available
+          const { renderCreateProjectModal, renderFileContentModal } = window.module["modal.js"] || {};
+          const createProjectModalNode = renderCreateProjectModal ? renderCreateProjectModal(state.modal) : null;
+          const fileContentModalNode = renderFileContentModal ? renderFileContentModal(state.modal) : null;
+  
           return h('div', { id: 'chat-screen', className: 'screen' }, [
-              h('div', { id: 'chat-container' }, [chatHistory]),
-              h('div', { id: 'input-container' }, [
-                  h('textarea', {
-                      id: 'message-input',
-                      placeholder: 'Type your message...',
-                      autocomplete: 'off',
-                      rows: '1'
-                  }, text(''))
-              ])
-          ]);
+              // Sidebar (left panel)
+              sidebarNode,
+  
+              // Chat panel (right panel)
+              h('div', { id: 'chat-panel' }, [
+                  h('div', { id: 'chat-container' }, [chatHistory]),
+                  h('div', { id: 'input-container' }, [
+                      // Check if last message is task_complete - show button instead of input
+                      (messages.length > 0 && messages[messages.length - 1].type === 'task_complete') ?
+                          h('button', {
+                              id: 'start-new-task-btn',
+                              className: 'primary-button',
+                              disabled: state.isProcessing
+                          }, text('Start New Task'))
+                      :
+                          h('textarea', {
+                              id: 'message-input',
+                              placeholder: state.sidebar.currentProject ? 'Type your message...' : 'Select a project to start...',
+                              autocomplete: 'off',
+                              rows: '1',
+                              disabled: !state.sidebar.currentProject || state.isProcessing
+                          }, text(''))
+                  ])
+              ]),
+  
+              // Modals (overlay on top)
+              createProjectModalNode,
+              fileContentModalNode
+          ].filter(Boolean));
       }
   
       function renderMessage(msg, allMessages, index, state) {
@@ -10541,6 +11805,10 @@
                   return renderUserMessage(msg);
               case 'assistant_msg':
                   return renderAssistantMessage(msg);
+              case 'greeting':
+                  return renderAssistantMessage(msg); // Render greetings as assistant messages
+              case 'task_complete':
+                  return renderTaskComplete(msg); // Render task completion as assistant message
               case 'tool_use':
                   return renderToolUse(msg, allMessages, index, state);
               case 'tool_result':
@@ -10845,7 +12113,7 @@
                   const expandedFiles = uiController ? uiController.expandedFiles : {};
                   const showFullContent = expandedFiles[msg.tool_use_id] === true;
                   console.log('[TOOL_RESULT] msg.tool_use_id:', msg.tool_use_id, 'expanded:', expandedFiles[msg.tool_use_id], 'showFullContent:', showFullContent);
-                  return renderFileContent(msg.toolName, toolUseMsg.parameters, msg.tool_use_id, showFullContent);
+                  return renderFileContent(msg.toolName, toolUseMsg.parameters, msg.result, msg.tool_use_id, showFullContent);
               }
           }
   
@@ -11255,7 +12523,7 @@
       }
   
       // Render file content for create_file and update_file
-      function renderFileContent(toolName, parameters, toolUseId, showFullContent) {
+      function renderFileContent(toolName, parameters, result, toolUseId, showFullContent) {
           const maxLines = 10;
   
           if (toolName === 'create_file') {
@@ -11313,6 +12581,9 @@
               const oldContent = parameters.old_content || '';
               const newContent = parameters.new_content || '';
   
+              // Get start_line from result (similar to update_file_batch)
+              const startLine = result && result.start_line ? result.start_line : 1;
+  
               const diffLines = computeLineDiff(oldContent, newContent);
               const visibleLines = diffLines.filter(line => line.type !== 'unchanged');
   
@@ -11322,24 +12593,30 @@
                                  (showFullContent ? visibleLines : visibleLines.slice(0, maxLines));
   
               const lineElements = linesToShow.map((line, index) => {
-                  // Use actual line numbers from the file
-                  const lineNum = line.type === 'added' ?
-                      line.newLineNum.toString().padStart(3, ' ') :
-                      line.oldLineNum.toString().padStart(3, ' ');
+                  // Calculate actual file line number using start_line
+                  let lineNum;
+                  if (line.type === 'added' && line.newLineNum !== undefined) {
+                      // For added lines, calculate from start line + offset in new content
+                      lineNum = startLine + line.newLineNum - 1;
+                  } else if (line.type === 'removed' && line.oldLineNum !== undefined) {
+                      // For removed lines, use start line + offset in old content
+                      lineNum = startLine + line.oldLineNum - 1;
+                  } else {
+                      // Fallback
+                      lineNum = startLine;
+                  }
+  
                   const className = line.type === 'added' ? 'diff-line diff-add' : 'diff-line diff-remove';
                   const prefix = line.type === 'added' ? ' + ' : ' - ';
-  
-                  // Use actual line number for key to ensure proper VDOM diffing
-                  const actualLineNum = line.type === 'added' ? line.newLineNum : line.oldLineNum;
   
                   const isLastLine = index === linesToShow.length - 1;
                   const shouldShowMore = visibleLines.length > maxLines && !showFullContent && isLastLine;
   
                   return h('div', {
                       className,
-                      key: `${toolUseId}-${line.type}-${actualLineNum}`  // Unique key for proper VDOM diffing
+                      key: `${toolUseId}-${line.type}-${lineNum}`  // Use actual line number in key
                   }, [
-                      h('span', { className: 'diff-line-number' }, text(lineNum)),
+                      h('span', { className: 'diff-line-number' }, text(lineNum.toString().padStart(3, ' '))),
                       h('span', { className: 'diff-line-content' }, text(prefix + line.content)),
                       shouldShowMore ? h('span', {
                           className: 'show-more-link',
@@ -11557,6 +12834,13 @@
           return h('div', { className: 'message approval-request-message' },
               lines.map(line => h('div', { className: 'approval-line' }, text(line)))
           );
+      }
+  
+      function renderTaskComplete(msg) {
+          // Render task completion message - just display the completion message
+          // The continuation prompt is stored but shown via button click
+          const content = parseAssistantContent(msg.completionMessage);
+          return h('div', { className: 'message assistant-message task-complete-message' }, content);
       }
   
   
@@ -12275,7 +13559,25 @@
           messages: [],
           isProcessing: false,
           inputEnabled: true,
-          currentScreen: 'welcome'
+          currentScreen: 'welcome',
+          sidebar: {
+            projects: [],
+            currentProject: null,
+            currentTask: null,
+            isMinimized: false,
+            activeTab: 'projects' // 'projects' or 'memory'
+          },
+          modal: {
+            showCreateProject: false,
+            showFileContent: false,
+            projectName: '',
+            projectDescription: '',
+            fileName: '',
+            content: '',
+            error: null
+          },
+          currentProject: null,
+          currentTask: null
         };
   
         // Scroll state management
@@ -12392,11 +13694,14 @@
           chatContainer.addEventListener('scroll', () => this.handleScroll());
         }
   
-        // Focus input when clicking in input container
+        // Focus input when clicking in input container OR handle start new task button
         if (!inputContainer._hasClickListener) {
           inputContainer._hasClickListener = true;
           inputContainer.addEventListener('click', (e) => {
-            if (e.target === inputContainer) {
+            // Handle "Start New Task" button
+            if (e.target.id === 'start-new-task-btn') {
+              this.handleStartNewTask();
+            } else if (e.target === inputContainer && input) {
               input.focus();
             }
           });
@@ -12430,6 +13735,10 @@
         // Generate virtual DOM for entire app
         const { render } = window.module["render.js"];
         const { createDOMNode } = window.module["vdom.js"];
+        if (!render) {
+          console.error('[UIController] render function not found in window.module["render.js"]');
+          return;
+        }
         const vnode = render(this.state);
         const newDOM = createDOMNode(vnode);
   
@@ -12468,8 +13777,10 @@
       /**
        * Show chat screen
        */
-      showChatScreen() {
+      async showChatScreen() {
         this.updateUI({ currentScreen: 'chat' });
+        // Load projects to populate the sidebar
+        await this.loadProjects();
       }
   
       /**
@@ -12529,6 +13840,43 @@
           input.value = '';
           input.style.height = 'auto';
         }
+      }
+  
+      /**
+       * Handle start new task button click
+       * @private
+       */
+      async handleStartNewTask() {
+        // Get the task completion message (last message)
+        const messages = this.state.messages;
+        if (messages.length === 0 || messages[messages.length - 1].type !== 'task_complete') {
+          console.warn('[UIController] No task completion message found');
+          return;
+        }
+  
+        const taskCompleteMsg = messages[messages.length - 1];
+        const continuationPrompt = taskCompleteMsg.continuationPrompt;
+  
+        // Clear conversation
+        const app = window.CodeBossApp;
+        if (app && app.components.conversationManager) {
+          app.components.conversationManager.state.messages = [];
+        }
+  
+        // Add continuation prompt as greeting
+        if (app && app.components.conversationManager && continuationPrompt) {
+          const { createGreetingMessage } = window.module.ConversationState;
+          const greetingMsg = createGreetingMessage(continuationPrompt);
+          app.components.conversationManager.state.messages.push(greetingMsg);
+        }
+  
+        // Update UI
+        if (app && app.components.conversationManager) {
+          const newMessages = app.components.conversationManager.getMessages();
+          this.setMessages(newMessages);
+        }
+  
+        this.renderApp();
       }
   
       /**
@@ -12675,6 +14023,324 @@
       }
   
       /**
+       * Toggle sidebar visibility
+       */
+      toggleSidebar() {
+        this.state.sidebar.isMinimized = !this.state.sidebar.isMinimized;
+        this.renderApp();
+      }
+  
+      /**
+       * Switch sidebar tab
+       * @param {string} tab - Tab name ('projects' or 'memory')
+       */
+      switchSidebarTab(tab) {
+        this.state.sidebar.activeTab = tab;
+        this.renderApp();
+      }
+  
+      /**
+       * Toggle project expand/collapse and select project
+       * @param {string} projectDir - Project directory
+       */
+      async toggleProject(projectDir) {
+        const projects = this.state.sidebar.projects;
+        const project = projects.find(p => p.projectDir === projectDir);
+        if (!project) return;
+  
+        // Toggle expansion
+        project.expanded = !project.expanded;
+  
+        // If clicking a different project (or no project selected), select it and enter planning mode
+        if (this.state.sidebar.currentProject !== projectDir) {
+          await this.selectProject(projectDir);
+        } else {
+          this.renderApp();
+        }
+      }
+  
+      /**
+       * Select a project and enter planning mode
+       * @param {string} projectDir - Project directory
+       */
+      async selectProject(projectDir) {
+        console.log(`[UIController] selectProject: ${projectDir}`);
+  
+        try {
+          const app = window.CodeBossApp;
+          if (!app) {
+            console.error('[UIController] App not available');
+            return;
+          }
+  
+          // Clear current conversation
+          if (app.components.conversationManager) {
+            app.components.conversationManager.state.messages = [];
+          }
+  
+          // Set project in AI processor (this enters planning mode)
+          if (app.components.aiProcessor) {
+            await app.components.aiProcessor.setProject(projectDir);
+          }
+  
+          // Show planning mode welcome message
+          const project = this.state.sidebar.projects.find(p => p.projectDir === projectDir);
+          const projectName = project ? project.name : projectDir;
+  
+          const planningMessage = `📋 Planning Mode: ${projectName}
+  
+  Let's discuss what you'd like to build. Tell me about your ideas, and we'll create a plan together.
+  
+  Once we have a solid plan, I'll create a checklist and begin execution.`;
+  
+          if (app.components.conversationManager) {
+            const { createGreetingMessage } = window.module.ConversationState;
+            const greetingMsg = createGreetingMessage(planningMessage);
+            app.components.conversationManager.state.messages.push(greetingMsg);
+          }
+  
+          // Update UI with all changes at once
+          const messages = app.components.conversationManager.getMessages();
+          this.updateUI({
+            messages,
+            sidebar: {
+              ...this.state.sidebar,
+              currentProject: projectDir,
+              currentTask: null
+            },
+            currentProject: projectDir,
+            currentTask: null
+          });
+  
+        } catch (error) {
+          console.error('[UIController] Failed to select project:', error);
+        }
+      }
+  
+      /**
+       * Toggle task expand/collapse
+       * @param {string} projectDir - Project directory
+       * @param {string} taskName - Task name
+       */
+      toggleTask(projectDir, taskName) {
+        const projects = this.state.sidebar.projects;
+        const project = projects.find(p => p.projectDir === projectDir);
+        if (!project) return;
+  
+        const task = project.tasks?.find(t => t.name === taskName);
+        if (!task) return;
+  
+        // Toggle expansion
+        task.expanded = !task.expanded;
+        this.renderApp();
+      }
+  
+      /**
+       * Select a task and load its conversation
+       * @param {string} projectDir - Project directory
+       * @param {string} taskName - Task name
+       */
+      async selectTask(projectDir, taskName) {
+        console.log(`[UIController] selectTask: ${projectDir}/${taskName}`);
+  
+        try {
+          const app = window.CodeBossApp;
+          if (!app || !app.components.taskManager) {
+            console.error('[UIController] TaskManager not available');
+            return;
+          }
+  
+          // Load task messages
+          const taskManager = app.components.taskManager;
+          const messages = await taskManager.readMessages(projectDir, taskName);
+  
+          console.log(`[UIController] Loaded ${messages.length} messages for task ${taskName}`);
+  
+          // Update conversation manager with task messages
+          if (app.components.conversationManager) {
+            app.components.conversationManager.state.messages = messages;
+            this.setMessages(messages);
+          }
+  
+          // Update sidebar to show this task as current
+          this.state.sidebar.currentProject = projectDir;
+          this.state.sidebar.currentTask = taskName;
+  
+          // Update global current task
+          this.state.currentProject = projectDir;
+          this.state.currentTask = taskName;
+  
+          this.renderApp();
+  
+        } catch (error) {
+          console.error('[UIController] Failed to select task:', error);
+        }
+      }
+  
+      /**
+       * Show create project modal
+       */
+      showCreateProjectModal() {
+        this.state.modal = {
+          showCreateProject: true,
+          showFileContent: false,
+          projectName: '',
+          projectDescription: '',
+          fileName: '',
+          content: '',
+          error: null
+        };
+        this.renderApp();
+      }
+  
+      /**
+       * Close modal
+       */
+      closeModal() {
+        this.state.modal = {
+          showCreateProject: false,
+          showFileContent: false,
+          projectName: '',
+          projectDescription: '',
+          fileName: '',
+          content: '',
+          error: null
+        };
+        this.renderApp();
+      }
+  
+      /**
+       * Create project (from modal)
+       */
+      async createProject() {
+        const nameInput = document.getElementById('project-name-input');
+        const descInput = document.getElementById('project-desc-input');
+  
+        if (!nameInput) {
+          console.error('[UIController] Project name input not found');
+          return;
+        }
+  
+        const name = nameInput.value.trim();
+        const description = descInput ? descInput.value.trim() : '';
+  
+        if (!name) {
+          this.state.modal.error = 'Project name is required';
+          this.renderApp();
+          return;
+        }
+  
+        console.log(`[UIController] Creating project: ${name}`);
+  
+        try {
+          // Get the app instance and create project
+          const app = window.CodeBossApp;
+          if (!app || !app.components.projectManager) {
+            console.error('[UIController] ProjectManager not available');
+            this.state.modal.error = 'Project manager not available';
+            this.renderApp();
+            return;
+          }
+  
+          const projectManager = app.components.projectManager;
+          const project = await projectManager.createProject(name);
+  
+          console.log(`[UIController] Project created: ${project.projectDir}`);
+  
+          // Close modal
+          this.closeModal();
+  
+          // Reload project list and update sidebar
+          await this.loadProjects();
+  
+          // Automatically select the newly created project and enter planning mode
+          await this.selectProject(project.projectDir);
+  
+        } catch (error) {
+          console.error('[UIController] Failed to create project:', error);
+          this.state.modal.error = `Failed to create project: ${error.message}`;
+          this.renderApp();
+        }
+      }
+  
+      /**
+       * Copy to clipboard
+       * @param {string} text - Text to copy
+       */
+      async copyToClipboard(text) {
+        try {
+          await navigator.clipboard.writeText(text);
+          console.log('[UIController] Copied to clipboard');
+        } catch (err) {
+          console.error('[UIController] Failed to copy to clipboard:', err);
+        }
+      }
+  
+      /**
+       * Update sidebar with project/task data
+       * @param {Object} sidebarData - Sidebar data
+       */
+      updateSidebar(sidebarData) {
+        this.state.sidebar = { ...this.state.sidebar, ...sidebarData };
+        this.renderApp();
+      }
+  
+      /**
+       * Load projects from ProjectManager and update sidebar
+       */
+      async loadProjects() {
+        try {
+          const app = window.CodeBossApp;
+          if (!app || !app.components.projectManager) {
+            console.warn('[UIController] ProjectManager not available for loadProjects');
+            return;
+          }
+  
+          const projectManager = app.components.projectManager;
+          const projects = await projectManager.listProjects();
+  
+          console.log(`[UIController] Loaded ${projects.length} projects:`, projects);
+          console.log('[UIController] Current sidebar state before update:', JSON.parse(JSON.stringify(this.state.sidebar)));
+  
+          // Update sidebar with projects
+          this.updateSidebar({ projects });
+  
+          console.log('[UIController] Current sidebar state after update:', JSON.parse(JSON.stringify(this.state.sidebar)));
+  
+        } catch (error) {
+          console.error('[UIController] Failed to load projects:', error);
+        }
+      }
+  
+      /**
+       * Update task checklist in sidebar
+       * @param {string} projectDir - Project directory
+       * @param {string} taskName - Task name
+       * @param {Array} checklist - Checklist items with completion status
+       */
+      updateTaskChecklist(projectDir, taskName, checklist) {
+        try {
+          // Find the project in sidebar
+          const project = this.state.sidebar.projects.find(p => p.projectDir === projectDir);
+          if (!project) return;
+  
+          // Find the task in project
+          const task = project.tasks?.find(t => t.name === taskName);
+          if (!task) return;
+  
+          // Update task with checklist
+          task.checklist = checklist;
+          task.currentItemIndex = checklist.findIndex(item => item.status === 'in_progress');
+  
+          // Re-render to show updated checklist
+          this.renderApp();
+  
+        } catch (error) {
+          console.error('[UIController] Failed to update task checklist:', error);
+        }
+      }
+  
+      /**
        * Inject CSS styles
        * @private
        */
@@ -12757,8 +14423,9 @@
           /* Chat Screen */
           #chat-screen {
             display: flex;
-            flex-direction: column;
-            height: 100vh;
+            flex-direction: row;
+            flex: 1;
+            overflow: hidden;
           }
   
           #chat-container {
@@ -13396,32 +15063,63 @@
           // 8. Initialize AI API (auto-detects mode based on auth token vs API key)
           this.components.aiApi = new window.module.AIApi(apiKey, authToken !== null);
   
-          // 9. Initialize prompt generator
-          this.components.promptGenerator = new window.module.PromptGenerator();
+          // 9. Initialize phase system managers (before prompt generator)
+          this.components.modeManager = new window.module.ModeManager();
   
-          // 10. Initialize response parser
+          this.components.projectManager = new window.module.ProjectManager(this.components.fsManager);
+  
+          this.components.checklistManager = new window.module.ChecklistManager();
+  
+          this.components.ephemeralContentManager = new window.module.EphemeralContentManager();
+  
+          this.components.mentalModelManager = new window.module.MentalModelManager();
+  
+          this.components.recentChangesTracker = new window.module.RecentChangesTracker();
+  
+          this.components.taskManager = new window.module.TaskManager(
+            this.components.fsManager,
+            this.components.projectManager
+          );
+  
+          // 10. Initialize prompt generator (with managers)
+          this.components.promptGenerator = new window.module.PromptGenerator(
+            this.components.modeManager,
+            this.components.mentalModelManager,
+            this.components.recentChangesTracker,
+            this.components.ephemeralContentManager
+          );
+  
+          // 11. Initialize response parser
           this.components.responseParser = new window.module.ResponseParser();
   
-          // 11. Initialize AI processor
+          // 12. Initialize AI processor (with phase system integration)
           this.components.aiProcessor = new window.module.AIProcessor(
             this.components.conversationManager,
             this.components.promptGenerator,
             this.components.responseParser,
             this.components.toolExecutor,
             this.components.toolDefinitions,
-            this.components.aiApi
+            this.components.aiApi,
+            // Phase system managers
+            this.components.modeManager,
+            this.components.projectManager,
+            this.components.taskManager,
+            this.components.checklistManager,
+            this.components.ephemeralContentManager,
+            this.components.mentalModelManager,
+            this.components.recentChangesTracker
           );
   
-          // 12. Initialize UI controller
+          // 13. Initialize UI controller
           this.components.uiController = new window.module.UIController();
           this.components.uiController.initialize(containerId);
   
-          // 13. Wire up UI callbacks
+          // 14. Wire up UI callbacks
           this.components.uiController.setUserInputCallback((message) => {
             this.handleUserMessage(message);
           });
   
-          // 14. Wire up AI processor callbacks
+          // 15. Wire up AI processor callbacks
           this.components.aiProcessor.setUpdateCallback(() => {
             this.handleAIUpdate();
           });
@@ -13439,9 +15137,9 @@
               await this.handleDirectorySelection();
             });
           } else {
-            // Show chat screen directly
-            this.components.uiController.showChatScreen();
-            this.showWelcomeMessage();
+            // Show chat screen directly (directory already selected)
+            await this.components.uiController.showChatScreen();
+            this.showProjectSelectionMessage();
           }
   
         } catch (error) {
@@ -13517,11 +15215,11 @@
           console.log('[CodeBossApp] Step 2 SUCCESS: .agent directory initialized');
   
           console.log('[CodeBossApp] Step 3: Switching to chat screen...');
-          // Switch to chat screen
-          this.components.uiController.showChatScreen();
+          // Switch to chat screen (this will load projects in sidebar)
+          await this.components.uiController.showChatScreen();
   
-          // Show welcome message in chat
-          this.showWelcomeMessage();
+          // Show message prompting user to select/create a project
+          this.showProjectSelectionMessage();
           console.log('[CodeBossApp] Step 3 SUCCESS: All done!');
   
         } catch (error) {
@@ -13557,6 +15255,28 @@
         this.handleAIUpdate();
       }
   
+      /**
+       * Show project selection message
+       * Prompts user to select or create a project
+       * @private
+       */
+      showProjectSelectionMessage() {
+        const dirPath = this.components.fsManager.getDirectoryPath();
+        const { createGreetingMessage } = window.module.ConversationState;
+  
+        const message = `Welcome to Code Boss!
+  
+  Working directory: ${dirPath}
+  
+  To get started, please select an existing project from the sidebar or create a new project using the "+ New Project" button.
+  
+  Once you select a project, we'll enter Planning mode where we can discuss what you'd like to build.`;
+  
+        // Use greeting message type (not sent to API)
+        const greetingMsg = createGreetingMessage(message);
+        this.components.conversationManager.state.messages.push(greetingMsg);
+        this.handleAIUpdate();
+      }
   
       /**
        * Handle user message
@@ -13604,14 +15324,36 @@
   
       /**
        * Handle AI update (new message added)
+       * Also reloads sidebar to show any new tasks/checklist updates
        * @private
        */
-      handleAIUpdate() {
+      async handleAIUpdate() {
         // Get all messages
         const messages = this.components.conversationManager.getMessages();
   
         // Update UI with new messages (VDOM will handle efficient rendering)
         this.components.uiController.setMessages(messages);
+  
+        // Reload sidebar to show any new tasks or checklist updates
+        await this.components.uiController.loadProjects();
+  
+        // Update sidebar with current project/task/phase state
+        const currentProject = this.components.aiProcessor.getCurrentProject();
+        const currentTask = this.components.aiProcessor.getCurrentTask();
+        const currentPhase = this.components.aiProcessor.getCurrentPhase();
+  
+        if (currentProject) {
+          this.components.uiController.updateSidebar({
+            currentProject: currentProject,
+            currentTask: currentTask
+          });
+        }
+  
+        // Update sidebar with checklist if in execution phase
+        if (currentPhase === 'execution' && currentTask) {
+          const checklist = this.components.checklistManager.getChecklist();
+          this.components.uiController.updateTaskChecklist(currentProject, currentTask, checklist);
+        }
       }
   
       /**
