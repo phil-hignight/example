@@ -5,7 +5,7 @@
  * Uses File System Access API for file operations.
  *
  * @version 1.0.0-browser
- * @generated 2025-11-13T22:38:23.002Z
+ * @generated 2025-11-13T22:48:09.204Z
  * @license MIT
  *
  * Usage:
@@ -14,7 +14,7 @@
  *   3. Paste this entire script
  *   4. Follow prompts to select working directory
  *
- * Files bundled: 47
+ * Files bundled: 51
  * Total size: [calculated at build time]
  */
 
@@ -7751,6 +7751,1039 @@
   })();
 
   // ============================================================================
+  // src/mental-model-manager.js
+  // ============================================================================
+
+  /**
+   * mental-model-manager.js
+   *
+   * Manages two-stage mental model update system:
+   * - Stage 1: Inline updates during execution (MANDATORY after reads)
+   * - Stage 2: Promotion to project level after task completion
+   *
+   * Mental models use concise notes format (5-15 words per entry):
+   * - Key: file path or concept
+   * - Value: concise note string
+   *
+   * Based on: specs/MENTAL-MODEL-UPDATES.md, specs/PHASES.md
+   */
+  
+  (function() {
+    'use strict';
+  
+    const { MessageType } = window.module.ConversationState;
+  
+    /**
+     * MentalModelManager class
+     * Handles both task-level and project-level mental models
+     */
+    class MentalModelManager {
+      constructor() {
+        // Project mental model (persists across tasks)
+        this.projectMentalModel = {};
+  
+        // Task mental model (current task only, cleared on completion)
+        this.taskMentalModel = {};
+      }
+  
+      /**
+       * Stage 1: Update task mental model (inline during execution)
+       * MANDATORY after any read operation
+       * @param {Object} updates - Map of key -> note string
+       * @returns {void}
+       */
+      updateTaskMentalModel(updates) {
+        // Merge updates into task mental model
+        // Note: null value means delete the key
+        for (const [key, value] of Object.entries(updates)) {
+          if (value === null) {
+            delete this.taskMentalModel[key];
+          } else {
+            this.taskMentalModel[key] = value;
+          }
+        }
+      }
+  
+      /**
+       * Stage 2: Promote task mental model to project level
+       * Called after task completion during review phase
+       * @param {Object} promotedUpdates - Keys to promote with optional new notes
+       * @returns {void}
+       */
+      promoteToProjectMentalModel(promotedUpdates) {
+        // Merge promoted updates into project mental model
+        for (const [key, value] of Object.entries(promotedUpdates)) {
+          if (value === null) {
+            delete this.projectMentalModel[key];
+          } else {
+            this.projectMentalModel[key] = value;
+          }
+        }
+      }
+  
+      /**
+       * Get task mental model
+       * @returns {Object} Task mental model
+       */
+      getTaskMentalModel() {
+        return { ...this.taskMentalModel };
+      }
+  
+      /**
+       * Get project mental model
+       * @returns {Object} Project mental model
+       */
+      getProjectMentalModel() {
+        return { ...this.projectMentalModel };
+      }
+  
+      /**
+       * Set project mental model (for loading from storage)
+       * @param {Object} model - Project mental model
+       * @returns {void}
+       */
+      setProjectMentalModel(model) {
+        this.projectMentalModel = model || {};
+      }
+  
+      /**
+       * Set task mental model (for loading from storage)
+       * @param {Object} model - Task mental model
+       * @returns {void}
+       */
+      setTaskMentalModel(model) {
+        this.taskMentalModel = model || {};
+      }
+  
+      /**
+       * Clear task mental model
+       * Called when task completes and mental model is promoted
+       * @returns {void}
+       */
+      clearTaskMentalModel() {
+        this.taskMentalModel = {};
+      }
+  
+      /**
+       * Validate mental model update
+       * Ensures updates are in correct format (concise notes)
+       * @param {Object} updates - Mental model updates
+       * @returns {Object} {valid: boolean, error: string|null}
+       */
+      validateUpdate(updates) {
+        if (typeof updates !== 'object' || updates === null) {
+          return {
+            valid: false,
+            error: 'Mental model updates must be an object'
+          };
+        }
+  
+        // Check each update
+        for (const [key, value] of Object.entries(updates)) {
+          // Key must be non-empty string
+          if (typeof key !== 'string' || key.trim() === '') {
+            return {
+              valid: false,
+              error: `Invalid key: ${key}. Keys must be non-empty strings.`
+            };
+          }
+  
+          // Value must be string or null (null = delete)
+          if (value !== null && typeof value !== 'string') {
+            return {
+              valid: false,
+              error: `Invalid value for key "${key}". Values must be strings or null.`
+            };
+          }
+  
+          // Value should be concise (5-15 words recommended)
+          if (value !== null) {
+            const wordCount = value.trim().split(/\s+/).length;
+            if (wordCount > 30) {
+              return {
+                valid: false,
+                error: `Note for "${key}" is too long (${wordCount} words). Keep notes concise (5-15 words recommended).`
+              };
+            }
+          }
+        }
+  
+        return { valid: true, error: null };
+      }
+  
+      /**
+       * Format mental model for prompt
+       * @param {string} scope - 'project' or 'task'
+       * @returns {string} Formatted mental model section
+       */
+      formatForPrompt(scope) {
+        const model = scope === 'project' ? this.projectMentalModel : this.taskMentalModel;
+        const title = scope === 'project' ? 'Project Mental Model' : 'Task Mental Model';
+  
+        if (Object.keys(model).length === 0) {
+          return '';
+        }
+  
+        let content = `## ${title}\n\n`;
+  
+        // Group by type (files vs concepts)
+        const files = {};
+        const concepts = {};
+  
+        for (const [key, note] of Object.entries(model)) {
+          // If key looks like a file path (contains / or .), it's a file
+          if (key.includes('/') || key.includes('.')) {
+            files[key] = note;
+          } else {
+            concepts[key] = note;
+          }
+        }
+  
+        // Format files
+        if (Object.keys(files).length > 0) {
+          content += '### Files:\n';
+          for (const [path, note] of Object.entries(files)) {
+            content += `- **${path}**: ${note}\n`;
+          }
+          content += '\n';
+        }
+  
+        // Format concepts
+        if (Object.keys(concepts).length > 0) {
+          content += '### Concepts:\n';
+          for (const [concept, note] of Object.entries(concepts)) {
+            content += `- **${concept}**: ${note}\n`;
+          }
+          content += '\n';
+        }
+  
+        return content;
+      }
+  
+      /**
+       * Check if mental model update is required
+       * After a read operation, update_mental_model is MANDATORY
+       * @param {Array} toolCalls - Recent tool calls
+       * @returns {boolean} True if update_mental_model is required
+       */
+      isUpdateRequired(toolCalls) {
+        // Read tools that require mental model update
+        const readTools = [
+          'read_file',
+          'git_read',
+          'list_files',
+          'search_files_by_name',
+          'search_files_by_content',
+          'list_projects',
+          'list_tasks_for_project',
+          'read_task_messages',
+          'read_change'
+        ];
+  
+        // Check if any read tool was called
+        const hasReadOperation = toolCalls.some(call => readTools.includes(call.toolName));
+  
+        // Check if update_mental_model was called
+        const hasUpdate = toolCalls.some(call => call.toolName === 'update_mental_model');
+  
+        // Update is required if there was a read but no update
+        return hasReadOperation && !hasUpdate;
+      }
+  
+      /**
+       * Generate validation error for missing mental model update
+       * @returns {string} Error message
+       */
+      generateMissingUpdateError() {
+        return `ERROR: Mental model update is MANDATORY after read operations.
+  
+  You performed a read operation (read_file, git_read, list_files, or search) but did not call update_mental_model.
+  
+  All ephemeral content is cleared after your response. You MUST extract learnings using update_mental_model before the content disappears.
+  
+  Use update_mental_model with concise notes (5-15 words per entry):
+  {
+    "src/app.js": "main entry point, initializes components",
+    "authentication": "uses JWT tokens, stored in localStorage"
+  }`;
+      }
+  
+      /**
+       * Export mental models to JSON (for persistence)
+       * @returns {Object} {project, task}
+       */
+      toJSON() {
+        return {
+          project: this.projectMentalModel,
+          task: this.taskMentalModel
+        };
+      }
+  
+      /**
+       * Load mental models from JSON
+       * @param {Object} data - {project, task}
+       * @returns {void}
+       */
+      fromJSON(data) {
+        if (data) {
+          this.projectMentalModel = data.project || {};
+          this.taskMentalModel = data.task || {};
+        }
+      }
+  
+      /**
+       * Get statistics about mental models
+       * @returns {Object} Statistics
+       */
+      getStatistics() {
+        return {
+          projectEntries: Object.keys(this.projectMentalModel).length,
+          taskEntries: Object.keys(this.taskMentalModel).length,
+          totalEntries: Object.keys(this.projectMentalModel).length + Object.keys(this.taskMentalModel).length
+        };
+      }
+  
+      /**
+       * Search mental models
+       * @param {string} query - Search query
+       * @returns {Object} {project: [], task: []} - Matching entries
+       */
+      search(query) {
+        const queryLower = query.toLowerCase();
+        const results = {
+          project: [],
+          task: []
+        };
+  
+        // Search project mental model
+        for (const [key, note] of Object.entries(this.projectMentalModel)) {
+          if (key.toLowerCase().includes(queryLower) || note.toLowerCase().includes(queryLower)) {
+            results.project.push({ key, note });
+          }
+        }
+  
+        // Search task mental model
+        for (const [key, note] of Object.entries(this.taskMentalModel)) {
+          if (key.toLowerCase().includes(queryLower) || note.toLowerCase().includes(queryLower)) {
+            results.task.push({ key, note });
+          }
+        }
+  
+        return results;
+      }
+    }
+  
+    // Export to window.module
+    window.module = window.module || {};
+    window.module.MentalModelManager = MentalModelManager;
+  
+  })();
+
+  // ============================================================================
+  // src/ephemeral-content-manager.js
+  // ============================================================================
+
+  /**
+   * ephemeral-content-manager.js
+   *
+   * Manages ephemeral content that is shown temporarily and cleared after each AI message:
+   * - File contents from read_file
+   * - Directory listings from list_files
+   * - Search results from search operations
+   * - Git output from git_read
+   * - Project/task listings
+   *
+   * Based on: specs/PHASES.md, specs/MENTAL-MODEL-UPDATES.md
+   */
+  
+  (function() {
+    'use strict';
+  
+    const { MessageType } = window.module.ConversationState;
+  
+    /**
+     * EphemeralContentManager class
+     * Tracks and clears ephemeral content shown to AI
+     */
+    class EphemeralContentManager {
+      constructor() {
+        // Files shown ephemerally (Array<string> of file paths)
+        this.ephemeralFiles = [];
+  
+        // Other ephemeral content (Object with keys for different types)
+        this.ephemeralContent = {
+          git_read: [],           // Git command outputs
+          list_files: [],         // Directory listings
+          search_results: [],     // Search results
+          project_list: null,     // Project list
+          task_list: null,        // Task list for a project
+          task_messages: null,    // Messages from a task
+          change_details: []      // Full diffs from read_change
+        };
+      }
+  
+      /**
+       * Add file to ephemeral files list
+       * @param {string} filePath - File path that was read
+       * @returns {void}
+       */
+      addEphemeralFile(filePath) {
+        if (!this.ephemeralFiles.includes(filePath)) {
+          this.ephemeralFiles.push(filePath);
+        }
+      }
+  
+      /**
+       * Add git output to ephemeral content
+       * @param {string} command - Git command that was executed
+       * @param {string} output - Git command output
+       * @returns {void}
+       */
+      addGitOutput(command, output) {
+        this.ephemeralContent.git_read.push({ command, output });
+      }
+  
+      /**
+       * Add directory listing to ephemeral content
+       * @param {string} path - Directory path
+       * @param {Array} files - List of files
+       * @returns {void}
+       */
+      addDirectoryListing(path, files) {
+        this.ephemeralContent.list_files.push({ path, files });
+      }
+  
+      /**
+       * Add search results to ephemeral content
+       * @param {string} searchType - Type of search (by_name, by_content)
+       * @param {string} query - Search query
+       * @param {Array} results - Search results
+       * @returns {void}
+       */
+      addSearchResults(searchType, query, results) {
+        this.ephemeralContent.search_results.push({ searchType, query, results });
+      }
+  
+      /**
+       * Set project list (ephemeral)
+       * @param {Array} projects - List of projects
+       * @returns {void}
+       */
+      setProjectList(projects) {
+        this.ephemeralContent.project_list = projects;
+      }
+  
+      /**
+       * Set task list (ephemeral)
+       * @param {string} projectDir - Project directory
+       * @param {Array} tasks - List of tasks
+       * @returns {void}
+       */
+      setTaskList(projectDir, tasks) {
+        this.ephemeralContent.task_list = { projectDir, tasks };
+      }
+  
+      /**
+       * Set task messages (ephemeral)
+       * @param {string} taskName - Task name
+       * @param {Array} messages - Task messages
+       * @returns {void}
+       */
+      setTaskMessages(taskName, messages) {
+        this.ephemeralContent.task_messages = { taskName, messages };
+      }
+  
+      /**
+       * Add change details (full diff from read_change)
+       * @param {string} changeId - Change ID
+       * @param {string} diff - Full diff
+       * @returns {void}
+       */
+      addChangeDetails(changeId, diff) {
+        this.ephemeralContent.change_details.push({ changeId, diff });
+      }
+  
+      /**
+       * Check if there is any ephemeral content
+       * @returns {boolean} True if there is ephemeral content
+       */
+      hasEphemeralContent() {
+        return this.ephemeralFiles.length > 0 ||
+               this.ephemeralContent.git_read.length > 0 ||
+               this.ephemeralContent.list_files.length > 0 ||
+               this.ephemeralContent.search_results.length > 0 ||
+               this.ephemeralContent.project_list !== null ||
+               this.ephemeralContent.task_list !== null ||
+               this.ephemeralContent.task_messages !== null ||
+               this.ephemeralContent.change_details.length > 0;
+      }
+  
+      /**
+       * Clear all ephemeral content
+       * Called IMMEDIATELY after each AI message
+       * @returns {void}
+       */
+      clearAll() {
+        this.ephemeralFiles = [];
+        this.ephemeralContent = {
+          git_read: [],
+          list_files: [],
+          search_results: [],
+          project_list: null,
+          task_list: null,
+          task_messages: null,
+          change_details: []
+        };
+      }
+  
+      /**
+       * Get ephemeral files list
+       * @returns {Array<string>} List of file paths shown ephemerally
+       */
+      getEphemeralFiles() {
+        return this.ephemeralFiles;
+      }
+  
+      /**
+       * Get all ephemeral content
+       * @returns {Object} All ephemeral content
+       */
+      getAllEphemeralContent() {
+        return {
+          files: this.ephemeralFiles,
+          ...this.ephemeralContent
+        };
+      }
+  
+      /**
+       * Format ephemeral content for prompt
+       * Generates a section to include in AI prompt showing all ephemeral data
+       * @returns {string} Formatted ephemeral content section
+       */
+      formatForPrompt() {
+        if (!this.hasEphemeralContent()) {
+          return '';
+        }
+  
+        let content = '## Ephemeral Content (Cleared After Your Response)\n\n';
+        content += 'IMPORTANT: This content is temporary. Use update_mental_model to extract learnings.\n\n';
+  
+        // Ephemeral files
+        if (this.ephemeralFiles.length > 0) {
+          content += '### Files Read:\n';
+          for (const filePath of this.ephemeralFiles) {
+            content += `- ${filePath}\n`;
+          }
+          content += '\n';
+        }
+  
+        // Git outputs
+        if (this.ephemeralContent.git_read.length > 0) {
+          content += '### Git Operations:\n';
+          for (const { command, output } of this.ephemeralContent.git_read) {
+            content += `**Command:** \`${command}\`\n`;
+            content += '```\n' + output + '\n```\n\n';
+          }
+        }
+  
+        // Directory listings
+        if (this.ephemeralContent.list_files.length > 0) {
+          content += '### Directory Listings:\n';
+          for (const { path, files } of this.ephemeralContent.list_files) {
+            content += `**Path:** ${path}\n`;
+            content += '```\n' + files.map(f => `${f.type === 'directory' ? '[DIR]' : '[FILE]'} ${f.name}`).join('\n') + '\n```\n\n';
+          }
+        }
+  
+        // Search results
+        if (this.ephemeralContent.search_results.length > 0) {
+          content += '### Search Results:\n';
+          for (const { searchType, query, results } of this.ephemeralContent.search_results) {
+            content += `**Type:** ${searchType}, **Query:** "${query}"\n`;
+            content += `Found ${results.length} results\n\n`;
+          }
+        }
+  
+        // Project list
+        if (this.ephemeralContent.project_list !== null) {
+          content += '### Projects:\n';
+          for (const project of this.ephemeralContent.project_list) {
+            content += `- ${project.name} (${project.status})\n`;
+          }
+          content += '\n';
+        }
+  
+        // Task list
+        if (this.ephemeralContent.task_list !== null) {
+          const { projectDir, tasks } = this.ephemeralContent.task_list;
+          content += `### Tasks for ${projectDir}:\n`;
+          for (const task of tasks) {
+            content += `- ${task.name} (${task.status})\n`;
+          }
+          content += '\n';
+        }
+  
+        // Task messages
+        if (this.ephemeralContent.task_messages !== null) {
+          const { taskName, messages } = this.ephemeralContent.task_messages;
+          content += `### Messages from task "${taskName}":\n`;
+          content += `${messages.length} messages\n\n`;
+        }
+  
+        // Change details
+        if (this.ephemeralContent.change_details.length > 0) {
+          content += '### Change Details:\n';
+          for (const { changeId, diff } of this.ephemeralContent.change_details) {
+            content += `**Change ID:** ${changeId}\n`;
+            content += '```diff\n' + diff + '\n```\n\n';
+          }
+        }
+  
+        return content;
+      }
+  
+      /**
+       * Track ephemeral content from tool execution
+       * Called after a tool executes to register what content is ephemeral
+       * @param {string} toolName - Tool that was executed
+       * @param {Object} parameters - Tool parameters
+       * @param {*} result - Tool result
+       * @returns {void}
+       */
+      trackToolExecution(toolName, parameters, result) {
+        // Track read_file
+        if (toolName === 'read_file') {
+          this.addEphemeralFile(parameters.path);
+        }
+  
+        // Track git_read
+        else if (toolName === 'git_read') {
+          this.addGitOutput(parameters.command, result.output || '');
+        }
+  
+        // Track list_files
+        else if (toolName === 'list_files') {
+          this.addDirectoryListing(parameters.path, result.files || []);
+        }
+  
+        // Track search operations
+        else if (toolName === 'search_files_by_name') {
+          this.addSearchResults('by_name', parameters.pattern, result.results || []);
+        }
+        else if (toolName === 'search_files_by_content') {
+          this.addSearchResults('by_content', parameters.pattern, result.results || []);
+        }
+  
+        // Track list_projects
+        else if (toolName === 'list_projects') {
+          this.setProjectList(result.projects || []);
+        }
+  
+        // Track list_tasks_for_project
+        else if (toolName === 'list_tasks_for_project') {
+          this.setTaskList(parameters.projectDir, result.tasks || []);
+        }
+  
+        // Track read_task_messages
+        else if (toolName === 'read_task_messages') {
+          this.setTaskMessages(parameters.taskName, result.messages || []);
+        }
+  
+        // Track read_change
+        else if (toolName === 'read_change') {
+          this.addChangeDetails(parameters.changeId, result.diff || '');
+        }
+      }
+  
+      /**
+       * Check if a tool produces ephemeral content
+       * @param {string} toolName - Tool name
+       * @returns {boolean} True if tool produces ephemeral content
+       */
+      isEphemeralTool(toolName) {
+        const ephemeralTools = [
+          'read_file',
+          'git_read',
+          'list_files',
+          'search_files_by_name',
+          'search_files_by_content',
+          'list_projects',
+          'list_tasks_for_project',
+          'read_task_messages',
+          'read_change'
+        ];
+        return ephemeralTools.includes(toolName);
+      }
+    }
+  
+    // Export to window.module
+    window.module = window.module || {};
+    window.module.EphemeralContentManager = EphemeralContentManager;
+  
+  })();
+
+  // ============================================================================
+  // src/recent-changes-tracker.js
+  // ============================================================================
+
+  /**
+   * recent-changes-tracker.js
+   *
+   * Tracks recent file and git operations:
+   * - Records last 10 changes
+   * - Stores short diffs (<= 10 lines) inline
+   * - Tracks longer diffs by change ID for read_change tool
+   * - Change types: create, update, delete, move, git_commit
+   *
+   * Based on: specs/DATA-STRUCTURES.md, specs/PHASES.md
+   */
+  
+  (function() {
+    'use strict';
+  
+    const { ChangeType, createChangeEntry } = window.module.ConversationState;
+  
+    /**
+     * RecentChangesTracker class
+     * Maintains a rolling history of the last 10 operations
+     */
+    class RecentChangesTracker {
+      constructor() {
+        // Recent changes (last 10 operations)
+        this.changes = [];
+  
+        // Maximum number of changes to keep
+        this.maxChanges = 10;
+  
+        // Maximum lines for inline diff (>10 lines = use read_change)
+        this.maxInlineDiffLines = 10;
+      }
+  
+      /**
+       * Record a file creation
+       * @param {string} filePath - File that was created
+       * @param {string} content - File content
+       * @returns {string} Change ID
+       */
+      recordCreate(filePath, content) {
+        const lines = content.split('\n').length;
+        const diff = lines <= this.maxInlineDiffLines ? content : null;
+  
+        const change = createChangeEntry(
+          ChangeType.CREATE,
+          filePath,
+          `Created ${filePath}`,
+          lines,
+          diff
+        );
+  
+        this.addChange(change);
+        return change.id;
+      }
+  
+      /**
+       * Record a file update
+       * @param {string} filePath - File that was updated
+       * @param {string} oldContent - Original content
+       * @param {string} newContent - New content
+       * @returns {string} Change ID
+       */
+      recordUpdate(filePath, oldContent, newContent) {
+        // Generate diff
+        const diff = this.generateDiff(oldContent, newContent);
+        const diffLines = diff.split('\n').length;
+        const inlineDiff = diffLines <= this.maxInlineDiffLines ? diff : null;
+  
+        const change = createChangeEntry(
+          ChangeType.UPDATE,
+          filePath,
+          `Updated ${filePath}`,
+          diffLines,
+          inlineDiff
+        );
+  
+        // Store full diff if too long for inline
+        if (!inlineDiff) {
+          change.fullDiff = diff;
+        }
+  
+        this.addChange(change);
+        return change.id;
+      }
+  
+      /**
+       * Record a file deletion
+       * @param {string} filePath - File that was deleted
+       * @returns {string} Change ID
+       */
+      recordDelete(filePath) {
+        const change = createChangeEntry(
+          ChangeType.DELETE,
+          filePath,
+          `Deleted ${filePath}`,
+          0,
+          null
+        );
+  
+        this.addChange(change);
+        return change.id;
+      }
+  
+      /**
+       * Record a file move
+       * @param {string} fromPath - Original path
+       * @param {string} toPath - New path
+       * @returns {string} Change ID
+       */
+      recordMove(fromPath, toPath) {
+        const change = createChangeEntry(
+          ChangeType.MOVE,
+          fromPath,
+          `Moved ${fromPath} → ${toPath}`,
+          0,
+          null
+        );
+  
+        change.toPath = toPath;
+  
+        this.addChange(change);
+        return change.id;
+      }
+  
+      /**
+       * Record a git commit
+       * @param {string} message - Commit message
+       * @param {Array} files - Files in commit
+       * @returns {string} Change ID
+       */
+      recordGitCommit(message, files) {
+        const change = createChangeEntry(
+          ChangeType.GIT_COMMIT,
+          null,
+          `Commit: ${message}`,
+          files.length,
+          null
+        );
+  
+        change.commitMessage = message;
+        change.files = files;
+  
+        this.addChange(change);
+        return change.id;
+      }
+  
+      /**
+       * Add change to history (maintains max 10)
+       * @param {Object} change - Change entry
+       * @returns {void}
+       */
+      addChange(change) {
+        // Add to beginning of array
+        this.changes.unshift(change);
+  
+        // Keep only last 10
+        if (this.changes.length > this.maxChanges) {
+          this.changes = this.changes.slice(0, this.maxChanges);
+        }
+      }
+  
+      /**
+       * Get all recent changes
+       * @returns {Array} Recent changes (last 10)
+       */
+      getRecentChanges() {
+        return [...this.changes];
+      }
+  
+      /**
+       * Get change by ID (for read_change tool)
+       * @param {string} changeId - Change ID
+       * @returns {Object|null} Change entry with full diff
+       */
+      getChangeById(changeId) {
+        return this.changes.find(c => c.id === changeId) || null;
+      }
+  
+      /**
+       * Get full diff for a change
+       * @param {string} changeId - Change ID
+       * @returns {string|null} Full diff or null
+       */
+      getFullDiff(changeId) {
+        const change = this.getChangeById(changeId);
+        if (!change) {
+          return null;
+        }
+  
+        // If diff is inline, return it
+        if (change.diff) {
+          return change.diff;
+        }
+  
+        // If full diff is stored separately, return it
+        if (change.fullDiff) {
+          return change.fullDiff;
+        }
+  
+        return null;
+      }
+  
+      /**
+       * Generate simple diff between two strings
+       * @param {string} oldContent - Original content
+       * @param {string} newContent - New content
+       * @returns {string} Diff in unified format
+       */
+      generateDiff(oldContent, newContent) {
+        const oldLines = oldContent.split('\n');
+        const newLines = newContent.split('\n');
+  
+        let diff = '';
+        const maxLines = Math.max(oldLines.length, newLines.length);
+  
+        for (let i = 0; i < maxLines; i++) {
+          const oldLine = oldLines[i];
+          const newLine = newLines[i];
+  
+          if (oldLine !== newLine) {
+            if (oldLine !== undefined) {
+              diff += `- ${oldLine}\n`;
+            }
+            if (newLine !== undefined) {
+              diff += `+ ${newLine}\n`;
+            }
+          }
+        }
+  
+        return diff || '(no changes)';
+      }
+  
+      /**
+       * Format recent changes for prompt
+       * @returns {string} Formatted recent changes section
+       */
+      formatForPrompt() {
+        if (this.changes.length === 0) {
+          return '';
+        }
+  
+        let content = '## Recent Changes (Last 10 Operations)\n\n';
+  
+        for (const change of this.changes) {
+          content += `### ${change.description}\n`;
+          content += `**Type:** ${change.type} | **Time:** ${new Date(change.timestamp).toLocaleString()}\n`;
+  
+          // Show diff if available and inline
+          if (change.diff) {
+            content += '```diff\n' + change.diff + '\n```\n';
+          } else if (change.linesChanged > this.maxInlineDiffLines) {
+            content += `_Diff too long (${change.linesChanged} lines). Use read_change tool with ID: ${change.id}_\n`;
+          }
+  
+          // Show move details
+          if (change.type === ChangeType.MOVE && change.toPath) {
+            content += `**New path:** ${change.toPath}\n`;
+          }
+  
+          // Show git commit details
+          if (change.type === ChangeType.GIT_COMMIT) {
+            content += `**Files:** ${change.files ? change.files.length : 0}\n`;
+          }
+  
+          content += '\n';
+        }
+  
+        return content;
+      }
+  
+      /**
+       * Clear all changes
+       * @returns {void}
+       */
+      clearAll() {
+        this.changes = [];
+      }
+  
+      /**
+       * Get statistics
+       * @returns {Object} Statistics
+       */
+      getStatistics() {
+        const stats = {
+          total: this.changes.length,
+          byType: {}
+        };
+  
+        for (const type of Object.values(ChangeType)) {
+          stats.byType[type] = this.changes.filter(c => c.type === type).length;
+        }
+  
+        return stats;
+      }
+  
+      /**
+       * Export changes to JSON (for persistence)
+       * @returns {Array} Changes array
+       */
+      toJSON() {
+        return this.changes;
+      }
+  
+      /**
+       * Load changes from JSON
+       * @param {Array} changes - Changes array
+       * @returns {void}
+       */
+      fromJSON(changes) {
+        this.changes = Array.isArray(changes) ? changes : [];
+  
+        // Ensure we only keep last 10
+        if (this.changes.length > this.maxChanges) {
+          this.changes = this.changes.slice(0, this.maxChanges);
+        }
+      }
+  
+      /**
+       * Get changes for a specific file
+       * @param {string} filePath - File path
+       * @returns {Array} Changes for that file
+       */
+      getChangesForFile(filePath) {
+        return this.changes.filter(c => c.file === filePath);
+      }
+  
+      /**
+       * Get changes of a specific type
+       * @param {string} type - Change type
+       * @returns {Array} Changes of that type
+       */
+      getChangesByType(type) {
+        return this.changes.filter(c => c.type === type);
+      }
+  
+      /**
+       * Check if a file was recently changed
+       * @param {string} filePath - File path
+       * @param {number} withinMinutes - Time window in minutes (default: 30)
+       * @returns {boolean} True if file was recently changed
+       */
+      wasRecentlyChanged(filePath, withinMinutes = 30) {
+        const cutoff = Date.now() - (withinMinutes * 60 * 1000);
+  
+        return this.changes.some(c =>
+          c.file === filePath &&
+          new Date(c.timestamp).getTime() > cutoff
+        );
+      }
+    }
+  
+    // Export to window.module
+    window.module = window.module || {};
+    window.module.RecentChangesTracker = RecentChangesTracker;
+  
+  })();
+
+  // ============================================================================
   // src/response-parser.js
   // ============================================================================
 
@@ -11463,6 +12496,11 @@
                   } else if (key.startsWith('on')) {
                       const eventName = key.substring(2).toLowerCase();
                       el.addEventListener(eventName, vnode.props[key]);
+                  } else if (key === 'disabled' || key === 'checked' || key === 'selected') {
+                      // Boolean attributes - only set if truthy
+                      if (vnode.props[key]) {
+                          el.setAttribute(key, '');
+                      }
                   } else {
                       el.setAttribute(key, vnode.props[key]);
                   }
@@ -11788,7 +12826,11 @@
                               placeholder: state.sidebar.currentProject ? 'Type your message...' : 'Select a project to start...',
                               autocomplete: 'off',
                               rows: '1',
-                              disabled: !state.sidebar.currentProject || state.isProcessing
+                              disabled: (console.log('[render] Textarea disabled check:', {
+                                  currentProject: state.sidebar.currentProject,
+                                  isProcessing: state.isProcessing,
+                                  willDisable: !state.sidebar.currentProject || state.isProcessing
+                              }), !state.sidebar.currentProject || state.isProcessing)
                           }, text(''))
                   ])
               ]),
@@ -12847,6 +13889,324 @@
       window.module["render.js"] = {
           render
       };
+  })();
+
+  // ============================================================================
+  // src/ui/sidebar.js
+  // ============================================================================
+
+  /**
+   * sidebar.js
+   *
+   * Simplified sidebar rendering:
+   * - Projects (collapsable)
+   *   - Tasks (collapsable) with checklist items OR
+   *   - [PLANNING] indicator
+   */
+  
+  (function() {
+    'use strict';
+  
+    const { h, text } = window.module["vdom.js"];
+  
+    /**
+     * Render the entire sidebar
+     * @param {Object} state - Sidebar state
+     * @returns {VNode} Sidebar virtual node
+     */
+    function renderSidebar(state) {
+      const { projects, currentProject, currentTask, isMinimized, activeTab } = state;
+  
+      if (isMinimized) {
+        return renderMinimizedSidebar();
+      }
+  
+      return h('div', { id: 'sidebar', className: 'sidebar' }, [
+        renderSidebarHeader(activeTab || 'projects'),
+        activeTab === 'memory' ?
+          renderMemoryTab(currentProject, currentTask) :
+          renderProjectList(projects, currentProject, currentTask),
+        activeTab === 'projects' ? renderNewProjectButton() : null
+      ].filter(Boolean));
+    }
+  
+    /**
+     * Render sidebar header with tabs and minimize button
+     * @param {string} activeTab - Active tab ('projects' or 'memory')
+     * @returns {VNode} Header virtual node
+     */
+    function renderSidebarHeader(activeTab) {
+      return h('div', { className: 'sidebar-header' }, [
+        h('div', { className: 'sidebar-tabs' }, [
+          h('button', {
+            className: `sidebar-tab ${activeTab === 'projects' ? 'active' : ''}`,
+            onclick: () => window.module.uiControllerInstance.switchSidebarTab('projects')
+          }, text('PROJECTS')),
+          h('button', {
+            className: `sidebar-tab ${activeTab === 'memory' ? 'active' : ''}`,
+            onclick: () => window.module.uiControllerInstance.switchSidebarTab('memory')
+          }, text('MEMORY'))
+        ]),
+        h('button', {
+          className: 'minimize-btn',
+          onclick: () => window.module.uiControllerInstance.toggleSidebar(),
+          title: 'Minimize sidebar'
+        }, text('−'))
+      ]);
+    }
+  
+    /**
+     * Render minimized sidebar (just hamburger menu)
+     * @returns {VNode} Minimized sidebar virtual node
+     */
+    function renderMinimizedSidebar() {
+      return h('div', { id: 'sidebar', className: 'sidebar minimized' }, [
+        h('button', {
+          className: 'hamburger-btn',
+          onclick: () => window.module.uiControllerInstance.toggleSidebar(),
+          title: 'Show sidebar'
+        }, text('≡'))
+      ]);
+    }
+  
+    /**
+     * Render list of projects
+     * @param {Array} projects - All projects
+     * @param {string} currentProject - Current project directory
+     * @param {string} currentTask - Current task name
+     * @returns {VNode} Project list virtual node
+     */
+    function renderProjectList(projects, currentProject, currentTask) {
+      if (!projects || projects.length === 0) {
+        return h('div', { className: 'sidebar-content' }, [
+          h('div', { className: 'empty-state' }, text('No projects yet. Create your first project below.'))
+        ]);
+      }
+  
+      const projectNodes = projects.map(project =>
+        renderProject(project, project.projectDir === currentProject, currentTask)
+      );
+  
+      return h('div', { className: 'sidebar-content' }, projectNodes);
+    }
+  
+    /**
+     * Render a single project
+     * @param {Object} project - Project object
+     * @param {boolean} isCurrent - Is this the current project?
+     * @param {string} currentTask - Current task name
+     * @returns {VNode} Project virtual node
+     */
+    function renderProject(project, isCurrent, currentTask) {
+      const isExpanded = project.expanded !== false; // Default to expanded
+      const chevron = isExpanded ? '▼' : '▶';
+  
+      return h('div', {
+        className: `project ${isCurrent ? 'current' : ''} ${isExpanded ? 'expanded' : 'collapsed'}`
+      }, [
+        // Project header (clickable to expand/collapse)
+        h('div', {
+          className: 'project-header',
+          onclick: () => window.module.uiControllerInstance.toggleProject(project.projectDir)
+        }, [
+          h('span', { className: 'chevron' }, text(chevron + ' ')),
+          h('span', { className: 'project-name' }, text(project.name)),
+          isCurrent ? h('span', { className: 'current-indicator' }, text(' ● NOW')) : null
+        ].filter(Boolean)),
+  
+        // Show tasks OR planning indicator when expanded
+        isExpanded ? renderProjectContent(project, currentTask) : null
+      ].filter(Boolean));
+    }
+  
+    /**
+     * Render project content (tasks or planning indicator)
+     * @param {Object} project - Project object
+     * @param {string} currentTask - Current task name
+     * @returns {VNode|null} Project content virtual node
+     */
+    function renderProjectContent(project, currentTask) {
+      const tasks = project.tasks || [];
+  
+      // If there are tasks, show them
+      if (tasks.length > 0) {
+        return h('div', { className: 'project-tasks' },
+          tasks.map(task => renderTask(task, project.projectDir, task.name === currentTask))
+        );
+      }
+  
+      // Otherwise, show [PLANNING] indicator
+      return h('div', { className: 'planning-indicator' }, text('  [PLANNING]'));
+    }
+  
+    /**
+     * Render a single task with its checklist
+     * @param {Object} task - Task object
+     * @param {string} projectDir - Parent project directory
+     * @param {boolean} isCurrent - Is this the current task?
+     * @returns {VNode} Task virtual node
+     */
+    function renderTask(task, projectDir, isCurrent) {
+      // Default to expanded, but respect explicit collapse
+      const isExpanded = task.expanded !== false;
+      const chevron = isExpanded ? '▼' : '▶';
+  
+      return h('div', {
+        className: `task ${isCurrent ? 'current' : ''} ${task.complete ? 'complete' : ''} ${isExpanded ? 'expanded' : 'collapsed'}`
+      }, [
+        // Task header (collapsable)
+        h('div', {
+          className: 'task-header',
+          onclick: () => window.module.uiControllerInstance.toggleTask(projectDir, task.name)
+        }, [
+          h('span', { className: 'chevron' }, text(`  ${chevron} `)),
+          h('span', { className: 'task-name' }, text(task.name || task.description))
+        ]),
+  
+        // Checklist items (shown if expanded and task has checklist)
+        isExpanded && task.checklist ? renderChecklist(task.checklist) : null
+      ].filter(Boolean));
+    }
+  
+    /**
+     * Render checklist items for a task
+     * @param {Array} checklist - Array of checklist items
+     * @returns {VNode} Checklist virtual node
+     */
+    function renderChecklist(checklist) {
+      return h('div', { className: 'checklist' },
+        checklist.map((item, index) => renderChecklistItem(item, index))
+      );
+    }
+  
+    /**
+     * Render a single checklist item
+     * @param {Object} item - Checklist item
+     * @param {number} index - Item index
+     * @returns {VNode} Checklist item virtual node
+     */
+    function renderChecklistItem(item, index) {
+      const status = item.status || 'pending';
+      const isInProgress = status === 'in_progress';
+      const isComplete = status === 'completed' || status === 'complete';
+      const isFailed = status === 'failed';
+  
+      // Choose checkbox symbol based on status
+      let checkbox;
+      if (isComplete) {
+        checkbox = '[✓]';
+      } else if (isFailed) {
+        checkbox = '[✗]';
+      } else if (isInProgress) {
+        checkbox = '[~]';
+      } else {
+        checkbox = '[ ]';
+      }
+  
+      return h('div', {
+        className: `checklist-item ${status}`,
+        key: `item-${index}`
+      }, [
+        h('span', { className: 'checkbox' }, text(`    ${checkbox} `)),
+        h('span', { className: 'item-text' }, text(item.short_desc || item.detailed_desc))
+      ]);
+    }
+  
+    /**
+     * Render new project button
+     * @returns {VNode} New project button virtual node
+     */
+    function renderNewProjectButton() {
+      return h('div', { className: 'sidebar-footer' }, [
+        h('button', {
+          className: 'new-project-btn',
+          onclick: () => window.module.uiControllerInstance.showCreateProjectModal()
+        }, text('+ New Project'))
+      ]);
+    }
+  
+    /**
+     * Render memory tab showing mental model
+     * @param {string} currentProject - Current project directory
+     * @param {string} currentTask - Current task name
+     * @returns {VNode} Memory tab content
+     */
+    function renderMemoryTab(currentProject, currentTask) {
+      // Get mental model from the app
+      const app = window.CodeBossApp;
+      if (!app || !app.components.mentalModelManager) {
+        return h('div', { className: 'sidebar-content' }, [
+          h('div', { className: 'empty-state' }, text('Mental model not available'))
+        ]);
+      }
+  
+      if (!currentProject) {
+        return h('div', { className: 'sidebar-content' }, [
+          h('div', { className: 'empty-state' }, text('Select a project to view mental model'))
+        ]);
+      }
+  
+      const projectModel = app.components.mentalModelManager.getProjectMentalModel();
+      const taskModel = app.components.mentalModelManager.getTaskMentalModel();
+  
+      const sections = [];
+  
+      // Project Mental Model
+      if (Object.keys(projectModel).length > 0) {
+        const entries = Object.entries(projectModel);
+        sections.push(
+          h('div', { className: 'memory-section' }, [
+            h('div', { className: 'memory-section-title' }, text('Project Mental Model')),
+            h('div', { className: 'memory-section-content' },
+              h('ul', { className: 'insight-list' },
+                entries.map(([key, note]) =>
+                  h('li', { className: 'insight-item' }, [
+                    h('span', { className: 'insight-key' }, text(key + ': ')),
+                    h('span', { className: 'insight-note' }, text(note))
+                  ])
+                )
+              )
+            )
+          ])
+        );
+      }
+  
+      // Task Mental Model (if there's a current task)
+      if (currentTask && Object.keys(taskModel).length > 0) {
+        const entries = Object.entries(taskModel);
+        sections.push(
+          h('div', { className: 'memory-section' }, [
+            h('div', { className: 'memory-section-title' }, text('Task Mental Model')),
+            h('div', { className: 'memory-section-content' },
+              h('ul', { className: 'insight-list' },
+                entries.map(([key, note]) =>
+                  h('li', { className: 'insight-item' }, [
+                    h('span', { className: 'insight-key' }, text(key + ': ')),
+                    h('span', { className: 'insight-note' }, text(note))
+                  ])
+                )
+              )
+            )
+          ])
+        );
+      }
+  
+      // Empty state
+      if (sections.length === 0) {
+        return h('div', { className: 'sidebar-content' }, [
+          h('div', { className: 'empty-state' }, text('No mental model entries yet. Mental models are built as the AI learns about your project.'))
+        ]);
+      }
+  
+      return h('div', { className: 'sidebar-content memory-content' }, sections);
+    }
+  
+    // Export
+    window.module = window.module || {};
+    window.module["sidebar.js"] = {
+      renderSidebar
+    };
+  
   })();
 
   // ============================================================================
@@ -14101,6 +15461,7 @@
   
           // Update UI with all changes at once
           const messages = app.components.conversationManager.getMessages();
+          console.log('[UIController] selectProject - Updating UI with currentProject:', projectDir);
           this.updateUI({
             messages,
             sidebar: {
@@ -14111,6 +15472,7 @@
             currentProject: projectDir,
             currentTask: null
           });
+          console.log('[UIController] selectProject - After updateUI, sidebar.currentProject:', this.state.sidebar.currentProject);
   
         } catch (error) {
           console.error('[UIController] Failed to select project:', error);
