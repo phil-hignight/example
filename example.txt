@@ -5,7 +5,7 @@
  * Uses File System Access API for file operations.
  *
  * @version 1.0.0-browser
- * @generated 2025-11-14T15:54:07.665Z
+ * @generated 2025-11-14T16:40:10.386Z
  * @license MIT
  *
  * Usage:
@@ -14,7 +14,7 @@
  *   3. Paste this entire script
  *   4. Follow prompts to select working directory
  *
- * Files bundled: 52
+ * Files bundled: 53
  * Total size: [calculated at build time]
  */
 
@@ -12806,10 +12806,8 @@
               isMinimized: false
           }) : null;
   
-          // Render modals if modal module is available
-          const { renderCreateProjectModal, renderFileContentModal } = window.module["modal.js"] || {};
-          const createProjectModalNode = renderCreateProjectModal ? renderCreateProjectModal(state.modal) : null;
-          const fileContentModalNode = renderFileContentModal ? renderFileContentModal(state.modal) : null;
+          // NOTE: Modals are now rendered directly to body by UIController.renderModals()
+          // This prevents morphdom from interfering with modal show/hide
   
           return h('div', { id: 'chat-screen', className: 'screen' }, [
               // Sidebar (left panel)
@@ -12839,11 +12837,7 @@
                               }), !state.sidebar.currentProject || state.isProcessing)
                           }, text(''))
                   ])
-              ]),
-  
-              // Modals (overlay on top)
-              createProjectModalNode,
-              fileContentModalNode
+              ])
           ].filter(Boolean));
       }
   
@@ -14226,6 +14220,167 @@
   })();
 
   // ============================================================================
+  // src/ui/modal.js
+  // ============================================================================
+
+  /**
+   * modal.js
+   *
+   * Modal dialogs for UI interactions:
+   * - Project creation modal
+   * - Future: File content viewer, confirmations, etc.
+   */
+  
+  (function() {
+    'use strict';
+  
+    const { h, text } = window.module["vdom.js"];
+  
+    /**
+     * Render create project modal
+     * @param {Object} modalState - Modal state
+     * @returns {VNode|null} Modal virtual node or null if not shown
+     */
+    function renderCreateProjectModal(modalState) {
+      if (!modalState || !modalState.showCreateProject) {
+        return null;
+      }
+  
+      return h('div', { className: 'modal-overlay', onclick: () => window.module.uiControllerInstance.closeModal() }, [
+        h('div', {
+          className: 'modal-content',
+          onclick: (e) => e.stopPropagation() // Prevent closing when clicking inside modal
+        }, [
+          // Modal header
+          h('div', { className: 'modal-header' }, [
+            h('h2', { className: 'modal-title' }, text('Create New Project')),
+            h('button', {
+              className: 'modal-close-btn',
+              onclick: () => window.module.uiControllerInstance.closeModal(),
+              title: 'Close'
+            }, text('✕'))
+          ]),
+  
+          // Modal body
+          h('div', { className: 'modal-body' }, [
+            // Project name field
+            h('div', { className: 'form-field' }, [
+              h('label', { for: 'project-name-input', className: 'form-label' }, text('Project Name:')),
+              h('input', {
+                type: 'text',
+                id: 'project-name-input',
+                className: 'form-input',
+                placeholder: 'My Project',
+                autocomplete: 'off',
+                value: modalState.projectName || ''
+              }, text(''))
+            ]),
+  
+            // Project description field
+            h('div', { className: 'form-field' }, [
+              h('label', { for: 'project-desc-input', className: 'form-label' }, text('Description (optional):')),
+              h('textarea', {
+                id: 'project-desc-input',
+                className: 'form-textarea',
+                placeholder: 'Brief description of the project...',
+                rows: '3',
+                value: modalState.projectDescription || ''
+              }, text(''))
+            ]),
+  
+            // Error message
+            modalState.error ? h('div', { className: 'form-error' }, text(modalState.error)) : null
+          ].filter(Boolean)),
+  
+          // Modal footer
+          h('div', { className: 'modal-footer' }, [
+            h('button', {
+              className: 'btn btn-secondary',
+              onclick: () => window.module.uiControllerInstance.closeModal()
+            }, text('Cancel')),
+            h('button', {
+              className: 'btn btn-primary',
+              onclick: () => window.module.uiControllerInstance.createProject()
+            }, text('Create'))
+          ])
+        ])
+      ]);
+    }
+  
+    /**
+     * Render file content modal (for viewing full tool results)
+     * @param {Object} modalState - Modal state
+     * @returns {VNode|null} Modal virtual node or null if not shown
+     */
+    function renderFileContentModal(modalState) {
+      if (!modalState || !modalState.showFileContent) {
+        return null;
+      }
+  
+      const { fileName, content } = modalState;
+  
+      return h('div', { className: 'modal-overlay', onclick: () => window.module.uiControllerInstance.closeModal() }, [
+        h('div', {
+          className: 'modal-content modal-large',
+          onclick: (e) => e.stopPropagation()
+        }, [
+          // Modal header
+          h('div', { className: 'modal-header' }, [
+            h('h2', { className: 'modal-title' }, text(`📄 ${fileName}`)),
+            h('button', {
+              className: 'btn btn-secondary',
+              onclick: () => window.module.uiControllerInstance.copyToClipboard(content)
+            }, text('Copy')),
+            h('button', {
+              className: 'modal-close-btn',
+              onclick: () => window.module.uiControllerInstance.closeModal(),
+              title: 'Close'
+            }, text('✕'))
+          ]),
+  
+          // Modal body with file content
+          h('div', { className: 'modal-body' }, [
+            h('pre', { className: 'file-content-viewer' }, [
+              h('code', {}, text(content || ''))
+            ])
+          ]),
+  
+          // Modal footer
+          h('div', { className: 'modal-footer' }, [
+            h('button', {
+              className: 'btn btn-primary',
+              onclick: () => window.module.uiControllerInstance.closeModal()
+            }, text('Close'))
+          ])
+        ])
+      ]);
+    }
+  
+    /**
+     * Escape string for use in HTML attribute
+     * @param {string} str - String to escape
+     * @returns {string} Escaped string
+     */
+    function escapeForAttribute(str) {
+      if (!str) return '';
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+  
+    // Export
+    window.module = window.module || {};
+    window.module["modal.js"] = {
+      renderCreateProjectModal,
+      renderFileContentModal
+    };
+  
+  })();
+
+  // ============================================================================
   // src/ui/ui-injector.js
   // ============================================================================
 
@@ -15125,6 +15280,9 @@
           window.morphdom(container.firstChild, newDOM);
         }
   
+        // After main DOM update, handle modals separately (outside morphdom tree)
+        this.renderModals();
+  
         // After DOM update, handle scroll and event listeners
         if (this.state.currentScreen === 'chat') {
           // Re-attach event listeners that may have been lost during morph
@@ -15140,6 +15298,48 @@
         } else if (this.state.currentScreen === 'welcome') {
           // Re-attach welcome screen event listeners
           this.attachWelcomeEventListeners();
+        }
+      }
+  
+      /**
+       * Render modals directly to body (outside morphdom tree)
+       * This ensures modals appear/disappear reliably without morphdom interference
+       * @private
+       */
+      renderModals() {
+        const { renderCreateProjectModal, renderFileContentModal } = window.module["modal.js"] || {};
+        const { createDOMNode } = window.module["vdom.js"];
+  
+        if (!renderCreateProjectModal || !renderFileContentModal || !createDOMNode) {
+          return;
+        }
+  
+        // Render create project modal
+        const createProjectModalNode = renderCreateProjectModal(this.state.modal);
+        const existingCreateProjectModal = document.querySelector('.modal-overlay.create-project-modal');
+  
+        if (createProjectModalNode && !existingCreateProjectModal) {
+          // Modal should be shown but doesn't exist - add it
+          const modalDOM = createDOMNode(createProjectModalNode);
+          modalDOM.classList.add('create-project-modal'); // Add identifier class
+          document.body.appendChild(modalDOM);
+        } else if (!createProjectModalNode && existingCreateProjectModal) {
+          // Modal shouldn't be shown but exists - remove it
+          existingCreateProjectModal.remove();
+        }
+  
+        // Render file content modal
+        const fileContentModalNode = renderFileContentModal(this.state.modal);
+        const existingFileContentModal = document.querySelector('.modal-overlay.file-content-modal');
+  
+        if (fileContentModalNode && !existingFileContentModal) {
+          // Modal should be shown but doesn't exist - add it
+          const modalDOM = createDOMNode(fileContentModalNode);
+          modalDOM.classList.add('file-content-modal'); // Add identifier class
+          document.body.appendChild(modalDOM);
+        } else if (!fileContentModalNode && existingFileContentModal) {
+          // Modal shouldn't be shown but exists - remove it
+          existingFileContentModal.remove();
         }
       }
   
