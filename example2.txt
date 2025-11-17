@@ -1,118 +1,127 @@
-// Simple test script for the AI API (Production)
-// Paste this directly into the browser console
+// AI Agent - Built 2025-11-17T18:38:40.391Z
+(function() {
+  window.module = {};
 
-(async () => {
-  // Get auth token from localStorage
-  const authToken = localStorage.getItem('token');
-
-  const apiUrl = '/api/chat/completions';
-
-  console.log('=== API Configuration ===');
-  console.log('API URL:', apiUrl);
-  console.log('Auth token present:', !!authToken);
-  if (authToken) {
-    console.log('Token (first 20 chars):', authToken.substring(0, 20) + '...');
-  } else {
-    console.warn('WARNING: No auth token found in localStorage["token"]');
-  }
-  console.log('');
-
-  const requestBody = {
-    stream: true,
-    model: 'Anthropic Claude 4 Sonnet',
-    messages: [
-      {
-        role: 'user',
-        content: 'Hello! Please respond with a simple greeting.'
-      }
-    ],
-    params: {},
-    features: {
-      web_search: false
-    },
-    session_id: 'test-session-' + Math.random().toString(36).substr(2, 9),
-    id: 'msg-' + Date.now() + '-assistant',
-    background_tasks: {
-      title_generation: false,
-      tags_generation: false
-    }
-  };
-
-  console.log('=== Request Details ===');
-  console.log('Request body:', JSON.stringify(requestBody, null, 2));
-
-  try {
-    // Build headers with auth token
-    const headers = {
-      'Content-Type': 'application/json'
-    };
-
-    if (authToken) {
-      headers['Authorization'] = `Bearer ${authToken}`;
-    }
-
-    console.log('Headers:', Object.keys(headers));
-    console.log('');
-
-    const response = await fetch(apiUrl, {
-      method: 'POST',
-      headers: headers,
-      body: JSON.stringify(requestBody)
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error(`API request failed (${response.status}):`, errorText);
-      return;
-    }
-
-    console.log('Response received, reading stream...');
-
-    // Read streaming response
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let finalContent = '';
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      const chunk = decoder.decode(value);
-      const lines = chunk.split('\n');
-
-      for (const line of lines) {
-        if (line.startsWith('data: ')) {
-          const data = line.slice(6).trim();
-          if (data === '[DONE]') {
-            console.log('Stream complete (received [DONE])');
-            continue;
-          }
-
-          if (!data) continue;
-
-          try {
-            const parsed = JSON.parse(data);
-            // Extract text content from OpenAI-style streaming
-            if (parsed.choices && parsed.choices[0] &&
-                parsed.choices[0].delta && parsed.choices[0].delta.content) {
-              const content = parsed.choices[0].delta.content;
-              finalContent += content;
-              // Print chunks as they arrive (browser-safe)
-              console.log('[Chunk]', content);
+  // Module: main.js
+  // Main entry point for the app
+  window.module['main.js'] = {
+    run: async function() {
+      const output = document.getElementById('output');
+  
+      output.textContent = 'Hello from the AI UI app!\n\n';
+      output.textContent += 'Starting API test...\n';
+  
+      try {
+        // Get auth token from localStorage (simulate production)
+        const authToken = localStorage.getItem('token');
+  
+        if (!authToken) {
+          output.textContent += '\nWARNING: No auth token found. Setting a test token...\n';
+          localStorage.setItem('token', 'test-token-123');
+        }
+  
+        const apiUrl = '/api/chat/completions';
+  
+        const requestBody = {
+          stream: true,
+          model: 'Anthropic Claude 4 Sonnet',
+          messages: [
+            {
+              role: 'user',
+              content: 'Say hello and tell me a short joke!'
             }
-          } catch (e) {
-            console.warn('Error parsing SSE data:', e);
+          ],
+          params: {},
+          features: {
+            web_search: false
+          },
+          session_id: 'test-session-' + Math.random().toString(36).substr(2, 9),
+          id: 'msg-' + Date.now() + '-assistant',
+          background_tasks: {
+            title_generation: false,
+            tags_generation: false
+          }
+        };
+  
+        output.textContent += '\nSending request to: ' + apiUrl + '\n';
+        output.textContent += 'Request: ' + JSON.stringify(requestBody.messages[0], null, 2) + '\n\n';
+  
+        const headers = {
+          'Content-Type': 'application/json'
+        };
+  
+        const token = localStorage.getItem('token');
+        if (token) {
+          headers['Authorization'] = `Bearer ${token}`;
+        }
+  
+        const response = await fetch(apiUrl, {
+          method: 'POST',
+          headers: headers,
+          body: JSON.stringify(requestBody)
+        });
+  
+        if (!response.ok) {
+          const errorText = await response.text();
+          output.textContent += `\nERROR: API request failed (${response.status}): ${errorText}\n`;
+          return;
+        }
+  
+        output.textContent += 'Response received! Streaming...\n';
+        output.textContent += '---\n';
+  
+        // Read streaming response
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let finalContent = '';
+  
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+  
+          const chunk = decoder.decode(value);
+          const lines = chunk.split('\n');
+  
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              const data = line.slice(6).trim();
+              if (data === '[DONE]') {
+                continue;
+              }
+  
+              if (!data) continue;
+  
+              try {
+                const parsed = JSON.parse(data);
+                if (parsed.choices && parsed.choices[0] &&
+                    parsed.choices[0].delta && parsed.choices[0].delta.content) {
+                  const content = parsed.choices[0].delta.content;
+                  finalContent += content;
+                  output.textContent += content;
+                }
+              } catch (e) {
+                console.warn('Error parsing SSE data:', e);
+              }
+            }
           }
         }
+  
+        output.textContent += '\n---\n';
+        output.textContent += '\nAPI test completed successfully!';
+        output.textContent += '\nTotal characters received: ' + finalContent.length;
+  
+      } catch (error) {
+        output.textContent += '\n\nERROR: ' + error.message;
+        console.error('Error:', error);
       }
     }
+  };
+  
 
-    console.log('\n\n=== FINAL RESPONSE ===');
-    console.log(finalContent);
-    console.log('\n=== RESPONSE LENGTH ===');
-    console.log(finalContent.length, 'characters');
-
-  } catch (error) {
-    console.error('Error:', error);
+  // Run main module
+  if (window.module['main.js']) {
+    window.module['main.js'].run();
+  } else {
+    console.error('Error: main.js module not found');
   }
 })();
