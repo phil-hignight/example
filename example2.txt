@@ -1,0 +1,94 @@
+// Simple test script for the AI API
+// Paste this directly into the browser console
+
+(async () => {
+  const apiUrl = '/completions'; // Change to '/api/chat/completions' if needed
+
+  const requestBody = {
+    stream: true,
+    model: 'Anthropic Claude 4 Sonnet', // Adjust model name as needed
+    messages: [
+      {
+        role: 'user',
+        content: 'Hello! Please respond with a simple greeting.'
+      }
+    ],
+    params: {},
+    features: {
+      web_search: false
+    },
+    session_id: 'test-session-' + Math.random().toString(36).substr(2, 9),
+    id: 'msg-' + Date.now() + '-assistant',
+    background_tasks: {
+      title_generation: false,
+      tags_generation: false
+    }
+  };
+
+  console.log('Sending request to:', apiUrl);
+  console.log('Request body:', JSON.stringify(requestBody, null, 2));
+
+  try {
+    const response = await fetch(apiUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(requestBody)
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error(`API request failed (${response.status}):`, errorText);
+      return;
+    }
+
+    console.log('Response received, reading stream...');
+
+    // Read streaming response
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let finalContent = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      const chunk = decoder.decode(value);
+      const lines = chunk.split('\n');
+
+      for (const line of lines) {
+        if (line.startsWith('data: ')) {
+          const data = line.slice(6).trim();
+          if (data === '[DONE]') {
+            console.log('Stream complete (received [DONE])');
+            continue;
+          }
+
+          if (!data) continue;
+
+          try {
+            const parsed = JSON.parse(data);
+            // Extract text content from OpenAI-style streaming
+            if (parsed.choices && parsed.choices[0] &&
+                parsed.choices[0].delta && parsed.choices[0].delta.content) {
+              const content = parsed.choices[0].delta.content;
+              finalContent += content;
+              process.stdout.write(content); // Print chunks as they arrive
+            }
+          } catch (e) {
+            console.warn('Error parsing SSE data:', e);
+          }
+        }
+      }
+    }
+
+    console.log('\n\n=== FINAL RESPONSE ===');
+    console.log(finalContent);
+    console.log('\n=== RESPONSE LENGTH ===');
+    console.log(finalContent.length, 'characters');
+
+  } catch (error) {
+    console.error('Error:', error);
+  }
+})();
