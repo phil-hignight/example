@@ -97,7 +97,8 @@
                 parsed.choices[0].delta && parsed.choices[0].delta.content) {
               const content = parsed.choices[0].delta.content;
               finalContent += content;
-              process.stdout.write(content); // Print chunks as they arrive
+              // Print chunks as they arrive (browser-safe)
+              console.log('[Chunk]', content);
             }
           } catch (e) {
             console.warn('Error parsing SSE data:', e);
