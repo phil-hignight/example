@@ -5,7 +5,7 @@
   // Get auth token from localStorage
   const authToken = localStorage.getItem('token');
 
-  const apiUrl = '/completions';
+  const apiUrl = '/api/chat/completions';
 
   console.log('=== API Configuration ===');
   console.log('API URL:', apiUrl);
