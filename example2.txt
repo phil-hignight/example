@@ -1,12 +1,25 @@
-// Simple test script for the AI API
+// Simple test script for the AI API (Production)
 // Paste this directly into the browser console
 
 (async () => {
-  const apiUrl = '/completions'; // Change to '/api/chat/completions' if needed
+  // Get auth token from localStorage
+  const authToken = localStorage.getItem('token');
+
+  const apiUrl = '/completions';
+
+  console.log('=== API Configuration ===');
+  console.log('API URL:', apiUrl);
+  console.log('Auth token present:', !!authToken);
+  if (authToken) {
+    console.log('Token (first 20 chars):', authToken.substring(0, 20) + '...');
+  } else {
+    console.warn('WARNING: No auth token found in localStorage["token"]');
+  }
+  console.log('');
 
   const requestBody = {
     stream: true,
-    model: 'Anthropic Claude 4 Sonnet', // Adjust model name as needed
+    model: 'Anthropic Claude 4 Sonnet',
     messages: [
       {
         role: 'user',
@@ -25,15 +38,25 @@
     }
   };
 
-  console.log('Sending request to:', apiUrl);
+  console.log('=== Request Details ===');
   console.log('Request body:', JSON.stringify(requestBody, null, 2));
 
   try {
+    // Build headers with auth token
+    const headers = {
+      'Content-Type': 'application/json'
+    };
+
+    if (authToken) {
+      headers['Authorization'] = `Bearer ${authToken}`;
+    }
+
+    console.log('Headers:', Object.keys(headers));
+    console.log('');
+
     const response = await fetch(apiUrl, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
+      headers: headers,
       body: JSON.stringify(requestBody)
     });
 
