@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-20T22:20:39.398Z
+// AI Agent - Built 2025-11-20T22:55:05.457Z
 (function() {
   window.module = {};
 
@@ -617,7 +617,7 @@
     },
   
     // Truncate tool output if it exceeds size limit
-    truncateToolOutput: function(content, toolName, maxTokens = 250) {
+    truncateToolOutput: function(content, toolName, maxTokens = 100) {
       const diagnostics = window.module['diagnostics.js'];
       const state = window.module['state.js'];
       const limit = state.getContextLimit();
@@ -638,7 +638,7 @@
         limit: maxChars
       });
   
-      return truncated + `\n\n[... Content truncated - ${remainingTokens} more tokens (${remaining} chars) omitted. The output was too large to include in full. If you didn't find what you needed in the visible portion, try using more specific parameters to narrow down the results (e.g., search in a specific subdirectory, use a more specific filename pattern, or search for more specific text).]`;
+      return truncated + `\n\n[Truncated: ${remainingTokens} more tokens omitted. Use more specific search parameters.]`;
     },
   
     // Execute tools (unified handler for all tools) - UI-independent
@@ -1851,8 +1851,24 @@
       const state = window.module['state.js'];
       const ui = window.module['ui.js'];
       const core = window.module['core.js'];
+      const diagnostics = window.module['diagnostics.js'];
   
       const selectedDirectory = state.getState().selectedDirectory;
+  
+      // Check if context exceeds limit BEFORE calling API
+      const currentTokens = state.calculateTokens();
+      const limit = state.getContextLimit();
+      if (currentTokens > limit) {
+        diagnostics.log('context', `[Main] Context exceeds limit before API call (${currentTokens} > ${limit}), compacting...`);
+        diagnostics.handleError('CONTEXT_LIMIT_EXCEEDED', {
+          currentTokens: currentTokens,
+          limit: limit,
+          messageCount: state.getMessages().length
+        });
+        await this.compactContext();
+        ui.renderMessages(state.getMessages());
+        ui.updateContextStats();
+      }
   
       // Use core.js for UI-independent processing
       await core.processAIResponse(
@@ -2848,41 +2864,11 @@
         return;
       }
   
-      // Calculate target: remove messages until we're at 50% of limit or less
-      const limit = state.getContextLimit();
-      const targetTokens = Math.floor(limit * 0.5);
-      const currentTokens = tokensBefore;
+      // Get ALL real (non-uiOnly) messages to summarize
+      const messagesToSummarize = messages.filter(m => !m.uiOnly);
   
-      diagnostics.log('compaction', '[Main] Current tokens: ' + currentTokens + ' / Limit: ' + limit);
-      diagnostics.log('compaction', '[Main] Target after compaction: ' + targetTokens + ' tokens (50% of limit)');
-  
-      // Remove messages from the front until we reach target
-      let splitIndex = firstRealMessageIndex;
-      let tokensAfterSplit = currentTokens;
-  
-      for (let i = firstRealMessageIndex; i < messages.length; i++) {
-        if (messages[i].uiOnly) continue;
-  
-        // Calculate tokens if we remove up to this message
-        const remainingMessages = messages.slice(i + 1);
-        tokensAfterSplit = state.calculateTokens(remainingMessages);
-  
-        splitIndex = i;
-  
-        // Stop if we've reached our target
-        if (tokensAfterSplit <= targetTokens) {
-          break;
-        }
-      }
-  
-      const messagesToRemove = splitIndex - firstRealMessageIndex + 1;
-      diagnostics.log('compaction', '[Main] Removing ' + messagesToRemove + ' messages (up to index ' + splitIndex + ')');
-      diagnostics.log('compaction', '[Main] Tokens after removal: ' + tokensAfterSplit);
-  
-      // Get messages to summarize (from first real message to split point)
-      const messagesToSummarize = messages.slice(firstRealMessageIndex, splitIndex + 1);
-  
-      diagnostics.log('compaction', '[Main] Summarizing ' + messagesToSummarize.length + ' messages');
+      diagnostics.log('compaction', '[Main] Summarizing ALL ' + messagesToSummarize.length + ' messages');
+      diagnostics.log('compaction', '[Main] Current tokens: ' + tokensBefore);
   
       // Create summarization request
       const summarizationMessages = [
@@ -2920,23 +2906,22 @@
         const summaryContent = response.parsed.content;
         diagnostics.log('compaction', '[Main] Received summary: ' + summaryContent.substring(0, 100) + '...');
   
-        // Mark messages before the split as UI-only (keep them visible in UI, exclude from API)
-        const messagesBeforeSummary = messages.slice(firstRealMessageIndex, splitIndex + 1).map(msg => ({
+        // Mark ALL old messages as UI-only (keep them visible in UI, exclude from API)
+        const oldMessages = messages.slice(firstRealMessageIndex).map(msg => ({
           ...msg,
           uiOnly: true
         }));
   
-        // Keep all messages but mark old ones as uiOnly and insert summary
+        // Keep all messages but mark ALL old ones as uiOnly and insert summary
         const newMessages = [
           ...messages.slice(0, firstRealMessageIndex),
-          ...messagesBeforeSummary,
+          ...oldMessages,
           {
             role: 'summary',
             content: summaryContent,
             timestamp: Date.now(),
             uiOnly: true  // Summary is UI-only, actual content goes in system prompt
-          },
-          ...messages.slice(splitIndex + 1)
+          }
         ];
   
         // Update state with new message array
@@ -3260,7 +3245,7 @@
   
         /* Messages */
         .message {
-          margin-bottom: 20px;
+          margin-bottom: 8px;
         }
   
         .message:first-child {
@@ -3420,27 +3405,27 @@
   
         /* Tool Group Container */
         .tool-group {
-          margin-bottom: 12px;
+          margin-bottom: 8px;
         }
   
         /* Tool Use Messages (before execution) */
         .tool-use-message {
           color: var(--color-text-secondary);
-          padding: 4px 12px;
+          padding: 0px 12px;
           background: rgba(212, 160, 23, 0.08);
           border-left: 3px solid rgba(212, 160, 23, 0.5);
           border-radius: 4px;
           cursor: pointer;
           transition: all 0.2s ease;
           font-size: 13px;
-          line-height: 1.4;
+          line-height: 1.2;
         }
   
         /* When in a group, remove individual border radius and add top border */
         .tool-group .tool-use-message {
           border-radius: 0;
           margin-bottom: 0;
-          border-top: 1px solid var(--color-border);
+          border-top: 0.5px solid rgba(64, 64, 64, 0.3);
         }
   
         /* First child in group gets top rounded corners and no top border */
@@ -3473,21 +3458,21 @@
         /* Tool Result Messages (after execution) */
         .tool-result-message {
           color: var(--color-text-secondary);
-          padding: 4px 12px;
+          padding: 0px 12px;
           background: rgba(76, 175, 80, 0.08);
           border-left: 3px solid rgba(76, 175, 80, 0.5);
           border-radius: 4px;
           cursor: pointer;
           transition: all 0.2s ease;
           font-size: 13px;
-          line-height: 1.4;
+          line-height: 1.2;
         }
   
         /* When in a group, remove individual border radius and add top border */
         .tool-group .tool-result-message {
           border-radius: 0;
           margin-bottom: 0;
-          border-top: 1px solid var(--color-border);
+          border-top: 0.5px solid rgba(64, 64, 64, 0.3);
         }
   
         /* First child in group gets top rounded corners and no top border */
