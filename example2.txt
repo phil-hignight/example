@@ -1,139 +1,2958 @@
-// AI Agent - Built 2025-11-17T18:42:39.414Z
+// AI Agent - Built 2025-11-20T02:08:01.129Z
 (function() {
   window.module = {};
 
-  // Module: main.js
-  // Main entry point for the app
-  window.module['main.js'] = {
-    run: async function() {
-      // Clear existing page content
-      document.body.innerHTML = '';
+  // Module: api.js
+  // API communication
+  window.module['api.js'] = {
+    // Render messages for API - simplified version
+    renderMessagesForAPI: function(messages) {
+      const tools = window.module['tools.js'];
+      const state = window.module['state.js'];
   
-      // Create container
-      const container = document.createElement('div');
-      container.id = 'ai-agent-container';
-      container.style.cssText = 'width: 100%; max-width: 800px; margin: 50px auto; padding: 20px; font-family: monospace;';
+      console.log('[API] Total messages:', messages.length);
   
-      // Create title
-      const title = document.createElement('h1');
-      title.textContent = 'AI Agent';
-      title.style.cssText = 'color: #333; margin-bottom: 20px;';
-      container.appendChild(title);
+      // Filter out UI-only messages
+      const apiMessages = messages.filter(msg => !msg.uiOnly);
   
-      // Create output div
-      const output = document.createElement('div');
-      output.id = 'output';
-      output.style.cssText = 'white-space: pre-wrap; font-size: 14px; line-height: 1.6; background: #f5f5f5; padding: 20px; border-radius: 4px;';
-      container.appendChild(output);
+      console.log('[API] After UI filtering:', apiMessages.length);
   
-      document.body.appendChild(container);
+      // If a summary exists, only include messages from last summary forward
+      const lastSummaryIndex = state.getLastSummaryIndex();
+      let messagesToProcess = apiMessages;
+      let summaryContent = null;
   
-      output.textContent = 'Hello from the AI UI app!\n\n';
-      output.textContent += 'Starting API test...\n';
+      if (lastSummaryIndex !== -1) {
+        // Find the summary message
+        summaryContent = messages[lastSummaryIndex].content;
   
-      try {
-        // Get auth token from localStorage (simulate production)
-        const authToken = localStorage.getItem('token');
+        // Filter to only messages after the summary (excluding the summary itself)
+        messagesToProcess = apiMessages.filter((msg, index) => {
+          const originalIndex = messages.findIndex(m => m === messages[index]);
+          return originalIndex > lastSummaryIndex;
+        });
   
-        if (!authToken) {
-          output.textContent += '\nWARNING: No auth token found. Setting a test token...\n';
-          localStorage.setItem('token', 'test-token-123');
-        }
+        console.log('[API] Found summary at index', lastSummaryIndex);
+        console.log('[API] Using', messagesToProcess.length, 'messages after summary');
+      }
   
-        const apiUrl = '/api/chat/completions';
+      // Convert messages for API: tool-use and tool-result become user messages
+      // Combine consecutive user messages
+      const processedMessages = [];
   
-        const requestBody = {
-          stream: true,
-          model: 'Anthropic Claude 4 Sonnet',
-          messages: [
-            {
+      for (let i = 0; i < messagesToProcess.length; i++) {
+        const msg = messagesToProcess[i];
+  
+        // Convert tool-use and tool-result to user role
+        if (msg.role === 'tool-use' || msg.role === 'tool-result') {
+          const userContent = msg.content;
+  
+          // Check if previous message was also a user message
+          if (processedMessages.length > 0 && processedMessages[processedMessages.length - 1].role === 'user') {
+            // Combine with previous user message
+            processedMessages[processedMessages.length - 1].content += '\n\n' + userContent;
+          } else {
+            // Create new user message
+            processedMessages.push({
               role: 'user',
-              content: 'Say hello and tell me a short joke!'
-            }
-          ],
-          params: {},
-          features: {
-            web_search: false
-          },
-          session_id: 'test-session-' + Math.random().toString(36).substr(2, 9),
-          id: 'msg-' + Date.now() + '-assistant',
-          background_tasks: {
-            title_generation: false,
-            tags_generation: false
+              content: userContent
+            });
           }
-        };
+        } else {
+          // Regular user or assistant message
+          const newMsg = {
+            role: msg.role,
+            content: msg.content
+          };
   
-        output.textContent += '\nSending request to: ' + apiUrl + '\n';
-        output.textContent += 'Request: ' + JSON.stringify(requestBody.messages[0], null, 2) + '\n\n';
-  
-        const headers = {
-          'Content-Type': 'application/json'
-        };
-  
-        const token = localStorage.getItem('token');
-        if (token) {
-          headers['Authorization'] = `Bearer ${token}`;
+          // Check if we need to combine consecutive user messages
+          if (newMsg.role === 'user' && processedMessages.length > 0 && processedMessages[processedMessages.length - 1].role === 'user') {
+            // Combine with previous user message
+            processedMessages[processedMessages.length - 1].content += '\n\n' + newMsg.content;
+          } else {
+            processedMessages.push(newMsg);
+          }
         }
+      }
   
-        const response = await fetch(apiUrl, {
+      console.log('[API] Sending', processedMessages.length, 'messages to API');
+  
+      return {
+        messages: processedMessages,
+        summary: summaryContent
+      };
+    },
+  
+    // Handle truncated responses by requesting continuations
+    handleTruncatedResponse: async function(initialResponseText, headers, requestBody, startTime) {
+      const TERMINATOR = '||||END||||';
+      const MAX_CONTINUATIONS = 20;
+      const TAIL_LENGTH = 20;
+  
+      let fullResponse = initialResponseText;
+      let continuationCount = 0;
+      let lastChunk = null;
+  
+      console.log('[API] Response missing terminator - handling truncation');
+  
+      while (!fullResponse.includes(TERMINATOR) && continuationCount < MAX_CONTINUATIONS) {
+        continuationCount++;
+        console.log(`[API] Requesting continuation ${continuationCount}/${MAX_CONTINUATIONS}`);
+  
+        // Get last TAIL_LENGTH characters
+        const tail = fullResponse.slice(-TAIL_LENGTH);
+        console.log(`[API] Tail (last ${TAIL_LENGTH} chars): "${tail}"`);
+  
+        // Check for duplicate chunks (AI repeating itself)
+        if (lastChunk && tail === lastChunk) {
+          throw new Error('AI is repeating the same content - aborting continuation');
+        }
+        lastChunk = tail;
+  
+        // Create continuation prompt
+        const continuationMessages = [
+          ...requestBody.messages,
+          {
+            role: 'assistant',
+            content: fullResponse
+          },
+          {
+            role: 'user',
+            content: `Your response was truncated. The last ${TAIL_LENGTH} characters were: "${tail}". Continue from exactly the next character. When done, end with ||||END||||`
+          }
+        ];
+  
+        const continuationBody = {
+          ...requestBody,
+          messages: continuationMessages
+        };
+  
+        // Make continuation request
+        const response = await fetch('/api/chat/completions', {
           method: 'POST',
           headers: headers,
-          body: JSON.stringify(requestBody)
+          body: JSON.stringify(continuationBody)
         });
   
         if (!response.ok) {
           const errorText = await response.text();
-          output.textContent += `\nERROR: API request failed (${response.status}): ${errorText}\n`;
-          return;
+          throw new Error(`Continuation request failed (${response.status}): ${errorText}`);
         }
   
-        output.textContent += 'Response received! Streaming...\n';
-        output.textContent += '---\n';
+        const data = await response.json();
+        const chunk = data.choices[0].message.content;
+        console.log(`[API] Chunk received (first 100 chars): "${chunk.substring(0, 100)}"`);
   
-        // Read streaming response
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let finalContent = '';
+        // Handle blank response
+        if (!chunk || chunk.trim() === '') {
+          console.log('[API] Received blank continuation - treating as incomplete');
+          throw new Error('Received blank continuation response');
+        }
   
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
+        // If AI just sends terminator, it means previous response was complete
+        if (chunk.trim() === TERMINATOR) {
+          console.log('[API] AI confirmed completion with terminator');
+          fullResponse += TERMINATOR;
+          break;
+        }
   
-          const chunk = decoder.decode(value);
-          const lines = chunk.split('\n');
-  
-          for (const line of lines) {
-            if (line.startsWith('data: ')) {
-              const data = line.slice(6).trim();
-              if (data === '[DONE]') {
-                continue;
-              }
-  
-              if (!data) continue;
-  
-              try {
-                const parsed = JSON.parse(data);
-                if (parsed.choices && parsed.choices[0] &&
-                    parsed.choices[0].delta && parsed.choices[0].delta.content) {
-                  const content = parsed.choices[0].delta.content;
-                  finalContent += content;
-                  output.textContent += content;
-                }
-              } catch (e) {
-                console.warn('Error parsing SSE data:', e);
-              }
-            }
+        // Check if the continuation starts with part of the tail (overlap detection)
+        // The AI might repeat some characters to ensure continuity
+        let chunkToAdd = chunk;
+        let overlapFound = false;
+        for (let overlapLen = TAIL_LENGTH; overlapLen > 0; overlapLen--) {
+          const tailEnd = tail.slice(-overlapLen);
+          const chunkStart = chunk.slice(0, overlapLen);
+          if (tailEnd === chunkStart) {
+            // Found overlap - remove it from the chunk
+            chunkToAdd = chunk.slice(overlapLen);
+            console.log(`[API] Detected ${overlapLen} char overlap: "${tailEnd}"`);
+            overlapFound = true;
+            break;
           }
         }
   
-        output.textContent += '\n---\n';
-        output.textContent += '\nAPI test completed successfully!';
-        output.textContent += '\nTotal characters received: ' + finalContent.length;
+        if (!overlapFound) {
+          console.log(`[API] No overlap detected between tail and chunk start`);
+        }
+  
+        console.log(`[API] Received continuation chunk: ${chunk.length} chars (${chunkToAdd.length} after overlap removal)`);
+        fullResponse += chunkToAdd;
+      }
+  
+      if (continuationCount >= MAX_CONTINUATIONS) {
+        throw new Error(`Exceeded maximum continuation attempts (${MAX_CONTINUATIONS})`);
+      }
+  
+      console.log(`[API] Complete response assembled after ${continuationCount} continuations`);
+      const endTime = Date.now();
+      const durationSeconds = (endTime - startTime) / 1000;
+  
+      return {
+        fullResponse: fullResponse,
+        durationSeconds: durationSeconds
+      };
+    },
+  
+    callAPI: async function(messages, maxRetries = 3) {
+      const authToken = localStorage.getItem('token');
+      const tools = window.module['tools.js'];
+      const TERMINATOR = '||||END||||';
+  
+      const result = this.renderMessagesForAPI(messages);
+      const processedMessages = result.messages;
+      const summary = result.summary;
+  
+      // Build system prompt
+      let systemPrompt = tools.getSystemPrompt();
+  
+      // If summary exists, append it to system prompt
+      if (summary) {
+        systemPrompt += "\n\n=== Summary of Earlier Conversation ===\n\n" + summary;
+        console.log('[API] Appending summary to system prompt');
+      }
+  
+      // Prepend system prompt to first user message (prod API doesn't support system field)
+      const messagesWithSystem = [...processedMessages];
+      if (messagesWithSystem.length > 0) {
+        messagesWithSystem[0] = {
+          ...messagesWithSystem[0],
+          content: systemPrompt + "\n\n" + messagesWithSystem[0].content
+        };
+      }
+  
+      const requestBody = {
+        stream: false,
+        model: 'Anthropic Claude 4 Sonnet',
+        messages: messagesWithSystem,
+        // Note: Removed 'system' field - prod API doesn't support it
+        // Note: Removed 'tools' field - prod API doesn't support native tools
+        params: {},
+        features: {
+          web_search: false
+        },
+        session_id: 'session-' + Math.random().toString(36).substr(2, 9),
+        id: 'msg-' + Date.now() + '-assistant',
+        background_tasks: {
+          title_generation: false,
+          tags_generation: false
+        }
+      };
+  
+      console.log('[API] ========================================');
+      console.log('[API] REQUEST SUMMARY:');
+      console.log('[API] ========================================');
+      console.log('  - System prompt length:', systemPrompt.length);
+      console.log('  - Messages count:', messagesWithSystem.length);
+      console.log('  - Tools: list_directory, read_file, write_file');
+      if (summary) {
+        console.log('  - Summary included: YES (' + summary.length + ' chars)');
+      }
+      console.log('[API]');
+      console.log('[API] FULL REQUEST BODY:');
+      console.log('[API] ========================================');
+      console.log(JSON.stringify(requestBody, null, 2));
+      console.log('[API] ========================================');
+  
+      const headers = {
+        'Content-Type': 'application/json'
+      };
+  
+      if (authToken) {
+        headers['Authorization'] = `Bearer ${authToken}`;
+      }
+  
+      let lastError = null;
+  
+      for (let attempt = 0; attempt < maxRetries; attempt++) {
+        try {
+          const startTime = Date.now();
+          const response = await fetch('/api/chat/completions', {
+            method: 'POST',
+            headers: headers,
+            body: JSON.stringify(requestBody)
+          });
+  
+          if (!response.ok) {
+            const errorText = await response.text();
+            throw new Error(`API request failed (${response.status}): ${errorText}`);
+          }
+  
+          const data = await response.json();
+          let responseText = data.choices[0].message.content;
+          let durationSeconds = (Date.now() - startTime) / 1000;
+  
+          console.log('[API]');
+          console.log('[API] ========================================');
+          console.log('[API] FULL API RESPONSE:');
+          console.log('[API] ========================================');
+          console.log(JSON.stringify(data, null, 2));
+          console.log('[API] ========================================');
+          console.log('[API] Response text length:', responseText.length, 'chars');
+          console.log('[API] ========================================');
+  
+          // Check for terminator
+          if (!responseText.includes(TERMINATOR)) {
+            // Handle truncation
+            const result = await this.handleTruncatedResponse(responseText, headers, requestBody, startTime);
+            responseText = result.fullResponse;
+            durationSeconds = result.durationSeconds;
+          }
+  
+          // Remove terminator before parsing
+          responseText = responseText.replace(TERMINATOR, '').trim();
+  
+          // Parse and validate response
+          const parseResult = tools.parseResponse(responseText);
+  
+          if (!parseResult.valid) {
+            lastError = parseResult.error;
+            console.warn(`Attempt ${attempt + 1}/${maxRetries} - Invalid response: ${parseResult.error}`);
+            console.warn(`Raw response text:`, responseText.substring(0, 500));
+  
+            // On validation errors, return immediately with error details
+            // Don't retry - let the main loop provide feedback to AI
+            return {
+              text: responseText,
+              parsed: null,
+              valid: false,
+              error: parseResult.error,
+              apiInput: processedMessages,
+              apiInputFull: requestBody,
+              apiOutput: data,
+              durationSeconds: durationSeconds
+            };
+          }
+  
+          // Return both raw text and parsed response
+          return {
+            text: responseText,
+            parsed: parseResult.valid ? parseResult.parsed : null,
+            valid: parseResult.valid,
+            error: parseResult.valid ? null : parseResult.error,
+            apiInput: processedMessages,  // Store input messages for debugging
+            apiInputFull: requestBody,  // Store FULL request body that was actually sent
+            apiOutput: data,  // Store full API response for debugging
+            durationSeconds: durationSeconds
+          };
+        } catch (error) {
+          lastError = error.message;
+          console.warn(`Attempt ${attempt + 1}/${maxRetries} - Error: ${error.message}`);
+  
+          if (attempt < maxRetries - 1) {
+            continue;
+          }
+        }
+      }
+  
+      // All retries failed
+      throw new Error(`Failed after ${maxRetries} attempts. Last error: ${lastError}`);
+    }
+  };
+  
+
+  // Module: main.js
+  // Main entry point for the app
+  window.module['main.js'] = {
+    version: '2.0.0',
+  
+    run: async function() {
+      console.log('[AI Agent] Version:', this.version);
+  
+      // Get module references
+      const state = window.module['state.js'];
+      const styles = window.module['styles.js'];
+      const ui = window.module['ui.js'];
+      const api = window.module['api.js'];
+  
+      // Clear existing page content
+      document.body.innerHTML = '';
+  
+      // Add styles
+      styles.injectStyles();
+  
+      // Show directory selection screen
+      ui.showDirectorySelection(() => this.selectDirectory());
+    },
+  
+    selectDirectory: async function() {
+      const state = window.module['state.js'];
+      const ui = window.module['ui.js'];
+  
+      try {
+        if (!window.showDirectoryPicker) {
+          alert('Your browser does not support the File System Access API. Please use Chrome, Edge, or another compatible browser.');
+          return;
+        }
+  
+        const dirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
+        state.setSelectedDirectory(dirHandle);
+        this.showChatScreen();
+      } catch (error) {
+        if (error.name === 'AbortError') {
+          // User cancelled the picker
+          console.log('Directory selection cancelled');
+        } else {
+          console.error('Error selecting directory:', error);
+          alert('Error selecting directory: ' + error.message);
+        }
+      }
+    },
+  
+    showChatScreen: function() {
+      const state = window.module['state.js'];
+      const ui = window.module['ui.js'];
+  
+      const selectedDirectory = state.getState().selectedDirectory;
+      ui.showChatScreen(selectedDirectory, () => this.sendMessage());
+  
+      // Render initial messages (including greeting)
+      ui.renderMessages(state.getMessages());
+    },
+  
+    sendMessage: async function() {
+      const state = window.module['state.js'];
+      const ui = window.module['ui.js'];
+      const api = window.module['api.js'];
+      const tools = window.module['tools.js'];
+  
+      const message = ui.getInputValue();
+  
+      if (!message || state.isProcessing()) {
+        return;
+      }
+  
+      // Check if adding this message would exceed context limit
+      if (state.wouldExceedLimit(message)) {
+        console.log('[Main] Message would exceed limit, compacting context first');
+        await this.compactContext();
+        ui.renderMessages(state.getMessages());
+        ui.updateContextStats();
+      }
+  
+      // Add user message
+      state.addMessage({
+        role: 'user',
+        content: message
+      });
+  
+      // Clear input and reset height
+      ui.clearInput();
+  
+      // Render messages
+      ui.renderMessages(state.getMessages());
+  
+      // Update context stats
+      ui.updateContextStats();
+  
+      // Set processing state
+      state.setProcessing(true);
+      ui.setInputDisabled(true);
+  
+      // Show loading indicator
+      ui.showLoading();
+  
+      try {
+        await this.processAIResponse();
+      } catch (error) {
+        ui.hideLoading();
+        state.addMessage({
+          role: 'assistant',
+          content: 'Error: ' + error.message
+        });
+        ui.renderMessages(state.getMessages());
+        ui.updateContextStats();
+      } finally {
+        state.setProcessing(false);
+        ui.setInputDisabled(false);
+      }
+    },
+  
+    processAIResponse: async function() {
+      const state = window.module['state.js'];
+      const ui = window.module['ui.js'];
+      const api = window.module['api.js'];
+      const tools = window.module['tools.js'];
+  
+      const selectedDirectory = state.getState().selectedDirectory;
+      let continueProcessing = true;
+      let iteration = 0;
+      let consecutiveErrors = 0;
+      const MAX_RETRIES = 3;
+  
+      while (continueProcessing) {
+        iteration++;
+        console.log('='.repeat(80));
+        console.log(`[Main] ========== ITERATION ${iteration} START ==========`);
+        console.log('[Main] Total messages:', state.getMessages().length);
+  
+        // Send to API
+        const response = await api.callAPI(state.getMessages());
+  
+        // Remove loading indicator
+        ui.hideLoading();
+  
+        if (!response.valid) {
+          // Invalid response - provide detailed feedback to AI
+          console.error('[Main] Invalid response:', response.error);
+          consecutiveErrors++;
+          console.log(`[Main] Consecutive errors: ${consecutiveErrors}/${MAX_RETRIES}`);
+  
+          // Only show error to user if we've exceeded retry limit
+          if (consecutiveErrors >= MAX_RETRIES) {
+            console.error('[Main] Max retries exceeded, showing error to user');
+            state.addMessage({
+              role: 'assistant',
+              content: `Error: Invalid response after ${MAX_RETRIES} attempts - ${response.error}`
+            });
+            ui.renderMessages(state.getMessages());
+            state.setProcessing(false);
+            return;
+          }
+  
+          // Send error feedback to AI
+          let errorFeedback = `ERROR: Your response was invalid. Error: "${response.error}"\n\n`;
+          errorFeedback += `Your response was:\n${response.text.substring(0, 300)}${response.text.length > 300 ? '...' : ''}\n\n`;
+          errorFeedback += `Please provide a valid JSON response.`;
+  
+          state.addMessage({
+            role: 'user',
+            content: errorFeedback,
+            fromSystem: true
+          });
+  
+          ui.showLoading();
+          continue;
+        }
+  
+        // Reset error counter on successful response
+        consecutiveErrors = 0;
+  
+        const parsedResponse = response.parsed;
+  
+        if (parsedResponse.type === 'message') {
+          // Final message response
+          console.log('[Main] ========== MESSAGE RESPONSE ==========');
+  
+          // Check if adding this message would exceed context limit
+          if (state.wouldExceedLimit(parsedResponse.content)) {
+            console.log('[Main] Assistant message would exceed limit, compacting context first');
+            await this.compactContext();
+          }
+  
+          state.addMessage({
+            role: 'assistant',
+            content: parsedResponse.content,
+            apiData: {
+              input: response.apiInput,
+              inputFull: response.apiInputFull,
+              output: response.apiOutput,
+              rawResponse: response.text
+            },
+            durationSeconds: response.durationSeconds
+          });
+          ui.renderMessages(state.getMessages());
+          ui.updateContextStats();
+          continueProcessing = false;
+        } else if (parsedResponse.type === 'execute') {
+          console.log('[Main] ========== EXECUTE RESPONSE ==========');
+          console.log('[Main] AI requested', parsedResponse.tool_uses.length, 'tool(s)');
+  
+          // Check if adding this message would exceed context limit
+          if (state.wouldExceedLimit(response.text)) {
+            console.log('[Main] Execute response would exceed limit, compacting context first');
+            await this.compactContext();
+          }
+  
+          // Add assistant message with API data
+          state.addMessage({
+            role: 'assistant',
+            content: response.text,
+            apiData: {
+              input: response.apiInput,
+              inputFull: response.apiInputFull,
+              output: response.apiOutput,
+              rawResponse: response.text
+            },
+            durationSeconds: response.durationSeconds
+          });
+  
+          // Execute all tools
+          await this.executeTools(parsedResponse.tool_uses, selectedDirectory);
+  
+          ui.updateContextStats();
+          ui.showLoading();
+          continue;
+        }
+      }
+  
+      console.log('[Main] Processing complete after', iteration, 'iterations');
+    },
+  
+    // Execute tools (unified handler for all tools)
+    executeTools: async function(toolUses, selectedDirectory) {
+      const state = window.module['state.js'];
+      const ui = window.module['ui.js'];
+  
+      for (const toolUse of toolUses) {
+        if (toolUse.name === 'list_directory') {
+          // Add tool use message
+          state.addMessage({
+            role: 'tool-use',
+            toolName: 'list_directory',
+            params: toolUse.input,
+            content: `list_directory ${JSON.stringify(toolUse.input)}`
+          });
+  
+          const result = await this.executeListDirectory(toolUse.input.path, selectedDirectory);
+  
+          if (result.success) {
+            // Count entries
+            const lines = result.output.split('\n');
+            const dirCount = lines.filter(l => l.includes('📁')).length;
+            const fileCount = lines.filter(l => l.includes('📄')).length;
+            const total = dirCount + fileCount;
+  
+            state.addMessage({
+              role: 'tool-result',
+              toolName: 'list_directory',
+              summary: `Listed ${total} items (${dirCount} folders, ${fileCount} files)`,
+              fullResult: result.output,
+              content: `Tool result for list_directory("${toolUse.input.path}"):\n\n${result.output}`
+            });
+          } else {
+            state.addMessage({
+              role: 'tool-result',
+              toolName: 'list_directory',
+              summary: `Error: ${result.error}`,
+              error: true,
+              content: `Tool error for list_directory("${toolUse.input.path}"): ${result.error}`
+            });
+          }
+        } else if (toolUse.name === 'read_file') {
+          // Add tool use message
+          state.addMessage({
+            role: 'tool-use',
+            toolName: 'read_file',
+            params: toolUse.input,
+            content: `read_file ${JSON.stringify(toolUse.input)}`
+          });
+  
+          const result = await this.executeReadFile(toolUse.input.path, selectedDirectory);
+  
+          if (result.success) {
+            const lineCount = result.content.split('\n').length;
+  
+            state.addMessage({
+              role: 'tool-result',
+              toolName: 'read_file',
+              summary: `Read ${lineCount} lines from ${result.path}`,
+              fullResult: result.content,
+              content: `File: ${result.path}\n\n${result.content}`
+            });
+          } else {
+            state.addMessage({
+              role: 'tool-result',
+              toolName: 'read_file',
+              summary: `Error: ${result.error}`,
+              error: true,
+              content: `Error reading file ${result.path}: ${result.error}`
+            });
+          }
+        } else if (toolUse.name === 'write_file') {
+          // Add tool use message
+          state.addMessage({
+            role: 'tool-use',
+            toolName: 'write_file',
+            params: toolUse.input,
+            content: `write_file ${JSON.stringify({ path: toolUse.input.path, content: `(${toolUse.input.content.length} chars)` })}`
+          });
+  
+          const result = await this.executeWriteFile(toolUse.input.path, toolUse.input.content, selectedDirectory);
+  
+          if (result.success) {
+            state.addMessage({
+              role: 'tool-result',
+              toolName: 'write_file',
+              summary: `Wrote ${toolUse.input.content.length} characters to ${result.path}`,
+              fullResult: `Successfully wrote to ${result.path}`,
+              content: `Successfully wrote ${toolUse.input.content.length} characters to ${result.path}`
+            });
+          } else {
+            state.addMessage({
+              role: 'tool-result',
+              toolName: 'write_file',
+              summary: `Error: ${result.error}`,
+              error: true,
+              content: `Error writing file ${result.path}: ${result.error}`
+            });
+          }
+        } else {
+          // Unknown tool
+          state.addMessage({
+            role: 'user',
+            content: `ERROR: Unknown tool "${toolUse.name}". Available tools are: list_directory, read_file, write_file.`,
+            fromSystem: true
+          });
+          console.warn(`[Main] Unknown tool: ${toolUse.name}`);
+        }
+      }
+  
+      ui.renderMessages(state.getMessages());
+    },
+  
+    // Execute file operations using FileSystem API
+    executeListDirectory: async function(path, dirHandle) {
+      try {
+        let targetHandle = dirHandle;
+  
+        // Navigate to the target path if not root
+        if (path && path !== '.' && path !== './') {
+          const pathParts = path.split('/').filter(p => p && p !== '.');
+          for (const part of pathParts) {
+            targetHandle = await targetHandle.getDirectoryHandle(part);
+          }
+        }
+  
+        // List directory contents
+        const entries = [];
+        for await (const entry of targetHandle.values()) {
+          entries.push({
+            name: entry.name,
+            kind: entry.kind
+          });
+        }
+  
+        // Format output
+        let output = `Contents of "${path || '.'}":\n\n`;
+        const dirs = entries.filter(e => e.kind === 'directory').sort((a, b) => a.name.localeCompare(b.name));
+        const files = entries.filter(e => e.kind === 'file').sort((a, b) => a.name.localeCompare(b.name));
+  
+        if (dirs.length > 0) {
+          output += 'Directories:\n';
+          dirs.forEach(d => {
+            output += `  📁 ${d.name}/\n`;
+          });
+        }
+  
+        if (files.length > 0) {
+          output += '\nFiles:\n';
+          files.forEach(f => {
+            output += `  📄 ${f.name}\n`;
+          });
+        }
+  
+        if (entries.length === 0) {
+          output += '(empty directory)\n';
+        }
+  
+        return { success: true, output };
+      } catch (error) {
+        return { success: false, error: error.message };
+      }
+    },
+  
+    executeReadFile: async function(path, dirHandle) {
+      try {
+        const pathParts = path.split('/').filter(p => p);
+        let currentHandle = dirHandle;
+  
+        // Navigate to parent directory
+        for (let i = 0; i < pathParts.length - 1; i++) {
+          currentHandle = await currentHandle.getDirectoryHandle(pathParts[i]);
+        }
+  
+        // Get file
+        const fileName = pathParts[pathParts.length - 1];
+        const fileHandle = await currentHandle.getFileHandle(fileName);
+        const file = await fileHandle.getFile();
+        const content = await file.text();
+  
+        return { success: true, content, path };
+      } catch (error) {
+        return { success: false, error: error.message, path };
+      }
+    },
+  
+    executeWriteFile: async function(path, content, dirHandle) {
+      try {
+        const pathParts = path.split('/').filter(p => p);
+        let currentHandle = dirHandle;
+  
+        // Navigate to parent directory (create if doesn't exist)
+        for (let i = 0; i < pathParts.length - 1; i++) {
+          try {
+            currentHandle = await currentHandle.getDirectoryHandle(pathParts[i]);
+          } catch {
+            // Directory doesn't exist, create it
+            currentHandle = await currentHandle.getDirectoryHandle(pathParts[i], { create: true });
+          }
+        }
+  
+        // Create or get file
+        const fileName = pathParts[pathParts.length - 1];
+        const fileHandle = await currentHandle.getFileHandle(fileName, { create: true });
+  
+        // Write content
+        const writable = await fileHandle.createWritable();
+        await writable.write(content);
+        await writable.close();
+  
+        return { success: true, path };
+      } catch (error) {
+        // Check if it's a user activation error
+        if (error.message && error.message.includes('User activation is required')) {
+          return {
+            success: false,
+            error: `Cannot create new directories due to browser security. Please manually create the parent directory first, then try again.`,
+            path
+          };
+        }
+        return { success: false, error: error.message, path };
+      }
+    },
+  
+    // Compact context by summarizing first half of messages
+    compactContext: async function() {
+      const state = window.module['state.js'];
+      const api = window.module['api.js'];
+      const ui = window.module['ui.js'];
+  
+      console.log('[Main] ========== COMPACTING CONTEXT ==========');
+  
+      const messages = state.getMessages();
+  
+      // Find first message that's not uiOnly (skip initial greeting)
+      let firstRealMessageIndex = -1;
+      for (let i = 0; i < messages.length; i++) {
+        if (!messages[i].uiOnly) {
+          firstRealMessageIndex = i;
+          break;
+        }
+      }
+  
+      if (firstRealMessageIndex === -1) {
+        console.log('[Main] No messages to compact');
+        return;
+      }
+  
+      // Calculate midpoint (first half of non-uiOnly messages)
+      const realMessages = messages.filter(m => !m.uiOnly);
+      const halfCount = Math.ceil(realMessages.length / 2);
+  
+      // Get the index in the full messages array where we should split
+      let splitIndex = -1;
+      let realCount = 0;
+      for (let i = 0; i < messages.length; i++) {
+        if (!messages[i].uiOnly) {
+          realCount++;
+          if (realCount === halfCount) {
+            splitIndex = i;
+            break;
+          }
+        }
+      }
+  
+      console.log('[Main] Splitting at index', splitIndex, '(half count:', halfCount, ')');
+  
+      // Get messages to summarize (from first real message to split point)
+      const messagesToSummarize = messages.slice(firstRealMessageIndex, splitIndex + 1);
+  
+      console.log('[Main] Summarizing', messagesToSummarize.length, 'messages');
+  
+      // Create summarization request
+      const summarizationMessages = [
+        {
+          role: 'user',
+          content: 'Please provide a concise summary of the following conversation. Focus on key decisions, code changes, and important context that would be needed to continue the conversation.\n\nConversation to summarize:\n\n' +
+            messagesToSummarize.map(m => `[${m.role}]: ${m.content}`).join('\n\n')
+        }
+      ];
+  
+      try {
+        // Call API for summarization
+        const response = await api.callAPI(summarizationMessages);
+  
+        if (!response.valid || response.parsed.type !== 'message') {
+          console.error('[Main] Failed to get summary from API');
+          return;
+        }
+  
+        const summaryContent = response.parsed.content;
+        console.log('[Main] Received summary:', summaryContent.substring(0, 100) + '...');
+  
+        // Remove the first half of messages and replace with summary
+        const newMessages = [
+          ...messages.slice(0, firstRealMessageIndex),
+          {
+            role: 'summary',
+            content: summaryContent,
+            timestamp: Date.now()
+          },
+          ...messages.slice(splitIndex + 1)
+        ];
+  
+        // Update state with new message array
+        state.state.messages = newMessages;
+  
+        console.log('[Main] Context compacted:', messages.length, '->', newMessages.length, 'messages');
   
       } catch (error) {
-        output.textContent += '\n\nERROR: ' + error.message;
-        console.error('Error:', error);
+        console.error('[Main] Error during compaction:', error);
       }
+    }
+  };
+  
+
+  // Module: state.js
+  // State management
+  window.module['state.js'] = {
+    state: {
+      selectedDirectory: null,
+      messages: [
+        {
+          role: 'assistant',
+          content: 'Hello! I\'m your AI coding agent. I can help you with coding tasks, answer questions about your codebase, write code, debug issues, and more. What would you like to work on?',
+          uiOnly: true  // This message won't be sent to the API
+        }
+      ],
+      isProcessing: false,
+      contextLimit: 20000  // Default 20K tokens (80K chars)
+    },
+  
+    getState: function() {
+      return this.state;
+    },
+  
+    setSelectedDirectory: function(dirHandle) {
+      this.state.selectedDirectory = dirHandle;
+    },
+  
+    // Message management
+    addMessage: function(message) {
+      this.state.messages.push({
+        ...message,
+        timestamp: message.timestamp || Date.now()
+      });
+    },
+  
+    getMessages: function() {
+      return this.state.messages;
+    },
+  
+    // Processing state
+    setProcessing: function(isProcessing) {
+      this.state.isProcessing = isProcessing;
+    },
+  
+    isProcessing: function() {
+      return this.state.isProcessing;
+    },
+  
+    // Clear all messages (keep initial greeting)
+    clearMessages: function() {
+      const initialGreeting = {
+        role: 'assistant',
+        content: 'Hello! I\'m your AI coding agent. I can help you with coding tasks, answer questions about your codebase, write code, debug issues, and more. What would you like to work on?',
+        uiOnly: true
+      };
+  
+      this.state.messages = [initialGreeting];
+    },
+  
+    // Context limit management
+    getContextLimit: function() {
+      return this.state.contextLimit;
+    },
+  
+    setContextLimit: function(limitInTokens) {
+      this.state.contextLimit = limitInTokens;
+    },
+  
+    // Calculate message size in tokens (estimate: 4 chars = 1 token)
+    calculateTokens: function(messages) {
+      if (!messages) {
+        messages = this.state.messages;
+      }
+  
+      let totalChars = 0;
+      messages.forEach(msg => {
+        if (msg.content) {
+          totalChars += msg.content.length;
+        }
+      });
+  
+      return Math.ceil(totalChars / 4);  // 4 chars per token estimate
+    },
+  
+    // Check if adding a message would exceed limit
+    wouldExceedLimit: function(newMessageContent) {
+      const currentTokens = this.calculateTokens();
+      const newMessageTokens = Math.ceil(newMessageContent.length / 4);
+      return (currentTokens + newMessageTokens) > this.state.contextLimit;
+    },
+  
+    // Get the last summary index (if any)
+    getLastSummaryIndex: function() {
+      for (let i = this.state.messages.length - 1; i >= 0; i--) {
+        if (this.state.messages[i].role === 'summary') {
+          return i;
+        }
+      }
+      return -1;
+    }
+  };
+  
+
+  // Module: styles.js
+  // Styles and CSS injection
+  window.module['styles.js'] = {
+    injectStyles: function() {
+      const style = document.createElement('style');
+      style.textContent = `
+        :root {
+          --color-gold: #d4a017;
+          --color-gold-light: #e5b028;
+          --color-gold-glow: rgba(212, 160, 23, 0.3);
+          --color-gold-subtle: rgba(212, 160, 23, 0.1);
+          --color-bg-primary: #1a1a1a;
+          --color-bg-secondary: #2d2d2d;
+          --color-border: #404040;
+          --color-text-primary: #e0e0e0;
+          --color-text-secondary: #b0b0b0;
+          --color-text-dim: #707070;
+        }
+  
+        body {
+          margin: 0;
+          padding: 0;
+          font-family: 'Consolas', 'Courier New', monospace;
+          background-color: var(--color-bg-primary);
+          color: var(--color-text-primary);
+          overflow: hidden;
+        }
+  
+        #app-container {
+          width: 100%;
+          height: 100vh;
+          display: flex;
+          flex-direction: column;
+          overflow: hidden;
+        }
+  
+        /* Directory Selection Screen */
+        #directory-screen {
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          height: 100vh;
+          flex-direction: column;
+        }
+  
+        #directory-screen h1 {
+          color: var(--color-gold);
+          margin-bottom: 2rem;
+          font-size: 48px;
+          font-weight: 700;
+          text-align: center;
+          width: 100%;
+        }
+  
+        #select-dir-btn {
+          display: block;
+          margin: 0 auto;
+          background: var(--color-gold);
+          color: var(--color-bg-primary);
+          border: none;
+          padding: 16px 32px;
+          font-size: 16px;
+          font-family: 'Consolas', 'Courier New', monospace;
+          font-weight: 700;
+          cursor: pointer;
+          border-radius: 4px;
+          transition: all 0.2s ease;
+        }
+  
+        #select-dir-btn:hover {
+          background: var(--color-gold-light);
+          transform: translateY(-2px);
+          box-shadow: 0 4px 12px var(--color-gold-glow);
+        }
+  
+        #select-dir-btn:active {
+          transform: translateY(0);
+        }
+  
+        /* Chat Screen */
+        #chat-screen {
+          display: flex;
+          flex-direction: column;
+          height: 100vh;
+        }
+  
+        #chat-container {
+          flex: 1;
+          overflow-y: auto;
+          padding: 16px;
+          scroll-behavior: smooth;
+          width: 100%;
+          max-width: 100%;
+          box-sizing: border-box;
+        }
+  
+        #chat-container::-webkit-scrollbar {
+          width: 8px;
+        }
+  
+        #chat-container::-webkit-scrollbar-track {
+          background: var(--color-bg-secondary);
+        }
+  
+        #chat-container::-webkit-scrollbar-thumb {
+          background: #555;
+          border-radius: 4px;
+        }
+  
+        #chat-container::-webkit-scrollbar-thumb:hover {
+          background: #777;
+        }
+  
+        #input-container {
+          padding: 16px;
+          background-color: var(--color-bg-primary);
+          width: 100%;
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          gap: 8px;
+        }
+  
+        #input-wrapper {
+          position: relative;
+          width: 90%;
+          max-width: 1200px;
+          display: flex;
+          align-items: flex-start;
+          background-color: var(--color-bg-secondary);
+          border: 1px solid var(--color-border);
+          border-radius: 8px;
+          max-height: 33.333vh;
+          overflow: hidden;
+        }
+  
+        #message-input {
+          width: 100%;
+          background: transparent;
+          border: none;
+          color: var(--color-text-primary);
+          font-family: 'Consolas', 'Courier New', monospace;
+          font-size: 14px;
+          resize: none;
+          outline: none;
+          padding: 12px 16px;
+          line-height: 1.6;
+          overflow-y: auto;
+          box-sizing: border-box;
+        }
+  
+        #message-input::-webkit-scrollbar {
+          display: none;
+        }
+  
+        #message-input::placeholder {
+          color: var(--color-text-dim);
+        }
+  
+        #message-input:disabled {
+          opacity: 0.5;
+          cursor: not-allowed;
+        }
+  
+        #project-path {
+          font-size: 12px;
+          color: var(--color-text-secondary);
+          text-align: left;
+          width: 90%;
+          max-width: 1200px;
+        }
+  
+        #context-stats {
+          display: flex;
+          gap: 12px;
+          justify-content: flex-end;
+          width: 90%;
+          max-width: 1200px;
+          margin-top: 4px;
+        }
+  
+        .context-stat-btn {
+          background: none;
+          border: none;
+          color: var(--color-text-dim);
+          font-size: 11px;
+          font-family: 'Consolas', 'Courier New', monospace;
+          cursor: pointer;
+          padding: 2px 4px;
+          transition: color 0.2s ease;
+        }
+  
+        .context-stat-btn:hover {
+          color: var(--color-gold);
+        }
+  
+        /* Messages */
+        .message {
+          margin-bottom: 20px;
+        }
+  
+        .message:first-child {
+          margin-top: 20px;
+        }
+  
+        .user-message {
+          display: flex;
+          gap: 8px;
+          color: var(--color-text-dim);
+        }
+  
+        .user-message .message-prefix {
+          flex-shrink: 0;
+        }
+  
+        .user-message .message-content {
+          flex: 1;
+          white-space: pre-wrap;
+          word-wrap: break-word;
+        }
+  
+        .assistant-message {
+          color: var(--color-gold);
+          padding-left: 2ch;
+          background-image: linear-gradient(
+            to right,
+            transparent 0px,
+            transparent calc(1ch - 5px),
+            var(--color-gold) calc(1ch - 5px),
+            var(--color-gold) calc(1ch - 4px),
+            transparent calc(1ch - 4px)
+          );
+          background-repeat: no-repeat;
+          background-size: 100% 100%;
+          transition: all 0.2s ease;
+          position: relative;
+        }
+  
+        .assistant-message:hover {
+          background-color: var(--color-gold-subtle);
+          transform: translateX(2px);
+        }
+  
+        .assistant-message .message-content {
+          white-space: pre-wrap;
+          word-wrap: break-word;
+          max-width: 100%;
+          overflow-wrap: break-word;
+        }
+  
+        .message-timing {
+          font-size: 10px;
+          color: var(--color-text-dim);
+          margin-top: 4px;
+          opacity: 0.7;
+        }
+  
+        .tool-execution-timing {
+          font-size: 10px;
+          color: var(--color-text-dim);
+          text-align: center;
+          margin: 8px 0;
+          opacity: 0.6;
+          font-style: italic;
+        }
+  
+        .loading {
+          display: flex;
+          gap: 6px;
+          padding: 8px 12px;
+          background: var(--color-gold-subtle);
+          border-radius: 4px;
+          color: var(--color-gold);
+        }
+  
+        .loading::after {
+          content: '';
+          width: 6px;
+          height: 6px;
+          background: var(--color-gold);
+          border-radius: 50%;
+          animation: loading-bounce 1.4s infinite ease-in-out both;
+        }
+  
+        @keyframes loading-bounce {
+          0%, 80%, 100% {
+            transform: scale(0);
+            opacity: 0.5;
+          }
+          40% {
+            transform: scale(1);
+            opacity: 1;
+          }
+        }
+  
+        /* Tool Execution Messages - Inline Style */
+        .tool-use-inline {
+          padding: 4px 0 4px 2ch;
+          font-size: 13px;
+          line-height: 1.8;
+        }
+  
+        .tool-use-inline .tool-name {
+          color: #a0a0a0;
+          font-weight: bold;
+        }
+  
+        .tool-use-inline .tool-params {
+          color: #888888;
+          font-weight: normal;
+        }
+  
+        .tool-result-inline {
+          padding: 4px 0 12px 3ch;
+          font-size: 13px;
+          color: #999999;
+          cursor: pointer;
+          transition: color 0.2s ease;
+          line-height: 1.8;
+        }
+  
+        .tool-result-inline:hover {
+          color: var(--color-gold);
+        }
+  
+        .tool-result-inline.error {
+          color: #ff6b6b;
+        }
+  
+        .tool-result-inline.error:hover {
+          color: #ff5252;
+        }
+  
+        /* Tool Execution Messages - Legacy */
+        .tool-message {
+          color: var(--color-text-secondary);
+          padding: 8px 12px;
+          background: var(--color-gold-subtle);
+          border-left: 3px solid var(--color-gold);
+          border-radius: 4px;
+          cursor: pointer;
+          transition: all 0.2s ease;
+          font-size: 13px;
+        }
+  
+        .tool-message:hover {
+          background: rgba(212, 160, 23, 0.15);
+          border-left-color: var(--color-gold-light);
+          transform: translateX(2px);
+        }
+  
+        .tool-message .message-content {
+          white-space: pre-wrap;
+          word-wrap: break-word;
+        }
+  
+        /* Tool Group Container */
+        .tool-group {
+          margin-bottom: 20px;
+        }
+  
+        /* Tool Use Messages (before execution) */
+        .tool-use-message {
+          color: var(--color-text-secondary);
+          padding: 8px 12px;
+          background: rgba(212, 160, 23, 0.08);
+          border-left: 3px solid rgba(212, 160, 23, 0.5);
+          border-radius: 4px;
+          cursor: pointer;
+          transition: all 0.2s ease;
+          font-size: 13px;
+        }
+  
+        /* When in a group, remove individual border radius and add top border */
+        .tool-group .tool-use-message {
+          border-radius: 0;
+          margin-bottom: 0;
+          border-top: 1px solid var(--color-border);
+        }
+  
+        /* First child in group gets top rounded corners and no top border */
+        .tool-group .tool-use-message:first-child {
+          border-radius: 4px 4px 0 0;
+          border-top: none;
+        }
+  
+        /* Last child in group gets bottom rounded corners */
+        .tool-group .tool-use-message:last-child {
+          border-radius: 0 0 4px 4px;
+        }
+  
+        /* Single child gets all corners rounded */
+        .tool-group .tool-use-message:first-child:last-child {
+          border-radius: 4px;
+        }
+  
+        .tool-use-message:hover {
+          background: rgba(212, 160, 23, 0.12);
+          border-left-color: var(--color-gold);
+          transform: translateX(2px);
+        }
+  
+        .tool-use-message .message-content {
+          white-space: pre-wrap;
+          word-wrap: break-word;
+        }
+  
+        /* Tool Result Messages (after execution) */
+        .tool-result-message {
+          color: var(--color-text-secondary);
+          padding: 8px 12px;
+          background: rgba(76, 175, 80, 0.08);
+          border-left: 3px solid rgba(76, 175, 80, 0.5);
+          border-radius: 4px;
+          cursor: pointer;
+          transition: all 0.2s ease;
+          font-size: 13px;
+        }
+  
+        /* When in a group, remove individual border radius and add top border */
+        .tool-group .tool-result-message {
+          border-radius: 0;
+          margin-bottom: 0;
+          border-top: 1px solid var(--color-border);
+        }
+  
+        /* First child in group gets top rounded corners and no top border */
+        .tool-group .tool-result-message:first-child {
+          border-radius: 4px 4px 0 0;
+          border-top: none;
+        }
+  
+        /* Last child in group gets bottom rounded corners */
+        .tool-group .tool-result-message:last-child {
+          border-radius: 0 0 4px 4px;
+        }
+  
+        /* Single child gets all corners rounded */
+        .tool-group .tool-result-message:first-child:last-child {
+          border-radius: 4px;
+        }
+  
+        .tool-result-message:hover {
+          background: rgba(76, 175, 80, 0.15);
+          border-left-color: #4caf50;
+          transform: translateX(2px);
+        }
+  
+        .tool-result-message .message-content {
+          white-space: pre-wrap;
+          word-wrap: break-word;
+        }
+  
+        /* Modal Overlay */
+        .modal-overlay {
+          position: fixed;
+          top: 0;
+          left: 0;
+          width: 100%;
+          height: 100%;
+          background: rgba(0, 0, 0, 0.85);
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          z-index: 1000;
+          animation: fadeIn 0.2s ease;
+        }
+  
+        @keyframes fadeIn {
+          from { opacity: 0; }
+          to { opacity: 1; }
+        }
+  
+        /* Modal Container */
+        .modal-container {
+          background: var(--color-bg-secondary);
+          border: 2px solid var(--color-gold);
+          border-radius: 8px;
+          width: 90%;
+          max-width: 900px;
+          max-height: 80vh;
+          display: flex;
+          flex-direction: column;
+          animation: slideUp 0.2s ease;
+        }
+  
+        @keyframes slideUp {
+          from {
+            transform: translateY(20px);
+            opacity: 0;
+          }
+          to {
+            transform: translateY(0);
+            opacity: 1;
+          }
+        }
+  
+        /* Modal Header */
+        .modal-header {
+          padding: 16px 20px;
+          border-bottom: 1px solid var(--color-border);
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+        }
+  
+        .modal-title {
+          color: var(--color-gold);
+          font-size: 18px;
+          font-weight: bold;
+        }
+  
+        .modal-close {
+          background: none;
+          border: none;
+          color: var(--color-text-secondary);
+          font-size: 24px;
+          cursor: pointer;
+          padding: 0;
+          width: 32px;
+          height: 32px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          transition: color 0.2s ease;
+        }
+  
+        .modal-close:hover {
+          color: var(--color-gold);
+        }
+  
+        /* Modal Body */
+        .modal-body {
+          padding: 20px;
+          overflow-y: auto;
+          flex: 1;
+        }
+  
+        .modal-body::-webkit-scrollbar {
+          width: 8px;
+        }
+  
+        .modal-body::-webkit-scrollbar-track {
+          background: var(--color-bg-primary);
+        }
+  
+        .modal-body::-webkit-scrollbar-thumb {
+          background: #555;
+          border-radius: 4px;
+        }
+  
+        .modal-body::-webkit-scrollbar-thumb:hover {
+          background: #777;
+        }
+  
+        .modal-section {
+          margin-bottom: 24px;
+        }
+  
+        .modal-section:last-child {
+          margin-bottom: 0;
+        }
+  
+        .modal-section-title-row {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          margin-bottom: 8px;
+        }
+  
+        .modal-section-title {
+          color: var(--color-gold);
+          font-size: 14px;
+          font-weight: bold;
+          text-transform: uppercase;
+          letter-spacing: 0.5px;
+        }
+  
+        .modal-section-copy-btn {
+          background: var(--color-bg-primary);
+          border: 1px solid var(--color-gold);
+          color: var(--color-gold);
+          padding: 4px 8px;
+          font-size: 11px;
+          font-family: 'Consolas', 'Courier New', monospace;
+          cursor: pointer;
+          border-radius: 3px;
+          transition: all 0.2s ease;
+        }
+  
+        .modal-section-copy-btn:hover {
+          background: var(--color-gold);
+          color: var(--color-bg-primary);
+        }
+  
+        .modal-section-content {
+          background: var(--color-bg-primary);
+          padding: 12px;
+          border-radius: 4px;
+          border-left: 3px solid var(--color-gold-subtle);
+          color: var(--color-text-primary);
+          white-space: pre-wrap;
+          word-wrap: break-word;
+          font-family: 'Consolas', 'Courier New', monospace;
+          font-size: 13px;
+          line-height: 1.5;
+          max-height: 400px;
+          overflow-y: auto;
+        }
+  
+        .modal-section-content::-webkit-scrollbar {
+          width: 6px;
+        }
+  
+        .modal-section-content::-webkit-scrollbar-track {
+          background: var(--color-bg-secondary);
+        }
+  
+        .modal-section-content::-webkit-scrollbar-thumb {
+          background: #555;
+          border-radius: 3px;
+        }
+  
+        /* Summary Messages */
+        .summary-message {
+          background: rgba(100, 150, 200, 0.08);
+          border-left: 3px solid rgba(100, 150, 200, 0.5);
+          border-radius: 4px;
+          padding: 12px 16px;
+          margin-bottom: 20px;
+          transition: all 0.2s ease;
+        }
+  
+        .summary-message:hover {
+          background: rgba(100, 150, 200, 0.12);
+          border-left-color: #6496c8;
+          transform: translateX(2px);
+        }
+  
+        .summary-header {
+          color: #6496c8;
+          font-weight: bold;
+          font-size: 13px;
+          margin-bottom: 8px;
+          text-transform: uppercase;
+          letter-spacing: 0.5px;
+        }
+  
+        .summary-message .message-content {
+          color: var(--color-text-secondary);
+          white-space: pre-wrap;
+          word-wrap: break-word;
+          font-size: 13px;
+          line-height: 1.6;
+        }
+      `;
+      document.head.appendChild(style);
+    }
+  };
+  
+
+  // Module: tools.js
+  // Tool system - simplified architecture
+  window.module['tools.js'] = {
+  
+    // Tool definitions
+    tools: [
+      {
+        name: 'list_directory',
+        description: 'List the contents of a directory (one level deep)',
+        input_schema: {
+          type: 'object',
+          properties: {
+            path: {
+              type: 'string',
+              description: 'The directory path to list (relative to project root, use "." for root)'
+            }
+          },
+          required: ['path']
+        }
+      },
+  
+      {
+        name: 'read_file',
+        description: 'Read the contents of a file',
+        input_schema: {
+          type: 'object',
+          properties: {
+            path: {
+              type: 'string',
+              description: 'The file path to read (relative to project root)'
+            }
+          },
+          required: ['path']
+        }
+      },
+  
+      {
+        name: 'write_file',
+        description: 'Write content to a file (creates file and directories if they don\'t exist)',
+        input_schema: {
+          type: 'object',
+          properties: {
+            path: {
+              type: 'string',
+              description: 'The file path to write (relative to project root)'
+            },
+            content: {
+              type: 'string',
+              description: 'The content to write to the file'
+            }
+          },
+          required: ['path', 'content']
+        }
+      }
+    ],
+  
+    // Get system prompt
+    getSystemPrompt: function() {
+      return `You are a coding agent with access to a project's file system via tools.
+  
+  CRITICAL INSTRUCTION: When a user asks you to explore a project, your FIRST response MUST be to execute the list_directory tool with path ".". DO NOT say you don't have access. DO NOT ask for clarification. IMMEDIATELY use the tools.
+  
+  Example: If user says "explore the project", you MUST respond with:
+  {"type":"execute","tool_uses":[{"name":"list_directory","input":{"path":"."}}]}
+  
+  IMPORTANT: You have REAL tools to list, read, and write files. When a user asks you to explore or modify files, you MUST use these tools. Do NOT say you don't have access - you DO have access via these tools.
+  
+  ## Available Tools
+  
+  You have access to these tools to explore and work with the project:
+  
+  ### list_directory
+  List the contents of a directory (one level deep)
+  
+  Parameters:
+  - path (string, required): The directory path to list (relative to project root, use "." for root)
+  
+  Example usage:
+  {"type":"execute","tool_uses":[{"name":"list_directory","input":{"path":"."}}]}
+  
+  ### read_file
+  Read the contents of a file
+  
+  Parameters:
+  - path (string, required): The file path to read (relative to project root)
+  
+  Example usage (single file):
+  {"type":"execute","tool_uses":[{"name":"read_file","input":{"path":"package.json"}}]}
+  
+  Example usage (multiple files):
+  {"type":"execute","tool_uses":[{"name":"read_file","input":{"path":"src/app/main.js"}},{"name":"read_file","input":{"path":"package.json"}}]}
+  
+  ### write_file
+  Write content to a file (creates file and directories if they don't exist)
+  
+  Parameters:
+  - path (string, required): The file path to write (relative to project root)
+  - content (string, required): The content to write to the file
+  
+  Example usage:
+  {"type":"execute","tool_uses":[{"name":"write_file","input":{"path":"src/utils/helper.js","content":"// Helper functions\\nexport function add(a, b) {\\n  return a + b;\\n}"}}]}
+  
+  ## Workflow
+  
+  When asked to explore a project:
+  1. Use list_directory to see what files/folders exist
+  2. Use read_file to read relevant files (you can read multiple files at once)
+  3. File contents will remain in the conversation for context
+  4. Use write_file to create or update files
+  5. Then provide your analysis or response
+  
+  ## Response Format
+  
+  You MUST respond with valid JSON followed by a terminator. Your response MUST be ONLY the JSON object, followed immediately by ||||END||||
+  
+  **To execute tools:**
+  {"type":"execute","tool_uses":[{"name":"tool_name","input":{"param":"value"}}]}||||END||||
+  
+  **To send a message:**
+  {"type":"message","content":"Your response text here"}||||END||||
+  
+  CRITICAL:
+  - Do NOT use any other response type. Only "execute" or "message".
+  - Do NOT wrap your JSON in markdown code blocks
+  - Do NOT include any explanatory text before or after the JSON
+  - Your ENTIRE response must be valid JSON starting with { and ending with }
+  - ALWAYS end your response with ||||END|||| immediately after the closing }
+  - If your response is blank or empty, just send ||||END|||| to indicate completion`;
+    },
+  
+    // Attempt to fix malformed JSON
+    tryFixJSON: function(jsonText) {
+      // If last character is "}", try removing it and parsing again
+      if (jsonText.trim().endsWith('}')) {
+        const withoutLastBrace = jsonText.trim().slice(0, -1);
+        try {
+          const parsed = JSON.parse(withoutLastBrace);
+          console.log('[tryFixJSON] Successfully fixed JSON by removing trailing }');
+          return { fixed: true, json: withoutLastBrace, parsed };
+        } catch (e) {
+          return { fixed: false };
+        }
+      }
+      return { fixed: false };
+    },
+  
+    // Attempt to fix unescaped newlines in JSON content
+    tryFixNewlines: function(jsonText) {
+      try {
+        // Strategy: Find content field and escape newlines within it
+        // This is a heuristic approach for common AI response patterns
+        const contentMatch = jsonText.match(/"content"\s*:\s*"([\s\S]*?)(?:"(?:\s*[,}]))/);
+        if (contentMatch) {
+          const originalContent = contentMatch[1];
+          const fixedContent = originalContent
+            .replace(/\r/g, '\\r')
+            .replace(/\n/g, '\\n')
+            .replace(/\t/g, '\\t');
+  
+          const fixedJson = jsonText.replace(
+            `"content":"${originalContent}"`,
+            `"content":"${fixedContent}"`
+          );
+  
+          const parsed = JSON.parse(fixedJson);
+          console.log('[tryFixNewlines] Successfully fixed JSON by escaping newlines');
+          return { fixed: true, json: fixedJson, parsed };
+        }
+      } catch (e) {
+        console.log('[tryFixNewlines] Failed to fix:', e.message);
+        return { fixed: false };
+      }
+      return { fixed: false };
+    },
+  
+    // Parse and validate AI response
+    parseResponse: function(responseText) {
+      let response;
+  
+      // Try to parse JSON
+      try {
+        response = JSON.parse(responseText);
+      } catch (parseError) {
+        // Try to fix the JSON
+        console.log('[parseResponse] Initial JSON parse failed:', parseError.message);
+  
+        // Try multiple fix strategies
+        let fixResult = this.tryFixJSON(responseText);
+  
+        if (!fixResult.fixed) {
+          // If that didn't work, try escaping newlines in content
+          fixResult = this.tryFixNewlines(responseText);
+        }
+  
+        if (fixResult.fixed) {
+          console.log('[parseResponse] JSON was fixed, using repaired version');
+          response = fixResult.parsed;
+        } else {
+          return {
+            valid: false,
+            error: `Invalid JSON: ${parseError.message}`
+          };
+        }
+      }
+  
+      // Validate response structure
+      if (!response.type) {
+        return {
+          valid: false,
+          error: 'Response missing required "type" field'
+        };
+      }
+  
+      if (response.type === 'message') {
+        if (!response.content || typeof response.content !== 'string') {
+          return {
+            valid: false,
+            error: 'Message response missing "content" field or content is not a string'
+          };
+        }
+      } else if (response.type === 'execute') {
+        if (!response.tool_uses || !Array.isArray(response.tool_uses)) {
+          return {
+            valid: false,
+            error: 'Execute response missing "tool_uses" array'
+          };
+        }
+  
+        // Validate each tool use
+        for (let i = 0; i < response.tool_uses.length; i++) {
+          const toolUse = response.tool_uses[i];
+          if (!toolUse.name || typeof toolUse.name !== 'string') {
+            return {
+              valid: false,
+              error: `Tool use ${i} missing "name" field or name is not a string`
+            };
+          }
+          if (!toolUse.input || typeof toolUse.input !== 'object') {
+            return {
+              valid: false,
+              error: `Tool use ${i} missing "input" field or input is not an object`
+            };
+          }
+        }
+      } else {
+        return {
+          valid: false,
+          error: `Unknown response type: "${response.type}". Must be "message" or "execute"`
+        };
+      }
+  
+      return {
+        valid: true,
+        parsed: response
+      };
+    }
+  };
+  
+
+  // Module: ui.js
+  // UI rendering and interaction
+  window.module['ui.js'] = {
+    showDirectorySelection: function(onSelect) {
+      const container = document.createElement('div');
+      container.id = 'app-container';
+  
+      const screen = document.createElement('div');
+      screen.id = 'directory-screen';
+  
+      const title = document.createElement('h1');
+      title.textContent = 'AI Coding Agent';
+  
+      const button = document.createElement('button');
+      button.id = 'select-dir-btn';
+      button.textContent = 'Select Project Directory';
+      button.onclick = onSelect;
+  
+      screen.appendChild(title);
+      screen.appendChild(button);
+      container.appendChild(screen);
+      document.body.appendChild(container);
+    },
+  
+    showChatScreen: function(selectedDirectory, onSendMessage) {
+      const container = document.getElementById('app-container');
+      container.innerHTML = '';
+  
+      const screen = document.createElement('div');
+      screen.id = 'chat-screen';
+  
+      // Chat container
+      const chatContainer = document.createElement('div');
+      chatContainer.id = 'chat-container';
+  
+      // Input container
+      const inputContainer = document.createElement('div');
+      inputContainer.id = 'input-container';
+  
+      // Input wrapper
+      const inputWrapper = document.createElement('div');
+      inputWrapper.id = 'input-wrapper';
+  
+      const textarea = document.createElement('textarea');
+      textarea.id = 'message-input';
+      textarea.placeholder = 'Type your message...';
+      textarea.rows = 1;
+  
+      // Auto-resize textarea
+      const resizeTextarea = () => {
+        textarea.style.height = '0px';
+        textarea.style.height = Math.min(textarea.scrollHeight, window.innerHeight * 0.33) + 'px';
+      };
+  
+      textarea.addEventListener('input', resizeTextarea);
+  
+      textarea.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+          e.preventDefault();
+          onSendMessage();
+        }
+      });
+  
+      inputWrapper.appendChild(textarea);
+      inputContainer.appendChild(inputWrapper);
+  
+      // Project path display
+      const projectPath = document.createElement('div');
+      projectPath.id = 'project-path';
+  
+      // Get full path from directory handle
+      if (selectedDirectory) {
+        // Try to resolve the full path if available (Chrome 86+)
+        selectedDirectory.resolve().then(path => {
+          if (path && path.length > 0) {
+            projectPath.textContent = path.join('/');
+          } else {
+            projectPath.textContent = selectedDirectory.name;
+          }
+        }).catch(() => {
+          // Fallback to just the directory name
+          projectPath.textContent = selectedDirectory.name;
+        });
+      }
+  
+      inputContainer.appendChild(projectPath);
+  
+      // Context stats display
+      const contextStats = document.createElement('div');
+      contextStats.id = 'context-stats';
+  
+      const messagesBtn = document.createElement('button');
+      messagesBtn.className = 'context-stat-btn';
+      messagesBtn.id = 'messages-stat-btn';
+      messagesBtn.textContent = '0K';
+      messagesBtn.onclick = () => this.showContextModal();
+  
+      contextStats.appendChild(messagesBtn);
+  
+      inputContainer.appendChild(contextStats);
+  
+      screen.appendChild(chatContainer);
+      screen.appendChild(inputContainer);
+      container.appendChild(screen);
+  
+      // Focus the input
+      textarea.focus();
+  
+      // Initial stats update
+      this.updateContextStats();
+    },
+  
+    renderMessages: function(messages) {
+      const container = document.getElementById('chat-container');
+      container.innerHTML = '';
+  
+      // Track which groupIds have been rendered
+      const renderedGroupIds = new Set();
+  
+      messages.forEach((msg, index) => {
+        // Skip messages from system (tool results, internal prompts)
+        if (msg.fromSystem) {
+          return;
+        }
+  
+        // Skip marker messages
+        if (msg.isMarker) {
+          return;
+        }
+  
+        // Skip API-only messages
+        if (msg.apiOnly) {
+          return;
+        }
+  
+        // Skip assistant messages that contain raw JSON tool execution requests
+        // These are for API conversation structure only, not for UI display
+        // We detect them by checking if the content starts with JSON (contains "type": "execute")
+        // However, we still want to show the timing for these AI calls
+        if (msg.role === 'assistant' && msg.apiData && msg.content && msg.content.includes('"type"')) {
+          // If there's timing info, display it
+          if (msg.durationSeconds !== undefined) {
+            const timingDiv = document.createElement('div');
+            timingDiv.className = 'tool-execution-timing';
+            timingDiv.textContent = `${msg.durationSeconds.toFixed(2)}s`;
+            container.appendChild(timingDiv);
+          }
+          return;
+        }
+  
+        // Check if this message belongs to a tool group
+        const groupId = (msg.isToolUse && msg.toolUseData?.groupId) ||
+                        (msg.isToolResult && msg.toolResultData?.groupId);
+  
+        // If this message has a groupId and we've already rendered this group, skip it
+        if (groupId && renderedGroupIds.has(groupId)) {
+          return;
+        }
+  
+        // If this message is part of a tool group, collect all messages in that group
+        if (groupId) {
+          // Mark this group as rendered
+          renderedGroupIds.add(groupId);
+  
+          // Collect all messages with this groupId (both tool-use and tool-result)
+          const groupMessages = messages.filter(m => {
+            const msgGroupId = (m.isToolUse && m.toolUseData?.groupId) ||
+                               (m.isToolResult && m.toolResultData?.groupId);
+            return msgGroupId === groupId;
+          });
+  
+          // Create a grouped container
+          const groupDiv = document.createElement('div');
+          groupDiv.className = 'message tool-group';
+  
+          // Render each message in the group in order
+          groupMessages.forEach(groupMsg => {
+            if (groupMsg.isToolUse) {
+              // Create tool-use div
+              const toolUseDiv = document.createElement('div');
+              toolUseDiv.className = 'tool-use-message';
+              toolUseDiv.addEventListener('click', () => {
+                this.showToolUseModal(groupMsg);
+              });
+  
+              const toolUseContent = document.createElement('div');
+              toolUseContent.className = 'message-content';
+              toolUseContent.textContent = groupMsg.content;
+              toolUseDiv.appendChild(toolUseContent);
+  
+              groupDiv.appendChild(toolUseDiv);
+            } else if (groupMsg.isToolResult) {
+              // Create tool-result div
+              const toolResultDiv = document.createElement('div');
+              toolResultDiv.className = 'tool-result-message';
+              toolResultDiv.addEventListener('click', () => {
+                this.showToolResultModal(groupMsg);
+              });
+  
+              const toolResultContent = document.createElement('div');
+              toolResultContent.className = 'message-content';
+              toolResultContent.textContent = groupMsg.content;
+              toolResultDiv.appendChild(toolResultContent);
+  
+              groupDiv.appendChild(toolResultDiv);
+            }
+          });
+  
+          container.appendChild(groupDiv);
+          return;
+        }
+  
+        // Regular message rendering (for non-grouped messages)
+        const messageDiv = document.createElement('div');
+  
+        // Handle new tool-use and tool-result roles
+        if (msg.role === 'tool-use') {
+          messageDiv.className = 'message tool-use-inline';
+  
+          const toolName = document.createElement('span');
+          toolName.className = 'tool-name';
+          toolName.textContent = msg.toolName;
+  
+          const toolParams = document.createElement('span');
+          toolParams.className = 'tool-params';
+          toolParams.textContent = ' ' + JSON.stringify(msg.params);
+  
+          messageDiv.appendChild(toolName);
+          messageDiv.appendChild(toolParams);
+  
+          container.appendChild(messageDiv);
+          return;
+        } else if (msg.role === 'tool-result') {
+          messageDiv.className = msg.error ? 'message tool-result-inline error' : 'message tool-result-inline';
+          messageDiv.textContent = msg.summary;
+          messageDiv.style.cursor = 'pointer';
+          messageDiv.addEventListener('click', () => {
+            this.showToolResultModal(msg);
+          });
+  
+          container.appendChild(messageDiv);
+          return;
+        }
+  
+        // Apply different styling for tool use and tool result messages
+        if (msg.isToolUse) {
+          messageDiv.className = 'message tool-use-message';
+          messageDiv.addEventListener('click', () => {
+            this.showToolUseModal(msg);
+          });
+        } else if (msg.isToolResult) {
+          messageDiv.className = 'message tool-result-message';
+          messageDiv.addEventListener('click', () => {
+            this.showToolResultModal(msg);
+          });
+        } else if (msg.isToolExecution) {
+          // Legacy support
+          messageDiv.className = 'message tool-message';
+          messageDiv.addEventListener('click', () => {
+            this.showToolModal(msg);
+          });
+        } else {
+          messageDiv.className = `message ${msg.role}-message`;
+        }
+  
+        if (msg.role === 'user') {
+          const prefix = document.createElement('span');
+          prefix.className = 'message-prefix';
+          prefix.textContent = '> ';
+  
+          const content = document.createElement('span');
+          content.className = 'message-content';
+          content.textContent = msg.content;
+  
+          messageDiv.appendChild(prefix);
+          messageDiv.appendChild(content);
+        } else if (msg.role === 'assistant') {
+          const content = document.createElement('div');
+          content.className = 'message-content';
+          content.textContent = msg.content;
+          messageDiv.appendChild(content);
+  
+          // Add timing info if available
+          if (msg.durationSeconds !== undefined) {
+            const timing = document.createElement('div');
+            timing.className = 'message-timing';
+            timing.textContent = `${msg.durationSeconds.toFixed(2)}s`;
+            messageDiv.appendChild(timing);
+          }
+  
+          // Make all assistant messages clickable to show details
+          messageDiv.style.cursor = 'pointer';
+          messageDiv.addEventListener('click', () => {
+            this.showAssistantMessageModal(msg);
+          });
+        } else if (msg.role === 'summary') {
+          // Summary message - special styling
+          const header = document.createElement('div');
+          header.className = 'summary-header';
+          header.textContent = '📝 Conversation Summary';
+  
+          const content = document.createElement('div');
+          content.className = 'message-content';
+          content.textContent = msg.content;
+  
+          messageDiv.appendChild(header);
+          messageDiv.appendChild(content);
+        } else {
+          const content = document.createElement('div');
+          content.className = 'message-content';
+          content.textContent = msg.content;
+          messageDiv.appendChild(content);
+        }
+  
+        container.appendChild(messageDiv);
+      });
+  
+      // Scroll to bottom
+      container.scrollTop = container.scrollHeight;
+  
+      // Update context stats
+      this.updateContextStats();
+    },
+  
+    showToolModal: function(toolMessage) {
+      const overlay = document.createElement('div');
+      overlay.className = 'modal-overlay';
+  
+      const modalContainer = document.createElement('div');
+      modalContainer.className = 'modal-container';
+  
+      // Header
+      const header = document.createElement('div');
+      header.className = 'modal-header';
+  
+      const title = document.createElement('div');
+      title.className = 'modal-title';
+      title.textContent = 'Tool Execution Details';
+  
+      const closeBtn = document.createElement('button');
+      closeBtn.className = 'modal-close';
+      closeBtn.textContent = '×';
+      closeBtn.onclick = () => overlay.remove();
+  
+      header.appendChild(title);
+      header.appendChild(closeBtn);
+  
+      // Body
+      const body = document.createElement('div');
+      body.className = 'modal-body';
+  
+      // If there's toolData, show specific tool information
+      if (toolMessage.toolData && toolMessage.toolData.results) {
+        toolMessage.toolData.results.forEach((toolResult, index) => {
+          const toolUse = toolMessage.toolData.toolUses[index];
+  
+          // Tool name section
+          const nameSection = document.createElement('div');
+          nameSection.className = 'modal-section';
+  
+          const nameTitle = document.createElement('div');
+          nameTitle.className = 'modal-section-title';
+          nameTitle.textContent = `Tool: ${toolUse.tool}`;
+  
+          const nameContent = document.createElement('div');
+          nameContent.className = 'modal-section-content';
+          nameContent.textContent = `Parameters: ${JSON.stringify(toolUse.params, null, 2)}`;
+  
+          nameSection.appendChild(nameTitle);
+          nameSection.appendChild(nameContent);
+          body.appendChild(nameSection);
+  
+          // Special handling for read_file
+          if (toolUse.tool === 'read_file' && toolResult.result.success) {
+            // File contents
+            if (toolResult.result.fileContents) {
+              const contentsSection = document.createElement('div');
+              contentsSection.className = 'modal-section';
+  
+              const contentsTitle = document.createElement('div');
+              contentsTitle.className = 'modal-section-title';
+              contentsTitle.textContent = `File: ${toolResult.result.path}`;
+  
+              const contentsContent = document.createElement('div');
+              contentsContent.className = 'modal-section-content';
+              contentsContent.textContent = toolResult.result.fileContents;
+  
+              contentsSection.appendChild(contentsTitle);
+              contentsSection.appendChild(contentsContent);
+              body.appendChild(contentsSection);
+            }
+  
+            // Previous mental model notes
+            if (toolResult.result.currentNotes) {
+              const notesSection = document.createElement('div');
+              notesSection.className = 'modal-section';
+  
+              const notesTitle = document.createElement('div');
+              notesTitle.className = 'modal-section-title';
+              notesTitle.textContent = 'Mental Model (Before)';
+  
+              const notesContent = document.createElement('div');
+              notesContent.className = 'modal-section-content';
+              notesContent.textContent = toolResult.result.currentNotes;
+  
+              notesSection.appendChild(notesTitle);
+              notesSection.appendChild(notesContent);
+              body.appendChild(notesSection);
+            }
+          } else {
+            // For other tools, show result
+            const resultSection = document.createElement('div');
+            resultSection.className = 'modal-section';
+  
+            const resultTitle = document.createElement('div');
+            resultTitle.className = 'modal-section-title';
+            resultTitle.textContent = 'Result';
+  
+            const resultContent = document.createElement('div');
+            resultContent.className = 'modal-section-content';
+            resultContent.textContent = JSON.stringify(toolResult.result, null, 2);
+  
+            resultSection.appendChild(resultTitle);
+            resultSection.appendChild(resultContent);
+            body.appendChild(resultSection);
+          }
+        });
+      } else {
+        // Fallback: show basic tool execution message
+        const toolSection = document.createElement('div');
+        toolSection.className = 'modal-section';
+  
+        const toolTitle = document.createElement('div');
+        toolTitle.className = 'modal-section-title';
+        toolTitle.textContent = 'Tool Execution';
+  
+        const toolContent = document.createElement('div');
+        toolContent.className = 'modal-section-content';
+        toolContent.textContent = toolMessage.content;
+  
+        toolSection.appendChild(toolTitle);
+        toolSection.appendChild(toolContent);
+        body.appendChild(toolSection);
+      }
+  
+      modalContainer.appendChild(header);
+      modalContainer.appendChild(body);
+      overlay.appendChild(modalContainer);
+  
+      // Close on overlay click
+      overlay.addEventListener('click', (e) => {
+        if (e.target === overlay) {
+          overlay.remove();
+        }
+      });
+  
+      // Close on ESC key
+      const escHandler = (e) => {
+        if (e.key === 'Escape') {
+          overlay.remove();
+          document.removeEventListener('keydown', escHandler);
+        }
+      };
+      document.addEventListener('keydown', escHandler);
+  
+      document.body.appendChild(overlay);
+    },
+  
+    showLoading: function() {
+      const container = document.getElementById('chat-container');
+      const loading = document.createElement('div');
+      loading.id = 'loading-indicator';
+      loading.className = 'message assistant-message loading';
+      loading.textContent = 'Thinking';
+      container.appendChild(loading);
+      container.scrollTop = container.scrollHeight;
+    },
+  
+    hideLoading: function() {
+      const loading = document.getElementById('loading-indicator');
+      if (loading) {
+        loading.remove();
+      }
+    },
+  
+    getInputValue: function() {
+      const input = document.getElementById('message-input');
+      return input ? input.value.trim() : '';
+    },
+  
+    clearInput: function() {
+      const input = document.getElementById('message-input');
+      if (input) {
+        input.value = '';
+        input.style.height = 'auto';
+        input.style.height = input.scrollHeight + 'px';
+      }
+    },
+  
+    setInputDisabled: function(disabled) {
+      const input = document.getElementById('message-input');
+      if (input) {
+        input.disabled = disabled;
+        if (!disabled) {
+          input.focus();
+        }
+      }
+    },
+  
+    showToolUseModal: function(toolUseMessage) {
+      const data = toolUseMessage.toolUseData;
+      const toolUse = data.toolUse;
+  
+      const overlay = this.createModalOverlay('Tool Use');
+      const body = overlay.querySelector('.modal-body');
+  
+      // Tool and parameters
+      const toolSection = this.createModalSection('Tool', `${toolUse.tool}`);
+      body.appendChild(toolSection);
+  
+      const paramsSection = this.createModalSection('Parameters', JSON.stringify(toolUse.params, null, 2));
+      body.appendChild(paramsSection);
+  
+      // For read_file, show additional context
+      if (toolUse.tool === 'read_file') {
+        const pathSection = this.createModalSection('File Path', toolUse.params.path);
+        body.appendChild(pathSection);
+      }
+  
+      // For update_mental_model, show the mental model updates
+      if (toolUse.tool === 'update_mental_model' && toolUse.params.notes) {
+        const notesSection = this.createModalSection(
+          'Mental Model Updates',
+          JSON.stringify(toolUse.params.notes, null, 2)
+        );
+        body.appendChild(notesSection);
+  
+        // Show individual file notes for easier reading
+        const notes = toolUse.params.notes;
+        if (Object.keys(notes).length > 0) {
+          Object.entries(notes).forEach(([filePath, fileNotes]) => {
+            const fileSection = this.createModalSection(
+              `File: ${filePath}`,
+              fileNotes
+            );
+            body.appendChild(fileSection);
+          });
+        }
+      }
+  
+      // Full tool use object
+      const fullSection = this.createModalSection('Full Tool Use Object', JSON.stringify(toolUse, null, 2));
+      body.appendChild(fullSection);
+  
+      document.body.appendChild(overlay);
+    },
+  
+    showToolResultModal: function(toolResultMessage) {
+      const overlay = this.createModalOverlay('Tool Execution Details');
+      const body = overlay.querySelector('.modal-body');
+  
+      const state = window.module['state.js'];
+      const messages = state.getMessages();
+      const currentIndex = messages.indexOf(toolResultMessage);
+  
+      // Find the previous assistant message (contains the tool execution request)
+      let inputMessage = null;
+      if (currentIndex !== -1) {
+        for (let i = currentIndex - 1; i >= 0; i--) {
+          if (messages[i].role === 'assistant') {
+            inputMessage = messages[i];
+            break;
+          }
+        }
+      }
+  
+      // INPUT: Show the full API request body that generated this tool execution
+      if (inputMessage && inputMessage.apiData && inputMessage.apiData.inputFull) {
+        const inputSection = this.createModalSection(
+          'Input',
+          JSON.stringify(inputMessage.apiData.inputFull, null, 2)
+        );
+        body.appendChild(inputSection);
+      } else {
+        const noInputSection = this.createModalSection(
+          'Input',
+          'Could not find the associated API request'
+        );
+        body.appendChild(noInputSection);
+      }
+  
+      // OUTPUT: Show the full API response that came back
+      if (inputMessage && inputMessage.apiData && inputMessage.apiData.output) {
+        const outputSection = this.createModalSection(
+          'Output',
+          JSON.stringify(inputMessage.apiData.output, null, 2)
+        );
+        body.appendChild(outputSection);
+      } else {
+        const noOutputSection = this.createModalSection(
+          'Output',
+          'Could not find the associated API response'
+        );
+        body.appendChild(noOutputSection);
+      }
+  
+      document.body.appendChild(overlay);
+    },
+  
+    createModalOverlay: function(title) {
+      const overlay = document.createElement('div');
+      overlay.className = 'modal-overlay';
+  
+      const modalContainer = document.createElement('div');
+      modalContainer.className = 'modal-container';
+  
+      // Header
+      const header = document.createElement('div');
+      header.className = 'modal-header';
+  
+      const titleEl = document.createElement('div');
+      titleEl.className = 'modal-title';
+      titleEl.textContent = title;
+  
+      const closeBtn = document.createElement('button');
+      closeBtn.className = 'modal-close';
+      closeBtn.textContent = '×';
+      closeBtn.onclick = () => overlay.remove();
+  
+      header.appendChild(titleEl);
+      header.appendChild(closeBtn);
+  
+      // Body
+      const body = document.createElement('div');
+      body.className = 'modal-body';
+  
+      modalContainer.appendChild(header);
+      modalContainer.appendChild(body);
+      overlay.appendChild(modalContainer);
+  
+      // Close on overlay click
+      overlay.addEventListener('click', (e) => {
+        if (e.target === overlay) {
+          overlay.remove();
+        }
+      });
+  
+      // Close on ESC key
+      const escHandler = (e) => {
+        if (e.key === 'Escape') {
+          overlay.remove();
+          document.removeEventListener('keydown', escHandler);
+        }
+      };
+      document.addEventListener('keydown', escHandler);
+  
+      return overlay;
+    },
+  
+    createModalSection: function(title, content) {
+      const section = document.createElement('div');
+      section.className = 'modal-section';
+  
+      const titleRow = document.createElement('div');
+      titleRow.className = 'modal-section-title-row';
+  
+      const titleEl = document.createElement('div');
+      titleEl.className = 'modal-section-title';
+      titleEl.textContent = title;
+  
+      const copyBtn = document.createElement('button');
+      copyBtn.className = 'modal-section-copy-btn';
+      copyBtn.textContent = 'Copy';
+      copyBtn.onclick = () => this.copySectionContent(content, copyBtn);
+  
+      titleRow.appendChild(titleEl);
+      titleRow.appendChild(copyBtn);
+  
+      const contentEl = document.createElement('div');
+      contentEl.className = 'modal-section-content';
+      contentEl.textContent = content;
+  
+      section.appendChild(titleRow);
+      section.appendChild(contentEl);
+  
+      return section;
+    },
+  
+    copySectionContent: function(content, button) {
+      navigator.clipboard.writeText(content).then(() => {
+        const originalText = button.textContent;
+        button.textContent = 'Copied!';
+        button.style.backgroundColor = 'var(--color-gold)';
+        button.style.color = 'var(--color-bg-primary)';
+  
+        setTimeout(() => {
+          button.textContent = originalText;
+          button.style.backgroundColor = '';
+          button.style.color = '';
+        }, 2000);
+      }).catch(err => {
+        console.error('Failed to copy:', err);
+        button.textContent = 'Failed';
+        setTimeout(() => {
+          button.textContent = 'Copy';
+        }, 2000);
+      });
+    },
+  
+    showAssistantMessageModal: function(message) {
+      const apiData = message.apiData;
+  
+      const overlay = this.createModalOverlay('Assistant Message Details');
+      const body = overlay.querySelector('.modal-body');
+  
+      if (!apiData) {
+        // No API data available (e.g., initial greeting)
+        const noDataSection = this.createModalSection(
+          'No API Data',
+          'No API interaction data available for this message'
+        );
+        body.appendChild(noDataSection);
+      } else {
+        // Input: Full API request body (stored at time of request)
+        if (apiData.inputFull) {
+          const inputSection = this.createModalSection(
+            'Input',
+            JSON.stringify(apiData.inputFull, null, 2)
+          );
+          body.appendChild(inputSection);
+        }
+  
+        // Output: Full API response
+        if (apiData.output) {
+          const outputSection = this.createModalSection(
+            'Output',
+            JSON.stringify(apiData.output, null, 2)
+          );
+          body.appendChild(outputSection);
+        }
+      }
+  
+      document.body.appendChild(overlay);
+    },
+  
+    // Calculate messages size in tokens
+    calculateMessagesSize: function() {
+      const state = window.module['state.js'];
+      return state.calculateTokens();
+    },
+  
+    // Format size in K (1K = 1000 tokens)
+    formatSize: function(tokens) {
+      const k = Math.ceil(tokens / 1000);
+      return k + 'K';
+    },
+  
+    // Update context stats display
+    updateContextStats: function() {
+      const messagesBtn = document.getElementById('messages-stat-btn');
+  
+      if (!messagesBtn) {
+        return;
+      }
+  
+      const tokens = this.calculateMessagesSize();
+  
+      messagesBtn.textContent = this.formatSize(tokens);
+    },
+  
+    // Show clear confirmation modal
+    showClearModal: function(contextType) {
+      const overlay = document.createElement('div');
+      overlay.className = 'modal-overlay';
+  
+      const modalContainer = document.createElement('div');
+      modalContainer.className = 'modal-container';
+  
+      // Header
+      const header = document.createElement('div');
+      header.className = 'modal-header';
+  
+      const titleEl = document.createElement('div');
+      titleEl.className = 'modal-title';
+      titleEl.textContent = 'Clear Messages';
+  
+      const closeBtn = document.createElement('button');
+      closeBtn.className = 'modal-close';
+      closeBtn.textContent = '×';
+      closeBtn.onclick = () => overlay.remove();
+  
+      header.appendChild(titleEl);
+      header.appendChild(closeBtn);
+  
+      // Body
+      const body = document.createElement('div');
+      body.className = 'modal-body';
+  
+      const message = document.createElement('div');
+      message.style.marginBottom = '20px';
+      message.style.color = 'var(--color-text-primary)';
+      message.textContent = 'Are you sure you want to clear all messages? This will reset the conversation history (except the initial greeting).';
+  
+      const buttonContainer = document.createElement('div');
+      buttonContainer.style.display = 'flex';
+      buttonContainer.style.gap = '12px';
+      buttonContainer.style.justifyContent = 'flex-end';
+  
+      const cancelBtn = document.createElement('button');
+      cancelBtn.textContent = 'Cancel';
+      cancelBtn.style.padding = '8px 16px';
+      cancelBtn.style.background = 'var(--color-bg-primary)';
+      cancelBtn.style.border = '1px solid var(--color-border)';
+      cancelBtn.style.color = 'var(--color-text-primary)';
+      cancelBtn.style.cursor = 'pointer';
+      cancelBtn.style.borderRadius = '4px';
+      cancelBtn.style.fontFamily = "'Consolas', 'Courier New', monospace";
+      cancelBtn.onclick = () => overlay.remove();
+  
+      const confirmBtn = document.createElement('button');
+      confirmBtn.textContent = 'Clear';
+      confirmBtn.style.padding = '8px 16px';
+      confirmBtn.style.background = 'var(--color-gold)';
+      confirmBtn.style.border = 'none';
+      confirmBtn.style.color = 'var(--color-bg-primary)';
+      confirmBtn.style.cursor = 'pointer';
+      confirmBtn.style.borderRadius = '4px';
+      confirmBtn.style.fontFamily = "'Consolas', 'Courier New', monospace";
+      confirmBtn.style.fontWeight = 'bold';
+      confirmBtn.onclick = () => {
+        this.clearContext(contextType);
+        overlay.remove();
+      };
+  
+      buttonContainer.appendChild(cancelBtn);
+      buttonContainer.appendChild(confirmBtn);
+  
+      body.appendChild(message);
+      body.appendChild(buttonContainer);
+  
+      modalContainer.appendChild(header);
+      modalContainer.appendChild(body);
+      overlay.appendChild(modalContainer);
+  
+      // Close on overlay click
+      overlay.addEventListener('click', (e) => {
+        if (e.target === overlay) {
+          overlay.remove();
+        }
+      });
+  
+      // Close on ESC key
+      const escHandler = (e) => {
+        if (e.key === 'Escape') {
+          overlay.remove();
+          document.removeEventListener('keydown', escHandler);
+        }
+      };
+      document.addEventListener('keydown', escHandler);
+  
+      document.body.appendChild(overlay);
+    },
+  
+    // Clear context
+    clearContext: function(contextType) {
+      const state = window.module['state.js'];
+      state.clearMessages();
+  
+      // Update UI
+      this.renderMessages(state.getMessages());
+      this.updateContextStats();
+    },
+  
+    // Show context management modal (new)
+    showContextModal: function() {
+      const state = window.module['state.js'];
+      const overlay = document.createElement('div');
+      overlay.className = 'modal-overlay';
+  
+      const modalContainer = document.createElement('div');
+      modalContainer.className = 'modal-container';
+  
+      // Header
+      const header = document.createElement('div');
+      header.className = 'modal-header';
+  
+      const titleEl = document.createElement('div');
+      titleEl.className = 'modal-title';
+      titleEl.textContent = 'Context Management';
+  
+      const closeBtn = document.createElement('button');
+      closeBtn.className = 'modal-close';
+      closeBtn.textContent = '×';
+      closeBtn.onclick = () => overlay.remove();
+  
+      header.appendChild(titleEl);
+      header.appendChild(closeBtn);
+  
+      // Body
+      const body = document.createElement('div');
+      body.className = 'modal-body';
+  
+      // Current stats
+      const statsDiv = document.createElement('div');
+      statsDiv.style.marginBottom = '20px';
+      statsDiv.style.color = 'var(--color-text-primary)';
+      const currentTokens = state.calculateTokens();
+      const currentLimit = state.getContextLimit();
+      statsDiv.innerHTML = `Current: <strong>${this.formatSize(currentTokens)}</strong> / ${this.formatSize(currentLimit)}`;
+  
+      // Context limit input
+      const limitLabel = document.createElement('div');
+      limitLabel.style.marginBottom = '8px';
+      limitLabel.style.color = 'var(--color-text-primary)';
+      limitLabel.textContent = 'Context limit (tokens):';
+  
+      const limitInput = document.createElement('input');
+      limitInput.type = 'number';
+      limitInput.value = currentLimit;
+      limitInput.min = '1000';
+      limitInput.step = '1000';
+      limitInput.style.width = '100%';
+      limitInput.style.padding = '8px';
+      limitInput.style.marginBottom = '20px';
+      limitInput.style.background = 'var(--color-bg-primary)';
+      limitInput.style.border = '1px solid var(--color-border)';
+      limitInput.style.color = 'var(--color-text-primary)';
+      limitInput.style.borderRadius = '4px';
+      limitInput.style.fontSize = '14px';
+      limitInput.style.fontFamily = "'Consolas', 'Courier New', monospace";
+  
+      // Buttons
+      const buttonContainer = document.createElement('div');
+      buttonContainer.style.display = 'flex';
+      buttonContainer.style.gap = '12px';
+      buttonContainer.style.justifyContent = 'flex-end';
+      buttonContainer.style.marginTop = '20px';
+  
+      const clearBtn = document.createElement('button');
+      clearBtn.textContent = 'Clear All';
+      clearBtn.style.padding = '8px 16px';
+      clearBtn.style.background = 'var(--color-bg-primary)';
+      clearBtn.style.border = '1px solid #ff6b6b';
+      clearBtn.style.color = '#ff6b6b';
+      clearBtn.style.cursor = 'pointer';
+      clearBtn.style.borderRadius = '4px';
+      clearBtn.style.fontSize = '14px';
+      clearBtn.style.fontFamily = "'Consolas', 'Courier New', monospace";
+      clearBtn.style.marginRight = 'auto';
+      clearBtn.onclick = () => {
+        if (confirm('Are you sure you want to clear all messages?')) {
+          state.clearMessages();
+          this.renderMessages(state.getMessages());
+          this.updateContextStats();
+          overlay.remove();
+        }
+      };
+  
+      const cancelBtn = document.createElement('button');
+      cancelBtn.textContent = 'Cancel';
+      cancelBtn.style.padding = '8px 16px';
+      cancelBtn.style.background = 'var(--color-bg-primary)';
+      cancelBtn.style.border = '1px solid var(--color-border)';
+      cancelBtn.style.color = 'var(--color-text-primary)';
+      cancelBtn.style.cursor = 'pointer';
+      cancelBtn.style.borderRadius = '4px';
+      cancelBtn.style.fontFamily = "'Consolas', 'Courier New', monospace";
+      cancelBtn.onclick = () => overlay.remove();
+  
+      const saveBtn = document.createElement('button');
+      saveBtn.textContent = 'Save Limit';
+      saveBtn.style.padding = '8px 16px';
+      saveBtn.style.background = 'var(--color-gold)';
+      saveBtn.style.border = 'none';
+      saveBtn.style.color = 'var(--color-bg-primary)';
+      saveBtn.style.cursor = 'pointer';
+      saveBtn.style.borderRadius = '4px';
+      saveBtn.style.fontSize = '14px';
+      saveBtn.style.fontFamily = "'Consolas', 'Courier New', monospace";
+      saveBtn.style.fontWeight = 'bold';
+      saveBtn.onclick = async () => {
+        const newLimit = parseInt(limitInput.value);
+        if (newLimit && newLimit >= 1000) {
+          state.setContextLimit(newLimit);
+  
+          // If new limit is lower than current usage, trigger compaction
+          if (currentTokens > newLimit) {
+            const main = window.module['main.js'];
+            await main.compactContext();
+            this.renderMessages(state.getMessages());
+          }
+  
+          this.updateContextStats();
+          overlay.remove();
+        } else {
+          alert('Please enter a valid limit (minimum 1000 tokens)');
+        }
+      };
+  
+      buttonContainer.appendChild(clearBtn);
+      buttonContainer.appendChild(cancelBtn);
+      buttonContainer.appendChild(saveBtn);
+  
+      body.appendChild(statsDiv);
+      body.appendChild(limitLabel);
+      body.appendChild(limitInput);
+      body.appendChild(buttonContainer);
+  
+      modalContainer.appendChild(header);
+      modalContainer.appendChild(body);
+      overlay.appendChild(modalContainer);
+  
+      // Close on overlay click
+      overlay.addEventListener('click', (e) => {
+        if (e.target === overlay) {
+          overlay.remove();
+        }
+      });
+  
+      // Close on ESC key
+      const escHandler = (e) => {
+        if (e.key === 'Escape') {
+          overlay.remove();
+          document.removeEventListener('keydown', escHandler);
+        }
+      };
+      document.addEventListener('keydown', escHandler);
+  
+      document.body.appendChild(overlay);
     }
   };
   
