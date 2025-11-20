@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-20T16:52:06.810Z
+// AI Agent - Built 2025-11-20T17:49:55.694Z
 (function() {
   window.module = {};
 
@@ -452,7 +452,8 @@
         onHideLoading = () => {},
         onRenderMessages = () => {},
         onUpdateStats = () => {},
-        onProcessingChange = () => {}
+        onProcessingChange = () => {},
+        onAfterTools = async () => {}  // Callback after tools execute (for compaction check)
       } = callbacks;
   
       let continueProcessing = true;
@@ -548,6 +549,9 @@
           // Execute all tools
           await this.executeTools(parsedResponse.tool_uses, selectedDirectory, addMessage, onRenderMessages);
   
+          // Check if compaction is needed after tools added results
+          await onAfterTools();
+  
           onUpdateStats();
           onLoading();
           continue;
@@ -556,6 +560,23 @@
   
       console.log('[Core] Processing complete after', iteration, 'iterations');
       return { success: true, iterations: iteration };
+    },
+  
+    // Truncate tool output if it exceeds size limit
+    truncateToolOutput: function(content, toolName, maxTokens = 2500) {
+      const state = window.module['state.js'];
+      const limit = state.getContextLimit();
+      const maxChars = maxTokens * 4; // 4 chars per token estimate
+  
+      if (content.length <= maxChars) {
+        return content;
+      }
+  
+      const truncated = content.substring(0, maxChars);
+      const remaining = content.length - maxChars;
+      const remainingTokens = Math.ceil(remaining / 4);
+  
+      return truncated + `\n\n[... Output truncated. ${remainingTokens} more tokens (${remaining} chars) omitted. If you need the full output, run ${toolName} again with more specific parameters to reduce output size.]`;
     },
   
     // Execute tools (unified handler for all tools) - UI-independent
@@ -608,13 +629,16 @@
   
           if (result.success) {
             const lineCount = result.content.split('\n').length;
+            const truncatedContent = this.truncateToolOutput(result.content, 'read_file');
+            const wasTruncated = truncatedContent.length < result.content.length;
   
             addMessage({
               role: 'tool-result',
               toolName: 'read_file',
-              summary: `Read ${lineCount} lines from ${result.path}`,
+              summary: `Read ${lineCount} lines from ${result.path}${wasTruncated ? ' (truncated)' : ''}`,
               fullResult: result.content,
-              content: `File: ${result.path}\n\n${result.content}`
+              content: `File: ${result.path}\n\n${truncatedContent}`,
+              truncated: wasTruncated
             });
           } else {
             addMessage({
@@ -1384,9 +1408,41 @@
           onHideLoading: () => ui.hideLoading(),
           onRenderMessages: () => ui.renderMessages(state.getMessages()),
           onUpdateStats: () => ui.updateContextStats(),
-          onProcessingChange: (processing) => state.setProcessing(processing)
+          onProcessingChange: (processing) => state.setProcessing(processing),
+          onAfterTools: async () => {
+            // Check if context exceeds limit after tool results
+            const currentTokens = state.calculateTokens();
+            const limit = state.getContextLimit();
+            if (currentTokens > limit) {
+              console.log(`[Main] Context exceeds limit after tools (${currentTokens} > ${limit}), compacting...`);
+              await this.compactContext();
+              ui.renderMessages(state.getMessages());
+              ui.updateContextStats();
+            }
+          }
         }
       );
+    },
+  
+    // Truncate tool output if it exceeds size limit (1/8 of context limit = 2500 tokens default)
+    truncateToolOutput: function(content, toolName) {
+      const state = window.module['state.js'];
+      const limit = state.getContextLimit();
+      const maxTokens = Math.floor(limit / 8); // 1/8 of limit
+      const maxChars = maxTokens * 4; // 4 chars per token estimate
+  
+      if (content.length <= maxChars) {
+        return { content, wasTruncated: false };
+      }
+  
+      const truncated = content.substring(0, maxChars);
+      const remaining = content.length - maxChars;
+      const remainingTokens = Math.ceil(remaining / 4);
+  
+      return {
+        content: truncated + `\n\n[... Output truncated. ${remainingTokens} more tokens (${remaining} chars) omitted. If you need the full output, run ${toolName} again with more specific parameters to reduce output size.]`,
+        wasTruncated: true
+      };
     },
   
     // Execute tools (unified handler for all tools)
@@ -1502,13 +1558,15 @@
           if (result.success) {
             const matchCount = result.matches.length;
             const timeoutWarning = result.timeout ? ' (search timed out - partial results)' : '';
+            const truncated = this.truncateToolOutput(result.output, 'search_by_filename');
   
             state.addMessage({
               role: 'tool-result',
               toolName: 'search_by_filename',
-              summary: `Found ${matchCount} file(s) matching "${toolUse.input.pattern}"${timeoutWarning}`,
+              summary: `Found ${matchCount} file(s) matching "${toolUse.input.pattern}"${timeoutWarning}${truncated.wasTruncated ? ' (truncated)' : ''}`,
               fullResult: result.output,
-              content: `Search results for pattern "${toolUse.input.pattern}" in "${searchPath}":\n\n${result.output}`
+              content: `Search results for pattern "${toolUse.input.pattern}" in "${searchPath}":\n\n${truncated.content}`,
+              truncated: truncated.wasTruncated
             });
           } else {
             state.addMessage({
@@ -1535,13 +1593,15 @@
           if (result.success) {
             const matchCount = result.matches.length;
             const timeoutWarning = result.timeout ? ' (search timed out - partial results)' : '';
+            const truncated = this.truncateToolOutput(result.output, 'search_by_content');
   
             state.addMessage({
               role: 'tool-result',
               toolName: 'search_by_content',
-              summary: `Found ${matchCount} match(es) for "${toolUse.input.text}"${timeoutWarning}`,
+              summary: `Found ${matchCount} match(es) for "${toolUse.input.text}"${timeoutWarning}${truncated.wasTruncated ? ' (truncated)' : ''}`,
               fullResult: result.output,
-              content: `Search results for text "${toolUse.input.text}" in "${searchPath}":\n\n${result.output}`
+              content: `Search results for text "${toolUse.input.text}" in "${searchPath}":\n\n${truncated.content}`,
+              truncated: truncated.wasTruncated
             });
           } else {
             state.addMessage({
@@ -2106,24 +2166,36 @@
         return;
       }
   
-      // Calculate midpoint (first half of non-uiOnly messages)
-      const realMessages = messages.filter(m => !m.uiOnly);
-      const halfCount = Math.ceil(realMessages.length / 2);
+      // Calculate target: remove messages until we're at 50% of limit or less
+      const limit = state.getContextLimit();
+      const targetTokens = Math.floor(limit * 0.5);
+      const currentTokens = state.calculateTokens();
   
-      // Get the index in the full messages array where we should split
-      let splitIndex = -1;
-      let realCount = 0;
-      for (let i = 0; i < messages.length; i++) {
-        if (!messages[i].uiOnly) {
-          realCount++;
-          if (realCount === halfCount) {
-            splitIndex = i;
-            break;
-          }
+      console.log('[Main] Current tokens:', currentTokens, '/ Limit:', limit);
+      console.log('[Main] Target after compaction:', targetTokens, 'tokens (50% of limit)');
+  
+      // Remove messages from the front until we reach target
+      let splitIndex = firstRealMessageIndex;
+      let tokensAfterSplit = currentTokens;
+  
+      for (let i = firstRealMessageIndex; i < messages.length; i++) {
+        if (messages[i].uiOnly) continue;
+  
+        // Calculate tokens if we remove up to this message
+        const remainingMessages = messages.slice(i + 1);
+        tokensAfterSplit = state.calculateTokens(remainingMessages);
+  
+        splitIndex = i;
+  
+        // Stop if we've reached our target
+        if (tokensAfterSplit <= targetTokens) {
+          break;
         }
       }
   
-      console.log('[Main] Splitting at index', splitIndex, '(half count:', halfCount, ')');
+      const messagesToRemove = splitIndex - firstRealMessageIndex + 1;
+      console.log('[Main] Removing', messagesToRemove, 'messages (up to index', splitIndex, ')');
+      console.log('[Main] Tokens after removal:', tokensAfterSplit);
   
       // Get messages to summarize (from first real message to split point)
       const messagesToSummarize = messages.slice(firstRealMessageIndex, splitIndex + 1);
