@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-20T18:12:24.565Z
+// AI Agent - Built 2025-11-20T22:20:39.398Z
 (function() {
   window.module = {};
 
@@ -9,19 +9,19 @@
     renderMessagesForAPI: function(messages) {
       const tools = window.module['tools.js'];
       const state = window.module['state.js'];
+      const diagnostics = window.module['diagnostics.js'];
   
-      console.log('[API INPUT] Total messages:', messages.length);
+      diagnostics.log('api', 'renderMessagesForAPI called', { totalMessages: messages.length });
   
       // Filter out UI-only messages
       const apiMessages = messages.filter(msg => !msg.uiOnly);
   
-      console.log('[API INPUT] After UI filtering:', apiMessages.length);
+      diagnostics.log('api', 'After UI filtering', { apiMessagesCount: apiMessages.length });
   
       // Log total size estimate and find largest messages
       const totalChars = messages.reduce((sum, msg) => sum + (msg.content?.length || 0), 0);
       const estimatedTokens = Math.ceil(totalChars / 4);
-      console.log('[API INPUT SIZE] Total characters in all messages:', totalChars);
-      console.log('[API INPUT SIZE] Estimated tokens (chars/4):', estimatedTokens);
+      diagnostics.log('api', 'Message size calculation', { totalChars, estimatedTokens });
   
       // Find and log the 5 largest messages
       const messagesWithSize = messages.map((msg, idx) => ({
@@ -32,11 +32,7 @@
         preview: msg.content?.substring(0, 100) || ''
       })).sort((a, b) => b.size - a.size);
   
-      console.log('[API LARGEST MESSAGES] Top 5 largest messages:');
-      for (let i = 0; i < Math.min(5, messagesWithSize.length); i++) {
-        const m = messagesWithSize[i];
-        console.log(`  ${i+1}. Index ${m.index}, Role: ${m.role}${m.toolName ? ' ('+m.toolName+')' : ''}, Size: ${m.size} chars, Preview: "${m.preview}..."`);
-      }
+      diagnostics.log('api', 'Top 5 largest messages', { top5: messagesWithSize.slice(0, 5) });
   
       // If a summary exists, only include messages from last summary forward
       const lastSummaryIndex = state.getLastSummaryIndex();
@@ -53,8 +49,10 @@
           return originalIndex > lastSummaryIndex;
         });
   
-        console.log('[API] Found summary at index', lastSummaryIndex);
-        console.log('[API] Using', messagesToProcess.length, 'messages after summary');
+        diagnostics.log('api', 'Summary compaction', {
+          lastSummaryIndex,
+          messagesAfterSummary: messagesToProcess.length
+        });
       }
   
       // Convert messages for API: tool-use and tool-result become user messages
@@ -96,7 +94,7 @@
         }
       }
   
-      console.log('[API] Sending', processedMessages.length, 'messages to API');
+      diagnostics.log('api', 'Sending messages to API', { messageCount: processedMessages.length });
   
       return {
         messages: processedMessages,
@@ -106,6 +104,7 @@
   
     // Handle truncated responses by requesting continuations
     handleTruncatedResponse: async function(initialResponseText, headers, requestBody, startTime) {
+      const diagnostics = window.module['diagnostics.js'];
       const TERMINATOR = '||||END||||';
       const MAX_CONTINUATIONS = 20;
       const TAIL_LENGTH = 20;
@@ -116,15 +115,15 @@
       let incomplete = false;
       let incompleteReason = null;
   
-      console.log('[API] Response missing terminator - handling truncation');
+      diagnostics.log('api', 'Response missing terminator - handling truncation');
   
       while (!fullResponse.includes(TERMINATOR) && continuationCount < MAX_CONTINUATIONS) {
         continuationCount++;
-        console.log(`[API] Requesting continuation ${continuationCount}/${MAX_CONTINUATIONS}`);
+        diagnostics.log('api', 'Requesting continuation', { continuationCount, MAX_CONTINUATIONS });
   
         // Get last TAIL_LENGTH characters
         const tail = fullResponse.slice(-TAIL_LENGTH);
-        console.log(`[API] Tail (last ${TAIL_LENGTH} chars): "${tail}"`);
+        diagnostics.log('api', 'Tail characters', { TAIL_LENGTH, tail });
   
         // Create continuation prompt
         const continuationMessages = [
@@ -154,19 +153,36 @@
   
           if (!response.ok) {
             const errorText = await response.text();
-            console.warn(`[API] Continuation request failed (${response.status}): ${errorText}`);
+            diagnostics.handleError('API_ERROR', {
+              error: new Error(`Continuation request failed (${response.status})`),
+              response: { status: response.status, statusText: response.statusText },
+              requestBody: continuationBody
+            });
             incomplete = true;
             incompleteReason = `Continuation request failed (${response.status})`;
             break;
           }
   
-          const data = await response.json();
+          let data;
+          try {
+            data = await response.json();
+          } catch (error) {
+            const responseText = await response.text();
+            diagnostics.handleError('JSON_PARSE_ERROR', {
+              error,
+              jsonString: responseText,
+              position: error.message.match(/position (\d+)/)?.[1] || 0
+            });
+            incomplete = true;
+            incompleteReason = `JSON parse error: ${error.message}`;
+            break;
+          }
           const chunk = data.choices[0].message.content;
-          console.log(`[API] Chunk received (first 100 chars): "${chunk.substring(0, 100)}"`);
+          diagnostics.log('api', 'Chunk received', { chunkPreview: chunk.substring(0, 100) });
   
           // Handle blank response
           if (!chunk || chunk.trim() === '') {
-            console.log('[API] Received blank continuation - stopping');
+            diagnostics.log('api', 'Received blank continuation - stopping');
             incomplete = true;
             incompleteReason = 'Received blank continuation response';
             break;
@@ -174,7 +190,7 @@
   
           // Check for duplicate chunks (AI repeating itself)
           if (lastChunk && chunk === lastChunk) {
-            console.warn('[API] AI is repeating the same chunk - aborting continuation');
+            diagnostics.log('api', 'AI is repeating the same chunk - aborting continuation');
             incomplete = true;
             incompleteReason = 'AI is repeating the same content';
             break;
@@ -183,7 +199,7 @@
   
           // If AI just sends terminator, it means previous response was complete
           if (chunk.trim() === TERMINATOR) {
-            console.log('[API] AI confirmed completion with terminator');
+            diagnostics.log('api', 'AI confirmed completion with terminator');
             fullResponse += TERMINATOR;
             break;
           }
@@ -198,20 +214,20 @@
             if (tailEnd === chunkStart) {
               // Found overlap - remove it from the chunk
               chunkToAdd = chunk.slice(overlapLen);
-              console.log(`[API] Detected ${overlapLen} char overlap: "${tailEnd}"`);
+              diagnostics.log('api', 'Detected overlap', { overlapLen, tailEnd });
               overlapFound = true;
               break;
             }
           }
   
           if (!overlapFound) {
-            console.log(`[API] No overlap detected between tail and chunk start`);
+            diagnostics.log('api', 'No overlap detected between tail and chunk start');
           }
   
-          console.log(`[API] Received continuation chunk: ${chunk.length} chars (${chunkToAdd.length} after overlap removal)`);
+          diagnostics.log('api', 'Received continuation chunk', { chunkLength: chunk.length, afterOverlapRemoval: chunkToAdd.length });
           fullResponse += chunkToAdd;
         } catch (error) {
-          console.warn(`[API] Error during continuation: ${error.message}`);
+          diagnostics.log('api', 'Error during continuation', { error: error.message });
           incomplete = true;
           incompleteReason = error.message;
           break;
@@ -219,7 +235,7 @@
       }
   
       if (continuationCount >= MAX_CONTINUATIONS) {
-        console.warn(`[API] Exceeded maximum continuation attempts (${MAX_CONTINUATIONS})`);
+        diagnostics.log('api', 'Exceeded maximum continuation attempts', { MAX_CONTINUATIONS });
         incomplete = true;
         incompleteReason = `Exceeded maximum continuation attempts (${MAX_CONTINUATIONS})`;
       }
@@ -228,9 +244,9 @@
       const durationSeconds = (endTime - startTime) / 1000;
   
       if (incomplete) {
-        console.log(`[API] Returning incomplete response after ${continuationCount} continuations. Reason: ${incompleteReason}`);
+        diagnostics.log('api', 'Returning incomplete response', { continuationCount, incompleteReason });
       } else {
-        console.log(`[API] Complete response assembled after ${continuationCount} continuations`);
+        diagnostics.log('api', 'Complete response assembled', { continuationCount });
       }
   
       return {
@@ -242,6 +258,7 @@
     },
   
     callAPI: async function(messages, maxRetries = 3) {
+      const diagnostics = window.module['diagnostics.js'];
       const authToken = localStorage.getItem('token');
       const tools = window.module['tools.js'];
       const TERMINATOR = '||||END||||';
@@ -256,7 +273,7 @@
       // If summary exists, append it to system prompt
       if (summary) {
         systemPrompt += "\n\n=== Summary of Earlier Conversation ===\n\n" + summary;
-        console.log('[API] Appending summary to system prompt');
+        diagnostics.log('api', 'Appending summary to system prompt');
       }
   
       // Prepend system prompt to first user message (prod API doesn't support system field)
@@ -291,22 +308,15 @@
       const requestBodySize = requestBodyString.length;
       const requestBodyTokens = Math.ceil(requestBodySize / 4);
   
-      console.log('[API] ========================================');
-      console.log('[API REQUEST] REQUEST SUMMARY:');
-      console.log('[API] ========================================');
-      console.log('  - System prompt length:', systemPrompt.length);
-      console.log('  - Messages count:', messagesWithSystem.length);
-      console.log('  - Tools: list_directory, read_file, write_file');
-      if (summary) {
-        console.log('  - Summary included: YES (' + summary.length + ' chars)');
-      }
-      console.log('[API REQUEST SIZE] Request body size:', requestBodySize, 'chars');
-      console.log('[API REQUEST SIZE] Request body estimated tokens:', requestBodyTokens);
-      console.log('[API]');
-      console.log('[API] FULL REQUEST BODY:');
-      console.log('[API] ========================================');
-      console.log(JSON.stringify(requestBody, null, 2));
-      console.log('[API] ========================================');
+      diagnostics.log('api', 'API REQUEST SUMMARY', {
+        systemPromptLength: systemPrompt.length,
+        messagesCount: messagesWithSystem.length,
+        tools: 'list_directory, read_file, write_file',
+        summaryIncluded: summary ? `YES (${summary.length} chars)` : 'NO',
+        requestBodySize,
+        requestBodyTokens
+      });
+      diagnostics.log('api', 'FULL REQUEST BODY', { requestBody });
   
       const headers = {
         'Content-Type': 'application/json'
@@ -329,18 +339,26 @@
   
           if (!response.ok) {
             const errorText = await response.text();
-            console.error('[API ERROR] ========================================');
-            console.error('[API ERROR] API REQUEST FAILED');
-            console.error('[API ERROR] ========================================');
-            console.error('[API ERROR] Status code:', response.status);
-            console.error('[API ERROR] Status text:', response.statusText);
-            console.error('[API ERROR] Error response length:', errorText.length, 'chars');
-            console.error('[API ERROR] Error response:', errorText);
-            console.error('[API ERROR] ========================================');
+            diagnostics.handleError('API_ERROR', {
+              error: new Error(`API request failed (${response.status}): ${errorText}`),
+              response: { status: response.status, statusText: response.statusText },
+              requestBody
+            });
             throw new Error(`API request failed (${response.status}): ${errorText}`);
           }
   
-          const data = await response.json();
+          let data;
+          try {
+            data = await response.json();
+          } catch (error) {
+            const responseText = await response.text();
+            diagnostics.handleError('JSON_PARSE_ERROR', {
+              error,
+              jsonString: responseText,
+              position: error.message.match(/position (\d+)/)?.[1] || 0
+            });
+            throw new Error(`JSON parse error: ${error.message}`);
+          }
           let responseText = data.choices[0].message.content;
           let durationSeconds = (Date.now() - startTime) / 1000;
   
@@ -349,17 +367,13 @@
           const responseDataSize = responseDataString.length;
           const responseTokens = Math.ceil(responseText.length / 4);
   
-          console.log('[API]');
-          console.log('[API] ========================================');
-          console.log('[API RESPONSE] FULL API RESPONSE:');
-          console.log('[API] ========================================');
-          console.log(JSON.stringify(data, null, 2));
-          console.log('[API] ========================================');
-          console.log('[API RESPONSE SIZE] Response text length:', responseText.length, 'chars');
-          console.log('[API RESPONSE SIZE] Response estimated tokens:', responseTokens);
-          console.log('[API RESPONSE SIZE] Full response data size:', responseDataSize, 'chars');
-          console.log('[API RESPONSE SIZE] Request duration:', durationSeconds.toFixed(2), 'seconds');
-          console.log('[API] ========================================');
+          diagnostics.log('api', 'FULL API RESPONSE', { data });
+          diagnostics.log('api', 'API RESPONSE SIZE', {
+            responseTextLength: responseText.length,
+            responseTokens,
+            fullResponseDataSize: responseDataSize,
+            durationSeconds: durationSeconds.toFixed(2)
+          });
   
           // Check for terminator
           let wasIncomplete = false;
@@ -381,8 +395,12 @@
   
           if (!parseResult.valid) {
             lastError = parseResult.error;
-            console.warn(`Attempt ${attempt + 1}/${maxRetries} - Invalid response: ${parseResult.error}`);
-            console.warn(`Raw response text:`, responseText.substring(0, 500));
+            diagnostics.log('api', 'Invalid response', {
+              attempt: attempt + 1,
+              maxRetries,
+              error: parseResult.error,
+              responseTextPreview: responseText.substring(0, 500)
+            });
   
             // If response was incomplete, include that info in the error
             let errorMessage = parseResult.error;
@@ -419,16 +437,14 @@
           };
         } catch (error) {
           lastError = error.message;
-          console.error('[API ERROR] ========================================');
-          console.error('[API ERROR] EXCEPTION DURING API CALL');
-          console.error('[API ERROR] ========================================');
-          console.error('[API ERROR] Attempt:', `${attempt + 1}/${maxRetries}`);
-          console.error('[API ERROR] Error message:', error.message);
-          console.error('[API ERROR] Error stack:', error.stack);
-          console.error('[API ERROR] ========================================');
+          diagnostics.log('api', 'API ERROR - EXCEPTION DURING API CALL', {
+            attempt: `${attempt + 1}/${maxRetries}`,
+            errorMessage: error.message,
+            errorStack: error.stack
+          });
   
           if (attempt < maxRetries - 1) {
-            console.log('[API ERROR] Retrying...');
+            diagnostics.log('api', 'Retrying API call');
             continue;
           }
         }
@@ -446,6 +462,7 @@
   window.module['core.js'] = {
     // Process AI response loop (without UI calls)
     processAIResponse: async function(getMessages, addMessage, selectedDirectory, callbacks = {}) {
+      const diagnostics = window.module['diagnostics.js'];
       const api = window.module['api.js'];
       const {
         onLoading = () => {},
@@ -463,11 +480,11 @@
   
       while (continueProcessing) {
         iteration++;
-        console.log('='.repeat(80));
-        console.log(`[Core] ========== ITERATION ${iteration} START ==========`);
-        console.log('[Core] Total messages:', getMessages().length);
+        diagnostics.log('context', '='.repeat(80));
+        diagnostics.log('context', `[Core] ========== ITERATION ${iteration} START ==========`);
+        diagnostics.log('context', '[Core] Total messages: ' + getMessages().length);
   
-        // Send to API
+        // Send to API (loading indicator should already be showing)
         const response = await api.callAPI(getMessages());
   
         // Remove loading indicator
@@ -475,13 +492,13 @@
   
         if (!response.valid) {
           // Invalid response - provide detailed feedback to AI
-          console.error('[Core] Invalid response:', response.error);
+          diagnostics.log('context', '[Core] Invalid response: ' + response.error);
           consecutiveErrors++;
-          console.log(`[Core] Consecutive errors: ${consecutiveErrors}/${MAX_RETRIES}`);
+          diagnostics.log('context', `[Core] Consecutive errors: ${consecutiveErrors}/${MAX_RETRIES}`);
   
           // Only show error to user if we've exceeded retry limit
           if (consecutiveErrors >= MAX_RETRIES) {
-            console.error('[Core] Max retries exceeded, showing error to user');
+            diagnostics.log('context', '[Core] Max retries exceeded, showing error to user');
             addMessage({
               role: 'assistant',
               content: `Error: Invalid response after ${MAX_RETRIES} attempts - ${response.error}`
@@ -511,9 +528,21 @@
   
         const parsedResponse = response.parsed;
   
+        // If text was extracted from before/after the JSON, show it as an assistant message
+        if (response.extractedText) {
+          if (response.extractedText.prefix) {
+            diagnostics.log('json', '[Core] Showing extracted prefix text as assistant message');
+            addMessage({
+              role: 'assistant',
+              content: response.extractedText.prefix
+            });
+            onRenderMessages();
+          }
+        }
+  
         if (parsedResponse.type === 'message') {
           // Final message response
-          console.log('[Core] ========== MESSAGE RESPONSE ==========');
+          diagnostics.log('context', '[Core] ========== MESSAGE RESPONSE ==========');
   
           addMessage({
             role: 'assistant',
@@ -528,10 +557,21 @@
           });
           onRenderMessages();
           onUpdateStats();
+  
+          // If there's suffix text (text after JSON), show it as assistant message
+          if (response.extractedText && response.extractedText.suffix) {
+            diagnostics.log('json', '[Core] Showing extracted suffix text as assistant message');
+            addMessage({
+              role: 'assistant',
+              content: response.extractedText.suffix
+            });
+            onRenderMessages();
+          }
+  
           continueProcessing = false;
         } else if (parsedResponse.type === 'execute') {
-          console.log('[Core] ========== EXECUTE RESPONSE ==========');
-          console.log('[Core] AI requested', parsedResponse.tool_uses.length, 'tool(s)');
+          diagnostics.log('tools', '[Core] ========== EXECUTE RESPONSE ==========');
+          diagnostics.log('tools', '[Core] AI requested ' + parsedResponse.tool_uses.length + ' tool(s)');
   
           // Add assistant message with API data
           addMessage({
@@ -545,25 +585,40 @@
             },
             durationSeconds: response.durationSeconds
           });
+          onRenderMessages();
+          onUpdateStats();
+  
+          // Show loading before executing tools
+          onLoading();
   
           // Execute all tools
           await this.executeTools(parsedResponse.tool_uses, selectedDirectory, addMessage, onRenderMessages);
   
+          // If there's suffix text (text after JSON), show it as assistant message
+          if (response.extractedText && response.extractedText.suffix) {
+            diagnostics.log('json', '[Core] Showing extracted suffix text as assistant message');
+            addMessage({
+              role: 'assistant',
+              content: response.extractedText.suffix
+            });
+            onRenderMessages();
+          }
+  
           // Check if compaction is needed after tools added results
           await onAfterTools();
   
-          onUpdateStats();
-          onLoading();
+          // Loading indicator will remain on for next API call
           continue;
         }
       }
   
-      console.log('[Core] Processing complete after', iteration, 'iterations');
+      diagnostics.log('context', '[Core] Processing complete after ' + iteration + ' iterations');
       return { success: true, iterations: iteration };
     },
   
     // Truncate tool output if it exceeds size limit
-    truncateToolOutput: function(content, toolName, maxTokens = 2500) {
+    truncateToolOutput: function(content, toolName, maxTokens = 250) {
+      const diagnostics = window.module['diagnostics.js'];
       const state = window.module['state.js'];
       const limit = state.getContextLimit();
       const maxChars = maxTokens * 4; // 4 chars per token estimate
@@ -576,7 +631,14 @@
       const remaining = content.length - maxChars;
       const remainingTokens = Math.ceil(remaining / 4);
   
-      return truncated + `\n\n[... Output truncated. ${remainingTokens} more tokens (${remaining} chars) omitted. If you need the full output, run ${toolName} again with more specific parameters to reduce output size.]`;
+      diagnostics.handleError('TOOL_OUTPUT_TOO_LARGE', {
+        toolName,
+        originalSize: content.length,
+        truncatedSize: truncated.length,
+        limit: maxChars
+      });
+  
+      return truncated + `\n\n[... Content truncated - ${remainingTokens} more tokens (${remaining} chars) omitted. The output was too large to include in full. If you didn't find what you needed in the visible portion, try using more specific parameters to narrow down the results (e.g., search in a specific subdirectory, use a more specific filename pattern, or search for more specific text).]`;
     },
   
     // Execute tools (unified handler for all tools) - UI-independent
@@ -805,7 +867,8 @@
             content: `ERROR: Unknown tool "${toolUse.name}". Available tools are: list_directory, read_file, write_file, search_by_filename, search_by_content, edit_file, edit_file_batch.`,
             fromSystem: true
           });
-          console.warn(`[Core] Unknown tool: ${toolUse.name}`);
+          const diagnostics = window.module['diagnostics.js'];
+          diagnostics.log('tools', `[Core] Unknown tool: ${toolUse.name}`);
         }
       }
   
@@ -972,7 +1035,8 @@
             }
           }
         } catch (error) {
-          console.warn(`[Search] Error accessing ${currentPath}:`, error.message);
+          const diagnostics = window.module['diagnostics.js'];
+          diagnostics.log('tools', `[Search] Error accessing ${currentPath}: ${error.message}`);
         }
       }
   
@@ -1069,7 +1133,8 @@
                 }
               } catch (error) {
                 // Skip binary files or files that can't be read as text
-                console.warn(`[Search] Could not read ${entryPath}:`, error.message);
+                const diagnostics = window.module['diagnostics.js'];
+                diagnostics.log('tools', `[Search] Could not read ${entryPath}: ${error.message}`);
               }
             } else if (entry.kind === 'directory') {
               // Recurse into subdirectory
@@ -1077,7 +1142,8 @@
             }
           }
         } catch (error) {
-          console.warn(`[Search] Error accessing ${currentPath}:`, error.message);
+          const diagnostics = window.module['diagnostics.js'];
+          diagnostics.log('tools', `[Search] Error accessing ${currentPath}: ${error.message}`);
         }
       }
   
@@ -1274,13 +1340,401 @@
   };
   
 
+  // Module: diagnostics.js
+  // Diagnostic and Error Handling System
+  // Stores logs in memory and provides structured error reporting
+  
+  (function() {
+    'use strict';
+  
+    // Log storage
+    const logs = [];
+    const MAX_LOGS = 1000;
+  
+    // Logging function (replaces console.log for internal use)
+    function log(category, message, data = null) {
+      const entry = {
+        timestamp: Date.now(),
+        category,
+        message,
+        data
+      };
+      logs.push(entry);
+  
+      // Keep only last MAX_LOGS entries
+      if (logs.length > MAX_LOGS) {
+        logs.shift();
+      }
+    }
+  
+    // Get recent logs
+    function getLogs(category = null, count = 100) {
+      let filtered = category ? logs.filter(l => l.category === category) : logs;
+      return filtered.slice(-count);
+    }
+  
+    // Clear logs
+    function clearLogs() {
+      logs.length = 0;
+    }
+  
+    // Error analyzers - each analyzes a specific error type
+    const errorAnalyzers = {
+      'JSON_PARSE_ERROR': function(context) {
+        const { error, jsonString, position } = context;
+        const logs = getLogs('json', 50);
+  
+        // Extract key metrics
+        const stringLength = jsonString ? jsonString.length : 0;
+        const preview = jsonString ? jsonString.substring(Math.max(0, position - 50), position + 50) : '';
+        const charAtPosition = jsonString ? jsonString[position] : '';
+  
+        // Check for common issues
+        const hasTrailingComma = jsonString && /,\s*[}\]]/.test(jsonString);
+        const hasUnescapedQuotes = jsonString && /[^\\]"[^,:}\]\s]/.test(jsonString);
+        const hasMissingQuotes = jsonString && /{\s*\w+:/.test(jsonString);
+        const hasTextBeforeJSON = jsonString && jsonString.trim()[0] !== '{';
+        const hasTextAfterJSON = jsonString && jsonString.trim().slice(-1) !== '}';
+        const firstBrace = jsonString ? jsonString.indexOf('{') : -1;
+        const lastBrace = jsonString ? jsonString.lastIndexOf('}') : -1;
+  
+        // Theory-based analysis
+        const theories = [];
+        if (hasTextBeforeJSON || hasTextAfterJSON) {
+          theories.push('AI added commentary text before/after JSON - extraction should handle this');
+        }
+        if (hasTrailingComma) {
+          theories.push('Trailing comma in JSON object/array - invalid JSON syntax');
+        }
+        if (hasUnescapedQuotes) {
+          theories.push('Unescaped quotes in string values - needs backslash escaping');
+        }
+        if (hasMissingQuotes) {
+          theories.push('Missing quotes around object keys - invalid JSON syntax');
+        }
+        if (stringLength > 100000) {
+          theories.push('Response over 100KB - may be truncated by API or network');
+        }
+        if (firstBrace === -1 || lastBrace === -1) {
+          theories.push('No JSON braces found - response may be plain text error message');
+        }
+        if (firstBrace > 100) {
+          theories.push(`JSON starts at position ${firstBrace} - likely has ${firstBrace} chars of text before it`);
+        }
+  
+        return {
+          code: 'JSON_PARSE_ERROR',
+          position,
+          stringLength,
+          preview: `...${preview}...`,
+          charAtPosition: charAtPosition ? `'${charAtPosition}' (code: ${charAtPosition.charCodeAt(0)})` : 'N/A',
+          jsonBounds: `{ at ${firstBrace}, } at ${lastBrace}`,
+          theories: theories.length > 0 ? theories : ['Unknown cause - check error message and preview'],
+          errorMessage: error.message
+        };
+      },
+  
+      'API_ERROR': function(context) {
+        const { error, response, requestBody } = context;
+        const logs = getLogs('api', 50);
+  
+        const requestSize = requestBody ? JSON.stringify(requestBody).length : 0;
+        const responseSize = response ? JSON.stringify(response).length : 0;
+        const status = response?.status || 'unknown';
+  
+        // Check for size issues
+        const requestTokens = Math.ceil(requestSize / 4);
+        const isRequestTooLarge = requestTokens > 30000;
+  
+        // Count recent API calls
+        const recentApiCalls = logs.filter(l =>
+          l.message.includes('callAPI') || l.message.includes('API')
+        ).length;
+  
+        // Theory-based analysis
+        const theories = [];
+        if (status === 401 || status === 403) {
+          theories.push('Authentication failed - check API key is valid and not expired');
+        }
+        if (status === 429) {
+          theories.push('Rate limit exceeded - too many requests to API');
+          theories.push(`Recent API calls: ${recentApiCalls} in last 50 log entries`);
+        }
+        if (status === 500 || status === 502 || status === 503) {
+          theories.push('Server error - API provider may be experiencing issues');
+        }
+        if (status === 400) {
+          theories.push('Bad request - request format may be invalid');
+          if (isRequestTooLarge) {
+            theories.push(`Request is ${requestTokens} tokens - may exceed API limits`);
+          }
+        }
+        if (isRequestTooLarge) {
+          theories.push(`Request size (${requestTokens} tokens) exceeds typical limits - context compaction needed`);
+        }
+        if (status === 'unknown') {
+          theories.push('Network error - check internet connection or API endpoint availability');
+        }
+        if (error.message.includes('fetch')) {
+          theories.push('Fetch failed - possible CORS issue or network problem');
+        }
+  
+        return {
+          code: 'API_ERROR',
+          status,
+          requestSize,
+          requestTokens,
+          responseSize,
+          recentApiCalls,
+          theories: theories.length > 0 ? theories : ['Unknown API error - check error message'],
+          errorMessage: error.message || 'Unknown API error',
+          responsePreview: response ? JSON.stringify(response).substring(0, 200) : 'No response'
+        };
+      },
+  
+      'CONTEXT_LIMIT_EXCEEDED': function(context) {
+        const { currentTokens, limit, messageCount } = context;
+        const logs = getLogs('context', 50);
+  
+        const exceededBy = currentTokens - limit;
+        const percentOver = Math.round((exceededBy / limit) * 100);
+  
+        // Check compaction history
+        const compactionLogs = logs.filter(l => l.message.includes('compact'));
+        const lastCompactionTime = compactionLogs.length > 0 ?
+          Date.now() - compactionLogs[compactionLogs.length - 1].timestamp : null;
+  
+        // Check for truncations
+        const truncationLogs = logs.filter(l => l.message.includes('truncat'));
+  
+        // Theory-based analysis
+        const theories = [];
+        if (percentOver < 10) {
+          theories.push('Slightly over limit - normal, compaction should resolve');
+        } else if (percentOver > 50) {
+          theories.push('Significantly over limit - may indicate large tool outputs or insufficient compaction');
+        }
+  
+        if (compactionLogs.length === 0) {
+          theories.push('No compactions yet - this is the first time limit exceeded');
+        } else if (compactionLogs.length > 5) {
+          theories.push(`Frequent compactions (${compactionLogs.length}) - conversation may be too long or summaries ineffective`);
+        }
+  
+        if (lastCompactionTime && lastCompactionTime < 10000) {
+          theories.push('Compacted very recently - limit exceeded again quickly, may need more aggressive compaction');
+        }
+  
+        if (truncationLogs.length > 0) {
+          theories.push(`${truncationLogs.length} truncations detected - large tool outputs contributing to size`);
+        }
+  
+        if (messageCount > 100) {
+          theories.push(`High message count (${messageCount}) - long conversation needs compaction`);
+        }
+  
+        const tokensPerMessage = Math.round(currentTokens / messageCount);
+        if (tokensPerMessage > 500) {
+          theories.push(`Large average message size (${tokensPerMessage} tokens/msg) - suggests large tool outputs or verbose responses`);
+        }
+  
+        return {
+          code: 'CONTEXT_LIMIT_EXCEEDED',
+          currentTokens,
+          limit,
+          exceededBy,
+          percentOver,
+          messageCount,
+          tokensPerMessage,
+          lastCompactionAgo: lastCompactionTime ? `${Math.round(lastCompactionTime / 1000)}s ago` : 'never',
+          compactionCount: compactionLogs.length,
+          theories: theories.length > 0 ? theories : ['Context limit exceeded - compaction will run']
+        };
+      },
+  
+      'COMPACTION_FAILED': function(context) {
+        const { error, tokensBefore, tokensAfter, messagesBefore, messagesAfter } = context;
+        const logs = getLogs('compaction', 50);
+  
+        const tokensReduced = tokensBefore - tokensAfter;
+        const messagesRemoved = messagesBefore - messagesAfter;
+        const percentReduced = tokensBefore > 0 ? Math.round((tokensReduced / tokensBefore) * 100) : 0;
+  
+        // Check API logs for summarization issues
+        const apiLogs = getLogs('api', 50);
+        const recentApiErrors = apiLogs.filter(l =>
+          l.message.includes('ERROR') || l.message.includes('error')
+        ).length;
+  
+        // Theory-based analysis
+        const theories = [];
+  
+        if (!error) {
+          theories.push('No error object provided - compaction may not have actually failed');
+        } else if (error.message.includes('API') || error.message.includes('fetch')) {
+          theories.push('API call failed during summarization - check network or API status');
+          if (recentApiErrors > 0) {
+            theories.push(`${recentApiErrors} recent API errors detected - API may be unstable`);
+          }
+        } else if (error.message.includes('JSON')) {
+          theories.push('JSON parse error - summary response may be malformed');
+        }
+  
+        if (tokensReduced > 0 && percentReduced < 30) {
+          theories.push(`Low reduction (${percentReduced}%) - summary may be too verbose or conversation already compact`);
+        } else if (tokensReduced <= 0) {
+          theories.push('No token reduction achieved - compaction failed to create effective summary');
+        } else if (percentReduced > 30) {
+          theories.push(`Good reduction (${percentReduced}%) achieved despite failure flag`);
+        }
+  
+        if (messagesRemoved === 0) {
+          theories.push('No messages removed - compaction logic may not have executed');
+        }
+  
+        const compactionAttempts = logs.filter(l =>
+          l.message.includes('compact') || l.message.includes('Compacting')
+        ).length;
+        if (compactionAttempts > 3) {
+          theories.push(`Multiple compaction attempts (${compactionAttempts}) - may be stuck in retry loop`);
+        }
+  
+        return {
+          code: 'COMPACTION_FAILED',
+          tokensBefore,
+          tokensAfter,
+          tokensReduced,
+          percentReduced,
+          messagesBefore,
+          messagesAfter,
+          messagesRemoved,
+          compactionAttempts,
+          theories: theories.length > 0 ? theories : ['Compaction failed - check error message'],
+          errorMessage: error ? error.message : 'Unknown error'
+        };
+      },
+  
+      'TOOL_OUTPUT_TOO_LARGE': function(context) {
+        const { toolName, originalSize, truncatedSize, limit } = context;
+  
+        const originalTokens = Math.ceil(originalSize / 4);
+        const truncatedTokens = Math.ceil(truncatedSize / 4);
+        const limitTokens = Math.ceil(limit / 4);
+        const exceededBy = originalSize - limit;
+        const percentReduced = Math.round(((originalSize - truncatedSize) / originalSize) * 100);
+  
+        // Get recent tool usage
+        const logs = getLogs('tools', 50);
+        const toolUsageCounts = {};
+        logs.forEach(l => {
+          if (l.message.includes('tool') || l.message.includes('Tool')) {
+            const match = l.message.match(/\b(read_file|search_by_content|search_by_filename|list_directory)\b/);
+            if (match) {
+              toolUsageCounts[match[1]] = (toolUsageCounts[match[1]] || 0) + 1;
+            }
+          }
+        });
+  
+        // Theory-based analysis
+        const theories = [];
+  
+        if (toolName === 'read_file') {
+          theories.push('File too large - AI should read specific sections or search for specific content instead');
+          if (originalTokens > 5000) {
+            theories.push(`Very large file (${originalTokens} tokens) - likely a log file, data file, or minified code`);
+          }
+          theories.push('Suggest: Use search_by_content to find specific sections, or ask user which part to focus on');
+        } else if (toolName === 'search_by_content') {
+          theories.push('Search returned too many results - need more specific search term or narrower file pattern');
+          const resultCount = Math.floor(originalSize / 100); // Rough estimate
+          theories.push(`Estimated ${resultCount}+ matches found - use more specific search or limit to specific directory`);
+        } else if (toolName === 'search_by_filename') {
+          theories.push('Filename search returned too many files - use more specific pattern or search in subdirectory');
+        } else if (toolName === 'list_directory') {
+          theories.push('Directory has too many files - should list specific subdirectories instead');
+        }
+  
+        if (percentReduced > 80) {
+          theories.push(`Severe truncation (${percentReduced}%) - most of output lost, AI needs different approach`);
+        }
+  
+        const truncationCount = logs.filter(l => l.message.includes('truncat')).length;
+        if (truncationCount > 3) {
+          theories.push(`Frequent truncations (${truncationCount}) - AI strategy needs adjustment to use more targeted queries`);
+        }
+  
+        return {
+          code: 'TOOL_OUTPUT_TOO_LARGE',
+          toolName,
+          originalSize,
+          originalTokens,
+          truncatedSize,
+          truncatedTokens,
+          limit,
+          limitTokens,
+          exceededBy,
+          percentReduced,
+          recentToolUsage: toolUsageCounts,
+          theories: theories.length > 0 ? theories : ['Output too large - truncated']
+        };
+      }
+    };
+  
+    // Handle an error - calls appropriate analyzer and outputs to console
+    function handleError(errorCode, context = {}) {
+      const analyzer = errorAnalyzers[errorCode];
+  
+      if (!analyzer) {
+        console.error(`ERROR: ${errorCode} (no analyzer found)`);
+        return;
+      }
+  
+      const analysis = analyzer(context);
+  
+      // Output ONLY the error code and key data points to console
+      console.error(`\n========== ERROR: ${analysis.code} ==========`);
+      delete analysis.code; // Already printed above
+  
+      for (const [key, value] of Object.entries(analysis)) {
+        if (key === 'theories' && Array.isArray(value)) {
+          console.error(`\n${key}:`);
+          value.forEach((theory, idx) => {
+            console.error(`  ${idx + 1}. ${theory}`);
+          });
+        } else if (typeof value === 'object' && !Array.isArray(value)) {
+          console.error(`${key}:`);
+          for (const [subKey, subValue] of Object.entries(value)) {
+            console.error(`  ${subKey}: ${subValue}`);
+          }
+        } else {
+          console.error(`${key}: ${value}`);
+        }
+      }
+      console.error('==========================================\n');
+    }
+  
+    // Export module
+    window.module = window.module || {};
+    window.module['diagnostics.js'] = {
+      log,
+      getLogs,
+      clearLogs,
+      handleError,
+      // Expose for testing/debugging
+      _errorAnalyzers: errorAnalyzers,
+      _logs: logs
+    };
+  })();
+  
+
   // Module: main.js
   // Main entry point for the app
   window.module['main.js'] = {
     version: '2.0.0',
   
     run: async function() {
-      console.log('[AI Agent] Version:', this.version);
+      const diagnostics = window.module['diagnostics.js'];
+      diagnostics.log('ui', '[AI Agent] Version: ' + this.version);
   
       // Get module references
       const state = window.module['state.js'];
@@ -1312,11 +1766,12 @@
         state.setSelectedDirectory(dirHandle);
         this.showChatScreen();
       } catch (error) {
+        const diagnostics = window.module['diagnostics.js'];
         if (error.name === 'AbortError') {
           // User cancelled the picker
-          console.log('Directory selection cancelled');
+          diagnostics.log('ui', 'Directory selection cancelled');
         } else {
-          console.error('Error selecting directory:', error);
+          diagnostics.log('ui', 'Error selecting directory: ' + error);
           alert('Error selecting directory: ' + error.message);
         }
       }
@@ -1334,6 +1789,7 @@
     },
   
     sendMessage: async function() {
+      const diagnostics = window.module['diagnostics.js'];
       const state = window.module['state.js'];
       const ui = window.module['ui.js'];
       const api = window.module['api.js'];
@@ -1347,7 +1803,7 @@
   
       // Check if adding this message would exceed context limit
       if (state.wouldExceedLimit(message)) {
-        console.log('[Main] Message would exceed limit, compacting context first');
+        diagnostics.log('compaction', '[Main] Message would exceed limit, compacting context first');
         await this.compactContext();
         ui.renderMessages(state.getMessages());
         ui.updateContextStats();
@@ -1411,10 +1867,16 @@
           onProcessingChange: (processing) => state.setProcessing(processing),
           onAfterTools: async () => {
             // Check if context exceeds limit after tool results
+            const diagnostics = window.module['diagnostics.js'];
             const currentTokens = state.calculateTokens();
             const limit = state.getContextLimit();
             if (currentTokens > limit) {
-              console.log(`[Main] Context exceeds limit after tools (${currentTokens} > ${limit}), compacting...`);
+              diagnostics.log('context', `[Main] Context exceeds limit after tools (${currentTokens} > ${limit}), compacting...`);
+              diagnostics.handleError('CONTEXT_LIMIT_EXCEEDED', {
+                currentTokens: currentTokens,
+                limit: limit,
+                messageCount: state.getMessages().length
+              });
               await this.compactContext();
               ui.renderMessages(state.getMessages());
               ui.updateContextStats();
@@ -1426,6 +1888,7 @@
   
     // Truncate tool output if it exceeds size limit (1/8 of context limit = 2500 tokens default)
     truncateToolOutput: function(content, toolName) {
+      const diagnostics = window.module['diagnostics.js'];
       const state = window.module['state.js'];
       const limit = state.getContextLimit();
       const maxTokens = Math.floor(limit / 8); // 1/8 of limit
@@ -1438,6 +1901,13 @@
       const truncated = content.substring(0, maxChars);
       const remaining = content.length - maxChars;
       const remainingTokens = Math.ceil(remaining / 4);
+  
+      diagnostics.handleError('TOOL_OUTPUT_TOO_LARGE', {
+        toolName,
+        originalSize: content.length,
+        truncatedSize: truncated.length,
+        limit: maxChars
+      });
   
       return {
         content: truncated + `\n\n[... Output truncated. ${remainingTokens} more tokens (${remaining} chars) omitted. If you need the full output, run ${toolName} again with more specific parameters to reduce output size.]`,
@@ -1787,7 +2257,8 @@
             content: `ERROR: Unknown tool "${toolUse.name}". Available tools are: list_directory, read_file, write_file, search_by_filename, search_by_content, edit_file, edit_file_batch, delete_file, move_file, copy_file, create_directory.`,
             fromSystem: true
           });
-          console.warn(`[Main] Unknown tool: ${toolUse.name}`);
+          const diagnostics = window.module['diagnostics.js'];
+          diagnostics.log('tools', `[Main] Unknown tool: ${toolUse.name}`);
         }
       }
   
@@ -2101,7 +2572,8 @@
             }
           }
         } catch (error) {
-          console.warn(`[Search] Error accessing ${currentPath}:`, error.message);
+          const diagnostics = window.module['diagnostics.js'];
+          diagnostics.log('tools', `[Search] Error accessing ${currentPath}: ${error.message}`);
         }
       }
   
@@ -2198,7 +2670,8 @@
                 }
               } catch (error) {
                 // Skip binary files or files that can't be read as text
-                console.warn(`[Search] Could not read ${entryPath}:`, error.message);
+                const diagnostics = window.module['diagnostics.js'];
+                diagnostics.log('tools', `[Search] Could not read ${entryPath}: ${error.message}`);
               }
             } else if (entry.kind === 'directory') {
               // Recurse into subdirectory
@@ -2206,7 +2679,8 @@
             }
           }
         } catch (error) {
-          console.warn(`[Search] Error accessing ${currentPath}:`, error.message);
+          const diagnostics = window.module['diagnostics.js'];
+          diagnostics.log('tools', `[Search] Error accessing ${currentPath}: ${error.message}`);
         }
       }
   
@@ -2294,7 +2768,8 @@
         const deleteResult = await this.executeDeleteFile(source, dirHandle);
         if (!deleteResult.success) {
           // Destination was written but source couldn't be deleted - warn but don't fail
-          console.warn(`[Main] Moved file but couldn't delete source: ${deleteResult.error}`);
+          const diagnostics = window.module['diagnostics.js'];
+          diagnostics.log('tools', `[Main] Moved file but couldn't delete source: ${deleteResult.error}`);
         }
   
         return { success: true, source, destination };
@@ -2348,13 +2823,16 @@
   
     // Compact context by summarizing first half of messages
     compactContext: async function() {
+      const diagnostics = window.module['diagnostics.js'];
       const state = window.module['state.js'];
       const api = window.module['api.js'];
       const ui = window.module['ui.js'];
   
-      console.log('[Main] ========== COMPACTING CONTEXT ==========');
+      diagnostics.log('compaction', '[Main] ========== COMPACTING CONTEXT ==========');
   
       const messages = state.getMessages();
+      const tokensBefore = state.calculateTokens();
+      const messagesBefore = messages.length;
   
       // Find first message that's not uiOnly (skip initial greeting)
       let firstRealMessageIndex = -1;
@@ -2366,17 +2844,17 @@
       }
   
       if (firstRealMessageIndex === -1) {
-        console.log('[Main] No messages to compact');
+        diagnostics.log('compaction', '[Main] No messages to compact');
         return;
       }
   
       // Calculate target: remove messages until we're at 50% of limit or less
       const limit = state.getContextLimit();
       const targetTokens = Math.floor(limit * 0.5);
-      const currentTokens = state.calculateTokens();
+      const currentTokens = tokensBefore;
   
-      console.log('[Main] Current tokens:', currentTokens, '/ Limit:', limit);
-      console.log('[Main] Target after compaction:', targetTokens, 'tokens (50% of limit)');
+      diagnostics.log('compaction', '[Main] Current tokens: ' + currentTokens + ' / Limit: ' + limit);
+      diagnostics.log('compaction', '[Main] Target after compaction: ' + targetTokens + ' tokens (50% of limit)');
   
       // Remove messages from the front until we reach target
       let splitIndex = firstRealMessageIndex;
@@ -2398,19 +2876,25 @@
       }
   
       const messagesToRemove = splitIndex - firstRealMessageIndex + 1;
-      console.log('[Main] Removing', messagesToRemove, 'messages (up to index', splitIndex, ')');
-      console.log('[Main] Tokens after removal:', tokensAfterSplit);
+      diagnostics.log('compaction', '[Main] Removing ' + messagesToRemove + ' messages (up to index ' + splitIndex + ')');
+      diagnostics.log('compaction', '[Main] Tokens after removal: ' + tokensAfterSplit);
   
       // Get messages to summarize (from first real message to split point)
       const messagesToSummarize = messages.slice(firstRealMessageIndex, splitIndex + 1);
   
-      console.log('[Main] Summarizing', messagesToSummarize.length, 'messages');
+      diagnostics.log('compaction', '[Main] Summarizing ' + messagesToSummarize.length + ' messages');
   
       // Create summarization request
       const summarizationMessages = [
         {
           role: 'user',
-          content: 'Please provide a concise summary of the following conversation. Focus on key decisions, code changes, and important context that would be needed to continue the conversation.\n\nConversation to summarize:\n\n' +
+          content: 'Please provide a concise summary of the following conversation. The summary should include:\n' +
+            '1. The user\'s most recent request or question\n' +
+            '2. The last few actions or tasks completed by the assistant\n' +
+            '3. Key decisions, code changes, and important context needed to continue\n' +
+            '4. Any ongoing work or issues that need to be addressed\n\n' +
+            'Focus on recent activity and actionable context.\n\n' +
+            'Conversation to summarize:\n\n' +
             messagesToSummarize.map(m => `[${m.role}]: ${m.content}`).join('\n\n')
         }
       ];
@@ -2420,20 +2904,37 @@
         const response = await api.callAPI(summarizationMessages);
   
         if (!response.valid || response.parsed.type !== 'message') {
-          console.error('[Main] Failed to get summary from API');
+          diagnostics.log('compaction', '[Main] Failed to get summary from API');
+          const tokensAfter = state.calculateTokens();
+          const messagesAfter = messages.length;
+          diagnostics.handleError('COMPACTION_FAILED', {
+            error: new Error('Failed to get summary from API'),
+            tokensBefore,
+            tokensAfter,
+            messagesBefore,
+            messagesAfter
+          });
           return;
         }
   
         const summaryContent = response.parsed.content;
-        console.log('[Main] Received summary:', summaryContent.substring(0, 100) + '...');
+        diagnostics.log('compaction', '[Main] Received summary: ' + summaryContent.substring(0, 100) + '...');
   
-        // Remove the first half of messages and replace with summary
+        // Mark messages before the split as UI-only (keep them visible in UI, exclude from API)
+        const messagesBeforeSummary = messages.slice(firstRealMessageIndex, splitIndex + 1).map(msg => ({
+          ...msg,
+          uiOnly: true
+        }));
+  
+        // Keep all messages but mark old ones as uiOnly and insert summary
         const newMessages = [
           ...messages.slice(0, firstRealMessageIndex),
+          ...messagesBeforeSummary,
           {
             role: 'summary',
             content: summaryContent,
-            timestamp: Date.now()
+            timestamp: Date.now(),
+            uiOnly: true  // Summary is UI-only, actual content goes in system prompt
           },
           ...messages.slice(splitIndex + 1)
         ];
@@ -2441,10 +2942,21 @@
         // Update state with new message array
         state.state.messages = newMessages;
   
-        console.log('[Main] Context compacted:', messages.length, '->', newMessages.length, 'messages');
+        const tokensAfter = state.calculateTokens();
+        const messagesAfter = newMessages.length;
+        diagnostics.log('compaction', '[Main] Context compacted: ' + messages.length + ' -> ' + newMessages.length + ' messages');
   
       } catch (error) {
-        console.error('[Main] Error during compaction:', error);
+        diagnostics.log('compaction', '[Main] Error during compaction: ' + error);
+        const tokensAfter = state.calculateTokens();
+        const messagesAfter = messages.length;
+        diagnostics.handleError('COMPACTION_FAILED', {
+          error,
+          tokensBefore,
+          tokensAfter,
+          messagesBefore,
+          messagesAfter
+        });
       }
     }
   };
@@ -2908,19 +3420,20 @@
   
         /* Tool Group Container */
         .tool-group {
-          margin-bottom: 20px;
+          margin-bottom: 12px;
         }
   
         /* Tool Use Messages (before execution) */
         .tool-use-message {
           color: var(--color-text-secondary);
-          padding: 8px 12px;
+          padding: 4px 12px;
           background: rgba(212, 160, 23, 0.08);
           border-left: 3px solid rgba(212, 160, 23, 0.5);
           border-radius: 4px;
           cursor: pointer;
           transition: all 0.2s ease;
           font-size: 13px;
+          line-height: 1.4;
         }
   
         /* When in a group, remove individual border radius and add top border */
@@ -2960,13 +3473,14 @@
         /* Tool Result Messages (after execution) */
         .tool-result-message {
           color: var(--color-text-secondary);
-          padding: 8px 12px;
+          padding: 4px 12px;
           background: rgba(76, 175, 80, 0.08);
           border-left: 3px solid rgba(76, 175, 80, 0.5);
           border-radius: 4px;
           cursor: pointer;
           transition: all 0.2s ease;
           font-size: 13px;
+          line-height: 1.4;
         }
   
         /* When in a group, remove individual border radius and add top border */
@@ -3585,9 +4099,93 @@
       return { fixed: false };
     },
   
+    // Attempt to extract valid JSON when AI adds text before/after the JSON
+    tryExtractJSON: function(text) {
+      const diagnostics = window.module['diagnostics.js'];
+  
+      try {
+        // Strategy: Find the first '{' and count braces to find where JSON ends
+        // Must properly handle braces inside strings
+        const startIdx = text.indexOf('{');
+        if (startIdx === -1) {
+          return { fixed: false };
+        }
+  
+        let braceCount = 0;
+        let endIdx = -1;
+        let inString = false;
+        let escapeNext = false;
+  
+        for (let i = startIdx; i < text.length; i++) {
+          const char = text[i];
+  
+          // Handle escape sequences
+          if (escapeNext) {
+            escapeNext = false;
+            continue;
+          }
+  
+          if (char === '\\') {
+            escapeNext = true;
+            continue;
+          }
+  
+          // Handle string boundaries
+          if (char === '"') {
+            inString = !inString;
+            continue;
+          }
+  
+          // Only count braces outside of strings
+          if (!inString) {
+            if (char === '{') {
+              braceCount++;
+            } else if (char === '}') {
+              braceCount--;
+              if (braceCount === 0) {
+                endIdx = i + 1;
+                break;
+              }
+            }
+          }
+        }
+  
+        if (endIdx === -1) {
+          return { fixed: false };
+        }
+  
+        const extractedJson = text.substring(startIdx, endIdx);
+        const parsed = JSON.parse(extractedJson);
+  
+        const prefixText = text.substring(0, startIdx).trim();
+        const suffixText = text.substring(endIdx).trim();
+  
+        if (prefixText || suffixText) {
+          diagnostics.log('json', '[tryExtractJSON] Extracted JSON, discarded surrounding text', {
+            extractedLength: extractedJson.length,
+            discardedPrefix: prefixText.substring(0, 100),
+            discardedSuffix: suffixText.substring(0, 100)
+          });
+        }
+  
+        console.log('[tryExtractJSON] Successfully extracted JSON from response with surrounding text');
+        return {
+          fixed: true,
+          json: extractedJson,
+          parsed,
+          prefixText: prefixText || null,
+          suffixText: suffixText || null
+        };
+      } catch (e) {
+        console.log('[tryExtractJSON] Failed to extract:', e.message);
+        return { fixed: false };
+      }
+    },
+  
     // Parse and validate AI response
     parseResponse: function(responseText) {
       let response;
+      let extractedText = null;  // Store any text that was extracted
   
       // Try to parse JSON
       try {
@@ -3604,9 +4202,22 @@
           fixResult = this.tryFixNewlines(responseText);
         }
   
+        if (!fixResult.fixed) {
+          // If that didn't work, try extracting just the JSON portion (AI adding text after JSON)
+          fixResult = this.tryExtractJSON(responseText);
+        }
+  
         if (fixResult.fixed) {
           console.log('[parseResponse] JSON was fixed, using repaired version');
           response = fixResult.parsed;
+  
+          // If extraction found prefix/suffix text, store it
+          if (fixResult.prefixText || fixResult.suffixText) {
+            extractedText = {
+              prefix: fixResult.prefixText,
+              suffix: fixResult.suffixText
+            };
+          }
         } else {
           return {
             valid: false,
@@ -3663,7 +4274,8 @@
   
       return {
         valid: true,
-        parsed: response
+        parsed: response,
+        extractedText: extractedText  // Include any prefix/suffix text that was extracted
       };
     }
   };
@@ -4370,7 +4982,8 @@
           button.style.color = '';
         }, 2000);
       }).catch(err => {
-        console.error('Failed to copy:', err);
+        const diagnostics = window.module['diagnostics.js'];
+        diagnostics.log('ui', 'Failed to copy: ' + err);
         button.textContent = 'Failed';
         setTimeout(() => {
           button.textContent = 'Copy';
@@ -4627,6 +5240,40 @@
         }
       };
   
+      const compactBtn = document.createElement('button');
+      compactBtn.textContent = 'Compact Now';
+      compactBtn.style.padding = '8px 16px';
+      compactBtn.style.background = 'var(--color-bg-primary)';
+      compactBtn.style.border = '1px solid var(--color-gold)';
+      compactBtn.style.color = 'var(--color-gold)';
+      compactBtn.style.cursor = 'pointer';
+      compactBtn.style.borderRadius = '4px';
+      compactBtn.style.fontSize = '14px';
+      compactBtn.style.fontFamily = "'Consolas', 'Courier New', monospace";
+      compactBtn.onclick = async () => {
+        compactBtn.disabled = true;
+        compactBtn.textContent = 'Compacting...';
+        try {
+          const main = window.module['main.js'];
+          await main.compactContext();
+          this.renderMessages(state.getMessages());
+          this.updateContextStats();
+          // Update stats display in modal
+          statsDiv.innerHTML = `Current: <strong>${this.formatSize(state.calculateTokens())}</strong> / ${this.formatSize(state.getContextLimit())}`;
+          compactBtn.textContent = 'Compacted!';
+          setTimeout(() => {
+            compactBtn.textContent = 'Compact Now';
+            compactBtn.disabled = false;
+          }, 2000);
+        } catch (error) {
+          compactBtn.textContent = 'Error';
+          setTimeout(() => {
+            compactBtn.textContent = 'Compact Now';
+            compactBtn.disabled = false;
+          }, 2000);
+        }
+      };
+  
       const cancelBtn = document.createElement('button');
       cancelBtn.textContent = 'Cancel';
       cancelBtn.style.padding = '8px 16px';
@@ -4669,6 +5316,7 @@
       };
   
       buttonContainer.appendChild(clearBtn);
+      buttonContainer.appendChild(compactBtn);
       buttonContainer.appendChild(cancelBtn);
       buttonContainer.appendChild(saveBtn);
   
