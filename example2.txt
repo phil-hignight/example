@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-20T17:49:55.694Z
+// AI Agent - Built 2025-11-20T18:12:24.565Z
 (function() {
   window.module = {};
 
@@ -1668,11 +1668,123 @@
               content: `Error batch editing file ${toolUse.input.path}: ${result.error}`
             });
           }
+        } else if (toolUse.name === 'delete_file') {
+          // Add tool use message
+          state.addMessage({
+            role: 'tool-use',
+            toolName: 'delete_file',
+            params: toolUse.input,
+            content: `delete_file ${JSON.stringify(toolUse.input)}`
+          });
+  
+          const result = await this.executeDeleteFile(toolUse.input.path, selectedDirectory);
+  
+          if (result.success) {
+            state.addMessage({
+              role: 'tool-result',
+              toolName: 'delete_file',
+              summary: `Deleted file: ${result.path}`,
+              fullResult: `Successfully deleted ${result.path}`,
+              content: `Successfully deleted file: ${result.path}`
+            });
+          } else {
+            state.addMessage({
+              role: 'tool-result',
+              toolName: 'delete_file',
+              summary: `Error: ${result.error}`,
+              error: true,
+              content: `Error deleting file ${toolUse.input.path}: ${result.error}`
+            });
+          }
+        } else if (toolUse.name === 'move_file') {
+          // Add tool use message
+          state.addMessage({
+            role: 'tool-use',
+            toolName: 'move_file',
+            params: toolUse.input,
+            content: `move_file ${JSON.stringify(toolUse.input)}`
+          });
+  
+          const result = await this.executeMoveFile(toolUse.input.source, toolUse.input.destination, selectedDirectory);
+  
+          if (result.success) {
+            state.addMessage({
+              role: 'tool-result',
+              toolName: 'move_file',
+              summary: `Moved: ${result.source} → ${result.destination}`,
+              fullResult: `Successfully moved ${result.source} to ${result.destination}`,
+              content: `Successfully moved file from ${result.source} to ${result.destination}`
+            });
+          } else {
+            state.addMessage({
+              role: 'tool-result',
+              toolName: 'move_file',
+              summary: `Error: ${result.error}`,
+              error: true,
+              content: `Error moving file: ${result.error}`
+            });
+          }
+        } else if (toolUse.name === 'copy_file') {
+          // Add tool use message
+          state.addMessage({
+            role: 'tool-use',
+            toolName: 'copy_file',
+            params: toolUse.input,
+            content: `copy_file ${JSON.stringify(toolUse.input)}`
+          });
+  
+          const result = await this.executeCopyFile(toolUse.input.source, toolUse.input.destination, selectedDirectory);
+  
+          if (result.success) {
+            state.addMessage({
+              role: 'tool-result',
+              toolName: 'copy_file',
+              summary: `Copied: ${result.source} → ${result.destination}`,
+              fullResult: `Successfully copied ${result.source} to ${result.destination}`,
+              content: `Successfully copied file from ${result.source} to ${result.destination}`
+            });
+          } else {
+            state.addMessage({
+              role: 'tool-result',
+              toolName: 'copy_file',
+              summary: `Error: ${result.error}`,
+              error: true,
+              content: `Error copying file: ${result.error}`
+            });
+          }
+        } else if (toolUse.name === 'create_directory') {
+          // Add tool use message
+          state.addMessage({
+            role: 'tool-use',
+            toolName: 'create_directory',
+            params: toolUse.input,
+            content: `create_directory ${JSON.stringify(toolUse.input)}`
+          });
+  
+          const result = await this.executeCreateDirectory(toolUse.input.path, selectedDirectory);
+  
+          if (result.success) {
+            state.addMessage({
+              role: 'tool-result',
+              toolName: 'create_directory',
+              summary: `Created directory: ${result.path}`,
+              fullResult: `Successfully created directory ${result.path}`,
+              content: `Successfully created directory: ${result.path}`
+            });
+          } else {
+            state.addMessage({
+              role: 'tool-result',
+              toolName: 'create_directory',
+              summary: `Error: ${result.error}`,
+              error: true,
+              content: `Error creating directory ${toolUse.input.path}: ${result.error}`
+            });
+          }
         } else {
           // Unknown tool
           state.addMessage({
             role: 'user',
-            content: `ERROR: Unknown tool "${toolUse.name}". Available tools are: list_directory, read_file, write_file, search_by_filename, search_by_content, edit_file, edit_file_batch.`,
+            content: `ERROR: Unknown tool "${toolUse.name}". Available tools are: list_directory, read_file, write_file, search_by_filename, search_by_content, edit_file, edit_file_batch, delete_file, move_file, copy_file, create_directory.`,
             fromSystem: true
           });
           console.warn(`[Main] Unknown tool: ${toolUse.name}`);
@@ -2139,6 +2251,98 @@
         };
       } catch (error) {
         return { success: false, error: error.message, matches: [] };
+      }
+    },
+  
+    // Delete a file
+    executeDeleteFile: async function(path, dirHandle) {
+      try {
+        // Navigate to the parent directory
+        const pathParts = path.split('/').filter(p => p);
+        const fileName = pathParts.pop();
+  
+        let targetHandle = dirHandle;
+        for (const part of pathParts) {
+          targetHandle = await targetHandle.getDirectoryHandle(part);
+        }
+  
+        // Delete the file
+        await targetHandle.removeEntry(fileName);
+  
+        return { success: true, path };
+      } catch (error) {
+        return { success: false, error: error.message, path };
+      }
+    },
+  
+    // Move/rename a file
+    executeMoveFile: async function(source, destination, dirHandle) {
+      try {
+        // Read source file
+        const sourceContent = await this.executeReadFile(source, dirHandle);
+        if (!sourceContent.success) {
+          return { success: false, error: `Failed to read source file: ${sourceContent.error}`, source, destination };
+        }
+  
+        // Write to destination
+        const writeResult = await this.executeWriteFile(destination, sourceContent.content, dirHandle);
+        if (!writeResult.success) {
+          return { success: false, error: `Failed to write destination file: ${writeResult.error}`, source, destination };
+        }
+  
+        // Delete source file
+        const deleteResult = await this.executeDeleteFile(source, dirHandle);
+        if (!deleteResult.success) {
+          // Destination was written but source couldn't be deleted - warn but don't fail
+          console.warn(`[Main] Moved file but couldn't delete source: ${deleteResult.error}`);
+        }
+  
+        return { success: true, source, destination };
+      } catch (error) {
+        return { success: false, error: error.message, source, destination };
+      }
+    },
+  
+    // Copy a file
+    executeCopyFile: async function(source, destination, dirHandle) {
+      try {
+        // Read source file
+        const sourceContent = await this.executeReadFile(source, dirHandle);
+        if (!sourceContent.success) {
+          return { success: false, error: `Failed to read source file: ${sourceContent.error}`, source, destination };
+        }
+  
+        // Write to destination
+        const writeResult = await this.executeWriteFile(destination, sourceContent.content, dirHandle);
+        if (!writeResult.success) {
+          return { success: false, error: `Failed to write destination file: ${writeResult.error}`, source, destination };
+        }
+  
+        return { success: true, source, destination };
+      } catch (error) {
+        return { success: false, error: error.message, source, destination };
+      }
+    },
+  
+    // Create a directory
+    executeCreateDirectory: async function(path, dirHandle) {
+      try {
+        // Navigate and create directories as needed
+        const pathParts = path.split('/').filter(p => p);
+  
+        let targetHandle = dirHandle;
+        for (const part of pathParts) {
+          try {
+            targetHandle = await targetHandle.getDirectoryHandle(part);
+          } catch (error) {
+            // Directory doesn't exist, create it
+            targetHandle = await targetHandle.getDirectoryHandle(part, { create: true });
+          }
+        }
+  
+        return { success: true, path };
+      } catch (error) {
+        return { success: false, error: error.message, path };
       }
     },
   
@@ -3265,6 +3469,44 @@
   
   Example usage:
   {"type":"execute","tool_uses":[{"name":"edit_file_batch","input":{"path":"src/config.js","edits":[{"find":"version: '1.0.0'","replace":"version: '2.0.0'"},{"find":"debug: false","replace":"debug: true"}]}}]}
+  
+  ### delete_file
+  Delete a file
+  
+  Parameters:
+  - path (string, required): The file path to delete (relative to project root)
+  
+  Example usage:
+  {"type":"execute","tool_uses":[{"name":"delete_file","input":{"path":"temp/old-file.js"}}]}
+  
+  ### move_file
+  Move or rename a file
+  
+  Parameters:
+  - source (string, required): The source file path (relative to project root)
+  - destination (string, required): The destination file path (relative to project root)
+  
+  Example usage:
+  {"type":"execute","tool_uses":[{"name":"move_file","input":{"source":"src/old-name.js","destination":"src/new-name.js"}}]}
+  
+  ### copy_file
+  Copy a file to a new location
+  
+  Parameters:
+  - source (string, required): The source file path (relative to project root)
+  - destination (string, required): The destination file path (relative to project root)
+  
+  Example usage:
+  {"type":"execute","tool_uses":[{"name":"copy_file","input":{"source":"src/template.js","destination":"src/new-component.js"}}]}
+  
+  ### create_directory
+  Create a new directory (and any parent directories as needed)
+  
+  Parameters:
+  - path (string, required): The directory path to create (relative to project root)
+  
+  Example usage:
+  {"type":"execute","tool_uses":[{"name":"create_directory","input":{"path":"src/components/new-feature"}}]}
   
   ## Workflow
   
