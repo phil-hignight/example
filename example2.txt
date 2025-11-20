@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-20T15:24:50.993Z
+// AI Agent - Built 2025-11-20T16:52:06.810Z
 (function() {
   window.module = {};
 
@@ -10,12 +10,33 @@
       const tools = window.module['tools.js'];
       const state = window.module['state.js'];
   
-      console.log('[API] Total messages:', messages.length);
+      console.log('[API INPUT] Total messages:', messages.length);
   
       // Filter out UI-only messages
       const apiMessages = messages.filter(msg => !msg.uiOnly);
   
-      console.log('[API] After UI filtering:', apiMessages.length);
+      console.log('[API INPUT] After UI filtering:', apiMessages.length);
+  
+      // Log total size estimate and find largest messages
+      const totalChars = messages.reduce((sum, msg) => sum + (msg.content?.length || 0), 0);
+      const estimatedTokens = Math.ceil(totalChars / 4);
+      console.log('[API INPUT SIZE] Total characters in all messages:', totalChars);
+      console.log('[API INPUT SIZE] Estimated tokens (chars/4):', estimatedTokens);
+  
+      // Find and log the 5 largest messages
+      const messagesWithSize = messages.map((msg, idx) => ({
+        index: idx,
+        role: msg.role,
+        toolName: msg.toolName,
+        size: msg.content?.length || 0,
+        preview: msg.content?.substring(0, 100) || ''
+      })).sort((a, b) => b.size - a.size);
+  
+      console.log('[API LARGEST MESSAGES] Top 5 largest messages:');
+      for (let i = 0; i < Math.min(5, messagesWithSize.length); i++) {
+        const m = messagesWithSize[i];
+        console.log(`  ${i+1}. Index ${m.index}, Role: ${m.role}${m.toolName ? ' ('+m.toolName+')' : ''}, Size: ${m.size} chars, Preview: "${m.preview}..."`);
+      }
   
       // If a summary exists, only include messages from last summary forward
       const lastSummaryIndex = state.getLastSummaryIndex();
@@ -265,8 +286,13 @@
         }
       };
   
+      // Log request body size
+      const requestBodyString = JSON.stringify(requestBody);
+      const requestBodySize = requestBodyString.length;
+      const requestBodyTokens = Math.ceil(requestBodySize / 4);
+  
       console.log('[API] ========================================');
-      console.log('[API] REQUEST SUMMARY:');
+      console.log('[API REQUEST] REQUEST SUMMARY:');
       console.log('[API] ========================================');
       console.log('  - System prompt length:', systemPrompt.length);
       console.log('  - Messages count:', messagesWithSystem.length);
@@ -274,6 +300,8 @@
       if (summary) {
         console.log('  - Summary included: YES (' + summary.length + ' chars)');
       }
+      console.log('[API REQUEST SIZE] Request body size:', requestBodySize, 'chars');
+      console.log('[API REQUEST SIZE] Request body estimated tokens:', requestBodyTokens);
       console.log('[API]');
       console.log('[API] FULL REQUEST BODY:');
       console.log('[API] ========================================');
@@ -301,6 +329,14 @@
   
           if (!response.ok) {
             const errorText = await response.text();
+            console.error('[API ERROR] ========================================');
+            console.error('[API ERROR] API REQUEST FAILED');
+            console.error('[API ERROR] ========================================');
+            console.error('[API ERROR] Status code:', response.status);
+            console.error('[API ERROR] Status text:', response.statusText);
+            console.error('[API ERROR] Error response length:', errorText.length, 'chars');
+            console.error('[API ERROR] Error response:', errorText);
+            console.error('[API ERROR] ========================================');
             throw new Error(`API request failed (${response.status}): ${errorText}`);
           }
   
@@ -308,13 +344,21 @@
           let responseText = data.choices[0].message.content;
           let durationSeconds = (Date.now() - startTime) / 1000;
   
+          // Log response size details
+          const responseDataString = JSON.stringify(data);
+          const responseDataSize = responseDataString.length;
+          const responseTokens = Math.ceil(responseText.length / 4);
+  
           console.log('[API]');
           console.log('[API] ========================================');
-          console.log('[API] FULL API RESPONSE:');
+          console.log('[API RESPONSE] FULL API RESPONSE:');
           console.log('[API] ========================================');
           console.log(JSON.stringify(data, null, 2));
           console.log('[API] ========================================');
-          console.log('[API] Response text length:', responseText.length, 'chars');
+          console.log('[API RESPONSE SIZE] Response text length:', responseText.length, 'chars');
+          console.log('[API RESPONSE SIZE] Response estimated tokens:', responseTokens);
+          console.log('[API RESPONSE SIZE] Full response data size:', responseDataSize, 'chars');
+          console.log('[API RESPONSE SIZE] Request duration:', durationSeconds.toFixed(2), 'seconds');
           console.log('[API] ========================================');
   
           // Check for terminator
@@ -375,9 +419,16 @@
           };
         } catch (error) {
           lastError = error.message;
-          console.warn(`Attempt ${attempt + 1}/${maxRetries} - Error: ${error.message}`);
+          console.error('[API ERROR] ========================================');
+          console.error('[API ERROR] EXCEPTION DURING API CALL');
+          console.error('[API ERROR] ========================================');
+          console.error('[API ERROR] Attempt:', `${attempt + 1}/${maxRetries}`);
+          console.error('[API ERROR] Error message:', error.message);
+          console.error('[API ERROR] Error stack:', error.stack);
+          console.error('[API ERROR] ========================================');
   
           if (attempt < maxRetries - 1) {
+            console.log('[API ERROR] Retrying...');
             continue;
           }
         }
