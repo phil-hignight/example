@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-20T02:08:01.129Z
+// AI Agent - Built 2025-11-20T15:24:50.993Z
 (function() {
   window.module = {};
 
@@ -92,6 +92,8 @@
       let fullResponse = initialResponseText;
       let continuationCount = 0;
       let lastChunk = null;
+      let incomplete = false;
+      let incompleteReason = null;
   
       console.log('[API] Response missing terminator - handling truncation');
   
@@ -102,12 +104,6 @@
         // Get last TAIL_LENGTH characters
         const tail = fullResponse.slice(-TAIL_LENGTH);
         console.log(`[API] Tail (last ${TAIL_LENGTH} chars): "${tail}"`);
-  
-        // Check for duplicate chunks (AI repeating itself)
-        if (lastChunk && tail === lastChunk) {
-          throw new Error('AI is repeating the same content - aborting continuation');
-        }
-        lastChunk = tail;
   
         // Create continuation prompt
         const continuationMessages = [
@@ -127,70 +123,100 @@
           messages: continuationMessages
         };
   
-        // Make continuation request
-        const response = await fetch('/api/chat/completions', {
-          method: 'POST',
-          headers: headers,
-          body: JSON.stringify(continuationBody)
-        });
+        try {
+          // Make continuation request
+          const response = await fetch('/api/chat/completions', {
+            method: 'POST',
+            headers: headers,
+            body: JSON.stringify(continuationBody)
+          });
   
-        if (!response.ok) {
-          const errorText = await response.text();
-          throw new Error(`Continuation request failed (${response.status}): ${errorText}`);
-        }
-  
-        const data = await response.json();
-        const chunk = data.choices[0].message.content;
-        console.log(`[API] Chunk received (first 100 chars): "${chunk.substring(0, 100)}"`);
-  
-        // Handle blank response
-        if (!chunk || chunk.trim() === '') {
-          console.log('[API] Received blank continuation - treating as incomplete');
-          throw new Error('Received blank continuation response');
-        }
-  
-        // If AI just sends terminator, it means previous response was complete
-        if (chunk.trim() === TERMINATOR) {
-          console.log('[API] AI confirmed completion with terminator');
-          fullResponse += TERMINATOR;
-          break;
-        }
-  
-        // Check if the continuation starts with part of the tail (overlap detection)
-        // The AI might repeat some characters to ensure continuity
-        let chunkToAdd = chunk;
-        let overlapFound = false;
-        for (let overlapLen = TAIL_LENGTH; overlapLen > 0; overlapLen--) {
-          const tailEnd = tail.slice(-overlapLen);
-          const chunkStart = chunk.slice(0, overlapLen);
-          if (tailEnd === chunkStart) {
-            // Found overlap - remove it from the chunk
-            chunkToAdd = chunk.slice(overlapLen);
-            console.log(`[API] Detected ${overlapLen} char overlap: "${tailEnd}"`);
-            overlapFound = true;
+          if (!response.ok) {
+            const errorText = await response.text();
+            console.warn(`[API] Continuation request failed (${response.status}): ${errorText}`);
+            incomplete = true;
+            incompleteReason = `Continuation request failed (${response.status})`;
             break;
           }
-        }
   
-        if (!overlapFound) {
-          console.log(`[API] No overlap detected between tail and chunk start`);
-        }
+          const data = await response.json();
+          const chunk = data.choices[0].message.content;
+          console.log(`[API] Chunk received (first 100 chars): "${chunk.substring(0, 100)}"`);
   
-        console.log(`[API] Received continuation chunk: ${chunk.length} chars (${chunkToAdd.length} after overlap removal)`);
-        fullResponse += chunkToAdd;
+          // Handle blank response
+          if (!chunk || chunk.trim() === '') {
+            console.log('[API] Received blank continuation - stopping');
+            incomplete = true;
+            incompleteReason = 'Received blank continuation response';
+            break;
+          }
+  
+          // Check for duplicate chunks (AI repeating itself)
+          if (lastChunk && chunk === lastChunk) {
+            console.warn('[API] AI is repeating the same chunk - aborting continuation');
+            incomplete = true;
+            incompleteReason = 'AI is repeating the same content';
+            break;
+          }
+          lastChunk = chunk;
+  
+          // If AI just sends terminator, it means previous response was complete
+          if (chunk.trim() === TERMINATOR) {
+            console.log('[API] AI confirmed completion with terminator');
+            fullResponse += TERMINATOR;
+            break;
+          }
+  
+          // Check if the continuation starts with part of the tail (overlap detection)
+          // The AI might repeat some characters to ensure continuity
+          let chunkToAdd = chunk;
+          let overlapFound = false;
+          for (let overlapLen = TAIL_LENGTH; overlapLen > 0; overlapLen--) {
+            const tailEnd = tail.slice(-overlapLen);
+            const chunkStart = chunk.slice(0, overlapLen);
+            if (tailEnd === chunkStart) {
+              // Found overlap - remove it from the chunk
+              chunkToAdd = chunk.slice(overlapLen);
+              console.log(`[API] Detected ${overlapLen} char overlap: "${tailEnd}"`);
+              overlapFound = true;
+              break;
+            }
+          }
+  
+          if (!overlapFound) {
+            console.log(`[API] No overlap detected between tail and chunk start`);
+          }
+  
+          console.log(`[API] Received continuation chunk: ${chunk.length} chars (${chunkToAdd.length} after overlap removal)`);
+          fullResponse += chunkToAdd;
+        } catch (error) {
+          console.warn(`[API] Error during continuation: ${error.message}`);
+          incomplete = true;
+          incompleteReason = error.message;
+          break;
+        }
       }
   
       if (continuationCount >= MAX_CONTINUATIONS) {
-        throw new Error(`Exceeded maximum continuation attempts (${MAX_CONTINUATIONS})`);
+        console.warn(`[API] Exceeded maximum continuation attempts (${MAX_CONTINUATIONS})`);
+        incomplete = true;
+        incompleteReason = `Exceeded maximum continuation attempts (${MAX_CONTINUATIONS})`;
       }
   
-      console.log(`[API] Complete response assembled after ${continuationCount} continuations`);
       const endTime = Date.now();
       const durationSeconds = (endTime - startTime) / 1000;
   
+      if (incomplete) {
+        console.log(`[API] Returning incomplete response after ${continuationCount} continuations. Reason: ${incompleteReason}`);
+      } else {
+        console.log(`[API] Complete response assembled after ${continuationCount} continuations`);
+      }
+  
       return {
         fullResponse: fullResponse,
-        durationSeconds: durationSeconds
+        durationSeconds: durationSeconds,
+        incomplete: incomplete,
+        incompleteReason: incompleteReason
       };
     },
   
@@ -292,11 +318,15 @@
           console.log('[API] ========================================');
   
           // Check for terminator
+          let wasIncomplete = false;
+          let incompleteReason = null;
           if (!responseText.includes(TERMINATOR)) {
             // Handle truncation
             const result = await this.handleTruncatedResponse(responseText, headers, requestBody, startTime);
             responseText = result.fullResponse;
             durationSeconds = result.durationSeconds;
+            wasIncomplete = result.incomplete;
+            incompleteReason = result.incompleteReason;
           }
   
           // Remove terminator before parsing
@@ -310,17 +340,25 @@
             console.warn(`Attempt ${attempt + 1}/${maxRetries} - Invalid response: ${parseResult.error}`);
             console.warn(`Raw response text:`, responseText.substring(0, 500));
   
+            // If response was incomplete, include that info in the error
+            let errorMessage = parseResult.error;
+            if (wasIncomplete) {
+              errorMessage += ` (Response was incomplete: ${incompleteReason})`;
+            }
+  
             // On validation errors, return immediately with error details
             // Don't retry - let the main loop provide feedback to AI
             return {
               text: responseText,
               parsed: null,
               valid: false,
-              error: parseResult.error,
+              error: errorMessage,
               apiInput: processedMessages,
               apiInputFull: requestBody,
               apiOutput: data,
-              durationSeconds: durationSeconds
+              durationSeconds: durationSeconds,
+              incomplete: wasIncomplete,
+              incompleteReason: incompleteReason
             };
           }
   
@@ -347,6 +385,816 @@
   
       // All retries failed
       throw new Error(`Failed after ${maxRetries} attempts. Last error: ${lastError}`);
+    }
+  };
+  
+
+  // Module: core.js
+  // Core AI agent logic (UI-independent)
+  // This module contains all the logic that can run without DOM/browser UI
+  window.module['core.js'] = {
+    // Process AI response loop (without UI calls)
+    processAIResponse: async function(getMessages, addMessage, selectedDirectory, callbacks = {}) {
+      const api = window.module['api.js'];
+      const {
+        onLoading = () => {},
+        onHideLoading = () => {},
+        onRenderMessages = () => {},
+        onUpdateStats = () => {},
+        onProcessingChange = () => {}
+      } = callbacks;
+  
+      let continueProcessing = true;
+      let iteration = 0;
+      let consecutiveErrors = 0;
+      const MAX_RETRIES = 3;
+  
+      while (continueProcessing) {
+        iteration++;
+        console.log('='.repeat(80));
+        console.log(`[Core] ========== ITERATION ${iteration} START ==========`);
+        console.log('[Core] Total messages:', getMessages().length);
+  
+        // Send to API
+        const response = await api.callAPI(getMessages());
+  
+        // Remove loading indicator
+        onHideLoading();
+  
+        if (!response.valid) {
+          // Invalid response - provide detailed feedback to AI
+          console.error('[Core] Invalid response:', response.error);
+          consecutiveErrors++;
+          console.log(`[Core] Consecutive errors: ${consecutiveErrors}/${MAX_RETRIES}`);
+  
+          // Only show error to user if we've exceeded retry limit
+          if (consecutiveErrors >= MAX_RETRIES) {
+            console.error('[Core] Max retries exceeded, showing error to user');
+            addMessage({
+              role: 'assistant',
+              content: `Error: Invalid response after ${MAX_RETRIES} attempts - ${response.error}`
+            });
+            onRenderMessages();
+            onProcessingChange(false);
+            return { success: false, error: response.error, iterations: iteration };
+          }
+  
+          // Send error feedback to AI
+          let errorFeedback = `ERROR: Your response was invalid. Error: "${response.error}"\n\n`;
+          errorFeedback += `Your response was:\n${response.text.substring(0, 300)}${response.text.length > 300 ? '...' : ''}\n\n`;
+          errorFeedback += `Please provide a valid JSON response.`;
+  
+          addMessage({
+            role: 'user',
+            content: errorFeedback,
+            fromSystem: true
+          });
+  
+          onLoading();
+          continue;
+        }
+  
+        // Reset error counter on successful response
+        consecutiveErrors = 0;
+  
+        const parsedResponse = response.parsed;
+  
+        if (parsedResponse.type === 'message') {
+          // Final message response
+          console.log('[Core] ========== MESSAGE RESPONSE ==========');
+  
+          addMessage({
+            role: 'assistant',
+            content: parsedResponse.content,
+            apiData: {
+              input: response.apiInput,
+              inputFull: response.apiInputFull,
+              output: response.apiOutput,
+              rawResponse: response.text
+            },
+            durationSeconds: response.durationSeconds
+          });
+          onRenderMessages();
+          onUpdateStats();
+          continueProcessing = false;
+        } else if (parsedResponse.type === 'execute') {
+          console.log('[Core] ========== EXECUTE RESPONSE ==========');
+          console.log('[Core] AI requested', parsedResponse.tool_uses.length, 'tool(s)');
+  
+          // Add assistant message with API data
+          addMessage({
+            role: 'assistant',
+            content: response.text,
+            apiData: {
+              input: response.apiInput,
+              inputFull: response.apiInputFull,
+              output: response.apiOutput,
+              rawResponse: response.text
+            },
+            durationSeconds: response.durationSeconds
+          });
+  
+          // Execute all tools
+          await this.executeTools(parsedResponse.tool_uses, selectedDirectory, addMessage, onRenderMessages);
+  
+          onUpdateStats();
+          onLoading();
+          continue;
+        }
+      }
+  
+      console.log('[Core] Processing complete after', iteration, 'iterations');
+      return { success: true, iterations: iteration };
+    },
+  
+    // Execute tools (unified handler for all tools) - UI-independent
+    executeTools: async function(toolUses, selectedDirectory, addMessage, onRenderMessages = () => {}) {
+      for (const toolUse of toolUses) {
+        if (toolUse.name === 'list_directory') {
+          // Add tool use message
+          addMessage({
+            role: 'tool-use',
+            toolName: 'list_directory',
+            params: toolUse.input,
+            content: `list_directory ${JSON.stringify(toolUse.input)}`
+          });
+  
+          const result = await this.executeListDirectory(toolUse.input.path, selectedDirectory);
+  
+          if (result.success) {
+            // Count entries
+            const lines = result.output.split('\n');
+            const dirCount = lines.filter(l => l.includes('📁')).length;
+            const fileCount = lines.filter(l => l.includes('📄')).length;
+            const total = dirCount + fileCount;
+  
+            addMessage({
+              role: 'tool-result',
+              toolName: 'list_directory',
+              summary: `Listed ${total} items (${dirCount} folders, ${fileCount} files)`,
+              fullResult: result.output,
+              content: `Tool result for list_directory("${toolUse.input.path}"):\n\n${result.output}`
+            });
+          } else {
+            addMessage({
+              role: 'tool-result',
+              toolName: 'list_directory',
+              summary: `Error: ${result.error}`,
+              error: true,
+              content: `Tool error for list_directory("${toolUse.input.path}"): ${result.error}`
+            });
+          }
+        } else if (toolUse.name === 'read_file') {
+          // Add tool use message
+          addMessage({
+            role: 'tool-use',
+            toolName: 'read_file',
+            params: toolUse.input,
+            content: `read_file ${JSON.stringify(toolUse.input)}`
+          });
+  
+          const result = await this.executeReadFile(toolUse.input.path, selectedDirectory);
+  
+          if (result.success) {
+            const lineCount = result.content.split('\n').length;
+  
+            addMessage({
+              role: 'tool-result',
+              toolName: 'read_file',
+              summary: `Read ${lineCount} lines from ${result.path}`,
+              fullResult: result.content,
+              content: `File: ${result.path}\n\n${result.content}`
+            });
+          } else {
+            addMessage({
+              role: 'tool-result',
+              toolName: 'read_file',
+              summary: `Error: ${result.error}`,
+              error: true,
+              content: `Error reading file ${result.path}: ${result.error}`
+            });
+          }
+        } else if (toolUse.name === 'write_file') {
+          // Add tool use message
+          addMessage({
+            role: 'tool-use',
+            toolName: 'write_file',
+            params: toolUse.input,
+            content: `write_file ${JSON.stringify({ path: toolUse.input.path, content: `(${toolUse.input.content.length} chars)` })}`
+          });
+  
+          const result = await this.executeWriteFile(toolUse.input.path, toolUse.input.content, selectedDirectory);
+  
+          if (result.success) {
+            addMessage({
+              role: 'tool-result',
+              toolName: 'write_file',
+              summary: `Wrote ${toolUse.input.content.length} characters to ${result.path}`,
+              fullResult: `Successfully wrote to ${result.path}`,
+              content: `Successfully wrote ${toolUse.input.content.length} characters to ${result.path}`
+            });
+          } else {
+            addMessage({
+              role: 'tool-result',
+              toolName: 'write_file',
+              summary: `Error: ${result.error}`,
+              error: true,
+              content: `Error writing file ${result.path}: ${result.error}`
+            });
+          }
+        } else if (toolUse.name === 'search_by_filename') {
+          // Add tool use message
+          addMessage({
+            role: 'tool-use',
+            toolName: 'search_by_filename',
+            params: toolUse.input,
+            content: `search_by_filename ${JSON.stringify(toolUse.input)}`
+          });
+  
+          const searchPath = toolUse.input.path || '.';
+          const result = await this.executeSearchByFilename(toolUse.input.pattern, searchPath, selectedDirectory);
+  
+          if (result.success) {
+            const matchCount = result.matches.length;
+            const timeoutWarning = result.timeout ? ' (search timed out - partial results)' : '';
+  
+            addMessage({
+              role: 'tool-result',
+              toolName: 'search_by_filename',
+              summary: `Found ${matchCount} file(s) matching "${toolUse.input.pattern}"${timeoutWarning}`,
+              fullResult: result.output,
+              content: `Search results for pattern "${toolUse.input.pattern}" in "${searchPath}":\n\n${result.output}`
+            });
+          } else {
+            addMessage({
+              role: 'tool-result',
+              toolName: 'search_by_filename',
+              summary: `Error: ${result.error}`,
+              error: true,
+              content: `Error searching for files: ${result.error}`
+            });
+          }
+        } else if (toolUse.name === 'search_by_content') {
+          // Add tool use message
+          addMessage({
+            role: 'tool-use',
+            toolName: 'search_by_content',
+            params: toolUse.input,
+            content: `search_by_content ${JSON.stringify(toolUse.input)}`
+          });
+  
+          const searchPath = toolUse.input.path || '.';
+          const filePattern = toolUse.input.filePattern || null;
+          const result = await this.executeSearchByContent(toolUse.input.text, searchPath, filePattern, selectedDirectory);
+  
+          if (result.success) {
+            const matchCount = result.matches.length;
+            const timeoutWarning = result.timeout ? ' (search timed out - partial results)' : '';
+  
+            addMessage({
+              role: 'tool-result',
+              toolName: 'search_by_content',
+              summary: `Found ${matchCount} match(es) for "${toolUse.input.text}"${timeoutWarning}`,
+              fullResult: result.output,
+              content: `Search results for text "${toolUse.input.text}" in "${searchPath}":\n\n${result.output}`
+            });
+          } else {
+            addMessage({
+              role: 'tool-result',
+              toolName: 'search_by_content',
+              summary: `Error: ${result.error}`,
+              error: true,
+              content: `Error searching file contents: ${result.error}`
+            });
+          }
+        } else if (toolUse.name === 'edit_file') {
+          // Add tool use message
+          addMessage({
+            role: 'tool-use',
+            toolName: 'edit_file',
+            params: toolUse.input,
+            content: `edit_file ${JSON.stringify({ path: toolUse.input.path, find: `(${toolUse.input.find.length} chars)`, replace: `(${toolUse.input.replace.length} chars)` })}`
+          });
+  
+          const result = await this.executeEditFile(toolUse.input.path, toolUse.input.find, toolUse.input.replace, selectedDirectory);
+  
+          if (result.success) {
+            addMessage({
+              role: 'tool-result',
+              toolName: 'edit_file',
+              summary: `Edited ${result.path}: replaced ${toolUse.input.find.length} chars with ${toolUse.input.replace.length} chars`,
+              fullResult: `Successfully edited ${result.path}`,
+              content: `Successfully edited ${result.path}`
+            });
+          } else {
+            addMessage({
+              role: 'tool-result',
+              toolName: 'edit_file',
+              summary: `Error: ${result.error}`,
+              error: true,
+              content: `Error editing file ${toolUse.input.path}: ${result.error}`
+            });
+          }
+        } else if (toolUse.name === 'edit_file_batch') {
+          // Add tool use message
+          addMessage({
+            role: 'tool-use',
+            toolName: 'edit_file_batch',
+            params: toolUse.input,
+            content: `edit_file_batch ${JSON.stringify({ path: toolUse.input.path, edits: `(${toolUse.input.edits.length} edits)` })}`
+          });
+  
+          const result = await this.executeEditFileBatch(toolUse.input.path, toolUse.input.edits, selectedDirectory);
+  
+          if (result.success) {
+            addMessage({
+              role: 'tool-result',
+              toolName: 'edit_file_batch',
+              summary: `Batch edited ${result.path}: applied ${toolUse.input.edits.length} edit(s)`,
+              fullResult: `Successfully applied ${toolUse.input.edits.length} edits to ${result.path}`,
+              content: `Successfully applied ${toolUse.input.edits.length} edits to ${result.path}`
+            });
+          } else {
+            addMessage({
+              role: 'tool-result',
+              toolName: 'edit_file_batch',
+              summary: `Error: ${result.error}`,
+              error: true,
+              content: `Error batch editing file ${toolUse.input.path}: ${result.error}`
+            });
+          }
+        } else {
+          // Unknown tool
+          addMessage({
+            role: 'user',
+            content: `ERROR: Unknown tool "${toolUse.name}". Available tools are: list_directory, read_file, write_file, search_by_filename, search_by_content, edit_file, edit_file_batch.`,
+            fromSystem: true
+          });
+          console.warn(`[Core] Unknown tool: ${toolUse.name}`);
+        }
+      }
+  
+      onRenderMessages();
+    },
+  
+    // Execute file operations using FileSystem API
+    executeListDirectory: async function(path, dirHandle) {
+      try {
+        let targetHandle = dirHandle;
+  
+        // Navigate to the target path if not root
+        if (path && path !== '.' && path !== './') {
+          const pathParts = path.split('/').filter(p => p && p !== '.');
+          for (const part of pathParts) {
+            targetHandle = await targetHandle.getDirectoryHandle(part);
+          }
+        }
+  
+        // List directory contents
+        const entries = [];
+        for await (const entry of targetHandle.values()) {
+          entries.push({
+            name: entry.name,
+            kind: entry.kind
+          });
+        }
+  
+        // Format output
+        let output = `Contents of "${path || '.'}":\n\n`;
+        const dirs = entries.filter(e => e.kind === 'directory').sort((a, b) => a.name.localeCompare(b.name));
+        const files = entries.filter(e => e.kind === 'file').sort((a, b) => a.name.localeCompare(b.name));
+  
+        if (dirs.length > 0) {
+          output += 'Directories:\n';
+          dirs.forEach(d => {
+            output += `  📁 ${d.name}/\n`;
+          });
+        }
+  
+        if (files.length > 0) {
+          output += '\nFiles:\n';
+          files.forEach(f => {
+            output += `  📄 ${f.name}\n`;
+          });
+        }
+  
+        if (entries.length === 0) {
+          output += '(empty directory)\n';
+        }
+  
+        return { success: true, output };
+      } catch (error) {
+        return { success: false, error: error.message };
+      }
+    },
+  
+    executeReadFile: async function(path, dirHandle) {
+      try {
+        const pathParts = path.split('/').filter(p => p);
+        let currentHandle = dirHandle;
+  
+        // Navigate to parent directory
+        for (let i = 0; i < pathParts.length - 1; i++) {
+          currentHandle = await currentHandle.getDirectoryHandle(pathParts[i]);
+        }
+  
+        // Get file
+        const fileName = pathParts[pathParts.length - 1];
+        const fileHandle = await currentHandle.getFileHandle(fileName);
+        const file = await fileHandle.getFile();
+        const content = await file.text();
+  
+        return { success: true, content, path };
+      } catch (error) {
+        return { success: false, error: error.message, path };
+      }
+    },
+  
+    executeWriteFile: async function(path, content, dirHandle) {
+      try {
+        const pathParts = path.split('/').filter(p => p);
+        let currentHandle = dirHandle;
+  
+        // Navigate to parent directory (create if doesn't exist)
+        for (let i = 0; i < pathParts.length - 1; i++) {
+          try {
+            currentHandle = await currentHandle.getDirectoryHandle(pathParts[i]);
+          } catch {
+            // Directory doesn't exist, create it
+            currentHandle = await currentHandle.getDirectoryHandle(pathParts[i], { create: true });
+          }
+        }
+  
+        // Create or get file
+        const fileName = pathParts[pathParts.length - 1];
+        const fileHandle = await currentHandle.getFileHandle(fileName, { create: true });
+  
+        // Write content
+        const writable = await fileHandle.createWritable();
+        await writable.write(content);
+        await writable.close();
+  
+        return { success: true, path };
+      } catch (error) {
+        // Check if it's a user activation error
+        if (error.message && error.message.includes('User activation is required')) {
+          return {
+            success: false,
+            error: `Cannot create new directories due to browser security. Please manually create the parent directory first, then try again.`,
+            path
+          };
+        }
+        return { success: false, error: error.message, path };
+      }
+    },
+  
+    // Helper function to match wildcard pattern
+    matchesPattern: function(filename, pattern) {
+      // Convert wildcard pattern to regex
+      // * matches any characters, ? matches single character
+      const regexPattern = pattern
+        .replace(/[.+^${}()|[\]\\]/g, '\\$&')  // Escape special regex chars
+        .replace(/\*/g, '.*')  // * becomes .*
+        .replace(/\?/g, '.');  // ? becomes .
+  
+      const regex = new RegExp(`^${regexPattern}$`, 'i');  // Case-insensitive
+      return regex.test(filename);
+    },
+  
+    // Recursively search for files by filename pattern
+    executeSearchByFilename: async function(pattern, path, dirHandle) {
+      const TIMEOUT_MS = 10000;  // 10 seconds
+      const startTime = Date.now();
+      let timedOut = false;
+  
+      const matches = [];
+  
+      async function searchRecursive(handle, currentPath) {
+        // Check timeout
+        if (Date.now() - startTime > TIMEOUT_MS) {
+          timedOut = true;
+          return;
+        }
+  
+        try {
+          for await (const entry of handle.values()) {
+            // Check timeout inside loop
+            if (Date.now() - startTime > TIMEOUT_MS) {
+              timedOut = true;
+              return;
+            }
+  
+            const entryPath = currentPath ? `${currentPath}/${entry.name}` : entry.name;
+  
+            if (entry.kind === 'file') {
+              // Check if filename matches pattern
+              if (window.module['core.js'].matchesPattern(entry.name, pattern)) {
+                matches.push(entryPath);
+              }
+            } else if (entry.kind === 'directory') {
+              // Recurse into subdirectory
+              await searchRecursive(entry, entryPath);
+            }
+          }
+        } catch (error) {
+          console.warn(`[Search] Error accessing ${currentPath}:`, error.message);
+        }
+      }
+  
+      try {
+        // Navigate to starting path
+        let targetHandle = dirHandle;
+        if (path && path !== '.' && path !== './') {
+          const pathParts = path.split('/').filter(p => p && p !== '.');
+          for (const part of pathParts) {
+            targetHandle = await targetHandle.getDirectoryHandle(part);
+          }
+        }
+  
+        // Start recursive search
+        await searchRecursive(targetHandle, path === '.' || !path ? '' : path);
+  
+        // Format output
+        let output = '';
+        if (matches.length === 0) {
+          output = 'No files found matching the pattern.';
+        } else {
+          output = matches.map(m => `📄 ${m}`).join('\n');
+        }
+  
+        if (timedOut) {
+          output += '\n\n⚠️ Search timed out after 10 seconds - showing partial results. Try narrowing your search path or pattern.';
+        }
+  
+        return {
+          success: true,
+          matches: matches,
+          output: output,
+          timeout: timedOut
+        };
+      } catch (error) {
+        return { success: false, error: error.message, matches: [] };
+      }
+    },
+  
+    // Recursively search for text within file contents
+    executeSearchByContent: async function(searchText, path, filePattern, dirHandle) {
+      const TIMEOUT_MS = 10000;  // 10 seconds
+      const startTime = Date.now();
+      let timedOut = false;
+  
+      const matches = [];
+  
+      async function searchRecursive(handle, currentPath) {
+        // Check timeout
+        if (Date.now() - startTime > TIMEOUT_MS) {
+          timedOut = true;
+          return;
+        }
+  
+        try {
+          for await (const entry of handle.values()) {
+            // Check timeout inside loop
+            if (Date.now() - startTime > TIMEOUT_MS) {
+              timedOut = true;
+              return;
+            }
+  
+            const entryPath = currentPath ? `${currentPath}/${entry.name}` : entry.name;
+  
+            if (entry.kind === 'file') {
+              // Check if file matches filePattern (if provided)
+              if (filePattern && !window.module['core.js'].matchesPattern(entry.name, filePattern)) {
+                continue;
+              }
+  
+              try {
+                // Read file and search for text
+                const file = await entry.getFile();
+                const content = await file.text();
+  
+                if (content.toLowerCase().includes(searchText.toLowerCase())) {
+                  // Find line numbers where text appears
+                  const lines = content.split('\n');
+                  const matchingLines = [];
+  
+                  for (let i = 0; i < lines.length; i++) {
+                    if (lines[i].toLowerCase().includes(searchText.toLowerCase())) {
+                      matchingLines.push({
+                        lineNum: i + 1,
+                        line: lines[i].trim()
+                      });
+                    }
+                  }
+  
+                  matches.push({
+                    path: entryPath,
+                    lineMatches: matchingLines
+                  });
+                }
+              } catch (error) {
+                // Skip binary files or files that can't be read as text
+                console.warn(`[Search] Could not read ${entryPath}:`, error.message);
+              }
+            } else if (entry.kind === 'directory') {
+              // Recurse into subdirectory
+              await searchRecursive(entry, entryPath);
+            }
+          }
+        } catch (error) {
+          console.warn(`[Search] Error accessing ${currentPath}:`, error.message);
+        }
+      }
+  
+      try {
+        // Navigate to starting path
+        let targetHandle = dirHandle;
+        if (path && path !== '.' && path !== './') {
+          const pathParts = path.split('/').filter(p => p && p !== '.');
+          for (const part of pathParts) {
+            targetHandle = await targetHandle.getDirectoryHandle(part);
+          }
+        }
+  
+        // Start recursive search
+        await searchRecursive(targetHandle, path === '.' || !path ? '' : path);
+  
+        // Format output
+        let output = '';
+        if (matches.length === 0) {
+          output = 'No matches found.';
+        } else {
+          output = matches.map(match => {
+            const header = `📄 ${match.path}`;
+            const lineInfo = match.lineMatches.slice(0, 5).map(lm =>
+              `  Line ${lm.lineNum}: ${lm.line.substring(0, 100)}${lm.line.length > 100 ? '...' : ''}`
+            ).join('\n');
+            const moreLines = match.lineMatches.length > 5 ? `  ... and ${match.lineMatches.length - 5} more matches` : '';
+  
+            return `${header}\n${lineInfo}${moreLines ? '\n' + moreLines : ''}`;
+          }).join('\n\n');
+        }
+  
+        if (timedOut) {
+          output += '\n\n⚠️ Search timed out after 10 seconds - showing partial results. Try narrowing your search path or using a file pattern.';
+        }
+  
+        return {
+          success: true,
+          matches: matches,
+          output: output,
+          timeout: timedOut
+        };
+      } catch (error) {
+        return { success: false, error: error.message, matches: [] };
+      }
+    },
+  
+    executeEditFile: async function(path, findStr, replaceStr, dirHandle) {
+      const state = window.module['state.js'];
+  
+      try {
+        // 1. Check if file was read within last 5 minutes
+        const fiveMinutesAgo = Date.now() - (5 * 60 * 1000);
+        const messages = state.getMessages();
+        const recentRead = messages
+          .filter(m => m.role === 'tool-result' && m.toolName === 'read_file' && m.timestamp > fiveMinutesAgo)
+          .find(m => {
+            // Check if this read was for our file
+            const toolUseIndex = messages.indexOf(m) - 1;
+            if (toolUseIndex >= 0 && messages[toolUseIndex].role === 'tool-use') {
+              return messages[toolUseIndex].params.path === path;
+            }
+            return false;
+          });
+  
+        if (!recentRead) {
+          return {
+            success: false,
+            error: `File has not been read in the last 5 minutes. Please read the file first to ensure you have the latest content before editing.`,
+            path
+          };
+        }
+  
+        // 2. Read current file content
+        const readResult = await this.executeReadFile(path, dirHandle);
+        if (!readResult.success) {
+          return { success: false, error: readResult.error, path };
+        }
+  
+        const content = readResult.content;
+  
+        // 3. Check if file is blank - suggest using write_file instead
+        if (content.trim() === '') {
+          return {
+            success: false,
+            error: `File is empty. Please use write_file to populate empty files instead of edit_file.`,
+            path
+          };
+        }
+  
+        // 4. Check that find string appears exactly once
+        const occurrences = content.split(findStr).length - 1;
+        if (occurrences === 0) {
+          return {
+            success: false,
+            error: `Find string not found in file. The file may have changed since you last read it.`,
+            path
+          };
+        } else if (occurrences > 1) {
+          return {
+            success: false,
+            error: `Find string appears ${occurrences} times in the file. It must appear exactly once. Please use a more specific find string.`,
+            path
+          };
+        }
+  
+        // 5. Perform replacement
+        const newContent = content.replace(findStr, replaceStr);
+  
+        // 6. Write back
+        const writeResult = await this.executeWriteFile(path, newContent, dirHandle);
+        return writeResult;
+  
+      } catch (error) {
+        return { success: false, error: error.message, path };
+      }
+    },
+  
+    executeEditFileBatch: async function(path, edits, dirHandle) {
+      const state = window.module['state.js'];
+  
+      try {
+        // 1. Check if file was read within last 5 minutes
+        const fiveMinutesAgo = Date.now() - (5 * 60 * 1000);
+        const messages = state.getMessages();
+        const recentRead = messages
+          .filter(m => m.role === 'tool-result' && m.toolName === 'read_file' && m.timestamp > fiveMinutesAgo)
+          .find(m => {
+            // Check if this read was for our file
+            const toolUseIndex = messages.indexOf(m) - 1;
+            if (toolUseIndex >= 0 && messages[toolUseIndex].role === 'tool-use') {
+              return messages[toolUseIndex].params.path === path;
+            }
+            return false;
+          });
+  
+        if (!recentRead) {
+          return {
+            success: false,
+            error: `File has not been read in the last 5 minutes. Please read the file first to ensure you have the latest content before editing.`,
+            path
+          };
+        }
+  
+        // 2. Read current file content
+        const readResult = await this.executeReadFile(path, dirHandle);
+        if (!readResult.success) {
+          return { success: false, error: readResult.error, path };
+        }
+  
+        let content = readResult.content;
+  
+        // 3. Check if file is blank - suggest using write_file instead
+        if (content.trim() === '') {
+          return {
+            success: false,
+            error: `File is empty. Please use write_file to populate empty files instead of edit_file_batch.`,
+            path
+          };
+        }
+  
+        // 4. Apply each edit in sequence
+        for (let i = 0; i < edits.length; i++) {
+          const { find, replace } = edits[i];
+  
+          // Check that find string appears exactly once in current content
+          const occurrences = content.split(find).length - 1;
+          if (occurrences === 0) {
+            return {
+              success: false,
+              error: `Edit ${i + 1}: Find string not found in file. The file may have changed or earlier edits affected this replacement.`,
+              path
+            };
+          } else if (occurrences > 1) {
+            return {
+              success: false,
+              error: `Edit ${i + 1}: Find string appears ${occurrences} times in the file. It must appear exactly once. Please use a more specific find string.`,
+              path
+            };
+          }
+  
+          // Perform replacement
+          content = content.replace(find, replace);
+        }
+  
+        // 5. Write back
+        const writeResult = await this.executeWriteFile(path, content, dirHandle);
+        return writeResult;
+  
+      } catch (error) {
+        return { success: false, error: error.message, path };
+      }
     }
   };
   
@@ -471,122 +1319,23 @@
     processAIResponse: async function() {
       const state = window.module['state.js'];
       const ui = window.module['ui.js'];
-      const api = window.module['api.js'];
-      const tools = window.module['tools.js'];
+      const core = window.module['core.js'];
   
       const selectedDirectory = state.getState().selectedDirectory;
-      let continueProcessing = true;
-      let iteration = 0;
-      let consecutiveErrors = 0;
-      const MAX_RETRIES = 3;
   
-      while (continueProcessing) {
-        iteration++;
-        console.log('='.repeat(80));
-        console.log(`[Main] ========== ITERATION ${iteration} START ==========`);
-        console.log('[Main] Total messages:', state.getMessages().length);
-  
-        // Send to API
-        const response = await api.callAPI(state.getMessages());
-  
-        // Remove loading indicator
-        ui.hideLoading();
-  
-        if (!response.valid) {
-          // Invalid response - provide detailed feedback to AI
-          console.error('[Main] Invalid response:', response.error);
-          consecutiveErrors++;
-          console.log(`[Main] Consecutive errors: ${consecutiveErrors}/${MAX_RETRIES}`);
-  
-          // Only show error to user if we've exceeded retry limit
-          if (consecutiveErrors >= MAX_RETRIES) {
-            console.error('[Main] Max retries exceeded, showing error to user');
-            state.addMessage({
-              role: 'assistant',
-              content: `Error: Invalid response after ${MAX_RETRIES} attempts - ${response.error}`
-            });
-            ui.renderMessages(state.getMessages());
-            state.setProcessing(false);
-            return;
-          }
-  
-          // Send error feedback to AI
-          let errorFeedback = `ERROR: Your response was invalid. Error: "${response.error}"\n\n`;
-          errorFeedback += `Your response was:\n${response.text.substring(0, 300)}${response.text.length > 300 ? '...' : ''}\n\n`;
-          errorFeedback += `Please provide a valid JSON response.`;
-  
-          state.addMessage({
-            role: 'user',
-            content: errorFeedback,
-            fromSystem: true
-          });
-  
-          ui.showLoading();
-          continue;
+      // Use core.js for UI-independent processing
+      await core.processAIResponse(
+        () => state.getMessages(),
+        (msg) => state.addMessage(msg),
+        selectedDirectory,
+        {
+          onLoading: () => ui.showLoading(),
+          onHideLoading: () => ui.hideLoading(),
+          onRenderMessages: () => ui.renderMessages(state.getMessages()),
+          onUpdateStats: () => ui.updateContextStats(),
+          onProcessingChange: (processing) => state.setProcessing(processing)
         }
-  
-        // Reset error counter on successful response
-        consecutiveErrors = 0;
-  
-        const parsedResponse = response.parsed;
-  
-        if (parsedResponse.type === 'message') {
-          // Final message response
-          console.log('[Main] ========== MESSAGE RESPONSE ==========');
-  
-          // Check if adding this message would exceed context limit
-          if (state.wouldExceedLimit(parsedResponse.content)) {
-            console.log('[Main] Assistant message would exceed limit, compacting context first');
-            await this.compactContext();
-          }
-  
-          state.addMessage({
-            role: 'assistant',
-            content: parsedResponse.content,
-            apiData: {
-              input: response.apiInput,
-              inputFull: response.apiInputFull,
-              output: response.apiOutput,
-              rawResponse: response.text
-            },
-            durationSeconds: response.durationSeconds
-          });
-          ui.renderMessages(state.getMessages());
-          ui.updateContextStats();
-          continueProcessing = false;
-        } else if (parsedResponse.type === 'execute') {
-          console.log('[Main] ========== EXECUTE RESPONSE ==========');
-          console.log('[Main] AI requested', parsedResponse.tool_uses.length, 'tool(s)');
-  
-          // Check if adding this message would exceed context limit
-          if (state.wouldExceedLimit(response.text)) {
-            console.log('[Main] Execute response would exceed limit, compacting context first');
-            await this.compactContext();
-          }
-  
-          // Add assistant message with API data
-          state.addMessage({
-            role: 'assistant',
-            content: response.text,
-            apiData: {
-              input: response.apiInput,
-              inputFull: response.apiInputFull,
-              output: response.apiOutput,
-              rawResponse: response.text
-            },
-            durationSeconds: response.durationSeconds
-          });
-  
-          // Execute all tools
-          await this.executeTools(parsedResponse.tool_uses, selectedDirectory);
-  
-          ui.updateContextStats();
-          ui.showLoading();
-          continue;
-        }
-      }
-  
-      console.log('[Main] Processing complete after', iteration, 'iterations');
+      );
     },
   
     // Execute tools (unified handler for all tools)
@@ -687,11 +1436,132 @@
               content: `Error writing file ${result.path}: ${result.error}`
             });
           }
+        } else if (toolUse.name === 'search_by_filename') {
+          // Add tool use message
+          state.addMessage({
+            role: 'tool-use',
+            toolName: 'search_by_filename',
+            params: toolUse.input,
+            content: `search_by_filename ${JSON.stringify(toolUse.input)}`
+          });
+  
+          const searchPath = toolUse.input.path || '.';
+          const result = await this.executeSearchByFilename(toolUse.input.pattern, searchPath, selectedDirectory);
+  
+          if (result.success) {
+            const matchCount = result.matches.length;
+            const timeoutWarning = result.timeout ? ' (search timed out - partial results)' : '';
+  
+            state.addMessage({
+              role: 'tool-result',
+              toolName: 'search_by_filename',
+              summary: `Found ${matchCount} file(s) matching "${toolUse.input.pattern}"${timeoutWarning}`,
+              fullResult: result.output,
+              content: `Search results for pattern "${toolUse.input.pattern}" in "${searchPath}":\n\n${result.output}`
+            });
+          } else {
+            state.addMessage({
+              role: 'tool-result',
+              toolName: 'search_by_filename',
+              summary: `Error: ${result.error}`,
+              error: true,
+              content: `Error searching for files: ${result.error}`
+            });
+          }
+        } else if (toolUse.name === 'search_by_content') {
+          // Add tool use message
+          state.addMessage({
+            role: 'tool-use',
+            toolName: 'search_by_content',
+            params: toolUse.input,
+            content: `search_by_content ${JSON.stringify(toolUse.input)}`
+          });
+  
+          const searchPath = toolUse.input.path || '.';
+          const filePattern = toolUse.input.filePattern || null;
+          const result = await this.executeSearchByContent(toolUse.input.text, searchPath, filePattern, selectedDirectory);
+  
+          if (result.success) {
+            const matchCount = result.matches.length;
+            const timeoutWarning = result.timeout ? ' (search timed out - partial results)' : '';
+  
+            state.addMessage({
+              role: 'tool-result',
+              toolName: 'search_by_content',
+              summary: `Found ${matchCount} match(es) for "${toolUse.input.text}"${timeoutWarning}`,
+              fullResult: result.output,
+              content: `Search results for text "${toolUse.input.text}" in "${searchPath}":\n\n${result.output}`
+            });
+          } else {
+            state.addMessage({
+              role: 'tool-result',
+              toolName: 'search_by_content',
+              summary: `Error: ${result.error}`,
+              error: true,
+              content: `Error searching file contents: ${result.error}`
+            });
+          }
+        } else if (toolUse.name === 'edit_file') {
+          // Add tool use message
+          state.addMessage({
+            role: 'tool-use',
+            toolName: 'edit_file',
+            params: toolUse.input,
+            content: `edit_file ${JSON.stringify({ path: toolUse.input.path, find: `(${toolUse.input.find.length} chars)`, replace: `(${toolUse.input.replace.length} chars)` })}`
+          });
+  
+          const result = await this.executeEditFile(toolUse.input.path, toolUse.input.find, toolUse.input.replace, selectedDirectory);
+  
+          if (result.success) {
+            state.addMessage({
+              role: 'tool-result',
+              toolName: 'edit_file',
+              summary: `Edited ${result.path}: replaced ${toolUse.input.find.length} chars with ${toolUse.input.replace.length} chars`,
+              fullResult: `Successfully edited ${result.path}`,
+              content: `Successfully edited ${result.path}`
+            });
+          } else {
+            state.addMessage({
+              role: 'tool-result',
+              toolName: 'edit_file',
+              summary: `Error: ${result.error}`,
+              error: true,
+              content: `Error editing file ${toolUse.input.path}: ${result.error}`
+            });
+          }
+        } else if (toolUse.name === 'edit_file_batch') {
+          // Add tool use message
+          state.addMessage({
+            role: 'tool-use',
+            toolName: 'edit_file_batch',
+            params: toolUse.input,
+            content: `edit_file_batch ${JSON.stringify({ path: toolUse.input.path, edits: `(${toolUse.input.edits.length} edits)` })}`
+          });
+  
+          const result = await this.executeEditFileBatch(toolUse.input.path, toolUse.input.edits, selectedDirectory);
+  
+          if (result.success) {
+            state.addMessage({
+              role: 'tool-result',
+              toolName: 'edit_file_batch',
+              summary: `Batch edited ${result.path}: applied ${toolUse.input.edits.length} edit(s)`,
+              fullResult: `Successfully applied ${toolUse.input.edits.length} edits to ${result.path}`,
+              content: `Successfully applied ${toolUse.input.edits.length} edits to ${result.path}`
+            });
+          } else {
+            state.addMessage({
+              role: 'tool-result',
+              toolName: 'edit_file_batch',
+              summary: `Error: ${result.error}`,
+              error: true,
+              content: `Error batch editing file ${toolUse.input.path}: ${result.error}`
+            });
+          }
         } else {
           // Unknown tool
           state.addMessage({
             role: 'user',
-            content: `ERROR: Unknown tool "${toolUse.name}". Available tools are: list_directory, read_file, write_file.`,
+            content: `ERROR: Unknown tool "${toolUse.name}". Available tools are: list_directory, read_file, write_file, search_by_filename, search_by_content, edit_file, edit_file_batch.`,
             fromSystem: true
           });
           console.warn(`[Main] Unknown tool: ${toolUse.name}`);
@@ -809,6 +1679,355 @@
           };
         }
         return { success: false, error: error.message, path };
+      }
+    },
+  
+    executeEditFile: async function(path, findStr, replaceStr, dirHandle) {
+      const state = window.module['state.js'];
+  
+      try {
+        // 1. Check if file was read within last 5 minutes
+        const fiveMinutesAgo = Date.now() - (5 * 60 * 1000);
+        const messages = state.getMessages();
+        const recentRead = messages
+          .filter(m => m.role === 'tool-result' && m.toolName === 'read_file' && m.timestamp > fiveMinutesAgo)
+          .find(m => {
+            // Check if this read was for our file
+            const toolUseIndex = messages.indexOf(m) - 1;
+            if (toolUseIndex >= 0 && messages[toolUseIndex].role === 'tool-use') {
+              return messages[toolUseIndex].params.path === path;
+            }
+            return false;
+          });
+  
+        if (!recentRead) {
+          return {
+            success: false,
+            error: `File has not been read in the last 5 minutes. Please read the file first to ensure you have the latest content before editing.`,
+            path
+          };
+        }
+  
+        // 2. Read current file content
+        const readResult = await this.executeReadFile(path, dirHandle);
+        if (!readResult.success) {
+          return { success: false, error: readResult.error, path };
+        }
+  
+        const content = readResult.content;
+  
+        // 3. Check if file is blank - suggest using write_file instead
+        if (content.trim() === '') {
+          return {
+            success: false,
+            error: `File is empty. Please use write_file to populate empty files instead of edit_file.`,
+            path
+          };
+        }
+  
+        // 4. Check that find string appears exactly once
+        const occurrences = content.split(findStr).length - 1;
+        if (occurrences === 0) {
+          return {
+            success: false,
+            error: `Find string not found in file. The file may have changed since you last read it.`,
+            path
+          };
+        } else if (occurrences > 1) {
+          return {
+            success: false,
+            error: `Find string appears ${occurrences} times in the file. It must appear exactly once. Please use a more specific find string.`,
+            path
+          };
+        }
+  
+        // 5. Perform replacement
+        const newContent = content.replace(findStr, replaceStr);
+  
+        // 6. Write back
+        const writeResult = await this.executeWriteFile(path, newContent, dirHandle);
+        return writeResult;
+  
+      } catch (error) {
+        return { success: false, error: error.message, path };
+      }
+    },
+  
+    executeEditFileBatch: async function(path, edits, dirHandle) {
+      const state = window.module['state.js'];
+  
+      try {
+        // 1. Check if file was read within last 5 minutes
+        const fiveMinutesAgo = Date.now() - (5 * 60 * 1000);
+        const messages = state.getMessages();
+        const recentRead = messages
+          .filter(m => m.role === 'tool-result' && m.toolName === 'read_file' && m.timestamp > fiveMinutesAgo)
+          .find(m => {
+            // Check if this read was for our file
+            const toolUseIndex = messages.indexOf(m) - 1;
+            if (toolUseIndex >= 0 && messages[toolUseIndex].role === 'tool-use') {
+              return messages[toolUseIndex].params.path === path;
+            }
+            return false;
+          });
+  
+        if (!recentRead) {
+          return {
+            success: false,
+            error: `File has not been read in the last 5 minutes. Please read the file first to ensure you have the latest content before editing.`,
+            path
+          };
+        }
+  
+        // 2. Read current file content
+        const readResult = await this.executeReadFile(path, dirHandle);
+        if (!readResult.success) {
+          return { success: false, error: readResult.error, path };
+        }
+  
+        let content = readResult.content;
+  
+        // 3. Check if file is blank - suggest using write_file instead
+        if (content.trim() === '') {
+          return {
+            success: false,
+            error: `File is empty. Please use write_file to populate empty files instead of edit_file_batch.`,
+            path
+          };
+        }
+  
+        // 4. Apply each edit in sequence
+        for (let i = 0; i < edits.length; i++) {
+          const { find, replace } = edits[i];
+  
+          // Check that find string appears exactly once in current content
+          const occurrences = content.split(find).length - 1;
+          if (occurrences === 0) {
+            return {
+              success: false,
+              error: `Edit ${i + 1}: Find string not found in file. The file may have changed or earlier edits affected this replacement.`,
+              path
+            };
+          } else if (occurrences > 1) {
+            return {
+              success: false,
+              error: `Edit ${i + 1}: Find string appears ${occurrences} times in the file. It must appear exactly once. Please use a more specific find string.`,
+              path
+            };
+          }
+  
+          // Perform replacement
+          content = content.replace(find, replace);
+        }
+  
+        // 5. Write back
+        const writeResult = await this.executeWriteFile(path, content, dirHandle);
+        return writeResult;
+  
+      } catch (error) {
+        return { success: false, error: error.message, path };
+      }
+    },
+  
+    // Helper function to match wildcard pattern
+    matchesPattern: function(filename, pattern) {
+      // Convert wildcard pattern to regex
+      // * matches any characters, ? matches single character
+      const regexPattern = pattern
+        .replace(/[.+^${}()|[\]\\]/g, '\\$&')  // Escape special regex chars
+        .replace(/\*/g, '.*')  // * becomes .*
+        .replace(/\?/g, '.');  // ? becomes .
+  
+      const regex = new RegExp(`^${regexPattern}$`, 'i');  // Case-insensitive
+      return regex.test(filename);
+    },
+  
+    // Recursively search for files by filename pattern
+    executeSearchByFilename: async function(pattern, path, dirHandle) {
+      const TIMEOUT_MS = 10000;  // 10 seconds
+      const startTime = Date.now();
+      let timedOut = false;
+  
+      const matches = [];
+  
+      async function searchRecursive(handle, currentPath) {
+        // Check timeout
+        if (Date.now() - startTime > TIMEOUT_MS) {
+          timedOut = true;
+          return;
+        }
+  
+        try {
+          for await (const entry of handle.values()) {
+            // Check timeout inside loop
+            if (Date.now() - startTime > TIMEOUT_MS) {
+              timedOut = true;
+              return;
+            }
+  
+            const entryPath = currentPath ? `${currentPath}/${entry.name}` : entry.name;
+  
+            if (entry.kind === 'file') {
+              // Check if filename matches pattern
+              if (window.module['main.js'].matchesPattern(entry.name, pattern)) {
+                matches.push(entryPath);
+              }
+            } else if (entry.kind === 'directory') {
+              // Recurse into subdirectory
+              await searchRecursive(entry, entryPath);
+            }
+          }
+        } catch (error) {
+          console.warn(`[Search] Error accessing ${currentPath}:`, error.message);
+        }
+      }
+  
+      try {
+        // Navigate to starting path
+        let targetHandle = dirHandle;
+        if (path && path !== '.' && path !== './') {
+          const pathParts = path.split('/').filter(p => p && p !== '.');
+          for (const part of pathParts) {
+            targetHandle = await targetHandle.getDirectoryHandle(part);
+          }
+        }
+  
+        // Start recursive search
+        await searchRecursive(targetHandle, path === '.' || !path ? '' : path);
+  
+        // Format output
+        let output = '';
+        if (matches.length === 0) {
+          output = 'No files found matching the pattern.';
+        } else {
+          output = matches.map(m => `📄 ${m}`).join('\n');
+        }
+  
+        if (timedOut) {
+          output += '\n\n⚠️ Search timed out after 10 seconds - showing partial results. Try narrowing your search path or pattern.';
+        }
+  
+        return {
+          success: true,
+          matches: matches,
+          output: output,
+          timeout: timedOut
+        };
+      } catch (error) {
+        return { success: false, error: error.message, matches: [] };
+      }
+    },
+  
+    // Recursively search for text within file contents
+    executeSearchByContent: async function(searchText, path, filePattern, dirHandle) {
+      const TIMEOUT_MS = 10000;  // 10 seconds
+      const startTime = Date.now();
+      let timedOut = false;
+  
+      const matches = [];
+  
+      async function searchRecursive(handle, currentPath) {
+        // Check timeout
+        if (Date.now() - startTime > TIMEOUT_MS) {
+          timedOut = true;
+          return;
+        }
+  
+        try {
+          for await (const entry of handle.values()) {
+            // Check timeout inside loop
+            if (Date.now() - startTime > TIMEOUT_MS) {
+              timedOut = true;
+              return;
+            }
+  
+            const entryPath = currentPath ? `${currentPath}/${entry.name}` : entry.name;
+  
+            if (entry.kind === 'file') {
+              // Check if file matches filePattern (if provided)
+              if (filePattern && !window.module['main.js'].matchesPattern(entry.name, filePattern)) {
+                continue;
+              }
+  
+              try {
+                // Read file and search for text
+                const file = await entry.getFile();
+                const content = await file.text();
+  
+                if (content.toLowerCase().includes(searchText.toLowerCase())) {
+                  // Find line numbers where text appears
+                  const lines = content.split('\n');
+                  const matchingLines = [];
+  
+                  for (let i = 0; i < lines.length; i++) {
+                    if (lines[i].toLowerCase().includes(searchText.toLowerCase())) {
+                      matchingLines.push({
+                        lineNum: i + 1,
+                        line: lines[i].trim()
+                      });
+                    }
+                  }
+  
+                  matches.push({
+                    path: entryPath,
+                    lineMatches: matchingLines
+                  });
+                }
+              } catch (error) {
+                // Skip binary files or files that can't be read as text
+                console.warn(`[Search] Could not read ${entryPath}:`, error.message);
+              }
+            } else if (entry.kind === 'directory') {
+              // Recurse into subdirectory
+              await searchRecursive(entry, entryPath);
+            }
+          }
+        } catch (error) {
+          console.warn(`[Search] Error accessing ${currentPath}:`, error.message);
+        }
+      }
+  
+      try {
+        // Navigate to starting path
+        let targetHandle = dirHandle;
+        if (path && path !== '.' && path !== './') {
+          const pathParts = path.split('/').filter(p => p && p !== '.');
+          for (const part of pathParts) {
+            targetHandle = await targetHandle.getDirectoryHandle(part);
+          }
+        }
+  
+        // Start recursive search
+        await searchRecursive(targetHandle, path === '.' || !path ? '' : path);
+  
+        // Format output
+        let output = '';
+        if (matches.length === 0) {
+          output = 'No matches found.';
+        } else {
+          output = matches.map(match => {
+            const header = `📄 ${match.path}`;
+            const lineInfo = match.lineMatches.slice(0, 5).map(lm =>
+              `  Line ${lm.lineNum}: ${lm.line.substring(0, 100)}${lm.line.length > 100 ? '...' : ''}`
+            ).join('\n');
+            const moreLines = match.lineMatches.length > 5 ? `  ... and ${match.lineMatches.length - 5} more matches` : '';
+  
+            return `${header}\n${lineInfo}${moreLines ? '\n' + moreLines : ''}`;
+          }).join('\n\n');
+        }
+  
+        if (timedOut) {
+          output += '\n\n⚠️ Search timed out after 10 seconds - showing partial results. Try narrowing your search path or using a file pattern.';
+        }
+  
+        return {
+          success: true,
+          matches: matches,
+          output: output,
+          timeout: timedOut
+        };
+      } catch (error) {
+        return { success: false, error: error.message, matches: [] };
       }
     },
   
@@ -1718,6 +2937,104 @@
           },
           required: ['path', 'content']
         }
+      },
+  
+      {
+        name: 'search_by_filename',
+        description: 'Search for files by filename pattern (supports wildcards like *.js, test*, etc.)',
+        input_schema: {
+          type: 'object',
+          properties: {
+            pattern: {
+              type: 'string',
+              description: 'The filename pattern to search for (e.g., "*.js", "test*", "config.json")'
+            },
+            path: {
+              type: 'string',
+              description: 'The directory to search in (relative to project root, use "." for root). Optional, defaults to "."'
+            }
+          },
+          required: ['pattern']
+        }
+      },
+  
+      {
+        name: 'search_by_content',
+        description: 'Search for text within file contents',
+        input_schema: {
+          type: 'object',
+          properties: {
+            text: {
+              type: 'string',
+              description: 'The text to search for within files'
+            },
+            path: {
+              type: 'string',
+              description: 'The directory to search in (relative to project root, use "." for root). Optional, defaults to "."'
+            },
+            filePattern: {
+              type: 'string',
+              description: 'Optional file pattern to limit search (e.g., "*.js", "*.txt"). If not provided, searches all files.'
+            }
+          },
+          required: ['text']
+        }
+      },
+  
+      {
+        name: 'edit_file',
+        description: 'Edit a file by finding and replacing a specific string. The file must have been read within the last 5 minutes. The find string must appear exactly once in the file.',
+        input_schema: {
+          type: 'object',
+          properties: {
+            path: {
+              type: 'string',
+              description: 'The file path to edit (relative to project root)'
+            },
+            find: {
+              type: 'string',
+              description: 'The exact string to find in the file (must appear exactly once)'
+            },
+            replace: {
+              type: 'string',
+              description: 'The string to replace it with'
+            }
+          },
+          required: ['path', 'find', 'replace']
+        }
+      },
+  
+      {
+        name: 'edit_file_batch',
+        description: 'Edit a file by applying multiple find/replace operations in sequence. The file must have been read within the last 5 minutes. Each find string must appear exactly once in the file.',
+        input_schema: {
+          type: 'object',
+          properties: {
+            path: {
+              type: 'string',
+              description: 'The file path to edit (relative to project root)'
+            },
+            edits: {
+              type: 'array',
+              description: 'Array of edit operations to apply in sequence',
+              items: {
+                type: 'object',
+                properties: {
+                  find: {
+                    type: 'string',
+                    description: 'The exact string to find in the file (must appear exactly once)'
+                  },
+                  replace: {
+                    type: 'string',
+                    description: 'The string to replace it with'
+                  }
+                },
+                required: ['find', 'replace']
+              }
+            }
+          },
+          required: ['path', 'edits']
+        }
       }
     ],
   
@@ -1764,17 +3081,78 @@
   - path (string, required): The file path to write (relative to project root)
   - content (string, required): The content to write to the file
   
+  CRITICAL: The "content" field MUST be a literal JSON string. Do NOT use JavaScript expressions like .repeat(), string concatenation (+), or template literals. The content must be the FULL, EXPANDED text as a single JSON string with proper escaping.
+  
+  WRONG: {"content":"Line 1\\n" + "Line 2"}
+  WRONG: {"content":"text ".repeat(100)}
+  CORRECT: {"content":"Line 1\\nLine 2"}
+  
   Example usage:
   {"type":"execute","tool_uses":[{"name":"write_file","input":{"path":"src/utils/helper.js","content":"// Helper functions\\nexport function add(a, b) {\\n  return a + b;\\n}"}}]}
+  
+  ### search_by_filename
+  Search for files by filename pattern (supports wildcards)
+  
+  Parameters:
+  - pattern (string, required): The filename pattern to search for (e.g., "*.js", "test*", "config.json")
+  - path (string, optional): The directory to search in (relative to project root, defaults to ".")
+  
+  Example usage:
+  {"type":"execute","tool_uses":[{"name":"search_by_filename","input":{"pattern":"*.js","path":"src"}}]}
+  
+  ### search_by_content
+  Search for text within file contents
+  
+  Parameters:
+  - text (string, required): The text to search for within files
+  - path (string, optional): The directory to search in (relative to project root, defaults to ".")
+  - filePattern (string, optional): File pattern to limit search (e.g., "*.js")
+  
+  Example usage:
+  {"type":"execute","tool_uses":[{"name":"search_by_content","input":{"text":"executeTools","filePattern":"*.js"}}]}
+  
+  ### edit_file
+  Edit a file by finding and replacing a specific string (for single edits)
+  
+  IMPORTANT REQUIREMENTS:
+  1. You MUST read the file within the last 5 minutes before editing
+  2. The find string MUST appear exactly once in the file (otherwise you'll get an error)
+  3. If the file is blank/empty, use write_file instead
+  
+  Parameters:
+  - path (string, required): The file path to edit (relative to project root)
+  - find (string, required): The exact string to find (must appear exactly once)
+  - replace (string, required): The string to replace it with
+  
+  Example usage:
+  {"type":"execute","tool_uses":[{"name":"edit_file","input":{"path":"src/config.js","find":"debug: false","replace":"debug: true"}}]}
+  
+  ### edit_file_batch
+  Edit a file by applying multiple find/replace operations in sequence (for multiple edits to the same file)
+  
+  IMPORTANT REQUIREMENTS:
+  1. You MUST read the file within the last 5 minutes before editing
+  2. Each find string MUST appear exactly once in the file at the time it's applied (otherwise you'll get an error)
+  3. Edits are applied in sequence, so later edits see the results of earlier edits
+  4. If the file is blank/empty, use write_file instead
+  
+  Parameters:
+  - path (string, required): The file path to edit (relative to project root)
+  - edits (array, required): Array of {find, replace} operations to apply in sequence
+  
+  Example usage:
+  {"type":"execute","tool_uses":[{"name":"edit_file_batch","input":{"path":"src/config.js","edits":[{"find":"version: '1.0.0'","replace":"version: '2.0.0'"},{"find":"debug: false","replace":"debug: true"}]}}]}
   
   ## Workflow
   
   When asked to explore a project:
   1. Use list_directory to see what files/folders exist
-  2. Use read_file to read relevant files (you can read multiple files at once)
-  3. File contents will remain in the conversation for context
-  4. Use write_file to create or update files
-  5. Then provide your analysis or response
+  2. Use search_by_filename to find specific files by pattern
+  3. Use search_by_content to find files containing specific text
+  4. Use read_file to read relevant files (you can read multiple files at once)
+  5. File contents will remain in the conversation for context
+  6. Use write_file to create or update files
+  7. Then provide your analysis or response
   
   ## Response Format
   
@@ -1791,6 +3169,8 @@
   - Do NOT wrap your JSON in markdown code blocks
   - Do NOT include any explanatory text before or after the JSON
   - Your ENTIRE response must be valid JSON starting with { and ending with }
+  - JSON fields MUST contain literal values only - NO JavaScript expressions, concatenation (+), .repeat(), template literals, or any code
+  - All string values must be fully expanded as literal JSON strings with proper escaping (\\n for newlines, \\" for quotes)
   - ALWAYS end your response with ||||END|||| immediately after the closing }
   - If your response is blank or empty, just send ||||END|||| to indicate completion`;
     },
