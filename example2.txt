@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-21T03:54:36.236Z
+// AI Agent - Built 2025-11-21T04:15:48.125Z
 (function() {
   window.module = {};
 
@@ -9,33 +9,35 @@
   
     // Main entry point - runs all diagnostic tests
     runAllTests: async function() {
-      console.log('\n========== API DIAGNOSTICS STARTED ==========\n');
+      console.log('\n========== API DIAGNOSTICS: Error Detection Test ==========\n');
   
-      this.results = [];
+      // Single test: 1792K message that we know triggers the error
+      const api = window.module['api.js'];
+      const size = 1792000;
+      const content = "reply 'K'. Ignore: " + 'x'.repeat(size);
+      const messages = [{ role: 'user', content }];
   
-      // Test 1: Message size limits
-      await this.testMessageSizeLimits();
+      console.log(`Sending ${Math.round(size/1000)}K message to trigger error...`);
   
-      // Test 2: Conversation length limits
-      await this.testConversationLengthLimits();
+      try {
+        const response = await api.callAPI(messages);
   
-      // Test 3: Rapid requests (rate limiting)
-      await this.testRapidRequests();
-  
-      // Test 4: Many tool results in context
-      await this.testManyToolResults();
-  
-      // Test 5: Message count (many small messages)
-      await this.testMessageCount();
-  
-      // Test 6: Very long single lines
-      await this.testLongLines();
-  
-      // Test 7: Burst then sustained requests
-      await this.testBurstSustained();
-  
-      // Print summary
-      this.printSummary();
+        if (response.valid) {
+          console.log('Unexpected: Request succeeded!');
+        } else {
+          console.log('Got error response:', response.error);
+          console.log('');
+          console.log('=== Error Detection Test ===');
+          console.log('is500Error():', this.is500Error(response.error) ? 'YES' : 'NO');
+          console.log('isServerConnectionError():', this.isServerConnectionError(response.error) ? 'YES' : 'NO');
+        }
+      } catch (e) {
+        console.log('Exception:', e.message);
+        console.log('');
+        console.log('=== Error Detection Test ===');
+        console.log('is500Error():', this.is500Error(e) ? 'YES' : 'NO');
+        console.log('isServerConnectionError():', this.isServerConnectionError(e) ? 'YES' : 'NO');
+      }
     },
   
     // Log result helper
@@ -63,6 +65,15 @@
       return errStr.includes('500') ||
              errStr.includes('Server Connection Error') ||
              errStr.includes('Open WebUI');
+    },
+  
+    // Specific check for the server connection error we see with large payloads
+    isServerConnectionError: function(error) {
+      if (!error) return false;
+      const errStr = String(error.message || error);
+      // Match: "500: Open WebUI: Server Connection Error"
+      return errStr.includes('Server Connection Error') ||
+             (errStr.includes('500') && errStr.includes('Open WebUI'));
     },
   
     // Test 1: Message size limits - start at 512K, go up to 4MB
