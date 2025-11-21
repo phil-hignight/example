@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-21T04:15:48.125Z
+// AI Agent - Built 2025-11-21T04:19:40.251Z
 (function() {
   window.module = {};
 
@@ -9,7 +9,7 @@
   
     // Main entry point - runs all diagnostic tests
     runAllTests: async function() {
-      console.log('\n========== API DIAGNOSTICS: Error Detection Test ==========\n');
+      console.log('\n========== API DIAGNOSTICS: Error Detection + Auto-Recovery Test ==========\n');
   
       // Single test: 1792K message that we know triggers the error
       const api = window.module['api.js'];
@@ -19,25 +19,92 @@
   
       console.log(`Sending ${Math.round(size/1000)}K message to trigger error...`);
   
-      try {
-        const response = await api.callAPI(messages);
+      const result = await this.callWithAutoRecovery(messages);
   
-        if (response.valid) {
-          console.log('Unexpected: Request succeeded!');
-        } else {
-          console.log('Got error response:', response.error);
-          console.log('');
-          console.log('=== Error Detection Test ===');
-          console.log('is500Error():', this.is500Error(response.error) ? 'YES' : 'NO');
-          console.log('isServerConnectionError():', this.isServerConnectionError(response.error) ? 'YES' : 'NO');
+      if (result.success) {
+        console.log('Final result: SUCCESS');
+        console.log('Retries needed:', result.retries);
+        if (result.compacted) {
+          console.log('Message was compacted from', result.originalSize, 'to', result.compactedSize, 'chars');
         }
-      } catch (e) {
-        console.log('Exception:', e.message);
-        console.log('');
-        console.log('=== Error Detection Test ===');
-        console.log('is500Error():', this.is500Error(e) ? 'YES' : 'NO');
-        console.log('isServerConnectionError():', this.isServerConnectionError(e) ? 'YES' : 'NO');
+      } else {
+        console.log('Final result: FAILED after recovery attempts');
+        console.log('Error:', result.error);
       }
+    },
+  
+    // Call API with auto-recovery on server connection error
+    callWithAutoRecovery: async function(messages, maxRetries = 2) {
+      const api = window.module['api.js'];
+      let retries = 0;
+      let currentMessages = messages;
+      let compacted = false;
+      let originalSize = JSON.stringify(messages).length;
+      let compactedSize = originalSize;
+  
+      while (retries <= maxRetries) {
+        try {
+          const response = await api.callAPI(currentMessages);
+  
+          if (response.valid) {
+            return { success: true, response, retries, compacted, originalSize, compactedSize };
+          }
+  
+          // Check if it's the server connection error
+          if (this.isServerConnectionError(response.error)) {
+            console.log(`Attempt ${retries + 1}: Server Connection Error detected`);
+  
+            if (retries < maxRetries) {
+              // Compact messages and retry
+              console.log('Compacting messages...');
+              currentMessages = this.compactMessages(currentMessages);
+              compacted = true;
+              compactedSize = JSON.stringify(currentMessages).length;
+              console.log(`Compacted: ${originalSize} -> ${compactedSize} chars (${Math.round((1 - compactedSize/originalSize) * 100)}% reduction)`);
+              retries++;
+              await this.delay(1000);
+              continue;
+            }
+          }
+  
+          return { success: false, error: response.error, retries, compacted, originalSize, compactedSize };
+  
+        } catch (e) {
+          if (this.isServerConnectionError(e)) {
+            console.log(`Attempt ${retries + 1}: Server Connection Error (exception)`);
+  
+            if (retries < maxRetries) {
+              console.log('Compacting messages...');
+              currentMessages = this.compactMessages(currentMessages);
+              compacted = true;
+              compactedSize = JSON.stringify(currentMessages).length;
+              console.log(`Compacted: ${originalSize} -> ${compactedSize} chars`);
+              retries++;
+              await this.delay(1000);
+              continue;
+            }
+          }
+  
+          return { success: false, error: e.message || e, retries, compacted, originalSize, compactedSize };
+        }
+      }
+  
+      return { success: false, error: 'Max retries exceeded', retries, compacted, originalSize, compactedSize };
+    },
+  
+    // Compact messages by truncating large content
+    compactMessages: function(messages) {
+      const maxContentSize = 500000; // 500K limit per message
+  
+      return messages.map(msg => {
+        if (msg.content && msg.content.length > maxContentSize) {
+          return {
+            ...msg,
+            content: msg.content.substring(0, maxContentSize) + '\n[TRUNCATED - content exceeded 500K limit]'
+          };
+        }
+        return msg;
+      });
     },
   
     // Log result helper
