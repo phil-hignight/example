@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-21T16:52:04.561Z
+// AI Agent - Built 2025-11-21T22:38:15.158Z
 (function() {
   window.module = {};
 
@@ -7,37 +7,34 @@
   window.module['api-diagnostics.js'] = {
     results: [],
   
-    // Main entry point - tests compaction prompt at various sizes
+    // Main entry point - tests EXACT compaction format at various sizes
     runAllTests: async function() {
-      console.log('\n========== API DIAGNOSTICS: Compaction Prompt Test ==========\n');
-      console.log('Testing compaction-style summarization at increasing sizes...\n');
+      console.log('\n========== API DIAGNOSTICS: EXACT Compaction Format Test ==========\n');
+      console.log('Testing with EXACT prompt and format used in main.js compactContext...\n');
   
       const api = window.module['api.js'];
       this.results = [];
   
-      // The actual compaction prompt (hardcoded)
-      const compactionPrompt = `You are summarizing a coding conversation. Create a concise summary that preserves:
-  1. The user's original goal/request
-  2. Key decisions made
-  3. Files modified and why
-  4. Current state/progress
-  5. Any errors encountered and how they were resolved
-  
-  Reply with ONLY the summary, no other text.
-  
-  Here is the conversation to summarize:
-  
-  `;
+      // EXACT prompt from main.js compactContext (line 1188-1196)
+      const compactionPrompt = 'You are summarizing a conversation between a user and a coding agent that has file system tools (read, write, search, edit files).\n\n' +
+        'Provide a concise summary including:\n' +
+        '1. User\'s most recent request\n' +
+        '2. Recent actions (files read, edited, created)\n' +
+        '3. Key decisions and context needed to continue\n' +
+        '4. Any ongoing work or issues\n\n' +
+        'Be concise. Focus on actionable context.\n\n' +
+        'Conversation:\n\n';
   
       // Test sizes (in chars) - 100 to 30K tokens = 400 to 120000 chars
       const sizes = [400, 2000, 4000, 8000, 16000, 24000, 32000, 48000, 64000, 80000, 100000, 120000];
   
       for (const size of sizes) {
-        const conversation = this.generateCodingConversation(size);
+        // Use EXACT format: [role]: content
+        const conversation = this.generateCompactionFormatConversation(size);
         const content = compactionPrompt + conversation;
         const tokens = Math.round(content.length / 4);
   
-        console.log(`\n[compaction-${tokens}tok] Testing...`);
+        console.log(`\n[exact-compaction-${tokens}tok] Testing...`);
   
         const messages = [{ role: 'user', content }];
         const startTime = Date.now();
@@ -50,15 +47,15 @@
   
           if (response.valid) {
             console.log(`  ✓ OK (total ${duration}s) [${timingStr}] - Summary: "${response.text.substring(0, 80)}..."`);
-            this.results.push({ name: `compaction-${tokens}tok`, tokens, success: true, duration, timings, error: null });
+            this.results.push({ name: `exact-compaction-${tokens}tok`, tokens, success: true, duration, timings, error: null });
           } else {
             console.log(`  ✗ FAILED (total ${duration}s) [${timingStr}] - ${response.error.substring(0, 100)}`);
-            this.results.push({ name: `compaction-${tokens}tok`, tokens, success: false, duration, timings, error: response.error });
+            this.results.push({ name: `exact-compaction-${tokens}tok`, tokens, success: false, duration, timings, error: response.error });
           }
         } catch (e) {
           const duration = ((Date.now() - startTime) / 1000).toFixed(1);
           console.log(`  ✗ EXCEPTION (total ${duration}s) - ${e.message.substring(0, 100)}`);
-          this.results.push({ name: `compaction-${tokens}tok`, tokens, success: false, duration, timings: [], error: e.message });
+          this.results.push({ name: `exact-compaction-${tokens}tok`, tokens, success: false, duration, timings: [], error: e.message });
         }
   
         await this.delay(500);
@@ -67,7 +64,7 @@
       this.printCompactionSummary();
     },
   
-    // Generate realistic coding conversation
+    // Generate realistic coding conversation (clean text)
     generateCodingConversation: function(targetLength) {
       const exchanges = [
         { user: "Can you help me fix a bug in my authentication code?", assistant: "I'd be happy to help. Could you share the relevant code and describe what's happening?" },
@@ -82,6 +79,34 @@
       while (conversation.length < targetLength) {
         const ex = exchanges[i % exchanges.length];
         conversation += `User: ${ex.user}\n\nAssistant: ${ex.assistant}\n\n`;
+        i++;
+      }
+      return conversation.substring(0, targetLength);
+    },
+  
+    // Generate conversation in EXACT compaction format with tool messages
+    generateCompactionFormatConversation: function(targetLength) {
+      // This mimics the exact format used in main.js compactContext:
+      // messagesToSummarize.map(m => `[${m.role}]: ${m.content}`).join('\n\n')
+      const messages = [
+        { role: 'user', content: 'Can you help me fix a bug in my authentication code?' },
+        { role: 'assistant', content: 'I\'d be happy to help. Let me read the file first.' },
+        { role: 'tool-use', content: 'read_file {"path":"src/auth.js"}' },
+        { role: 'tool-result', content: 'File: src/auth.js (150 lines)\n\n1: // Authentication module\n2: function login(user, pass) {\n3:   const hash = md5(pass);\n4:   return db.query(\'SELECT * FROM users WHERE name=\' + user);\n5: }\n6: \n7: function logout() {\n8:   session.destroy();\n9: }\n10: // ... more code ...' },
+        { role: 'assistant', content: 'I found a SQL injection vulnerability. Let me fix it.' },
+        { role: 'tool-use', content: 'edit_file {"path":"src/auth.js","find":"(50 chars)","replace":"(60 chars)"}' },
+        { role: 'tool-result', content: 'Successfully edited src/auth.js' },
+        { role: 'user', content: 'Now I need to add rate limiting.' },
+        { role: 'assistant', content: 'I\'ll search for where to add the rate limiter.' },
+        { role: 'tool-use', content: 'search_by_content {"text":"login","path":"."}' },
+        { role: 'tool-result', content: 'Found 5 matches:\nsrc/auth.js:4: function login(user, pass)\nsrc/routes/api.js:15: router.post(\'/login\', auth.login)\nsrc/tests/auth.test.js:10: describe(\'login\')' },
+      ];
+  
+      let conversation = '';
+      let i = 0;
+      while (conversation.length < targetLength) {
+        const m = messages[i % messages.length];
+        conversation += `[${m.role}]: ${m.content}\n\n`;
         i++;
       }
       return conversation.substring(0, targetLength);
