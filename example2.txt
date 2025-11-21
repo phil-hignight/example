@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-21T03:43:49.553Z
+// AI Agent - Built 2025-11-21T03:48:01.333Z
 (function() {
   window.module = {};
 
@@ -2224,8 +2224,8 @@
       // Render initial messages (including greeting)
       ui.renderMessages(state.getMessages());
   
-      // Start keepalive interval - send "reply 'K'" every 5 minutes to keep session alive
-      this.startKeepalive();
+      // Keepalive disabled for testing
+      // this.startKeepalive();
     },
   
     startKeepalive: function() {
