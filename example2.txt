@@ -1,6 +1,508 @@
-// AI Agent - Built 2025-11-20T22:55:05.457Z
+// AI Agent - Built 2025-11-21T03:11:58.684Z
 (function() {
   window.module = {};
+
+  // Module: api-diagnostics.js
+  // API Diagnostics - Probes for 500 errors and tests recovery strategies
+  window.module['api-diagnostics.js'] = {
+    results: [],
+  
+    // Main entry point - runs all diagnostic tests
+    runAllTests: async function() {
+      const diagnostics = window.module['diagnostics.js'];
+      console.log('\n========== API DIAGNOSTICS STARTED ==========\n');
+  
+      this.results = [];
+  
+      // Test 1: Basic connectivity
+      await this.testBasicConnectivity();
+  
+      // Test 2: Message size limits
+      await this.testMessageSizeLimits();
+  
+      // Test 3: Conversation length limits
+      await this.testConversationLengthLimits();
+  
+      // Test 4: Rapid requests (rate limiting)
+      await this.testRapidRequests();
+  
+      // Test 5: Large system prompt
+      await this.testLargeSystemPrompt();
+  
+      // Test 6: Many tool results in context
+      await this.testManyToolResults();
+  
+      // Test 7: Special characters / encoding issues
+      await this.testSpecialCharacters();
+  
+      // Print summary
+      this.printSummary();
+    },
+  
+    // Log result helper
+    logResult: function(testName, success, details, error = null) {
+      const result = {
+        test: testName,
+        success,
+        details,
+        error: error ? error.message || error : null,
+        timestamp: Date.now()
+      };
+      this.results.push(result);
+  
+      const status = success ? 'PASS' : 'FAIL';
+      console.log(`[${status}] ${testName}: ${details}`);
+      if (error) {
+        console.log(`  Error: ${error.message || error}`);
+      }
+    },
+  
+    // Check if error is the 500 Server Connection Error
+    is500Error: function(error) {
+      if (!error) return false;
+      const errStr = String(error.message || error);
+      return errStr.includes('500') ||
+             errStr.includes('Server Connection Error') ||
+             errStr.includes('Open WebUI');
+    },
+  
+    // Test 1: Basic connectivity
+    testBasicConnectivity: async function() {
+      console.log('\n--- Test 1: Basic Connectivity ---');
+  
+      try {
+        const api = window.module['api.js'];
+        const messages = [{ role: 'user', content: "reply 'K'" }];
+        const response = await api.callAPI(messages);
+  
+        if (response.valid) {
+          this.logResult('Basic Connectivity', true, 'Simple request succeeded');
+        } else {
+          this.logResult('Basic Connectivity', false, 'Request failed: ' + response.error, response.error);
+          if (this.is500Error(response.error)) {
+            console.log('  >>> 500 ERROR DETECTED on basic request! API may be down.');
+          }
+        }
+      } catch (e) {
+        this.logResult('Basic Connectivity', false, 'Exception thrown', e);
+      }
+    },
+  
+    // Test 2: Message size limits - exponential growth until failure
+    testMessageSizeLimits: async function() {
+      console.log('\n--- Test 2: Message Size Limits ---');
+  
+      const api = window.module['api.js'];
+      const sizes = [100, 500, 1000, 2000, 4000, 8000, 16000, 32000, 64000];
+      let lastSuccessSize = 0;
+      let firstFailSize = null;
+      let failError = null;
+  
+      for (const size of sizes) {
+        const content = "reply 'K'. Ignore this padding: " + 'x'.repeat(size);
+        const messages = [{ role: 'user', content }];
+  
+        console.log(`  Testing message size: ${size} chars...`);
+  
+        try {
+          const response = await api.callAPI(messages);
+  
+          if (response.valid) {
+            lastSuccessSize = size;
+            console.log(`    Size ${size}: OK`);
+          } else {
+            firstFailSize = size;
+            failError = response.error;
+            console.log(`    Size ${size}: FAILED - ${response.error}`);
+  
+            if (this.is500Error(response.error)) {
+              console.log(`  >>> 500 ERROR at size ${size}!`);
+              await this.attemptRecovery('Message Size', messages, response.error);
+            }
+            break;
+          }
+        } catch (e) {
+          firstFailSize = size;
+          failError = e;
+          console.log(`    Size ${size}: EXCEPTION - ${e.message}`);
+          break;
+        }
+  
+        // Small delay between tests
+        await this.delay(500);
+      }
+  
+      this.logResult('Message Size Limits',
+        firstFailSize === null,
+        `Last success: ${lastSuccessSize} chars, First fail: ${firstFailSize || 'none'}`,
+        failError);
+    },
+  
+    // Test 3: Conversation length limits
+    testConversationLengthLimits: async function() {
+      console.log('\n--- Test 3: Conversation Length Limits ---');
+  
+      const api = window.module['api.js'];
+      const counts = [5, 10, 20, 40, 80];
+      let lastSuccessCount = 0;
+      let firstFailCount = null;
+      let failError = null;
+  
+      for (const count of counts) {
+        // Build conversation with alternating user/assistant messages
+        const messages = [];
+        for (let i = 0; i < count; i++) {
+          messages.push({
+            role: i % 2 === 0 ? 'user' : 'assistant',
+            content: `Message ${i}: This is a test message with some content.`
+          });
+        }
+        messages.push({ role: 'user', content: "reply 'K'" });
+  
+        console.log(`  Testing conversation with ${count} messages...`);
+  
+        try {
+          const response = await api.callAPI(messages);
+  
+          if (response.valid) {
+            lastSuccessCount = count;
+            console.log(`    ${count} messages: OK`);
+          } else {
+            firstFailCount = count;
+            failError = response.error;
+            console.log(`    ${count} messages: FAILED - ${response.error}`);
+  
+            if (this.is500Error(response.error)) {
+              console.log(`  >>> 500 ERROR at ${count} messages!`);
+              await this.attemptRecovery('Conversation Length', messages, response.error);
+            }
+            break;
+          }
+        } catch (e) {
+          firstFailCount = count;
+          failError = e;
+          console.log(`    ${count} messages: EXCEPTION - ${e.message}`);
+          break;
+        }
+  
+        await this.delay(500);
+      }
+  
+      this.logResult('Conversation Length',
+        firstFailCount === null,
+        `Last success: ${lastSuccessCount} msgs, First fail: ${firstFailCount || 'none'}`,
+        failError);
+    },
+  
+    // Test 4: Rapid requests (rate limiting)
+    testRapidRequests: async function() {
+      console.log('\n--- Test 4: Rapid Requests (Rate Limiting) ---');
+  
+      const api = window.module['api.js'];
+      const messages = [{ role: 'user', content: "reply 'K'" }];
+      let successCount = 0;
+      let failCount = 0;
+      let firstError = null;
+  
+      console.log('  Sending 5 rapid requests...');
+  
+      const promises = [];
+      for (let i = 0; i < 5; i++) {
+        promises.push(api.callAPI(messages));
+      }
+  
+      try {
+        const results = await Promise.all(promises);
+  
+        for (let i = 0; i < results.length; i++) {
+          if (results[i].valid) {
+            successCount++;
+          } else {
+            failCount++;
+            if (!firstError) firstError = results[i].error;
+  
+            if (this.is500Error(results[i].error)) {
+              console.log(`  >>> 500 ERROR on rapid request ${i + 1}!`);
+            }
+          }
+        }
+      } catch (e) {
+        failCount++;
+        firstError = e;
+      }
+  
+      this.logResult('Rapid Requests',
+        failCount === 0,
+        `${successCount}/5 succeeded, ${failCount} failed`,
+        firstError);
+    },
+  
+    // Test 5: Large system prompt
+    testLargeSystemPrompt: async function() {
+      console.log('\n--- Test 5: Large System Prompt ---');
+  
+      const api = window.module['api.js'];
+      const tools = window.module['tools.js'];
+  
+      // Get current system prompt size
+      const currentPrompt = tools.getSystemPrompt();
+      console.log(`  Current system prompt size: ${currentPrompt.length} chars`);
+  
+      // Test with artificially large system prompt by adding padding to first message
+      const sizes = [1000, 5000, 10000, 20000];
+      let lastSuccessSize = 0;
+      let failError = null;
+  
+      for (const size of sizes) {
+        const padding = '\n[System context padding: ' + 'y'.repeat(size) + ']';
+        const messages = [
+          { role: 'user', content: padding + "\n\nreply 'K'" }
+        ];
+  
+        console.log(`  Testing with ${size} chars extra context...`);
+  
+        try {
+          const response = await api.callAPI(messages);
+  
+          if (response.valid) {
+            lastSuccessSize = size;
+            console.log(`    ${size} chars extra: OK`);
+          } else {
+            failError = response.error;
+            console.log(`    ${size} chars extra: FAILED - ${response.error}`);
+  
+            if (this.is500Error(response.error)) {
+              console.log(`  >>> 500 ERROR with ${size} chars system padding!`);
+              await this.attemptRecovery('Large System Prompt', messages, response.error);
+            }
+            break;
+          }
+        } catch (e) {
+          failError = e;
+          break;
+        }
+  
+        await this.delay(500);
+      }
+  
+      this.logResult('Large System Prompt',
+        failError === null,
+        `Last success: ${lastSuccessSize} chars extra`,
+        failError);
+    },
+  
+    // Test 6: Many tool results in context
+    testManyToolResults: async function() {
+      console.log('\n--- Test 6: Many Tool Results ---');
+  
+      const api = window.module['api.js'];
+      const counts = [5, 10, 20, 50];
+      let lastSuccessCount = 0;
+      let failError = null;
+  
+      for (const count of counts) {
+        // Simulate tool results in conversation
+        const messages = [];
+        for (let i = 0; i < count; i++) {
+          messages.push({
+            role: 'user',
+            content: `[Tool Result ${i}] list_directory: file1.js, file2.js, file3.js, folder1/, folder2/`
+          });
+          messages.push({
+            role: 'assistant',
+            content: `I see the directory listing ${i}.`
+          });
+        }
+        messages.push({ role: 'user', content: "reply 'K'" });
+  
+        console.log(`  Testing with ${count} tool results...`);
+  
+        try {
+          const response = await api.callAPI(messages);
+  
+          if (response.valid) {
+            lastSuccessCount = count;
+            console.log(`    ${count} tool results: OK`);
+          } else {
+            failError = response.error;
+            console.log(`    ${count} tool results: FAILED - ${response.error}`);
+  
+            if (this.is500Error(response.error)) {
+              console.log(`  >>> 500 ERROR with ${count} tool results!`);
+              await this.attemptRecovery('Many Tool Results', messages, response.error);
+            }
+            break;
+          }
+        } catch (e) {
+          failError = e;
+          break;
+        }
+  
+        await this.delay(500);
+      }
+  
+      this.logResult('Many Tool Results',
+        failError === null,
+        `Last success: ${lastSuccessCount} tool results`,
+        failError);
+    },
+  
+    // Test 7: Special characters / encoding
+    testSpecialCharacters: async function() {
+      console.log('\n--- Test 7: Special Characters ---');
+  
+      const api = window.module['api.js'];
+      const testCases = [
+        { name: 'Unicode emoji', content: "reply 'K'. Test: \ud83d\ude00\ud83d\ude01\ud83d\ude02" },
+        { name: 'Newlines', content: "reply 'K'.\n\n\n\nMultiple\n\nnewlines" },
+        { name: 'Tabs', content: "reply 'K'.\t\t\tTabs\there" },
+        { name: 'JSON-like', content: 'reply \'K\'. {"test": "value", "nested": {"a": 1}}' },
+        { name: 'Backticks', content: "reply 'K'. ```code block```" },
+        { name: 'Quotes', content: 'reply \'K\'. "double" and \'single\' quotes' },
+        { name: 'Backslashes', content: "reply 'K'. Path: C:\\Users\\test\\file.txt" },
+      ];
+  
+      let failures = [];
+  
+      for (const test of testCases) {
+        const messages = [{ role: 'user', content: test.content }];
+  
+        try {
+          const response = await api.callAPI(messages);
+  
+          if (response.valid) {
+            console.log(`  ${test.name}: OK`);
+          } else {
+            console.log(`  ${test.name}: FAILED - ${response.error}`);
+            failures.push(test.name);
+  
+            if (this.is500Error(response.error)) {
+              console.log(`  >>> 500 ERROR with ${test.name}!`);
+            }
+          }
+        } catch (e) {
+          console.log(`  ${test.name}: EXCEPTION - ${e.message}`);
+          failures.push(test.name);
+        }
+  
+        await this.delay(300);
+      }
+  
+      this.logResult('Special Characters',
+        failures.length === 0,
+        failures.length === 0 ? 'All passed' : `Failed: ${failures.join(', ')}`);
+    },
+  
+    // Recovery attempts when 500 error is detected
+    attemptRecovery: async function(context, originalMessages, originalError) {
+      console.log('\n  --- Attempting Recovery Strategies ---');
+  
+      const api = window.module['api.js'];
+  
+      // Strategy 1: Simple retry (3 times)
+      console.log('  Strategy 1: Simple retry...');
+      for (let i = 0; i < 3; i++) {
+        await this.delay(1000 * (i + 1)); // Increasing delay
+        try {
+          const response = await api.callAPI(originalMessages);
+          if (response.valid) {
+            console.log(`    Retry ${i + 1}: SUCCESS! Issue may be transient.`);
+            return { strategy: 'retry', attempt: i + 1 };
+          } else {
+            console.log(`    Retry ${i + 1}: Still failing - ${response.error}`);
+          }
+        } catch (e) {
+          console.log(`    Retry ${i + 1}: Exception - ${e.message}`);
+        }
+      }
+  
+      // Strategy 2: Reduce message count by half
+      if (originalMessages.length > 2) {
+        console.log('  Strategy 2: Reduce messages by half...');
+        const reducedMessages = originalMessages.slice(-Math.ceil(originalMessages.length / 2));
+        try {
+          const response = await api.callAPI(reducedMessages);
+          if (response.valid) {
+            console.log(`    Reduced to ${reducedMessages.length} messages: SUCCESS!`);
+            console.log(`    >>> FINDING: Context size may be the issue`);
+            return { strategy: 'reduce_messages', newCount: reducedMessages.length };
+          } else {
+            console.log(`    Reduced messages: Still failing`);
+          }
+        } catch (e) {
+          console.log(`    Reduced messages: Exception`);
+        }
+      }
+  
+      // Strategy 3: Simplify to minimal request
+      console.log('  Strategy 3: Minimal request...');
+      const minimalMessages = [{ role: 'user', content: "reply 'K'" }];
+      try {
+        const response = await api.callAPI(minimalMessages);
+        if (response.valid) {
+          console.log(`    Minimal request: SUCCESS!`);
+          console.log(`    >>> FINDING: Something in the original request is causing the issue`);
+          return { strategy: 'minimal', success: true };
+        } else {
+          console.log(`    Minimal request: FAILED - ${response.error}`);
+          console.log(`    >>> FINDING: API may be completely down or rejecting all requests`);
+          return { strategy: 'minimal', success: false };
+        }
+      } catch (e) {
+        console.log(`    Minimal request: Exception - ${e.message}`);
+        return { strategy: 'minimal', success: false };
+      }
+    },
+  
+    // Print summary of all tests
+    printSummary: function() {
+      console.log('\n========== API DIAGNOSTICS SUMMARY ==========\n');
+  
+      let passCount = 0;
+      let failCount = 0;
+      const failures = [];
+  
+      for (const result of this.results) {
+        if (result.success) {
+          passCount++;
+        } else {
+          failCount++;
+          failures.push(result);
+        }
+      }
+  
+      console.log(`Total: ${passCount} passed, ${failCount} failed\n`);
+  
+      if (failures.length > 0) {
+        console.log('Failed tests:');
+        for (const f of failures) {
+          console.log(`  - ${f.test}: ${f.details}`);
+          if (f.error) {
+            console.log(`    Error: ${f.error}`);
+          }
+        }
+      }
+  
+      // Check for 500 errors specifically
+      const has500 = this.results.some(r => r.error && this.is500Error(r.error));
+      if (has500) {
+        console.log('\n>>> 500 ERRORS DETECTED - Potential causes:');
+        console.log('  1. API server overloaded');
+        console.log('  2. Request too large for server buffer');
+        console.log('  3. Rate limiting (too many requests)');
+        console.log('  4. Malformed request body');
+        console.log('  5. Server-side timeout');
+      }
+  
+      console.log('\n========== END DIAGNOSTICS ==========\n');
+    },
+  
+    // Utility: delay
+    delay: function(ms) {
+      return new Promise(resolve => setTimeout(resolve, ms));
+    }
+  };
+  
 
   // Module: api.js
   // API communication
@@ -1786,6 +2288,62 @@
   
       // Render initial messages (including greeting)
       ui.renderMessages(state.getMessages());
+  
+      // Start keepalive interval - send "reply 'K'" every 5 minutes to keep session alive
+      this.startKeepalive();
+    },
+  
+    startKeepalive: function() {
+      const diagnostics = window.module['diagnostics.js'];
+      const KEEPALIVE_INTERVAL = 5 * 60 * 1000; // 5 minutes in milliseconds
+  
+      // Clear any existing keepalive interval
+      if (this.keepaliveInterval) {
+        clearInterval(this.keepaliveInterval);
+      }
+  
+      diagnostics.log('ui', '[Main] Starting keepalive interval (every 5 minutes)');
+  
+      this.keepaliveInterval = setInterval(async () => {
+        const state = window.module['state.js'];
+        const ui = window.module['ui.js'];
+  
+        // Only send keepalive if not currently processing
+        if (state.isProcessing()) {
+          diagnostics.log('ui', '[Main] Skipping keepalive - already processing');
+          return;
+        }
+  
+        diagnostics.log('ui', '[Main] Sending keepalive message');
+  
+        // Add keepalive message
+        state.addMessage({
+          role: 'user',
+          content: "reply 'K'",
+          fromSystem: true
+        });
+  
+        // Render messages
+        ui.renderMessages(state.getMessages());
+        ui.updateContextStats();
+  
+        // Set processing state
+        state.setProcessing(true);
+        ui.setInputDisabled(true);
+  
+        // Show loading indicator
+        ui.showLoading();
+  
+        try {
+          await this.processAIResponse();
+        } catch (error) {
+          ui.hideLoading();
+          diagnostics.log('ui', '[Main] Keepalive error: ' + error.message);
+        } finally {
+          state.setProcessing(false);
+          ui.setInputDisabled(false);
+        }
+      }, KEEPALIVE_INTERVAL);
     },
   
     sendMessage: async function() {
@@ -4363,7 +4921,20 @@
       messagesBtn.textContent = '0K';
       messagesBtn.onclick = () => this.showContextModal();
   
+      const diagBtn = document.createElement('button');
+      diagBtn.className = 'context-stat-btn';
+      diagBtn.textContent = 'Run API Tests';
+      diagBtn.onclick = () => {
+        const apiDiag = window.module['api-diagnostics.js'];
+        if (apiDiag) {
+          apiDiag.runAllTests();
+        } else {
+          console.error('API diagnostics module not loaded');
+        }
+      };
+  
       contextStats.appendChild(messagesBtn);
+      contextStats.appendChild(diagBtn);
   
       inputContainer.appendChild(contextStats);
   
@@ -4380,6 +4951,11 @@
   
     renderMessages: function(messages) {
       const container = document.getElementById('chat-container');
+  
+      // Preserve loading indicator if it exists
+      const loadingIndicator = document.getElementById('loading-indicator');
+      const loadingHTML = loadingIndicator ? loadingIndicator.outerHTML : null;
+  
       container.innerHTML = '';
   
       // Track which groupIds have been rendered
@@ -4582,6 +5158,11 @@
   
         container.appendChild(messageDiv);
       });
+  
+      // Restore loading indicator if it was present
+      if (loadingHTML) {
+        container.insertAdjacentHTML('beforeend', loadingHTML);
+      }
   
       // Scroll to bottom
       container.scrollTop = container.scrollHeight;
