@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-21T03:22:52.203Z
+// AI Agent - Built 2025-11-21T03:25:06.706Z
 (function() {
   window.module = {};
 
@@ -2564,34 +2564,15 @@
           return;
         }
   
-        diagnostics.log('ui', '[Main] Sending keepalive message');
+        diagnostics.log('ui', '[Main] Sending keepalive ping');
   
-        // Add keepalive message
-        state.addMessage({
-          role: 'user',
-          content: "reply 'K'",
-          fromSystem: true
-        });
-  
-        // Render messages
-        ui.renderMessages(state.getMessages());
-        ui.updateContextStats();
-  
-        // Set processing state
-        state.setProcessing(true);
-        ui.setInputDisabled(true);
-  
-        // Show loading indicator
-        ui.showLoading();
-  
+        // Call API directly with minimal payload - no system prompt, no context
+        const api = window.module['api.js'];
         try {
-          await this.processAIResponse();
+          await api.callAPI([{ role: 'user', content: "reply 'K'" }]);
+          diagnostics.log('ui', '[Main] Keepalive ping successful');
         } catch (error) {
-          ui.hideLoading();
           diagnostics.log('ui', '[Main] Keepalive error: ' + error.message);
-        } finally {
-          state.setProcessing(false);
-          ui.setInputDisabled(false);
         }
       }, KEEPALIVE_INTERVAL);
     },
