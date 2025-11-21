@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-21T22:38:15.158Z
+// AI Agent - Built 2025-11-21T22:52:35.062Z
 (function() {
   window.module = {};
 
@@ -509,7 +509,6 @@
   
     // Simple API call without system prompt - for internal operations like summarization
     callAPISimple: async function(messages, maxRetries = 3) {
-      const diagnostics = window.module['diagnostics.js'];
       const authToken = localStorage.getItem('token');
   
       const requestBody = {
@@ -523,9 +522,6 @@
         background_tasks: { title_generation: false, tags_generation: false }
       };
   
-      const requestBodySize = JSON.stringify(requestBody).length;
-      diagnostics.log('api', 'callAPISimple', { messagesCount: messages.length, requestBodySize });
-  
       const headers = { 'Content-Type': 'application/json' };
       if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
   
@@ -537,7 +533,7 @@
           // Add delay between retries (exponential backoff)
           if (attempt > 0) {
             const delay = Math.min(1000 * Math.pow(2, attempt - 1), 5000);
-            console.log(`[callAPISimple] Retry ${attempt + 1}/${maxRetries} after ${delay}ms delay`);
+            console.log(`[Compaction] Retry ${attempt + 1}/${maxRetries} after ${delay}ms delay`);
             await new Promise(r => setTimeout(r, delay));
           }
   
@@ -551,23 +547,22 @@
   
           if (!response.ok) {
             const errorText = await response.text();
-            console.log(`[callAPISimple] Attempt ${attempt + 1} FAILED (${attemptDuration}s) - Status ${response.status}`);
+            console.log(`[Compaction] Attempt ${attempt + 1} FAILED (${attemptDuration}s) - Status ${response.status}: ${errorText.substring(0, 100)}`);
             attemptTimings.push({ attempt: attempt + 1, duration: attemptDuration, success: false });
             throw new Error(`API request failed (${response.status}): ${errorText}`);
           }
   
           const data = await response.json();
           const responseText = data.choices[0].message.content;
-          console.log(`[callAPISimple] Attempt ${attempt + 1} OK (${attemptDuration}s)`);
+          console.log(`[Compaction] Attempt ${attempt + 1} OK (${attemptDuration}s)`);
           attemptTimings.push({ attempt: attempt + 1, duration: attemptDuration, success: true });
           return { valid: true, text: responseText, attemptTimings };
         } catch (error) {
           const attemptDuration = ((Date.now() - attemptStart) / 1000).toFixed(1);
           if (!attemptTimings.find(t => t.attempt === attempt + 1)) {
-            console.log(`[callAPISimple] Attempt ${attempt + 1} EXCEPTION (${attemptDuration}s)`);
+            console.log(`[Compaction] Attempt ${attempt + 1} EXCEPTION (${attemptDuration}s): ${error.message.substring(0, 100)}`);
             attemptTimings.push({ attempt: attempt + 1, duration: attemptDuration, success: false });
           }
-          diagnostics.log('api', 'callAPISimple error', { attempt: attempt + 1, error: error.message });
           if (attempt >= maxRetries - 1) {
             return { valid: false, error: error.message, attemptTimings };
           }
@@ -3252,7 +3247,6 @@
       const ui = window.module['ui.js'];
   
       console.log('[Compaction] Starting context compaction...');
-      diagnostics.log('compaction', '[Main] ========== COMPACTING CONTEXT ==========');
   
       // Update loading indicator
       ui.showLoading('Compacting');
@@ -3271,17 +3265,15 @@
       }
   
       if (firstRealMessageIndex === -1) {
-        diagnostics.log('compaction', '[Main] No messages to compact');
+        console.log('[Compaction] No messages to compact');
         return;
       }
   
       // Get ALL real (non-uiOnly) messages to summarize
       const messagesToSummarize = messages.filter(m => !m.uiOnly);
   
-      diagnostics.log('compaction', '[Main] Summarizing ALL ' + messagesToSummarize.length + ' messages');
-      diagnostics.log('compaction', '[Main] Current tokens: ' + tokensBefore);
-  
       // Create summarization request
+      const conversationText = messagesToSummarize.map(m => `[${m.role}]: ${m.content}`).join('\n\n');
       const summarizationMessages = [
         {
           role: 'user',
@@ -3293,14 +3285,28 @@
             '4. Any ongoing work or issues\n\n' +
             'Be concise. Focus on actionable context.\n\n' +
             'Conversation:\n\n' +
-            messagesToSummarize.map(m => `[${m.role}]: ${m.content}`).join('\n\n')
+            conversationText
         }
       ];
+  
+      // DETAILED LOGGING
+      console.log('[Compaction] ========== DETAILED DEBUG ==========');
+      console.log('[Compaction] Messages to summarize:', messagesToSummarize.length);
+      console.log('[Compaction] Total conversation chars:', conversationText.length);
+      console.log('[Compaction] First message type:', messagesToSummarize[0]?.role);
+      console.log('[Compaction] First message preview:', JSON.stringify(messagesToSummarize[0]).substring(0, 200));
+      console.log('[Compaction] Last message type:', messagesToSummarize[messagesToSummarize.length - 1]?.role);
+      console.log('[Compaction] Last message preview:', JSON.stringify(messagesToSummarize[messagesToSummarize.length - 1]).substring(0, 200));
   
       try {
         // Call API for summarization (use simple call without system prompt)
         const requestSize = JSON.stringify(summarizationMessages).length;
-        console.log(`[Compaction] Calling API for summarization (${requestSize} chars, ~${Math.round(requestSize/4)} tokens)`);
+        console.log('[Compaction] Request body size:', requestSize, 'chars (~' + Math.round(requestSize/4) + ' tokens)');
+        console.log('[Compaction] Full prompt being sent to API:');
+        console.log('========== PROMPT START ==========');
+        console.log(summarizationMessages[0].content);
+        console.log('========== PROMPT END ==========');
+  
         const response = await api.callAPISimple(summarizationMessages);
   
         if (!response.valid) {
