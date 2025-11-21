@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-21T16:08:51.528Z
+// AI Agent - Built 2025-11-21T16:52:04.561Z
 (function() {
   window.module = {};
 
@@ -7,37 +7,109 @@
   window.module['api-diagnostics.js'] = {
     results: [],
   
-    // Main entry point - tests complexity vs size
+    // Main entry point - tests compaction prompt at various sizes
     runAllTests: async function() {
-      console.log('\n========== API DIAGNOSTICS: Complexity vs Size ==========\n');
-      console.log('Testing if complex requests fail at smaller sizes than simple ones...\n');
+      console.log('\n========== API DIAGNOSTICS: Compaction Prompt Test ==========\n');
+      console.log('Testing compaction-style summarization at increasing sizes...\n');
   
       const api = window.module['api.js'];
       this.results = [];
   
-      // Test all complexity levels at the SAME sizes
-      const sizes = [300000, 350000, 400000, 450000, 500000, 550000, 600000, 650000, 700000, 750000];
-      const complexities = [
-        { key: 'simple', prompt: "Reply with just the letter 'K'. Ignore: " },
-        { key: 'medium', prompt: "Count how many 'x' characters appear in this text: " },
-        { key: 'complex', prompt: "Summarize this conversation in 2-3 sentences:\n" },
-        { key: 'vcomplex', prompt: "Analyze this code, identify bugs, and suggest improvements:\n" },
+      // The actual compaction prompt (hardcoded)
+      const compactionPrompt = `You are summarizing a coding conversation. Create a concise summary that preserves:
+  1. The user's original goal/request
+  2. Key decisions made
+  3. Files modified and why
+  4. Current state/progress
+  5. Any errors encountered and how they were resolved
+  
+  Reply with ONLY the summary, no other text.
+  
+  Here is the conversation to summarize:
+  
+  `;
+  
+      // Test sizes (in chars) - 100 to 30K tokens = 400 to 120000 chars
+      const sizes = [400, 2000, 4000, 8000, 16000, 24000, 32000, 48000, 64000, 80000, 100000, 120000];
+  
+      for (const size of sizes) {
+        const conversation = this.generateCodingConversation(size);
+        const content = compactionPrompt + conversation;
+        const tokens = Math.round(content.length / 4);
+  
+        console.log(`\n[compaction-${tokens}tok] Testing...`);
+  
+        const messages = [{ role: 'user', content }];
+        const startTime = Date.now();
+  
+        try {
+          const response = await api.callAPISimple(messages);
+          const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+          const timings = response.attemptTimings || [];
+          const timingStr = timings.map(t => `${t.success ? '✓' : '✗'}${t.duration}s`).join(', ');
+  
+          if (response.valid) {
+            console.log(`  ✓ OK (total ${duration}s) [${timingStr}] - Summary: "${response.text.substring(0, 80)}..."`);
+            this.results.push({ name: `compaction-${tokens}tok`, tokens, success: true, duration, timings, error: null });
+          } else {
+            console.log(`  ✗ FAILED (total ${duration}s) [${timingStr}] - ${response.error.substring(0, 100)}`);
+            this.results.push({ name: `compaction-${tokens}tok`, tokens, success: false, duration, timings, error: response.error });
+          }
+        } catch (e) {
+          const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+          console.log(`  ✗ EXCEPTION (total ${duration}s) - ${e.message.substring(0, 100)}`);
+          this.results.push({ name: `compaction-${tokens}tok`, tokens, success: false, duration, timings: [], error: e.message });
+        }
+  
+        await this.delay(500);
+      }
+  
+      this.printCompactionSummary();
+    },
+  
+    // Generate realistic coding conversation
+    generateCodingConversation: function(targetLength) {
+      const exchanges = [
+        { user: "Can you help me fix a bug in my authentication code?", assistant: "I'd be happy to help. Could you share the relevant code and describe what's happening?" },
+        { user: "Here's the login function:\nfunction login(user, pass) {\n  const hash = md5(pass);\n  return db.query('SELECT * FROM users WHERE name=' + user);\n}", assistant: "I see a SQL injection vulnerability. Let me fix that by using parameterized queries:\n```javascript\nfunction login(user, pass) {\n  const hash = md5(pass);\n  return db.query('SELECT * FROM users WHERE name = ?', [user]);\n}\n```" },
+        { user: "Thanks! Now I'm getting a timeout error on large queries.", assistant: "Let's add pagination and indexing. First, ensure you have an index on the name column, then modify the query to use LIMIT and OFFSET." },
+        { user: "I also need to add rate limiting to prevent brute force attacks.", assistant: "Good idea. Here's a simple rate limiter using a token bucket algorithm:\n```javascript\nconst rateLimiter = {\n  tokens: 10,\n  lastRefill: Date.now(),\n  refillRate: 1000,\n  check() {\n    const now = Date.now();\n    this.tokens = Math.min(10, this.tokens + (now - this.lastRefill) / this.refillRate);\n    this.lastRefill = now;\n    return this.tokens-- > 0;\n  }\n};\n```" },
+        { user: "The tests are failing now. Here's the error:\nAssertionError: expected 401 to equal 200", assistant: "The rate limiter is blocking test requests. Add a test mode bypass or mock the rate limiter in tests." },
       ];
   
-      // Build test matrix: every complexity at every size
-      const tests = [];
-      for (const size of sizes) {
-        for (const { key, prompt } of complexities) {
-          tests.push({ name: `${key}-${size}`, complexity: key, size, prompt });
+      let conversation = '';
+      let i = 0;
+      while (conversation.length < targetLength) {
+        const ex = exchanges[i % exchanges.length];
+        conversation += `User: ${ex.user}\n\nAssistant: ${ex.assistant}\n\n`;
+        i++;
+      }
+      return conversation.substring(0, targetLength);
+    },
+  
+    printCompactionSummary: function() {
+      console.log('\n========== COMPACTION TEST SUMMARY ==========\n');
+  
+      const passed = this.results.filter(r => r.success);
+      const failed = this.results.filter(r => !r.success);
+  
+      console.log(`Passed: ${passed.length}, Failed: ${failed.length}`);
+  
+      if (passed.length > 0) {
+        const maxSuccess = Math.max(...passed.map(r => r.tokens));
+        console.log(`\nMax successful size: ${maxSuccess} tokens`);
+      }
+  
+      if (failed.length > 0) {
+        const minFail = Math.min(...failed.map(r => r.tokens));
+        console.log(`First failure at: ${minFail} tokens`);
+        console.log('\nFailures:');
+        for (const f of failed) {
+          console.log(`  - ${f.name}: ${f.error?.substring(0, 60)}`);
         }
       }
   
-      for (const test of tests) {
-        await this.runTest(test, api);
-        await this.delay(500); // Pause between tests
-      }
-  
-      this.printSummary();
+      console.log('\n========== END ==========\n');
     },
   
     runTest: async function(test, api) {
@@ -432,7 +504,10 @@
       const headers = { 'Content-Type': 'application/json' };
       if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
   
+      const attemptTimings = [];
+  
       for (let attempt = 0; attempt < maxRetries; attempt++) {
+        const attemptStart = Date.now();
         try {
           // Add delay between retries (exponential backoff)
           if (attempt > 0) {
@@ -447,19 +522,29 @@
             body: JSON.stringify(requestBody)
           });
   
+          const attemptDuration = ((Date.now() - attemptStart) / 1000).toFixed(1);
+  
           if (!response.ok) {
             const errorText = await response.text();
-            console.log(`[callAPISimple] API error (${response.status}): ${errorText.substring(0, 200)}`);
+            console.log(`[callAPISimple] Attempt ${attempt + 1} FAILED (${attemptDuration}s) - Status ${response.status}`);
+            attemptTimings.push({ attempt: attempt + 1, duration: attemptDuration, success: false });
             throw new Error(`API request failed (${response.status}): ${errorText}`);
           }
   
           const data = await response.json();
           const responseText = data.choices[0].message.content;
-          return { valid: true, text: responseText };
+          console.log(`[callAPISimple] Attempt ${attempt + 1} OK (${attemptDuration}s)`);
+          attemptTimings.push({ attempt: attempt + 1, duration: attemptDuration, success: true });
+          return { valid: true, text: responseText, attemptTimings };
         } catch (error) {
+          const attemptDuration = ((Date.now() - attemptStart) / 1000).toFixed(1);
+          if (!attemptTimings.find(t => t.attempt === attempt + 1)) {
+            console.log(`[callAPISimple] Attempt ${attempt + 1} EXCEPTION (${attemptDuration}s)`);
+            attemptTimings.push({ attempt: attempt + 1, duration: attemptDuration, success: false });
+          }
           diagnostics.log('api', 'callAPISimple error', { attempt: attempt + 1, error: error.message });
           if (attempt >= maxRetries - 1) {
-            return { valid: false, error: error.message };
+            return { valid: false, error: error.message, attemptTimings };
           }
         }
       }
