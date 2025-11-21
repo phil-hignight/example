@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-21T04:53:54.846Z
+// AI Agent - Built 2025-11-21T15:13:44.109Z
 (function() {
   window.module = {};
 
@@ -791,6 +791,13 @@
   
       for (let attempt = 0; attempt < maxRetries; attempt++) {
         try {
+          // Add delay between retries (exponential backoff)
+          if (attempt > 0) {
+            const delay = Math.min(1000 * Math.pow(2, attempt - 1), 5000);
+            console.log(`[callAPISimple] Retry ${attempt + 1}/${maxRetries} after ${delay}ms delay`);
+            await new Promise(r => setTimeout(r, delay));
+          }
+  
           const response = await fetch('/api/chat/completions', {
             method: 'POST',
             headers,
@@ -799,6 +806,7 @@
   
           if (!response.ok) {
             const errorText = await response.text();
+            console.log(`[callAPISimple] API error (${response.status}): ${errorText.substring(0, 200)}`);
             throw new Error(`API request failed (${response.status}): ${errorText}`);
           }
   
@@ -807,7 +815,9 @@
           return { valid: true, text: responseText };
         } catch (error) {
           diagnostics.log('api', 'callAPISimple error', { attempt: attempt + 1, error: error.message });
-          if (attempt >= maxRetries - 1) throw error;
+          if (attempt >= maxRetries - 1) {
+            return { valid: false, error: error.message };
+          }
         }
       }
     },
@@ -1171,11 +1181,18 @@
       return { success: true, iterations: iteration };
     },
   
+    // Per-tool token limits
+    toolTokenLimits: {
+      read_file: 2000,           // ~8000 chars, ~200 lines
+      list_directory: 500,       // ~2000 chars
+      search_by_content: 1000,   // ~4000 chars
+      search_by_filename: 500,   // ~2000 chars
+      default: 500
+    },
+  
     // Truncate tool output if it exceeds size limit
-    truncateToolOutput: function(content, toolName, maxTokens = 100) {
-      const diagnostics = window.module['diagnostics.js'];
-      const state = window.module['state.js'];
-      const limit = state.getContextLimit();
+    truncateToolOutput: function(content, toolName) {
+      const maxTokens = this.toolTokenLimits[toolName] || this.toolTokenLimits.default;
       const maxChars = maxTokens * 4; // 4 chars per token estimate
   
       if (content.length <= maxChars) {
@@ -1185,13 +1202,6 @@
       const truncated = content.substring(0, maxChars);
       const remaining = content.length - maxChars;
       const remainingTokens = Math.ceil(remaining / 4);
-  
-      diagnostics.handleError('TOOL_OUTPUT_TOO_LARGE', {
-        toolName,
-        originalSize: content.length,
-        truncatedSize: truncated.length,
-        limit: maxChars
-      });
   
       return truncated + `\n\n[Truncated: ${remainingTokens} more tokens omitted. Use more specific search parameters.]`;
     },
@@ -3535,6 +3545,10 @@
       ];
   
       try {
+        // Add delay before compaction API call to avoid rapid successive requests
+        console.log('[Compaction] Waiting 2s before API call...');
+        await new Promise(r => setTimeout(r, 2000));
+  
         // Call API for summarization (use simple call without system prompt)
         const requestSize = JSON.stringify(summarizationMessages).length;
         console.log(`[Compaction] Calling API for summarization (${requestSize} chars, ~${Math.round(requestSize/4)} tokens)`);
