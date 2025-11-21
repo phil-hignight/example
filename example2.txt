@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-21T15:28:06.566Z
+// AI Agent - Built 2025-11-21T16:01:26.434Z
 (function() {
   window.module = {};
 
@@ -16,7 +16,7 @@
       this.results = [];
   
       // Test all complexity levels at the SAME sizes
-      const sizes = [20000, 31000, 42000, 53000, 64000, 75000, 86000, 97000, 108000, 120000];
+      const sizes = [120000, 140000, 160000, 180000, 200000, 220000, 240000, 260000, 280000, 300000];
       const complexities = [
         { key: 'simple', prompt: "Reply with just the letter 'K'. Ignore: " },
         { key: 'medium', prompt: "Count how many 'x' characters appear in this text: " },
