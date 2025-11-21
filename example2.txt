@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-21T03:30:50.234Z
+// AI Agent - Built 2025-11-21T03:43:49.553Z
 (function() {
   window.module = {};
 
@@ -284,11 +284,15 @@
             console.log(`    ${Math.round(totalSize/1000)}K: OK`);
           } else {
             failError = response.error;
-            console.log(`    ${Math.round(totalSize/1000)}K: FAILED`);
+            console.log(`    ${Math.round(totalSize/1000)}K: FAILED - ${response.error}`);
+            if (this.is500Error(response.error)) {
+              await this.attemptRecovery('Total Context', messages, response.error);
+            }
             break;
           }
         } catch (e) {
           failError = e;
+          console.log(`    ${Math.round(totalSize/1000)}K: EXCEPTION - ${e.message}`);
           break;
         }
   
