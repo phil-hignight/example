@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-21T15:21:04.737Z
+// AI Agent - Built 2025-11-21T15:23:43.915Z
 (function() {
   window.module = {};
 
@@ -15,28 +15,22 @@
       const api = window.module['api.js'];
       this.results = [];
   
-      // Test matrix: complexity levels x sizes
-      const tests = [
-        // SIMPLE: Just reply with a single character (minimal thinking)
-        { name: 'Simple-Small', complexity: 'simple', size: 1000, prompt: "Reply with just the letter 'K'." },
-        { name: 'Simple-Med', complexity: 'simple', size: 10000, prompt: "Reply with just 'K'. Ignore: " },
-        { name: 'Simple-Large', complexity: 'simple', size: 50000, prompt: "Reply with just 'K'. Ignore: " },
-        { name: 'Simple-XL', complexity: 'simple', size: 100000, prompt: "Reply with just 'K'. Ignore: " },
-  
-        // MEDIUM: Count or basic analysis
-        { name: 'Medium-Small', complexity: 'medium', size: 1000, prompt: "Count the words in this text and reply with the number: The quick brown fox jumps." },
-        { name: 'Medium-Med', complexity: 'medium', size: 10000, prompt: "Count how many 'x' characters appear in this text: " },
-        { name: 'Medium-Large', complexity: 'medium', size: 50000, prompt: "Count how many 'x' characters appear in this text: " },
-  
-        // COMPLEX: Summarization (like compaction does)
-        { name: 'Complex-Small', complexity: 'complex', size: 1000, prompt: "Summarize this conversation:\nUser: Hello\nAssistant: Hi there!\nUser: How are you?\nAssistant: I'm good!" },
-        { name: 'Complex-Med', complexity: 'complex', size: 5000, prompt: "Summarize this conversation in 2-3 sentences:\n" },
-        { name: 'Complex-Large', complexity: 'complex', size: 20000, prompt: "Summarize this conversation in 2-3 sentences:\n" },
-  
-        // VERY COMPLEX: Multi-step reasoning
-        { name: 'VeryComplex-Small', complexity: 'vcomplex', size: 500, prompt: "Analyze this code and explain what it does, identify any bugs, and suggest improvements:\nfunction add(a,b) { return a + b; }" },
-        { name: 'VeryComplex-Med', complexity: 'vcomplex', size: 5000, prompt: "Analyze this code and explain what it does, identify any bugs, and suggest improvements:\n" },
+      // Test all complexity levels at the SAME sizes
+      const sizes = [1000, 5000, 10000, 20000];
+      const complexities = [
+        { key: 'simple', prompt: "Reply with just the letter 'K'. Ignore: " },
+        { key: 'medium', prompt: "Count how many 'x' characters appear in this text: " },
+        { key: 'complex', prompt: "Summarize this conversation in 2-3 sentences:\n" },
+        { key: 'vcomplex', prompt: "Analyze this code, identify bugs, and suggest improvements:\n" },
       ];
+  
+      // Build test matrix: every complexity at every size
+      const tests = [];
+      for (const size of sizes) {
+        for (const { key, prompt } of complexities) {
+          tests.push({ name: `${key}-${size}`, complexity: key, size, prompt });
+        }
+      }
   
       for (const test of tests) {
         await this.runTest(test, api);
