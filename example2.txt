@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-21T03:25:06.706Z
+// AI Agent - Built 2025-11-21T03:30:50.234Z
 (function() {
   window.module = {};
 
@@ -9,48 +9,29 @@
   
     // Main entry point - runs all diagnostic tests
     runAllTests: async function() {
-      const diagnostics = window.module['diagnostics.js'];
       console.log('\n========== API DIAGNOSTICS STARTED ==========\n');
   
       this.results = [];
   
-      // Test 1: Basic connectivity
-      await this.testBasicConnectivity();
-  
-      // Test 2: Message size limits (larger volumes)
+      // Test 1: Message size limits
       await this.testMessageSizeLimits();
   
-      // Test 3: Conversation length limits (more messages)
+      // Test 2: Conversation length limits
       await this.testConversationLengthLimits();
   
-      // Test 4: Rapid requests (rate limiting)
+      // Test 3: Rapid requests (rate limiting)
       await this.testRapidRequests();
   
-      // Test 5: Large system prompt
-      await this.testLargeSystemPrompt();
-  
-      // Test 6: Many tool results in context
+      // Test 4: Many tool results in context
       await this.testManyToolResults();
   
-      // Test 7: Special characters / encoding issues
-      await this.testSpecialCharacters();
-  
-      // Test 8: Total context size (combined message + system prompt)
+      // Test 5: Total context size (combined messages)
       await this.testTotalContextSize();
   
-      // Test 9: Deep nesting / complex JSON in messages
-      await this.testComplexStructures();
-  
-      // Test 10: Alternating user/assistant pattern breaks
-      await this.testMessagePatterns();
-  
-      // Test 11: Empty and whitespace content
-      await this.testEdgeCaseContent();
-  
-      // Test 12: Very long single lines
+      // Test 6: Very long single lines
       await this.testLongLines();
   
-      // Test 13: Burst then sustained requests
+      // Test 7: Burst then sustained requests
       await this.testBurstSustained();
   
       // Print summary
@@ -84,57 +65,34 @@
              errStr.includes('Open WebUI');
     },
   
-    // Test 1: Basic connectivity
-    testBasicConnectivity: async function() {
-      console.log('\n--- Test 1: Basic Connectivity ---');
-  
-      try {
-        const api = window.module['api.js'];
-        const messages = [{ role: 'user', content: "reply 'K'" }];
-        const response = await api.callAPI(messages);
-  
-        if (response.valid) {
-          this.logResult('Basic Connectivity', true, 'Simple request succeeded');
-        } else {
-          this.logResult('Basic Connectivity', false, 'Request failed: ' + response.error, response.error);
-          if (this.is500Error(response.error)) {
-            console.log('  >>> 500 ERROR DETECTED on basic request! API may be down.');
-          }
-        }
-      } catch (e) {
-        this.logResult('Basic Connectivity', false, 'Exception thrown', e);
-      }
-    },
-  
-    // Test 2: Message size limits - exponential growth until failure
+    // Test 1: Message size limits - start at 512K, go up to 4MB
     testMessageSizeLimits: async function() {
-      console.log('\n--- Test 2: Message Size Limits ---');
+      console.log('\n--- Test 1: Message Size Limits ---');
   
       const api = window.module['api.js'];
-      const sizes = [64000, 128000, 192000, 256000, 384000, 512000];
+      // 12 rungs: 512K to 4MB
+      const sizes = [512000, 640000, 768000, 896000, 1024000, 1280000, 1536000, 1792000, 2048000, 2560000, 3072000, 4096000];
       let lastSuccessSize = 0;
       let firstFailSize = null;
       let failError = null;
   
       for (const size of sizes) {
-        const content = "reply 'K'. Ignore this padding: " + 'x'.repeat(size);
+        const content = "reply 'K'. Ignore: " + 'x'.repeat(size);
         const messages = [{ role: 'user', content }];
   
-        console.log(`  Testing message size: ${size} chars...`);
+        console.log(`  Testing ${Math.round(size/1000)}K chars...`);
   
         try {
           const response = await api.callAPI(messages);
   
           if (response.valid) {
             lastSuccessSize = size;
-            console.log(`    Size ${size}: OK`);
+            console.log(`    ${Math.round(size/1000)}K: OK`);
           } else {
             firstFailSize = size;
             failError = response.error;
-            console.log(`    Size ${size}: FAILED - ${response.error}`);
-  
+            console.log(`    ${Math.round(size/1000)}K: FAILED`);
             if (this.is500Error(response.error)) {
-              console.log(`  >>> 500 ERROR at size ${size}!`);
               await this.attemptRecovery('Message Size', messages, response.error);
             }
             break;
@@ -142,56 +100,52 @@
         } catch (e) {
           firstFailSize = size;
           failError = e;
-          console.log(`    Size ${size}: EXCEPTION - ${e.message}`);
           break;
         }
   
-        // Small delay between tests
         await this.delay(500);
       }
   
       this.logResult('Message Size Limits',
         firstFailSize === null,
-        `Last success: ${lastSuccessSize} chars, First fail: ${firstFailSize || 'none'}`,
+        `Last success: ${Math.round(lastSuccessSize/1000)}K, First fail: ${firstFailSize ? Math.round(firstFailSize/1000)+'K' : 'none'}`,
         failError);
     },
   
-    // Test 3: Conversation length limits
+    // Test 2: Conversation length - start at 80, go up to 1000 messages
     testConversationLengthLimits: async function() {
-      console.log('\n--- Test 3: Conversation Length Limits ---');
+      console.log('\n--- Test 2: Conversation Length Limits ---');
   
       const api = window.module['api.js'];
-      const counts = [5, 10, 20, 40, 80];
+      // 12 rungs: 80 to 1000 messages
+      const counts = [80, 120, 160, 200, 250, 300, 400, 500, 600, 700, 850, 1000];
       let lastSuccessCount = 0;
       let firstFailCount = null;
       let failError = null;
   
       for (const count of counts) {
-        // Build conversation with alternating user/assistant messages
         const messages = [];
         for (let i = 0; i < count; i++) {
           messages.push({
             role: i % 2 === 0 ? 'user' : 'assistant',
-            content: `Message ${i}: This is a test message with some content.`
+            content: `Msg ${i}: Test content here.`
           });
         }
         messages.push({ role: 'user', content: "reply 'K'" });
   
-        console.log(`  Testing conversation with ${count} messages...`);
+        console.log(`  Testing ${count} messages...`);
   
         try {
           const response = await api.callAPI(messages);
   
           if (response.valid) {
             lastSuccessCount = count;
-            console.log(`    ${count} messages: OK`);
+            console.log(`    ${count} msgs: OK`);
           } else {
             firstFailCount = count;
             failError = response.error;
-            console.log(`    ${count} messages: FAILED - ${response.error}`);
-  
+            console.log(`    ${count} msgs: FAILED`);
             if (this.is500Error(response.error)) {
-              console.log(`  >>> 500 ERROR at ${count} messages!`);
               await this.attemptRecovery('Conversation Length', messages, response.error);
             }
             break;
@@ -199,7 +153,6 @@
         } catch (e) {
           firstFailCount = count;
           failError = e;
-          console.log(`    ${count} messages: EXCEPTION - ${e.message}`);
           break;
         }
   
@@ -212,36 +165,31 @@
         failError);
     },
   
-    // Test 4: Rapid requests (rate limiting)
+    // Test 3: Rapid requests - increase burst size
     testRapidRequests: async function() {
-      console.log('\n--- Test 4: Rapid Requests (Rate Limiting) ---');
+      console.log('\n--- Test 3: Rapid Requests ---');
   
       const api = window.module['api.js'];
       const messages = [{ role: 'user', content: "reply 'K'" }];
+  
+      // Burst: 10 rapid requests
+      console.log('  Sending 10 rapid parallel requests...');
+      const promises = [];
+      for (let i = 0; i < 10; i++) {
+        promises.push(api.callAPI(messages));
+      }
+  
       let successCount = 0;
       let failCount = 0;
       let firstError = null;
   
-      console.log('  Sending 5 rapid requests...');
-  
-      const promises = [];
-      for (let i = 0; i < 5; i++) {
-        promises.push(api.callAPI(messages));
-      }
-  
       try {
         const results = await Promise.all(promises);
-  
-        for (let i = 0; i < results.length; i++) {
-          if (results[i].valid) {
-            successCount++;
-          } else {
+        for (const r of results) {
+          if (r.valid) successCount++;
+          else {
             failCount++;
-            if (!firstError) firstError = results[i].error;
-  
-            if (this.is500Error(results[i].error)) {
-              console.log(`  >>> 500 ERROR on rapid request ${i + 1}!`);
-            }
+            if (!firstError) firstError = r.error;
           }
         }
       } catch (e) {
@@ -251,104 +199,44 @@
   
       this.logResult('Rapid Requests',
         failCount === 0,
-        `${successCount}/5 succeeded, ${failCount} failed`,
+        `${successCount}/10 succeeded, ${failCount} failed`,
         firstError);
     },
   
-    // Test 5: Large system prompt
-    testLargeSystemPrompt: async function() {
-      console.log('\n--- Test 5: Large System Prompt ---');
-  
-      const api = window.module['api.js'];
-      const tools = window.module['tools.js'];
-  
-      // Get current system prompt size
-      const currentPrompt = tools.getSystemPrompt();
-      console.log(`  Current system prompt size: ${currentPrompt.length} chars`);
-  
-      // Test with artificially large system prompt by adding padding to first message
-      const sizes = [1000, 5000, 10000, 20000];
-      let lastSuccessSize = 0;
-      let failError = null;
-  
-      for (const size of sizes) {
-        const padding = '\n[System context padding: ' + 'y'.repeat(size) + ']';
-        const messages = [
-          { role: 'user', content: padding + "\n\nreply 'K'" }
-        ];
-  
-        console.log(`  Testing with ${size} chars extra context...`);
-  
-        try {
-          const response = await api.callAPI(messages);
-  
-          if (response.valid) {
-            lastSuccessSize = size;
-            console.log(`    ${size} chars extra: OK`);
-          } else {
-            failError = response.error;
-            console.log(`    ${size} chars extra: FAILED - ${response.error}`);
-  
-            if (this.is500Error(response.error)) {
-              console.log(`  >>> 500 ERROR with ${size} chars system padding!`);
-              await this.attemptRecovery('Large System Prompt', messages, response.error);
-            }
-            break;
-          }
-        } catch (e) {
-          failError = e;
-          break;
-        }
-  
-        await this.delay(500);
-      }
-  
-      this.logResult('Large System Prompt',
-        failError === null,
-        `Last success: ${lastSuccessSize} chars extra`,
-        failError);
-    },
-  
-    // Test 6: Many tool results in context
+    // Test 4: Many tool results - start at 50, go up to 500
     testManyToolResults: async function() {
-      console.log('\n--- Test 6: Many Tool Results ---');
+      console.log('\n--- Test 4: Many Tool Results ---');
   
       const api = window.module['api.js'];
-      const counts = [5, 10, 20, 50];
+      // 10 rungs: 50 to 500
+      const counts = [50, 75, 100, 125, 150, 200, 250, 300, 400, 500];
       let lastSuccessCount = 0;
       let failError = null;
   
       for (const count of counts) {
-        // Simulate tool results in conversation
         const messages = [];
         for (let i = 0; i < count; i++) {
           messages.push({
             role: 'user',
-            content: `[Tool Result ${i}] list_directory: file1.js, file2.js, file3.js, folder1/, folder2/`
+            content: `[Tool ${i}] list_directory: file1.js, file2.js, folder1/`
           });
           messages.push({
             role: 'assistant',
-            content: `I see the directory listing ${i}.`
+            content: `Listing ${i} done.`
           });
         }
         messages.push({ role: 'user', content: "reply 'K'" });
   
-        console.log(`  Testing with ${count} tool results...`);
+        console.log(`  Testing ${count} tool results...`);
   
         try {
           const response = await api.callAPI(messages);
-  
           if (response.valid) {
             lastSuccessCount = count;
-            console.log(`    ${count} tool results: OK`);
+            console.log(`    ${count}: OK`);
           } else {
             failError = response.error;
-            console.log(`    ${count} tool results: FAILED - ${response.error}`);
-  
-            if (this.is500Error(response.error)) {
-              console.log(`  >>> 500 ERROR with ${count} tool results!`);
-              await this.attemptRecovery('Many Tool Results', messages, response.error);
-            }
+            console.log(`    ${count}: FAILED`);
             break;
           }
         } catch (e) {
@@ -365,66 +253,20 @@
         failError);
     },
   
-    // Test 7: Special characters / encoding
-    testSpecialCharacters: async function() {
-      console.log('\n--- Test 7: Special Characters ---');
-  
-      const api = window.module['api.js'];
-      const testCases = [
-        { name: 'Unicode emoji', content: "reply 'K'. Test: \ud83d\ude00\ud83d\ude01\ud83d\ude02" },
-        { name: 'Newlines', content: "reply 'K'.\n\n\n\nMultiple\n\nnewlines" },
-        { name: 'Tabs', content: "reply 'K'.\t\t\tTabs\there" },
-        { name: 'JSON-like', content: 'reply \'K\'. {"test": "value", "nested": {"a": 1}}' },
-        { name: 'Backticks', content: "reply 'K'. ```code block```" },
-        { name: 'Quotes', content: 'reply \'K\'. "double" and \'single\' quotes' },
-        { name: 'Backslashes', content: "reply 'K'. Path: C:\\Users\\test\\file.txt" },
-      ];
-  
-      let failures = [];
-  
-      for (const test of testCases) {
-        const messages = [{ role: 'user', content: test.content }];
-  
-        try {
-          const response = await api.callAPI(messages);
-  
-          if (response.valid) {
-            console.log(`  ${test.name}: OK`);
-          } else {
-            console.log(`  ${test.name}: FAILED - ${response.error}`);
-            failures.push(test.name);
-  
-            if (this.is500Error(response.error)) {
-              console.log(`  >>> 500 ERROR with ${test.name}!`);
-            }
-          }
-        } catch (e) {
-          console.log(`  ${test.name}: EXCEPTION - ${e.message}`);
-          failures.push(test.name);
-        }
-  
-        await this.delay(300);
-      }
-  
-      this.logResult('Special Characters',
-        failures.length === 0,
-        failures.length === 0 ? 'All passed' : `Failed: ${failures.join(', ')}`);
-    },
-  
-    // Test 8: Total context size (combined large message + conversation)
+    // Test 5: Total context size - start at 100K, go up to 2MB
     testTotalContextSize: async function() {
-      console.log('\n--- Test 8: Total Context Size ---');
+      console.log('\n--- Test 5: Total Context Size ---');
   
       const api = window.module['api.js'];
-      const sizes = [10000, 25000, 50000, 75000, 100000];
+      // 12 rungs: 100K to 2MB total across multiple messages
+      const sizes = [100000, 150000, 200000, 300000, 400000, 500000, 750000, 1000000, 1250000, 1500000, 1750000, 2000000];
       let lastSuccessSize = 0;
       let failError = null;
   
       for (const size of sizes) {
-        // Build conversation with total size approaching target
         const messages = [];
-        const msgSize = Math.floor(size / 5);
-        for (let i = 0; i < 4; i++) {
+        const msgSize = Math.floor(size / 10);
+        for (let i = 0; i < 9; i++) {
           messages.push({
             role: i % 2 === 0 ? 'user' : 'assistant',
             content: `Msg ${i}: ${'z'.repeat(msgSize)}`
@@ -433,7 +275,7 @@
         messages.push({ role: 'user', content: "reply 'K'" });
   
         const totalSize = messages.reduce((sum, m) => sum + m.content.length, 0);
-        console.log(`  Testing total context ~${Math.round(totalSize/1000)}K chars...`);
+        console.log(`  Testing ~${Math.round(totalSize/1000)}K total context...`);
   
         try {
           const response = await api.callAPI(messages);
@@ -443,146 +285,29 @@
           } else {
             failError = response.error;
             console.log(`    ${Math.round(totalSize/1000)}K: FAILED`);
-            if (this.is500Error(response.error)) {
-              console.log(`  >>> 500 ERROR at ${Math.round(totalSize/1000)}K total context!`);
-            }
             break;
           }
         } catch (e) {
           failError = e;
           break;
         }
+  
         await this.delay(500);
       }
   
-      this.logResult('Total Context Size', failError === null,
-        `Last success: ${Math.round(lastSuccessSize/1000)}K chars`, failError);
+      this.logResult('Total Context Size',
+        failError === null,
+        `Last success: ${Math.round(lastSuccessSize/1000)}K chars`,
+        failError);
     },
   
-    // Test 9: Deep nesting / complex JSON in messages
-    testComplexStructures: async function() {
-      console.log('\n--- Test 9: Complex Structures ---');
-  
-      const api = window.module['api.js'];
-      const tests = [
-        { name: 'Deep array', content: JSON.stringify([[[[[[['deep']]]]]]]) },
-        { name: 'Deep object', content: JSON.stringify({a:{b:{c:{d:{e:{f:'deep'}}}}}}) },
-        { name: 'Large array', content: JSON.stringify(Array(100).fill({x:1,y:2})) },
-        { name: 'Mixed nesting', content: JSON.stringify({arr:[{nested:[1,2,{deep:true}]}]}) }
-      ];
-  
-      let failures = [];
-      for (const test of tests) {
-        const messages = [{ role: 'user', content: `reply 'K'. Data: ${test.content}` }];
-        try {
-          const response = await api.callAPI(messages);
-          if (response.valid) {
-            console.log(`  ${test.name}: OK`);
-          } else {
-            console.log(`  ${test.name}: FAILED`);
-            failures.push(test.name);
-          }
-        } catch (e) {
-          failures.push(test.name);
-        }
-        await this.delay(300);
-      }
-  
-      this.logResult('Complex Structures', failures.length === 0,
-        failures.length === 0 ? 'All passed' : `Failed: ${failures.join(', ')}`);
-    },
-  
-    // Test 10: Message pattern variations
-    testMessagePatterns: async function() {
-      console.log('\n--- Test 10: Message Patterns ---');
-  
-      const api = window.module['api.js'];
-      const patterns = [
-        { name: 'Double user', messages: [
-          { role: 'user', content: 'first' },
-          { role: 'user', content: "reply 'K'" }
-        ]},
-        { name: 'Double assistant', messages: [
-          { role: 'user', content: 'hi' },
-          { role: 'assistant', content: 'hello' },
-          { role: 'assistant', content: 'there' },
-          { role: 'user', content: "reply 'K'" }
-        ]},
-        { name: 'Start with assistant', messages: [
-          { role: 'assistant', content: 'I start' },
-          { role: 'user', content: "reply 'K'" }
-        ]}
-      ];
-  
-      let failures = [];
-      for (const p of patterns) {
-        try {
-          const response = await api.callAPI(p.messages);
-          if (response.valid) {
-            console.log(`  ${p.name}: OK`);
-          } else {
-            console.log(`  ${p.name}: FAILED - ${response.error}`);
-            failures.push(p.name);
-          }
-        } catch (e) {
-          failures.push(p.name);
-        }
-        await this.delay(300);
-      }
-  
-      this.logResult('Message Patterns', failures.length === 0,
-        failures.length === 0 ? 'All passed' : `Failed: ${failures.join(', ')}`);
-    },
-  
-    // Test 11: Empty and whitespace content
-    testEdgeCaseContent: async function() {
-      console.log('\n--- Test 11: Edge Case Content ---');
-  
-      const api = window.module['api.js'];
-      const cases = [
-        { name: 'Empty after valid', messages: [
-          { role: 'user', content: 'hi' },
-          { role: 'assistant', content: '' },
-          { role: 'user', content: "reply 'K'" }
-        ]},
-        { name: 'Whitespace only', messages: [
-          { role: 'user', content: '   \n\t  ' },
-          { role: 'assistant', content: 'ok' },
-          { role: 'user', content: "reply 'K'" }
-        ]},
-        { name: 'Null-like strings', messages: [
-          { role: 'user', content: 'null undefined NaN' },
-          { role: 'assistant', content: 'ok' },
-          { role: 'user', content: "reply 'K'" }
-        ]}
-      ];
-  
-      let failures = [];
-      for (const c of cases) {
-        try {
-          const response = await api.callAPI(c.messages);
-          if (response.valid) {
-            console.log(`  ${c.name}: OK`);
-          } else {
-            console.log(`  ${c.name}: FAILED`);
-            failures.push(c.name);
-          }
-        } catch (e) {
-          failures.push(c.name);
-        }
-        await this.delay(300);
-      }
-  
-      this.logResult('Edge Case Content', failures.length === 0,
-        failures.length === 0 ? 'All passed' : `Failed: ${failures.join(', ')}`);
-    },
-  
-    // Test 12: Very long single lines (no newlines)
+    // Test 6: Long single lines - start at 50K, go up to 1MB
     testLongLines: async function() {
-      console.log('\n--- Test 12: Long Lines ---');
+      console.log('\n--- Test 6: Long Lines (no newlines) ---');
   
       const api = window.module['api.js'];
-      const lengths = [1000, 5000, 10000, 20000, 50000];
+      // 10 rungs: 50K to 1MB single line
+      const lengths = [50000, 75000, 100000, 150000, 200000, 300000, 400000, 500000, 750000, 1000000];
       let lastSuccess = 0;
       let failError = null;
   
@@ -590,164 +315,120 @@
         const content = "reply 'K'. " + 'a'.repeat(len);
         const messages = [{ role: 'user', content }];
   
-        console.log(`  Testing ${len} char single line...`);
+        console.log(`  Testing ${Math.round(len/1000)}K char single line...`);
         try {
           const response = await api.callAPI(messages);
           if (response.valid) {
             lastSuccess = len;
-            console.log(`    ${len}: OK`);
+            console.log(`    ${Math.round(len/1000)}K: OK`);
           } else {
             failError = response.error;
-            console.log(`    ${len}: FAILED`);
+            console.log(`    ${Math.round(len/1000)}K: FAILED`);
             break;
           }
         } catch (e) {
           failError = e;
           break;
         }
+  
         await this.delay(300);
       }
   
-      this.logResult('Long Lines', failError === null,
-        `Last success: ${lastSuccess} chars`, failError);
+      this.logResult('Long Lines',
+        failError === null,
+        `Last success: ${Math.round(lastSuccess/1000)}K chars`,
+        failError);
     },
   
-    // Test 13: Burst then sustained requests
+    // Test 7: Burst then sustained
     testBurstSustained: async function() {
-      console.log('\n--- Test 13: Burst Then Sustained ---');
+      console.log('\n--- Test 7: Burst Then Sustained ---');
   
       const api = window.module['api.js'];
       const messages = [{ role: 'user', content: "reply 'K'" }];
   
-      // Burst: 3 rapid requests
-      console.log('  Burst phase: 3 rapid requests...');
-      const burstPromises = [api.callAPI(messages), api.callAPI(messages), api.callAPI(messages)];
+      // Burst: 5 rapid requests
+      console.log('  Burst: 5 rapid requests...');
+      const burstPromises = [];
+      for (let i = 0; i < 5; i++) burstPromises.push(api.callAPI(messages));
       const burstResults = await Promise.all(burstPromises);
       const burstSuccess = burstResults.filter(r => r.valid).length;
-      console.log(`    Burst: ${burstSuccess}/3 succeeded`);
+      console.log(`    Burst: ${burstSuccess}/5`);
   
-      // Sustained: 5 requests with 1s delay
-      console.log('  Sustained phase: 5 requests @ 1s intervals...');
+      // Sustained: 10 requests @ 500ms intervals
+      console.log('  Sustained: 10 requests @ 500ms...');
       let sustainedSuccess = 0;
-      for (let i = 0; i < 5; i++) {
-        await this.delay(1000);
+      for (let i = 0; i < 10; i++) {
+        await this.delay(500);
         try {
           const response = await api.callAPI(messages);
           if (response.valid) sustainedSuccess++;
         } catch (e) {}
       }
-      console.log(`    Sustained: ${sustainedSuccess}/5 succeeded`);
+      console.log(`    Sustained: ${sustainedSuccess}/10`);
   
       this.logResult('Burst Then Sustained',
-        burstSuccess >= 2 && sustainedSuccess >= 4,
-        `Burst: ${burstSuccess}/3, Sustained: ${sustainedSuccess}/5`);
+        burstSuccess >= 3 && sustainedSuccess >= 8,
+        `Burst: ${burstSuccess}/5, Sustained: ${sustainedSuccess}/10`);
     },
   
     // Recovery attempts when 500 error is detected
     attemptRecovery: async function(context, originalMessages, originalError) {
-      console.log('\n  --- Attempting Recovery Strategies ---');
+      console.log('\n  --- Attempting Recovery ---');
   
       const api = window.module['api.js'];
   
-      // Strategy 1: Simple retry (3 times)
-      console.log('  Strategy 1: Simple retry...');
+      // Strategy 1: Retry 3x with increasing delays
       for (let i = 0; i < 3; i++) {
-        await this.delay(1000 * (i + 1)); // Increasing delay
+        await this.delay(1000 * (i + 1));
         try {
           const response = await api.callAPI(originalMessages);
           if (response.valid) {
-            console.log(`    Retry ${i + 1}: SUCCESS! Issue may be transient.`);
+            console.log(`    Retry ${i + 1}: SUCCESS`);
             return { strategy: 'retry', attempt: i + 1 };
-          } else {
-            console.log(`    Retry ${i + 1}: Still failing - ${response.error}`);
           }
-        } catch (e) {
-          console.log(`    Retry ${i + 1}: Exception - ${e.message}`);
-        }
+        } catch (e) {}
       }
   
-      // Strategy 2: Reduce message count by half
-      if (originalMessages.length > 2) {
-        console.log('  Strategy 2: Reduce messages by half...');
-        const reducedMessages = originalMessages.slice(-Math.ceil(originalMessages.length / 2));
-        try {
-          const response = await api.callAPI(reducedMessages);
-          if (response.valid) {
-            console.log(`    Reduced to ${reducedMessages.length} messages: SUCCESS!`);
-            console.log(`    >>> FINDING: Context size may be the issue`);
-            return { strategy: 'reduce_messages', newCount: reducedMessages.length };
-          } else {
-            console.log(`    Reduced messages: Still failing`);
-          }
-        } catch (e) {
-          console.log(`    Reduced messages: Exception`);
-        }
-      }
-  
-      // Strategy 3: Simplify to minimal request
-      console.log('  Strategy 3: Minimal request...');
+      // Strategy 2: Minimal request
       const minimalMessages = [{ role: 'user', content: "reply 'K'" }];
       try {
         const response = await api.callAPI(minimalMessages);
         if (response.valid) {
-          console.log(`    Minimal request: SUCCESS!`);
-          console.log(`    >>> FINDING: Something in the original request is causing the issue`);
+          console.log(`    Minimal request: SUCCESS - original request too large`);
           return { strategy: 'minimal', success: true };
         } else {
-          console.log(`    Minimal request: FAILED - ${response.error}`);
-          console.log(`    >>> FINDING: API may be completely down or rejecting all requests`);
-          return { strategy: 'minimal', success: false };
+          console.log(`    Minimal request: FAILED - API may be down`);
         }
-      } catch (e) {
-        console.log(`    Minimal request: Exception - ${e.message}`);
-        return { strategy: 'minimal', success: false };
-      }
+      } catch (e) {}
+  
+      return { strategy: 'failed' };
     },
   
-    // Print summary of all tests
+    // Print summary
     printSummary: function() {
-      console.log('\n========== API DIAGNOSTICS SUMMARY ==========\n');
+      console.log('\n========== SUMMARY ==========\n');
   
       let passCount = 0;
       let failCount = 0;
-      const failures = [];
   
       for (const result of this.results) {
-        if (result.success) {
-          passCount++;
-        } else {
-          failCount++;
-          failures.push(result);
-        }
+        if (result.success) passCount++;
+        else failCount++;
       }
   
       console.log(`Total: ${passCount} passed, ${failCount} failed\n`);
   
-      if (failures.length > 0) {
+      if (failCount > 0) {
         console.log('Failed tests:');
-        for (const f of failures) {
+        for (const f of this.results.filter(r => !r.success)) {
           console.log(`  - ${f.test}: ${f.details}`);
-          if (f.error) {
-            console.log(`    Error: ${f.error}`);
-          }
         }
       }
   
-      // Check for 500 errors specifically
-      const has500 = this.results.some(r => r.error && this.is500Error(r.error));
-      if (has500) {
-        console.log('\n>>> 500 ERRORS DETECTED - Potential causes:');
-        console.log('  1. API server overloaded');
-        console.log('  2. Request too large for server buffer');
-        console.log('  3. Rate limiting (too many requests)');
-        console.log('  4. Malformed request body');
-        console.log('  5. Server-side timeout');
-      }
-  
-      console.log('\n========== END DIAGNOSTICS ==========\n');
+      console.log('\n========== END ==========\n');
     },
   
-    // Utility: delay
     delay: function(ms) {
       return new Promise(resolve => setTimeout(resolve, ms));
     }
