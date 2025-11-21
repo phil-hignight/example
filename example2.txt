@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-21T04:19:40.251Z
+// AI Agent - Built 2025-11-21T04:53:54.846Z
 (function() {
   window.module = {};
 
@@ -767,6 +767,51 @@
       };
     },
   
+    // Simple API call without system prompt - for internal operations like summarization
+    callAPISimple: async function(messages, maxRetries = 3) {
+      const diagnostics = window.module['diagnostics.js'];
+      const authToken = localStorage.getItem('token');
+  
+      const requestBody = {
+        stream: false,
+        model: 'Anthropic Claude 4 Sonnet',
+        messages: messages,
+        params: {},
+        features: { web_search: false },
+        session_id: 'session-' + Math.random().toString(36).substr(2, 9),
+        id: 'msg-' + Date.now() + '-simple',
+        background_tasks: { title_generation: false, tags_generation: false }
+      };
+  
+      const requestBodySize = JSON.stringify(requestBody).length;
+      diagnostics.log('api', 'callAPISimple', { messagesCount: messages.length, requestBodySize });
+  
+      const headers = { 'Content-Type': 'application/json' };
+      if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
+  
+      for (let attempt = 0; attempt < maxRetries; attempt++) {
+        try {
+          const response = await fetch('/api/chat/completions', {
+            method: 'POST',
+            headers,
+            body: JSON.stringify(requestBody)
+          });
+  
+          if (!response.ok) {
+            const errorText = await response.text();
+            throw new Error(`API request failed (${response.status}): ${errorText}`);
+          }
+  
+          const data = await response.json();
+          const responseText = data.choices[0].message.content;
+          return { valid: true, text: responseText };
+        } catch (error) {
+          diagnostics.log('api', 'callAPISimple error', { attempt: attempt + 1, error: error.message });
+          if (attempt >= maxRetries - 1) throw error;
+        }
+      }
+    },
+  
     callAPI: async function(messages, maxRetries = 3) {
       const diagnostics = window.module['diagnostics.js'];
       const authToken = localStorage.getItem('token');
@@ -975,7 +1020,7 @@
       const diagnostics = window.module['diagnostics.js'];
       const api = window.module['api.js'];
       const {
-        onLoading = () => {},
+        onLoading = (text) => {},
         onHideLoading = () => {},
         onRenderMessages = () => {},
         onUpdateStats = () => {},
@@ -1099,7 +1144,7 @@
           onUpdateStats();
   
           // Show loading before executing tools
-          onLoading();
+          onLoading('Running');
   
           // Execute all tools
           await this.executeTools(parsedResponse.tool_uses, selectedDirectory, addMessage, onRenderMessages);
@@ -1163,7 +1208,9 @@
             content: `list_directory ${JSON.stringify(toolUse.input)}`
           });
   
+          const startTime = performance.now();
           const result = await this.executeListDirectory(toolUse.input.path, selectedDirectory);
+          const durationMs = Math.round(performance.now() - startTime);
   
           if (result.success) {
             // Count entries
@@ -1177,7 +1224,8 @@
               toolName: 'list_directory',
               summary: `Listed ${total} items (${dirCount} folders, ${fileCount} files)`,
               fullResult: result.output,
-              content: `Tool result for list_directory("${toolUse.input.path}"):\n\n${result.output}`
+              content: `Tool result for list_directory("${toolUse.input.path}"):\n\n${result.output}`,
+              durationMs
             });
           } else {
             addMessage({
@@ -1185,7 +1233,8 @@
               toolName: 'list_directory',
               summary: `Error: ${result.error}`,
               error: true,
-              content: `Tool error for list_directory("${toolUse.input.path}"): ${result.error}`
+              content: `Tool error for list_directory("${toolUse.input.path}"): ${result.error}`,
+              durationMs
             });
           }
         } else if (toolUse.name === 'read_file') {
@@ -1197,20 +1246,47 @@
             content: `read_file ${JSON.stringify(toolUse.input)}`
           });
   
+          const startTime = performance.now();
           const result = await this.executeReadFile(toolUse.input.path, selectedDirectory);
+          const durationMs = Math.round(performance.now() - startTime);
   
           if (result.success) {
-            const lineCount = result.content.split('\n').length;
-            const truncatedContent = this.truncateToolOutput(result.content, 'read_file');
-            const wasTruncated = truncatedContent.length < result.content.length;
+            const allLines = result.content.split('\n');
+            const totalLines = allLines.length;
+  
+            // Apply offset/limit if provided
+            const offset = toolUse.input.offset || 1;
+            const limit = toolUse.input.limit || totalLines;
+            const startLine = Math.max(1, offset) - 1; // Convert to 0-based
+            const endLine = Math.min(startLine + limit, totalLines);
+            const selectedLines = allLines.slice(startLine, endLine);
+            const selectedContent = selectedLines.join('\n');
+  
+            // Add line numbers
+            const numberedContent = selectedLines.map((line, i) => `${startLine + i + 1}: ${line}`).join('\n');
+  
+            const truncatedContent = this.truncateToolOutput(numberedContent, 'read_file');
+            const wasTruncated = truncatedContent.length < numberedContent.length;
+  
+            // Calculate how many lines were actually shown
+            const linesShown = truncatedContent.split('\n').length;
+            const remainingLines = totalLines - (startLine + linesShown);
+            const nextOffset = startLine + linesShown + 1;
+  
+            // Build truncation info
+            let truncationNote = '';
+            if (wasTruncated || remainingLines > 0) {
+              truncationNote = `\n\n[Showing lines ${offset}-${startLine + linesShown} of ${totalLines}. ${remainingLines} more lines. Use offset:${nextOffset} to continue.]`;
+            }
   
             addMessage({
               role: 'tool-result',
               toolName: 'read_file',
-              summary: `Read ${lineCount} lines from ${result.path}${wasTruncated ? ' (truncated)' : ''}`,
+              summary: `Read lines ${offset}-${startLine + linesShown} of ${totalLines} from ${result.path}${wasTruncated ? ' (truncated)' : ''}`,
               fullResult: result.content,
-              content: `File: ${result.path}\n\n${truncatedContent}`,
-              truncated: wasTruncated
+              content: `File: ${result.path} (${totalLines} lines total)\n\n${truncatedContent}${truncationNote}`,
+              truncated: wasTruncated,
+              durationMs
             });
           } else {
             addMessage({
@@ -1218,7 +1294,8 @@
               toolName: 'read_file',
               summary: `Error: ${result.error}`,
               error: true,
-              content: `Error reading file ${result.path}: ${result.error}`
+              content: `Error reading file ${result.path}: ${result.error}`,
+              durationMs
             });
           }
         } else if (toolUse.name === 'write_file') {
@@ -1230,7 +1307,9 @@
             content: `write_file ${JSON.stringify({ path: toolUse.input.path, content: `(${toolUse.input.content.length} chars)` })}`
           });
   
+          const startTime = performance.now();
           const result = await this.executeWriteFile(toolUse.input.path, toolUse.input.content, selectedDirectory);
+          const durationMs = Math.round(performance.now() - startTime);
   
           if (result.success) {
             addMessage({
@@ -1238,7 +1317,8 @@
               toolName: 'write_file',
               summary: `Wrote ${toolUse.input.content.length} characters to ${result.path}`,
               fullResult: `Successfully wrote to ${result.path}`,
-              content: `Successfully wrote ${toolUse.input.content.length} characters to ${result.path}`
+              content: `Successfully wrote ${toolUse.input.content.length} characters to ${result.path}`,
+              durationMs
             });
           } else {
             addMessage({
@@ -1246,7 +1326,8 @@
               toolName: 'write_file',
               summary: `Error: ${result.error}`,
               error: true,
-              content: `Error writing file ${result.path}: ${result.error}`
+              content: `Error writing file ${result.path}: ${result.error}`,
+              durationMs
             });
           }
         } else if (toolUse.name === 'search_by_filename') {
@@ -1258,8 +1339,10 @@
             content: `search_by_filename ${JSON.stringify(toolUse.input)}`
           });
   
+          const startTime = performance.now();
           const searchPath = toolUse.input.path || '.';
           const result = await this.executeSearchByFilename(toolUse.input.pattern, searchPath, selectedDirectory);
+          const durationMs = Math.round(performance.now() - startTime);
   
           if (result.success) {
             const matchCount = result.matches.length;
@@ -1270,7 +1353,8 @@
               toolName: 'search_by_filename',
               summary: `Found ${matchCount} file(s) matching "${toolUse.input.pattern}"${timeoutWarning}`,
               fullResult: result.output,
-              content: `Search results for pattern "${toolUse.input.pattern}" in "${searchPath}":\n\n${result.output}`
+              content: `Search results for pattern "${toolUse.input.pattern}" in "${searchPath}":\n\n${result.output}`,
+              durationMs
             });
           } else {
             addMessage({
@@ -1278,7 +1362,8 @@
               toolName: 'search_by_filename',
               summary: `Error: ${result.error}`,
               error: true,
-              content: `Error searching for files: ${result.error}`
+              content: `Error searching for files: ${result.error}`,
+              durationMs
             });
           }
         } else if (toolUse.name === 'search_by_content') {
@@ -1290,9 +1375,11 @@
             content: `search_by_content ${JSON.stringify(toolUse.input)}`
           });
   
+          const startTime = performance.now();
           const searchPath = toolUse.input.path || '.';
           const filePattern = toolUse.input.filePattern || null;
           const result = await this.executeSearchByContent(toolUse.input.text, searchPath, filePattern, selectedDirectory);
+          const durationMs = Math.round(performance.now() - startTime);
   
           if (result.success) {
             const matchCount = result.matches.length;
@@ -1303,7 +1390,8 @@
               toolName: 'search_by_content',
               summary: `Found ${matchCount} match(es) for "${toolUse.input.text}"${timeoutWarning}`,
               fullResult: result.output,
-              content: `Search results for text "${toolUse.input.text}" in "${searchPath}":\n\n${result.output}`
+              content: `Search results for text "${toolUse.input.text}" in "${searchPath}":\n\n${result.output}`,
+              durationMs
             });
           } else {
             addMessage({
@@ -1311,7 +1399,8 @@
               toolName: 'search_by_content',
               summary: `Error: ${result.error}`,
               error: true,
-              content: `Error searching file contents: ${result.error}`
+              content: `Error searching file contents: ${result.error}`,
+              durationMs
             });
           }
         } else if (toolUse.name === 'edit_file') {
@@ -1323,7 +1412,9 @@
             content: `edit_file ${JSON.stringify({ path: toolUse.input.path, find: `(${toolUse.input.find.length} chars)`, replace: `(${toolUse.input.replace.length} chars)` })}`
           });
   
+          const startTime = performance.now();
           const result = await this.executeEditFile(toolUse.input.path, toolUse.input.find, toolUse.input.replace, selectedDirectory);
+          const durationMs = Math.round(performance.now() - startTime);
   
           if (result.success) {
             addMessage({
@@ -1331,7 +1422,8 @@
               toolName: 'edit_file',
               summary: `Edited ${result.path}: replaced ${toolUse.input.find.length} chars with ${toolUse.input.replace.length} chars`,
               fullResult: `Successfully edited ${result.path}`,
-              content: `Successfully edited ${result.path}`
+              content: `Successfully edited ${result.path}`,
+              durationMs
             });
           } else {
             addMessage({
@@ -1339,7 +1431,8 @@
               toolName: 'edit_file',
               summary: `Error: ${result.error}`,
               error: true,
-              content: `Error editing file ${toolUse.input.path}: ${result.error}`
+              content: `Error editing file ${toolUse.input.path}: ${result.error}`,
+              durationMs
             });
           }
         } else if (toolUse.name === 'edit_file_batch') {
@@ -1351,7 +1444,9 @@
             content: `edit_file_batch ${JSON.stringify({ path: toolUse.input.path, edits: `(${toolUse.input.edits.length} edits)` })}`
           });
   
+          const startTime = performance.now();
           const result = await this.executeEditFileBatch(toolUse.input.path, toolUse.input.edits, selectedDirectory);
+          const durationMs = Math.round(performance.now() - startTime);
   
           if (result.success) {
             addMessage({
@@ -1359,7 +1454,8 @@
               toolName: 'edit_file_batch',
               summary: `Batch edited ${result.path}: applied ${toolUse.input.edits.length} edit(s)`,
               fullResult: `Successfully applied ${toolUse.input.edits.length} edits to ${result.path}`,
-              content: `Successfully applied ${toolUse.input.edits.length} edits to ${result.path}`
+              content: `Successfully applied ${toolUse.input.edits.length} edits to ${result.path}`,
+              durationMs
             });
           } else {
             addMessage({
@@ -1367,7 +1463,8 @@
               toolName: 'edit_file_batch',
               summary: `Error: ${result.error}`,
               error: true,
-              content: `Error batch editing file ${toolUse.input.path}: ${result.error}`
+              content: `Error batch editing file ${toolUse.input.path}: ${result.error}`,
+              durationMs
             });
           }
         } else {
@@ -2423,7 +2520,7 @@
         (msg) => state.addMessage(msg),
         selectedDirectory,
         {
-          onLoading: () => ui.showLoading(),
+          onLoading: (text) => ui.showLoading(text),
           onHideLoading: () => ui.hideLoading(),
           onRenderMessages: () => ui.renderMessages(state.getMessages()),
           onUpdateStats: () => ui.updateContextStats(),
@@ -3391,7 +3488,11 @@
       const api = window.module['api.js'];
       const ui = window.module['ui.js'];
   
+      console.log('[Compaction] Starting context compaction...');
       diagnostics.log('compaction', '[Main] ========== COMPACTING CONTEXT ==========');
+  
+      // Update loading indicator
+      ui.showLoading('Compacting');
   
       const messages = state.getMessages();
       const tokensBefore = state.calculateTokens();
@@ -3421,22 +3522,25 @@
       const summarizationMessages = [
         {
           role: 'user',
-          content: 'Please provide a concise summary of the following conversation. The summary should include:\n' +
-            '1. The user\'s most recent request or question\n' +
-            '2. The last few actions or tasks completed by the assistant\n' +
-            '3. Key decisions, code changes, and important context needed to continue\n' +
-            '4. Any ongoing work or issues that need to be addressed\n\n' +
-            'Focus on recent activity and actionable context.\n\n' +
-            'Conversation to summarize:\n\n' +
+          content: 'You are summarizing a conversation between a user and a coding agent that has file system tools (read, write, search, edit files).\n\n' +
+            'Provide a concise summary including:\n' +
+            '1. User\'s most recent request\n' +
+            '2. Recent actions (files read, edited, created)\n' +
+            '3. Key decisions and context needed to continue\n' +
+            '4. Any ongoing work or issues\n\n' +
+            'Be concise. Focus on actionable context.\n\n' +
+            'Conversation:\n\n' +
             messagesToSummarize.map(m => `[${m.role}]: ${m.content}`).join('\n\n')
         }
       ];
   
       try {
-        // Call API for summarization
-        const response = await api.callAPI(summarizationMessages);
+        // Call API for summarization (use simple call without system prompt)
+        const requestSize = JSON.stringify(summarizationMessages).length;
+        console.log(`[Compaction] Calling API for summarization (${requestSize} chars, ~${Math.round(requestSize/4)} tokens)`);
+        const response = await api.callAPISimple(summarizationMessages);
   
-        if (!response.valid || response.parsed.type !== 'message') {
+        if (!response.valid) {
           diagnostics.log('compaction', '[Main] Failed to get summary from API');
           const tokensAfter = state.calculateTokens();
           const messagesAfter = messages.length;
@@ -3450,7 +3554,7 @@
           return;
         }
   
-        const summaryContent = response.parsed.content;
+        const summaryContent = response.text;
         diagnostics.log('compaction', '[Main] Received summary: ' + summaryContent.substring(0, 100) + '...');
   
         // Mark ALL old messages as UI-only (keep them visible in UI, exclude from API)
@@ -3793,6 +3897,7 @@
         /* Messages */
         .message {
           margin-bottom: 8px;
+          position: relative;
         }
   
         .message:first-child {
@@ -3845,10 +3950,13 @@
         }
   
         .message-timing {
+          position: absolute;
+          bottom: 2px;
+          right: 8px;
           font-size: 10px;
           color: var(--color-text-dim);
-          margin-top: 4px;
-          opacity: 0.7;
+          opacity: 0.5;
+          pointer-events: none;
         }
   
         .tool-execution-timing {
@@ -3907,6 +4015,7 @@
         }
   
         .tool-result-inline {
+          position: relative;
           padding: 4px 0 12px 3ch;
           font-size: 13px;
           color: #999999;
@@ -3957,6 +4066,7 @@
   
         /* Tool Use Messages (before execution) */
         .tool-use-message {
+          position: relative;
           color: var(--color-text-secondary);
           padding: 0px 12px;
           background: rgba(212, 160, 23, 0.08);
@@ -4004,6 +4114,7 @@
   
         /* Tool Result Messages (after execution) */
         .tool-result-message {
+          position: relative;
           color: var(--color-text-secondary);
           padding: 0px 12px;
           background: rgba(76, 175, 80, 0.08);
@@ -4436,13 +4547,21 @@
   {"type":"execute","tool_uses":[{"name":"list_directory","input":{"path":"."}}]}
   
   ### read_file
-  Read the contents of a file
+  Read the contents of a file. Supports reading specific line ranges for large files.
   
   Parameters:
   - path (string, required): The file path to read (relative to project root)
+  - offset (number, optional): Line number to start reading from (1-based, default: 1)
+  - limit (number, optional): Maximum number of lines to read (default: all lines)
+  
+  When a file is truncated, the result will show "[Truncated: X more lines. Use offset/limit to read remaining.]"
+  To read the rest, call read_file again with offset set to the next line number.
   
   Example usage (single file):
   {"type":"execute","tool_uses":[{"name":"read_file","input":{"path":"package.json"}}]}
+  
+  Example usage (read lines 100-200):
+  {"type":"execute","tool_uses":[{"name":"read_file","input":{"path":"src/app/main.js","offset":100,"limit":100}}]}
   
   Example usage (multiple files):
   {"type":"execute","tool_uses":[{"name":"read_file","input":{"path":"src/app/main.js"}},{"name":"read_file","input":{"path":"package.json"}}]}
@@ -5035,6 +5154,14 @@
               toolResultContent.textContent = groupMsg.content;
               toolResultDiv.appendChild(toolResultContent);
   
+              // Add timing if available
+              if (groupMsg.durationMs !== undefined) {
+                const timing = document.createElement('div');
+                timing.className = 'message-timing';
+                timing.textContent = `${groupMsg.durationMs}ms`;
+                toolResultDiv.appendChild(timing);
+              }
+  
               groupDiv.appendChild(toolResultDiv);
             }
           });
@@ -5070,6 +5197,14 @@
           messageDiv.addEventListener('click', () => {
             this.showToolResultModal(msg);
           });
+  
+          // Add timing if available
+          if (msg.durationMs !== undefined) {
+            const timing = document.createElement('span');
+            timing.className = 'message-timing';
+            timing.textContent = `${msg.durationMs}ms`;
+            messageDiv.appendChild(timing);
+          }
   
           container.appendChild(messageDiv);
           return;
@@ -5304,13 +5439,18 @@
       document.body.appendChild(overlay);
     },
   
-    showLoading: function() {
+    showLoading: function(text = 'Thinking') {
       const container = document.getElementById('chat-container');
-      const loading = document.createElement('div');
-      loading.id = 'loading-indicator';
-      loading.className = 'message assistant-message loading';
-      loading.textContent = 'Thinking';
-      container.appendChild(loading);
+      let loading = document.getElementById('loading-indicator');
+      if (loading) {
+        loading.textContent = text;
+      } else {
+        loading = document.createElement('div');
+        loading.id = 'loading-indicator';
+        loading.className = 'message assistant-message loading';
+        loading.textContent = text;
+        container.appendChild(loading);
+      }
       container.scrollTop = container.scrollHeight;
     },
   
