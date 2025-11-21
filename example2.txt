@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-21T03:48:01.333Z
+// AI Agent - Built 2025-11-21T03:54:36.236Z
 (function() {
   window.module = {};
 
@@ -25,8 +25,8 @@
       // Test 4: Many tool results in context
       await this.testManyToolResults();
   
-      // Test 5: Total context size (combined messages)
-      await this.testTotalContextSize();
+      // Test 5: Message count (many small messages)
+      await this.testMessageCount();
   
       // Test 6: Very long single lines
       await this.testLongLines();
@@ -253,55 +253,50 @@
         failError);
     },
   
-    // Test 5: Total context size - start at 100K, go up to 2MB
-    testTotalContextSize: async function() {
-      console.log('\n--- Test 5: Total Context Size ---');
+    // Test 5: Message count (small content, many messages)
+    testMessageCount: async function() {
+      console.log('\n--- Test 5: Message Count ---');
   
       const api = window.module['api.js'];
-      // 12 rungs: 100K to 2MB total across multiple messages
-      const sizes = [100000, 150000, 200000, 300000, 400000, 500000, 750000, 1000000, 1250000, 1500000, 1750000, 2000000];
-      let lastSuccessSize = 0;
+      // Test message COUNT with small content per message
+      const counts = [10, 20, 50, 100, 200, 500];
+      let lastSuccessCount = 0;
       let failError = null;
   
-      for (const size of sizes) {
+      for (const count of counts) {
         const messages = [];
-        const msgSize = Math.floor(size / 10);
-        for (let i = 0; i < 9; i++) {
+        for (let i = 0; i < count; i++) {
           messages.push({
             role: i % 2 === 0 ? 'user' : 'assistant',
-            content: `Msg ${i}: ${'z'.repeat(msgSize)}`
+            content: `Msg ${i}: short content`
           });
         }
         messages.push({ role: 'user', content: "reply 'K'" });
   
-        const totalSize = messages.reduce((sum, m) => sum + m.content.length, 0);
-        console.log(`  Testing ~${Math.round(totalSize/1000)}K total context...`);
+        console.log(`  Testing ${count} messages (small content)...`);
   
         try {
           const response = await api.callAPI(messages);
           if (response.valid) {
-            lastSuccessSize = totalSize;
-            console.log(`    ${Math.round(totalSize/1000)}K: OK`);
+            lastSuccessCount = count;
+            console.log(`    ${count} msgs: OK`);
           } else {
             failError = response.error;
-            console.log(`    ${Math.round(totalSize/1000)}K: FAILED - ${response.error}`);
-            if (this.is500Error(response.error)) {
-              await this.attemptRecovery('Total Context', messages, response.error);
-            }
+            console.log(`    ${count} msgs: FAILED - ${response.error}`);
             break;
           }
         } catch (e) {
           failError = e;
-          console.log(`    ${Math.round(totalSize/1000)}K: EXCEPTION - ${e.message}`);
+          console.log(`    ${count} msgs: EXCEPTION - ${e.message}`);
           break;
         }
   
         await this.delay(500);
       }
   
-      this.logResult('Total Context Size',
+      this.logResult('Message Count',
         failError === null,
-        `Last success: ${Math.round(lastSuccessSize/1000)}K chars`,
+        `Last success: ${lastSuccessCount} messages`,
         failError);
     },
   
