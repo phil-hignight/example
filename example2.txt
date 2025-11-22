@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-22T22:03:58.561Z
+// AI Agent - Built 2025-11-22T22:12:43.984Z
 (function() {
   window.module = {};
 
@@ -541,7 +541,9 @@
             const errorText = await response.text();
             attemptTimings.push({ attempt: attempt + 1, duration: attemptDuration, success: false });
             // Log failed request
-            requestLogger.logRequest(requestBody, { error: errorText, status: response.status });
+            if (requestLogger) {
+              requestLogger.logRequest(requestBody, { error: errorText, status: response.status });
+            }
             throw new Error(`API request failed (${response.status}): ${errorText}`);
           }
   
@@ -549,7 +551,9 @@
           const responseText = data.choices[0].message.content;
           attemptTimings.push({ attempt: attempt + 1, duration: attemptDuration, success: true });
           // Log successful request
-          requestLogger.logRequest(requestBody, data);
+          if (requestLogger) {
+            requestLogger.logRequest(requestBody, data);
+          }
           return { valid: true, text: responseText, attemptTimings };
         } catch (error) {
           const attemptDuration = ((Date.now() - attemptStart) / 1000).toFixed(1);
@@ -558,7 +562,9 @@
           }
           if (attempt >= maxRetries - 1) {
             // Log final failed request
-            requestLogger.logRequest(requestBody, { error: error.message });
+            if (requestLogger) {
+              requestLogger.logRequest(requestBody, { error: error.message });
+            }
             return { valid: false, error: error.message, attemptTimings };
           }
         }
@@ -718,7 +724,9 @@
             }
   
             // Log failed request
-            requestLogger.logRequest(requestBody, { error: errorMessage, data });
+            if (requestLogger) {
+              requestLogger.logRequest(requestBody, { error: errorMessage, data });
+            }
   
             // On validation errors, return immediately with error details
             // Don't retry - let the main loop provide feedback to AI
@@ -737,7 +745,9 @@
           }
   
           // Log successful request
-          requestLogger.logRequest(requestBody, data);
+          if (requestLogger) {
+            requestLogger.logRequest(requestBody, data);
+          }
   
           // Return both raw text and parsed response
           return {
@@ -763,7 +773,9 @@
             continue;
           } else {
             // Log final failed request on last attempt
-            requestLogger.logRequest(requestBody, { error: error.message });
+            if (requestLogger) {
+              requestLogger.logRequest(requestBody, { error: error.message });
+            }
           }
         }
       }
@@ -6012,7 +6024,17 @@
     // Show requests debugging screen
     showRequestsScreen: function() {
       const requestLogger = window.module['request-logger.js'];
+      if (!requestLogger) {
+        console.error('request-logger.js module not loaded');
+        alert('Request logger module not loaded. Please refresh the page.');
+        return;
+      }
+  
       const container = document.getElementById('app-container');
+      if (!container) {
+        console.error('app-container not found');
+        return;
+      }
       container.innerHTML = '';
   
       const screen = document.createElement('div');
