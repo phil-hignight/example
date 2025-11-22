@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-22T20:53:32.728Z
+// AI Agent - Built 2025-11-22T21:02:35.268Z
 (function() {
   window.module = {};
 
@@ -5168,14 +5168,33 @@
           // Make all assistant messages clickable to show details
           messageDiv.style.cursor = 'pointer';
   
-          // If this is an error message, show error modal instead
-          console.log('[UI] Rendering assistant message:', { isError: msg.isError, hasFailedData: !!msg.failedRequestData, msg });
-          if (msg.isError && msg.failedRequestData) {
+          // Check if this is an error message - either by explicit flag or by content pattern
+          const isErrorMessage = msg.isError && msg.failedRequestData;
+          const isOldErrorMessage = !msg.isError && msg.content && (
+            msg.content.startsWith('Error: Invalid response after') ||
+            msg.content.startsWith('Error: Failed after')
+          );
+  
+          console.log('[UI] Rendering assistant message:', {
+            isError: msg.isError,
+            hasFailedData: !!msg.failedRequestData,
+            isErrorMessage,
+            isOldErrorMessage,
+            contentPreview: msg.content?.substring(0, 50)
+          });
+  
+          if (isErrorMessage) {
             console.log('[UI] This is an error message - adding error modal handler');
             messageDiv.classList.add('error-message');
             messageDiv.addEventListener('click', () => {
               console.log('[UI] Error message clicked - showing error retry modal');
               this.showErrorRetryModal(msg);
+            });
+          } else if (isOldErrorMessage) {
+            console.log('[UI] This is an OLD error message (no failedRequestData) - showing info');
+            messageDiv.classList.add('error-message');
+            messageDiv.addEventListener('click', () => {
+              alert('This error occurred before the retry feature was added.\n\nTo use the retry feature, please trigger a new error.');
             });
           } else {
             messageDiv.addEventListener('click', () => {
