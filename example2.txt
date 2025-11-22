@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-22T20:47:40.648Z
+// AI Agent - Built 2025-11-22T20:53:32.728Z
 (function() {
   window.module = {};
 
@@ -5169,9 +5169,12 @@
           messageDiv.style.cursor = 'pointer';
   
           // If this is an error message, show error modal instead
+          console.log('[UI] Rendering assistant message:', { isError: msg.isError, hasFailedData: !!msg.failedRequestData, msg });
           if (msg.isError && msg.failedRequestData) {
+            console.log('[UI] This is an error message - adding error modal handler');
             messageDiv.classList.add('error-message');
             messageDiv.addEventListener('click', () => {
+              console.log('[UI] Error message clicked - showing error retry modal');
               this.showErrorRetryModal(msg);
             });
           } else {
