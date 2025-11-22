@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-22T16:33:59.992Z
+// AI Agent - Built 2025-11-22T19:54:25.890Z
 (function() {
   window.module = {};
 
@@ -1015,10 +1015,17 @@
             const wasTruncated = truncatedContent.length < numberedContent.length;
   
             // Calculate how many lines were actually shown
-            // Use selectedLines.length (before truncation) for accurate line counting
-            const actualLinesSelected = selectedLines.length;
-            const linesShownInTruncated = truncatedContent.split('\n').length;
-            const endLineNumber = Math.min(startLine + actualLinesSelected, totalLines);
+            let endLineNumber;
+            if (wasTruncated) {
+              // Count lines in truncated output (it has line numbers, so count newlines)
+              const linesInTruncated = truncatedContent.split('\n').length;
+              endLineNumber = offset + linesInTruncated - 1;
+            } else {
+              // No truncation - use actual selected lines
+              const actualLinesSelected = selectedLines.length;
+              endLineNumber = Math.min(offset + actualLinesSelected - 1, totalLines);
+            }
+  
             const remainingLines = totalLines - endLineNumber;
             const nextOffset = endLineNumber + 1;
   
