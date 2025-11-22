@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-22T19:54:25.890Z
+// AI Agent - Built 2025-11-22T20:47:40.648Z
 (function() {
   window.module = {};
 
@@ -800,9 +800,22 @@
           // Only show error to user if we've exceeded retry limit
           if (consecutiveErrors >= MAX_RETRIES) {
             diagnostics.log('context', '[Core] Max retries exceeded, showing error to user');
+  
+            // Store the failed request data for debugging/retry
+            const failedRequestData = {
+              messages: getMessages().filter(m => !m.uiOnly),  // Messages before API rendering
+              error: response.error,
+              rawResponse: response.text,
+              apiInput: response.apiInput,
+              apiInputFull: response.apiInputFull,
+              apiOutput: response.apiOutput
+            };
+  
             addMessage({
               type: 'assistant_msg',
-              content: `Error: Invalid response after ${MAX_RETRIES} attempts - ${response.error}`
+              content: `Error: Invalid response after ${MAX_RETRIES} attempts - ${response.error}`,
+              isError: true,
+              failedRequestData: failedRequestData
             });
             onRenderMessages();
             onProcessingChange(false);
@@ -3784,6 +3797,22 @@
           transform: translateX(2px);
         }
   
+        .assistant-message.error-message {
+          color: #ff6b6b;
+          background-image: linear-gradient(
+            to right,
+            transparent 0px,
+            transparent calc(1ch - 5px),
+            #ff6b6b calc(1ch - 5px),
+            #ff6b6b calc(1ch - 4px),
+            transparent calc(1ch - 4px)
+          );
+        }
+  
+        .assistant-message.error-message:hover {
+          background-color: rgba(255, 107, 107, 0.1);
+        }
+  
         .assistant-message .message-content {
           white-space: pre-wrap;
           word-wrap: break-word;
@@ -5138,9 +5167,18 @@
   
           // Make all assistant messages clickable to show details
           messageDiv.style.cursor = 'pointer';
-          messageDiv.addEventListener('click', () => {
-            this.showAssistantMessageModal(msg);
-          });
+  
+          // If this is an error message, show error modal instead
+          if (msg.isError && msg.failedRequestData) {
+            messageDiv.classList.add('error-message');
+            messageDiv.addEventListener('click', () => {
+              this.showErrorRetryModal(msg);
+            });
+          } else {
+            messageDiv.addEventListener('click', () => {
+              this.showAssistantMessageModal(msg);
+            });
+          }
         } else if (msg.type === 'summary') {
           // Summary message - special styling
           const header = document.createElement('div');
@@ -5600,6 +5638,205 @@
       }
   
       document.body.appendChild(overlay);
+    },
+  
+    showErrorRetryModal: function(errorMessage) {
+      const failedData = errorMessage.failedRequestData;
+      if (!failedData) return;
+  
+      const overlay = this.createModalOverlay('API Error - Retry');
+      const body = overlay.querySelector('.modal-body');
+  
+      // Store original messages for comparison
+      const originalMessagesJson = JSON.stringify(failedData.messages, null, 2);
+      let currentMessagesJson = originalMessagesJson;
+  
+      // Error info section
+      const errorInfo = document.createElement('div');
+      errorInfo.className = 'modal-section';
+      errorInfo.style.marginBottom = '16px';
+      errorInfo.style.padding = '12px';
+      errorInfo.style.backgroundColor = 'rgba(255, 100, 100, 0.1)';
+      errorInfo.style.borderRadius = '4px';
+      errorInfo.innerHTML = `<strong>Error:</strong> ${failedData.error}`;
+      body.appendChild(errorInfo);
+  
+      // Token counter section
+      const tokenCounter = document.createElement('div');
+      tokenCounter.className = 'modal-section';
+      tokenCounter.style.marginBottom = '16px';
+      tokenCounter.style.padding = '8px 12px';
+      tokenCounter.style.backgroundColor = 'rgba(212, 160, 23, 0.1)';
+      tokenCounter.style.borderRadius = '4px';
+      tokenCounter.style.fontSize = '13px';
+      tokenCounter.id = 'error-modal-token-counter';
+  
+      const calculateAndDisplayTokens = (messagesJson) => {
+        try {
+          const messages = JSON.parse(messagesJson);
+          const api = window.module['api.js'];
+          const result = api.renderMessagesForAPI(messages);
+          const renderedMessages = result.messages;
+  
+          // Calculate total characters in rendered messages
+          const totalChars = renderedMessages.reduce((sum, msg) => sum + (msg.content?.length || 0), 0);
+          const estimatedTokens = Math.ceil(totalChars / 4);
+  
+          tokenCounter.innerHTML = `<strong>Estimated tokens:</strong> ${estimatedTokens.toLocaleString()} (${totalChars.toLocaleString()} chars, ${renderedMessages.length} messages after rendering)`;
+        } catch (e) {
+          tokenCounter.innerHTML = `<strong>Estimated tokens:</strong> Invalid JSON - cannot calculate`;
+        }
+      };
+  
+      calculateAndDisplayTokens(currentMessagesJson);
+      body.appendChild(tokenCounter);
+  
+      // Messages textarea section
+      const messagesSection = document.createElement('div');
+      messagesSection.className = 'modal-section';
+      messagesSection.style.marginBottom = '16px';
+  
+      const messagesTitle = document.createElement('div');
+      messagesTitle.className = 'modal-section-title';
+      messagesTitle.textContent = 'Messages (before API rendering)';
+      messagesTitle.style.marginBottom = '8px';
+      messagesTitle.style.fontWeight = 'bold';
+  
+      const messagesTextarea = document.createElement('textarea');
+      messagesTextarea.className = 'error-modal-textarea';
+      messagesTextarea.value = originalMessagesJson;
+      messagesTextarea.style.width = '100%';
+      messagesTextarea.style.height = '400px';
+      messagesTextarea.style.fontFamily = 'monospace';
+      messagesTextarea.style.fontSize = '12px';
+      messagesTextarea.style.padding = '8px';
+      messagesTextarea.style.backgroundColor = 'var(--color-bg-secondary)';
+      messagesTextarea.style.color = 'var(--color-text-primary)';
+      messagesTextarea.style.border = '1px solid var(--color-border)';
+      messagesTextarea.style.borderRadius = '4px';
+      messagesTextarea.style.resize = 'vertical';
+  
+      // Update token counter in real-time as user types
+      messagesTextarea.addEventListener('input', () => {
+        currentMessagesJson = messagesTextarea.value;
+        calculateAndDisplayTokens(currentMessagesJson);
+      });
+  
+      messagesSection.appendChild(messagesTitle);
+      messagesSection.appendChild(messagesTextarea);
+      body.appendChild(messagesSection);
+  
+      // Buttons section
+      const buttonsContainer = document.createElement('div');
+      buttonsContainer.style.display = 'flex';
+      buttonsContainer.style.gap = '12px';
+      buttonsContainer.style.justifyContent = 'flex-end';
+      buttonsContainer.style.marginTop = '16px';
+  
+      const retryBtn = document.createElement('button');
+      retryBtn.textContent = 'Retry';
+      retryBtn.className = 'modal-action-btn';
+      retryBtn.style.padding = '8px 16px';
+      retryBtn.style.backgroundColor = 'var(--color-gold)';
+      retryBtn.style.color = 'var(--color-bg-primary)';
+      retryBtn.style.border = 'none';
+      retryBtn.style.borderRadius = '4px';
+      retryBtn.style.cursor = 'pointer';
+      retryBtn.style.fontWeight = 'bold';
+  
+      const saveRetryBtn = document.createElement('button');
+      saveRetryBtn.textContent = 'Save & Retry';
+      saveRetryBtn.className = 'modal-action-btn';
+      saveRetryBtn.style.padding = '8px 16px';
+      saveRetryBtn.style.backgroundColor = '#4CAF50';
+      saveRetryBtn.style.color = 'white';
+      saveRetryBtn.style.border = 'none';
+      saveRetryBtn.style.borderRadius = '4px';
+      saveRetryBtn.style.cursor = 'pointer';
+      saveRetryBtn.style.fontWeight = 'bold';
+      saveRetryBtn.style.display = 'none'; // Initially hidden
+  
+      // Show "Save & Retry" button if user edited the messages
+      messagesTextarea.addEventListener('input', () => {
+        if (messagesTextarea.value !== originalMessagesJson) {
+          saveRetryBtn.style.display = 'block';
+        } else {
+          saveRetryBtn.style.display = 'none';
+        }
+      });
+  
+      retryBtn.onclick = () => {
+        overlay.remove();
+        this.retryFailedRequest(failedData, false);
+      };
+  
+      saveRetryBtn.onclick = () => {
+        try {
+          const editedMessages = JSON.parse(messagesTextarea.value);
+          overlay.remove();
+          this.retryFailedRequest(failedData, true, editedMessages);
+        } catch (e) {
+          alert('Invalid JSON - cannot save. Please fix the JSON syntax.');
+        }
+      };
+  
+      buttonsContainer.appendChild(retryBtn);
+      buttonsContainer.appendChild(saveRetryBtn);
+      body.appendChild(buttonsContainer);
+  
+      document.body.appendChild(overlay);
+    },
+  
+    retryFailedRequest: async function(failedData, saveEdited, editedMessages = null) {
+      const state = window.module['state.js'];
+      const main = window.module['main.js'];
+  
+      // If saveEdited is true, replace the messages in state
+      if (saveEdited && editedMessages) {
+        // Clear current messages and add the edited ones
+        const currentMessages = state.getMessages();
+  
+        // Find the error message and remove everything from it onwards
+        const errorMsgIndex = currentMessages.findIndex(m => m.isError);
+        if (errorMsgIndex !== -1) {
+          // Remove error message and anything after it
+          currentMessages.splice(errorMsgIndex);
+        }
+  
+        // Clear and replace with edited messages
+        state.state.messages = editedMessages;
+      } else {
+        // Just remove the error message
+        const currentMessages = state.getMessages();
+        const errorMsgIndex = currentMessages.findIndex(m => m.isError);
+        if (errorMsgIndex !== -1) {
+          currentMessages.splice(errorMsgIndex, 1);
+        }
+      }
+  
+      // Re-render messages
+      this.renderMessages(state.getMessages());
+  
+      // Set processing state
+      state.setProcessing(true);
+      this.setInputDisabled(true);
+      this.showLoading();
+  
+      // Process AI response
+      try {
+        await main.processAIResponse();
+      } catch (error) {
+        this.hideLoading();
+        state.addMessage({
+          type: 'assistant_msg',
+          content: 'Error: ' + error.message
+        });
+        this.renderMessages(state.getMessages());
+        this.updateContextStats();
+      } finally {
+        state.setProcessing(false);
+        this.setInputDisabled(false);
+      }
     },
   
     // Calculate messages size in tokens
