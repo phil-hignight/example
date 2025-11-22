@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-22T22:12:43.984Z
+// AI Agent - Built 2025-11-22T22:23:51.438Z
 (function() {
   window.module = {};
 
@@ -4891,6 +4891,10 @@
   
     showChatScreen: function(selectedDirectory, onSendMessage) {
       const container = document.getElementById('app-container');
+      if (!container) {
+        console.error('app-container not found');
+        return;
+      }
       container.innerHTML = '';
   
       const screen = document.createElement('div');
@@ -4998,6 +5002,10 @@
   
     renderMessages: function(messages) {
       const container = document.getElementById('chat-container');
+      if (!container) {
+        console.error('chat-container not found - may not be on chat screen');
+        return;
+      }
   
       // Preserve loading indicator if it exists
       const loadingIndicator = document.getElementById('loading-indicator');
