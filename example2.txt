@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-23T03:26:53.573Z
+// AI Agent - Built 2025-11-23T03:36:14.162Z
 (function() {
   window.module = {};
 
@@ -542,7 +542,7 @@
             attemptTimings.push({ attempt: attempt + 1, duration: attemptDuration, success: false });
             // Log failed request
             if (requestLogger) {
-              requestLogger.logRequest(requestBody, { error: errorText, status: response.status });
+              requestLogger.logRequest(requestBody, { error: errorText, status: response.status }, { type: 'compaction' });
             }
             throw new Error(`API request failed (${response.status}): ${errorText}`);
           }
@@ -552,7 +552,7 @@
           attemptTimings.push({ attempt: attempt + 1, duration: attemptDuration, success: true });
           // Log successful request
           if (requestLogger) {
-            requestLogger.logRequest(requestBody, data);
+            requestLogger.logRequest(requestBody, data, { type: 'compaction' });
           }
           return { valid: true, text: responseText, attemptTimings };
         } catch (error) {
@@ -563,7 +563,7 @@
           if (attempt >= maxRetries - 1) {
             // Log final failed request
             if (requestLogger) {
-              requestLogger.logRequest(requestBody, { error: error.message });
+              requestLogger.logRequest(requestBody, { error: error.message }, { type: 'compaction' });
             }
             return { valid: false, error: error.message, attemptTimings };
           }
@@ -3463,7 +3463,7 @@
     requests: [],
   
     // Log a new request
-    logRequest: function(requestBody, response = null) {
+    logRequest: function(requestBody, response = null, metadata = {}) {
       const timestamp = Date.now();
   
       // Extract first message to determine role
@@ -3482,14 +3482,17 @@
         }, 0);
       }
   
+      // Generate ID with type suffix if provided
+      const typeSuffix = metadata.type ? `-${metadata.type}` : '';
       const request = {
-        id: `req-${timestamp}-${Math.random().toString(36).substr(2, 9)}`,
+        id: `req-${timestamp}-${Math.random().toString(36).substr(2, 9)}${typeSuffix}`,
         timestamp,
         requestBody,
         response,
         role,
         contentPreview: contentPreview.substring(0, 200), // First 200 chars
-        charCount
+        charCount,
+        type: metadata.type || 'normal'  // normal or compaction
       };
   
       this.requests.push(request);
@@ -3890,14 +3893,6 @@
           color: var(--color-text-dim);
           opacity: 0.5;
           pointer-events: none;
-        }
-  
-        .tool-execution-timing {
-          font-size: 10px;
-          color: var(--color-text-dim);
-          text-align: center;
-          margin: 8px 0;
-          opacity: 0.6;
           font-style: italic;
         }
   
@@ -5035,15 +5030,7 @@
         // Skip assistant messages that contain raw JSON tool execution requests
         // These are for API conversation structure only, not for UI display
         // We detect them by checking if the content starts with JSON (contains "type": "execute")
-        // However, we still want to show the timing for these AI calls
         if (msg.type === 'assistant_msg' && msg.apiData && msg.content && msg.content.includes('"type"')) {
-          // If there's timing info, display it
-          if (msg.durationSeconds !== undefined) {
-            const timingDiv = document.createElement('div');
-            timingDiv.className = 'tool-execution-timing';
-            timingDiv.textContent = `${msg.durationSeconds.toFixed(2)}s`;
-            container.appendChild(timingDiv);
-          }
           return;
         }
   
