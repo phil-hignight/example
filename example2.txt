@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-23T19:14:14.140Z
+// AI Agent - Built 2025-11-23T19:17:00.074Z
 (function() {
   window.module = {};
 
@@ -503,10 +503,14 @@
     callAPISimple: async function(messages) {
       const authToken = localStorage.getItem('token');
   
+      // Transform messages to API format (with role and content)
+      const result = this.renderMessagesForAPI(messages);
+      const processedMessages = result.messages;
+  
       const requestBody = {
         stream: false,
         model: 'Anthropic Claude 4 Sonnet',
-        messages: messages,
+        messages: processedMessages,
         params: {},
         features: { web_search: false },
         session_id: 'session-' + Math.random().toString(36).substr(2, 9),
