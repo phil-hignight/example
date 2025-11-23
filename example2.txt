@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-23T16:46:20.988Z
+// AI Agent - Built 2025-11-23T16:54:35.746Z
 (function() {
   window.module = {};
 
@@ -1550,32 +1550,8 @@
     },
   
     executeEditFile: async function(path, findStr, replaceStr, dirHandle) {
-      const state = window.module['state.js'];
-  
       try {
-        // 1. Check if file was read within last 5 minutes
-        const fiveMinutesAgo = Date.now() - (5 * 60 * 1000);
-        const messages = state.getMessages();
-        const recentRead = messages
-          .filter(m => m.role === 'tool-result' && m.toolName === 'read_file' && m.timestamp > fiveMinutesAgo)
-          .find(m => {
-            // Check if this read was for our file
-            const toolUseIndex = messages.indexOf(m) - 1;
-            if (toolUseIndex >= 0 && messages[toolUseIndex].role === 'tool-use') {
-              return messages[toolUseIndex].params.path === path;
-            }
-            return false;
-          });
-  
-        if (!recentRead) {
-          return {
-            success: false,
-            error: `File has not been read in the last 5 minutes. Please read the file first to ensure you have the latest content before editing.`,
-            path
-          };
-        }
-  
-        // 2. Read current file content
+        // 1. Read current file content
         const readResult = await this.executeReadFile(path, dirHandle);
         if (!readResult.success) {
           return { success: false, error: readResult.error, path };
@@ -1583,7 +1559,7 @@
   
         const content = readResult.content;
   
-        // 3. Check if file is blank - suggest using write_file instead
+        // 2. Check if file is blank - suggest using write_file instead
         if (content.trim() === '') {
           return {
             success: false,
@@ -1592,7 +1568,7 @@
           };
         }
   
-        // 4. Check that find string appears exactly once
+        // 3. Check that find string appears exactly once
         const occurrences = content.split(findStr).length - 1;
         if (occurrences === 0) {
           return {
@@ -1608,10 +1584,10 @@
           };
         }
   
-        // 5. Perform replacement
+        // 4. Perform replacement
         const newContent = content.replace(findStr, replaceStr);
   
-        // 6. Write back
+        // 5. Write back
         const writeResult = await this.executeWriteFile(path, newContent, dirHandle);
         return writeResult;
   
@@ -1621,32 +1597,8 @@
     },
   
     executeEditFileBatch: async function(path, edits, dirHandle) {
-      const state = window.module['state.js'];
-  
       try {
-        // 1. Check if file was read within last 5 minutes
-        const fiveMinutesAgo = Date.now() - (5 * 60 * 1000);
-        const messages = state.getMessages();
-        const recentRead = messages
-          .filter(m => m.role === 'tool-result' && m.toolName === 'read_file' && m.timestamp > fiveMinutesAgo)
-          .find(m => {
-            // Check if this read was for our file
-            const toolUseIndex = messages.indexOf(m) - 1;
-            if (toolUseIndex >= 0 && messages[toolUseIndex].role === 'tool-use') {
-              return messages[toolUseIndex].params.path === path;
-            }
-            return false;
-          });
-  
-        if (!recentRead) {
-          return {
-            success: false,
-            error: `File has not been read in the last 5 minutes. Please read the file first to ensure you have the latest content before editing.`,
-            path
-          };
-        }
-  
-        // 2. Read current file content
+        // 1. Read current file content
         const readResult = await this.executeReadFile(path, dirHandle);
         if (!readResult.success) {
           return { success: false, error: readResult.error, path };
@@ -1654,7 +1606,7 @@
   
         let content = readResult.content;
   
-        // 3. Check if file is blank - suggest using write_file instead
+        // 2. Check if file is blank - suggest using write_file instead
         if (content.trim() === '') {
           return {
             success: false,
@@ -1663,7 +1615,7 @@
           };
         }
   
-        // 4. Apply each edit in sequence
+        // 3. Apply each edit in sequence
         for (let i = 0; i < edits.length; i++) {
           const { find, replace } = edits[i];
   
@@ -1687,7 +1639,7 @@
           content = content.replace(find, replace);
         }
   
-        // 5. Write back
+        // 4. Write back
         const writeResult = await this.executeWriteFile(path, content, dirHandle);
         return writeResult;
   
@@ -5387,9 +5339,6 @@
         container.insertAdjacentHTML('beforeend', loadingHTML);
       }
   
-      // Scroll to bottom
-      container.scrollTop = container.scrollHeight;
-  
       // Update context stats
       this.updateContextStats();
   
@@ -5553,7 +5502,6 @@
         loading.textContent = text;
         container.appendChild(loading);
       }
-      container.scrollTop = container.scrollHeight;
       this.updateSubmitButtonVisibility();
     },
   
