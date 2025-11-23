@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-23T17:57:02.361Z
+// AI Agent - Built 2025-11-23T18:17:04.254Z
 (function() {
   window.module = {};
 
@@ -500,7 +500,7 @@
     },
   
     // Simple API call without system prompt - for internal operations like summarization
-    callAPISimple: async function(messages, maxRetries = 3) {
+    callAPISimple: async function(messages) {
       const authToken = localStorage.getItem('token');
   
       const requestBody = {
@@ -517,48 +517,27 @@
       const headers = { 'Content-Type': 'application/json' };
       if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
   
-      const attemptTimings = [];
+      try {
+        const response = await fetch('/api/chat/completions', {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(requestBody)
+        });
   
-      for (let attempt = 0; attempt < maxRetries; attempt++) {
-        const attemptStart = Date.now();
-        try {
-          // Add delay between retries (exponential backoff)
-          if (attempt > 0) {
-            const delay = Math.min(1000 * Math.pow(2, attempt - 1), 5000);
-            await new Promise(r => setTimeout(r, delay));
-          }
-  
-          const response = await fetch('/api/chat/completions', {
-            method: 'POST',
-            headers,
-            body: JSON.stringify(requestBody)
-          });
-  
-          const attemptDuration = ((Date.now() - attemptStart) / 1000).toFixed(1);
-  
-          if (!response.ok) {
-            const errorText = await response.text();
-            attemptTimings.push({ attempt: attempt + 1, duration: attemptDuration, success: false });
-            throw new Error(`API request failed (${response.status}): ${errorText}`);
-          }
-  
-          const data = await response.json();
-          const responseText = data.choices[0].message.content;
-          attemptTimings.push({ attempt: attempt + 1, duration: attemptDuration, success: true });
-          return { valid: true, text: responseText, attemptTimings };
-        } catch (error) {
-          const attemptDuration = ((Date.now() - attemptStart) / 1000).toFixed(1);
-          if (!attemptTimings.find(t => t.attempt === attempt + 1)) {
-            attemptTimings.push({ attempt: attempt + 1, duration: attemptDuration, success: false });
-          }
-          if (attempt >= maxRetries - 1) {
-            return { valid: false, error: error.message, attemptTimings };
-          }
+        if (!response.ok) {
+          const errorText = await response.text();
+          return { valid: false, error: `API request failed (${response.status}): ${errorText}` };
         }
+  
+        const data = await response.json();
+        const responseText = data.choices[0].message.content;
+        return { valid: true, text: responseText };
+      } catch (error) {
+        return { valid: false, error: error.message };
       }
     },
   
-    callAPI: async function(messages, maxRetries = 3) {
+    callAPI: async function(messages) {
       const diagnostics = window.module['diagnostics.js'];
       const authToken = localStorage.getItem('token');
       const tools = window.module['tools.js'];
@@ -627,132 +606,125 @@
         headers['Authorization'] = `Bearer ${authToken}`;
       }
   
-      let lastError = null;
+      // Single attempt - no retries
+      try {
+        const startTime = Date.now();
+        const response = await fetch('/api/chat/completions', {
+          method: 'POST',
+          headers: headers,
+          body: JSON.stringify(requestBody)
+        });
   
-      for (let attempt = 0; attempt < maxRetries; attempt++) {
+        if (!response.ok) {
+          const errorText = await response.text();
+          diagnostics.handleError('API_ERROR', {
+            error: new Error(`API request failed (${response.status}): ${errorText}`),
+            response: { status: response.status, statusText: response.statusText },
+            requestBody
+          });
+          return {
+            valid: false,
+            error: `API request failed (${response.status}): ${errorText}`
+          };
+        }
+  
+        let data;
         try {
-          const startTime = Date.now();
-          const response = await fetch('/api/chat/completions', {
-            method: 'POST',
-            headers: headers,
-            body: JSON.stringify(requestBody)
+          data = await response.json();
+        } catch (error) {
+          const responseText = await response.text();
+          diagnostics.handleError('JSON_PARSE_ERROR', {
+            error,
+            jsonString: responseText,
+            position: error.message.match(/position (\d+)/)?.[1] || 0
+          });
+          return {
+            valid: false,
+            error: `JSON parse error: ${error.message}`
+          };
+        }
+        let responseText = data.choices[0].message.content;
+        let durationSeconds = (Date.now() - startTime) / 1000;
+  
+        // Log response size details
+        const responseDataString = JSON.stringify(data);
+        const responseDataSize = responseDataString.length;
+        const responseTokens = Math.ceil(responseText.length / 4);
+  
+        diagnostics.log('api', 'FULL API RESPONSE', { data });
+        diagnostics.log('api', 'API RESPONSE SIZE', {
+          responseTextLength: responseText.length,
+          responseTokens,
+          fullResponseDataSize: responseDataSize,
+          durationSeconds: durationSeconds.toFixed(2)
+        });
+  
+        // Check for terminator
+        let wasIncomplete = false;
+        let incompleteReason = null;
+        if (!responseText.includes(TERMINATOR)) {
+          // Handle truncation
+          const result = await this.handleTruncatedResponse(responseText, headers, requestBody, startTime);
+          responseText = result.fullResponse;
+          durationSeconds = result.durationSeconds;
+          wasIncomplete = result.incomplete;
+          incompleteReason = result.incompleteReason;
+        }
+  
+        // Remove terminator before parsing
+        responseText = responseText.replace(TERMINATOR, '').trim();
+  
+        // Parse and validate response
+        const parseResult = tools.parseResponse(responseText);
+  
+        if (!parseResult.valid) {
+          diagnostics.log('api', 'Invalid response', {
+            error: parseResult.error,
+            responseTextPreview: responseText.substring(0, 500)
           });
   
-          if (!response.ok) {
-            const errorText = await response.text();
-            diagnostics.handleError('API_ERROR', {
-              error: new Error(`API request failed (${response.status}): ${errorText}`),
-              response: { status: response.status, statusText: response.statusText },
-              requestBody
-            });
-            throw new Error(`API request failed (${response.status}): ${errorText}`);
+          // If response was incomplete, include that info in the error
+          let errorMessage = parseResult.error;
+          if (wasIncomplete) {
+            errorMessage += ` (Response was incomplete: ${incompleteReason})`;
           }
   
-          let data;
-          try {
-            data = await response.json();
-          } catch (error) {
-            const responseText = await response.text();
-            diagnostics.handleError('JSON_PARSE_ERROR', {
-              error,
-              jsonString: responseText,
-              position: error.message.match(/position (\d+)/)?.[1] || 0
-            });
-            throw new Error(`JSON parse error: ${error.message}`);
-          }
-          let responseText = data.choices[0].message.content;
-          let durationSeconds = (Date.now() - startTime) / 1000;
-  
-          // Log response size details
-          const responseDataString = JSON.stringify(data);
-          const responseDataSize = responseDataString.length;
-          const responseTokens = Math.ceil(responseText.length / 4);
-  
-          diagnostics.log('api', 'FULL API RESPONSE', { data });
-          diagnostics.log('api', 'API RESPONSE SIZE', {
-            responseTextLength: responseText.length,
-            responseTokens,
-            fullResponseDataSize: responseDataSize,
-            durationSeconds: durationSeconds.toFixed(2)
-          });
-  
-          // Check for terminator
-          let wasIncomplete = false;
-          let incompleteReason = null;
-          if (!responseText.includes(TERMINATOR)) {
-            // Handle truncation
-            const result = await this.handleTruncatedResponse(responseText, headers, requestBody, startTime);
-            responseText = result.fullResponse;
-            durationSeconds = result.durationSeconds;
-            wasIncomplete = result.incomplete;
-            incompleteReason = result.incompleteReason;
-          }
-  
-          // Remove terminator before parsing
-          responseText = responseText.replace(TERMINATOR, '').trim();
-  
-          // Parse and validate response
-          const parseResult = tools.parseResponse(responseText);
-  
-          if (!parseResult.valid) {
-            lastError = parseResult.error;
-            diagnostics.log('api', 'Invalid response', {
-              attempt: attempt + 1,
-              maxRetries,
-              error: parseResult.error,
-              responseTextPreview: responseText.substring(0, 500)
-            });
-  
-            // If response was incomplete, include that info in the error
-            let errorMessage = parseResult.error;
-            if (wasIncomplete) {
-              errorMessage += ` (Response was incomplete: ${incompleteReason})`;
-            }
-  
-            // On validation errors, return immediately with error details
-            // Don't retry - let the main loop provide feedback to AI
-            return {
-              text: responseText,
-              parsed: null,
-              valid: false,
-              error: errorMessage,
-              apiInput: processedMessages,
-              apiInputFull: requestBody,
-              apiOutput: data,
-              durationSeconds: durationSeconds,
-              incomplete: wasIncomplete,
-              incompleteReason: incompleteReason
-            };
-          }
-  
-          // Return both raw text and parsed response
           return {
             text: responseText,
-            parsed: parseResult.valid ? parseResult.parsed : null,
-            valid: parseResult.valid,
-            error: parseResult.valid ? null : parseResult.error,
-            apiInput: processedMessages,  // Store input messages for debugging
-            apiInputFull: requestBody,  // Store FULL request body that was actually sent
-            apiOutput: data,  // Store full API response for debugging
-            durationSeconds: durationSeconds
+            parsed: null,
+            valid: false,
+            error: errorMessage,
+            apiInput: processedMessages,
+            apiInputFull: requestBody,
+            apiOutput: data,
+            durationSeconds: durationSeconds,
+            incomplete: wasIncomplete,
+            incompleteReason: incompleteReason
           };
-        } catch (error) {
-          lastError = error.message;
-          diagnostics.log('api', 'API ERROR - EXCEPTION DURING API CALL', {
-            attempt: `${attempt + 1}/${maxRetries}`,
-            errorMessage: error.message,
-            errorStack: error.stack
-          });
-  
-          if (attempt < maxRetries - 1) {
-            diagnostics.log('api', 'Retrying API call');
-            continue;
-          }
         }
-      }
   
-      // All retries failed
-      throw new Error(`Failed after ${maxRetries} attempts. Last error: ${lastError}`);
+        // Return both raw text and parsed response
+        return {
+          text: responseText,
+          parsed: parseResult.valid ? parseResult.parsed : null,
+          valid: parseResult.valid,
+          error: parseResult.valid ? null : parseResult.error,
+          apiInput: processedMessages,  // Store input messages for debugging
+          apiInputFull: requestBody,  // Store FULL request body that was actually sent
+          apiOutput: data,  // Store full API response for debugging
+          durationSeconds: durationSeconds
+        };
+      } catch (error) {
+        diagnostics.log('api', 'API ERROR - EXCEPTION DURING API CALL', {
+          errorMessage: error.message,
+          errorStack: error.stack
+        });
+  
+        return {
+          valid: false,
+          error: error.message
+        };
+      }
     }
   };
   
@@ -776,8 +748,6 @@
   
       let continueProcessing = true;
       let iteration = 0;
-      let consecutiveErrors = 0;
-      const MAX_RETRIES = 3;
   
       while (continueProcessing) {
         iteration++;
@@ -792,40 +762,15 @@
         onHideLoading();
   
         if (!response.valid) {
-          // Invalid response - provide detailed feedback to AI
+          // Invalid response - show error to user without adding to conversation
           diagnostics.log('context', '[Core] Invalid response: ' + response.error);
-          consecutiveErrors++;
-          diagnostics.log('context', `[Core] Consecutive errors: ${consecutiveErrors}/${MAX_RETRIES}`);
+          onProcessingChange(false);
   
-          // Only show error to user if we've exceeded retry limit
-          if (consecutiveErrors >= MAX_RETRIES) {
-            diagnostics.log('context', '[Core] Max retries exceeded, showing error to user');
-            addMessage({
-              type: 'assistant_msg',
-              content: `Error: Invalid response after ${MAX_RETRIES} attempts - ${response.error}`
-            });
-            onRenderMessages();
-            onProcessingChange(false);
-            return { success: false, error: response.error, iterations: iteration };
-          }
+          // Show error in alert instead of adding to conversation
+          alert(`API Error: ${response.error}\n\nPlease try again.`);
   
-          // Send error feedback to AI
-          let errorFeedback = `ERROR: Your response was invalid. Error: "${response.error}"\n\n`;
-          errorFeedback += `Your response was:\n${response.text.substring(0, 300)}${response.text.length > 300 ? '...' : ''}\n\n`;
-          errorFeedback += `Please provide a valid JSON response.`;
-  
-          addMessage({
-            type: 'user_msg',
-            content: errorFeedback,
-            fromSystem: true
-          });
-  
-          onLoading();
-          continue;
+          return { success: false, error: response.error, iterations: iteration };
         }
-  
-        // Reset error counter on successful response
-        consecutiveErrors = 0;
   
         const parsedResponse = response.parsed;
   
@@ -4042,6 +3987,19 @@
           letter-spacing: 0.5px;
         }
   
+        /* Message character count badge */
+        .message-char-count {
+          position: absolute;
+          bottom: 4px;
+          right: 8px;
+          font-size: 10px;
+          color: #666;
+          font-weight: normal;
+          opacity: 0.6;
+          pointer-events: none;
+          font-family: 'Consolas', 'Courier New', monospace;
+        }
+  
         /* Modal Overlay */
         .modal-overlay {
           position: fixed;
@@ -4878,7 +4836,17 @@
         // Shift+Enter = newline
         if (e.key === 'Enter' && !e.shiftKey) {
           e.preventDefault();
-          onAddMessage();
+  
+          // If input is empty and submit button is visible, submit to AI
+          const inputValue = textarea.value.trim();
+          const submitBtn = document.getElementById('submit-ai-btn');
+          const submitBtnVisible = submitBtn && submitBtn.style.display !== 'none';
+  
+          if (!inputValue && submitBtnVisible) {
+            onSubmitToAI();
+          } else {
+            onAddMessage();
+          }
         }
       });
   
@@ -5062,6 +5030,15 @@
               this.addMessageActions(pairDiv, msg.id, nextMsg.id);
             }
   
+            // Add character count for the pair (combined)
+            const pairCharCount = this.getMessageCharCount(msg) + this.getMessageCharCount(nextMsg);
+            if (pairCharCount > 0) {
+              const charBadge = document.createElement('div');
+              charBadge.className = 'message-char-count';
+              charBadge.textContent = this.formatSizeDecimal(pairCharCount);
+              pairDiv.appendChild(charBadge);
+            }
+  
             container.appendChild(pairDiv);
             return;
           }
@@ -5088,6 +5065,15 @@
             messageDiv.classList.add('selected');
           }
   
+          // Add character count
+          const charCount = this.getMessageCharCount(msg);
+          if (charCount > 0) {
+            const charBadge = document.createElement('div');
+            charBadge.className = 'message-char-count';
+            charBadge.textContent = this.formatSizeDecimal(charCount);
+            messageDiv.appendChild(charBadge);
+          }
+  
           container.appendChild(messageDiv);
           return;
         } else if (msg.type === 'tool-result') {
@@ -5107,6 +5093,15 @@
   
           if (state.isMessageSelected(msg.id)) {
             messageDiv.classList.add('selected');
+          }
+  
+          // Add character count
+          const charCount = this.getMessageCharCount(msg);
+          if (charCount > 0) {
+            const charBadge = document.createElement('div');
+            charBadge.className = 'message-char-count';
+            charBadge.textContent = this.formatSizeDecimal(charCount);
+            messageDiv.appendChild(charBadge);
           }
   
           container.appendChild(messageDiv);
@@ -5182,6 +5177,15 @@
         // Add selection state
         if (state.isMessageSelected(msg.id)) {
           messageDiv.classList.add('selected');
+        }
+  
+        // Add character count
+        const charCount = this.getMessageCharCount(msg);
+        if (charCount > 0) {
+          const charBadge = document.createElement('div');
+          charBadge.className = 'message-char-count';
+          charBadge.textContent = this.formatSizeDecimal(charCount);
+          messageDiv.appendChild(charBadge);
         }
   
         container.appendChild(messageDiv);
@@ -5738,6 +5742,20 @@
     formatSize: function(chars) {
       const k = Math.ceil(chars / 1000);
       return k + 'K';
+    },
+  
+    // Format size with 1 decimal place (e.g., 7.3K)
+    formatSizeDecimal: function(chars) {
+      const k = chars / 1000;
+      return k.toFixed(1) + 'K';
+    },
+  
+    // Calculate character count for a message (excluding fromSystem and uiOnly)
+    getMessageCharCount: function(msg) {
+      if (msg.uiOnly || msg.fromSystem || !msg.content) {
+        return 0;
+      }
+      return msg.content.length;
     },
   
     // Update context stats display
