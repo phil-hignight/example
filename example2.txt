@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-23T16:54:35.746Z
+// AI Agent - Built 2025-11-23T17:10:57.243Z
 (function() {
   window.module = {};
 
@@ -4019,105 +4019,10 @@
           word-wrap: break-word;
         }
   
-        /* Tool Group Container */
-        .tool-group {
+        /* Tool Pair Container (inline tool-use + tool-result) */
+        .tool-pair {
           margin-bottom: 8px;
-        }
-  
-        /* Tool Use Messages (before execution) */
-        .tool-use-message {
           position: relative;
-          color: var(--color-text-secondary);
-          padding: 0px 12px;
-          background: rgba(212, 160, 23, 0.08);
-          border-left: 3px solid rgba(212, 160, 23, 0.5);
-          border-radius: 4px;
-          cursor: pointer;
-          transition: all 0.2s ease;
-          font-size: 13px;
-          line-height: 1.2;
-        }
-  
-        /* When in a group, remove individual border radius and add top border */
-        .tool-group .tool-use-message {
-          border-radius: 0;
-          margin-bottom: 0;
-          border-top: 0.5px solid rgba(64, 64, 64, 0.3);
-        }
-  
-        /* First child in group gets top rounded corners and no top border */
-        .tool-group .tool-use-message:first-child {
-          border-radius: 4px 4px 0 0;
-          border-top: none;
-        }
-  
-        /* Last child in group gets bottom rounded corners */
-        .tool-group .tool-use-message:last-child {
-          border-radius: 0 0 4px 4px;
-        }
-  
-        /* Single child gets all corners rounded */
-        .tool-group .tool-use-message:first-child:last-child {
-          border-radius: 4px;
-        }
-  
-        .tool-use-message:hover {
-          background: rgba(212, 160, 23, 0.12);
-          border-left-color: var(--color-gold);
-          transform: translateX(2px);
-        }
-  
-        .tool-use-message .message-content {
-          white-space: pre-wrap;
-          word-wrap: break-word;
-        }
-  
-        /* Tool Result Messages (after execution) */
-        .tool-result-message {
-          position: relative;
-          color: var(--color-text-secondary);
-          padding: 0px 12px;
-          background: rgba(76, 175, 80, 0.08);
-          border-left: 3px solid rgba(76, 175, 80, 0.5);
-          border-radius: 4px;
-          cursor: pointer;
-          transition: all 0.2s ease;
-          font-size: 13px;
-          line-height: 1.2;
-        }
-  
-        /* When in a group, remove individual border radius and add top border */
-        .tool-group .tool-result-message {
-          border-radius: 0;
-          margin-bottom: 0;
-          border-top: 0.5px solid rgba(64, 64, 64, 0.3);
-        }
-  
-        /* First child in group gets top rounded corners and no top border */
-        .tool-group .tool-result-message:first-child {
-          border-radius: 4px 4px 0 0;
-          border-top: none;
-        }
-  
-        /* Last child in group gets bottom rounded corners */
-        .tool-group .tool-result-message:last-child {
-          border-radius: 0 0 4px 4px;
-        }
-  
-        /* Single child gets all corners rounded */
-        .tool-group .tool-result-message:first-child:last-child {
-          border-radius: 4px;
-        }
-  
-        .tool-result-message:hover {
-          background: rgba(76, 175, 80, 0.15);
-          border-left-color: #4caf50;
-          transform: translateX(2px);
-        }
-  
-        .tool-result-message .message-content {
-          white-space: pre-wrap;
-          word-wrap: break-word;
         }
   
         /* Modal Overlay */
@@ -5028,9 +4933,6 @@
   
       container.innerHTML = '';
   
-      // Track which groupIds have been rendered
-      const renderedGroupIds = new Set();
-  
       messages.forEach((msg, index) => {
         // Skip messages from system (tool results, internal prompts)
         if (msg.fromSystem) {
@@ -5054,104 +4956,7 @@
           return;
         }
   
-        // Check if this message belongs to a tool group
-        const groupId = (msg.isToolUse && msg.toolUseData?.groupId) ||
-                        (msg.isToolResult && msg.toolResultData?.groupId);
-  
-        // If this message has a groupId and we've already rendered this group, skip it
-        if (groupId && renderedGroupIds.has(groupId)) {
-          return;
-        }
-  
-        // If this message is part of a tool group, collect all messages in that group
-        if (groupId) {
-          // Mark this group as rendered
-          renderedGroupIds.add(groupId);
-  
-          // Collect all messages with this groupId (both tool-use and tool-result)
-          const groupMessages = messages.filter(m => {
-            const msgGroupId = (m.isToolUse && m.toolUseData?.groupId) ||
-                               (m.isToolResult && m.toolResultData?.groupId);
-            return msgGroupId === groupId;
-          });
-  
-          // Create a grouped container
-          const groupDiv = document.createElement('div');
-          groupDiv.className = 'message tool-group';
-  
-          // Add selection state
-          const state = window.module['state.js'];
-          const firstMsg = groupMessages[0];
-          if (firstMsg && firstMsg.id && state.isMessageSelected(firstMsg.id)) {
-            groupDiv.classList.add('selected');
-          }
-  
-          // Add click handler for selection (using first message's ID)
-          groupDiv.addEventListener('click', (e) => {
-            if (!firstMsg || !firstMsg.id) return;
-  
-            // Don't interfere with edit/delete buttons or contenteditable
-            if (e.target.closest('.message-actions') || e.target.isContentEditable) {
-              return;
-            }
-  
-            e.stopPropagation();
-  
-            const ui = window.module['ui.js'];
-            if (e.shiftKey && ui.lastClickedMessageId) {
-              // Range selection
-              state.selectMessageRange(ui.lastClickedMessageId, firstMsg.id);
-            } else {
-              // Toggle single selection
-              state.toggleMessageSelection(firstMsg.id);
-            }
-  
-            ui.lastClickedMessageId = firstMsg.id;
-  
-            // Re-render to show selection
-            this.renderMessages(state.getMessages());
-            this.updateContextStats();
-            this.updateCompactButtonVisibility();
-          });
-  
-          // Render each message in the group in order
-          groupMessages.forEach(groupMsg => {
-            if (groupMsg.isToolUse) {
-              // Create tool-use div
-              const toolUseDiv = document.createElement('div');
-              toolUseDiv.className = 'tool-use-message';
-  
-              const toolUseContent = document.createElement('div');
-              toolUseContent.className = 'message-content';
-              toolUseContent.textContent = groupMsg.content;
-              toolUseDiv.appendChild(toolUseContent);
-  
-              groupDiv.appendChild(toolUseDiv);
-            } else if (groupMsg.isToolResult) {
-              // Create tool-result div
-              const toolResultDiv = document.createElement('div');
-              toolResultDiv.className = 'tool-result-message';
-  
-              const toolResultContent = document.createElement('div');
-              toolResultContent.className = 'message-content';
-              toolResultContent.textContent = groupMsg.content;
-              toolResultDiv.appendChild(toolResultContent);
-  
-              groupDiv.appendChild(toolResultDiv);
-            }
-          });
-  
-          // Add edit/delete buttons to the group container
-          // Use the first message's ID for the whole group
-          if (groupMessages.length > 0 && groupMessages[0].id) {
-            this.addMessageActions(groupDiv, groupMessages[0].id);
-          }
-  
-          container.appendChild(groupDiv);
-          return;
-        }
-  
-        // Regular message rendering (for non-grouped messages)
+        // Regular message rendering
         const messageDiv = document.createElement('div');
   
         // Add click handler for selection (with shift-click support)
@@ -5182,7 +4987,73 @@
         });
   
         // Handle new tool-use and tool-result types
+        // Check if this is a tool-use followed by tool-result (pair them)
         if (msg.type === 'tool-use') {
+          const nextMsg = messages[index + 1];
+          const isPaired = nextMsg && nextMsg.type === 'tool-result';
+  
+          if (isPaired) {
+            // Create a container for both messages
+            const pairDiv = document.createElement('div');
+            pairDiv.className = 'message tool-pair';
+  
+            // Tool use part
+            const toolUseDiv = document.createElement('div');
+            toolUseDiv.className = 'tool-use-inline';
+  
+            const toolName = document.createElement('span');
+            toolName.className = 'tool-name';
+            toolName.textContent = msg.toolName;
+  
+            const toolParams = document.createElement('span');
+            toolParams.className = 'tool-params';
+            toolParams.textContent = ' ' + JSON.stringify(msg.params);
+  
+            toolUseDiv.appendChild(toolName);
+            toolUseDiv.appendChild(toolParams);
+            pairDiv.appendChild(toolUseDiv);
+  
+            // Tool result part
+            const toolResultDiv = document.createElement('div');
+            toolResultDiv.className = nextMsg.error ? 'tool-result-inline error' : 'tool-result-inline';
+            toolResultDiv.textContent = nextMsg.summary;
+            pairDiv.appendChild(toolResultDiv);
+  
+            // Add selection state (using tool-use message ID)
+            if (state.isMessageSelected(msg.id)) {
+              pairDiv.classList.add('selected');
+            }
+  
+            // Add click handler for selection
+            pairDiv.addEventListener('click', (e) => {
+              if (e.target.closest('.message-actions') || e.target.isContentEditable) {
+                return;
+              }
+              e.stopPropagation();
+  
+              const ui = window.module['ui.js'];
+              if (e.shiftKey && ui.lastClickedMessageId) {
+                state.selectMessageRange(ui.lastClickedMessageId, msg.id);
+              } else {
+                state.toggleMessageSelection(msg.id);
+              }
+              ui.lastClickedMessageId = msg.id;
+  
+              this.renderMessages(state.getMessages());
+              this.updateContextStats();
+              this.updateCompactButtonVisibility();
+            });
+  
+            // Add single edit/delete button for the pair
+            if (msg.id) {
+              this.addMessageActions(pairDiv, msg.id, nextMsg.id);
+            }
+  
+            container.appendChild(pairDiv);
+            return;
+          }
+  
+          // Unpaired tool-use (shouldn't normally happen)
           messageDiv.className = 'message tool-use-inline';
   
           const toolName = document.createElement('span');
@@ -5196,12 +5067,10 @@
           messageDiv.appendChild(toolName);
           messageDiv.appendChild(toolParams);
   
-          // Add edit/delete buttons
           if (msg.id) {
             this.addMessageActions(messageDiv, msg.id);
           }
   
-          // Add selection state
           if (state.isMessageSelected(msg.id)) {
             messageDiv.classList.add('selected');
           }
@@ -5209,45 +5078,20 @@
           container.appendChild(messageDiv);
           return;
         } else if (msg.type === 'tool-result') {
-          messageDiv.className = msg.error ? 'message tool-result-inline error' : 'message tool-result-inline';
-  
-          // Parse summary to style different parts
-          // Format: "Read File • path/to/file.js\nlines info"
-          const lines = msg.summary.split('\n');
-          if (lines.length > 1 && lines[0].includes('•')) {
-            // Multi-line format with separator
-            const [toolPart, ...rest] = lines;
-            const [toolName, ...pathParts] = toolPart.split('•');
-            const path = pathParts.join('•').trim();
-  
-            const toolSpan = document.createElement('span');
-            toolSpan.style.fontWeight = 'bold';
-            toolSpan.style.color = '#aaaaaa';
-            toolSpan.textContent = toolName.trim() + ' • ';
-  
-            const pathSpan = document.createElement('span');
-            pathSpan.textContent = path;
-  
-            const lineBreak = document.createElement('br');
-  
-            const infoSpan = document.createElement('span');
-            infoSpan.textContent = rest.join('\n');
-  
-            messageDiv.appendChild(toolSpan);
-            messageDiv.appendChild(pathSpan);
-            messageDiv.appendChild(lineBreak);
-            messageDiv.appendChild(infoSpan);
-          } else {
-            // Fallback to plain text
-            messageDiv.textContent = msg.summary;
+          // Check if previous message was tool-use (if so, skip - already rendered as pair)
+          const prevMsg = messages[index - 1];
+          if (prevMsg && prevMsg.type === 'tool-use') {
+            return; // Skip, already rendered with tool-use
           }
   
-          // Add edit/delete buttons
+          // Unpaired tool-result (shouldn't normally happen)
+          messageDiv.className = msg.error ? 'message tool-result-inline error' : 'message tool-result-inline';
+          messageDiv.textContent = msg.summary;
+  
           if (msg.id) {
             this.addMessageActions(messageDiv, msg.id);
           }
   
-          // Add selection state
           if (state.isMessageSelected(msg.id)) {
             messageDiv.classList.add('selected');
           }
@@ -5256,19 +5100,10 @@
           return;
         }
   
-        // Apply different styling for tool use and tool result messages
-        if (msg.isToolUse) {
-          messageDiv.className = 'message tool-use-message';
-        } else if (msg.isToolResult) {
-          messageDiv.className = 'message tool-result-message';
-        } else if (msg.isToolExecution) {
-          // Legacy support
-          messageDiv.className = 'message tool-message';
-        } else {
-          // Translate type to CSS class (e.g., user_msg -> user-message)
-          const cssClass = msg.type === 'user_msg' ? 'user' : msg.type === 'assistant_msg' ? 'assistant' : msg.type;
-          messageDiv.className = `message ${cssClass}-message`;
-        }
+        // Apply styling based on message type
+        // Translate type to CSS class (e.g., user_msg -> user-message)
+        const cssClass = msg.type === 'user_msg' ? 'user' : msg.type === 'assistant_msg' ? 'assistant' : msg.type;
+        messageDiv.className = `message ${cssClass}-message`;
   
         // Check for compaction notice - apply special gray italic styling
         if (msg.isCompactionNotice) {
@@ -6193,7 +6028,8 @@
     },
   
     // Add edit/delete buttons to a message element
-    addMessageActions: function(messageElement, messageId) {
+    // For tool pairs, pass both messageId (tool-use) and pairedMessageId (tool-result)
+    addMessageActions: function(messageElement, messageId, pairedMessageId = null) {
       const state = window.module['state.js'];
   
       const actionsDiv = document.createElement('div');
@@ -6208,7 +6044,7 @@
         if (state.isProcessing()) {
           return;
         }
-        this.enterEditMode(messageElement, messageId);
+        this.enterEditMode(messageElement, messageId, pairedMessageId);
       };
   
       const deleteBtn = document.createElement('button');
@@ -6220,7 +6056,7 @@
         if (state.isProcessing()) {
           return;
         }
-        this.deleteMessage(messageId);
+        this.deleteMessage(messageId, pairedMessageId);
       };
   
       actionsDiv.appendChild(editBtn);
@@ -6229,11 +6065,102 @@
     },
   
     // Enter edit mode for a message
-    enterEditMode: function(messageElement, messageId) {
+    // For tool pairs, pass both messageId (tool-use) and pairedMessageId (tool-result)
+    enterEditMode: function(messageElement, messageId, pairedMessageId = null) {
       const state = window.module['state.js'];
       const message = state.getMessages().find(m => m.id === messageId);
       if (!message) return;
   
+      // For tool pairs, make both divs editable
+      if (pairedMessageId) {
+        const pairedMessage = state.getMessages().find(m => m.id === pairedMessageId);
+        if (!pairedMessage) return;
+  
+        const toolUseDiv = messageElement.querySelector('.tool-use-inline');
+        const toolResultDiv = messageElement.querySelector('.tool-result-inline');
+  
+        if (!toolUseDiv || !toolResultDiv) return;
+  
+        // Make tool-use editable (just the params span)
+        const paramsSpan = toolUseDiv.querySelector('.tool-params');
+        if (paramsSpan) {
+          paramsSpan.contentEditable = true;
+          paramsSpan.classList.add('editing');
+          paramsSpan.focus();
+  
+          // Select all text
+          const range = document.createRange();
+          range.selectNodeContents(paramsSpan);
+          const selection = window.getSelection();
+          selection.removeAllRanges();
+          selection.addRange(range);
+        }
+  
+        // Make tool-result editable
+        toolResultDiv.contentEditable = true;
+        toolResultDiv.classList.add('editing');
+  
+        // Create save/cancel buttons
+        const actionsDiv = document.createElement('div');
+        actionsDiv.className = 'edit-actions';
+  
+        const saveBtn = document.createElement('button');
+        saveBtn.className = 'edit-action-btn edit-save-btn';
+        saveBtn.textContent = 'Save';
+        saveBtn.onclick = () => {
+          if (paramsSpan) {
+            const newParamsText = paramsSpan.textContent.trim();
+            try {
+              const newParams = JSON.parse(newParamsText);
+              // Update tool-use message
+              state.editMessage(messageId, `${message.toolName} ${JSON.stringify(newParams)}`);
+              // Also update params property
+              const msg = state.getMessages().find(m => m.id === messageId);
+              if (msg) msg.params = newParams;
+            } catch (e) {
+              alert('Invalid JSON in parameters');
+              return;
+            }
+          }
+  
+          const newSummary = toolResultDiv.textContent.trim();
+          if (!newSummary) {
+            alert('Result summary cannot be empty');
+            return;
+          }
+          state.editMessage(pairedMessageId, newSummary);
+          // Also update summary property
+          const pairedMsg = state.getMessages().find(m => m.id === pairedMessageId);
+          if (pairedMsg) pairedMsg.summary = newSummary;
+  
+          this.renderMessages(state.getMessages());
+          this.updateContextStats();
+        };
+  
+        const cancelBtn = document.createElement('button');
+        cancelBtn.className = 'edit-action-btn edit-cancel-btn';
+        cancelBtn.textContent = 'Cancel';
+        cancelBtn.onclick = () => {
+          this.renderMessages(state.getMessages());
+        };
+  
+        actionsDiv.appendChild(saveBtn);
+        actionsDiv.appendChild(cancelBtn);
+        messageElement.appendChild(actionsDiv);
+  
+        // ESC to cancel
+        const escHandler = (e) => {
+          if (e.key === 'Escape') {
+            this.renderMessages(state.getMessages());
+            document.removeEventListener('keydown', escHandler);
+          }
+        };
+        document.addEventListener('keydown', escHandler);
+  
+        return;
+      }
+  
+      // Regular single message editing
       const contentDiv = messageElement.querySelector('.message-content');
       if (!contentDiv) return;
   
@@ -6302,7 +6229,8 @@
     },
   
     // Delete a message with confirmation
-    deleteMessage: function(messageId) {
+    // For tool pairs, pass both messageId (tool-use) and pairedMessageId (tool-result)
+    deleteMessage: function(messageId, pairedMessageId = null) {
       const state = window.module['state.js'];
       const messages = state.getMessages();
       const message = messages.find(m => m.id === messageId);
@@ -6310,22 +6238,10 @@
       if (!message) return;
   
       if (confirm('Delete this message?')) {
-        // Check if this is part of a tool group
-        const groupId = (message.isToolUse && message.toolUseData?.groupId) ||
-                        (message.isToolResult && message.toolResultData?.groupId);
-  
-        if (groupId) {
-          // Delete ALL messages in this group
-          const groupMessageIds = messages
-            .filter(m => {
-              const msgGroupId = (m.isToolUse && m.toolUseData?.groupId) ||
-                                 (m.isToolResult && m.toolResultData?.groupId);
-              return msgGroupId === groupId;
-            })
-            .map(m => m.id);
-  
-          // Delete all group messages
-          groupMessageIds.forEach(id => state.deleteMessage(id));
+        // If this is a tool pair, delete both
+        if (pairedMessageId) {
+          state.deleteMessage(messageId);
+          state.deleteMessage(pairedMessageId);
         } else {
           // Delete single message
           state.deleteMessage(messageId);
