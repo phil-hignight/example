@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-23T03:46:04.583Z
+// AI Agent - Built 2025-11-23T04:26:16.526Z
 (function() {
   window.module = {};
 
@@ -500,11 +500,8 @@
     },
   
     // Simple API call without system prompt - for internal operations like summarization
-    callAPISimple: async function(messages, maxRetries = 3, requestType = 'simple') {
+    callAPISimple: async function(messages, maxRetries = 3) {
       const authToken = localStorage.getItem('token');
-      const requestLogger = window.module['request-logger.js'];
-  
-      console.log('[API] callAPISimple called with requestType:', requestType);
   
       const requestBody = {
         stream: false,
@@ -542,20 +539,12 @@
           if (!response.ok) {
             const errorText = await response.text();
             attemptTimings.push({ attempt: attempt + 1, duration: attemptDuration, success: false });
-            // Log failed request
-            if (requestLogger) {
-              requestLogger.logRequest(requestBody, { error: errorText, status: response.status }, { type: requestType });
-            }
             throw new Error(`API request failed (${response.status}): ${errorText}`);
           }
   
           const data = await response.json();
           const responseText = data.choices[0].message.content;
           attemptTimings.push({ attempt: attempt + 1, duration: attemptDuration, success: true });
-          // Log successful request
-          if (requestLogger) {
-            requestLogger.logRequest(requestBody, data, { type: requestType });
-          }
           return { valid: true, text: responseText, attemptTimings };
         } catch (error) {
           const attemptDuration = ((Date.now() - attemptStart) / 1000).toFixed(1);
@@ -563,10 +552,6 @@
             attemptTimings.push({ attempt: attempt + 1, duration: attemptDuration, success: false });
           }
           if (attempt >= maxRetries - 1) {
-            // Log final failed request
-            if (requestLogger) {
-              requestLogger.logRequest(requestBody, { error: error.message }, { type: requestType });
-            }
             return { valid: false, error: error.message, attemptTimings };
           }
         }
@@ -577,7 +562,6 @@
       const diagnostics = window.module['diagnostics.js'];
       const authToken = localStorage.getItem('token');
       const tools = window.module['tools.js'];
-      const requestLogger = window.module['request-logger.js'];
       const TERMINATOR = '||||END||||';
   
       const result = this.renderMessagesForAPI(messages);
@@ -725,11 +709,6 @@
               errorMessage += ` (Response was incomplete: ${incompleteReason})`;
             }
   
-            // Log failed request
-            if (requestLogger) {
-              requestLogger.logRequest(requestBody, { error: errorMessage, data });
-            }
-  
             // On validation errors, return immediately with error details
             // Don't retry - let the main loop provide feedback to AI
             return {
@@ -744,11 +723,6 @@
               incomplete: wasIncomplete,
               incompleteReason: incompleteReason
             };
-          }
-  
-          // Log successful request
-          if (requestLogger) {
-            requestLogger.logRequest(requestBody, data);
           }
   
           // Return both raw text and parsed response
@@ -773,11 +747,6 @@
           if (attempt < maxRetries - 1) {
             diagnostics.log('api', 'Retrying API call');
             continue;
-          } else {
-            // Log final failed request on last attempt
-            if (requestLogger) {
-              requestLogger.logRequest(requestBody, { error: error.message });
-            }
           }
         }
       }
@@ -950,7 +919,7 @@
   
     // Per-tool token limits
     toolTokenLimits: {
-      read_file: 10000,          // ~40000 chars, ~1000 lines
+      read_file: 2000,           // ~8000 chars, ~200 lines
       list_directory: 500,       // ~2000 chars
       search_by_content: 1000,   // ~4000 chars
       search_by_filename: 500,   // ~2000 chars
@@ -3419,7 +3388,7 @@
       try {
         // Call API for summarization
         console.log('[Compaction] Requesting summary from API...');
-        const response = await api.callAPISimple(summarizationMessages, 3, 'compaction');
+        const response = await api.callAPISimple(summarizationMessages);
   
         if (!response.valid) {
           console.log('[Compaction] Failed to get summary from API');
@@ -3455,77 +3424,6 @@
         console.log('[Compaction] Exception: ' + error.message);
         return false;
       }
-    }
-  };
-  
-
-  // Module: request-logger.js
-  // Request Logger - Tracks all API requests for debugging
-  window.module['request-logger.js'] = {
-    requests: [],
-  
-    // Log a new request
-    logRequest: function(requestBody, response = null, metadata = {}) {
-      const timestamp = Date.now();
-  
-      console.log('[RequestLogger] logRequest called with metadata:', metadata);
-  
-      // Extract first message to determine role
-      let role = 'unknown';
-      let contentPreview = '';
-      let charCount = 0;
-  
-      if (requestBody.messages && requestBody.messages.length > 0) {
-        const firstMsg = requestBody.messages[0];
-        role = firstMsg.role || 'unknown';
-        contentPreview = firstMsg.content || '';
-  
-        // Calculate total character count
-        charCount = requestBody.messages.reduce((sum, msg) => {
-          return sum + (msg.content ? msg.content.length : 0);
-        }, 0);
-      }
-  
-      // Generate ID with type suffix if provided
-      const typeSuffix = metadata.type ? `-${metadata.type}` : '';
-      const request = {
-        id: `req-${timestamp}-${Math.random().toString(36).substr(2, 9)}${typeSuffix}`,
-        timestamp,
-        requestBody,
-        response,
-        role,
-        contentPreview: contentPreview.substring(0, 200), // First 200 chars
-        charCount,
-        type: metadata.type || 'normal'  // normal or compaction
-      };
-  
-      console.log('[RequestLogger] Created request with ID:', request.id, 'type:', request.type);
-  
-      this.requests.push(request);
-  
-      console.log('[RequestLogger] Total requests now:', this.requests.length);
-  
-      // Keep only last 100 requests
-      if (this.requests.length > 100) {
-        this.requests.shift();
-      }
-  
-      return request.id;
-    },
-  
-    // Get all requests
-    getAllRequests: function() {
-      return [...this.requests].reverse(); // Most recent first
-    },
-  
-    // Get request by ID
-    getRequest: function(id) {
-      return this.requests.find(r => r.id === id);
-    },
-  
-    // Clear all requests
-    clearRequests: function() {
-      this.requests = [];
     }
   };
   
@@ -3852,7 +3750,6 @@
           display: flex;
           gap: 8px;
           color: var(--color-text-dim);
-          margin-bottom: 16px;  /* More space after user messages */
         }
   
         .user-message .message-prefix {
@@ -3880,7 +3777,6 @@
           background-size: 100% 100%;
           transition: all 0.2s ease;
           position: relative;
-          margin-bottom: 16px;  /* More space after assistant messages */
         }
   
         .assistant-message:hover {
@@ -3903,6 +3799,14 @@
           color: var(--color-text-dim);
           opacity: 0.5;
           pointer-events: none;
+        }
+  
+        .tool-execution-timing {
+          font-size: 10px;
+          color: var(--color-text-dim);
+          text-align: center;
+          margin: 8px 0;
+          opacity: 0.6;
           font-style: italic;
         }
   
@@ -3913,7 +3817,6 @@
           background: var(--color-gold-subtle);
           border-radius: 4px;
           color: var(--color-gold);
-          margin-bottom: 16px;  /* More space after loading indicator */
         }
   
         .loading::after {
@@ -4000,7 +3903,7 @@
   
         /* Tool Group Container */
         .tool-group {
-          margin-bottom: 16px;  /* Space after tool groups to separate from next message */
+          margin-bottom: 8px;
         }
   
         /* Tool Use Messages (before execution) */
@@ -4897,10 +4800,6 @@
   
     showChatScreen: function(selectedDirectory, onSendMessage) {
       const container = document.getElementById('app-container');
-      if (!container) {
-        console.error('app-container not found');
-        return;
-      }
       container.innerHTML = '';
   
       const screen = document.createElement('div');
@@ -4984,14 +4883,8 @@
         }
       };
   
-      const requestsBtn = document.createElement('button');
-      requestsBtn.className = 'context-stat-btn';
-      requestsBtn.textContent = 'Requests';
-      requestsBtn.onclick = () => this.showRequestsScreen();
-  
       contextStats.appendChild(messagesBtn);
       contextStats.appendChild(diagBtn);
-      contextStats.appendChild(requestsBtn);
   
       inputContainer.appendChild(contextStats);
   
@@ -5008,10 +4901,6 @@
   
     renderMessages: function(messages) {
       const container = document.getElementById('chat-container');
-      if (!container) {
-        console.error('chat-container not found - may not be on chat screen');
-        return;
-      }
   
       // Preserve loading indicator if it exists
       const loadingIndicator = document.getElementById('loading-indicator');
@@ -5041,7 +4930,15 @@
         // Skip assistant messages that contain raw JSON tool execution requests
         // These are for API conversation structure only, not for UI display
         // We detect them by checking if the content starts with JSON (contains "type": "execute")
+        // However, we still want to show the timing for these AI calls
         if (msg.type === 'assistant_msg' && msg.apiData && msg.content && msg.content.includes('"type"')) {
+          // If there's timing info, display it
+          if (msg.durationSeconds !== undefined) {
+            const timingDiv = document.createElement('div');
+            timingDiv.className = 'tool-execution-timing';
+            timingDiv.textContent = `${msg.durationSeconds.toFixed(2)}s`;
+            container.appendChild(timingDiv);
+          }
           return;
         }
   
@@ -5425,11 +5322,6 @@
   
     showLoading: function(text = 'Thinking') {
       const container = document.getElementById('chat-container');
-      if (!container) {
-        console.error('chat-container not found - may not be on chat screen');
-        return;
-      }
-  
       let loading = document.getElementById('loading-indicator');
       if (loading) {
         loading.textContent = text;
@@ -6029,563 +5921,6 @@
       };
       document.addEventListener('keydown', escHandler);
   
-      document.body.appendChild(overlay);
-    },
-  
-    // Show requests debugging screen
-    showRequestsScreen: function() {
-      const requestLogger = window.module['request-logger.js'];
-      if (!requestLogger) {
-        console.error('request-logger.js module not loaded');
-        alert('Request logger module not loaded. Please refresh the page.');
-        return;
-      }
-  
-      const container = document.getElementById('app-container');
-      if (!container) {
-        console.error('app-container not found');
-        return;
-      }
-      container.innerHTML = '';
-  
-      const screen = document.createElement('div');
-      screen.id = 'requests-screen';
-      screen.style.display = 'flex';
-      screen.style.flexDirection = 'column';
-      screen.style.height = '100vh';
-      screen.style.background = 'var(--color-bg-primary)';
-  
-      // Header with back button
-      const header = document.createElement('div');
-      header.style.display = 'flex';
-      header.style.alignItems = 'center';
-      header.style.padding = '20px';
-      header.style.borderBottom = '1px solid var(--color-border)';
-      header.style.gap = '12px';
-  
-      const backBtn = document.createElement('button');
-      backBtn.textContent = '←';
-      backBtn.style.padding = '8px 16px';
-      backBtn.style.background = 'var(--color-bg-primary)';
-      backBtn.style.border = '1px solid var(--color-border)';
-      backBtn.style.color = 'var(--color-text-primary)';
-      backBtn.style.cursor = 'pointer';
-      backBtn.style.borderRadius = '4px';
-      backBtn.style.fontSize = '18px';
-      backBtn.style.fontFamily = "'Consolas', 'Courier New', monospace";
-      backBtn.onclick = () => {
-        const main = window.module['main.js'];
-        main.showChatScreen();
-      };
-  
-      const title = document.createElement('h2');
-      title.textContent = 'API Requests';
-      title.style.margin = '0';
-      title.style.color = 'var(--color-gold)';
-      title.style.fontFamily = "'Consolas', 'Courier New', monospace";
-      title.style.fontSize = '20px';
-  
-      header.appendChild(backBtn);
-      header.appendChild(title);
-  
-      // Requests list container
-      const requestsContainer = document.createElement('div');
-      requestsContainer.style.flex = '1';
-      requestsContainer.style.overflow = 'auto';
-      requestsContainer.style.padding = '20px';
-  
-      const requests = requestLogger.getAllRequests();
-  
-      console.log('[UI] Requests screen - Total requests:', requests.length);
-      console.log('[UI] Requests:', requests.map(r => ({ id: r.id, type: r.type, role: r.role })));
-  
-      if (requests.length === 0) {
-        const emptyMsg = document.createElement('div');
-        emptyMsg.textContent = 'No requests logged yet';
-        emptyMsg.style.color = 'var(--color-text-secondary)';
-        emptyMsg.style.textAlign = 'center';
-        emptyMsg.style.marginTop = '40px';
-        emptyMsg.style.fontFamily = "'Consolas', 'Courier New', monospace";
-        requestsContainer.appendChild(emptyMsg);
-      } else {
-        requests.forEach(request => {
-          console.log('[UI] Creating request item for:', request.id, 'type:', request.type);
-          const requestEl = this.createRequestItem(request);
-          requestsContainer.appendChild(requestEl);
-        });
-      }
-  
-      screen.appendChild(header);
-      screen.appendChild(requestsContainer);
-      container.appendChild(screen);
-    },
-  
-    // Create a request list item
-    createRequestItem: function(request) {
-      const item = document.createElement('div');
-      item.style.marginBottom = '12px';
-      item.style.border = '1px solid var(--color-border)';
-      item.style.borderRadius = '4px';
-      item.style.background = 'var(--color-bg-secondary)';
-      item.style.fontFamily = "'Consolas', 'Courier New', monospace";
-      item.style.fontSize = '13px';
-  
-      // Header (always visible)
-      const header = document.createElement('div');
-      header.style.padding = '12px';
-      header.style.cursor = 'pointer';
-      header.style.display = 'flex';
-      header.style.flexDirection = 'column';
-      header.style.gap = '8px';
-  
-      // First line: timestamp and role
-      const firstLine = document.createElement('div');
-      firstLine.style.display = 'flex';
-      firstLine.style.gap = '12px';
-      firstLine.style.alignItems = 'center';
-  
-      const timestamp = new Date(request.timestamp).toLocaleString();
-      const timestampEl = document.createElement('span');
-      timestampEl.textContent = timestamp;
-      timestampEl.style.color = 'var(--color-text-secondary)';
-  
-      const roleEl = document.createElement('span');
-      roleEl.textContent = request.role;
-      roleEl.style.color = request.role === 'user' ? '#6495ED' : '#90EE90';
-      roleEl.style.fontWeight = 'bold';
-  
-      const charCountEl = document.createElement('span');
-      charCountEl.textContent = `${request.charCount} chars`;
-      charCountEl.style.color = 'var(--color-text-secondary)';
-  
-      const requestIdEl = document.createElement('span');
-      requestIdEl.textContent = request.id;
-      requestIdEl.style.color = 'var(--color-text-dim)';
-      requestIdEl.style.fontSize = '11px';
-      requestIdEl.style.fontFamily = "'Consolas', 'Courier New', monospace";
-  
-      firstLine.appendChild(timestampEl);
-      firstLine.appendChild(roleEl);
-      firstLine.appendChild(charCountEl);
-      firstLine.appendChild(requestIdEl);
-  
-      // Second line: content preview
-      const previewEl = document.createElement('div');
-      previewEl.textContent = request.contentPreview;
-      previewEl.style.color = 'var(--color-text-primary)';
-      previewEl.style.whiteSpace = 'nowrap';
-      previewEl.style.overflow = 'hidden';
-      previewEl.style.textOverflow = 'ellipsis';
-  
-      header.appendChild(firstLine);
-      header.appendChild(previewEl);
-  
-      // Expanded content (initially hidden)
-      const expandedContent = document.createElement('div');
-      expandedContent.style.display = 'none';
-      expandedContent.style.borderTop = '1px solid var(--color-border)';
-      expandedContent.style.padding = '12px';
-  
-      let isExpanded = false;
-  
-      header.onclick = () => {
-        isExpanded = !isExpanded;
-        if (isExpanded) {
-          expandedContent.style.display = 'block';
-          if (expandedContent.children.length === 0) {
-            // Build expanded view on first expansion
-            this.buildExpandedRequestView(expandedContent, request);
-          }
-        } else {
-          expandedContent.style.display = 'none';
-        }
-      };
-  
-      item.appendChild(header);
-      item.appendChild(expandedContent);
-  
-      return item;
-    },
-  
-    // Build the expanded view with tabs
-    buildExpandedRequestView: function(container, request) {
-      // Tab buttons
-      const tabBar = document.createElement('div');
-      tabBar.style.display = 'flex';
-      tabBar.style.gap = '8px';
-      tabBar.style.marginBottom = '12px';
-  
-      const textTab = document.createElement('button');
-      textTab.textContent = 'Text';
-      textTab.style.padding = '6px 12px';
-      textTab.style.cursor = 'pointer';
-      textTab.style.border = '1px solid var(--color-border)';
-      textTab.style.borderRadius = '4px';
-      textTab.style.fontFamily = "'Consolas', 'Courier New', monospace";
-      textTab.style.fontSize = '12px';
-  
-      const parsedTab = document.createElement('button');
-      parsedTab.textContent = 'Parsed';
-      parsedTab.style.padding = '6px 12px';
-      parsedTab.style.cursor = 'pointer';
-      parsedTab.style.border = '1px solid var(--color-border)';
-      parsedTab.style.borderRadius = '4px';
-      parsedTab.style.fontFamily = "'Consolas', 'Courier New', monospace";
-      parsedTab.style.fontSize = '12px';
-  
-      // Tab content containers
-      const textContent = document.createElement('div');
-      textContent.style.marginBottom = '12px';
-  
-      const parsedContent = document.createElement('div');
-      parsedContent.style.display = 'none';
-      parsedContent.style.marginBottom = '12px';
-  
-      // Set active tab styling
-      const setActiveTab = (activeBtn, contentToShow, contentToHide) => {
-        textTab.style.background = 'var(--color-bg-secondary)';
-        textTab.style.color = 'var(--color-text-primary)';
-        parsedTab.style.background = 'var(--color-bg-secondary)';
-        parsedTab.style.color = 'var(--color-text-primary)';
-  
-        activeBtn.style.background = 'var(--color-gold)';
-        activeBtn.style.color = 'var(--color-bg-primary)';
-  
-        contentToShow.style.display = 'block';
-        contentToHide.style.display = 'none';
-      };
-  
-      // Default to text tab
-      setActiveTab(textTab, textContent, parsedContent);
-  
-      textTab.onclick = () => setActiveTab(textTab, textContent, parsedContent);
-      parsedTab.onclick = () => {
-        setActiveTab(parsedTab, parsedContent, textContent);
-        // Build parsed view if not already built
-        if (parsedContent.children.length === 0) {
-          this.buildParsedView(parsedContent, request.requestBody);
-        }
-      };
-  
-      tabBar.appendChild(textTab);
-      tabBar.appendChild(parsedTab);
-  
-      // Build text view
-      const jsonText = JSON.stringify(request.requestBody, null, 2);
-      const pre = document.createElement('pre');
-      pre.textContent = jsonText;
-      pre.style.background = 'var(--color-bg-primary)';
-      pre.style.padding = '12px';
-      pre.style.borderRadius = '4px';
-      pre.style.overflow = 'auto';
-      pre.style.maxHeight = '400px';
-      pre.style.color = 'var(--color-text-primary)';
-      pre.style.fontSize = '12px';
-      pre.style.margin = '0';
-      textContent.appendChild(pre);
-  
-      // Action buttons
-      const actionBar = document.createElement('div');
-      actionBar.style.display = 'flex';
-      actionBar.style.gap = '8px';
-  
-      const retryBtn = document.createElement('button');
-      retryBtn.textContent = 'Retry';
-      retryBtn.style.padding = '8px 16px';
-      retryBtn.style.background = 'var(--color-bg-primary)';
-      retryBtn.style.border = '1px solid var(--color-gold)';
-      retryBtn.style.color = 'var(--color-gold)';
-      retryBtn.style.cursor = 'pointer';
-      retryBtn.style.borderRadius = '4px';
-      retryBtn.style.fontSize = '12px';
-      retryBtn.style.fontFamily = "'Consolas', 'Courier New', monospace";
-      retryBtn.onclick = () => this.retryRequest(request.requestBody);
-  
-      const copyBtn = document.createElement('button');
-      copyBtn.textContent = 'Copy';
-      copyBtn.style.padding = '8px 16px';
-      copyBtn.style.background = 'var(--color-bg-primary)';
-      copyBtn.style.border = '1px solid var(--color-border)';
-      copyBtn.style.color = 'var(--color-text-primary)';
-      copyBtn.style.cursor = 'pointer';
-      copyBtn.style.borderRadius = '4px';
-      copyBtn.style.fontSize = '12px';
-      copyBtn.style.fontFamily = "'Consolas', 'Courier New', monospace";
-      copyBtn.onclick = () => this.showEditRequestModal(request.requestBody);
-  
-      actionBar.appendChild(retryBtn);
-      actionBar.appendChild(copyBtn);
-  
-      container.appendChild(tabBar);
-      container.appendChild(textContent);
-      container.appendChild(parsedContent);
-      container.appendChild(actionBar);
-    },
-  
-    // Build interactive tree view for parsed JSON
-    buildParsedView: function(container, obj) {
-      const tree = this.createTreeNode('root', obj, true);
-      container.appendChild(tree);
-    },
-  
-    // Create a tree node (recursive)
-    createTreeNode: function(key, value, isRoot = false) {
-      const nodeContainer = document.createElement('div');
-      nodeContainer.style.fontFamily = "'Consolas', 'Courier New', monospace";
-      nodeContainer.style.fontSize = '12px';
-  
-      const isObject = typeof value === 'object' && value !== null && !Array.isArray(value);
-      const isArray = Array.isArray(value);
-      const isExpandable = isObject || isArray;
-  
-      if (isExpandable) {
-        const header = document.createElement('div');
-        header.style.display = 'flex';
-        header.style.alignItems = 'center';
-        header.style.cursor = 'pointer';
-        header.style.padding = '4px 0';
-        header.style.color = 'var(--color-text-primary)';
-  
-        const arrow = document.createElement('span');
-        arrow.textContent = isRoot ? '▼ ' : '▶ ';
-        arrow.style.marginRight = '6px';
-        arrow.style.color = 'var(--color-text-secondary)';
-        arrow.style.userSelect = 'none';
-  
-        const label = document.createElement('span');
-        if (!isRoot) {
-          label.innerHTML = `<span style="color: var(--color-gold);">${key}</span>: ${isArray ? '[' : '{'}`;
-        } else {
-          label.textContent = 'Request Object';
-        }
-  
-        header.appendChild(arrow);
-        header.appendChild(label);
-  
-        const childrenContainer = document.createElement('div');
-        childrenContainer.style.marginLeft = '20px';
-        childrenContainer.style.display = isRoot ? 'block' : 'none';
-  
-        // Build children
-        const entries = isArray ? value.map((v, i) => [i, v]) : Object.entries(value);
-        entries.forEach(([k, v]) => {
-          const childNode = this.createTreeNode(k, v);
-          childrenContainer.appendChild(childNode);
-        });
-  
-        let isExpanded = isRoot;
-        header.onclick = () => {
-          isExpanded = !isExpanded;
-          arrow.textContent = isExpanded ? '▼ ' : '▶ ';
-          childrenContainer.style.display = isExpanded ? 'block' : 'none';
-        };
-  
-        nodeContainer.appendChild(header);
-        nodeContainer.appendChild(childrenContainer);
-      } else {
-        // Leaf node
-        const leaf = document.createElement('div');
-        leaf.style.padding = '4px 0';
-        leaf.style.marginLeft = '20px';
-  
-        const keySpan = document.createElement('span');
-        keySpan.textContent = key + ': ';
-        keySpan.style.color = 'var(--color-gold)';
-  
-        const valueSpan = document.createElement('span');
-        const valueColor = typeof value === 'string' ? '#90EE90' :
-                          typeof value === 'number' ? '#6495ED' :
-                          typeof value === 'boolean' ? '#FF6B6B' :
-                          'var(--color-text-secondary)';
-        valueSpan.style.color = valueColor;
-        valueSpan.textContent = typeof value === 'string' ? `"${value}"` : String(value);
-  
-        leaf.appendChild(keySpan);
-        leaf.appendChild(valueSpan);
-        nodeContainer.appendChild(leaf);
-      }
-  
-      return nodeContainer;
-    },
-  
-    // Retry a request
-    retryRequest: async function(requestBody) {
-      const overlay = document.createElement('div');
-      overlay.className = 'modal-overlay';
-  
-      const modalContainer = document.createElement('div');
-      modalContainer.className = 'modal-container';
-      modalContainer.style.maxWidth = '800px';
-  
-      // Header
-      const header = document.createElement('div');
-      header.className = 'modal-header';
-  
-      const titleEl = document.createElement('div');
-      titleEl.className = 'modal-title';
-      titleEl.textContent = 'Request Result';
-  
-      const closeBtn = document.createElement('button');
-      closeBtn.className = 'modal-close';
-      closeBtn.textContent = '×';
-      closeBtn.onclick = () => overlay.remove();
-  
-      header.appendChild(titleEl);
-      header.appendChild(closeBtn);
-  
-      // Body
-      const body = document.createElement('div');
-      body.className = 'modal-body';
-      body.textContent = 'Sending request...';
-      body.style.color = 'var(--color-text-primary)';
-  
-      modalContainer.appendChild(header);
-      modalContainer.appendChild(body);
-      overlay.appendChild(modalContainer);
-      document.body.appendChild(overlay);
-  
-      // Make the API call
-      try {
-        const authToken = localStorage.getItem('token');
-        const headers = { 'Content-Type': 'application/json' };
-        if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
-  
-        const response = await fetch('/api/chat/completions', {
-          method: 'POST',
-          headers,
-          body: JSON.stringify(requestBody)
-        });
-  
-        const data = await response.json();
-  
-        // Show result
-        body.innerHTML = '';
-        const pre = document.createElement('pre');
-        pre.textContent = JSON.stringify(data, null, 2);
-        pre.style.background = 'var(--color-bg-primary)';
-        pre.style.padding = '12px';
-        pre.style.borderRadius = '4px';
-        pre.style.overflow = 'auto';
-        pre.style.maxHeight = '500px';
-        pre.style.color = 'var(--color-text-primary)';
-        pre.style.fontSize = '12px';
-        body.appendChild(pre);
-      } catch (error) {
-        body.textContent = 'Error: ' + error.message;
-        body.style.color = '#ff6b6b';
-      }
-    },
-  
-    // Show edit request modal
-    showEditRequestModal: function(requestBody) {
-      const overlay = document.createElement('div');
-      overlay.className = 'modal-overlay';
-  
-      const modalContainer = document.createElement('div');
-      modalContainer.className = 'modal-container';
-      modalContainer.style.maxWidth = '800px';
-  
-      // Header
-      const header = document.createElement('div');
-      header.className = 'modal-header';
-  
-      const titleEl = document.createElement('div');
-      titleEl.className = 'modal-title';
-      titleEl.textContent = 'Edit & Run Request';
-  
-      const closeBtn = document.createElement('button');
-      closeBtn.className = 'modal-close';
-      closeBtn.textContent = '×';
-      closeBtn.onclick = () => overlay.remove();
-  
-      header.appendChild(titleEl);
-      header.appendChild(closeBtn);
-  
-      // Body
-      const body = document.createElement('div');
-      body.className = 'modal-body';
-  
-      const textarea = document.createElement('textarea');
-      textarea.value = JSON.stringify(requestBody, null, 2);
-      textarea.style.width = '100%';
-      textarea.style.height = '400px';
-      textarea.style.background = 'var(--color-bg-primary)';
-      textarea.style.border = '1px solid var(--color-border)';
-      textarea.style.color = 'var(--color-text-primary)';
-      textarea.style.padding = '12px';
-      textarea.style.borderRadius = '4px';
-      textarea.style.fontSize = '12px';
-      textarea.style.fontFamily = "'Consolas', 'Courier New', monospace";
-      textarea.style.resize = 'vertical';
-  
-      const runBtn = document.createElement('button');
-      runBtn.textContent = 'Run';
-      runBtn.style.marginTop = '12px';
-      runBtn.style.padding = '8px 16px';
-      runBtn.style.background = 'var(--color-bg-primary)';
-      runBtn.style.border = '1px solid var(--color-gold)';
-      runBtn.style.color = 'var(--color-gold)';
-      runBtn.style.cursor = 'pointer';
-      runBtn.style.borderRadius = '4px';
-      runBtn.style.fontSize = '12px';
-      runBtn.style.fontFamily = "'Consolas', 'Courier New', monospace";
-  
-      const resultDiv = document.createElement('div');
-      resultDiv.style.marginTop = '12px';
-  
-      runBtn.onclick = async () => {
-        try {
-          const editedBody = JSON.parse(textarea.value);
-  
-          runBtn.disabled = true;
-          runBtn.textContent = 'Running...';
-          resultDiv.textContent = '';
-  
-          const authToken = localStorage.getItem('token');
-          const headers = { 'Content-Type': 'application/json' };
-          if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
-  
-          const response = await fetch('/api/chat/completions', {
-            method: 'POST',
-            headers,
-            body: JSON.stringify(editedBody)
-          });
-  
-          const data = await response.json();
-  
-          // Show result
-          const pre = document.createElement('pre');
-          pre.textContent = JSON.stringify(data, null, 2);
-          pre.style.background = 'var(--color-bg-primary)';
-          pre.style.padding = '12px';
-          pre.style.borderRadius = '4px';
-          pre.style.overflow = 'auto';
-          pre.style.maxHeight = '300px';
-          pre.style.color = 'var(--color-text-primary)';
-          pre.style.fontSize = '12px';
-          resultDiv.appendChild(pre);
-  
-          // Log this request
-          const requestLogger = window.module['request-logger.js'];
-          requestLogger.logRequest(editedBody, data);
-  
-          runBtn.disabled = false;
-          runBtn.textContent = 'Run';
-        } catch (error) {
-          resultDiv.textContent = 'Error: ' + error.message;
-          resultDiv.style.color = '#ff6b6b';
-          runBtn.disabled = false;
-          runBtn.textContent = 'Run';
-        }
-      };
-  
-      body.appendChild(textarea);
-      body.appendChild(runBtn);
-      body.appendChild(resultDiv);
-  
-      modalContainer.appendChild(header);
-      modalContainer.appendChild(body);
-      overlay.appendChild(modalContainer);
       document.body.appendChild(overlay);
     }
   };
