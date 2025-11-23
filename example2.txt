@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-23T17:10:57.243Z
+// AI Agent - Built 2025-11-23T17:35:03.757Z
 (function() {
   window.module = {};
 
@@ -4905,6 +4905,7 @@
       messagesBtn.className = 'context-stat-btn';
       messagesBtn.id = 'messages-stat-btn';
       messagesBtn.textContent = '0K';
+      messagesBtn.onclick = () => this.showConversationModal();
   
       contextStats.appendChild(messagesBtn);
   
@@ -5651,6 +5652,61 @@
           body.appendChild(outputSection);
         }
       }
+  
+      document.body.appendChild(overlay);
+    },
+  
+    // Show conversation management modal
+    showConversationModal: function() {
+      const state = window.module['state.js'];
+      const overlay = this.createModalOverlay('Conversation');
+      const body = overlay.querySelector('.modal-body');
+  
+      // Current stats
+      const messages = state.getMessages();
+      const currentChars = state.calculateChars();
+      const messageCount = messages.length;
+  
+      const statsDiv = document.createElement('div');
+      statsDiv.style.marginBottom = '20px';
+      statsDiv.style.color = 'var(--color-text-primary)';
+      statsDiv.style.fontSize = '14px';
+      statsDiv.innerHTML = `
+        <div style="margin-bottom: 8px;"><strong>Messages:</strong> ${messageCount}</div>
+        <div><strong>Size:</strong> ${this.formatSize(currentChars)}</div>
+      `;
+  
+      body.appendChild(statsDiv);
+  
+      // Clear button
+      const buttonContainer = document.createElement('div');
+      buttonContainer.style.display = 'flex';
+      buttonContainer.style.gap = '12px';
+      buttonContainer.style.justifyContent = 'flex-end';
+      buttonContainer.style.marginTop = '20px';
+  
+      const clearBtn = document.createElement('button');
+      clearBtn.textContent = 'Clear Conversation';
+      clearBtn.style.padding = '8px 16px';
+      clearBtn.style.background = '#ff6b6b';
+      clearBtn.style.border = 'none';
+      clearBtn.style.color = 'white';
+      clearBtn.style.cursor = 'pointer';
+      clearBtn.style.borderRadius = '4px';
+      clearBtn.style.fontSize = '14px';
+      clearBtn.style.fontFamily = "'Consolas', 'Courier New', monospace";
+      clearBtn.style.fontWeight = 'bold';
+      clearBtn.onclick = () => {
+        if (confirm('Are you sure you want to clear all messages?')) {
+          state.clearMessages();
+          this.renderMessages(state.getMessages());
+          this.updateContextStats();
+          overlay.remove();
+        }
+      };
+  
+      buttonContainer.appendChild(clearBtn);
+      body.appendChild(buttonContainer);
   
       document.body.appendChild(overlay);
     },
