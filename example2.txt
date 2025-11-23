@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-23T03:36:14.162Z
+// AI Agent - Built 2025-11-23T03:41:14.386Z
 (function() {
   window.module = {};
 
@@ -3466,6 +3466,8 @@
     logRequest: function(requestBody, response = null, metadata = {}) {
       const timestamp = Date.now();
   
+      console.log('[RequestLogger] logRequest called with metadata:', metadata);
+  
       // Extract first message to determine role
       let role = 'unknown';
       let contentPreview = '';
@@ -3495,7 +3497,11 @@
         type: metadata.type || 'normal'  // normal or compaction
       };
   
+      console.log('[RequestLogger] Created request with ID:', request.id, 'type:', request.type);
+  
       this.requests.push(request);
+  
+      console.log('[RequestLogger] Total requests now:', this.requests.length);
   
       // Keep only last 100 requests
       if (this.requests.length > 100) {
@@ -3844,6 +3850,7 @@
           display: flex;
           gap: 8px;
           color: var(--color-text-dim);
+          margin-bottom: 16px;  /* More space after user messages */
         }
   
         .user-message .message-prefix {
@@ -3871,6 +3878,7 @@
           background-size: 100% 100%;
           transition: all 0.2s ease;
           position: relative;
+          margin-bottom: 16px;  /* More space after assistant messages */
         }
   
         .assistant-message:hover {
@@ -3903,6 +3911,7 @@
           background: var(--color-gold-subtle);
           border-radius: 4px;
           color: var(--color-gold);
+          margin-bottom: 16px;  /* More space after loading indicator */
         }
   
         .loading::after {
@@ -3989,7 +3998,7 @@
   
         /* Tool Group Container */
         .tool-group {
-          margin-bottom: 8px;
+          margin-bottom: 16px;  /* Space after tool groups to separate from next message */
         }
   
         /* Tool Use Messages (before execution) */
@@ -6085,6 +6094,9 @@
   
       const requests = requestLogger.getAllRequests();
   
+      console.log('[UI] Requests screen - Total requests:', requests.length);
+      console.log('[UI] Requests:', requests.map(r => ({ id: r.id, type: r.type, role: r.role })));
+  
       if (requests.length === 0) {
         const emptyMsg = document.createElement('div');
         emptyMsg.textContent = 'No requests logged yet';
@@ -6095,6 +6107,7 @@
         requestsContainer.appendChild(emptyMsg);
       } else {
         requests.forEach(request => {
+          console.log('[UI] Creating request item for:', request.id, 'type:', request.type);
           const requestEl = this.createRequestItem(request);
           requestsContainer.appendChild(requestEl);
         });
