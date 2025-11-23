@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-23T17:35:03.757Z
+// AI Agent - Built 2025-11-23T17:57:02.361Z
 (function() {
   window.module = {};
 
@@ -3443,8 +3443,8 @@
   
       let totalChars = 0;
       messages.forEach(msg => {
-        // Skip uiOnly messages - they don't get sent to API
-        if (!msg.uiOnly && msg.content) {
+        // Skip uiOnly and fromSystem messages - they don't get sent to API or are internal
+        if (!msg.uiOnly && !msg.fromSystem && msg.content) {
           totalChars += msg.content.length;
         }
       });
@@ -4023,6 +4023,23 @@
         .tool-pair {
           margin-bottom: 8px;
           position: relative;
+        }
+  
+        /* System messages - visually distinct */
+        .from-system {
+          border-left: 3px solid #ff9800 !important;
+          background: rgba(255, 152, 0, 0.05) !important;
+          opacity: 0.85;
+        }
+  
+        .from-system::before {
+          content: "⚙ SYSTEM";
+          display: block;
+          font-size: 10px;
+          font-weight: bold;
+          color: #ff9800;
+          margin-bottom: 4px;
+          letter-spacing: 0.5px;
         }
   
         /* Modal Overlay */
@@ -4935,11 +4952,6 @@
       container.innerHTML = '';
   
       messages.forEach((msg, index) => {
-        // Skip messages from system (tool results, internal prompts)
-        if (msg.fromSystem) {
-          return;
-        }
-  
         // Skip marker messages
         if (msg.isMarker) {
           return;
@@ -5105,6 +5117,11 @@
         // Translate type to CSS class (e.g., user_msg -> user-message)
         const cssClass = msg.type === 'user_msg' ? 'user' : msg.type === 'assistant_msg' ? 'assistant' : msg.type;
         messageDiv.className = `message ${cssClass}-message`;
+  
+        // Add fromSystem class for system messages
+        if (msg.fromSystem) {
+          messageDiv.classList.add('from-system');
+        }
   
         // Check for compaction notice - apply special gray italic styling
         if (msg.isCompactionNotice) {
