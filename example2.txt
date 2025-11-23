@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-23T18:17:04.254Z
+// AI Agent - Built 2025-11-23T18:27:08.263Z
 (function() {
   window.module = {};
 
@@ -3880,15 +3880,40 @@
           background: var(--color-gold-subtle);
           border-radius: 4px;
           color: var(--color-gold);
+          align-items: center;
+          justify-content: space-between;
         }
   
-        .loading::after {
+        .loading-text {
+          display: flex;
+          align-items: center;
+          gap: 6px;
+        }
+  
+        .loading-text::after {
           content: '';
           width: 6px;
           height: 6px;
           background: var(--color-gold);
           border-radius: 50%;
           animation: loading-bounce 1.4s infinite ease-in-out both;
+        }
+  
+        .loading-cancel-btn {
+          background: rgba(255, 255, 255, 0.1);
+          border: 1px solid var(--color-gold);
+          color: var(--color-gold);
+          padding: 4px 12px;
+          font-size: 11px;
+          font-family: 'Consolas', 'Courier New', monospace;
+          cursor: pointer;
+          border-radius: 3px;
+          transition: all 0.2s;
+        }
+  
+        .loading-cancel-btn:hover {
+          background: var(--color-gold);
+          color: var(--color-bg);
         }
   
         @keyframes loading-bounce {
@@ -5351,12 +5376,35 @@
       const container = document.getElementById('chat-container');
       let loading = document.getElementById('loading-indicator');
       if (loading) {
-        loading.textContent = text;
+        // Update text but keep cancel button
+        const textSpan = loading.querySelector('.loading-text');
+        if (textSpan) {
+          textSpan.textContent = text;
+        }
       } else {
         loading = document.createElement('div');
         loading.id = 'loading-indicator';
         loading.className = 'message assistant-message loading';
-        loading.textContent = text;
+  
+        // Create text span
+        const textSpan = document.createElement('span');
+        textSpan.className = 'loading-text';
+        textSpan.textContent = text;
+        loading.appendChild(textSpan);
+  
+        // Create cancel button
+        const cancelBtn = document.createElement('button');
+        cancelBtn.className = 'loading-cancel-btn';
+        cancelBtn.textContent = 'Cancel';
+        cancelBtn.onclick = () => {
+          const state = window.module['state.js'];
+          state.setProcessing(false);
+          this.hideLoading();
+          this.setInputDisabled(false);
+          this.updateSubmitButtonVisibility();
+        };
+        loading.appendChild(cancelBtn);
+  
         container.appendChild(loading);
       }
       this.updateSubmitButtonVisibility();
@@ -6219,8 +6267,8 @@
             alert('Result summary cannot be empty');
             return;
           }
-          state.editMessage(pairedMessageId, newSummary);
-          // Also update summary property
+          // For tool-result messages, only update the summary property (not content)
+          // Content is what gets sent to API and should remain the full result
           const pairedMsg = state.getMessages().find(m => m.id === pairedMessageId);
           if (pairedMsg) pairedMsg.summary = newSummary;
   
