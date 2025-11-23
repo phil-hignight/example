@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-23T16:40:04.287Z
+// AI Agent - Built 2025-11-23T16:46:20.988Z
 (function() {
   window.module = {};
 
@@ -5098,15 +5098,7 @@
         // Skip assistant messages that contain raw JSON tool execution requests
         // These are for API conversation structure only, not for UI display
         // We detect them by checking if the content starts with JSON (contains "type": "execute")
-        // However, we still want to show the timing for these AI calls
         if (msg.type === 'assistant_msg' && msg.apiData && msg.content && msg.content.includes('"type"')) {
-          // If there's timing info, display it
-          if (msg.durationSeconds !== undefined) {
-            const timingDiv = document.createElement('div');
-            timingDiv.className = 'tool-execution-timing';
-            timingDiv.textContent = `${msg.durationSeconds.toFixed(2)}s`;
-            container.appendChild(timingDiv);
-          }
           return;
         }
   
@@ -5192,14 +5184,6 @@
               toolResultContent.className = 'message-content';
               toolResultContent.textContent = groupMsg.content;
               toolResultDiv.appendChild(toolResultContent);
-  
-              // Add timing if available
-              if (groupMsg.durationMs !== undefined) {
-                const timing = document.createElement('div');
-                timing.className = 'message-timing';
-                timing.textContent = `${groupMsg.durationMs}ms`;
-                toolResultDiv.appendChild(timing);
-              }
   
               groupDiv.appendChild(toolResultDiv);
             }
@@ -5306,14 +5290,6 @@
             messageDiv.textContent = msg.summary;
           }
   
-          // Add timing if available
-          if (msg.durationMs !== undefined) {
-            const timing = document.createElement('span');
-            timing.className = 'message-timing';
-            timing.textContent = `${msg.durationMs}ms`;
-            messageDiv.appendChild(timing);
-          }
-  
           // Add edit/delete buttons
           if (msg.id) {
             this.addMessageActions(messageDiv, msg.id);
@@ -5369,14 +5345,6 @@
           content.className = 'message-content';
           content.textContent = msg.content;
           messageDiv.appendChild(content);
-  
-          // Add timing info if available
-          if (msg.durationSeconds !== undefined) {
-            const timing = document.createElement('div');
-            timing.className = 'message-timing';
-            timing.textContent = `${msg.durationSeconds.toFixed(2)}s`;
-            messageDiv.appendChild(timing);
-          }
   
           // Add edit/delete buttons
           if (msg.id) {
@@ -6388,9 +6356,33 @@
     // Delete a message with confirmation
     deleteMessage: function(messageId) {
       const state = window.module['state.js'];
+      const messages = state.getMessages();
+      const message = messages.find(m => m.id === messageId);
+  
+      if (!message) return;
   
       if (confirm('Delete this message?')) {
-        state.deleteMessage(messageId);
+        // Check if this is part of a tool group
+        const groupId = (message.isToolUse && message.toolUseData?.groupId) ||
+                        (message.isToolResult && message.toolResultData?.groupId);
+  
+        if (groupId) {
+          // Delete ALL messages in this group
+          const groupMessageIds = messages
+            .filter(m => {
+              const msgGroupId = (m.isToolUse && m.toolUseData?.groupId) ||
+                                 (m.isToolResult && m.toolResultData?.groupId);
+              return msgGroupId === groupId;
+            })
+            .map(m => m.id);
+  
+          // Delete all group messages
+          groupMessageIds.forEach(id => state.deleteMessage(id));
+        } else {
+          // Delete single message
+          state.deleteMessage(messageId);
+        }
+  
         this.renderMessages(state.getMessages());
         this.updateContextStats();
       }
