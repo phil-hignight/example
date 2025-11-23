@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-22T22:23:51.438Z
+// AI Agent - Built 2025-11-23T01:37:20.030Z
 (function() {
   window.module = {};
 
@@ -5427,6 +5427,11 @@
   
     showLoading: function(text = 'Thinking') {
       const container = document.getElementById('chat-container');
+      if (!container) {
+        console.error('chat-container not found - may not be on chat screen');
+        return;
+      }
+  
       let loading = document.getElementById('loading-indicator');
       if (loading) {
         loading.textContent = text;
