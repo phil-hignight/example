@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-23T04:26:16.526Z
+// AI Agent - Built 2025-11-23T04:38:23.231Z
 (function() {
   window.module = {};
 
@@ -917,19 +917,18 @@
       return { success: true, iterations: iteration };
     },
   
-    // Per-tool token limits
-    toolTokenLimits: {
-      read_file: 2000,           // ~8000 chars, ~200 lines
-      list_directory: 500,       // ~2000 chars
-      search_by_content: 1000,   // ~4000 chars
-      search_by_filename: 500,   // ~2000 chars
-      default: 500
+    // Per-tool char limits
+    toolCharLimits: {
+      read_file: 2000,
+      list_directory: 2000,
+      search_by_content: 2000,
+      search_by_filename: 2000,
+      default: 2000
     },
   
     // Truncate tool output if it exceeds size limit
     truncateToolOutput: function(content, toolName) {
-      const maxTokens = this.toolTokenLimits[toolName] || this.toolTokenLimits.default;
-      const maxChars = maxTokens * 4; // 4 chars per token estimate
+      const maxChars = this.toolCharLimits[toolName] || this.toolCharLimits.default;
   
       if (content.length <= maxChars) {
         return content;
@@ -937,9 +936,8 @@
   
       const truncated = content.substring(0, maxChars);
       const remaining = content.length - maxChars;
-      const remainingTokens = Math.ceil(remaining / 4);
   
-      return truncated + `\n\n[Truncated: ${remainingTokens} more tokens omitted. Use more specific search parameters.]`;
+      return truncated + `\n\n[Truncated: ${remaining} more chars omitted. Use more specific search parameters.]`;
     },
   
     // Execute tools (unified handler for all tools) - UI-independent
@@ -2161,8 +2159,7 @@
       // Render initial messages (including greeting)
       ui.renderMessages(state.getMessages());
   
-      // Start background compaction loop
-      this.startBackgroundCompaction();
+      // Note: Compaction now runs inline after tools execute (not in background)
   
       // Keepalive disabled for testing
       // this.startKeepalive();
@@ -2202,45 +2199,6 @@
       }, KEEPALIVE_INTERVAL);
     },
   
-    // Background compaction loop - checks every 5 seconds
-    startBackgroundCompaction: function() {
-      const diagnostics = window.module['diagnostics.js'];
-      const CHECK_INTERVAL = 5000; // 5 seconds
-  
-      const checkAndCompact = async () => {
-        const state = window.module['state.js'];
-        const ui = window.module['ui.js'];
-  
-        // If compaction already in progress, skip this check
-        if (state.isCompacting()) {
-          diagnostics.log('compaction', '[Background] Compaction in progress, skipping check');
-          setTimeout(checkAndCompact, CHECK_INTERVAL);
-          return;
-        }
-  
-        // Check if conversation exceeds limit
-        const currentTokens = state.calculateTokens();
-        const limit = state.getContextLimit();
-  
-        if (currentTokens > limit) {
-          diagnostics.log('compaction', `[Background] Context exceeds limit (${currentTokens} > ${limit}), starting compaction`);
-  
-          // Start compaction in background
-          this.compactContextWithFallback().then(() => {
-            diagnostics.log('compaction', '[Background] Compaction completed');
-          }).catch(error => {
-            diagnostics.log('compaction', '[Background] Compaction error: ' + error.message);
-          });
-        }
-  
-        // Schedule next check
-        setTimeout(checkAndCompact, CHECK_INTERVAL);
-      };
-  
-      // Start the loop
-      diagnostics.log('compaction', '[Background] Starting background compaction loop (every 5 seconds)');
-      setTimeout(checkAndCompact, CHECK_INTERVAL);
-    },
   
     // Compact context with progressive fallback
     compactContextWithFallback: async function() {
@@ -2308,6 +2266,39 @@
       state.setCompacting(false);
     },
   
+    // Helper: Check and compact if needed before adding a message
+    checkAndCompactBeforeAdd: async function(msg) {
+      const state = window.module['state.js'];
+      const diagnostics = window.module['diagnostics.js'];
+  
+      // Skip compaction check for uiOnly messages (they don't go to API)
+      if (msg.uiOnly) {
+        return;
+      }
+  
+      // Skip compaction check for compaction notices
+      if (msg.isCompactionNotice) {
+        return;
+      }
+  
+      // Check if adding this message would exceed limit
+      const currentChars = state.calculateChars();
+      const newMessageChars = msg.content?.length || 0;
+      const limit = state.getContextLimit();
+  
+      if (currentChars + newMessageChars > limit && !state.isCompacting()) {
+        diagnostics.log('compaction', `[Pre-Add] Adding message would exceed limit (${currentChars} + ${newMessageChars} > ${limit} chars), compacting first`);
+  
+        try {
+          await this.compactContextWithFallback();
+          diagnostics.log('compaction', '[Pre-Add] Compaction completed, now adding message');
+        } catch (error) {
+          diagnostics.log('compaction', '[Pre-Add] Compaction error: ' + error.message);
+          // Continue anyway - will add the message even if compaction failed
+        }
+      }
+    },
+  
     sendMessage: async function() {
       const diagnostics = window.module['diagnostics.js'];
       const state = window.module['state.js'];
@@ -2321,11 +2312,16 @@
         return;
       }
   
-      // Add user message
-      state.addMessage({
+      const userMessage = {
         type: 'user_msg',
         content: message
-      });
+      };
+  
+      // Check if we need to compact before adding user message
+      await this.checkAndCompactBeforeAdd(userMessage);
+  
+      // Add user message
+      state.addMessage(userMessage);
   
       // Clear input and reset height
       ui.clearInput();
@@ -2367,10 +2363,16 @@
   
       const selectedDirectory = state.getState().selectedDirectory;
   
+      // Create a wrapper for addMessage that checks/compacts before adding
+      const addMessageWithCompactionCheck = async (msg) => {
+        await this.checkAndCompactBeforeAdd(msg);
+        state.addMessage(msg);
+      };
+  
       // Use core.js for UI-independent processing
       await core.processAIResponse(
         () => state.getMessages(),
-        (msg) => state.addMessage(msg),
+        addMessageWithCompactionCheck,
         selectedDirectory,
         {
           onLoading: (text) => ui.showLoading(text),
@@ -2379,7 +2381,7 @@
           onUpdateStats: () => ui.updateContextStats(),
           onProcessingChange: (processing) => state.setProcessing(processing),
           onAfterTools: async () => {
-            // No-op (compaction now handled by background loop)
+            // No longer needed - compaction now happens before adding messages
           }
         }
       );
@@ -3441,8 +3443,8 @@
         }
       ],
       isProcessing: false,
-      isCompacting: false,  // Track if background compaction is in progress
-      contextLimit: 20000  // Default 20K tokens (80K chars)
+      isCompacting: false,  // Track if compaction is in progress
+      contextLimit: 80000  // Default 80K chars
     },
   
     getState: function() {
@@ -3490,13 +3492,13 @@
       return this.state.contextLimit;
     },
   
-    setContextLimit: function(limitInTokens) {
-      this.state.contextLimit = limitInTokens;
+    setContextLimit: function(limitInChars) {
+      this.state.contextLimit = limitInChars;
     },
   
-    // Calculate message size in tokens (estimate: 4 chars = 1 token)
+    // Calculate message size in characters
     // Only counts non-uiOnly messages since those are what get sent to API
-    calculateTokens: function(messages) {
+    calculateChars: function(messages) {
       if (!messages) {
         messages = this.state.messages;
       }
@@ -3509,14 +3511,14 @@
         }
       });
   
-      return Math.ceil(totalChars / 4);  // 4 chars per token estimate
+      return totalChars;
     },
   
     // Check if adding a message would exceed limit
     wouldExceedLimit: function(newMessageContent) {
-      const currentTokens = this.calculateTokens();
-      const newMessageTokens = Math.ceil(newMessageContent.length / 4);
-      return (currentTokens + newMessageTokens) > this.state.contextLimit;
+      const currentChars = this.calculateChars();
+      const newMessageChars = newMessageContent.length;
+      return (currentChars + newMessageChars) > this.state.contextLimit;
     },
   
     // Get the last summary index (if any)
@@ -5603,15 +5605,15 @@
       document.body.appendChild(overlay);
     },
   
-    // Calculate messages size in tokens
+    // Calculate messages size in characters
     calculateMessagesSize: function() {
       const state = window.module['state.js'];
-      return state.calculateTokens();
+      return state.calculateChars();
     },
   
-    // Format size in K (1K = 1000 tokens)
-    formatSize: function(tokens) {
-      const k = Math.ceil(tokens / 1000);
+    // Format size in K (1K = 1000 chars)
+    formatSize: function(chars) {
+      const k = Math.ceil(chars / 1000);
       return k + 'K';
     },
   
@@ -5764,15 +5766,15 @@
       const statsDiv = document.createElement('div');
       statsDiv.style.marginBottom = '20px';
       statsDiv.style.color = 'var(--color-text-primary)';
-      const currentTokens = state.calculateTokens();
+      const currentChars = state.calculateChars();
       const currentLimit = state.getContextLimit();
-      statsDiv.innerHTML = `Current: <strong>${this.formatSize(currentTokens)}</strong> / ${this.formatSize(currentLimit)}`;
+      statsDiv.innerHTML = `Current: <strong>${this.formatSize(currentChars)}</strong> / ${this.formatSize(currentLimit)}`;
   
       // Context limit input
       const limitLabel = document.createElement('div');
       limitLabel.style.marginBottom = '8px';
       limitLabel.style.color = 'var(--color-text-primary)';
-      limitLabel.textContent = 'Context limit (tokens):';
+      limitLabel.textContent = 'Context limit (chars):';
   
       const limitInput = document.createElement('input');
       limitInput.type = 'number';
@@ -5835,7 +5837,7 @@
           this.renderMessages(state.getMessages());
           this.updateContextStats();
           // Update stats display in modal
-          statsDiv.innerHTML = `Current: <strong>${this.formatSize(state.calculateTokens())}</strong> / ${this.formatSize(state.getContextLimit())}`;
+          statsDiv.innerHTML = `Current: <strong>${this.formatSize(state.calculateChars())}</strong> / ${this.formatSize(state.getContextLimit())}`;
           compactBtn.textContent = 'Compacted!';
           setTimeout(() => {
             compactBtn.textContent = 'Compact Now';
