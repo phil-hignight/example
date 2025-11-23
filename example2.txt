@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-23T04:43:35.461Z
+// AI Agent - Built 2025-11-23T16:40:04.287Z
 (function() {
   window.module = {};
 
@@ -895,6 +895,9 @@
           // Execute all tools
           await this.executeTools(parsedResponse.tool_uses, selectedDirectory, addMessage, onRenderMessages);
   
+          // Hide loading after tools complete
+          onHideLoading();
+  
           // If there's suffix text (text after JSON), show it as assistant message
           if (response.extractedText && response.extractedText.suffix) {
             diagnostics.log('json', '[Core] Showing extracted suffix text as assistant message');
@@ -908,8 +911,8 @@
           // Check if compaction is needed after tools added results
           await onAfterTools();
   
-          // Loading indicator will remain on for next API call
-          continue;
+          // NEW: Stop here - user will manually submit to continue
+          continueProcessing = false;
         }
       }
   
@@ -917,27 +920,10 @@
       return { success: true, iterations: iteration };
     },
   
-    // Per-tool char limits
-    toolCharLimits: {
-      read_file: 2000,
-      list_directory: 2000,
-      search_by_content: 2000,
-      search_by_filename: 2000,
-      default: 2000
-    },
-  
-    // Truncate tool output if it exceeds size limit
+    // Truncate tool output if it exceeds size limit (DISABLED - show full content)
     truncateToolOutput: function(content, toolName) {
-      const maxChars = this.toolCharLimits[toolName] || this.toolCharLimits.default;
-  
-      if (content.length <= maxChars) {
-        return content;
-      }
-  
-      const truncated = content.substring(0, maxChars);
-      const remaining = content.length - maxChars;
-  
-      return truncated + `\n\n[Truncated: ${remaining} more chars omitted. Use more specific search parameters.]`;
+      // No truncation - show full content
+      return content;
     },
   
     // Execute tools (unified handler for all tools) - UI-independent
@@ -2154,9 +2140,13 @@
       const ui = window.module['ui.js'];
   
       const selectedDirectory = state.getState().selectedDirectory;
-      ui.showChatScreen(selectedDirectory, () => this.sendMessage());
+      ui.showChatScreen(
+        selectedDirectory,
+        () => this.addMessage(),  // Enter key adds message
+        () => this.submitToAI()   // Button submits to AI
+      );
   
-      // Render initial messages (including greeting)
+      // Render initial messages (no greeting - starts empty)
       ui.renderMessages(state.getMessages());
   
       // Note: Compaction now runs inline after tools execute (not in background)
@@ -2199,112 +2189,10 @@
       }, KEEPALIVE_INTERVAL);
     },
   
-  
-    // Compact context with progressive fallback
-    compactContextWithFallback: async function() {
+    // Add message to chat (Enter key) - does NOT submit to AI
+    addMessage: function() {
       const state = window.module['state.js'];
       const ui = window.module['ui.js'];
-      const diagnostics = window.module['diagnostics.js'];
-  
-      // Mark compaction as in progress
-      state.setCompacting(true);
-  
-      const MAX_ATTEMPTS = 10;
-      let attemptNum = 0;
-      let targetPercentage = 1.0; // Start at 100%
-  
-      while (attemptNum < MAX_ATTEMPTS) {
-        attemptNum++;
-        diagnostics.log('compaction', `[Compaction] Attempt ${attemptNum}/${MAX_ATTEMPTS} at ${Math.round(targetPercentage * 100)}% scope`);
-  
-        try {
-          const success = await this.compactContext(targetPercentage);
-  
-          if (success) {
-            // Success! Add UI notification
-            state.addMessage({
-              type: 'user_msg',
-              content: `✓ Context compacted (attempt ${attemptNum}, ${Math.round(targetPercentage * 100)}% scope)`,
-              uiOnly: true,
-              isCompactionNotice: true
-            });
-            ui.renderMessages(state.getMessages());
-            ui.updateContextStats();
-  
-            state.setCompacting(false);
-            return;
-          } else {
-            // Failed - reduce scope and retry
-            diagnostics.log('compaction', `[Compaction] Attempt ${attemptNum} failed, reducing scope`);
-  
-            if (attemptNum < MAX_ATTEMPTS) {
-              // Wait 5 seconds before retry
-              await new Promise(resolve => setTimeout(resolve, 5000));
-              targetPercentage *= 0.75; // Reduce to 75% of previous size
-            }
-          }
-        } catch (error) {
-          diagnostics.log('compaction', `[Compaction] Attempt ${attemptNum} exception: ${error.message}`);
-  
-          if (attemptNum < MAX_ATTEMPTS) {
-            // Wait 5 seconds before retry
-            await new Promise(resolve => setTimeout(resolve, 5000));
-            targetPercentage *= 0.75;
-          }
-        }
-      }
-  
-      // All attempts failed
-      state.addMessage({
-        type: 'user_msg',
-        content: `✗ Context compaction failed after ${MAX_ATTEMPTS} attempts`,
-        uiOnly: true,
-        isCompactionNotice: true
-      });
-      ui.renderMessages(state.getMessages());
-  
-      state.setCompacting(false);
-    },
-  
-    // Helper: Check and compact if needed before adding a message
-    checkAndCompactBeforeAdd: async function(msg) {
-      const state = window.module['state.js'];
-      const diagnostics = window.module['diagnostics.js'];
-  
-      // Skip compaction check for uiOnly messages (they don't go to API)
-      if (msg.uiOnly) {
-        return;
-      }
-  
-      // Skip compaction check for compaction notices
-      if (msg.isCompactionNotice) {
-        return;
-      }
-  
-      // Check if adding this message would exceed limit
-      const currentChars = state.calculateChars();
-      const newMessageChars = msg.content?.length || 0;
-      const limit = state.getContextLimit();
-  
-      if (currentChars + newMessageChars > limit && !state.isCompacting()) {
-        diagnostics.log('compaction', `[Pre-Add] Adding message would exceed limit (${currentChars} + ${newMessageChars} > ${limit} chars), compacting first`);
-  
-        try {
-          await this.compactContextWithFallback();
-          diagnostics.log('compaction', '[Pre-Add] Compaction completed, now adding message');
-        } catch (error) {
-          diagnostics.log('compaction', '[Pre-Add] Compaction error: ' + error.message);
-          // Continue anyway - will add the message even if compaction failed
-        }
-      }
-    },
-  
-    sendMessage: async function() {
-      const diagnostics = window.module['diagnostics.js'];
-      const state = window.module['state.js'];
-      const ui = window.module['ui.js'];
-      const api = window.module['api.js'];
-      const tools = window.module['tools.js'];
   
       const message = ui.getInputValue();
   
@@ -2317,9 +2205,6 @@
         content: message
       };
   
-      // Check if we need to compact before adding user message
-      await this.checkAndCompactBeforeAdd(userMessage);
-  
       // Add user message
       state.addMessage(userMessage);
   
@@ -2331,6 +2216,17 @@
   
       // Update context stats
       ui.updateContextStats();
+    },
+  
+    // Submit entire conversation to AI (button click)
+    submitToAI: async function() {
+      const state = window.module['state.js'];
+      const ui = window.module['ui.js'];
+  
+      // Don't submit if already processing or no messages
+      if (state.isProcessing() || state.getMessages().length === 0) {
+        return;
+      }
   
       // Set processing state
       state.setProcessing(true);
@@ -2352,6 +2248,7 @@
       } finally {
         state.setProcessing(false);
         ui.setInputDisabled(false);
+        ui.updateSubmitButtonVisibility();
       }
     },
   
@@ -2359,20 +2256,13 @@
       const state = window.module['state.js'];
       const ui = window.module['ui.js'];
       const core = window.module['core.js'];
-      const diagnostics = window.module['diagnostics.js'];
   
       const selectedDirectory = state.getState().selectedDirectory;
-  
-      // Create a wrapper for addMessage that checks/compacts before adding
-      const addMessageWithCompactionCheck = async (msg) => {
-        await this.checkAndCompactBeforeAdd(msg);
-        state.addMessage(msg);
-      };
   
       // Use core.js for UI-independent processing
       await core.processAIResponse(
         () => state.getMessages(),
-        addMessageWithCompactionCheck,
+        (msg) => state.addMessage(msg),
         selectedDirectory,
         {
           onLoading: (text) => ui.showLoading(text),
@@ -2380,9 +2270,7 @@
           onRenderMessages: () => ui.renderMessages(state.getMessages()),
           onUpdateStats: () => ui.updateContextStats(),
           onProcessingChange: (processing) => state.setProcessing(processing),
-          onAfterTools: async () => {
-            // No longer needed - compaction now happens before adding messages
-          }
+          onAfterTools: async () => {}
         }
       );
     },
@@ -3322,111 +3210,208 @@
       }
     },
   
-    // Compact context by summarizing messages (with scope control via targetPercentage)
-    // Returns true if successful, false if failed
-    compactContext: async function(targetPercentage = 1.0) {
-      const diagnostics = window.module['diagnostics.js'];
+    // Compact selected messages using AI summarization
+    compactSelection: async function() {
       const state = window.module['state.js'];
+      const ui = window.module['ui.js'];
       const api = window.module['api.js'];
+      const diagnostics = window.module['diagnostics.js'];
   
-      console.log(`[Compaction] Starting compaction at ${Math.round(targetPercentage * 100)}% scope...`);
-  
-      const messages = state.getMessages();
-  
-      // Get all non-uiOnly messages
-      const realMessages = messages.filter(m => !m.uiOnly);
-  
-      if (realMessages.length === 0) {
-        console.log('[Compaction] No messages to compact (all are uiOnly)');
-        return true; // Nothing to do
+      if (!state.hasSelection()) {
+        diagnostics.log('context', '[Main] No messages selected for compaction');
+        return;
       }
   
-      // Calculate how many characters to summarize based on targetPercentage
-      const totalChars = realMessages.reduce((sum, m) => sum + (m.content?.length || 0), 0);
-      const targetChars = Math.floor(totalChars * targetPercentage);
+      // Get selected messages
+      const selectedMessages = state.getSelectedMessages();
+      const allMessages = state.getMessages();
   
-      // Find messages to summarize (from oldest to newest until we reach targetChars)
-      const messagesToSummarize = [];
-      let accumulatedChars = 0;
+      // Find indices of first and last selected messages in full conversation
+      const firstSelectedId = selectedMessages[0].id;
+      const lastSelectedId = selectedMessages[selectedMessages.length - 1].id;
   
-      for (let i = 0; i < realMessages.length; i++) {
-        const msgChars = realMessages[i].content?.length || 0;
-        if (accumulatedChars + msgChars <= targetChars) {
-          messagesToSummarize.push(realMessages[i]);
-          accumulatedChars += msgChars;
-        } else {
-          break;
+      const firstSelectedIndex = allMessages.findIndex(m => m.id === firstSelectedId);
+      const lastSelectedIndex = allMessages.findIndex(m => m.id === lastSelectedId);
+  
+      // Determine what message types should come before and after
+      const messageBefore = firstSelectedIndex > 0 ? allMessages[firstSelectedIndex - 1] : null;
+      const messageAfter = lastSelectedIndex < allMessages.length - 1 ? allMessages[lastSelectedIndex + 1] : null;
+  
+      // Determine required start and end types for AI response
+      let startType = null;
+      let endType = null;
+  
+      if (messageBefore) {
+        // If previous message was from user, AI should start with assistant
+        // If previous message was from assistant, AI should start with user
+        if (messageBefore.type === 'user_msg' || messageBefore.type === 'tool-result') {
+          startType = 'assistant';
+        } else if (messageBefore.type === 'assistant_msg' || messageBefore.type === 'tool-use') {
+          startType = 'user';
         }
       }
   
-      if (messagesToSummarize.length === 0) {
-        console.log('[Compaction] No messages selected for summarization');
-        return false;
+      if (messageAfter) {
+        // If next message is from user, AI should end with assistant
+        // If next message is from assistant, AI should end with user
+        if (messageAfter.type === 'user_msg' || messageAfter.type === 'tool-result') {
+          endType = 'assistant';
+        } else if (messageAfter.type === 'assistant_msg' || messageAfter.type === 'tool-use') {
+          endType = 'user';
+        }
       }
   
-      console.log(`[Compaction] Summarizing ${messagesToSummarize.length} messages (${accumulatedChars} chars)`);
+      // Build summarization prompt
+      let prompt = 'You are summarizing a portion of a conversation between a user and an AI coding assistant.\n\n';
+      prompt += 'Here are the messages to summarize:\n\n';
   
-      // Create summarization request
-      const conversationText = messagesToSummarize.map(m => {
-        const content = m.content ? String(m.content) : '[no content]';
-        return `[${m.type}]: ${content}`;
-      }).join('\n\n');
+      // Format selected messages for summarization
+      selectedMessages.forEach(msg => {
+        let role = 'unknown';
+        if (msg.type === 'user_msg') role = 'user';
+        else if (msg.type === 'assistant_msg') role = 'assistant';
+        else if (msg.type === 'tool-use') role = 'tool-use';
+        else if (msg.type === 'tool-result') role = 'tool-result';
   
-      const summarizationMessages = [
-        {
-          role: 'user',
-          content: 'You are summarizing a conversation between a user and a coding agent that has file system tools (read, write, search, edit files).\n\n' +
-            'Provide a concise summary including:\n' +
-            '1. User\'s most recent request\n' +
-            '2. Recent actions (files read, edited, created)\n' +
-            '3. Key decisions and context needed to continue\n' +
-            '4. Any ongoing work or issues\n\n' +
-            'Be concise. Focus on actionable context.\n\n' +
-            'Conversation:\n\n' +
-            conversationText
-        }
-      ];
+        prompt += `[${role}]: ${msg.content}\n\n`;
+      });
+  
+      prompt += '\nProvide a concise summary that captures:\n';
+      prompt += '1. Key user requests and intent\n';
+      prompt += '2. Important actions taken (files read, edited, created)\n';
+      prompt += '3. Key decisions and context needed to continue the conversation\n';
+      prompt += '4. Any ongoing issues or work in progress\n\n';
+  
+      // Tell AI about required message structure
+      if (startType && endType) {
+        prompt += `IMPORTANT: Your response must be formatted as a conversation that starts with a ${startType} message and ends with a ${endType} message. `;
+        prompt += `You can include as many messages as you need in between (could be just 1-2 messages, or more if needed), but must start with ${startType} and end with ${endType}.\n\n`;
+      } else if (startType) {
+        prompt += `IMPORTANT: Your response must start with a ${startType} message. You can include as many messages as needed.\n\n`;
+      } else if (endType) {
+        prompt += `IMPORTANT: Your response must end with a ${endType} message. You can include as many messages as needed.\n\n`;
+      } else {
+        prompt += 'Format your response as a conversation with user and assistant messages as needed.\n\n';
+      }
+  
+      prompt += 'Format each message as: [role]: message content\n';
+      prompt += 'Roles should be: user, assistant, tool-use, or tool-result\n';
+  
+      diagnostics.log('context', '[Main] Compacting ' + selectedMessages.length + ' messages');
+      diagnostics.log('context', '[Main] Start type: ' + (startType || 'any') + ', End type: ' + (endType || 'any'));
+  
+      // Show loading
+      state.setProcessing(true);
+      ui.setInputDisabled(true);
+      ui.showLoading('Compacting...');
   
       try {
-        // Call API for summarization
-        console.log('[Compaction] Requesting summary from API...');
-        const response = await api.callAPISimple(summarizationMessages);
+        // Call API with summarization request
+        const apiMessages = [{ role: 'user', content: prompt }];
+        const response = await api.callAPISimple(apiMessages);
   
         if (!response.valid) {
-          console.log('[Compaction] Failed to get summary from API');
-          return false;
+          throw new Error(response.error || 'Failed to get summary from AI');
         }
   
-        const summaryContent = response.text;
-        console.log('[Compaction] Received summary: ' + summaryContent.substring(0, 100) + '...');
+        // Parse AI response into messages
+        const summaryText = response.text;
   
-        // Find the index of the last message that was summarized
-        const lastSummarizedMsg = messagesToSummarize[messagesToSummarize.length - 1];
-        const lastSummarizedIndex = messages.indexOf(lastSummarizedMsg);
-  
-        // Mark summarized messages as uiOnly
-        for (let i = 0; i < messagesToSummarize.length; i++) {
-          const msgIndex = messages.indexOf(messagesToSummarize[i]);
-          if (msgIndex !== -1) {
-            messages[msgIndex].uiOnly = true;
-          }
+        if (!summaryText) {
+          diagnostics.log('context', '[Main] API response missing text field: ' + JSON.stringify(response));
+          throw new Error('API response missing text content');
         }
   
-        // Insert summary right after the last summarized message
-        messages.splice(lastSummarizedIndex + 1, 0, {
-          type: 'summary',
-          content: 'CONTEXT SUMMARY (previous conversation):\n\n' + summaryContent,
-          timestamp: Date.now()
-        });
+        diagnostics.log('context', '[Main] AI response: ' + summaryText.substring(0, 200) + '...');
+        const newMessages = this.parseCompactionResponse(summaryText);
   
-        console.log('[Compaction] Success: marked ' + messagesToSummarize.length + ' messages as uiOnly, inserted summary');
-        return true;
+        diagnostics.log('context', '[Main] AI generated ' + newMessages.length + ' summary messages');
   
+        // Replace selected messages with new summary messages
+        const beforeMessages = allMessages.slice(0, firstSelectedIndex);
+        const afterMessages = allMessages.slice(lastSelectedIndex + 1);
+  
+        // Clear current messages and rebuild
+        state.clearMessages();
+  
+        // Add messages back in order: before, summary, after
+        beforeMessages.forEach(msg => state.addMessage(msg));
+        newMessages.forEach(msg => state.addMessage(msg));
+        afterMessages.forEach(msg => state.addMessage(msg));
+  
+        // Clear selection
+        state.clearSelection();
+  
+        // Re-render and update UI
+        ui.renderMessages(state.getMessages());
+        ui.updateContextStats();
+        ui.updateCompactButtonVisibility();
+  
+        diagnostics.log('context', '[Main] Compaction complete');
       } catch (error) {
-        console.log('[Compaction] Exception: ' + error.message);
-        return false;
+        diagnostics.log('context', '[Main] Compaction error: ' + error.message);
+        alert('Error compacting messages: ' + error.message);
+      } finally {
+        state.setProcessing(false);
+        ui.setInputDisabled(false);
+        ui.hideLoading();
+        ui.updateSubmitButtonVisibility();
       }
-    }
+    },
+  
+    // Parse AI's compaction response into message objects
+    parseCompactionResponse: function(text) {
+      const messages = [];
+  
+      if (!text || typeof text !== 'string') {
+        const diagnostics = window.module['diagnostics.js'];
+        diagnostics.log('context', '[Main] parseCompactionResponse received invalid text: ' + typeof text);
+        return messages;
+      }
+  
+      const lines = text.split('\n');
+  
+      let currentMessage = null;
+  
+      for (const line of lines) {
+        // Check if line starts with [role]:
+        const roleMatch = line.match(/^\[(user|assistant|tool-use|tool-result)\]:\s*(.*)$/);
+  
+        if (roleMatch) {
+          // Save previous message if exists
+          if (currentMessage) {
+            messages.push(currentMessage);
+          }
+  
+          // Start new message
+          const role = roleMatch[1];
+          const content = roleMatch[2];
+  
+          let type = 'user_msg';
+          if (role === 'assistant') type = 'assistant_msg';
+          else if (role === 'tool-use') type = 'tool-use';
+          else if (role === 'tool-result') type = 'tool-result';
+  
+          currentMessage = {
+            type: type,
+            content: content
+          };
+        } else if (currentMessage && line.trim()) {
+          // Continue current message (multi-line)
+          currentMessage.content += '\n' + line;
+        }
+      }
+  
+      // Don't forget last message
+      if (currentMessage) {
+        messages.push(currentMessage);
+      }
+  
+      return messages;
+    },
+  
+    // Compact context by summarizing messages (with scope control via targetPercentage)
+    // Returns true if successful, false if failed
   };
   
 
@@ -3435,16 +3420,10 @@
   window.module['state.js'] = {
     state: {
       selectedDirectory: null,
-      messages: [
-        {
-          type: 'assistant_msg',
-          content: 'Hello! I\'m your AI coding agent. I can help you with coding tasks, answer questions about your codebase, write code, debug issues, and more. What would you like to work on?',
-          uiOnly: true  // This message won't be sent to the API
-        }
-      ],
+      messages: [],  // Start with empty chat (no greeting)
       isProcessing: false,
-      isCompacting: false,  // Track if compaction is in progress
-      contextLimit: 80000  // Default 80K chars
+      contextLimit: 80000,  // Default 80K chars (reference only, no auto-enforcement)
+      selectedMessageIds: []  // Message selection for compaction
     },
   
     getState: function() {
@@ -3457,10 +3436,23 @@
   
     // Message management
     addMessage: function(message) {
+      const id = message.id || `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
       this.state.messages.push({
         ...message,
+        id,
         timestamp: message.timestamp || Date.now()
       });
+    },
+  
+    editMessage: function(id, newContent) {
+      const message = this.state.messages.find(m => m.id === id);
+      if (message) {
+        message.content = newContent;
+      }
+    },
+  
+    deleteMessage: function(id) {
+      this.state.messages = this.state.messages.filter(m => m.id !== id);
     },
   
     getMessages: function() {
@@ -3476,15 +3468,9 @@
       return this.state.isProcessing;
     },
   
-    // Clear all messages (keep initial greeting)
+    // Clear all messages
     clearMessages: function() {
-      const initialGreeting = {
-        type: 'assistant_msg',
-        content: 'Hello! I\'m your AI coding agent. I can help you with coding tasks, answer questions about your codebase, write code, debug issues, and more. What would you like to work on?',
-        uiOnly: true
-      };
-  
-      this.state.messages = [initialGreeting];
+      this.state.messages = [];
     },
   
     // Context limit management
@@ -3521,24 +3507,55 @@
       return (currentChars + newMessageChars) > this.state.contextLimit;
     },
   
-    // Get the last summary index (if any)
-    getLastSummaryIndex: function() {
-      for (let i = this.state.messages.length - 1; i >= 0; i--) {
-        if (this.state.messages[i].type === 'summary') {
-          return i;
+    // Message selection management
+    toggleMessageSelection: function(id) {
+      const index = this.state.selectedMessageIds.indexOf(id);
+      if (index > -1) {
+        // Deselect
+        this.state.selectedMessageIds.splice(index, 1);
+      } else {
+        // Select
+        this.state.selectedMessageIds.push(id);
+      }
+    },
+  
+    selectMessageRange: function(fromId, toId) {
+      // Find indices of from and to messages
+      const messages = this.state.messages;
+      const fromIndex = messages.findIndex(m => m.id === fromId);
+      const toIndex = messages.findIndex(m => m.id === toId);
+  
+      if (fromIndex === -1 || toIndex === -1) return;
+  
+      // Determine range direction
+      const start = Math.min(fromIndex, toIndex);
+      const end = Math.max(fromIndex, toIndex);
+  
+      // Select all messages in range
+      for (let i = start; i <= end; i++) {
+        const id = messages[i].id;
+        if (!this.state.selectedMessageIds.includes(id)) {
+          this.state.selectedMessageIds.push(id);
         }
       }
-      return -1;
     },
   
-    // Compaction state management
-    isCompacting: function() {
-      return this.state.isCompacting;
+    isMessageSelected: function(id) {
+      return this.state.selectedMessageIds.includes(id);
     },
   
-    setCompacting: function(isCompacting) {
-      this.state.isCompacting = isCompacting;
-    }
+    getSelectedMessages: function() {
+      return this.state.messages.filter(m => this.state.selectedMessageIds.includes(m.id));
+    },
+  
+    clearSelection: function() {
+      this.state.selectedMessageIds = [];
+    },
+  
+    hasSelection: function() {
+      return this.state.selectedMessageIds.length > 0;
+    },
+  
   };
   
 
@@ -3670,16 +3687,18 @@
           width: 90%;
           max-width: 1200px;
           display: flex;
-          align-items: flex-start;
+          align-items: flex-end;
+          gap: 12px;
           background-color: var(--color-bg-secondary);
           border: 1px solid var(--color-border);
           border-radius: 8px;
           max-height: 33.333vh;
           overflow: hidden;
+          padding: 12px;
         }
   
         #message-input {
-          width: 100%;
+          flex: 1;
           background: transparent;
           border: none;
           color: var(--color-text-primary);
@@ -3687,10 +3706,68 @@
           font-size: 14px;
           resize: none;
           outline: none;
-          padding: 12px 16px;
+          padding: 0;
           line-height: 1.6;
           overflow-y: auto;
           box-sizing: border-box;
+          max-height: calc(33.333vh - 24px);
+        }
+  
+        .submit-ai-btn {
+          background: var(--color-gold);
+          color: var(--color-bg-primary);
+          border: none;
+          border-radius: 6px;
+          padding: 8px 16px;
+          font-size: 14px;
+          font-weight: 600;
+          cursor: pointer;
+          white-space: nowrap;
+          transition: opacity 0.2s, transform 0.1s;
+          align-self: flex-end;
+          margin-bottom: 0;
+        }
+  
+        .submit-ai-btn:hover:not(:disabled) {
+          opacity: 0.9;
+          transform: translateY(-1px);
+        }
+  
+        .submit-ai-btn:active:not(:disabled) {
+          transform: translateY(0);
+        }
+  
+        .submit-ai-btn:disabled {
+          opacity: 0.5;
+          cursor: not-allowed;
+        }
+  
+        /* Compact button - floating in upper right */
+        .compact-button {
+          position: fixed;
+          top: 20px;
+          right: 20px;
+          background: var(--color-gold);
+          color: var(--color-bg-primary);
+          border: none;
+          border-radius: 6px;
+          padding: 10px 20px;
+          font-size: 14px;
+          font-weight: 600;
+          cursor: pointer;
+          transition: all 0.2s;
+          z-index: 1000;
+          box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+        }
+  
+        .compact-button:hover {
+          background: var(--color-gold-light);
+          transform: translateY(-2px);
+          box-shadow: 0 4px 12px var(--color-gold-glow);
+        }
+  
+        .compact-button:active {
+          transform: translateY(0);
         }
   
         #message-input::-webkit-scrollbar {
@@ -3742,10 +3819,97 @@
         .message {
           margin-bottom: 8px;
           position: relative;
+          cursor: pointer;
+          transition: all 0.2s;
+        }
+  
+        .message.selected {
+          background: rgba(212, 160, 23, 0.15);
+          border-left: 3px solid var(--color-gold);
+          padding-left: 8px;
+          margin-left: -8px;
         }
   
         .message:first-child {
           margin-top: 20px;
+        }
+  
+        /* Edit/Delete buttons */
+        .message-actions {
+          position: absolute;
+          top: 4px;
+          right: 8px;
+          opacity: 0;
+          transition: opacity 0.2s;
+          display: flex;
+          gap: 8px;
+          z-index: 10;
+        }
+  
+        .message:hover .message-actions {
+          opacity: 1;
+        }
+  
+        .message-action-btn {
+          background: rgba(0, 0, 0, 0.3);
+          border: 1px solid rgba(255, 255, 255, 0.2);
+          border-radius: 3px;
+          padding: 2px 6px;
+          cursor: pointer;
+          font-size: 12px;
+          color: var(--color-text-secondary);
+          transition: all 0.2s;
+        }
+  
+        .message-action-btn:hover {
+          background: rgba(0, 0, 0, 0.5);
+          border-color: var(--color-gold);
+          color: var(--color-gold);
+        }
+  
+        /* Editing state */
+        .message-content.editing {
+          border: 1px solid var(--color-gold);
+          outline: none;
+          background: rgba(212, 160, 23, 0.1);
+          cursor: text;
+          padding: 8px;
+          border-radius: 4px;
+        }
+  
+        .edit-actions {
+          display: flex;
+          gap: 8px;
+          margin-top: 8px;
+          justify-content: flex-end;
+        }
+  
+        .edit-action-btn {
+          padding: 4px 12px;
+          border-radius: 4px;
+          border: 1px solid var(--color-border);
+          cursor: pointer;
+          font-size: 12px;
+          transition: all 0.2s;
+        }
+  
+        .edit-save-btn {
+          background: var(--color-gold);
+          color: var(--color-bg-primary);
+          border-color: var(--color-gold);
+        }
+  
+        .edit-save-btn:hover {
+          opacity: 0.9;
+        }
+  
+        .edit-cancel-btn {
+          background: transparent;
+          color: var(--color-text-secondary);
+        }
+  
+        .edit-cancel-btn:hover {
+          background: rgba(255, 255, 255, 0.1);
         }
   
         .user-message {
@@ -4779,6 +4943,9 @@
   // Module: ui.js
   // UI rendering and interaction
   window.module['ui.js'] = {
+    // Track last clicked message for shift-click range selection
+    lastClickedMessageId: null,
+  
     showDirectorySelection: function(onSelect) {
       const container = document.createElement('div');
       container.id = 'app-container';
@@ -4800,7 +4967,7 @@
       document.body.appendChild(container);
     },
   
-    showChatScreen: function(selectedDirectory, onSendMessage) {
+    showChatScreen: function(selectedDirectory, onAddMessage, onSubmitToAI) {
       const container = document.getElementById('app-container');
       container.innerHTML = '';
   
@@ -4833,13 +5000,23 @@
       textarea.addEventListener('input', resizeTextarea);
   
       textarea.addEventListener('keydown', (e) => {
+        // Enter = add message (no shift)
+        // Shift+Enter = newline
         if (e.key === 'Enter' && !e.shiftKey) {
           e.preventDefault();
-          onSendMessage();
+          onAddMessage();
         }
       });
   
+      // Submit to AI button
+      const submitBtn = document.createElement('button');
+      submitBtn.id = 'submit-ai-btn';
+      submitBtn.className = 'submit-ai-btn';
+      submitBtn.textContent = 'Submit to AI';
+      submitBtn.onclick = onSubmitToAI;
+  
       inputWrapper.appendChild(textarea);
+      inputWrapper.appendChild(submitBtn);
       inputContainer.appendChild(inputWrapper);
   
       // Project path display
@@ -4871,22 +5048,8 @@
       messagesBtn.className = 'context-stat-btn';
       messagesBtn.id = 'messages-stat-btn';
       messagesBtn.textContent = '0K';
-      messagesBtn.onclick = () => this.showContextModal();
-  
-      const diagBtn = document.createElement('button');
-      diagBtn.className = 'context-stat-btn';
-      diagBtn.textContent = 'Run API Tests';
-      diagBtn.onclick = () => {
-        const apiDiag = window.module['api-diagnostics.js'];
-        if (apiDiag) {
-          apiDiag.runAllTests();
-        } else {
-          console.error('API diagnostics module not loaded');
-        }
-      };
   
       contextStats.appendChild(messagesBtn);
-      contextStats.appendChild(diagBtn);
   
       inputContainer.appendChild(contextStats);
   
@@ -4899,6 +5062,9 @@
   
       // Initial stats update
       this.updateContextStats();
+  
+      // Initial button visibility update
+      this.updateSubmitButtonVisibility();
     },
   
     renderMessages: function(messages) {
@@ -4969,15 +5135,47 @@
           const groupDiv = document.createElement('div');
           groupDiv.className = 'message tool-group';
   
+          // Add selection state
+          const state = window.module['state.js'];
+          const firstMsg = groupMessages[0];
+          if (firstMsg && firstMsg.id && state.isMessageSelected(firstMsg.id)) {
+            groupDiv.classList.add('selected');
+          }
+  
+          // Add click handler for selection (using first message's ID)
+          groupDiv.addEventListener('click', (e) => {
+            if (!firstMsg || !firstMsg.id) return;
+  
+            // Don't interfere with edit/delete buttons or contenteditable
+            if (e.target.closest('.message-actions') || e.target.isContentEditable) {
+              return;
+            }
+  
+            e.stopPropagation();
+  
+            const ui = window.module['ui.js'];
+            if (e.shiftKey && ui.lastClickedMessageId) {
+              // Range selection
+              state.selectMessageRange(ui.lastClickedMessageId, firstMsg.id);
+            } else {
+              // Toggle single selection
+              state.toggleMessageSelection(firstMsg.id);
+            }
+  
+            ui.lastClickedMessageId = firstMsg.id;
+  
+            // Re-render to show selection
+            this.renderMessages(state.getMessages());
+            this.updateContextStats();
+            this.updateCompactButtonVisibility();
+          });
+  
           // Render each message in the group in order
           groupMessages.forEach(groupMsg => {
             if (groupMsg.isToolUse) {
               // Create tool-use div
               const toolUseDiv = document.createElement('div');
               toolUseDiv.className = 'tool-use-message';
-              toolUseDiv.addEventListener('click', () => {
-                this.showToolUseModal(groupMsg);
-              });
   
               const toolUseContent = document.createElement('div');
               toolUseContent.className = 'message-content';
@@ -4989,9 +5187,6 @@
               // Create tool-result div
               const toolResultDiv = document.createElement('div');
               toolResultDiv.className = 'tool-result-message';
-              toolResultDiv.addEventListener('click', () => {
-                this.showToolResultModal(groupMsg);
-              });
   
               const toolResultContent = document.createElement('div');
               toolResultContent.className = 'message-content';
@@ -5010,12 +5205,45 @@
             }
           });
   
+          // Add edit/delete buttons to the group container
+          // Use the first message's ID for the whole group
+          if (groupMessages.length > 0 && groupMessages[0].id) {
+            this.addMessageActions(groupDiv, groupMessages[0].id);
+          }
+  
           container.appendChild(groupDiv);
           return;
         }
   
         // Regular message rendering (for non-grouped messages)
         const messageDiv = document.createElement('div');
+  
+        // Add click handler for selection (with shift-click support)
+        const state = window.module['state.js'];
+        messageDiv.addEventListener('click', (e) => {
+          // Don't interfere with edit/delete buttons or contenteditable
+          if (e.target.closest('.message-actions') || e.target.isContentEditable) {
+            return;
+          }
+  
+          e.stopPropagation();
+  
+          const ui = window.module['ui.js'];
+          if (e.shiftKey && ui.lastClickedMessageId) {
+            // Range selection
+            state.selectMessageRange(ui.lastClickedMessageId, msg.id);
+          } else {
+            // Toggle single selection
+            state.toggleMessageSelection(msg.id);
+          }
+  
+          ui.lastClickedMessageId = msg.id;
+  
+          // Re-render to show selection
+          this.renderMessages(state.getMessages());
+          this.updateContextStats();
+          this.updateCompactButtonVisibility();
+        });
   
         // Handle new tool-use and tool-result types
         if (msg.type === 'tool-use') {
@@ -5032,14 +5260,20 @@
           messageDiv.appendChild(toolName);
           messageDiv.appendChild(toolParams);
   
+          // Add edit/delete buttons
+          if (msg.id) {
+            this.addMessageActions(messageDiv, msg.id);
+          }
+  
+          // Add selection state
+          if (state.isMessageSelected(msg.id)) {
+            messageDiv.classList.add('selected');
+          }
+  
           container.appendChild(messageDiv);
           return;
         } else if (msg.type === 'tool-result') {
           messageDiv.className = msg.error ? 'message tool-result-inline error' : 'message tool-result-inline';
-          messageDiv.style.cursor = 'pointer';
-          messageDiv.addEventListener('click', () => {
-            this.showToolResultModal(msg);
-          });
   
           // Parse summary to style different parts
           // Format: "Read File • path/to/file.js\nlines info"
@@ -5080,6 +5314,16 @@
             messageDiv.appendChild(timing);
           }
   
+          // Add edit/delete buttons
+          if (msg.id) {
+            this.addMessageActions(messageDiv, msg.id);
+          }
+  
+          // Add selection state
+          if (state.isMessageSelected(msg.id)) {
+            messageDiv.classList.add('selected');
+          }
+  
           container.appendChild(messageDiv);
           return;
         }
@@ -5087,20 +5331,11 @@
         // Apply different styling for tool use and tool result messages
         if (msg.isToolUse) {
           messageDiv.className = 'message tool-use-message';
-          messageDiv.addEventListener('click', () => {
-            this.showToolUseModal(msg);
-          });
         } else if (msg.isToolResult) {
           messageDiv.className = 'message tool-result-message';
-          messageDiv.addEventListener('click', () => {
-            this.showToolResultModal(msg);
-          });
         } else if (msg.isToolExecution) {
           // Legacy support
           messageDiv.className = 'message tool-message';
-          messageDiv.addEventListener('click', () => {
-            this.showToolModal(msg);
-          });
         } else {
           // Translate type to CSS class (e.g., user_msg -> user-message)
           const cssClass = msg.type === 'user_msg' ? 'user' : msg.type === 'assistant_msg' ? 'assistant' : msg.type;
@@ -5124,6 +5359,11 @@
   
           messageDiv.appendChild(prefix);
           messageDiv.appendChild(content);
+  
+          // Add edit/delete buttons
+          if (msg.id) {
+            this.addMessageActions(messageDiv, msg.id);
+          }
         } else if (msg.type === 'assistant_msg') {
           const content = document.createElement('div');
           content.className = 'message-content';
@@ -5138,12 +5378,10 @@
             messageDiv.appendChild(timing);
           }
   
-          // Make all assistant messages clickable to show details
-          messageDiv.style.cursor = 'pointer';
-  
-          messageDiv.addEventListener('click', () => {
-            this.showAssistantMessageModal(msg);
-          });
+          // Add edit/delete buttons
+          if (msg.id) {
+            this.addMessageActions(messageDiv, msg.id);
+          }
         } else if (msg.type === 'summary') {
           // Summary message - special styling
           const header = document.createElement('div');
@@ -5161,6 +5399,16 @@
           content.className = 'message-content';
           content.textContent = msg.content;
           messageDiv.appendChild(content);
+  
+          // Add edit/delete buttons for all other message types
+          if (msg.id) {
+            this.addMessageActions(messageDiv, msg.id);
+          }
+        }
+  
+        // Add selection state
+        if (state.isMessageSelected(msg.id)) {
+          messageDiv.classList.add('selected');
         }
   
         container.appendChild(messageDiv);
@@ -5176,6 +5424,9 @@
   
       // Update context stats
       this.updateContextStats();
+  
+      // Update submit button visibility
+      this.updateSubmitButtonVisibility();
     },
   
     showToolModal: function(toolMessage) {
@@ -5335,12 +5586,60 @@
         container.appendChild(loading);
       }
       container.scrollTop = container.scrollHeight;
+      this.updateSubmitButtonVisibility();
     },
   
     hideLoading: function() {
       const loading = document.getElementById('loading-indicator');
       if (loading) {
         loading.remove();
+      }
+      this.updateSubmitButtonVisibility();
+    },
+  
+    // Update submit button visibility based on processing state
+    updateSubmitButtonVisibility: function() {
+      const submitBtn = document.getElementById('submit-ai-btn');
+      if (!submitBtn) return;
+  
+      const state = window.module['state.js'];
+      const isProcessing = state.isProcessing();
+      const hasMessages = state.getMessages().length > 0;
+  
+      // Show button only when NOT processing AND has messages
+      if (isProcessing || !hasMessages) {
+        submitBtn.style.display = 'none';
+      } else {
+        submitBtn.style.display = 'block';
+      }
+    },
+  
+    updateCompactButtonVisibility: function() {
+      const state = window.module['state.js'];
+      let compactBtn = document.getElementById('compact-btn');
+  
+      if (state.hasSelection()) {
+        // Show button if selection exists
+        if (!compactBtn) {
+          // Create the button if it doesn't exist
+          compactBtn = document.createElement('button');
+          compactBtn.id = 'compact-btn';
+          compactBtn.className = 'compact-button';
+          compactBtn.textContent = 'Compact';
+          compactBtn.addEventListener('click', () => {
+            const main = window.module['main.js'];
+            if (main && main.compactSelection) {
+              main.compactSelection();
+            }
+          });
+          document.body.appendChild(compactBtn);
+        }
+        compactBtn.style.display = 'block';
+      } else {
+        // Hide button if no selection
+        if (compactBtn) {
+          compactBtn.style.display = 'none';
+        }
       }
     },
   
@@ -5625,9 +5924,18 @@
         return;
       }
   
-      const tokens = this.calculateMessagesSize();
+      const state = window.module['state.js'];
   
-      messagesBtn.textContent = this.formatSize(tokens);
+      // If there are selected messages, show selected count instead of total
+      if (state.hasSelection()) {
+        const selectedMessages = state.getSelectedMessages();
+        const selectedChars = state.calculateChars(selectedMessages);
+        const selectedTokens = Math.ceil(selectedChars / 4);
+        messagesBtn.textContent = `Selected: ${this.formatSize(selectedTokens)}`;
+      } else {
+        const tokens = this.calculateMessagesSize();
+        messagesBtn.textContent = this.formatSize(tokens);
+      }
     },
   
     // Show clear confirmation modal
@@ -5966,6 +6274,126 @@
       document.addEventListener('keydown', escHandler);
   
       document.body.appendChild(overlay);
+    },
+  
+    // Add edit/delete buttons to a message element
+    addMessageActions: function(messageElement, messageId) {
+      const state = window.module['state.js'];
+  
+      const actionsDiv = document.createElement('div');
+      actionsDiv.className = 'message-actions';
+  
+      const editBtn = document.createElement('button');
+      editBtn.className = 'message-action-btn';
+      editBtn.textContent = 'Edit';
+      editBtn.onclick = (e) => {
+        e.stopPropagation();
+        // Don't allow editing while processing
+        if (state.isProcessing()) {
+          return;
+        }
+        this.enterEditMode(messageElement, messageId);
+      };
+  
+      const deleteBtn = document.createElement('button');
+      deleteBtn.className = 'message-action-btn';
+      deleteBtn.textContent = 'Delete';
+      deleteBtn.onclick = (e) => {
+        e.stopPropagation();
+        // Don't allow deleting while processing
+        if (state.isProcessing()) {
+          return;
+        }
+        this.deleteMessage(messageId);
+      };
+  
+      actionsDiv.appendChild(editBtn);
+      actionsDiv.appendChild(deleteBtn);
+      messageElement.appendChild(actionsDiv);
+    },
+  
+    // Enter edit mode for a message
+    enterEditMode: function(messageElement, messageId) {
+      const state = window.module['state.js'];
+      const message = state.getMessages().find(m => m.id === messageId);
+      if (!message) return;
+  
+      const contentDiv = messageElement.querySelector('.message-content');
+      if (!contentDiv) return;
+  
+      const originalContent = message.content;
+  
+      // Make contenteditable
+      contentDiv.contentEditable = true;
+      contentDiv.classList.add('editing');
+      contentDiv.focus();
+  
+      // Select all text
+      const range = document.createRange();
+      range.selectNodeContents(contentDiv);
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+  
+      // Create save/cancel buttons
+      const actionsDiv = document.createElement('div');
+      actionsDiv.className = 'edit-actions';
+  
+      const saveBtn = document.createElement('button');
+      saveBtn.className = 'edit-action-btn edit-save-btn';
+      saveBtn.textContent = 'Save';
+      saveBtn.onclick = () => {
+        const newContent = contentDiv.textContent.trim();
+        if (!newContent) {
+          alert('Message content cannot be empty');
+          return;
+        }
+        state.editMessage(messageId, newContent);
+        this.renderMessages(state.getMessages());
+        this.updateContextStats();
+      };
+  
+      const cancelBtn = document.createElement('button');
+      cancelBtn.className = 'edit-action-btn edit-cancel-btn';
+      cancelBtn.textContent = 'Cancel';
+      cancelBtn.onclick = () => {
+        this.renderMessages(state.getMessages());
+      };
+  
+      actionsDiv.appendChild(saveBtn);
+      actionsDiv.appendChild(cancelBtn);
+      messageElement.appendChild(actionsDiv);
+  
+      // ESC to cancel
+      const escHandler = (e) => {
+        if (e.key === 'Escape') {
+          this.renderMessages(state.getMessages());
+          document.removeEventListener('keydown', escHandler);
+        }
+      };
+      document.addEventListener('keydown', escHandler);
+  
+      // Update char count in real-time
+      contentDiv.addEventListener('input', () => {
+        const tempMessages = [...state.getMessages()];
+        const msgIndex = tempMessages.findIndex(m => m.id === messageId);
+        if (msgIndex >= 0) {
+          tempMessages[msgIndex].content = contentDiv.textContent;
+          const newCharCount = state.calculateChars(tempMessages);
+          this.updateContextStats(newCharCount);
+        }
+      });
+    },
+  
+    // Delete a message with confirmation
+    deleteMessage: function(messageId) {
+      const state = window.module['state.js'];
+  
+      if (confirm('Delete this message?')) {
+        state.deleteMessage(messageId);
+        this.renderMessages(state.getMessages());
+        this.updateContextStats();
+      }
     }
   };
   
