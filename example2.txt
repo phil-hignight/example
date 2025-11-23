@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-23T04:38:23.231Z
+// AI Agent - Built 2025-11-23T04:43:35.461Z
 (function() {
   window.module = {};
 
@@ -5791,6 +5791,30 @@
       limitInput.style.fontSize = '14px';
       limitInput.style.fontFamily = "'Consolas', 'Courier New', monospace";
   
+      // Tool output limit input
+      const core = window.module['core.js'];
+      const currentToolLimit = core.toolCharLimits.default;
+  
+      const toolLimitLabel = document.createElement('div');
+      toolLimitLabel.style.marginBottom = '8px';
+      toolLimitLabel.style.color = 'var(--color-text-primary)';
+      toolLimitLabel.textContent = 'Tool output limit (chars):';
+  
+      const toolLimitInput = document.createElement('input');
+      toolLimitInput.type = 'number';
+      toolLimitInput.value = currentToolLimit;
+      toolLimitInput.min = '500';
+      toolLimitInput.step = '100';
+      toolLimitInput.style.width = '100%';
+      toolLimitInput.style.padding = '8px';
+      toolLimitInput.style.marginBottom = '20px';
+      toolLimitInput.style.background = 'var(--color-bg-primary)';
+      toolLimitInput.style.border = '1px solid var(--color-border)';
+      toolLimitInput.style.color = 'var(--color-text-primary)';
+      toolLimitInput.style.borderRadius = '4px';
+      toolLimitInput.style.fontSize = '14px';
+      toolLimitInput.style.fontFamily = "'Consolas', 'Courier New', monospace";
+  
       // Buttons
       const buttonContainer = document.createElement('div');
       buttonContainer.style.display = 'flex';
@@ -5864,7 +5888,7 @@
       cancelBtn.onclick = () => overlay.remove();
   
       const saveBtn = document.createElement('button');
-      saveBtn.textContent = 'Save Limit';
+      saveBtn.textContent = 'Save Limits';
       saveBtn.style.padding = '8px 16px';
       saveBtn.style.background = 'var(--color-gold)';
       saveBtn.style.border = 'none';
@@ -5876,21 +5900,37 @@
       saveBtn.style.fontWeight = 'bold';
       saveBtn.onclick = async () => {
         const newLimit = parseInt(limitInput.value);
-        if (newLimit && newLimit >= 1000) {
-          state.setContextLimit(newLimit);
+        const newToolLimit = parseInt(toolLimitInput.value);
   
-          // If new limit is lower than current usage, trigger compaction
-          if (currentTokens > newLimit) {
-            const main = window.module['main.js'];
-            await main.compactContext();
-            this.renderMessages(state.getMessages());
-          }
-  
-          this.updateContextStats();
-          overlay.remove();
-        } else {
-          alert('Please enter a valid limit (minimum 1000 tokens)');
+        // Validate inputs
+        if (!newLimit || newLimit < 1000) {
+          alert('Please enter a valid context limit (minimum 1000 chars)');
+          return;
         }
+        if (!newToolLimit || newToolLimit < 500) {
+          alert('Please enter a valid tool limit (minimum 500 chars)');
+          return;
+        }
+  
+        // Save context limit
+        state.setContextLimit(newLimit);
+  
+        // Save tool limit (apply to all tools)
+        core.toolCharLimits.read_file = newToolLimit;
+        core.toolCharLimits.list_directory = newToolLimit;
+        core.toolCharLimits.search_by_content = newToolLimit;
+        core.toolCharLimits.search_by_filename = newToolLimit;
+        core.toolCharLimits.default = newToolLimit;
+  
+        // If new limit is lower than current usage, trigger compaction
+        if (currentChars > newLimit) {
+          const main = window.module['main.js'];
+          await main.compactContext();
+          this.renderMessages(state.getMessages());
+        }
+  
+        this.updateContextStats();
+        overlay.remove();
       };
   
       buttonContainer.appendChild(clearBtn);
@@ -5901,6 +5941,8 @@
       body.appendChild(statsDiv);
       body.appendChild(limitLabel);
       body.appendChild(limitInput);
+      body.appendChild(toolLimitLabel);
+      body.appendChild(toolLimitInput);
       body.appendChild(buttonContainer);
   
       modalContainer.appendChild(header);
