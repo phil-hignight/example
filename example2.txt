@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-23T03:41:14.386Z
+// AI Agent - Built 2025-11-23T03:46:04.583Z
 (function() {
   window.module = {};
 
@@ -500,9 +500,11 @@
     },
   
     // Simple API call without system prompt - for internal operations like summarization
-    callAPISimple: async function(messages, maxRetries = 3) {
+    callAPISimple: async function(messages, maxRetries = 3, requestType = 'simple') {
       const authToken = localStorage.getItem('token');
       const requestLogger = window.module['request-logger.js'];
+  
+      console.log('[API] callAPISimple called with requestType:', requestType);
   
       const requestBody = {
         stream: false,
@@ -542,7 +544,7 @@
             attemptTimings.push({ attempt: attempt + 1, duration: attemptDuration, success: false });
             // Log failed request
             if (requestLogger) {
-              requestLogger.logRequest(requestBody, { error: errorText, status: response.status }, { type: 'compaction' });
+              requestLogger.logRequest(requestBody, { error: errorText, status: response.status }, { type: requestType });
             }
             throw new Error(`API request failed (${response.status}): ${errorText}`);
           }
@@ -552,7 +554,7 @@
           attemptTimings.push({ attempt: attempt + 1, duration: attemptDuration, success: true });
           // Log successful request
           if (requestLogger) {
-            requestLogger.logRequest(requestBody, data, { type: 'compaction' });
+            requestLogger.logRequest(requestBody, data, { type: requestType });
           }
           return { valid: true, text: responseText, attemptTimings };
         } catch (error) {
@@ -563,7 +565,7 @@
           if (attempt >= maxRetries - 1) {
             // Log final failed request
             if (requestLogger) {
-              requestLogger.logRequest(requestBody, { error: error.message }, { type: 'compaction' });
+              requestLogger.logRequest(requestBody, { error: error.message }, { type: requestType });
             }
             return { valid: false, error: error.message, attemptTimings };
           }
@@ -3417,7 +3419,7 @@
       try {
         // Call API for summarization
         console.log('[Compaction] Requesting summary from API...');
-        const response = await api.callAPISimple(summarizationMessages);
+        const response = await api.callAPISimple(summarizationMessages, 3, 'compaction');
   
         if (!response.valid) {
           console.log('[Compaction] Failed to get summary from API');
