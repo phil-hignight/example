@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-23T18:27:08.263Z
+// AI Agent - Built 2025-11-23T19:14:14.140Z
 (function() {
   window.module = {};
 
@@ -5052,7 +5052,7 @@
   
             // Add single edit/delete button for the pair
             if (msg.id) {
-              this.addMessageActions(pairDiv, msg.id, nextMsg.id);
+              this.addMessageActions(pairDiv, msg.id, nextMsg.id, msg.toolName);
             }
   
             // Add character count for the pair (combined)
@@ -5820,11 +5820,10 @@
       if (state.hasSelection()) {
         const selectedMessages = state.getSelectedMessages();
         const selectedChars = state.calculateChars(selectedMessages);
-        const selectedTokens = Math.ceil(selectedChars / 4);
-        messagesBtn.textContent = `Selected: ${this.formatSize(selectedTokens)}`;
+        messagesBtn.textContent = `Selected: ${this.formatSize(selectedChars)}`;
       } else {
-        const tokens = this.calculateMessagesSize();
-        messagesBtn.textContent = this.formatSize(tokens);
+        const chars = this.calculateMessagesSize();
+        messagesBtn.textContent = this.formatSize(chars);
       }
     },
   
@@ -6168,11 +6167,26 @@
   
     // Add edit/delete buttons to a message element
     // For tool pairs, pass both messageId (tool-use) and pairedMessageId (tool-result)
-    addMessageActions: function(messageElement, messageId, pairedMessageId = null) {
+    addMessageActions: function(messageElement, messageId, pairedMessageId = null, toolName = null) {
       const state = window.module['state.js'];
   
       const actionsDiv = document.createElement('div');
       actionsDiv.className = 'message-actions';
+  
+      // Add extract button for read_file tools
+      if (toolName === 'read_file' && pairedMessageId) {
+        const extractBtn = document.createElement('button');
+        extractBtn.className = 'message-action-btn';
+        extractBtn.textContent = 'Extract';
+        extractBtn.onclick = async (e) => {
+          e.stopPropagation();
+          if (state.isProcessing()) {
+            return;
+          }
+          await this.extractRelevantCode(messageId, pairedMessageId);
+        };
+        actionsDiv.appendChild(extractBtn);
+      }
   
       const editBtn = document.createElement('button');
       editBtn.className = 'message-action-btn';
@@ -6388,6 +6402,74 @@
   
         this.renderMessages(state.getMessages());
         this.updateContextStats();
+      }
+    },
+  
+    // Extract relevant code from a read_file tool result
+    extractRelevantCode: async function(toolUseId, toolResultId) {
+      const state = window.module['state.js'];
+      const api = window.module['api.js'];
+      const messages = state.getMessages();
+  
+      const toolUseMsg = messages.find(m => m.id === toolUseId);
+      const toolResultMsg = messages.find(m => m.id === toolResultId);
+  
+      if (!toolUseMsg || !toolResultMsg) return;
+  
+      // Get original content size
+      const originalSize = toolResultMsg.content.length;
+  
+      // Build messages up to and including this tool pair
+      const indexOfToolUse = messages.indexOf(toolUseMsg);
+      const conversationContext = messages.slice(0, indexOfToolUse + 2); // Include tool-use and tool-result
+  
+      // Add extraction request
+      const extractionPrompt = {
+        type: 'user_msg',
+        content: 'From the file you just read, extract ONLY the specific code sections, functions, or lines that are directly relevant to this conversation. Return the extracted code with minimal context. Format as:\n\n[Brief description of what was extracted]\n\n```\n[extracted code]\n```\n\nBe very selective - only include what is actually needed.',
+        uiOnly: true  // Don't save this to conversation
+      };
+  
+      conversationContext.push(extractionPrompt);
+  
+      // Show loading state
+      this.showLoading('Extracting relevant code');
+      state.setProcessing(true);
+  
+      try {
+        // Call API with the context
+        const response = await api.callAPISimple(conversationContext);
+  
+        this.hideLoading();
+        state.setProcessing(false);
+  
+        if (!response.valid) {
+          alert('Failed to extract code: ' + response.error);
+          return;
+        }
+  
+        const extractedContent = response.text;
+        const extractedSize = extractedContent.length;
+  
+        // Check if extraction is actually smaller
+        if (extractedSize >= originalSize) {
+          alert(`Extraction did not reduce size.\nOriginal: ${this.formatSizeDecimal(originalSize)}, Extracted: ${this.formatSizeDecimal(extractedSize)}\n\nKeeping original content.`);
+          return;
+        }
+  
+        // Update the tool result with extracted content
+        toolResultMsg.content = `[EXTRACTED - Relevant sections only. Original file was ${this.formatSizeDecimal(originalSize)}]\n\n${extractedContent}`;
+        toolResultMsg.summary = `Extracted relevant code (${this.formatSizeDecimal(extractedSize)} from ${this.formatSizeDecimal(originalSize)})`;
+        toolResultMsg.wasExtracted = true;
+  
+        // Re-render
+        this.renderMessages(state.getMessages());
+        this.updateContextStats();
+  
+      } catch (error) {
+        this.hideLoading();
+        state.setProcessing(false);
+        alert('Error during extraction: ' + error.message);
       }
     }
   };
