@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-24T19:15:28.280Z
+// AI Agent - Built 2025-11-24T19:52:02.849Z
 (function() {
   window.module = {};
 
@@ -281,8 +281,10 @@
   
           let messages;
           if (structure === 'monolithic') {
-            // Single large user message
-            const content = 'Please respond with OK. ' + 'x'.repeat(inputSize - 25);
+            // Single large user message with realistic content
+            const baseContent = "I need help reviewing and improving this authentication and rate limiting implementation. Here's the complete code:\n\n```javascript\n// Authentication module\nconst crypto = require('crypto');\nconst bcrypt = require('bcrypt');\n\nclass AuthService {\n  constructor(db, rateLimiter) {\n    this.db = db;\n    this.rateLimiter = rateLimiter;\n    this.saltRounds = 12;\n  }\n\n  async login(username, password, ipAddress) {\n    // Check rate limit first\n    if (!await this.rateLimiter.check(ipAddress)) {\n      throw new Error('Too many login attempts. Please try again later.');\n    }\n\n    // Query user from database\n    const user = await this.db.query(\n      'SELECT id, username, password_hash, failed_attempts, locked_until FROM users WHERE username = ?',\n      [username]\n    );\n\n    if (!user) {\n      await this.rateLimiter.recordFailure(ipAddress);\n      throw new Error('Invalid username or password');\n    }\n\n    // Check if account is locked\n    if (user.locked_until && user.locked_until > new Date()) {\n      throw new Error('Account is temporarily locked. Please try again later.');\n    }\n\n    // Verify password\n    const isValid = await bcrypt.compare(password, user.password_hash);\n    if (!isValid) {\n      await this.handleFailedLogin(user);\n      await this.rateLimiter.recordFailure(ipAddress);\n      throw new Error('Invalid username or password');\n    }\n\n    // Successful login - reset failed attempts\n    await this.db.query('UPDATE users SET failed_attempts = 0, locked_until = NULL WHERE id = ?', [user.id]);\n    await this.rateLimiter.recordSuccess(ipAddress);\n\n    return this.generateSession(user);\n  }\n\n  async handleFailedLogin(user) {\n    const newFailedAttempts = user.failed_attempts + 1;\n    let lockedUntil = null;\n\n    if (newFailedAttempts >= 5) {\n      lockedUntil = new Date(Date.now() + 15 * 60 * 1000); // Lock for 15 minutes\n    }\n\n    await this.db.query(\n      'UPDATE users SET failed_attempts = ?, locked_until = ? WHERE id = ?',\n      [newFailedAttempts, lockedUntil, user.id]\n    );\n  }\n\n  generateSession(user) {\n    const sessionId = crypto.randomBytes(32).toString('hex');\n    const token = crypto.randomBytes(64).toString('hex');\n    return { sessionId, token, userId: user.id };\n  }\n}\n\n// Rate Limiter with Redis\nclass RateLimiter {\n  constructor(redis) {\n    this.redis = redis;\n    this.windowMs = 15 * 60 * 1000;\n    this.maxAttempts = 10;\n  }\n\n  async check(identifier) {\n    const key = `ratelimit:${identifier}`;\n    const multi = this.redis.multi();\n    multi.incr(key);\n    multi.expire(key, Math.ceil(this.windowMs / 1000), 'NX');\n    const results = await multi.exec();\n    const count = results[0][1];\n    return count <= this.maxAttempts;\n  }\n\n  async recordFailure(identifier) {\n    const key = `failures:${identifier}`;\n    await this.redis.incr(key);\n    await this.redis.expire(key, 3600); // Track for 1 hour\n  }\n\n  async recordSuccess(identifier) {\n    const key = `failures:${identifier}`;\n    await this.redis.del(key);\n  }\n}\n\nmodule.exports = { AuthService, RateLimiter };\n```\n\nPlease review this code for:\n1. Security vulnerabilities\n2. Race conditions or concurrency issues\n3. Performance bottlenecks\n4. Best practices violations\n5. Edge cases that aren't handled\n\nAlso suggest improvements for scalability in a distributed system with multiple application servers.";
+  
+            const content = this.fillToSize(baseContent, inputSize);
             messages = [{ role: 'user', content }];
           } else {
             // Split into conversation with 1000 char messages
@@ -340,32 +342,96 @@
       this.printMessageStructureSummary();
     },
   
-    // Generate conversational message array
+    // Generate conversational message array with realistic content
     generateConversationalMessages: function(totalChars, chunkSize) {
       const messages = [];
       let remaining = totalChars;
       let isUser = true;
+      let turnIndex = 0;
   
-      // First message
-      messages.push({
-        role: 'user',
-        content: 'Please help me with this task. ' + 'x'.repeat(Math.min(chunkSize - 32, remaining - 32))
-      });
-      remaining -= chunkSize;
+      // Realistic conversation snippets that require processing
+      const userSnippets = [
+        "I need help implementing a user authentication system. Here's what I have so far:\n\nfunction login(username, password) {\n  const hash = md5(password);\n  return db.query('SELECT * FROM users WHERE name=' + username + ' AND pass=' + hash);\n}\n\nI'm getting intermittent failures and I'm not sure why. Can you help identify the issues?",
+        "Thanks for that feedback. Now I need to add rate limiting to prevent brute force attacks. What's the best approach? I was thinking of using Redis to track login attempts per IP address, but I'm concerned about the performance impact at scale.",
+        "Here's my current implementation of the rate limiter:\n\nclass RateLimiter {\n  constructor(redis) {\n    this.redis = redis;\n    this.windowMs = 15 * 60 * 1000;\n    this.maxAttempts = 5;\n  }\n\n  async check(ip) {\n    const key = `ratelimit:${ip}`;\n    const count = await this.redis.incr(key);\n    if (count === 1) await this.redis.expire(key, this.windowMs / 1000);\n    return count <= this.maxAttempts;\n  }\n}\n\nDoes this look correct? I'm worried about race conditions.",
+        "Good point about the race conditions. Let me also ask - should I be implementing this at the application layer or would it be better handled at the infrastructure level with something like nginx? What are the tradeoffs?",
+        "I'm also concerned about distributed systems. If I have multiple app servers behind a load balancer, how do I ensure the rate limiting works consistently across all instances? Should I stick with Redis or consider other options?",
+        "Here's another issue - my tests are now failing with this error:\n\nAssertionError: expected 429 to equal 200\n  at Context.<anonymous> (test/auth.test.js:45:32)\n  at processImmediate (node:internal/timers:464:21)\n\nThe test is expecting a successful login but getting rate limited. How should I handle testing with rate limiting enabled?"
+      ];
   
-      // Alternate user/assistant messages
+      const assistantSnippets = [
+        "I can see several critical security issues in your code:\n\n1. **SQL Injection Vulnerability**: You're concatenating user input directly into the SQL query. Use parameterized queries instead:\n```javascript\nreturn db.query('SELECT * FROM users WHERE name = ? AND pass = ?', [username, hash]);\n```\n\n2. **Weak Password Hashing**: MD5 is cryptographically broken. Use bcrypt or argon2 instead.\n\n3. **Timing Attacks**: The current implementation may be vulnerable to timing attacks. Consider using constant-time comparison.\n\nWould you like me to provide a complete rewrite addressing all these issues?",
+        "For rate limiting, Redis is indeed a solid choice for distributed systems. Here's a robust approach using the token bucket algorithm:\n\n```javascript\nclass TokenBucketRateLimiter {\n  async checkLimit(identifier) {\n    const key = `rate:${identifier}`;\n    const now = Date.now();\n    const script = `\n      local tokens = redis.call('GET', KEYS[1])\n      local lastRefill = redis.call('GET', KEYS[2])\n      -- token bucket logic here\n    `;\n    return this.redis.eval(script, 2, key, `${key}:time`);\n  }\n}\n```\n\nThis uses Lua scripting to ensure atomicity. The performance impact is minimal - Redis can handle tens of thousands of operations per second.",
+        "Your implementation has a subtle race condition between INCR and EXPIRE. Here's a safer approach using Redis atomic operations:\n\n```javascript\nasync check(ip) {\n  const key = `ratelimit:${ip}`;\n  const multi = this.redis.multi();\n  multi.incr(key);\n  multi.expire(key, Math.ceil(this.windowMs / 1000), 'NX');\n  const results = await multi.exec();\n  const count = results[0][1];\n  return count <= this.maxAttempts;\n}\n```\n\nThe 'NX' flag ensures EXPIRE only sets the expiry if it doesn't already exist, preventing the race condition. Also consider adding pipeline batching for better performance.",
+        "Great question about application vs infrastructure layer. Here are the tradeoffs:\n\n**Application Layer (Current Approach)**:\n- Pros: Fine-grained control, can rate limit per user/endpoint, custom logic\n- Cons: Uses app resources, requires coordination in distributed setups\n\n**Infrastructure Layer (nginx/HAProxy)**:\n- Pros: Offloads work from app, handles traffic before it reaches your code\n- Cons: Less flexible, typically IP-based only, harder to customize\n\n**Recommendation**: Use both! nginx for coarse-grained DDoS protection, application layer for business logic rate limiting (e.g., per-user API limits).",
+        "For distributed systems, Redis is the right choice. Here's a complete architecture:\n\n1. **Centralized Redis**: All app servers connect to the same Redis cluster\n2. **Lua Scripts**: Ensure atomic operations (no race conditions)\n3. **Connection Pooling**: Reuse connections for performance\n4. **Fallback Strategy**: If Redis is down, either fail-open (allow) or fail-closed (deny)\n\nConsider Redis Cluster for high availability:\n```javascript\nconst Redis = require('ioredis');\nconst cluster = new Redis.Cluster([/* nodes */]);\n```\n\nAlternatives include: Memcached (simpler, no persistence), etcd (strongly consistent), or even a distributed cache like Hazelcast.",
+        "For testing with rate limiting, you have several options:\n\n1. **Mock/Stub the Rate Limiter**:\n```javascript\nsinon.stub(rateLimiter, 'check').resolves(true);\n```\n\n2. **Use a Test-Specific Config**:\n```javascript\nif (process.env.NODE_ENV === 'test') {\n  rateLimiter.maxAttempts = Infinity;\n}\n```\n\n3. **Test the Rate Limiter Separately**:\nCreate dedicated tests for rate limiting behavior, then mock it in other tests.\n\n4. **Use Different Redis Database**:\n```javascript\nconst testRedis = new Redis({ db: 15 }); // Test DB\n```\n\nI recommend option 3 - unit test the rate limiter thoroughly, then mock it for integration tests. This keeps tests fast and predictable."
+      ];
+  
+      // Add first message
+      const firstContent = this.fillToSize(userSnippets[0], Math.min(chunkSize, remaining));
+      messages.push({ role: 'user', content: firstContent });
+      remaining -= firstContent.length;
+  
+      // Alternate between user and assistant with realistic content
       while (remaining > 0) {
         const role = isUser ? 'user' : 'assistant';
-        const size = Math.min(chunkSize, remaining);
-        messages.push({
-          role,
-          content: 'x'.repeat(size)
-        });
-        remaining -= size;
+        const snippets = isUser ? userSnippets : assistantSnippets;
+        const snippetIndex = Math.floor(turnIndex / 2) % snippets.length;
+        const baseSnippet = snippets[snippetIndex];
+  
+        const targetSize = Math.min(chunkSize, remaining);
+        const content = this.fillToSize(baseSnippet, targetSize);
+  
+        messages.push({ role, content });
+        remaining -= content.length;
         isUser = !isUser;
+        turnIndex++;
       }
   
       return messages;
+    },
+  
+    // Fill content to target size by repeating or truncating with variations
+    fillToSize: function(baseContent, targetSize) {
+      if (baseContent.length >= targetSize) {
+        return baseContent.substring(0, targetSize);
+      }
+  
+      // Add variations to prevent exact repetition
+      const variations = [
+        "\n\nAdditionally, I'm curious about the edge cases here. ",
+        "\n\nOne more question - what about performance implications? ",
+        "\n\nI'd also like to understand the security aspects better. ",
+        "\n\nCould you elaborate on the scalability concerns? ",
+        "\n\nLet me also ask about error handling strategies. ",
+        "\n\nWhat are your thoughts on the testing approach? ",
+        "\n\nI'm also thinking about the deployment strategy. ",
+        "\n\nHow does this compare to alternative approaches? ",
+        "\n\nWhat about backwards compatibility issues? ",
+        "\n\nCould you clarify the configuration options? "
+      ];
+  
+      let result = baseContent;
+      let variationIndex = 0;
+  
+      while (result.length < targetSize) {
+        const remaining = targetSize - result.length;
+  
+        // Add variation prefix
+        const variation = variations[variationIndex % variations.length];
+        variationIndex++;
+  
+        if (remaining >= baseContent.length + variation.length) {
+          result += variation + baseContent;
+        } else if (remaining >= variation.length + 50) {
+          result += variation + baseContent.substring(0, remaining - variation.length);
+        } else {
+          // Just pad with the variation or base content
+          result += baseContent.substring(0, remaining);
+        }
+      }
+      return result.substring(0, targetSize);
     },
   
     // Print message structure test summary
