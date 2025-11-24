@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-24T17:56:37.130Z
+// AI Agent - Built 2025-11-24T18:34:57.608Z
 (function() {
   window.module = {};
 
@@ -262,9 +262,9 @@
       // Input sizes: start at 80K (highest from prev test), double each time
       const inputSizes = [80000, 160000, 320000, 640000, 1280000];
   
-      // Output sizes: start at 8K chars (highest from prev test), double each time
+      // Output sizes: start at 128K (highest from prev test), double each time
       // chars/4 = rough token count
-      const outputSizes = [8000, 16000, 32000, 64000, 128000]; // ~2000, 4000, 8000, 16000, 32000 tokens
+      const outputSizes = [128000, 256000, 512000, 1024000, 2048000]; // ~32000, 64000, 128000, 256000, 512000 tokens
   
       // Complexity levels
       const complexityLevels = ['simple', 'medium', 'complex'];
@@ -384,8 +384,35 @@
         console.log(`${complexity.toUpperCase()}: ${complexityPassed}/${complexityResults.length} passed`);
       }
   
+      // Show Input vs Output Tradeoff
+      console.log('\n--- Input vs Output Tradeoff ---');
+      console.log('For each input size, what is the max successful output?');
+      console.log('(Shows how larger inputs reduce available output space)\n');
+  
+      for (const complexity of complexities) {
+        console.log(`${complexity.toUpperCase()}:`);
+        const complexityResults = this.results.filter(r => r.complexity === complexity);
+  
+        // Get unique input sizes
+        const inputSizes = [...new Set(complexityResults.map(r => r.inputSize))].sort((a, b) => a - b);
+  
+        for (const inputSize of inputSizes) {
+          const resultsForInput = complexityResults.filter(r => r.inputSize === inputSize && r.success);
+          if (resultsForInput.length > 0) {
+            const maxOutput = Math.max(...resultsForInput.map(r => r.outputSize));
+            const maxOutputTokens = Math.ceil(maxOutput / 4);
+            const inputTokens = Math.ceil(inputSize / 4);
+            console.log(`  input=${inputSize}c (~${inputTokens}tok) → max_output=${maxOutput}c (~${maxOutputTokens}tok)`);
+          } else {
+            // No successful tests at this input size
+            console.log(`  input=${inputSize}c → ✗ ALL FAILED`);
+          }
+        }
+        console.log('');
+      }
+  
       // Find boundaries
-      console.log('\n--- Success Boundaries ---');
+      console.log('--- Success Boundaries ---');
       for (const complexity of complexities) {
         const complexityResults = this.results.filter(r => r.complexity === complexity && r.success);
         if (complexityResults.length > 0) {
@@ -395,6 +422,31 @@
             Math.max(max, r.inputSize + r.outputSize), 0);
           console.log(`${complexity}: max_input=${maxInput}c, max_output=${maxOutput}c, max_combined=${maxCombined}c`);
         }
+      }
+  
+      // Find failure ranges
+      console.log('\n--- Failure Boundaries ---');
+      console.log('(Smallest values where failures occurred)\n');
+      for (const complexity of complexities) {
+        const complexityFailures = this.results.filter(r => r.complexity === complexity && !r.success);
+        if (complexityFailures.length > 0) {
+          const minFailInput = Math.min(...complexityFailures.map(r => r.inputSize));
+          const minFailOutput = Math.min(...complexityFailures.map(r => r.outputSize));
+          const minFailCombined = Math.min(...complexityFailures.map(r => r.inputSize + r.outputSize));
+  
+          console.log(`${complexity.toUpperCase()}:`);
+          console.log(`  First failure at: input≥${minFailInput}c OR output≥${minFailOutput}c`);
+          console.log(`  Min combined that failed: ${minFailCombined}c`);
+  
+          // Show specific failure patterns
+          const inputFailures = [...new Set(complexityFailures.map(r => r.inputSize))].sort((a, b) => a - b);
+          const outputFailures = [...new Set(complexityFailures.map(r => r.outputSize))].sort((a, b) => a - b);
+          console.log(`  Input sizes with failures: [${inputFailures.join(', ')}]`);
+          console.log(`  Output sizes with failures: [${outputFailures.join(', ')}]`);
+        } else {
+          console.log(`${complexity.toUpperCase()}: No failures`);
+        }
+        console.log('');
       }
   
       // Generate formula
