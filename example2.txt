@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-24T17:33:53.887Z
+// AI Agent - Built 2025-11-24T17:56:37.130Z
 (function() {
   window.module = {};
 
@@ -259,12 +259,12 @@
       this.results = [];
   
       // Define test dimensions
-      // Input sizes: start at 5K chars, double each time
-      const inputSizes = [5000, 10000, 20000, 40000, 80000];
+      // Input sizes: start at 80K (highest from prev test), double each time
+      const inputSizes = [80000, 160000, 320000, 640000, 1280000];
   
-      // Output sizes: start at 500 chars (~125 tokens), double each time
+      // Output sizes: start at 8K chars (highest from prev test), double each time
       // chars/4 = rough token count
-      const outputSizes = [500, 1000, 2000, 4000, 8000]; // ~125, 250, 500, 1000, 2000 tokens
+      const outputSizes = [8000, 16000, 32000, 64000, 128000]; // ~2000, 4000, 8000, 16000, 32000 tokens
   
       // Complexity levels
       const complexityLevels = ['simple', 'medium', 'complex'];
