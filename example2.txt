@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-23T19:18:24.114Z
+// AI Agent - Built 2025-11-24T17:33:53.887Z
 (function() {
   window.module = {};
 
@@ -248,6 +248,228 @@
   
     delay: function(ms) {
       return new Promise(resolve => setTimeout(resolve, ms));
+    },
+  
+    // 3D Test Matrix: Input Size x Output Size x Complexity
+    run3DTest: async function() {
+      console.log('\n========== API 3D TEST: Input x Output x Complexity ==========\n');
+      console.log('Testing combinations of input size, output size, and complexity...\n');
+  
+      const api = window.module['api.js'];
+      this.results = [];
+  
+      // Define test dimensions
+      // Input sizes: start at 5K chars, double each time
+      const inputSizes = [5000, 10000, 20000, 40000, 80000];
+  
+      // Output sizes: start at 500 chars (~125 tokens), double each time
+      // chars/4 = rough token count
+      const outputSizes = [500, 1000, 2000, 4000, 8000]; // ~125, 250, 500, 1000, 2000 tokens
+  
+      // Complexity levels
+      const complexityLevels = ['simple', 'medium', 'complex'];
+  
+      const totalTests = inputSizes.length * outputSizes.length * complexityLevels.length;
+      let completedTests = 0;
+  
+      console.log(`Total test combinations: ${totalTests}`);
+      console.log(`Input sizes (chars): ${inputSizes.join(', ')}`);
+      console.log(`Output sizes (chars): ${outputSizes.join(', ')}`);
+      console.log(`Complexity levels: ${complexityLevels.join(', ')}\n`);
+  
+      // Run all combinations
+      for (const complexity of complexityLevels) {
+        for (const inputSize of inputSizes) {
+          for (const outputSize of outputSizes) {
+            completedTests++;
+            const maxTokens = Math.ceil(outputSize / 4);
+  
+            console.log(`\n[${completedTests}/${totalTests}] Testing: ${complexity}, input=${inputSize}c, output=${outputSize}c (~${maxTokens}tok)`);
+  
+            // Generate appropriate content based on complexity
+            const content = this.generateContentByComplexity(complexity, inputSize);
+            const messages = [{ role: 'user', content }];
+  
+            const startTime = Date.now();
+  
+            try {
+              const response = await api.callAPISimpleWithMaxTokens(messages, maxTokens);
+              const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+              const outputLength = response.text ? response.text.length : 0;
+  
+              if (response.valid) {
+                console.log(`  ✓ OK (${duration}s) - Output: ${outputLength} chars`);
+                this.results.push({
+                  complexity,
+                  inputSize,
+                  outputSize,
+                  maxTokens,
+                  success: true,
+                  duration: parseFloat(duration),
+                  actualOutputLength: outputLength,
+                  error: null
+                });
+              } else {
+                console.log(`  ✗ FAILED (${duration}s) - ${response.error.substring(0, 80)}`);
+                this.results.push({
+                  complexity,
+                  inputSize,
+                  outputSize,
+                  maxTokens,
+                  success: false,
+                  duration: parseFloat(duration),
+                  actualOutputLength: 0,
+                  error: response.error
+                });
+              }
+            } catch (e) {
+              const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+              console.log(`  ✗ EXCEPTION (${duration}s) - ${e.message.substring(0, 80)}`);
+              this.results.push({
+                complexity,
+                inputSize,
+                outputSize,
+                maxTokens,
+                success: false,
+                duration: parseFloat(duration),
+                actualOutputLength: 0,
+                error: e.message
+              });
+            }
+  
+            // Small delay between tests
+            await this.delay(300);
+          }
+        }
+      }
+  
+      this.print3DTestSummary();
+    },
+  
+    // Generate content based on complexity level
+    generateContentByComplexity: function(complexity, targetLength) {
+      const basePrompt = "Please respond with a detailed explanation. ";
+  
+      if (complexity === 'simple') {
+        // Simple repetitive text
+        const filler = 'This is simple test content. '.repeat(Math.ceil(targetLength / 30));
+        return basePrompt + filler.substring(0, targetLength - basePrompt.length);
+      } else if (complexity === 'medium') {
+        // Structured conversation format
+        return basePrompt + this.generateCompactionFormatConversation(targetLength - basePrompt.length);
+      } else {
+        // Complex: Ask for analysis/summarization
+        const conversation = this.generateCompactionFormatConversation(targetLength - basePrompt.length - 100);
+        return "Please analyze and summarize the following conversation:\n\n" + conversation;
+      }
+    },
+  
+    // Print 3D test summary with analysis
+    print3DTestSummary: function() {
+      console.log('\n========== 3D TEST SUMMARY ==========\n');
+  
+      const passed = this.results.filter(r => r.success);
+      const failed = this.results.filter(r => !r.success);
+  
+      console.log(`Total: ${this.results.length} tests`);
+      console.log(`Passed: ${passed.length} (${(passed.length/this.results.length*100).toFixed(1)}%)`);
+      console.log(`Failed: ${failed.length} (${(failed.length/this.results.length*100).toFixed(1)}%)`);
+  
+      // Analysis by complexity
+      console.log('\n--- By Complexity ---');
+      const complexities = ['simple', 'medium', 'complex'];
+      for (const complexity of complexities) {
+        const complexityResults = this.results.filter(r => r.complexity === complexity);
+        const complexityPassed = complexityResults.filter(r => r.success).length;
+        console.log(`${complexity.toUpperCase()}: ${complexityPassed}/${complexityResults.length} passed`);
+      }
+  
+      // Find boundaries
+      console.log('\n--- Success Boundaries ---');
+      for (const complexity of complexities) {
+        const complexityResults = this.results.filter(r => r.complexity === complexity && r.success);
+        if (complexityResults.length > 0) {
+          const maxInput = Math.max(...complexityResults.map(r => r.inputSize));
+          const maxOutput = Math.max(...complexityResults.map(r => r.outputSize));
+          const maxCombined = complexityResults.reduce((max, r) =>
+            Math.max(max, r.inputSize + r.outputSize), 0);
+          console.log(`${complexity}: max_input=${maxInput}c, max_output=${maxOutput}c, max_combined=${maxCombined}c`);
+        }
+      }
+  
+      // Generate formula
+      console.log('\n--- Formula Derivation ---');
+      this.deriveFormula();
+  
+      // Show failures
+      if (failed.length > 0) {
+        console.log('\n--- Failures ---');
+        const failureSample = failed.slice(0, 10);
+        for (const f of failureSample) {
+          console.log(`  ${f.complexity}, in=${f.inputSize}c, out=${f.outputSize}c: ${f.error?.substring(0, 60)}`);
+        }
+        if (failed.length > 10) {
+          console.log(`  ... and ${failed.length - 10} more failures`);
+        }
+      }
+  
+      console.log('\n========== END ==========\n');
+    },
+  
+    // Derive a predictive formula from test results
+    deriveFormula: function() {
+      const successful = this.results.filter(r => r.success);
+  
+      if (successful.length === 0) {
+        console.log('No successful tests to analyze.');
+        return;
+      }
+  
+      // Group by complexity
+      const byComplexity = {
+        simple: successful.filter(r => r.complexity === 'simple'),
+        medium: successful.filter(r => r.complexity === 'medium'),
+        complex: successful.filter(r => r.complexity === 'complex')
+      };
+  
+      // Calculate complexity weights
+      const complexityWeights = {};
+  
+      for (const [complexity, results] of Object.entries(byComplexity)) {
+        if (results.length === 0) continue;
+  
+        const maxTotal = Math.max(...results.map(r => r.inputSize + r.outputSize));
+        complexityWeights[complexity] = maxTotal;
+      }
+  
+      // Normalize to simple = 1.0
+      const simpleMax = complexityWeights.simple || 1;
+      const normalizedWeights = {};
+      for (const [complexity, weight] of Object.entries(complexityWeights)) {
+        normalizedWeights[complexity] = (weight / simpleMax).toFixed(2);
+      }
+  
+      console.log('Complexity Multipliers (relative to simple):');
+      for (const [complexity, weight] of Object.entries(normalizedWeights)) {
+        console.log(`  ${complexity}: ${weight}x`);
+      }
+  
+      // Find optimal input/output ratio
+      console.log('\nOptimal Input/Output Ratios:');
+      for (const [complexity, results] of Object.entries(byComplexity)) {
+        if (results.length === 0) continue;
+  
+        const ratios = results.map(r => r.inputSize / r.outputSize);
+        const avgRatio = (ratios.reduce((a, b) => a + b, 0) / ratios.length).toFixed(1);
+        console.log(`  ${complexity}: ${avgRatio}:1 (input:output)`);
+      }
+  
+      // Suggest formula
+      console.log('\nSuggested Formula:');
+      console.log('  max_output_chars = (BASE_LIMIT - input_chars) / complexity_weight');
+      console.log('  where:');
+      console.log(`    BASE_LIMIT ≈ ${simpleMax} chars (adjust based on actual limits)`);
+      console.log('    complexity_weight:', JSON.stringify(normalizedWeights, null, 4));
     }
   };
   
@@ -515,6 +737,48 @@
         features: { web_search: false },
         session_id: 'session-' + Math.random().toString(36).substr(2, 9),
         id: 'msg-' + Date.now() + '-simple',
+        background_tasks: { title_generation: false, tags_generation: false }
+      };
+  
+      const headers = { 'Content-Type': 'application/json' };
+      if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
+  
+      try {
+        const response = await fetch('/api/chat/completions', {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(requestBody)
+        });
+  
+        if (!response.ok) {
+          const errorText = await response.text();
+          return { valid: false, error: `API request failed (${response.status}): ${errorText}` };
+        }
+  
+        const data = await response.json();
+        const responseText = data.choices[0].message.content;
+        return { valid: true, text: responseText };
+      } catch (error) {
+        return { valid: false, error: error.message };
+      }
+    },
+  
+    // Simple API call with max_tokens parameter for testing output limits
+    callAPISimpleWithMaxTokens: async function(messages, maxTokens) {
+      const authToken = localStorage.getItem('token');
+  
+      // Transform messages to API format (with role and content)
+      const result = this.renderMessagesForAPI(messages);
+      const processedMessages = result.messages;
+  
+      const requestBody = {
+        stream: false,
+        model: 'Anthropic Claude 4 Sonnet',
+        messages: processedMessages,
+        params: { max_tokens: maxTokens },
+        features: { web_search: false },
+        session_id: 'session-' + Math.random().toString(36).substr(2, 9),
+        id: 'msg-' + Date.now() + '-test',
         background_tasks: { title_generation: false, tags_generation: false }
       };
   
@@ -3716,6 +3980,29 @@
           color: var(--color-gold);
         }
   
+        .api-test-btn {
+          background: var(--color-gold);
+          border: 1px solid var(--color-gold);
+          color: var(--color-bg-primary);
+          font-size: 11px;
+          font-family: 'Consolas', 'Courier New', monospace;
+          cursor: pointer;
+          padding: 4px 8px;
+          margin-left: 8px;
+          border-radius: 3px;
+          transition: all 0.2s ease;
+          font-weight: 600;
+        }
+  
+        .api-test-btn:hover {
+          background: var(--color-gold-light);
+          box-shadow: 0 2px 8px var(--color-gold-glow);
+        }
+  
+        .api-test-btn:active {
+          transform: scale(0.98);
+        }
+  
         /* Messages */
         .message {
           margin-bottom: 8px;
@@ -4922,6 +5209,26 @@
       messagesBtn.onclick = () => this.showConversationModal();
   
       contextStats.appendChild(messagesBtn);
+  
+      // Add API 3D Test button
+      const apiTestBtn = document.createElement('button');
+      apiTestBtn.className = 'api-test-btn';
+      apiTestBtn.id = 'api-test-btn';
+      apiTestBtn.textContent = 'Run 3D Test';
+      apiTestBtn.title = 'Test API with input/output/complexity combinations';
+      apiTestBtn.onclick = () => {
+        const diagnostics = window.module['api-diagnostics.js'];
+        if (diagnostics) {
+          console.log('Starting 3D API Test...');
+          diagnostics.run3DTest().then(() => {
+            console.log('3D API Test completed!');
+          }).catch(err => {
+            console.error('3D API Test failed:', err);
+          });
+        }
+      };
+  
+      contextStats.appendChild(apiTestBtn);
   
       inputContainer.appendChild(contextStats);
   
