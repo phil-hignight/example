@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-24T21:04:19.409Z
+// AI Agent - Built 2025-11-24T21:13:00.973Z
 (function() {
   window.module = {};
 
@@ -298,9 +298,16 @@
                 content: msg.content
               }));
   
+              // Log what we're actually sending
+              const totalContentChars = stateMessages.reduce((sum, m) => sum + (m.content?.length || 0), 0);
+              console.log(`  [DEBUG] Sending ${stateMessages.length} messages, ${totalContentChars}c total content`);
+  
               response = await api.callAPI(stateMessages);
             } else {
               // Use callAPISimpleWithMaxTokens which has NO system prompt
+              const totalContentChars = messages.reduce((sum, m) => sum + (m.content?.length || 0), 0);
+              console.log(`  [DEBUG] Sending ${messages.length} messages, ${totalContentChars}c total content`);
+  
               response = await api.callAPISimpleWithMaxTokens(messages, 100);
             }
   
