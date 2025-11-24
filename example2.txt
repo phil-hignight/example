@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-24T18:34:57.608Z
+// AI Agent - Built 2025-11-24T19:15:28.280Z
 (function() {
   window.module = {};
 
@@ -250,8 +250,202 @@
       return new Promise(resolve => setTimeout(resolve, ms));
     },
   
-    // 3D Test Matrix: Input Size x Output Size x Complexity
+    // Message Structure Test: Monolithic vs Conversational
     run3DTest: async function() {
+      console.log('\n========== MESSAGE STRUCTURE TEST: Monolithic vs Conversational ==========\n');
+      console.log('Testing if input limits differ based on message structure...\n');
+  
+      const api = window.module['api.js'];
+      this.results = [];
+  
+      // Test input sizes (total chars across all messages)
+      const inputSizes = [10000, 20000, 40000, 80000, 160000, 320000, 640000, 1280000];
+      const messageStructures = ['monolithic', 'conversational'];
+      const MESSAGE_CHUNK_SIZE = 1000; // For conversational, each message is 1000 chars
+  
+      const totalTests = inputSizes.length * messageStructures.length;
+      let completedTests = 0;
+  
+      console.log(`Total test combinations: ${totalTests}`);
+      console.log(`Input sizes (chars): ${inputSizes.join(', ')}`);
+      console.log(`Message structures: ${messageStructures.join(', ')}`);
+      console.log(`Conversational chunk size: ${MESSAGE_CHUNK_SIZE} chars\n`);
+  
+      // Run all combinations
+      for (const structure of messageStructures) {
+        for (const inputSize of inputSizes) {
+          completedTests++;
+          const inputTokens = Math.ceil(inputSize / 4);
+  
+          console.log(`\n[${completedTests}/${totalTests}] Testing: ${structure}, input=${inputSize}c (~${inputTokens}tok)`);
+  
+          let messages;
+          if (structure === 'monolithic') {
+            // Single large user message
+            const content = 'Please respond with OK. ' + 'x'.repeat(inputSize - 25);
+            messages = [{ role: 'user', content }];
+          } else {
+            // Split into conversation with 1000 char messages
+            messages = this.generateConversationalMessages(inputSize, MESSAGE_CHUNK_SIZE);
+          }
+  
+          const messageCount = messages.length;
+          console.log(`  Message count: ${messageCount}`);
+  
+          const startTime = Date.now();
+  
+          try {
+            const response = await api.callAPISimpleWithMaxTokens(messages, 100); // Small output
+            const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+  
+            if (response.valid) {
+              console.log(`  ✓ OK (${duration}s)`);
+              this.results.push({
+                structure,
+                inputSize,
+                messageCount,
+                success: true,
+                duration: parseFloat(duration),
+                error: null
+              });
+            } else {
+              console.log(`  ✗ FAILED (${duration}s) - ${response.error.substring(0, 80)}`);
+              this.results.push({
+                structure,
+                inputSize,
+                messageCount,
+                success: false,
+                duration: parseFloat(duration),
+                error: response.error
+              });
+            }
+          } catch (e) {
+            const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+            console.log(`  ✗ EXCEPTION (${duration}s) - ${e.message.substring(0, 80)}`);
+            this.results.push({
+              structure,
+              inputSize,
+              messageCount,
+              success: false,
+              duration: parseFloat(duration),
+              error: e.message
+            });
+          }
+  
+          // Small delay between tests
+          await this.delay(300);
+        }
+      }
+  
+      this.printMessageStructureSummary();
+    },
+  
+    // Generate conversational message array
+    generateConversationalMessages: function(totalChars, chunkSize) {
+      const messages = [];
+      let remaining = totalChars;
+      let isUser = true;
+  
+      // First message
+      messages.push({
+        role: 'user',
+        content: 'Please help me with this task. ' + 'x'.repeat(Math.min(chunkSize - 32, remaining - 32))
+      });
+      remaining -= chunkSize;
+  
+      // Alternate user/assistant messages
+      while (remaining > 0) {
+        const role = isUser ? 'user' : 'assistant';
+        const size = Math.min(chunkSize, remaining);
+        messages.push({
+          role,
+          content: 'x'.repeat(size)
+        });
+        remaining -= size;
+        isUser = !isUser;
+      }
+  
+      return messages;
+    },
+  
+    // Print message structure test summary
+    printMessageStructureSummary: function() {
+      console.log('\n========== MESSAGE STRUCTURE TEST SUMMARY ==========\n');
+  
+      const passed = this.results.filter(r => r.success);
+      const failed = this.results.filter(r => !r.success);
+  
+      console.log(`Total: ${this.results.length} tests`);
+      console.log(`Passed: ${passed.length} (${(passed.length/this.results.length*100).toFixed(1)}%)`);
+      console.log(`Failed: ${failed.length} (${(failed.length/this.results.length*100).toFixed(1)}%)`);
+  
+      // Compare structures
+      console.log('\n--- Comparison by Structure ---\n');
+  
+      for (const structure of ['monolithic', 'conversational']) {
+        console.log(`${structure.toUpperCase()}:`);
+        const structureResults = this.results.filter(r => r.structure === structure);
+        const structurePassed = structureResults.filter(r => r.success);
+  
+        if (structurePassed.length > 0) {
+          const maxInput = Math.max(...structurePassed.map(r => r.inputSize));
+          const maxInputTokens = Math.ceil(maxInput / 4);
+          console.log(`  Max successful input: ${maxInput}c (~${maxInputTokens}tok)`);
+  
+          // Show all successful sizes
+          const successfulSizes = structurePassed.map(r => r.inputSize).sort((a, b) => a - b);
+          console.log(`  Successful sizes: [${successfulSizes.join(', ')}]`);
+        }
+  
+        const structureFailed = structureResults.filter(r => !r.success);
+        if (structureFailed.length > 0) {
+          const minFail = Math.min(...structureFailed.map(r => r.inputSize));
+          console.log(`  First failure at: ${minFail}c`);
+  
+          // Show all failed sizes
+          const failedSizes = structureFailed.map(r => r.inputSize).sort((a, b) => a - b);
+          console.log(`  Failed sizes: [${failedSizes.join(', ')}]`);
+        }
+        console.log('');
+      }
+  
+      // Direct comparison
+      console.log('--- Direct Comparison ---\n');
+      const monoResults = this.results.filter(r => r.structure === 'monolithic');
+      const convResults = this.results.filter(r => r.structure === 'conversational');
+  
+      const monoMaxSuccess = Math.max(0, ...monoResults.filter(r => r.success).map(r => r.inputSize));
+      const convMaxSuccess = Math.max(0, ...convResults.filter(r => r.success).map(r => r.inputSize));
+  
+      console.log(`Monolithic max success: ${monoMaxSuccess}c (~${Math.ceil(monoMaxSuccess/4)}tok)`);
+      console.log(`Conversational max success: ${convMaxSuccess}c (~${Math.ceil(convMaxSuccess/4)}tok)`);
+  
+      if (monoMaxSuccess > convMaxSuccess) {
+        const diff = monoMaxSuccess - convMaxSuccess;
+        const pct = ((diff / convMaxSuccess) * 100).toFixed(1);
+        console.log(`\nMonolithic handles ${diff}c (${pct}%) MORE than conversational`);
+      } else if (convMaxSuccess > monoMaxSuccess) {
+        const diff = convMaxSuccess - monoMaxSuccess;
+        const pct = ((diff / monoMaxSuccess) * 100).toFixed(1);
+        console.log(`\nConversational handles ${diff}c (${pct}%) MORE than monolithic`);
+      } else {
+        console.log(`\nBoth structures handle the same amount`);
+      }
+  
+      // Show failures
+      if (failed.length > 0) {
+        console.log('\n--- Failures ---');
+        for (const f of failed) {
+          console.log(`  ${f.structure}, input=${f.inputSize}c, msgs=${f.messageCount}: ${f.error?.substring(0, 60)}`);
+        }
+      }
+  
+      console.log('\n========== END ==========\n');
+    },
+  
+    // COMMENTED OUT: Previous 3D test (input x output x complexity)
+    /*
+    run3DTest_OLD: async function() {
       console.log('\n========== API 3D TEST: Input x Output x Complexity ==========\n');
       console.log('Testing combinations of input size, output size, and complexity...\n');
   
@@ -345,6 +539,7 @@
   
       this.print3DTestSummary();
     },
+    */
   
     // Generate content based on complexity level
     generateContentByComplexity: function(complexity, targetLength) {
