@@ -41,6 +41,10 @@
     return messages.reduce((total, msg) => total + (msg.content?.length || 0), 0);
   }
 
+  function formatCharCount(count) {
+    return `${(count / 1000).toFixed(1)}K`;
+  }
+
   // ============================================================================
   // File System Handler
   // ============================================================================
@@ -78,11 +82,22 @@
             handle: entry
           });
         } else {
+          // Read file to get character count
+          let charCount = 0;
+          try {
+            const file = await entry.getFile();
+            const text = await file.text();
+            charCount = text.length;
+          } catch (err) {
+            console.warn('Could not read file for char count:', entry.name);
+          }
+
           entries.push({
             name: entry.name,
             type: 'file',
             path: fullPath,
-            handle: entry
+            handle: entry,
+            charCount: charCount
           });
         }
       }
@@ -511,7 +526,13 @@
             entry.children.forEach(child => renderEntry(child, level + 1));
           }
         } else {
-          item.innerHTML = `<span>📄</span><span>${entry.name}</span>`;
+          const charCountStr = formatCharCount(entry.charCount);
+          item.innerHTML = `
+            <span>📄</span>
+            <span style="flex: 1;">${entry.name}</span>
+            <span style="color: #858585; font-size: 11px; margin-left: 8px;">${charCountStr}</span>
+          `;
+          item.style.display = 'flex';
           item.addEventListener('click', async (e) => {
             e.stopPropagation();
             await this.addFileToConversation(entry);
@@ -591,15 +612,33 @@
           border-radius: 4px;
         `;
 
+        const headerDiv = document.createElement('div');
+        headerDiv.style.cssText = `
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          margin-bottom: 8px;
+        `;
+
         const roleLabel = document.createElement('div');
         roleLabel.style.cssText = `
           font-weight: 600;
-          margin-bottom: 8px;
           color: ${msg.role === 'user' ? '#4db8ff' : '#5fb583'};
           font-size: 12px;
           text-transform: uppercase;
         `;
         roleLabel.textContent = msg.role;
+
+        const charLabel = document.createElement('div');
+        charLabel.style.cssText = `
+          color: #858585;
+          font-size: 11px;
+        `;
+        const charCount = msg.content?.length || 0;
+        charLabel.textContent = `${formatCharCount(charCount)} chars`;
+
+        headerDiv.appendChild(roleLabel);
+        headerDiv.appendChild(charLabel);
 
         const contentDiv = document.createElement('div');
         contentDiv.style.cssText = `
@@ -610,7 +649,7 @@
         `;
         contentDiv.textContent = msg.content;
 
-        msgDiv.appendChild(roleLabel);
+        msgDiv.appendChild(headerDiv);
         msgDiv.appendChild(contentDiv);
         chatArea.appendChild(msgDiv);
       });
@@ -620,7 +659,7 @@
 
     updateCharCounter() {
       const count = countCharacters(this.messages);
-      const formatted = count >= 1000 ? `${(count / 1000).toFixed(1)}K` : count;
+      const formatted = formatCharCount(count);
       document.getElementById('charCounter').textContent = `${formatted} chars`;
     }
 
