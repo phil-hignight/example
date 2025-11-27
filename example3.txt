@@ -1,0 +1,762 @@
+// API Testing Interface
+// Paste this into Chrome DevTools Console to run
+
+(async function() {
+  'use strict';
+
+  // ============================================================================
+  // Configuration
+  // ============================================================================
+  const CONFIG = {
+    API_BASE: 'https://chat.niprgpt.mil/api',
+    MODEL: 'Anthropic Claude 4 Sonnet'
+  };
+
+  // ============================================================================
+  // Utility Functions
+  // ============================================================================
+
+  function generateUUID() {
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+      const r = Math.random() * 16 | 0;
+      const v = c === 'x' ? r : (r & 0x3 | 0x8);
+      return v.toString(16);
+    });
+  }
+
+  function generateSessionId() {
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-';
+    let result = '';
+    for (let i = 0; i < 20; i++) {
+      result += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    return result;
+  }
+
+  function getTimestamp() {
+    return Math.floor(Date.now() / 1000);
+  }
+
+  function countCharacters(messages) {
+    return messages.reduce((total, msg) => total + (msg.content?.length || 0), 0);
+  }
+
+  // ============================================================================
+  // File System Handler
+  // ============================================================================
+
+  class FileSystemHandler {
+    constructor() {
+      this.directoryHandle = null;
+      this.fileTree = [];
+    }
+
+    async requestDirectory() {
+      try {
+        this.directoryHandle = await window.showDirectoryPicker();
+        this.fileTree = await this.buildFileTree(this.directoryHandle);
+        return true;
+      } catch (err) {
+        console.error('Directory access error:', err);
+        return false;
+      }
+    }
+
+    async buildFileTree(dirHandle, path = '') {
+      const entries = [];
+
+      for await (const entry of dirHandle.values()) {
+        const fullPath = path ? `${path}/${entry.name}` : entry.name;
+
+        if (entry.kind === 'directory') {
+          const children = await this.buildFileTree(entry, fullPath);
+          entries.push({
+            name: entry.name,
+            type: 'directory',
+            path: fullPath,
+            children: children,
+            handle: entry
+          });
+        } else {
+          entries.push({
+            name: entry.name,
+            type: 'file',
+            path: fullPath,
+            handle: entry
+          });
+        }
+      }
+
+      return entries.sort((a, b) => {
+        if (a.type !== b.type) return a.type === 'directory' ? -1 : 1;
+        return a.name.localeCompare(b.name);
+      });
+    }
+
+    async readFile(fileEntry) {
+      try {
+        const file = await fileEntry.handle.getFile();
+        const text = await file.text();
+        return text;
+      } catch (err) {
+        console.error('File read error:', err);
+        return null;
+      }
+    }
+  }
+
+  // ============================================================================
+  // API Client
+  // ============================================================================
+
+  class APIClient {
+    constructor() {
+      this.chatId = null;
+      this.sessionId = generateSessionId();
+    }
+
+    async createNewChat(firstMessage) {
+      const messageId = generateUUID();
+      const timestamp = getTimestamp();
+
+      const payload = {
+        chat: {
+          id: '',
+          title: 'Chat Pending',
+          models: [CONFIG.MODEL],
+          params: {},
+          history: {
+            messages: {
+              [messageId]: {
+                id: messageId,
+                parentId: null,
+                childrenIds: [],
+                role: 'user',
+                content: firstMessage,
+                timestamp: timestamp,
+                models: [CONFIG.MODEL]
+              }
+            },
+            currentId: messageId
+          },
+          messages: [
+            {
+              id: messageId,
+              parentId: null,
+              childrenIds: [],
+              role: 'user',
+              content: firstMessage,
+              timestamp: timestamp,
+              models: [CONFIG.MODEL]
+            }
+          ],
+          tags: [],
+          timestamp: Date.now()
+        }
+      };
+
+      const response = await fetch(`${CONFIG.API_BASE}/v1/chats/new`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(payload)
+      });
+
+      if (!response.ok) {
+        throw new Error(`Failed to create chat: ${response.status} ${response.statusText}`);
+      }
+
+      const data = await response.json();
+      this.chatId = data.id;
+
+      return { chatId: data.id, messageId };
+    }
+
+    async updateChat(messages) {
+      const timestamp = getTimestamp();
+
+      // Build history object
+      const historyMessages = {};
+      messages.forEach((msg, idx) => {
+        historyMessages[msg.id] = {
+          id: msg.id,
+          parentId: msg.parentId,
+          childrenIds: msg.childrenIds,
+          content: msg.content,
+          role: msg.role,
+          timestamp: msg.timestamp,
+          ...(msg.role === 'user' ? { models: [CONFIG.MODEL] } : {
+            model: CONFIG.MODEL,
+            modelIdx: 0,
+            modelName: CONFIG.MODEL,
+            userContext: null
+          })
+        };
+      });
+
+      const currentId = messages[messages.length - 1].id;
+
+      const payload = {
+        chat: {
+          models: [CONFIG.MODEL],
+          files: [],
+          params: {},
+          history: {
+            messages: historyMessages,
+            currentId: currentId
+          },
+          messages: messages.map(msg => ({
+            id: msg.id,
+            parentId: msg.parentId,
+            childrenIds: msg.childrenIds,
+            content: msg.content,
+            role: msg.role,
+            timestamp: msg.timestamp,
+            ...(msg.role === 'user' ? { models: [CONFIG.MODEL] } : {
+              model: CONFIG.MODEL,
+              modelIdx: 0,
+              modelName: CONFIG.MODEL,
+              userContext: null
+            })
+          }))
+        }
+      };
+
+      const response = await fetch(`${CONFIG.API_BASE}/v1/chats/${this.chatId}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(payload)
+      });
+
+      if (!response.ok) {
+        throw new Error(`Failed to update chat: ${response.status} ${response.statusText}`);
+      }
+
+      return await response.json();
+    }
+
+    async getCompletion(messages, assistantMessageId) {
+      const userMessages = messages
+        .filter(m => m.role === 'user')
+        .map(m => ({
+          role: 'user',
+          content: m.content
+        }));
+
+      const payload = {
+        stream: true,
+        model: CONFIG.MODEL,
+        messages: userMessages,
+        params: {},
+        features: {
+          web_search: false
+        },
+        session_id: this.sessionId,
+        chat_id: this.chatId,
+        id: assistantMessageId,
+        background_tasks: {
+          title_generation: true,
+          tags_generation: true
+        }
+      };
+
+      const response = await fetch(`${CONFIG.API_BASE}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(payload)
+      });
+
+      if (!response.ok) {
+        throw new Error(`Failed to get completion: ${response.status} ${response.statusText}`);
+      }
+
+      return response;
+    }
+  }
+
+  // ============================================================================
+  // UI Manager
+  // ============================================================================
+
+  class UIManager {
+    constructor() {
+      this.fileSystemHandler = new FileSystemHandler();
+      this.apiClient = new APIClient();
+      this.messages = [];
+      this.expandedDirs = new Set();
+
+      this.initUI();
+    }
+
+    initUI() {
+      // Remove existing UI
+      document.body.innerHTML = '';
+
+      // Create main container
+      const container = document.createElement('div');
+      container.id = 'test-interface';
+      container.style.cssText = `
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100vw;
+        height: 100vh;
+        background: #1e1e1e;
+        color: #d4d4d4;
+        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+      `;
+
+      // Header
+      const header = document.createElement('div');
+      header.style.cssText = `
+        background: #252526;
+        padding: 12px 20px;
+        border-bottom: 1px solid #3e3e42;
+        display: flex;
+        align-items: center;
+        gap: 15px;
+      `;
+      header.innerHTML = `
+        <h1 style="margin: 0; font-size: 18px; font-weight: 600;">API Test Interface</h1>
+        <button id="selectFolder" style="
+          background: #0e639c;
+          color: white;
+          border: none;
+          padding: 6px 16px;
+          border-radius: 4px;
+          cursor: pointer;
+          font-size: 13px;
+        ">Select Folder</button>
+        <span id="folderName" style="color: #858585; font-size: 13px;"></span>
+      `;
+
+      // Main content area
+      const mainContent = document.createElement('div');
+      mainContent.style.cssText = `
+        display: flex;
+        flex: 1;
+        overflow: hidden;
+      `;
+
+      // Left panel - File tree
+      const leftPanel = document.createElement('div');
+      leftPanel.style.cssText = `
+        width: 30%;
+        background: #252526;
+        border-right: 1px solid #3e3e42;
+        overflow-y: auto;
+        padding: 10px;
+      `;
+      leftPanel.innerHTML = '<div id="fileTree" style="font-size: 13px;"></div>';
+
+      // Right panel - Chat
+      const rightPanel = document.createElement('div');
+      rightPanel.style.cssText = `
+        width: 70%;
+        display: flex;
+        flex-direction: column;
+      `;
+
+      // Chat messages area
+      const chatArea = document.createElement('div');
+      chatArea.id = 'chatArea';
+      chatArea.style.cssText = `
+        flex: 1;
+        overflow-y: auto;
+        padding: 20px;
+      `;
+
+      // Input area
+      const inputArea = document.createElement('div');
+      inputArea.style.cssText = `
+        background: #252526;
+        border-top: 1px solid #3e3e42;
+        padding: 15px;
+      `;
+      inputArea.innerHTML = `
+        <div style="display: flex; gap: 10px; margin-bottom: 10px;">
+          <textarea id="chatInput" placeholder="Enter your message..." style="
+            flex: 1;
+            background: #3c3c3c;
+            color: #d4d4d4;
+            border: 1px solid #3e3e42;
+            border-radius: 4px;
+            padding: 10px;
+            font-family: inherit;
+            font-size: 13px;
+            resize: vertical;
+            min-height: 60px;
+          "></textarea>
+        </div>
+        <div style="display: flex; gap: 10px; align-items: center;">
+          <button id="addToConversation" style="
+            background: #0e639c;
+            color: white;
+            border: none;
+            padding: 8px 18px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 13px;
+          ">Add to Conversation</button>
+          <button id="submitToAI" style="
+            background: #16825d;
+            color: white;
+            border: none;
+            padding: 8px 18px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 600;
+          ">Submit to AI</button>
+          <div id="charCounter" style="
+            margin-left: auto;
+            font-size: 13px;
+            color: #858585;
+          ">0 chars</div>
+        </div>
+        <div id="errorDisplay" style="
+          margin-top: 10px;
+          padding: 10px;
+          background: #5a1d1d;
+          border: 1px solid #f48771;
+          border-radius: 4px;
+          color: #f48771;
+          display: none;
+          font-size: 12px;
+        "></div>
+      `;
+
+      rightPanel.appendChild(chatArea);
+      rightPanel.appendChild(inputArea);
+
+      mainContent.appendChild(leftPanel);
+      mainContent.appendChild(rightPanel);
+
+      container.appendChild(header);
+      container.appendChild(mainContent);
+
+      document.body.appendChild(container);
+
+      // Attach event listeners
+      this.attachEventListeners();
+      this.updateCharCounter();
+    }
+
+    attachEventListeners() {
+      document.getElementById('selectFolder').addEventListener('click', async () => {
+        const success = await this.fileSystemHandler.requestDirectory();
+        if (success) {
+          document.getElementById('folderName').textContent =
+            this.fileSystemHandler.directoryHandle.name;
+          this.renderFileTree();
+        }
+      });
+
+      document.getElementById('addToConversation').addEventListener('click', () => {
+        this.addMessageToConversation();
+      });
+
+      document.getElementById('submitToAI').addEventListener('click', () => {
+        this.submitToAI();
+      });
+
+      document.getElementById('chatInput').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && e.ctrlKey) {
+          this.addMessageToConversation();
+        }
+      });
+    }
+
+    renderFileTree() {
+      const treeContainer = document.getElementById('fileTree');
+      treeContainer.innerHTML = '';
+
+      const renderEntry = (entry, level = 0) => {
+        const item = document.createElement('div');
+        item.style.cssText = `
+          padding: 4px 8px;
+          padding-left: ${level * 20 + 8}px;
+          cursor: pointer;
+          display: flex;
+          align-items: center;
+          gap: 6px;
+        `;
+
+        if (entry.type === 'directory') {
+          const isExpanded = this.expandedDirs.has(entry.path);
+          const icon = isExpanded ? '📂' : '📁';
+          item.innerHTML = `<span>${icon}</span><span>${entry.name}</span>`;
+
+          item.addEventListener('click', (e) => {
+            e.stopPropagation();
+            if (isExpanded) {
+              this.expandedDirs.delete(entry.path);
+            } else {
+              this.expandedDirs.add(entry.path);
+            }
+            this.renderFileTree();
+          });
+
+          treeContainer.appendChild(item);
+
+          if (isExpanded && entry.children) {
+            entry.children.forEach(child => renderEntry(child, level + 1));
+          }
+        } else {
+          item.innerHTML = `<span>📄</span><span>${entry.name}</span>`;
+          item.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            await this.addFileToConversation(entry);
+          });
+          item.addEventListener('mouseenter', () => {
+            item.style.background = '#2a2d2e';
+          });
+          item.addEventListener('mouseleave', () => {
+            item.style.background = '';
+          });
+          treeContainer.appendChild(item);
+        }
+      };
+
+      this.fileSystemHandler.fileTree.forEach(entry => renderEntry(entry));
+    }
+
+    async addFileToConversation(fileEntry) {
+      const content = await this.fileSystemHandler.readFile(fileEntry);
+      if (content !== null) {
+        const messageContent = `File: ${fileEntry.path}\n\n\`\`\`\n${content}\n\`\`\``;
+        this.addMessage('user', messageContent);
+        this.showError(`Added file: ${fileEntry.path}`, 'info');
+      } else {
+        this.showError(`Failed to read file: ${fileEntry.path}`);
+      }
+    }
+
+    addMessageToConversation() {
+      const input = document.getElementById('chatInput');
+      const content = input.value.trim();
+
+      if (content) {
+        this.addMessage('user', content);
+        input.value = '';
+        this.hideError();
+      }
+    }
+
+    addMessage(role, content) {
+      const timestamp = getTimestamp();
+      const messageId = generateUUID();
+
+      const message = {
+        id: messageId,
+        role: role,
+        content: content,
+        timestamp: timestamp,
+        parentId: this.messages.length > 0 ? this.messages[this.messages.length - 1].id : null,
+        childrenIds: []
+      };
+
+      // Update parent's childrenIds
+      if (message.parentId) {
+        const parent = this.messages.find(m => m.id === message.parentId);
+        if (parent) {
+          parent.childrenIds.push(messageId);
+        }
+      }
+
+      this.messages.push(message);
+      this.renderChat();
+      this.updateCharCounter();
+    }
+
+    renderChat() {
+      const chatArea = document.getElementById('chatArea');
+      chatArea.innerHTML = '';
+
+      this.messages.forEach(msg => {
+        const msgDiv = document.createElement('div');
+        msgDiv.style.cssText = `
+          margin-bottom: 20px;
+          padding: 15px;
+          background: ${msg.role === 'user' ? '#0e639c20' : '#16825d20'};
+          border-left: 3px solid ${msg.role === 'user' ? '#0e639c' : '#16825d'};
+          border-radius: 4px;
+        `;
+
+        const roleLabel = document.createElement('div');
+        roleLabel.style.cssText = `
+          font-weight: 600;
+          margin-bottom: 8px;
+          color: ${msg.role === 'user' ? '#4db8ff' : '#5fb583'};
+          font-size: 12px;
+          text-transform: uppercase;
+        `;
+        roleLabel.textContent = msg.role;
+
+        const contentDiv = document.createElement('div');
+        contentDiv.style.cssText = `
+          white-space: pre-wrap;
+          word-break: break-word;
+          font-size: 13px;
+          line-height: 1.6;
+        `;
+        contentDiv.textContent = msg.content;
+
+        msgDiv.appendChild(roleLabel);
+        msgDiv.appendChild(contentDiv);
+        chatArea.appendChild(msgDiv);
+      });
+
+      chatArea.scrollTop = chatArea.scrollHeight;
+    }
+
+    updateCharCounter() {
+      const count = countCharacters(this.messages);
+      const formatted = count >= 1000 ? `${(count / 1000).toFixed(1)}K` : count;
+      document.getElementById('charCounter').textContent = `${formatted} chars`;
+    }
+
+    async submitToAI() {
+      if (this.messages.length === 0) {
+        this.showError('No messages to submit. Add messages to the conversation first.');
+        return;
+      }
+
+      // Filter to only user messages for the first message
+      const userMessages = this.messages.filter(m => m.role === 'user');
+      if (userMessages.length === 0) {
+        this.showError('No user messages in conversation.');
+        return;
+      }
+
+      this.showError('Submitting to AI...', 'info');
+
+      try {
+        // Step 1: Create new chat if needed
+        if (!this.apiClient.chatId) {
+          const { chatId, messageId } = await this.apiClient.createNewChat(userMessages[0].content);
+          console.log('Created chat:', chatId);
+        }
+
+        // Step 2: Create assistant message placeholder
+        const assistantMessageId = generateUUID();
+        const assistantMessage = {
+          id: assistantMessageId,
+          role: 'assistant',
+          content: '',
+          timestamp: getTimestamp(),
+          parentId: this.messages[this.messages.length - 1].id,
+          childrenIds: []
+        };
+
+        // Update parent's childrenIds
+        const parent = this.messages[this.messages.length - 1];
+        parent.childrenIds.push(assistantMessageId);
+
+        this.messages.push(assistantMessage);
+        this.renderChat();
+
+        // Step 3: Update chat with current conversation
+        await this.apiClient.updateChat(this.messages);
+        console.log('Updated chat');
+
+        // Step 4: Get completion
+        const response = await this.apiClient.getCompletion(this.messages, assistantMessageId);
+        console.log('Getting completion...');
+
+        // Step 5: Stream response
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        while (true) {
+          const { done, value } = await reader.read();
+
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop(); // Keep incomplete line in buffer
+
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              const data = line.substring(6);
+
+              if (data === '[DONE]') continue;
+
+              try {
+                const parsed = JSON.parse(data);
+
+                if (parsed.choices && parsed.choices[0]?.delta?.content) {
+                  assistantMessage.content += parsed.choices[0].delta.content;
+                  this.renderChat();
+                } else if (parsed.done && parsed.content) {
+                  assistantMessage.content = parsed.content;
+                  this.renderChat();
+                }
+              } catch (e) {
+                console.warn('Failed to parse streaming data:', data);
+              }
+            }
+          }
+        }
+
+        this.updateCharCounter();
+        this.showError('AI response completed successfully!', 'success');
+
+      } catch (error) {
+        console.error('Submit error:', error);
+        this.showError(`Error: ${error.message}`);
+
+        // Remove the failed assistant message
+        this.messages.pop();
+        this.renderChat();
+      }
+    }
+
+    showError(message, type = 'error') {
+      const errorDiv = document.getElementById('errorDisplay');
+      errorDiv.textContent = message;
+      errorDiv.style.display = 'block';
+
+      if (type === 'info') {
+        errorDiv.style.background = '#1a3a52';
+        errorDiv.style.borderColor = '#4db8ff';
+        errorDiv.style.color = '#4db8ff';
+      } else if (type === 'success') {
+        errorDiv.style.background = '#1a3d2e';
+        errorDiv.style.borderColor = '#5fb583';
+        errorDiv.style.color = '#5fb583';
+      } else {
+        errorDiv.style.background = '#5a1d1d';
+        errorDiv.style.borderColor = '#f48771';
+        errorDiv.style.color = '#f48771';
+      }
+
+      if (type === 'success' || type === 'info') {
+        setTimeout(() => this.hideError(), 3000);
+      }
+    }
+
+    hideError() {
+      document.getElementById('errorDisplay').style.display = 'none';
+    }
+  }
+
+  // ============================================================================
+  // Initialize
+  // ============================================================================
+
+  console.log('Initializing API Test Interface...');
+  const ui = new UIManager();
+  console.log('API Test Interface ready!');
+
+})();
