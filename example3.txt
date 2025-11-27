@@ -707,44 +707,92 @@
         await this.apiClient.updateChat(this.messages);
         console.log('Updated chat');
 
-        // Step 4: Get completion
-        const response = await this.apiClient.getCompletion(this.messages, assistantMessageId);
-        console.log('Getting completion...');
+        // Step 4: Get completion with retry logic
+        const MAX_RETRIES = 5;
+        const TIMEOUT_MS = 30000; // 30 seconds
+        let retryCount = 0;
+        let success = false;
 
-        // Step 5: Stream response
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
-
-        while (true) {
-          const { done, value } = await reader.read();
-
-          if (done) break;
-
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split('\n');
-          buffer = lines.pop(); // Keep incomplete line in buffer
-
-          for (const line of lines) {
-            if (line.startsWith('data: ')) {
-              const data = line.substring(6);
-
-              if (data === '[DONE]') continue;
-
-              try {
-                const parsed = JSON.parse(data);
-
-                if (parsed.choices && parsed.choices[0]?.delta?.content) {
-                  assistantMessage.content += parsed.choices[0].delta.content;
-                  this.renderChat();
-                } else if (parsed.done && parsed.content) {
-                  assistantMessage.content = parsed.content;
-                  this.renderChat();
-                }
-              } catch (e) {
-                console.warn('Failed to parse streaming data:', data);
-              }
+        while (retryCount < MAX_RETRIES && !success) {
+          try {
+            if (retryCount > 0) {
+              this.showError(`Retry attempt ${retryCount}/${MAX_RETRIES}...`, 'info');
+              console.log(`Retry attempt ${retryCount}/${MAX_RETRIES}`);
             }
+
+            const response = await this.apiClient.getCompletion(this.messages, assistantMessageId);
+            console.log('Getting completion...');
+
+            // Step 5: Stream response with timeout
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+            let lastDataTime = Date.now();
+            let timeoutId;
+
+            const checkTimeout = () => {
+              const elapsed = Date.now() - lastDataTime;
+              if (elapsed > TIMEOUT_MS) {
+                console.warn('Timeout: No data received for 30 seconds');
+                reader.cancel();
+                throw new Error('Timeout: No data received for 30 seconds');
+              }
+            };
+
+            // Check timeout every 5 seconds
+            timeoutId = setInterval(checkTimeout, 5000);
+
+            try {
+              while (true) {
+                const { done, value } = await reader.read();
+
+                if (done) break;
+
+                lastDataTime = Date.now(); // Reset timeout on any data received
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split('\n');
+                buffer = lines.pop(); // Keep incomplete line in buffer
+
+                for (const line of lines) {
+                  if (line.startsWith('data: ')) {
+                    const data = line.substring(6);
+
+                    if (data === '[DONE]') continue;
+
+                    try {
+                      const parsed = JSON.parse(data);
+
+                      if (parsed.choices && parsed.choices[0]?.delta?.content) {
+                        assistantMessage.content += parsed.choices[0].delta.content;
+                        this.renderChat();
+                      } else if (parsed.done && parsed.content) {
+                        assistantMessage.content = parsed.content;
+                        this.renderChat();
+                      }
+                    } catch (e) {
+                      console.warn('Failed to parse streaming data:', data);
+                    }
+                  }
+                }
+              }
+
+              clearInterval(timeoutId);
+              success = true; // Completed successfully
+            } catch (streamError) {
+              clearInterval(timeoutId);
+              throw streamError;
+            }
+
+          } catch (retryError) {
+            retryCount++;
+            console.error(`Attempt ${retryCount} failed:`, retryError.message);
+
+            if (retryCount >= MAX_RETRIES) {
+              throw new Error(`Failed after ${MAX_RETRIES} attempts. Last error: ${retryError.message}`);
+            }
+
+            // Wait a bit before retrying
+            await new Promise(resolve => setTimeout(resolve, 1000));
           }
         }
 
