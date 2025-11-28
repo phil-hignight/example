@@ -727,25 +727,29 @@
             const reader = response.body.getReader();
             const decoder = new TextDecoder();
             let buffer = '';
-            let lastDataTime = Date.now();
-            let timeoutId;
             let hasReceivedData = false;
-
-            const checkTimeout = () => {
-              const elapsed = Date.now() - lastDataTime;
-              if (elapsed > TIMEOUT_MS) {
-                console.warn(`Timeout: No data received for 30 seconds (hasReceivedData: ${hasReceivedData})`);
-                reader.cancel();
-                throw new Error('Timeout: No data received for 30 seconds');
-              }
-            };
-
-            // Start checking timeout immediately (every 5 seconds)
-            timeoutId = setInterval(checkTimeout, 5000);
 
             try {
               while (true) {
-                const { done, value } = await reader.read();
+                // Race the read against a timeout
+                const timeoutPromise = new Promise((_, reject) => {
+                  setTimeout(() => {
+                    reject(new Error(`Timeout: No data received for ${TIMEOUT_MS / 1000} seconds`));
+                  }, TIMEOUT_MS);
+                });
+
+                const readPromise = reader.read();
+
+                let result;
+                try {
+                  result = await Promise.race([readPromise, timeoutPromise]);
+                } catch (timeoutError) {
+                  console.warn(`Timeout occurred (hasReceivedData: ${hasReceivedData})`);
+                  await reader.cancel();
+                  throw timeoutError;
+                }
+
+                const { done, value } = result;
 
                 if (done) {
                   console.log('Stream ended');
@@ -753,7 +757,6 @@
                 }
 
                 hasReceivedData = true;
-                lastDataTime = Date.now(); // Reset timeout on any data received
                 console.log(`Received ${value.length} bytes`);
 
                 buffer += decoder.decode(value, { stream: true });
@@ -786,11 +789,15 @@
                 }
               }
 
-              clearInterval(timeoutId);
+              // Check if we actually got content
+              if (!assistantMessage.content || assistantMessage.content.trim().length === 0) {
+                console.warn('Stream completed but no content received');
+                throw new Error('Stream completed without content');
+              }
+
               success = true; // Completed successfully
-              console.log('Stream completed successfully');
+              console.log('Stream completed successfully with content');
             } catch (streamError) {
-              clearInterval(timeoutId);
               console.error('Stream error:', streamError);
               throw streamError;
             }
