@@ -729,26 +729,33 @@
             let buffer = '';
             let lastDataTime = Date.now();
             let timeoutId;
+            let hasReceivedData = false;
 
             const checkTimeout = () => {
               const elapsed = Date.now() - lastDataTime;
               if (elapsed > TIMEOUT_MS) {
-                console.warn('Timeout: No data received for 30 seconds');
+                console.warn(`Timeout: No data received for 30 seconds (hasReceivedData: ${hasReceivedData})`);
                 reader.cancel();
                 throw new Error('Timeout: No data received for 30 seconds');
               }
             };
 
-            // Check timeout every 5 seconds
+            // Start checking timeout immediately (every 5 seconds)
             timeoutId = setInterval(checkTimeout, 5000);
 
             try {
               while (true) {
                 const { done, value } = await reader.read();
 
-                if (done) break;
+                if (done) {
+                  console.log('Stream ended');
+                  break;
+                }
 
+                hasReceivedData = true;
                 lastDataTime = Date.now(); // Reset timeout on any data received
+                console.log(`Received ${value.length} bytes`);
+
                 buffer += decoder.decode(value, { stream: true });
                 const lines = buffer.split('\n');
                 buffer = lines.pop(); // Keep incomplete line in buffer
@@ -757,7 +764,10 @@
                   if (line.startsWith('data: ')) {
                     const data = line.substring(6);
 
-                    if (data === '[DONE]') continue;
+                    if (data === '[DONE]') {
+                      console.log('Received [DONE] marker');
+                      continue;
+                    }
 
                     try {
                       const parsed = JSON.parse(data);
@@ -778,8 +788,10 @@
 
               clearInterval(timeoutId);
               success = true; // Completed successfully
+              console.log('Stream completed successfully');
             } catch (streamError) {
               clearInterval(timeoutId);
+              console.error('Stream error:', streamError);
               throw streamError;
             }
 
