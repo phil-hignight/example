@@ -1,61 +1,205 @@
-// API Testing Interface
-// Paste this into Chrome DevTools Console to run
+// AI Agent - Built 2025-11-28T20:24:59.091Z
+(function() {
+  window.module = {};
 
-(async function() {
-  'use strict';
-
-  // ============================================================================
-  // Configuration
-  // ============================================================================
-  const CONFIG = {
-    API_BASE: 'https://chat.niprgpt.mil/api',
-    MODEL: 'Anthropic Claude 4 Sonnet'
+  // Module: api-client.js
+  // API Client
+  window.module['api-client.js'] = {
+    chatId: null,
+    sessionId: null,
+  
+    init: function() {
+      const utils = window.module['utils.js'];
+      this.sessionId = utils.generateSessionId();
+    },
+  
+    createNewChat: async function(firstMessage) {
+      const config = window.module['config.js'];
+      const utils = window.module['utils.js'];
+  
+      const messageId = utils.generateUUID();
+      const timestamp = utils.getTimestamp();
+  
+      const payload = {
+        chat: {
+          id: '',
+          title: 'Chat Pending',
+          models: [config.MODEL],
+          params: {},
+          history: {
+            messages: {
+              [messageId]: {
+                id: messageId,
+                parentId: null,
+                childrenIds: [],
+                role: 'user',
+                content: firstMessage,
+                timestamp: timestamp,
+                models: [config.MODEL]
+              }
+            },
+            currentId: messageId
+          },
+          messages: [
+            {
+              id: messageId,
+              parentId: null,
+              childrenIds: [],
+              role: 'user',
+              content: firstMessage,
+              timestamp: timestamp,
+              models: [config.MODEL]
+            }
+          ],
+          tags: [],
+          timestamp: Date.now()
+        }
+      };
+  
+      const response = await fetch(`${config.API_BASE}/v1/chats/new`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(payload)
+      });
+  
+      if (!response.ok) {
+        throw new Error(`Failed to create chat: ${response.status} ${response.statusText}`);
+      }
+  
+      const data = await response.json();
+      this.chatId = data.id;
+  
+      return { chatId: data.id, messageId };
+    },
+  
+    updateChat: async function(messages) {
+      const config = window.module['config.js'];
+  
+      // Build history object
+      const historyMessages = {};
+      messages.forEach((msg) => {
+        historyMessages[msg.id] = {
+          id: msg.id,
+          parentId: msg.parentId,
+          childrenIds: msg.childrenIds,
+          content: msg.content,
+          role: msg.role,
+          timestamp: msg.timestamp,
+          ...(msg.role === 'user' ? { models: [config.MODEL] } : {
+            model: config.MODEL,
+            modelIdx: 0,
+            modelName: config.MODEL,
+            userContext: null
+          })
+        };
+      });
+  
+      const currentId = messages[messages.length - 1].id;
+  
+      const payload = {
+        chat: {
+          models: [config.MODEL],
+          files: [],
+          params: {},
+          history: {
+            messages: historyMessages,
+            currentId: currentId
+          },
+          messages: messages.map(msg => ({
+            id: msg.id,
+            parentId: msg.parentId,
+            childrenIds: msg.childrenIds,
+            content: msg.content,
+            role: msg.role,
+            timestamp: msg.timestamp,
+            ...(msg.role === 'user' ? { models: [config.MODEL] } : {
+              model: config.MODEL,
+              modelIdx: 0,
+              modelName: config.MODEL,
+              userContext: null
+            })
+          }))
+        }
+      };
+  
+      const response = await fetch(`${config.API_BASE}/v1/chats/${this.chatId}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(payload)
+      });
+  
+      if (!response.ok) {
+        throw new Error(`Failed to update chat: ${response.status} ${response.statusText}`);
+      }
+  
+      return await response.json();
+    },
+  
+    getCompletion: async function(messages, assistantMessageId) {
+      const config = window.module['config.js'];
+  
+      const userMessages = messages
+        .filter(m => m.role === 'user')
+        .map(m => ({
+          role: 'user',
+          content: m.content
+        }));
+  
+      const payload = {
+        stream: true,
+        model: config.MODEL,
+        messages: userMessages,
+        params: {},
+        features: {
+          web_search: false
+        },
+        session_id: this.sessionId,
+        chat_id: this.chatId,
+        id: assistantMessageId,
+        background_tasks: {
+          title_generation: true,
+          tags_generation: true
+        }
+      };
+  
+      const response = await fetch(`${config.API_BASE}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(payload)
+      });
+  
+      if (!response.ok) {
+        throw new Error(`Failed to get completion: ${response.status} ${response.statusText}`);
+      }
+  
+      return response;
+    }
   };
+  
 
-  // ============================================================================
-  // Utility Functions
-  // ============================================================================
+  // Module: config.js
+  // Configuration
+  window.module['config.js'] = {
+    API_BASE: 'https://chat.niprgpt.mil/api',
+    MODEL: 'Anthropic Claude 4 Sonnet',
+    MAX_RETRIES: 5,
+    TIMEOUT_MS: 30000 // 30 seconds
+  };
+  
 
-  function generateUUID() {
-    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
-      const r = Math.random() * 16 | 0;
-      const v = c === 'x' ? r : (r & 0x3 | 0x8);
-      return v.toString(16);
-    });
-  }
-
-  function generateSessionId() {
-    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-';
-    let result = '';
-    for (let i = 0; i < 20; i++) {
-      result += chars.charAt(Math.floor(Math.random() * chars.length));
-    }
-    return result;
-  }
-
-  function getTimestamp() {
-    return Math.floor(Date.now() / 1000);
-  }
-
-  function countCharacters(messages) {
-    return messages.reduce((total, msg) => total + (msg.content?.length || 0), 0);
-  }
-
-  function formatCharCount(count) {
-    return `${(count / 1000).toFixed(1)}K`;
-  }
-
-  // ============================================================================
+  // Module: file-system.js
   // File System Handler
-  // ============================================================================
-
-  class FileSystemHandler {
-    constructor() {
-      this.directoryHandle = null;
-      this.fileTree = [];
-    }
-
-    async requestDirectory() {
+  window.module['file-system.js'] = {
+    directoryHandle: null,
+    fileTree: [],
+  
+    requestDirectory: async function() {
       try {
         this.directoryHandle = await window.showDirectoryPicker();
         this.fileTree = await this.buildFileTree(this.directoryHandle);
@@ -64,14 +208,14 @@
         console.error('Directory access error:', err);
         return false;
       }
-    }
-
-    async buildFileTree(dirHandle, path = '') {
+    },
+  
+    buildFileTree: async function(dirHandle, path = '') {
       const entries = [];
-
+  
       for await (const entry of dirHandle.values()) {
         const fullPath = path ? `${path}/${entry.name}` : entry.name;
-
+  
         if (entry.kind === 'directory') {
           const children = await this.buildFileTree(entry, fullPath);
           entries.push({
@@ -91,7 +235,7 @@
           } catch (err) {
             console.warn('Could not read file for char count:', entry.name);
           }
-
+  
           entries.push({
             name: entry.name,
             type: 'file',
@@ -101,14 +245,14 @@
           });
         }
       }
-
+  
       return entries.sort((a, b) => {
         if (a.type !== b.type) return a.type === 'directory' ? -1 : 1;
         return a.name.localeCompare(b.name);
       });
-    }
-
-    async readFile(fileEntry) {
+    },
+  
+    readFile: async function(fileEntry) {
       try {
         const file = await fileEntry.handle.getFile();
         const text = await file.text();
@@ -118,200 +262,43 @@
         return null;
       }
     }
-  }
+  };
+  
 
-  // ============================================================================
-  // API Client
-  // ============================================================================
-
-  class APIClient {
-    constructor() {
-      this.chatId = null;
-      this.sessionId = generateSessionId();
+  // Module: main.js
+  // Main entry point
+  window.module['main.js'] = {
+    version: '1.0.0',
+  
+    run: function() {
+      console.log('Initializing API Test Interface...');
+      console.log('Version:', this.version);
+  
+      const uiManager = window.module['ui-manager.js'];
+      uiManager.init();
+  
+      console.log('API Test Interface ready!');
     }
+  };
+  
 
-    async createNewChat(firstMessage) {
-      const messageId = generateUUID();
-      const timestamp = getTimestamp();
-
-      const payload = {
-        chat: {
-          id: '',
-          title: 'Chat Pending',
-          models: [CONFIG.MODEL],
-          params: {},
-          history: {
-            messages: {
-              [messageId]: {
-                id: messageId,
-                parentId: null,
-                childrenIds: [],
-                role: 'user',
-                content: firstMessage,
-                timestamp: timestamp,
-                models: [CONFIG.MODEL]
-              }
-            },
-            currentId: messageId
-          },
-          messages: [
-            {
-              id: messageId,
-              parentId: null,
-              childrenIds: [],
-              role: 'user',
-              content: firstMessage,
-              timestamp: timestamp,
-              models: [CONFIG.MODEL]
-            }
-          ],
-          tags: [],
-          timestamp: Date.now()
-        }
-      };
-
-      const response = await fetch(`${CONFIG.API_BASE}/v1/chats/new`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(payload)
-      });
-
-      if (!response.ok) {
-        throw new Error(`Failed to create chat: ${response.status} ${response.statusText}`);
-      }
-
-      const data = await response.json();
-      this.chatId = data.id;
-
-      return { chatId: data.id, messageId };
-    }
-
-    async updateChat(messages) {
-      const timestamp = getTimestamp();
-
-      // Build history object
-      const historyMessages = {};
-      messages.forEach((msg, idx) => {
-        historyMessages[msg.id] = {
-          id: msg.id,
-          parentId: msg.parentId,
-          childrenIds: msg.childrenIds,
-          content: msg.content,
-          role: msg.role,
-          timestamp: msg.timestamp,
-          ...(msg.role === 'user' ? { models: [CONFIG.MODEL] } : {
-            model: CONFIG.MODEL,
-            modelIdx: 0,
-            modelName: CONFIG.MODEL,
-            userContext: null
-          })
-        };
-      });
-
-      const currentId = messages[messages.length - 1].id;
-
-      const payload = {
-        chat: {
-          models: [CONFIG.MODEL],
-          files: [],
-          params: {},
-          history: {
-            messages: historyMessages,
-            currentId: currentId
-          },
-          messages: messages.map(msg => ({
-            id: msg.id,
-            parentId: msg.parentId,
-            childrenIds: msg.childrenIds,
-            content: msg.content,
-            role: msg.role,
-            timestamp: msg.timestamp,
-            ...(msg.role === 'user' ? { models: [CONFIG.MODEL] } : {
-              model: CONFIG.MODEL,
-              modelIdx: 0,
-              modelName: CONFIG.MODEL,
-              userContext: null
-            })
-          }))
-        }
-      };
-
-      const response = await fetch(`${CONFIG.API_BASE}/v1/chats/${this.chatId}`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(payload)
-      });
-
-      if (!response.ok) {
-        throw new Error(`Failed to update chat: ${response.status} ${response.statusText}`);
-      }
-
-      return await response.json();
-    }
-
-    async getCompletion(messages, assistantMessageId) {
-      const userMessages = messages
-        .filter(m => m.role === 'user')
-        .map(m => ({
-          role: 'user',
-          content: m.content
-        }));
-
-      const payload = {
-        stream: true,
-        model: CONFIG.MODEL,
-        messages: userMessages,
-        params: {},
-        features: {
-          web_search: false
-        },
-        session_id: this.sessionId,
-        chat_id: this.chatId,
-        id: assistantMessageId,
-        background_tasks: {
-          title_generation: true,
-          tags_generation: true
-        }
-      };
-
-      const response = await fetch(`${CONFIG.API_BASE}/chat/completions`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(payload)
-      });
-
-      if (!response.ok) {
-        throw new Error(`Failed to get completion: ${response.status} ${response.statusText}`);
-      }
-
-      return response;
-    }
-  }
-
-  // ============================================================================
+  // Module: ui-manager.js
   // UI Manager
-  // ============================================================================
-
-  class UIManager {
-    constructor() {
-      this.fileSystemHandler = new FileSystemHandler();
-      this.apiClient = new APIClient();
-      this.messages = [];
-      this.expandedDirs = new Set();
-
+  window.module['ui-manager.js'] = {
+    messages: [],
+    expandedDirs: new Set(),
+  
+    init: function() {
+      const apiClient = window.module['api-client.js'];
+      apiClient.init();
+  
       this.initUI();
-    }
-
-    initUI() {
+    },
+  
+    initUI: function() {
       // Remove existing UI
       document.body.innerHTML = '';
-
+  
       // Create main container
       const container = document.createElement('div');
       container.id = 'test-interface';
@@ -328,7 +315,7 @@
         flex-direction: column;
         overflow: hidden;
       `;
-
+  
       // Header
       const header = document.createElement('div');
       header.style.cssText = `
@@ -352,7 +339,7 @@
         ">Select Folder</button>
         <span id="folderName" style="color: #858585; font-size: 13px;"></span>
       `;
-
+  
       // Main content area
       const mainContent = document.createElement('div');
       mainContent.style.cssText = `
@@ -360,7 +347,7 @@
         flex: 1;
         overflow: hidden;
       `;
-
+  
       // Left panel - File tree
       const leftPanel = document.createElement('div');
       leftPanel.style.cssText = `
@@ -371,7 +358,7 @@
         padding: 10px;
       `;
       leftPanel.innerHTML = '<div id="fileTree" style="font-size: 13px;"></div>';
-
+  
       // Right panel - Chat
       const rightPanel = document.createElement('div');
       rightPanel.style.cssText = `
@@ -379,7 +366,7 @@
         display: flex;
         flex-direction: column;
       `;
-
+  
       // Chat messages area
       const chatArea = document.createElement('div');
       chatArea.id = 'chatArea';
@@ -388,7 +375,7 @@
         overflow-y: auto;
         padding: 20px;
       `;
-
+  
       // Input area
       const inputArea = document.createElement('div');
       inputArea.style.cssText = `
@@ -448,52 +435,58 @@
           font-size: 12px;
         "></div>
       `;
-
+  
       rightPanel.appendChild(chatArea);
       rightPanel.appendChild(inputArea);
-
+  
       mainContent.appendChild(leftPanel);
       mainContent.appendChild(rightPanel);
-
+  
       container.appendChild(header);
       container.appendChild(mainContent);
-
+  
       document.body.appendChild(container);
-
+  
       // Attach event listeners
       this.attachEventListeners();
       this.updateCharCounter();
-    }
-
-    attachEventListeners() {
+    },
+  
+    attachEventListeners: function() {
+      const self = this;
+      const fileSystem = window.module['file-system.js'];
+  
       document.getElementById('selectFolder').addEventListener('click', async () => {
-        const success = await this.fileSystemHandler.requestDirectory();
+        const success = await fileSystem.requestDirectory();
         if (success) {
-          document.getElementById('folderName').textContent =
-            this.fileSystemHandler.directoryHandle.name;
-          this.renderFileTree();
+          document.getElementById('folderName').textContent = fileSystem.directoryHandle.name;
+          self.renderFileTree();
         }
       });
-
+  
       document.getElementById('addToConversation').addEventListener('click', () => {
-        this.addMessageToConversation();
+        self.addMessageToConversation();
       });
-
+  
       document.getElementById('submitToAI').addEventListener('click', () => {
-        this.submitToAI();
+        self.submitToAI();
       });
-
+  
       document.getElementById('chatInput').addEventListener('keydown', (e) => {
         if (e.key === 'Enter' && e.ctrlKey) {
-          this.addMessageToConversation();
+          self.addMessageToConversation();
         }
       });
-    }
-
-    renderFileTree() {
+    },
+  
+    renderFileTree: function() {
+      const fileSystem = window.module['file-system.js'];
+      const utils = window.module['utils.js'];
+      const self = this;
+  
       const treeContainer = document.getElementById('fileTree');
       treeContainer.innerHTML = '';
-
+  
       const renderEntry = (entry, level = 0) => {
         const item = document.createElement('div');
         item.style.cssText = `
@@ -504,29 +497,29 @@
           align-items: center;
           gap: 6px;
         `;
-
+  
         if (entry.type === 'directory') {
-          const isExpanded = this.expandedDirs.has(entry.path);
+          const isExpanded = self.expandedDirs.has(entry.path);
           const icon = isExpanded ? '📂' : '📁';
           item.innerHTML = `<span>${icon}</span><span>${entry.name}</span>`;
-
+  
           item.addEventListener('click', (e) => {
             e.stopPropagation();
             if (isExpanded) {
-              this.expandedDirs.delete(entry.path);
+              self.expandedDirs.delete(entry.path);
             } else {
-              this.expandedDirs.add(entry.path);
+              self.expandedDirs.add(entry.path);
             }
-            this.renderFileTree();
+            self.renderFileTree();
           });
-
+  
           treeContainer.appendChild(item);
-
+  
           if (isExpanded && entry.children) {
             entry.children.forEach(child => renderEntry(child, level + 1));
           }
         } else {
-          const charCountStr = formatCharCount(entry.charCount);
+          const charCountStr = utils.formatCharCount(entry.charCount);
           item.innerHTML = `
             <span>📄</span>
             <span style="flex: 1;">${entry.name}</span>
@@ -535,7 +528,7 @@
           item.style.display = 'flex';
           item.addEventListener('click', async (e) => {
             e.stopPropagation();
-            await this.addFileToConversation(entry);
+            await self.addFileToConversation(entry);
           });
           item.addEventListener('mouseenter', () => {
             item.style.background = '#2a2d2e';
@@ -546,12 +539,13 @@
           treeContainer.appendChild(item);
         }
       };
-
-      this.fileSystemHandler.fileTree.forEach(entry => renderEntry(entry));
-    }
-
-    async addFileToConversation(fileEntry) {
-      const content = await this.fileSystemHandler.readFile(fileEntry);
+  
+      fileSystem.fileTree.forEach(entry => renderEntry(entry));
+    },
+  
+    addFileToConversation: async function(fileEntry) {
+      const fileSystem = window.module['file-system.js'];
+      const content = await fileSystem.readFile(fileEntry);
       if (content !== null) {
         const messageContent = `File: ${fileEntry.path}\n\n\`\`\`\n${content}\n\`\`\``;
         this.addMessage('user', messageContent);
@@ -559,23 +553,24 @@
       } else {
         this.showError(`Failed to read file: ${fileEntry.path}`);
       }
-    }
-
-    addMessageToConversation() {
+    },
+  
+    addMessageToConversation: function() {
       const input = document.getElementById('chatInput');
       const content = input.value.trim();
-
+  
       if (content) {
         this.addMessage('user', content);
         input.value = '';
         this.hideError();
       }
-    }
-
-    addMessage(role, content) {
-      const timestamp = getTimestamp();
-      const messageId = generateUUID();
-
+    },
+  
+    addMessage: function(role, content) {
+      const utils = window.module['utils.js'];
+      const timestamp = utils.getTimestamp();
+      const messageId = utils.generateUUID();
+  
       const message = {
         id: messageId,
         role: role,
@@ -584,7 +579,7 @@
         parentId: this.messages.length > 0 ? this.messages[this.messages.length - 1].id : null,
         childrenIds: []
       };
-
+  
       // Update parent's childrenIds
       if (message.parentId) {
         const parent = this.messages.find(m => m.id === message.parentId);
@@ -592,16 +587,17 @@
           parent.childrenIds.push(messageId);
         }
       }
-
+  
       this.messages.push(message);
       this.renderChat();
       this.updateCharCounter();
-    }
-
-    renderChat() {
+    },
+  
+    renderChat: function() {
+      const utils = window.module['utils.js'];
       const chatArea = document.getElementById('chatArea');
       chatArea.innerHTML = '';
-
+  
       this.messages.forEach(msg => {
         const msgDiv = document.createElement('div');
         msgDiv.style.cssText = `
@@ -611,7 +607,7 @@
           border-left: 3px solid ${msg.role === 'user' ? '#0e639c' : '#16825d'};
           border-radius: 4px;
         `;
-
+  
         const headerDiv = document.createElement('div');
         headerDiv.style.cssText = `
           display: flex;
@@ -619,7 +615,7 @@
           align-items: center;
           margin-bottom: 8px;
         `;
-
+  
         const roleLabel = document.createElement('div');
         roleLabel.style.cssText = `
           font-weight: 600;
@@ -628,18 +624,18 @@
           text-transform: uppercase;
         `;
         roleLabel.textContent = msg.role;
-
+  
         const charLabel = document.createElement('div');
         charLabel.style.cssText = `
           color: #858585;
           font-size: 11px;
         `;
         const charCount = msg.content?.length || 0;
-        charLabel.textContent = `${formatCharCount(charCount)} chars`;
-
+        charLabel.textContent = `${utils.formatCharCount(charCount)} chars`;
+  
         headerDiv.appendChild(roleLabel);
         headerDiv.appendChild(charLabel);
-
+  
         const contentDiv = document.createElement('div');
         contentDiv.style.cssText = `
           white-space: pre-wrap;
@@ -648,98 +644,101 @@
           line-height: 1.6;
         `;
         contentDiv.textContent = msg.content;
-
+  
         msgDiv.appendChild(headerDiv);
         msgDiv.appendChild(contentDiv);
         chatArea.appendChild(msgDiv);
       });
-
+  
       chatArea.scrollTop = chatArea.scrollHeight;
-    }
-
-    updateCharCounter() {
-      const count = countCharacters(this.messages);
-      const formatted = formatCharCount(count);
+    },
+  
+    updateCharCounter: function() {
+      const utils = window.module['utils.js'];
+      const count = utils.countCharacters(this.messages);
+      const formatted = utils.formatCharCount(count);
       document.getElementById('charCounter').textContent = `${formatted} chars`;
-    }
-
-    async submitToAI() {
+    },
+  
+    submitToAI: async function() {
+      const config = window.module['config.js'];
+      const utils = window.module['utils.js'];
+      const apiClient = window.module['api-client.js'];
+  
       if (this.messages.length === 0) {
         this.showError('No messages to submit. Add messages to the conversation first.');
         return;
       }
-
+  
       // Filter to only user messages for the first message
       const userMessages = this.messages.filter(m => m.role === 'user');
       if (userMessages.length === 0) {
         this.showError('No user messages in conversation.');
         return;
       }
-
+  
       this.showError('Submitting to AI...', 'info');
-
+  
       try {
         // Step 1: Create new chat if needed
-        if (!this.apiClient.chatId) {
-          const { chatId, messageId } = await this.apiClient.createNewChat(userMessages[0].content);
+        if (!apiClient.chatId) {
+          const { chatId } = await apiClient.createNewChat(userMessages[0].content);
           console.log('Created chat:', chatId);
         }
-
+  
         // Step 2: Create assistant message placeholder
-        const assistantMessageId = generateUUID();
+        const assistantMessageId = utils.generateUUID();
         const assistantMessage = {
           id: assistantMessageId,
           role: 'assistant',
           content: '',
-          timestamp: getTimestamp(),
+          timestamp: utils.getTimestamp(),
           parentId: this.messages[this.messages.length - 1].id,
           childrenIds: []
         };
-
+  
         // Update parent's childrenIds
         const parent = this.messages[this.messages.length - 1];
         parent.childrenIds.push(assistantMessageId);
-
+  
         this.messages.push(assistantMessage);
         this.renderChat();
-
+  
         // Step 3: Update chat with current conversation
-        await this.apiClient.updateChat(this.messages);
+        await apiClient.updateChat(this.messages);
         console.log('Updated chat');
-
+  
         // Step 4: Get completion with retry logic
-        const MAX_RETRIES = 5;
-        const TIMEOUT_MS = 30000; // 30 seconds
         let retryCount = 0;
         let success = false;
-
-        while (retryCount < MAX_RETRIES && !success) {
+  
+        while (retryCount < config.MAX_RETRIES && !success) {
           try {
             if (retryCount > 0) {
-              this.showError(`Retry attempt ${retryCount}/${MAX_RETRIES}...`, 'info');
-              console.log(`Retry attempt ${retryCount}/${MAX_RETRIES}`);
+              this.showError(`Retry attempt ${retryCount}/${config.MAX_RETRIES}...`, 'info');
+              console.log(`Retry attempt ${retryCount}/${config.MAX_RETRIES}`);
             }
-
-            const response = await this.apiClient.getCompletion(this.messages, assistantMessageId);
+  
+            const response = await apiClient.getCompletion(this.messages, assistantMessageId);
             console.log('Getting completion...');
-
+  
             // Step 5: Stream response with timeout
             const reader = response.body.getReader();
             const decoder = new TextDecoder();
             let buffer = '';
             let hasReceivedData = false;
-
+  
             try {
               while (true) {
                 // Race the read against a timeout
                 const timeoutPromise = new Promise((_, reject) => {
                   setTimeout(() => {
-                    reject(new Error(`Timeout: No data received for ${TIMEOUT_MS / 1000} seconds`));
-                  }, TIMEOUT_MS);
+                    reject(new Error(`Timeout: No data received for ${config.TIMEOUT_MS / 1000} seconds`));
+                  }, config.TIMEOUT_MS);
                 });
-
+  
                 const readPromise = reader.read();
-
+  
                 let result;
                 try {
                   result = await Promise.race([readPromise, timeoutPromise]);
@@ -748,33 +747,33 @@
                   await reader.cancel();
                   throw timeoutError;
                 }
-
+  
                 const { done, value } = result;
-
+  
                 if (done) {
                   console.log('Stream ended');
                   break;
                 }
-
+  
                 hasReceivedData = true;
                 console.log(`Received ${value.length} bytes`);
-
+  
                 buffer += decoder.decode(value, { stream: true });
                 const lines = buffer.split('\n');
                 buffer = lines.pop(); // Keep incomplete line in buffer
-
+  
                 for (const line of lines) {
                   if (line.startsWith('data: ')) {
                     const data = line.substring(6);
-
+  
                     if (data === '[DONE]') {
                       console.log('Received [DONE] marker');
                       continue;
                     }
-
+  
                     try {
                       const parsed = JSON.parse(data);
-
+  
                       if (parsed.choices && parsed.choices[0]?.delta?.content) {
                         assistantMessage.content += parsed.choices[0].delta.content;
                         this.renderChat();
@@ -788,51 +787,51 @@
                   }
                 }
               }
-
+  
               // Check if we actually got content
               if (!assistantMessage.content || assistantMessage.content.trim().length === 0) {
                 console.warn('Stream completed but no content received');
                 throw new Error('Stream completed without content');
               }
-
+  
               success = true; // Completed successfully
               console.log('Stream completed successfully with content');
             } catch (streamError) {
               console.error('Stream error:', streamError);
               throw streamError;
             }
-
+  
           } catch (retryError) {
             retryCount++;
             console.error(`Attempt ${retryCount} failed:`, retryError.message);
-
-            if (retryCount >= MAX_RETRIES) {
-              throw new Error(`Failed after ${MAX_RETRIES} attempts. Last error: ${retryError.message}`);
+  
+            if (retryCount >= config.MAX_RETRIES) {
+              throw new Error(`Failed after ${config.MAX_RETRIES} attempts. Last error: ${retryError.message}`);
             }
-
+  
             // Wait a bit before retrying
             await new Promise(resolve => setTimeout(resolve, 1000));
           }
         }
-
+  
         this.updateCharCounter();
         this.showError('AI response completed successfully!', 'success');
-
+  
       } catch (error) {
         console.error('Submit error:', error);
         this.showError(`Error: ${error.message}`);
-
+  
         // Remove the failed assistant message
         this.messages.pop();
         this.renderChat();
       }
-    }
-
-    showError(message, type = 'error') {
+    },
+  
+    showError: function(message, type = 'error') {
       const errorDiv = document.getElementById('errorDisplay');
       errorDiv.textContent = message;
       errorDiv.style.display = 'block';
-
+  
       if (type === 'info') {
         errorDiv.style.background = '#1a3a52';
         errorDiv.style.borderColor = '#4db8ff';
@@ -846,23 +845,56 @@
         errorDiv.style.borderColor = '#f48771';
         errorDiv.style.color = '#f48771';
       }
-
+  
       if (type === 'success' || type === 'info') {
         setTimeout(() => this.hideError(), 3000);
       }
-    }
-
-    hideError() {
+    },
+  
+    hideError: function() {
       document.getElementById('errorDisplay').style.display = 'none';
     }
+  };
+  
+
+  // Module: utils.js
+  // Utility Functions
+  window.module['utils.js'] = {
+    generateUUID: function() {
+      return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+        const r = Math.random() * 16 | 0;
+        const v = c === 'x' ? r : (r & 0x3 | 0x8);
+        return v.toString(16);
+      });
+    },
+  
+    generateSessionId: function() {
+      const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-';
+      let result = '';
+      for (let i = 0; i < 20; i++) {
+        result += chars.charAt(Math.floor(Math.random() * chars.length));
+      }
+      return result;
+    },
+  
+    getTimestamp: function() {
+      return Math.floor(Date.now() / 1000);
+    },
+  
+    countCharacters: function(messages) {
+      return messages.reduce((total, msg) => total + (msg.content?.length || 0), 0);
+    },
+  
+    formatCharCount: function(count) {
+      return `${(count / 1000).toFixed(1)}K`;
+    }
+  };
+  
+
+  // Run main module
+  if (window.module['main.js']) {
+    window.module['main.js'].run();
+  } else {
+    console.error('Error: main.js module not found');
   }
-
-  // ============================================================================
-  // Initialize
-  // ============================================================================
-
-  console.log('Initializing API Test Interface...');
-  const ui = new UIManager();
-  console.log('API Test Interface ready!');
-
 })();
