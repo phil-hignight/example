@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-29T22:18:10.634Z
+// AI Agent - Built 2025-11-29T22:29:44.339Z
 (function() {
   window.module = {};
 
@@ -160,6 +160,11 @@
         }
       };
   
+      console.log('=== GET COMPLETION REQUEST ===');
+      console.log('Messages count:', apiMessages.length);
+      console.log('Last message:', apiMessages[apiMessages.length - 1]);
+      console.log('Full payload:', payload);
+  
       const response = await fetch(`${config.API_BASE}/chat/completions`, {
         method: 'POST',
         headers: {
@@ -172,11 +177,19 @@
         throw new Error(`Failed to get completion: ${response.status} ${response.statusText}`);
       }
   
+      console.log('Response status:', response.status);
+  
       return response;
     },
   
     getContinuation: async function(apiMessages, assistantMessageId, partialContent) {
       const config = window.module['config.js'];
+  
+      console.log('=== GET CONTINUATION REQUEST ===');
+      console.log('Original messages count:', apiMessages.length);
+      console.log('Partial content length:', partialContent.length);
+      console.log('Partial content starts with:', partialContent.substring(0, 100));
+      console.log('Partial content ends with:', partialContent.substring(partialContent.length - 100));
   
       // Add the partial assistant response, then a user message asking for continuation
       const continueMessages = [
@@ -190,6 +203,12 @@
           content: '[System: Your previous response was cut off. Please continue from where you left off, starting with the exact continuation of your last incomplete response. Do not restart or summarize - just continue the exact text.]'
         }
       ];
+  
+      console.log('Continue messages count:', continueMessages.length);
+      console.log('Last 3 messages:');
+      for (let i = Math.max(0, continueMessages.length - 3); i < continueMessages.length; i++) {
+        console.log(`  [${i}] ${continueMessages[i].role}:`, continueMessages[i].content.substring(0, 150));
+      }
   
       const payload = {
         stream: true,
@@ -208,6 +227,8 @@
         }
       };
   
+      console.log('Full continuation payload:', payload);
+  
       const response = await fetch(`${config.API_BASE}/chat/completions`, {
         method: 'POST',
         headers: {
@@ -219,6 +240,8 @@
       if (!response.ok) {
         throw new Error(`Failed to get continuation: ${response.status} ${response.statusText}`);
       }
+  
+      console.log('Continuation response status:', response.status);
   
       return response;
     }
@@ -1728,6 +1751,12 @@
                 partialMessage = partialMessage.substring(1);
               }
   
+              console.log('BEFORE CONTINUATION:');
+              console.log('  accumulatedContent length:', accumulatedContent.length);
+              console.log('  accumulatedContent ends with:', accumulatedContent.substring(accumulatedContent.length - 200));
+              console.log('  partialMessage length:', partialMessage.length);
+              console.log('  partialMessage ends with:', partialMessage.substring(partialMessage.length - 200));
+  
               const continueResponse = await apiClient.getContinuation(apiMessages, assistantMessageId, partialMessage);
               const continueReader = continueResponse.body.getReader();
               const continueDecoder = new TextDecoder();
@@ -1773,6 +1802,11 @@
                   }
                 }
               }
+  
+              console.log('AFTER CONTINUATION:');
+              console.log('  continuationContent length:', continuationContent.length);
+              console.log('  continuationContent starts with:', continuationContent.substring(0, 200));
+              console.log('  continuationContent ends with:', continuationContent.substring(continuationContent.length - 200));
   
               // Check for repeating content (AI is stuck)
               if (continuationContent.length > 100 && continuationContent === lastChunkContent) {
@@ -2222,16 +2256,16 @@
           indicator.style.display = 'none';
   
           if (message.result && message.result.checklist) {
-            content.style.cssText += 'padding: 2px 0;';
+            content.style.cssText += 'padding: 2px 0; padding-left: 20px;';
             content.innerHTML = this.renderChecklist(message.result.checklist, message.result.completed_item, message.result.failed_item);
           } else {
-            content.style.cssText += 'color: #858585; padding: 2px 0;';
+            content.style.cssText += 'color: #858585; padding: 2px 0; padding-left: 20px;';
             content.textContent = this.formatToolResult(message);
           }
         } else {
-          // Normal tool results - no indicator, just text
+          // Normal tool results - no indicator, just text indented to align with content
           indicator.style.display = 'none';
-          content.style.cssText += 'color: #858585; padding: 2px 0; cursor: pointer;';
+          content.style.cssText += 'color: #858585; padding: 2px 0; padding-left: 20px; cursor: pointer;';
           content.textContent = this.formatToolResult(message);
           content.addEventListener('click', () => this.showToolModal(`Tool Result: ${message.tool}`, message.result));
         }
