@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-29T17:39:57.028Z
+// AI Agent - Built 2025-11-29T18:24:35.356Z
 (function() {
   window.module = {};
 
@@ -269,17 +269,17 @@
           });
   
         } else if (msg.type === 'assistant') {
-          // Assistant message responses are already in JSON format
+          // Assistant message responses use = prefix
           apiMessages.push({
             role: 'assistant',
-            content: msg.content
+            content: '=' + msg.content + '|||||END|||||'
           });
   
         } else if (msg.type === 'tool_use') {
-          // Tool execution - stringify the tools array
+          // Tool execution - stringify tools array without wrapper
           apiMessages.push({
             role: 'assistant',
-            content: JSON.stringify({ type: 'execute', tools: msg.tools }) + '|||||END|||||'
+            content: JSON.stringify({ tools: msg.tools }) + '|||||END|||||'
           });
   
         } else if (msg.type === 'system_error') {
@@ -495,101 +495,104 @@
 
   // Module: message-processor.js
   // Message Processor
-  // Handles 3-layer processing: trimming, parsing, validation
+  // Handles processing of streamed responses with = prefix (message) or { prefix (tools)
   window.module['message-processor.js'] = {
     TERMINATOR: '|||||END|||||',
   
     processStreamedResponse: function(rawText) {
-      // Layer 1: Trim text (basic implementation)
-      const trimmed = this.trimText(rawText);
-  
       // Check for terminator
-      if (!trimmed.includes(this.TERMINATOR)) {
+      if (!rawText.includes(this.TERMINATOR)) {
         return {
           complete: false,
-          content: trimmed,
+          content: rawText,
           error: null
         };
       }
   
-      // Layer 2: Parse JSON
-      const parsed = this.parseJSON(trimmed);
-      if (parsed.error) {
-        return {
-          complete: true,
-          content: null,
-          error: parsed.error,
-          originalContent: trimmed
-        };
-      }
+      // Extract content before terminator
+      const terminatorIndex = rawText.indexOf(this.TERMINATOR);
+      const content = rawText.substring(0, terminatorIndex);
   
-      // Layer 3: Validate (basic implementation)
-      const validated = this.validate(parsed.data);
-      if (validated.error) {
+      // Detect response type by first character
+      const firstChar = content.charAt(0);
+  
+      if (firstChar === '=') {
+        // Message response
+        return this.processMessage(content);
+      } else if (firstChar === '{') {
+        // Tool execution response
+        return this.processTools(content);
+      } else {
         return {
           complete: true,
           content: null,
-          error: validated.error,
-          originalContent: trimmed
+          error: `Invalid response format: must start with = or {, got "${firstChar}"`,
+          originalContent: rawText
         };
       }
+    },
+  
+    processMessage: function(text) {
+      // Remove = prefix
+      const message = text.substring(1);
   
       return {
         complete: true,
-        content: validated.data,
+        content: {
+          type: 'message',
+          text: message
+        },
         error: null
       };
     },
   
-    trimText: function(text) {
-      // TODO: Implement sophisticated trimming logic
-      // For now, just trim whitespace
-      return text.trim();
-    },
-  
-    parseJSON: function(text) {
-      // Extract JSON before terminator
-      const terminatorIndex = text.indexOf(this.TERMINATOR);
-      if (terminatorIndex === -1) {
-        return { error: 'Terminator not found', data: null };
-      }
-  
-      const jsonText = text.substring(0, terminatorIndex).trim();
-  
+    processTools: function(jsonText) {
+      // Parse JSON
       try {
         const data = JSON.parse(jsonText);
-        return { error: null, data: data };
+  
+        // Validate structure
+        if (!data || typeof data !== 'object') {
+          return {
+            complete: true,
+            content: null,
+            error: 'Invalid tools response: not an object',
+            originalContent: jsonText
+          };
+        }
+  
+        if (!Array.isArray(data.tools)) {
+          return {
+            complete: true,
+            content: null,
+            error: 'Invalid tools response: tools must be an array',
+            originalContent: jsonText
+          };
+        }
+  
+        // TODO: Add comprehensive tool validation
+        // - Check each tool has name and args
+        // - Validate tool names
+        // - Validate args match tool requirements
+  
+        return {
+          complete: true,
+          content: {
+            type: 'execute',
+            tools: data.tools
+          },
+          error: null
+        };
+  
       } catch (e) {
         // TODO: Implement JSON repair logic
-        return { error: `JSON parse error: ${e.message}`, data: null };
+        return {
+          complete: true,
+          content: null,
+          error: `JSON parse error: ${e.message}`,
+          originalContent: jsonText
+        };
       }
-    },
-  
-    validate: function(data) {
-      // Basic validation
-      if (!data || typeof data !== 'object') {
-        return { error: 'Invalid data: not an object', data: null };
-      }
-  
-      if (!data.type) {
-        return { error: 'Invalid data: missing type field', data: null };
-      }
-  
-      const validTypes = ['message', 'execute'];
-      if (!validTypes.includes(data.type)) {
-        return { error: `Invalid data: unknown type "${data.type}"`, data: null };
-      }
-  
-      if (data.type === 'message' && !data.content) {
-        return { error: 'Invalid message: missing content', data: null };
-      }
-  
-      if (data.type === 'execute' && !Array.isArray(data.tools)) {
-        return { error: 'Invalid execute: tools must be an array', data: null };
-      }
-  
-      // TODO: Add more comprehensive validation
-      return { error: null, data: data };
     }
   };
   
@@ -641,57 +644,32 @@
   
   ## Response Format
   
-  ALL responses must be valid JSON followed by |||||END|||||
+  ALL responses must end with |||||END|||||
   
-  Three response types in planning mode:
+  Two response types in planning mode:
   
   ### 1. Message Response
-  When you want to ask questions or discuss:
+  When you want to ask questions or discuss, start with = followed by your message:
   
-  {
-    "type": "message",
-    "content": "Your message to the user here"
-  }|||||END|||||
+  =Your message to the user here. Can be multiple lines.
+  You can include newlines and formatting.|||||END|||||
   
-  ### 2. Execute Response
-  When you need to explore the codebase, just use the tools directly:
+  ### 2. Tool Execution
+  When you need to use tools, start with { and provide valid JSON:
   
-  {
-    "type": "execute",
-    "tools": [
-      {"name": "list_folder", "args": {"path": "src/"}},
-      {"name": "read_file", "args": {"path": "src/main.js"}}
-    ]
-  }|||||END|||||
+  {"tools":[{"name":"list_folder","args":{"path":"src/"}},{"name":"read_file","args":{"path":"src/main.js"}}]}|||||END|||||
   
   IMPORTANT: Don't send a message first saying you're going to use tools. Just use them.
   The user sees the tool execution, so announcing it is redundant.
-  
-  ### 3. Exit Planning
-  When you're ready to start execution:
-  
-  {
-    "type": "execute",
-    "tools": [
-      {
-        "name": "exit_planning",
-        "args": {
-          "checklist": [
-            {
-              "short_desc": "Brief description for UI",
-              "long_desc": "Detailed description for execution"
-            }
-          ]
-        }
-      }
-    ]
-  }|||||END|||||
   
   ## Available Tools in Planning Mode
   
   - list_folder: Explore directories (non-recursive)
   - read_file: Read file contents
   - exit_planning: Exit planning with checklist
+  
+  Example exit_planning:
+  {"tools":[{"name":"exit_planning","args":{"checklist":[{"short_desc":"Brief description for UI","long_desc":"Detailed description for execution"}]}}]}|||||END|||||
   
   ## Rules
   
@@ -729,7 +707,19 @@
   
   ## Response Format
   
-  ALL responses must be valid JSON followed by |||||END|||||
+  ALL responses must end with |||||END|||||
+  
+  Two response types:
+  
+  ### 1. Message Response
+  Start with = followed by your message:
+  
+  =Task completed successfully.|||||END|||||
+  
+  ### 2. Tool Execution
+  Start with { and provide valid JSON:
+  
+  {"tools":[{"name":"create_file","args":{"path":"src/new.js","content":"console.log('hello');"}}]}|||||END|||||
   
   ## Available Tools in Execution Mode
   
@@ -1053,6 +1043,27 @@
       // Remove existing UI
       document.body.innerHTML = '';
   
+      // Add spinner animation style
+      const style = document.createElement('style');
+      style.textContent = `
+        @keyframes spin {
+          0% { content: '⠋'; }
+          12.5% { content: '⠙'; }
+          25% { content: '⠹'; }
+          37.5% { content: '⠸'; }
+          50% { content: '⠼'; }
+          62.5% { content: '⠴'; }
+          75% { content: '⠦'; }
+          87.5% { content: '⠧'; }
+          100% { content: '⠇'; }
+        }
+        .spinner::before {
+          content: '⠋';
+          animation: spin 0.8s steps(8) infinite;
+        }
+      `;
+      document.head.appendChild(style);
+  
       // Create main container
       const container = document.createElement('div');
       container.id = 'test-interface';
@@ -1070,23 +1081,7 @@
         overflow: hidden;
       `;
   
-      // Header
-      const header = document.createElement('div');
-      header.style.cssText = `
-        background: #252526;
-        padding: 12px 20px;
-        border-bottom: 1px solid #3e3e42;
-        display: flex;
-        align-items: center;
-        gap: 15px;
-      `;
-      header.innerHTML = `
-        <h1 style="margin: 0; font-size: 18px; font-weight: 600;">API Test Interface v2.0 (Planning Mode)</h1>
-        <span id="charCount" style="margin-left: auto; font-size: 13px; color: #858585;"></span>
-      `;
-      container.appendChild(header);
-  
-      // Chat area (full width, no sidebar)
+      // Chat area (full width, no header)
       const chatPanel = document.createElement('div');
       chatPanel.style.cssText = `
         flex: 1;
@@ -1124,7 +1119,16 @@
           font-size: 13px;
           resize: vertical;
         "></textarea>
-        <div id="errorMsg" style="margin-top: 8px; color: #f48771; font-size: 13px;"></div>
+        <div style="margin-top: 8px; display: flex; justify-content: space-between; align-items: center;">
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <span id="folderName" style="font-size: 12px; color: #858585;"></span>
+            <span id="loadingIndicator" style="font-size: 12px; color: #858585; display: none;">
+              <span class="spinner"></span> <span id="loadingText">Processing...</span>
+            </span>
+          </div>
+          <span id="charCount" style="font-size: 12px; color: #858585;"></span>
+        </div>
+        <div id="errorMsg" style="margin-top: 4px; color: #f48771; font-size: 13px;"></div>
       `;
       chatPanel.appendChild(inputArea);
   
@@ -1139,6 +1143,13 @@
         }
         // Shift+Enter allows newline (default textarea behavior)
       });
+  
+      // Set folder name
+      const fileSystem = window.module['file-system.js'];
+      const folderNameElement = document.getElementById('folderName');
+      if (fileSystem.directoryHandle) {
+        folderNameElement.textContent = `📁 ${fileSystem.directoryHandle.name}`;
+      }
   
       this.updateCharCounter();
     },
@@ -1191,6 +1202,9 @@
       const utils = window.module['utils.js'];
       const config = window.module['config.js'];
   
+      // Show loading indicator
+      this.showLoading('Thinking...');
+  
       // Render messages for API
       const messages = conversationManager.getMessages();
       const apiMessages = apiRenderer.renderMessagesForAPI(messages);
@@ -1203,16 +1217,14 @@
         }
       }
   
-      // Update chat
-      // TODO: This still uses old format - need to refactor
-      // For now, skip updateChat and go straight to getCompletion
-  
       // Get completion with streaming
       const assistantMessageId = utils.generateUUID();
   
       let retryCount = 0;
       let success = false;
       let accumulatedContent = '';
+      let streamingMessageId = null;
+      let responseType = null; // 'message' or 'tools'
   
       while (retryCount < config.MAX_RETRIES && !success) {
         try {
@@ -1241,7 +1253,46 @@
                 try {
                   const parsed = JSON.parse(data);
                   if (parsed.choices && parsed.choices[0] && parsed.choices[0].delta && parsed.choices[0].delta.content) {
-                    accumulatedContent += parsed.choices[0].delta.content;
+                    const deltaContent = parsed.choices[0].delta.content;
+                    accumulatedContent += deltaContent;
+  
+                    // Detect response type from first character
+                    if (responseType === null && accumulatedContent.length > 0) {
+                      const firstChar = accumulatedContent.charAt(0);
+                      if (firstChar === '=') {
+                        responseType = 'message';
+                        // Create streaming message
+                        streamingMessageId = utils.generateUUID();
+                        conversationManager.addMessage({
+                          id: streamingMessageId,
+                          type: 'assistant',
+                          content: '',
+                          streaming: true
+                        });
+                      } else if (firstChar === '{') {
+                        responseType = 'tools';
+                        // Don't create message yet, wait for complete JSON
+                      }
+                    }
+  
+                    // Update streaming message in real-time
+                    if (responseType === 'message' && streamingMessageId) {
+                      // Extract message content (remove = prefix and terminator if present)
+                      let messageContent = accumulatedContent.substring(1); // Remove =
+                      const terminatorIndex = messageContent.indexOf(messageProcessor.TERMINATOR);
+                      if (terminatorIndex !== -1) {
+                        messageContent = messageContent.substring(0, terminatorIndex);
+                      }
+  
+                      // Update the streaming message
+                      const msgs = conversationManager.getMessages();
+                      const streamingMsg = msgs.find(m => m.id === streamingMessageId);
+                      if (streamingMsg) {
+                        streamingMsg.content = messageContent;
+                        this.renderChat();
+                        this.updateCharCounter();
+                      }
+                    }
                   }
                 } catch (e) {
                   // Ignore parse errors in streaming data
@@ -1261,6 +1312,8 @@
               originalContent: processed.originalContent || accumulatedContent
             });
             this.renderChat();
+            this.updateCharCounter();
+            this.hideLoading();
             return;
           }
   
@@ -1272,6 +1325,8 @@
               completion: false
             });
             this.renderChat();
+            this.updateCharCounter();
+            this.hideLoading();
             return;
           }
   
@@ -1279,12 +1334,24 @@
           const aiResponse = processed.content;
   
           if (aiResponse.type === 'message') {
-            // Simple message response
-            conversationManager.addMessage({
-              type: 'assistant',
-              content: accumulatedContent
-            });
+            // Message was already streamed, just mark as complete
+            if (streamingMessageId) {
+              const msgs = conversationManager.getMessages();
+              const streamingMsg = msgs.find(m => m.id === streamingMessageId);
+              if (streamingMsg) {
+                streamingMsg.streaming = false;
+                streamingMsg.content = aiResponse.text;
+              }
+            } else {
+              // Fallback: add message if streaming didn't work
+              conversationManager.addMessage({
+                type: 'assistant',
+                content: aiResponse.text
+              });
+            }
             this.renderChat();
+            this.updateCharCounter();
+            this.hideLoading();
             success = true;
   
           } else if (aiResponse.type === 'execute') {
@@ -1294,6 +1361,10 @@
               tools: aiResponse.tools
             });
             this.renderChat();
+            this.updateCharCounter();
+  
+            // Update loading indicator for tool execution
+            this.showLoading('Executing tools...');
   
             // Execute tools
             const toolResults = await toolExecutor.executeTools(aiResponse.tools);
@@ -1311,6 +1382,7 @@
             }
   
             this.renderChat();
+            this.updateCharCounter();
   
             // Auto-call API again to let AI respond to tool results
             await this.getAIResponse();
@@ -1322,15 +1394,19 @@
           console.warn(`Attempt ${retryCount} failed:`, error.message);
   
           if (retryCount >= config.MAX_RETRIES) {
+            this.hideLoading();
             throw error;
           }
   
           // Wait 1 second before retry
           await new Promise(resolve => setTimeout(resolve, 1000));
           accumulatedContent = ''; // Reset for retry
+          streamingMessageId = null;
+          responseType = null;
         }
       }
   
+      this.hideLoading();
       this.updateCharCounter();
     },
   
@@ -1368,6 +1444,22 @@
     hideError: function() {
       const errorMsg = document.getElementById('errorMsg');
       errorMsg.textContent = '';
+    },
+  
+    showLoading: function(text = 'Processing...') {
+      const loadingIndicator = document.getElementById('loadingIndicator');
+      const loadingText = document.getElementById('loadingText');
+      if (loadingIndicator && loadingText) {
+        loadingText.textContent = text;
+        loadingIndicator.style.display = 'inline';
+      }
+    },
+  
+    hideLoading: function() {
+      const loadingIndicator = document.getElementById('loadingIndicator');
+      if (loadingIndicator) {
+        loadingIndicator.style.display = 'none';
+      }
     }
   };
   
