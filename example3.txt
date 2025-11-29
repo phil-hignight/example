@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-29T20:37:14.898Z
+// AI Agent - Built 2025-11-29T22:12:31.368Z
 (function() {
   window.module = {};
 
@@ -1226,7 +1226,8 @@
         result: {
           mode: 'execution',
           checklist_items: args.checklist.length,
-          current_item: 0
+          current_item: 0,
+          checklist: args.checklist
         },
         args: args
       };
@@ -1256,7 +1257,8 @@
           result: {
             completed_item: currentIndex,
             next_item: currentIndex + 1,
-            remaining: totalItems - (currentIndex + 1)
+            remaining: totalItems - (currentIndex + 1),
+            checklist: modeManager.state.checklist
           },
           args: args
         };
@@ -1269,7 +1271,8 @@
           result: {
             completed_item: currentIndex,
             all_complete: true,
-            mode: 'planning'
+            mode: 'planning',
+            checklist: modeManager.state.checklist
           },
           args: args
         };
@@ -1289,6 +1292,8 @@
       }
   
       // Return to planning mode
+      const currentIndex = modeManager.state.current_item_index;
+      const checklist = modeManager.state.checklist;
       const reason = args.reason || 'Task failed';
       modeManager.transitionToPlanning(reason);
   
@@ -1297,7 +1302,9 @@
         success: true,
         result: {
           mode: 'planning',
-          reason: reason
+          reason: reason,
+          failed_item: currentIndex,
+          checklist: checklist
         },
         args: args
       };
@@ -1436,29 +1443,52 @@
       `;
       chatPanel.appendChild(chatArea);
   
+      // Test button for continuation debugging
+      const testButton = document.createElement('button');
+      testButton.id = 'testContinuationBtn';
+      testButton.textContent = 'Test Continuation';
+      testButton.style.cssText = `
+        position: absolute;
+        top: 10px;
+        right: 10px;
+        padding: 8px 12px;
+        background: #3c3c3c;
+        color: white;
+        border: 1px solid #3e3e42;
+        border-radius: 4px;
+        cursor: pointer;
+        font-family: monospace;
+        font-size: 11px;
+        z-index: 100;
+      `;
+      testButton.addEventListener('click', () => this.testContinuation());
+      chatPanel.appendChild(testButton);
+  
       // Input area - floats at bottom, no padding or shadow
       const inputArea = document.createElement('div');
       inputArea.style.cssText = `
         position: absolute;
-        bottom: 20px;
+        bottom: 8px;
         left: 20px;
         right: 20px;
       `;
       inputArea.innerHTML = `
         <div style="border: 1px solid #3e3e42; border-radius: 4px; overflow: hidden;">
-          <textarea id="userInput" placeholder="Type your message..." style="
+          <textarea id="userInput" style="
             width: 100%;
             min-height: 20px;
             max-height: calc(33vh);
             background: #3c3c3c;
             color: white;
             border: none;
+            margin: 0;
             padding: 10px;
             font-family: monospace;
             font-size: 13px;
             resize: none;
             overflow-y: auto;
             line-height: 1.4;
+            display: block;
           "></textarea>
           <div style="display: flex; justify-content: space-between; align-items: center; padding: 6px 10px; background: #252526; border-top: 1px solid #3e3e42;">
             <span id="folderName" style="font-size: 11px; color: #858585;"></span>
@@ -1677,7 +1707,13 @@
             this.showLoading(`Requesting continuation (${continuationAttempts}/${MAX_CONTINUATION_ATTEMPTS})...`);
   
             try {
-              const continueResponse = await apiClient.getContinuation(apiMessages, assistantMessageId, accumulatedContent);
+              // Extract the actual message content (remove = prefix if present)
+              let partialMessage = accumulatedContent;
+              if (partialMessage.startsWith('=')) {
+                partialMessage = partialMessage.substring(1);
+              }
+  
+              const continueResponse = await apiClient.getContinuation(apiMessages, assistantMessageId, partialMessage);
               const continueReader = continueResponse.body.getReader();
               const continueDecoder = new TextDecoder();
               let continuationContent = '';
@@ -1941,6 +1977,136 @@
       if (loadingMessage) {
         loadingMessage.remove();
       }
+    },
+  
+    testContinuation: async function() {
+      const conversationManager = window.module['conversation-manager.js'];
+      const apiClient = window.module['api-client.js'];
+      const apiRenderer = window.module['api-renderer.js'];
+      const messageProcessor = window.module['message-processor.js'];
+  
+      // Create a test partial message
+      const testPartial = '=This is a test message that will be cut off without the terminator';
+  
+      conversationManager.addMessage({
+        type: 'system_warning',
+        warning: '=== CONTINUATION TEST STARTED ==='
+      });
+  
+      conversationManager.addMessage({
+        type: 'system_warning',
+        warning: `Raw partial content (${testPartial.length} chars): "${testPartial.substring(0, 50)}..."`
+      });
+  
+      // Extract message without = prefix
+      let extractedPartial = testPartial;
+      if (extractedPartial.startsWith('=')) {
+        extractedPartial = extractedPartial.substring(1);
+      }
+  
+      conversationManager.addMessage({
+        type: 'system_warning',
+        warning: `Extracted partial (${extractedPartial.length} chars): "${extractedPartial.substring(0, 50)}..."`
+      });
+  
+      this.renderChat();
+  
+      try {
+        // Get API messages
+        const apiMessages = apiRenderer.renderMessagesForAPI(conversationManager.getMessages());
+  
+        conversationManager.addMessage({
+          type: 'system_warning',
+          warning: `API messages count: ${apiMessages.length}`
+        });
+  
+        conversationManager.addMessage({
+          type: 'system_warning',
+          warning: `Last API message role: ${apiMessages[apiMessages.length - 1]?.role}`
+        });
+  
+        this.renderChat();
+  
+        // Make continuation request
+        const response = await apiClient.getContinuation(apiMessages, 'test-id', extractedPartial);
+  
+        conversationManager.addMessage({
+          type: 'system_warning',
+          warning: `Continuation response status: ${response.status}`
+        });
+  
+        this.renderChat();
+  
+        // Read first chunk of response
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let accumulatedResponse = '';
+        let chunkCount = 0;
+  
+        for (let i = 0; i < 5; i++) { // Read first 5 chunks
+          const { done, value } = await reader.read();
+          if (done) break;
+  
+          const chunk = decoder.decode(value, { stream: true });
+          accumulatedResponse += chunk;
+          chunkCount++;
+        }
+  
+        conversationManager.addMessage({
+          type: 'system_warning',
+          warning: `Read ${chunkCount} chunks, total ${accumulatedResponse.length} chars`
+        });
+  
+        // Extract content from SSE format
+        const lines = accumulatedResponse.split('\n');
+        let extractedContent = '';
+  
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            const data = line.slice(6);
+            if (data === '[DONE]') continue;
+            try {
+              const parsed = JSON.parse(data);
+              if (parsed.choices?.[0]?.delta?.content) {
+                extractedContent += parsed.choices[0].delta.content;
+              }
+            } catch (e) {}
+          }
+        }
+  
+        conversationManager.addMessage({
+          type: 'system_warning',
+          warning: `Extracted content (${extractedContent.length} chars): "${extractedContent.substring(0, 100)}"`
+        });
+  
+        conversationManager.addMessage({
+          type: 'system_warning',
+          warning: `First char: "${extractedContent.charAt(0)}" (code: ${extractedContent.charCodeAt(0)})`
+        });
+  
+        // Check if it starts with = or continues from partial
+        const startsWithEquals = extractedContent.startsWith('=');
+        const startsWithExpectedContinuation = extractedContent.startsWith('without') || extractedContent.startsWith(' without');
+  
+        conversationManager.addMessage({
+          type: 'system_warning',
+          warning: `Starts with =: ${startsWithEquals}, Looks like continuation: ${startsWithExpectedContinuation}`
+        });
+  
+        conversationManager.addMessage({
+          type: 'system_warning',
+          warning: '=== TEST COMPLETE ==='
+        });
+  
+        this.renderChat();
+  
+      } catch (error) {
+        conversationManager.addMessage({
+          type: 'system_error',
+          error: `Test failed: ${error.message}`
+        });
+        this.renderChat();
+      }
     }
   };
   
@@ -1976,10 +2142,12 @@
         content.textContent = message.content;
   
       } else if (message.type === 'tool_use') {
-        // Orange circle for tool use (will show before execution)
-        indicator.style.backgroundColor = '#ce9178'; // Orange to match tool name color
+        // Gray pulsing circle for tool use (will change color when result comes in)
+        indicator.style.backgroundColor = '#858585';
+        indicator.style.animation = 'pulse 1.5s ease-in-out infinite';
+        indicator.id = `tool-indicator-${message.toolId}`; // Use toolId for updating later
   
-        content.style.cssText += 'color: #ce9178; padding: 2px 0; cursor: pointer;';
+        content.style.cssText += 'color: #d4d4d4; padding: 2px 0; cursor: pointer;';
   
         // Render single tool as clean one-liner
         const tool = message.tool;
@@ -1990,16 +2158,34 @@
         content.addEventListener('click', () => this.showToolModal('Tool Use', tool));
   
       } else if (message.type === 'tool_result') {
-        // Green (success) or red (failed) circle
-        if (message.success) {
-          indicator.style.backgroundColor = '#4ec9b0'; // Green
-        } else {
-          indicator.style.backgroundColor = '#f48771'; // Red
+        // Update the corresponding tool_use indicator color
+        if (message.toolId) {
+          const toolIndicator = document.getElementById(`tool-indicator-${message.toolId}`);
+          if (toolIndicator) {
+            toolIndicator.style.animation = 'none'; // Stop pulsing
+            toolIndicator.style.backgroundColor = message.success ? '#4ec9b0' : '#f48771'; // Green or red
+          }
         }
   
-        content.style.cssText += 'color: #858585; padding: 2px 0; cursor: pointer;';
-        content.textContent = this.formatToolResult(message);
-        content.addEventListener('click', () => this.showToolModal(`Tool Result: ${message.tool}`, message.result));
+        // Special rendering for checklist tools
+        if (message.tool === 'exit_planning' || message.tool === 'item_completed' || message.tool === 'item_failed') {
+          // Hide indicator for these special tools - we'll show checklist instead
+          indicator.style.display = 'none';
+  
+          if (message.result && message.result.checklist) {
+            content.style.cssText += 'padding: 2px 0;';
+            content.innerHTML = this.renderChecklist(message.result.checklist, message.result.completed_item, message.result.failed_item);
+          } else {
+            content.style.cssText += 'color: #858585; padding: 2px 0;';
+            content.textContent = this.formatToolResult(message);
+          }
+        } else {
+          // Normal tool results - no indicator, just text
+          indicator.style.display = 'none';
+          content.style.cssText += 'color: #858585; padding: 2px 0; cursor: pointer;';
+          content.textContent = this.formatToolResult(message);
+          content.addEventListener('click', () => this.showToolModal(`Tool Result: ${message.tool}`, message.result));
+        }
   
       } else if (message.type === 'system_error') {
         indicator.style.backgroundColor = '#f48771'; // Red
@@ -2092,6 +2278,29 @@
         // Generic fallback
         return JSON.stringify(result);
       }
+    },
+  
+    renderChecklist: function(checklist, completedIndex, failedIndex) {
+      if (!checklist || !Array.isArray(checklist)) {
+        return 'Invalid checklist';
+      }
+  
+      const items = checklist.map((item, index) => {
+        let statusIcon = '○'; // Pending
+        let color = '#858585'; // Gray
+  
+        if (completedIndex !== undefined && index <= completedIndex) {
+          statusIcon = '✓'; // Completed
+          color = '#4ec9b0'; // Green
+        } else if (failedIndex !== undefined && index === failedIndex) {
+          statusIcon = '✗'; // Failed
+          color = '#f48771'; // Red
+        }
+  
+        return `<div style="color: ${color}; margin-bottom: 2px;">${statusIcon} ${this.escapeHtml(item.short_desc)}</div>`;
+      }).join('');
+  
+      return items;
     },
   
     showToolModal: function(title, content) {
