@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-29T17:14:58.715Z
+// AI Agent - Built 2025-11-29T17:24:50.061Z
 (function() {
   window.module = {};
 
@@ -617,7 +617,7 @@
   }|||||END|||||
   
   ### 2. Execute Response
-  When you need to explore the codebase:
+  When you need to explore the codebase, just use the tools directly:
   
   {
     "type": "execute",
@@ -626,6 +626,9 @@
       {"name": "read_file", "args": {"path": "src/main.js"}}
     ]
   }|||||END|||||
+  
+  IMPORTANT: Don't send a message first saying you're going to use tools. Just use them.
+  The user sees the tool execution, so announcing it is redundant.
   
   ### 3. Exit Planning
   When you're ready to start execution:
@@ -661,6 +664,7 @@
   4. Each checklist item should be independently verifiable
   5. Keep short_desc concise (for UI display)
   6. Make long_desc detailed (for execution context)
+  7. **ACTION OVER ANNOUNCEMENT**: When you need to use tools, just use them immediately. Don't send a message saying "Let me check..." or "I'll read..." - just execute the tools. The user will see the tool results.
   
   </system-reminder>`;
     },
@@ -940,10 +944,75 @@
       modeManager.init();
       apiClient.init();
   
-      this.initUI();
+      this.showIntroScreen();
     },
   
-    initUI: function() {
+    showIntroScreen: function() {
+      // Remove existing UI
+      document.body.innerHTML = '';
+  
+      // Create intro container
+      const container = document.createElement('div');
+      container.style.cssText = `
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100vw;
+        height: 100vh;
+        background: #1e1e1e;
+        color: #d4d4d4;
+        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      `;
+  
+      const content = document.createElement('div');
+      content.style.cssText = `
+        text-align: center;
+        max-width: 500px;
+        padding: 40px;
+      `;
+  
+      content.innerHTML = `
+        <h1 style="font-size: 32px; margin-bottom: 16px; font-weight: 600;">
+          API Test Interface v2.0
+        </h1>
+        <p style="font-size: 16px; color: #858585; margin-bottom: 32px;">
+          Planning Mode • AI-Driven Development
+        </p>
+        <p style="font-size: 14px; margin-bottom: 32px; line-height: 1.6;">
+          Select a project folder to begin. The AI will use tools to explore
+          and modify files as you work together.
+        </p>
+        <button id="selectFolderIntro" style="
+          background: #0e639c;
+          color: white;
+          border: none;
+          padding: 12px 32px;
+          border-radius: 3px;
+          cursor: pointer;
+          font-size: 15px;
+          font-weight: 500;
+        ">Select Folder</button>
+      `;
+  
+      container.appendChild(content);
+      document.body.appendChild(container);
+  
+      document.getElementById('selectFolderIntro').addEventListener('click', () => this.selectFolderAndStart());
+    },
+  
+    selectFolderAndStart: async function() {
+      const fileSystem = window.module['file-system.js'];
+      const success = await fileSystem.requestDirectory();
+  
+      if (success) {
+        this.initChatUI();
+      }
+    },
+  
+    initChatUI: function() {
       // Remove existing UI
       document.body.innerHTML = '';
   
@@ -976,15 +1045,6 @@
       `;
       header.innerHTML = `
         <h1 style="margin: 0; font-size: 18px; font-weight: 600;">API Test Interface v2.0 (Planning Mode)</h1>
-        <button id="selectFolder" style="
-          background: #0e639c;
-          color: white;
-          border: none;
-          padding: 6px 16px;
-          border-radius: 3px;
-          cursor: pointer;
-          font-size: 13px;
-        ">Select Folder</button>
         <span id="charCount" style="margin-left: auto; font-size: 13px; color: #858585;"></span>
       `;
       container.appendChild(header);
@@ -1015,7 +1075,7 @@
         border-top: 1px solid #3e3e42;
       `;
       inputArea.innerHTML = `
-        <textarea id="userInput" placeholder="Type your message..." style="
+        <textarea id="userInput" placeholder="Type your message (Enter to send, Shift+Enter for newline)..." style="
           width: 100%;
           min-height: 80px;
           background: #1e1e1e;
@@ -1027,18 +1087,7 @@
           font-size: 13px;
           resize: vertical;
         "></textarea>
-        <div style="margin-top: 10px; display: flex; gap: 10px;">
-          <button id="submitBtn" style="
-            background: #0e639c;
-            color: white;
-            border: none;
-            padding: 8px 20px;
-            border-radius: 3px;
-            cursor: pointer;
-            font-size: 13px;
-          ">Send</button>
-          <div id="errorMsg" style="color: #f48771; font-size: 13px; align-self: center;"></div>
-        </div>
+        <div id="errorMsg" style="margin-top: 8px; color: #f48771; font-size: 13px;"></div>
       `;
       chatPanel.appendChild(inputArea);
   
@@ -1046,21 +1095,15 @@
       document.body.appendChild(container);
   
       // Event listeners
-      document.getElementById('selectFolder').addEventListener('click', () => this.selectFolder());
-      document.getElementById('submitBtn').addEventListener('click', () => this.handleSubmit());
       document.getElementById('userInput').addEventListener('keydown', (e) => {
-        if (e.key === 'Enter' && e.ctrlKey) {
+        if (e.key === 'Enter' && !e.shiftKey) {
+          e.preventDefault();
           this.handleSubmit();
         }
+        // Shift+Enter allows newline (default textarea behavior)
       });
   
       this.updateCharCounter();
-    },
-  
-    selectFolder: async function() {
-      const fileSystem = window.module['file-system.js'];
-      await fileSystem.requestDirectory();
-      // No UI update needed - AI will use tools to access files
     },
   
     handleSubmit: async function() {
@@ -1232,8 +1275,8 @@
   
             this.renderChat();
   
-            // TODO: Auto-call API again to let AI respond to tool results
-            // For now, just stop
+            // Auto-call API again to let AI respond to tool results
+            await this.getAIResponse();
             success = true;
           }
   
