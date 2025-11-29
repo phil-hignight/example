@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-29T17:24:50.061Z
+// AI Agent - Built 2025-11-29T17:39:57.028Z
 (function() {
   window.module = {};
 
@@ -201,6 +201,7 @@
   
       let firstUserMessageIndex = -1;
       let pendingWarnings = []; // Can accumulate multiple warnings
+      let pendingToolResults = []; // Can accumulate multiple tool results
   
       for (let i = startIndex; i < messages.length; i++) {
         const msg = messages[i];
@@ -209,6 +210,32 @@
         if (msg.type === 'system_warning') {
           pendingWarnings.push(msg.warning);
           continue;
+        }
+  
+        // Collect tool results to combine
+        if (msg.type === 'tool_result') {
+          pendingToolResults.push(msg);
+          continue;
+        }
+  
+        // Flush pending tool results before processing other message types
+        if (pendingToolResults.length > 0) {
+          const combinedResults = pendingToolResults.map(result => {
+            if (result.success) {
+              // Include the file path in the result for read_file
+              const path = result.args?.path || '';
+              const prefix = path ? `Tool: ${result.tool} (${path})` : `Tool: ${result.tool}`;
+              return `${prefix}\nResult: ${JSON.stringify(result.result)}`;
+            } else {
+              return `Tool: ${result.tool}\nError: ${result.error}`;
+            }
+          }).join('\n\n');
+  
+          apiMessages.push({
+            role: 'user',
+            content: combinedResults
+          });
+          pendingToolResults = [];
         }
   
         // Handle different message types
@@ -255,16 +282,6 @@
             content: JSON.stringify({ type: 'execute', tools: msg.tools }) + '|||||END|||||'
           });
   
-        } else if (msg.type === 'tool_result') {
-          // Tool results are sent as user messages
-          const resultText = msg.success
-            ? `Tool: ${msg.tool}\nResult: ${JSON.stringify(msg.result)}`
-            : `Tool: ${msg.tool}\nError: ${msg.error}`;
-          apiMessages.push({
-            role: 'user',
-            content: resultText
-          });
-  
         } else if (msg.type === 'system_error') {
           apiMessages.push({
             role: 'user',
@@ -277,6 +294,24 @@
           // For now, skip partials (combination not yet implemented)
           continue;
         }
+      }
+  
+      // Flush any remaining tool results at the end
+      if (pendingToolResults.length > 0) {
+        const combinedResults = pendingToolResults.map(result => {
+          if (result.success) {
+            const path = result.args?.path || '';
+            const prefix = path ? `Tool: ${result.tool} (${path})` : `Tool: ${result.tool}`;
+            return `${prefix}\nResult: ${JSON.stringify(result.result)}`;
+          } else {
+            return `Tool: ${result.tool}\nError: ${result.error}`;
+          }
+        }).join('\n\n');
+  
+        apiMessages.push({
+          role: 'user',
+          content: combinedResults
+        });
       }
   
       return apiMessages;
@@ -598,9 +633,11 @@
   ## What you should do:
   
   1. Ask clarifying questions about the task
-  2. Explore the codebase using list_folder and read_file
+  2. Explore the codebase using list_folder and read_file (as many files as needed)
   3. Understand the current state and requirements
-  4. When you have enough information, create a checklist of discrete tasks
+  4. When ready to make CHANGES, create a checklist and exit to execution mode
+  
+  IMPORTANT: You can read as many files as you want in planning mode. Only exit to execution mode when you need to CREATE or MODIFY files. Reading is part of planning.
   
   ## Response Format
   
