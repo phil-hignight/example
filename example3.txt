@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-29T19:13:56.091Z
+// AI Agent - Built 2025-11-29T20:37:14.898Z
 (function() {
   window.module = {};
 
@@ -178,11 +178,18 @@
     getContinuation: async function(apiMessages, assistantMessageId, partialContent) {
       const config = window.module['config.js'];
   
-      // Add a system message asking for continuation
-      const continueMessages = [...apiMessages, {
-        role: 'user',
-        content: '[System: Your previous response was cut off. Please continue from where you left off, starting with the exact continuation of your last incomplete response. Do not restart or summarize - just continue the exact text.]'
-      }];
+      // Add the partial assistant response, then a user message asking for continuation
+      const continueMessages = [
+        ...apiMessages,
+        {
+          role: 'assistant',
+          content: partialContent
+        },
+        {
+          role: 'user',
+          content: '[System: Your previous response was cut off. Please continue from where you left off, starting with the exact continuation of your last incomplete response. Do not restart or summarize - just continue the exact text.]'
+        }
+      ];
   
       const payload = {
         stream: true,
@@ -1429,20 +1436,16 @@
       `;
       chatPanel.appendChild(chatArea);
   
-      // Input area - floats at bottom with rounded corners
+      // Input area - floats at bottom, no padding or shadow
       const inputArea = document.createElement('div');
       inputArea.style.cssText = `
         position: absolute;
         bottom: 20px;
         left: 20px;
         right: 20px;
-        background: #252526;
-        border-radius: 12px;
-        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
-        padding: 15px;
       `;
       inputArea.innerHTML = `
-        <div style="border: 1px solid #3e3e42; border-radius: 8px; background: #252526; overflow: hidden;">
+        <div style="border: 1px solid #3e3e42; border-radius: 4px; overflow: hidden;">
           <textarea id="userInput" placeholder="Type your message..." style="
             width: 100%;
             min-height: 20px;
@@ -1663,15 +1666,17 @@
             return;
           }
   
-          if (!processed.complete) {
-            // Handle partial response with continuation
-            console.log('Response incomplete, requesting continuation...');
+          // Handle incomplete responses - try up to 20 continuation attempts
+          let continuationAttempts = 0;
+          const MAX_CONTINUATION_ATTEMPTS = 20;
+          let lastChunkContent = '';
   
-            // Update loading text to show we're continuing
-            this.showLoading('Requesting continuation...');
+          while (!processed.complete && continuationAttempts < MAX_CONTINUATION_ATTEMPTS) {
+            continuationAttempts++;
+            console.log(`Response incomplete, requesting continuation (attempt ${continuationAttempts}/${MAX_CONTINUATION_ATTEMPTS})...`);
+            this.showLoading(`Requesting continuation (${continuationAttempts}/${MAX_CONTINUATION_ATTEMPTS})...`);
   
             try {
-              // Request continuation from API
               const continueResponse = await apiClient.getContinuation(apiMessages, assistantMessageId, accumulatedContent);
               const continueReader = continueResponse.body.getReader();
               const continueDecoder = new TextDecoder();
@@ -1698,7 +1703,18 @@
                     try {
                       const parsed = JSON.parse(data);
                       if (parsed.choices && parsed.choices[0] && parsed.choices[0].delta && parsed.choices[0].delta.content) {
-                        continuationContent += parsed.choices[0].delta.content;
+                        const deltaContent = parsed.choices[0].delta.content;
+                        continuationContent += deltaContent;
+  
+                        // Stream continuation to UI in real-time
+                        if (streamingMessageId) {
+                          const msgs = conversationManager.getMessages();
+                          const streamingMsg = msgs.find(m => m.id === streamingMessageId);
+                          if (streamingMsg) {
+                            streamingMsg.content = accumulatedContent + continuationContent;
+                            this.renderChat();
+                          }
+                        }
                       }
                     } catch (e) {
                       // Ignore parse errors
@@ -1707,37 +1723,37 @@
                 }
               }
   
-              // Combine partial + continuation
-              const combinedContent = accumulatedContent + continuationContent;
-              console.log('Combined content length:', combinedContent.length);
-  
-              // Try processing the combined content
-              const combinedProcessed = messageProcessor.processStreamedResponse(combinedContent);
-  
-              if (combinedProcessed.complete) {
-                // Successfully got complete response after continuation
-                accumulatedContent = combinedContent;
-                processed = combinedProcessed;
-                console.log('Continuation successful, response now complete');
-                // Continue with normal processing below
-              } else {
-                // Still incomplete after continuation - give up
-                console.error('Response still incomplete after continuation');
+              // Check for repeating content (AI is stuck)
+              if (continuationContent.length > 100 && continuationContent === lastChunkContent) {
+                console.warn('Continuation repeating same content, stopping attempts');
                 conversationManager.addMessage({
                   type: 'system_error',
-                  error: 'Response incomplete after continuation attempt',
-                  originalContent: combinedContent
+                  error: 'Response incomplete: AI started repeating content',
+                  originalContent: accumulatedContent + continuationContent
                 });
                 this.renderChat();
                 this.updateCharCounter();
                 this.hideLoading();
                 return;
               }
+              lastChunkContent = continuationContent;
+  
+              // Combine partial + continuation
+              accumulatedContent += continuationContent;
+              console.log('Combined content length:', accumulatedContent.length);
+  
+              // Try processing the combined content
+              processed = messageProcessor.processStreamedResponse(accumulatedContent);
+  
+              if (processed.complete) {
+                console.log(`Continuation successful after ${continuationAttempts} attempt(s), response now complete`);
+                // Will exit while loop and continue with normal processing
+              }
             } catch (continueError) {
               console.error('Continuation failed:', continueError);
               conversationManager.addMessage({
                 type: 'system_error',
-                error: `Continuation failed: ${continueError.message}`,
+                error: `Continuation failed after ${continuationAttempts} attempt(s): ${continueError.message}`,
                 originalContent: accumulatedContent
               });
               this.renderChat();
@@ -1745,6 +1761,20 @@
               this.hideLoading();
               return;
             }
+          }
+  
+          // If we exhausted all continuation attempts without getting terminator
+          if (!processed.complete) {
+            console.error(`Response still incomplete after ${MAX_CONTINUATION_ATTEMPTS} continuation attempts`);
+            conversationManager.addMessage({
+              type: 'system_error',
+              error: `Response incomplete after ${MAX_CONTINUATION_ATTEMPTS} continuation attempts`,
+              originalContent: accumulatedContent
+            });
+            this.renderChat();
+            this.updateCharCounter();
+            this.hideLoading();
+            return;
           }
   
           // Successfully got complete response
@@ -1772,46 +1802,45 @@
             success = true;
   
           } else if (aiResponse.type === 'execute') {
-            // Tool execution - create individual tool_use messages with IDs
+            // Tool execution - execute tools one at a time, interleaving use/result messages
             const utils = window.module['utils.js'];
-            const toolIds = [];
   
             for (const tool of aiResponse.tools) {
               const toolId = utils.generateUUID();
-              toolIds.push({ id: toolId, name: tool.name });
   
+              // Add tool_use message
               conversationManager.addMessage({
                 type: 'tool_use',
                 toolId: toolId,
                 tool: tool
               });
-            }
   
-            this.renderChat();
-            this.updateCharCounter();
+              this.renderChat();
+              this.updateCharCounter();
   
-            // Update loading indicator for tool execution
-            this.showLoading('Executing tools...');
+              // Update loading indicator for this specific tool
+              this.showLoading(`Executing ${tool.name}...`);
   
-            // Execute tools
-            const toolResults = await toolExecutor.executeTools(aiResponse.tools);
+              // Execute this single tool
+              const toolResults = await toolExecutor.executeTools([tool]);
+              const result = toolResults[0];
   
-            // Add tool results to conversation with matching tool IDs
-            for (let i = 0; i < toolResults.length; i++) {
-              const result = toolResults[i];
+              // Add tool_result message immediately after
               conversationManager.addMessage({
                 type: 'tool_result',
-                toolId: toolIds[i].id,
+                toolId: toolId,
                 tool: result.tool,
                 success: result.success,
                 result: result.result,
                 error: result.error,
                 args: result.args
               });
+  
+              this.renderChat();
+              this.updateCharCounter();
             }
   
-            this.renderChat();
-            this.updateCharCounter();
+            this.hideLoading();
   
             // Auto-call API again to let AI respond to tool results
             await this.getAIResponse();
