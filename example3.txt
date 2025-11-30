@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-29T22:29:44.339Z
+// AI Agent - Built 2025-11-30T17:26:04.476Z
 (function() {
   window.module = {};
 
@@ -191,20 +191,50 @@
       console.log('Partial content starts with:', partialContent.substring(0, 100));
       console.log('Partial content ends with:', partialContent.substring(partialContent.length - 100));
   
-      // Add the partial assistant response, then a user message asking for continuation
+      // Determine if this is a message or tool call
+      const isToolCall = partialContent.startsWith('{');
+      const isMessage = partialContent.startsWith('=');
+  
+      let wrappedContent;
+      let continuationPrompt;
+  
+      if (isToolCall) {
+        // Wrap the partial JSON as if the AI intentionally sent us a preview
+        wrappedContent = `Here's a partial response that got cut off:\n\`\`\`json\n${partialContent}\n\`\`\``;
+  
+        continuationPrompt = `Please complete the partial JSON above. Continue the content from where it was cut off and send the COMPLETE, valid JSON tool call with:
+  1. All the content that was already written, plus the continuation
+  2. Proper closing braces for the JSON structure
+  3. The terminator |||||END||||| at the end
+  
+  Do NOT restart from scratch - include everything that was already written and continue from there.`;
+      } else if (isMessage) {
+        // For messages: wrap similarly
+        const messageContent = partialContent.substring(1); // Remove = prefix
+        wrappedContent = `Here's a partial message that got cut off:\n\`\`\`\n${messageContent}\n\`\`\``;
+  
+        continuationPrompt = `Please complete the message above. Continue from exactly where it left off with the next words. Start your response with = followed by the continuation text.`;
+      } else {
+        // Unknown format, send as-is
+        wrappedContent = partialContent;
+        continuationPrompt = '[System: Your previous response was cut off. Please continue from where you left off.]';
+      }
+  
+      // Build continuation messages with wrapped content
       const continueMessages = [
         ...apiMessages,
         {
           role: 'assistant',
-          content: partialContent
+          content: wrappedContent
         },
         {
           role: 'user',
-          content: '[System: Your previous response was cut off. Please continue from where you left off, starting with the exact continuation of your last incomplete response. Do not restart or summarize - just continue the exact text.]'
+          content: continuationPrompt
         }
       ];
   
       console.log('Continue messages count:', continueMessages.length);
+      console.log('Continuation prompt:', continuationPrompt.substring(0, 200));
       console.log('Last 3 messages:');
       for (let i = Math.max(0, continueMessages.length - 3); i < continueMessages.length; i++) {
         console.log(`  [${i}] ${continueMessages[i].role}:`, continueMessages[i].content.substring(0, 150));
@@ -936,6 +966,10 @@
   // Tool Executor
   // Executes tools and returns results
   window.module['tool-executor.js'] = {
+    // Define tool availability by mode
+    PLANNING_TOOLS: ['list_folder', 'read_file', 'exit_planning'],
+    EXECUTION_TOOLS: ['list_folder', 'read_file', 'create_file', 'edit_file', 'item_completed', 'item_failed'],
+  
     executeTools: async function(tools) {
       const results = [];
   
@@ -955,8 +989,36 @@
       return results;
     },
   
+    validateToolAvailability: function(toolName) {
+      const modeManager = window.module['mode-manager.js'];
+      const currentMode = modeManager.getMode();
+  
+      const allowedTools = currentMode === 'planning' ? this.PLANNING_TOOLS : this.EXECUTION_TOOLS;
+  
+      if (!allowedTools.includes(toolName)) {
+        const modeLabel = currentMode === 'planning' ? 'Planning' : 'Execution';
+        return {
+          valid: false,
+          error: `Tool '${toolName}' is not available in ${modeLabel} Mode. Available tools: ${allowedTools.join(', ')}`
+        };
+      }
+  
+      return { valid: true };
+    },
+  
     executeTool: async function(tool) {
       const fileSystem = window.module['file-system.js'];
+  
+      // Validate tool availability in current mode
+      const validation = this.validateToolAvailability(tool.name);
+      if (!validation.valid) {
+        return {
+          tool: tool.name,
+          success: false,
+          error: validation.error,
+          args: tool.args
+        };
+      }
   
       try {
         switch (tool.name) {
@@ -1823,8 +1885,41 @@
               }
               lastChunkContent = continuationContent;
   
-              // Combine partial + continuation
-              accumulatedContent += continuationContent;
+              // Clean up the continuation content
+              let cleanedContinuation = continuationContent;
+  
+              // Simple rules: if starts with "=", it's a message. Otherwise, it's JSON.
+              if (cleanedContinuation.startsWith('=')) {
+                // It's a message response, use as-is
+                console.log('Continuation is a message response (starts with =)');
+              } else {
+                // It's a tool call JSON - strip any wrapper text before first "{" and after last "}"
+                const firstBrace = cleanedContinuation.indexOf('{');
+                const lastBrace = cleanedContinuation.lastIndexOf('}');
+  
+                if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+                  const originalLength = cleanedContinuation.length;
+                  cleanedContinuation = cleanedContinuation.substring(firstBrace, lastBrace + 1);
+                  if (originalLength !== cleanedContinuation.length) {
+                    console.log('Stripped wrapper text from JSON, extracted from first { to last }');
+                    console.log('  Original length:', originalLength, '-> Cleaned length:', cleanedContinuation.length);
+                  }
+                }
+              }
+  
+              // Determine how to combine: replace for tool calls, append for messages
+              const isToolCall = partialMessage.startsWith('{');
+  
+              if (isToolCall) {
+                // For tool calls, the continuation should be a COMPLETE replacement
+                console.log('Tool call continuation: replacing partial with complete response');
+                accumulatedContent = cleanedContinuation;
+              } else {
+                // For messages, append the continuation
+                console.log('Message continuation: appending to partial');
+                accumulatedContent += cleanedContinuation;
+              }
+  
               console.log('Combined content length:', accumulatedContent.length);
   
               // Try processing the combined content
@@ -2225,10 +2320,8 @@
         content.textContent = message.content;
   
       } else if (message.type === 'tool_use') {
-        // Gray pulsing circle for tool use (will change color when result comes in)
-        indicator.style.backgroundColor = '#858585';
-        indicator.style.animation = 'pulse 1.5s ease-in-out infinite';
-        indicator.id = `tool-indicator-${message.toolId}`; // Use toolId for updating later
+        // No circle for tool_use - we'll add it when the result comes in
+        indicator.style.display = 'none';
   
         content.style.cssText += 'color: #d4d4d4; padding: 2px 0; cursor: pointer;';
   
@@ -2241,14 +2334,8 @@
         content.addEventListener('click', () => this.showToolModal('Tool Use', tool));
   
       } else if (message.type === 'tool_result') {
-        // Update the corresponding tool_use indicator color
-        if (message.toolId) {
-          const toolIndicator = document.getElementById(`tool-indicator-${message.toolId}`);
-          if (toolIndicator) {
-            toolIndicator.style.animation = 'none'; // Stop pulsing
-            toolIndicator.style.backgroundColor = message.success ? '#4ec9b0' : '#f48771'; // Green or red
-          }
-        }
+        // Add circle indicator for the result
+        indicator.style.backgroundColor = message.success ? '#4ec9b0' : '#f48771'; // Green or red
   
         // Special rendering for checklist tools
         if (message.tool === 'exit_planning' || message.tool === 'item_completed' || message.tool === 'item_failed') {
