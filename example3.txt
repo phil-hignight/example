@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-30T17:26:04.476Z
+// AI Agent - Built 2025-11-30T17:42:31.912Z
 (function() {
   window.module = {};
 
@@ -199,25 +199,37 @@
       let continuationPrompt;
   
       if (isToolCall) {
-        // Wrap the partial JSON as if the AI intentionally sent us a preview
+        // For tool calls, ask for a CONTINUATION (not complete JSON)
+        // Use ~ prefix to indicate it's a continuation that should be appended
         wrappedContent = `Here's a partial response that got cut off:\n\`\`\`json\n${partialContent}\n\`\`\``;
   
-        continuationPrompt = `Please complete the partial JSON above. Continue the content from where it was cut off and send the COMPLETE, valid JSON tool call with:
-  1. All the content that was already written, plus the continuation
-  2. Proper closing braces for the JSON structure
-  3. The terminator |||||END||||| at the end
+        continuationPrompt = `Your previous response was cut off mid-JSON. Send ONLY the continuation text that should be appended.
   
-  Do NOT restart from scratch - include everything that was already written and continue from there.`;
+  The response ended with: "${partialContent.substring(partialContent.length - 100)}"
+  
+  Start your response with ~ followed by the exact text that should come next. Do NOT send complete JSON, do NOT start with {, just send the raw continuation text that will be appended to what you already wrote.
+  
+  Example: if the partial ended with "...delay", you might send:
+  ~ed memory access made them impractical for large-scale use."}}]}|||||END|||||
+  
+  The ~ tells the system this is a continuation to be appended, not a new complete response.`;
       } else if (isMessage) {
-        // For messages: wrap similarly
+        // For messages: also use ~ for continuation
         const messageContent = partialContent.substring(1); // Remove = prefix
         wrappedContent = `Here's a partial message that got cut off:\n\`\`\`\n${messageContent}\n\`\`\``;
   
-        continuationPrompt = `Please complete the message above. Continue from exactly where it left off with the next words. Start your response with = followed by the continuation text.`;
+        continuationPrompt = `Your previous message was cut off. Send ONLY the continuation text.
+  
+  The message ended with: "${messageContent.substring(messageContent.length - 100)}"
+  
+  Start your response with ~ followed by the next words. This will be appended to what you already wrote.
+  
+  Example: if it ended with "...early memory solution", you might send:
+  ~. These devices stored data as acoustic pulses...|||||END|||||`;
       } else {
         // Unknown format, send as-is
         wrappedContent = partialContent;
-        continuationPrompt = '[System: Your previous response was cut off. Please continue from where you left off.]';
+        continuationPrompt = '[System: Your previous response was cut off. Please continue from where you left off with ~ prefix.]';
       }
   
       // Build continuation messages with wrapped content
@@ -1581,6 +1593,7 @@
             background: #3c3c3c;
             color: white;
             border: none;
+            outline: none;
             margin: 0;
             padding: 10px;
             font-family: monospace;
@@ -1870,6 +1883,20 @@
               console.log('  continuationContent starts with:', continuationContent.substring(0, 200));
               console.log('  continuationContent ends with:', continuationContent.substring(continuationContent.length - 200));
   
+              // Validate that continuation starts with ~ (as requested)
+              if (!continuationContent.startsWith('~')) {
+                console.error('Continuation did not start with ~ as requested');
+                conversationManager.addMessage({
+                  type: 'system_error',
+                  error: `Continuation validation failed: Expected response to start with ~ but got "${continuationContent.substring(0, 50)}..."`,
+                  originalContent: accumulatedContent
+                });
+                this.renderChat();
+                this.updateCharCounter();
+                this.hideLoading();
+                return;
+              }
+  
               // Check for repeating content (AI is stuck)
               if (continuationContent.length > 100 && continuationContent === lastChunkContent) {
                 console.warn('Continuation repeating same content, stopping attempts');
@@ -1888,10 +1915,25 @@
               // Clean up the continuation content
               let cleanedContinuation = continuationContent;
   
-              // Simple rules: if starts with "=", it's a message. Otherwise, it's JSON.
-              if (cleanedContinuation.startsWith('=')) {
-                // It's a message response, use as-is
-                console.log('Continuation is a message response (starts with =)');
+              // Handle different continuation types:
+              // = → complete message (replace)
+              // ~ → raw continuation text (append)
+              // { → complete tool call (replace)
+  
+              if (cleanedContinuation.startsWith('~')) {
+                // It's a continuation - strip ~ and append
+                cleanedContinuation = cleanedContinuation.substring(1);
+                console.log('Continuation type: raw text (starts with ~), will append');
+                console.log('  Continuation length:', cleanedContinuation.length);
+  
+                // Append to accumulated content
+                accumulatedContent += cleanedContinuation;
+  
+              } else if (cleanedContinuation.startsWith('=')) {
+                // It's a complete message response - this shouldn't happen for continuations but handle it
+                console.log('Continuation is a complete message (starts with =), will replace');
+                accumulatedContent = cleanedContinuation;
+  
               } else {
                 // It's a tool call JSON - strip any wrapper text before first "{" and after last "}"
                 const firstBrace = cleanedContinuation.indexOf('{');
@@ -1905,19 +1947,10 @@
                     console.log('  Original length:', originalLength, '-> Cleaned length:', cleanedContinuation.length);
                   }
                 }
-              }
   
-              // Determine how to combine: replace for tool calls, append for messages
-              const isToolCall = partialMessage.startsWith('{');
-  
-              if (isToolCall) {
-                // For tool calls, the continuation should be a COMPLETE replacement
-                console.log('Tool call continuation: replacing partial with complete response');
+                // For tool calls, replace (this is a fallback if AI didn't use ~)
+                console.log('Continuation is complete JSON, will replace');
                 accumulatedContent = cleanedContinuation;
-              } else {
-                // For messages, append the continuation
-                console.log('Message continuation: appending to partial');
-                accumulatedContent += cleanedContinuation;
               }
   
               console.log('Combined content length:', accumulatedContent.length);
@@ -2320,8 +2353,8 @@
         content.textContent = message.content;
   
       } else if (message.type === 'tool_use') {
-        // No circle for tool_use - we'll add it when the result comes in
-        indicator.style.display = 'none';
+        // Show circle for tool use
+        indicator.style.backgroundColor = '#569cd6'; // Blue for tool use
   
         content.style.cssText += 'color: #d4d4d4; padding: 2px 0; cursor: pointer;';
   
