@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-30T19:10:36.177Z
+// AI Agent - Built 2025-11-30T22:10:00.141Z
 (function() {
   window.module = {};
 
@@ -877,8 +877,15 @@
   
   {"tools":[{"name":"list_folder","args":{"path":"src/"}},{"name":"read_file","args":{"path":"src/main.js"}}]}|||||END|||||
   
-  IMPORTANT: Don't send a message first saying you're going to use tools. Just use them.
-  The user sees the tool execution, so announcing it is redundant.
+  CRITICAL RULES FOR TOOL USE:
+  1. When using tools, respond with ONLY the JSON. Nothing else. No explanatory text before or after.
+  2. Start your response with { immediately. Do NOT write "I'll use..." or "Let me..." first.
+  3. ALL JSON must be on a SINGLE line. NO literal line breaks anywhere in the JSON.
+  4. For newlines within JSON string values, use \\n (backslash-n), never press Enter/Return.
+  5. Example CORRECT: {"long_desc":"Line 1\\nLine 2\\nLine 3"}
+  6. Example WRONG: "I'll use exit_planning.\n{"tools":[...  ← Extra text breaks parsing!
+  7. Example WRONG: {"long_desc":"Line 1
+  Line 2"}  ← Literal line break breaks JSON!
   
   ## Available Tools in Planning Mode
   
@@ -887,7 +894,7 @@
   - exit_planning: Exit planning with checklist
   
   Example exit_planning:
-  {"tools":[{"name":"exit_planning","args":{"checklist":[{"short_desc":"Brief description for UI","long_desc":"Detailed description for execution"}]}}]}|||||END|||||
+  {"tools":[{"name":"exit_planning","args":{"checklist":[{"short_desc":"Brief description for UI","long_desc":"Detailed description for execution. Use \\n for line breaks in long_desc."}]}}]}|||||END|||||
   
   ## Rules
   
@@ -938,6 +945,14 @@
   Start with { and provide valid JSON:
   
   {"tools":[{"name":"create_file","args":{"path":"src/new.js","content":"console.log('hello');"}}]}|||||END|||||
+  
+  IMPORTANT JSON FORMATTING:
+  - CRITICAL: ALL JSON must be on a SINGLE line. NO literal line breaks anywhere in the JSON.
+  - For newlines within JSON string values, use \\n (backslash-n), never press Enter/Return.
+  - For file content with multiple lines, use \\n between lines.
+  - Example CORRECT: {"content":"line1\\nline2\\nline3"}
+  - Example WRONG: {"content":"line1
+  line2"}  ← This breaks JSON parsing!
   
   ## Available Tools in Execution Mode
   
