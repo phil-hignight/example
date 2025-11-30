@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-30T17:50:48.118Z
+// AI Agent - Built 2025-11-30T19:10:36.177Z
 (function() {
   window.module = {};
 
@@ -1797,7 +1797,17 @@
           let processed = messageProcessor.processStreamedResponse(accumulatedContent);
   
           if (processed.error) {
-            // Add system error message
+            // Add the AI's failed response to conversation first
+            conversationManager.addMessage({
+              type: 'assistant',
+              id: assistantMessageId,
+              content: accumulatedContent,
+              timestamp: Date.now(),
+              parentId: null,
+              childrenIds: []
+            });
+  
+            // Then add system error message
             conversationManager.addMessage({
               type: 'system_error',
               error: processed.error,
@@ -1889,14 +1899,29 @@
               // Validate that continuation starts with ~ (as requested)
               if (!continuationContent.startsWith('~')) {
                 console.error('Continuation did not start with ~ as requested');
+  
+                // Add the AI's wrong response to conversation first
+                conversationManager.addMessage({
+                  type: 'assistant',
+                  id: assistantMessageId,
+                  content: continuationContent,
+                  timestamp: Date.now(),
+                  parentId: null,
+                  childrenIds: []
+                });
+  
+                // Then add system error message
                 conversationManager.addMessage({
                   type: 'system_error',
                   error: `Continuation validation failed: Expected response to start with ~ but got "${continuationContent.substring(0, 50)}..."`,
                   originalContent: accumulatedContent
                 });
+  
                 this.renderChat();
                 this.updateCharCounter();
-                this.hideLoading();
+  
+                // Call AI again so it can see the error and fix it
+                await this.sendMessage();
                 return;
               }
   
@@ -2365,24 +2390,52 @@
         // Look for corresponding tool_result to determine color
         const result = this.findToolResult(message.id);
   
-        if (result) {
-          // Result exists - show green for success, red for error
-          indicator.style.backgroundColor = result.success ? '#4ec9b0' : '#f48771';
-        } else {
-          // No result yet - show pulsing gray (still executing)
-          indicator.style.backgroundColor = '#858585';
-          indicator.style.animation = 'pulse 1.5s ease-in-out infinite';
-        }
-  
-        content.style.cssText += 'color: #d4d4d4; padding: 2px 0; cursor: pointer;';
-  
-        // Render single tool as clean one-liner
         const tool = message.tool;
-        const toolName = this.formatToolName(tool.name);
-        const params = this.formatToolParams(tool.name, tool.args);
-        content.innerHTML = `<span style="font-weight: bold;">${this.escapeHtml(toolName)}</span><span style="color: #858585;"> ${params}</span>`;
+        const isChecklistTool = tool.name === 'exit_planning' || tool.name === 'item_completed' || tool.name === 'item_failed';
   
-        content.addEventListener('click', () => this.showToolModal('Tool Use', tool));
+        if (isChecklistTool) {
+          // Hide indicator for checklist tools - we'll show the checklist instead
+          indicator.style.display = 'none';
+  
+          // Show checklist with current state
+          if (tool.name === 'exit_planning' && tool.args && tool.args.checklist) {
+            content.style.cssText += 'padding: 2px 0; padding-left: 20px;';
+            // Show all items as unchecked initially
+            content.innerHTML = this.renderChecklist(tool.args.checklist);
+          } else if (tool.name === 'item_completed' || tool.name === 'item_failed') {
+            // For item updates, get current checklist state from result
+            if (result && result.result && result.result.checklist) {
+              content.style.cssText += 'padding: 2px 0; padding-left: 20px;';
+              content.innerHTML = this.renderChecklist(
+                result.result.checklist,
+                result.result.completed_item,
+                result.result.failed_item
+              );
+            } else {
+              content.style.cssText += 'color: #858585; padding: 2px 0; padding-left: 20px;';
+              content.textContent = this.formatToolName(tool.name);
+            }
+          }
+        } else {
+          // Normal tools - show status indicator
+          if (result) {
+            // Result exists - show green for success, red for error
+            indicator.style.backgroundColor = result.success ? '#4ec9b0' : '#f48771';
+          } else {
+            // No result yet - show pulsing gray (still executing)
+            indicator.style.backgroundColor = '#858585';
+            indicator.style.animation = 'pulse 1.5s ease-in-out infinite';
+          }
+  
+          content.style.cssText += 'color: #d4d4d4; padding: 2px 0; cursor: pointer;';
+  
+          // Render single tool as clean one-liner
+          const toolName = this.formatToolName(tool.name);
+          const params = this.formatToolParams(tool.name, tool.args);
+          content.innerHTML = `<span style="font-weight: bold;">${this.escapeHtml(toolName)}</span><span style="color: #858585;"> ${params}</span>`;
+  
+          content.addEventListener('click', () => this.showToolModal('Tool Use', tool));
+        }
   
       } else if (message.type === 'tool_result') {
         // Add circle indicator for the result
