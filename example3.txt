@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-30T17:42:31.912Z
+// AI Agent - Built 2025-11-30T17:50:48.118Z
 (function() {
   window.module = {};
 
@@ -1805,7 +1805,10 @@
             });
             this.renderChat();
             this.updateCharCounter();
-            this.hideLoading();
+  
+            // Call AI again so it can see the error and fix it
+            console.log('Parse error detected, calling AI again with error context');
+            await this.sendMessage();
             return;
           }
   
@@ -2089,6 +2092,10 @@
       chatArea.innerHTML = '';
   
       const messages = conversationManager.getMessages();
+  
+      // Store messages in ui-renderer for tool_use/result lookups
+      uiRenderer.allMessages = messages;
+  
       messages.forEach(msg => {
         const msgElement = uiRenderer.renderMessage(msg);
         chatArea.appendChild(msgElement);
@@ -2326,6 +2333,8 @@
   // UI Renderer v3.0
   // Clean design with status indicators in gutter
   window.module['ui-renderer.js'] = {
+    allMessages: [], // Store reference to all messages for lookups
+  
     renderMessage: function(message) {
       const container = document.createElement('div');
       container.style.cssText = 'display: flex; gap: 12px; margin-bottom: 4px; align-items: flex-start; font-family: monospace; font-size: 13px;';
@@ -2353,8 +2362,17 @@
         content.textContent = message.content;
   
       } else if (message.type === 'tool_use') {
-        // Show circle for tool use
-        indicator.style.backgroundColor = '#569cd6'; // Blue for tool use
+        // Look for corresponding tool_result to determine color
+        const result = this.findToolResult(message.id);
+  
+        if (result) {
+          // Result exists - show green for success, red for error
+          indicator.style.backgroundColor = result.success ? '#4ec9b0' : '#f48771';
+        } else {
+          // No result yet - show pulsing gray (still executing)
+          indicator.style.backgroundColor = '#858585';
+          indicator.style.animation = 'pulse 1.5s ease-in-out infinite';
+        }
   
         content.style.cssText += 'color: #d4d4d4; padding: 2px 0; cursor: pointer;';
   
@@ -2413,6 +2431,16 @@
       container.appendChild(indicator);
       container.appendChild(content);
       return container;
+    },
+  
+    findToolResult: function(toolUseId) {
+      // Look through all messages to find tool_result with matching parentId
+      for (const msg of this.allMessages) {
+        if (msg.type === 'tool_result' && msg.parentId === toolUseId) {
+          return msg;
+        }
+      }
+      return null;
     },
   
     escapeHtml: function(text) {
