@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-12-01T21:08:16.816Z
+// AI Agent - Built 2025-12-01T21:18:25.513Z
 (function() {
   window.module = {};
 
@@ -18,7 +18,8 @@
       console.log('TESTING OUTPUT LIMIT');
       console.log('='.repeat(80));
   
-      const config = window.module['config.js'];
+      const conversationFlow = window.module['conversation-flow.js'];
+      const utils = window.module['utils.js'];
   
       // Test with increasing max_tokens values
       // 1 token ≈ 4 chars, so: 4K, 8K, 16K, 32K, 64K tokens = 16K, 32K, 64K, 128K, 256K chars
@@ -42,15 +43,24 @@
           content: 'Write a very long, detailed technical explanation about computer memory architecture. Include multiple sections with examples. Make it as long as possible.'
         }];
   
-        const payload = {
-          stream: false,
-          model: config.MODEL,
-          messages: messages,
-          max_tokens: test.tokens
-        };
-  
         try {
           const startTime = Date.now();
+          const assistantMessageId = utils.generateUUID();
+  
+          // Use existing getCompletion with max_tokens override
+          const config = window.module['config.js'];
+          const payload = {
+            stream: true,
+            model: config.MODEL,
+            messages: messages,
+            max_tokens: test.tokens,
+            session_id: this.sessionId,
+            id: assistantMessageId,
+            params: {},
+            features: { web_search: false },
+            background_tasks: { title_generation: false, tags_generation: false }
+          };
+  
           const response = await fetch(`${config.API_BASE}/chat/completions`, {
             method: 'POST',
             headers: {
@@ -59,22 +69,39 @@
             body: JSON.stringify(payload)
           });
   
-          const duration = Date.now() - startTime;
-  
           if (!response.ok) {
-            console.log(`  ✗ FAILED: ${response.status} ${response.statusText} (${duration}ms)`);
+            const errorText = await response.text();
+            console.log(`  ✗ FAILED: ${response.status} ${response.statusText}`);
+            console.log(`    Error: ${errorText.substring(0, 200)}`);
             break;
           }
   
-          const data = await response.json();
-          const content = data.choices?.[0]?.message?.content || '';
+          // Use existing conversation flow to handle response
+          let content = '';
+          const result = await conversationFlow.handleAIResponse(
+            response,
+            assistantMessageId,
+            messages,
+            {
+              onProgress: () => {},
+              onChunk: (chunk) => { content += chunk; }
+            }
+          );
+  
+          const totalDuration = Date.now() - startTime;
           const actualChars = content.length;
   
-          console.log(`  ✓ SUCCESS: ${actualChars} chars received (${duration}ms)`);
-          maxSuccessful = test.chars;
+          if (result.success) {
+            console.log(`  ✓ SUCCESS: ${actualChars} chars received (${totalDuration}ms)`);
+            maxSuccessful = test.chars;
+          } else {
+            console.log(`  ✗ FAILED: ${result.error}`);
+            break;
+          }
   
         } catch (error) {
           console.log(`  ✗ ERROR: ${error.message}`);
+          console.log(`    Stack: ${error.stack?.substring(0, 200)}`);
           break;
         }
   
@@ -89,6 +116,7 @@
         console.log(`Recommended safe limit: ${Math.floor(maxSuccessful * 0.8)} chars (80% of max)`);
       } else {
         console.log('RESULT: Unable to determine output limit (all tests failed)');
+        console.log('HINT: Check the error messages above for details');
       }
       console.log('='.repeat(80));
       console.log('');
