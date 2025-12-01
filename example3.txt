@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-12-01T19:49:00.899Z
+// AI Agent - Built 2025-12-01T20:15:54.177Z
 (function() {
   window.module = {};
 
@@ -1426,7 +1426,62 @@
         // Continue to next repair
       }
   
-      // Repair 5: Fix unescaped quotes (basic attempt)
+      // Repair 5: Fix double-escaped backslashes (\\\\n -> \\n)
+      try {
+        const withFixedDoubleEscapes = normalizedJson.replace(/\\\\\\\\/g, '\\\\');
+        const data = JSON.parse(withFixedDoubleEscapes);
+        console.log('[JSON Repair] Fixed double-escaped backslashes');
+        return { data, error: null };
+      } catch (e) {
+        lastError = e;
+      }
+  
+      // Repair 6: Fix literal backslash-n that should be escaped (when \n appears as two chars)
+      try {
+        // Replace sequences like \n that aren't properly escaped JSON
+        const withFixedLiteralBackslashN = normalizedJson.replace(/\\n/g, '\\\\n');
+        const data = JSON.parse(withFixedLiteralBackslashN);
+        console.log('[JSON Repair] Fixed literal backslash-n sequences');
+        return { data, error: null };
+      } catch (e) {
+        lastError = e;
+      }
+  
+      // Repair 7: Fix bad escape sequences near quotes
+      try {
+        // Sometimes continuation creates sequences like \"Line instead of \\"Line
+        const withFixedEscapeQuotes = normalizedJson.replace(/\\"/g, '\\\\"');
+        const data = JSON.parse(withFixedEscapeQuotes);
+        console.log('[JSON Repair] Fixed escape sequences near quotes');
+        return { data, error: null };
+      } catch (e) {
+        lastError = e;
+      }
+  
+      // Repair 8: Try truncating at the error position and adding proper terminators
+      try {
+        // Extract position from error message like "at position 84175"
+        const posMatch = lastError.message.match(/position (\d+)/);
+        if (posMatch) {
+          const errorPos = parseInt(posMatch[1]);
+          // Truncate a bit before the error and try to close the JSON properly
+          const truncated = normalizedJson.substring(0, Math.max(0, errorPos - 10));
+  
+          // Find the last complete line entry and close from there
+          const lastCompleteEntry = truncated.lastIndexOf('\\n');
+          if (lastCompleteEntry > 0) {
+            const cleaned = truncated.substring(0, lastCompleteEntry + 2); // Include the \n
+            const withProperEnd = cleaned + '"}]}';
+            const data = JSON.parse(withProperEnd);
+            console.log('[JSON Repair] Truncated at error position and closed JSON');
+            return { data, error: null };
+          }
+        }
+      } catch (e) {
+        lastError = e;
+      }
+  
+      // Repair 9: Fix unescaped quotes (basic attempt)
       try {
         // This is a simple heuristic - replace \" inside string values with '
         // More sophisticated repair would require proper parsing
@@ -2308,27 +2363,6 @@
       `;
       chatPanel.appendChild(chatArea);
   
-      // Test button for continuation debugging
-      const testButton = document.createElement('button');
-      testButton.id = 'testContinuationBtn';
-      testButton.textContent = 'Test Continuation';
-      testButton.style.cssText = `
-        position: absolute;
-        top: 10px;
-        right: 10px;
-        padding: 8px 12px;
-        background: #3c3c3c;
-        color: white;
-        border: 1px solid #3e3e42;
-        border-radius: 4px;
-        cursor: pointer;
-        font-family: monospace;
-        font-size: 11px;
-        z-index: 100;
-      `;
-      testButton.addEventListener('click', () => this.testContinuation());
-      chatPanel.appendChild(testButton);
-  
       // Gradient overlay - fades chat history behind input
       const gradientOverlay = document.createElement('div');
       gradientOverlay.style.cssText = `
@@ -2356,7 +2390,7 @@
         <div style="border: 1px solid #3e3e42; border-radius: 4px; overflow: hidden;">
           <textarea id="userInput" style="
             width: 100%;
-            min-height: 20px;
+            height: 38px;
             max-height: calc(33vh);
             background: #3c3c3c;
             color: white;
@@ -2388,7 +2422,7 @@
   
       // Auto-resize textarea as content changes
       const autoResize = () => {
-        userInput.style.height = '20px'; // Reset to min height
+        userInput.style.height = '38px'; // Reset to initial height (1 line)
         userInput.style.height = Math.min(userInput.scrollHeight, window.innerHeight / 3) + 'px';
       };
   
@@ -2928,29 +2962,9 @@
           (tools[0].name === 'exit_planning' || tools[0].name === 'item_completed' || tools[0].name === 'item_failed');
   
         if (isChecklistTool) {
-          // Hide indicator for checklist tools - we'll show the checklist instead
-          indicator.style.display = 'none';
-          const tool = tools[0];
-          const result = this.findToolResult(message.id);
-  
-          // Show checklist with current state
-          if (tool.name === 'exit_planning' && tool.args && tool.args.checklist) {
-            content.style.cssText += 'padding: 2px 0; padding-left: 20px;';
-            content.innerHTML = this.renderChecklist(tool.args.checklist);
-          } else if (tool.name === 'item_completed' || tool.name === 'item_failed') {
-            // For item updates, get current checklist state from result
-            if (result && result.result && result.result.checklist) {
-              content.style.cssText += 'padding: 2px 0; padding-left: 20px;';
-              content.innerHTML = this.renderChecklist(
-                result.result.checklist,
-                result.result.completed_item,
-                result.result.failed_item
-              );
-            } else {
-              content.style.cssText += 'color: #858585; padding: 2px 0; padding-left: 20px;';
-              content.textContent = this.formatToolName(tool.name);
-            }
-          }
+          // For checklist tools, don't show anything for tool_use - we'll show the checklist in tool_result
+          // Just hide this message completely
+          container.style.display = 'none';
         } else {
           // Normal tools - check if ALL tools have results
           const allToolsComplete = tools.every(tool => {
@@ -2998,12 +3012,18 @@
   
         // Special rendering for checklist tools
         if (message.tool === 'exit_planning' || message.tool === 'item_completed' || message.tool === 'item_failed') {
-          // Hide indicator for these special tools - we'll show checklist instead
+          // Hide indicator for these special tools - we'll show checklist card instead
           indicator.style.display = 'none';
   
           if (message.result && message.result.checklist) {
-            content.style.cssText += 'padding: 2px 0; padding-left: 20px;';
-            content.innerHTML = this.renderChecklist(message.result.checklist, message.result.completed_item, message.result.failed_item);
+            // Create a checklist card with min-width to fit content
+            content.style.cssText += 'padding: 0; margin-left: -20px;';
+            content.innerHTML = this.renderChecklistCard(
+              message.result.checklist,
+              message.result.completed_item,
+              message.result.failed_item,
+              message.tool
+            );
           } else {
             content.style.cssText += 'color: #858585; padding: 2px 0; padding-left: 20px;';
             content.textContent = this.formatToolResult(message);
@@ -3170,6 +3190,60 @@
       }).join('');
   
       return items;
+    },
+  
+    renderChecklistCard: function(checklist, completedIndex, failedIndex, toolName) {
+      if (!checklist || !Array.isArray(checklist)) {
+        return '<div style="color: #f48771;">Invalid checklist</div>';
+      }
+  
+      // Determine header text based on tool
+      let headerText = '📋 Task Checklist';
+      if (toolName === 'exit_planning') {
+        headerText = '📋 Task Checklist';
+      } else if (toolName === 'item_completed') {
+        headerText = '✓ Task Completed';
+      } else if (toolName === 'item_failed') {
+        headerText = '✗ Task Failed';
+      }
+  
+      const items = checklist.map((item, index) => {
+        let statusIcon = '○'; // Pending
+        let color = '#858585'; // Gray
+        let fontWeight = 'normal';
+  
+        if (completedIndex !== undefined && index <= completedIndex) {
+          statusIcon = '✓'; // Completed
+          color = '#4ec9b0'; // Green
+        } else if (failedIndex !== undefined && index === failedIndex) {
+          statusIcon = '✗'; // Failed
+          color = '#f48771'; // Red
+          fontWeight = 'bold';
+        } else if ((completedIndex !== undefined && index === completedIndex + 1) ||
+                   (failedIndex !== undefined && index === failedIndex + 1)) {
+          // Current task (next after completed/failed)
+          fontWeight = 'bold';
+        }
+  
+        return `<div style="color: ${color}; margin-bottom: 4px; font-weight: ${fontWeight}; padding-left: 8px;">${statusIcon} ${this.escapeHtml(item.short_desc)}</div>`;
+      }).join('');
+  
+      return `
+        <div style="
+          display: inline-block;
+          background: #2d2d30;
+          border: 1px solid #3e3e42;
+          border-radius: 4px;
+          padding: 12px;
+          margin: 4px 0;
+          min-width: 300px;
+        ">
+          <div style="color: #d4d4d4; font-weight: bold; margin-bottom: 8px; font-size: 13px;">
+            ${headerText}
+          </div>
+          ${items}
+        </div>
+      `;
     },
   
     showToolModal: function(title, content) {
