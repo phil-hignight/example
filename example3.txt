@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-12-01T19:21:10.186Z
+// AI Agent - Built 2025-12-01T19:49:00.899Z
 (function() {
   window.module = {};
 
@@ -326,6 +326,7 @@
       let pendingWarnings = []; // Can accumulate multiple warnings
       let pendingToolUses = []; // Can accumulate multiple tool uses to combine into one assistant message
       let pendingToolResults = []; // Can accumulate multiple tool results
+      let pendingPartials = []; // Can accumulate consecutive partial messages
   
       for (let i = startIndex; i < messages.length; i++) {
         const msg = messages[i];
@@ -334,6 +335,48 @@
         if (msg.type === 'system_warning') {
           pendingWarnings.push(msg.warning);
           continue;
+        }
+  
+        // Collect consecutive partial messages to combine
+        if (msg.type === 'partial') {
+          // But first, flush any pending tools (they come before this partial in message order)
+          if (pendingToolUses.length > 0) {
+            apiMessages.push({
+              role: 'assistant',
+              content: JSON.stringify({ tools: pendingToolUses }) + '|||||END|||||'
+            });
+            pendingToolUses = [];
+          }
+          if (pendingToolResults.length > 0) {
+            const combinedResults = pendingToolResults.map(result => {
+              if (result.success) {
+                const path = result.args?.path || '';
+                const prefix = path ? `Tool: ${result.tool} (${path})` : `Tool: ${result.tool}`;
+                return `${prefix}\nResult: ${JSON.stringify(result.result)}`;
+              } else {
+                return `Tool: ${result.tool}\nError: ${result.error}`;
+              }
+            }).join('\n\n');
+            apiMessages.push({
+              role: 'user',
+              content: combinedResults
+            });
+            pendingToolResults = [];
+          }
+  
+          pendingPartials.push(msg);
+          continue;
+        }
+  
+        // Flush pending partials before processing other message types (tool_use, tool_result, user, assistant)
+        if (pendingPartials.length > 0) {
+          // Combine all partial content into single assistant message
+          const combinedContent = pendingPartials.map(p => p.content).join('');
+          apiMessages.push({
+            role: 'assistant',
+            content: '=' + combinedContent + '|||||END|||||'
+          });
+          pendingPartials = [];
         }
   
         // Collect tool uses to combine into single assistant message
@@ -421,16 +464,18 @@
             role: 'user',
             content: `Error: ${msg.error}`
           });
-  
-        } else if (msg.type === 'partial') {
-          // TODO: Combine consecutive partials into single assistant message
-          // Partials should be combined before being sent to API
-          // For now, skip partials (combination not yet implemented)
-          continue;
         }
       }
   
-      // Flush any remaining tool uses at the end
+      // Flush any remaining tool uses at the end (in order of appearance)
+      if (pendingPartials.length > 0) {
+        const combinedContent = pendingPartials.map(p => p.content).join('');
+        apiMessages.push({
+          role: 'assistant',
+          content: '=' + combinedContent + '|||||END|||||'
+        });
+      }
+  
       if (pendingToolUses.length > 0) {
         apiMessages.push({
           role: 'assistant',
@@ -438,7 +483,6 @@
         });
       }
   
-      // Flush any remaining tool results at the end
       if (pendingToolResults.length > 0) {
         const combinedResults = pendingToolResults.map(result => {
           if (result.success) {
@@ -1587,22 +1631,31 @@
   
   ## Available Tools in Planning Mode
   
+  ⚠️ ONLY THESE 3 TOOLS ARE AVAILABLE IN PLANNING MODE:
   - list_folder: Explore directories (non-recursive)
   - read_file: Read file contents
   - exit_planning: Exit planning with checklist
+  
+  ❌ File creation and modification tools are NOT available in planning mode!
+  
+  If the user asks you to create or modify files, you MUST:
+  1. Call exit_planning with a checklist
+  2. The system will switch you to execution mode
+  3. Then you can use file operation tools
   
   Example exit_planning:
   {"tools":[{"name":"exit_planning","args":{"checklist":[{"short_desc":"Brief description for UI","long_desc":"Detailed description for execution. Use \\n for line breaks in long_desc."}]}}]}|||||END|||||
   
   ## Rules
   
-  1. Be conversational and ask questions
+  1. Be conversational and ask questions when requirements are unclear
   2. Don't start implementing until you call exit_planning
-  3. Break down complex tasks into discrete checklist items
-  4. Each checklist item should be independently verifiable
-  5. Keep short_desc concise (for UI display)
-  6. Make long_desc detailed (for execution context)
-  7. **ACTION OVER ANNOUNCEMENT**: When you need to use tools, just use them immediately. Don't send a message saying "Let me check..." or "I'll read..." - just execute the tools. The user will see the tool results.
+  3. If user asks to create/modify files, immediately call exit_planning - do NOT try to use file operation tools in planning mode
+  4. Break down complex tasks into discrete checklist items
+  5. Each checklist item should be independently verifiable
+  6. Keep short_desc concise (for UI display)
+  7. Make long_desc detailed (for execution context)
+  8. **ACTION OVER ANNOUNCEMENT**: When you need to use tools, just use them immediately. Don't send a message saying "Let me check..." or "I'll read..." - just execute the tools. The user will see the tool results.
   
   </system-reminder>`;
     },
@@ -2838,6 +2891,7 @@
   // Clean design with status indicators in gutter
   window.module['ui-renderer.js'] = {
     allMessages: [], // Store reference to all messages for lookups
+    expandedSummaries: new Set(), // Track which summaries are expanded
   
     renderMessage: function(message) {
       const container = document.createElement('div');
@@ -2973,6 +3027,36 @@
         content.style.cssText += 'color: #dcdcaa; padding: 2px 0;';
         content.style.whiteSpace = 'pre-wrap';
         content.textContent = message.warning;
+  
+      } else if (message.type === 'summary') {
+        // Yellow indicator for summary
+        indicator.style.backgroundColor = '#dcdcaa'; // Yellow
+        content.style.cssText += 'color: #858585; padding: 2px 0; cursor: pointer;';
+  
+        // Create collapsed summary view
+        const summaryId = 'summary-' + message.id;
+        const isExpanded = this.expandedSummaries && this.expandedSummaries.has(message.id);
+  
+        if (isExpanded) {
+          content.innerHTML = `<div style="font-weight: bold; margin-bottom: 4px;">📋 Summary (summarizes ${message.summarizes_to - message.summarizes_from + 1} messages) [Click to collapse]</div><div style="white-space: pre-wrap;">${this.escapeHtml(message.content)}</div>`;
+        } else {
+          content.innerHTML = `<div style="font-weight: bold;">📋 Summary (summarizes ${message.summarizes_to - message.summarizes_from + 1} messages) [Click to expand]</div>`;
+        }
+  
+        content.addEventListener('click', () => this.toggleSummary(message.id));
+  
+      } else if (message.type === 'partial') {
+        // White circle indicator for partial (like assistant)
+        indicator.style.backgroundColor = 'white';
+        content.style.cssText += 'color: #d4d4d4; padding: 2px 0;';
+        content.style.whiteSpace = 'pre-wrap';
+  
+        // Show streaming indicator if incomplete
+        if (message.completion === false) {
+          content.innerHTML = `${this.escapeHtml(message.content)}<span style="color: #858585; font-style: italic;"> (streaming...)</span>`;
+        } else {
+          content.textContent = message.content;
+        }
   
       } else {
         // Unknown type
@@ -3178,6 +3262,21 @@
         }
       };
       document.addEventListener('keydown', escapeHandler);
+    },
+  
+    toggleSummary: function(messageId) {
+      // Toggle expanded state
+      if (this.expandedSummaries.has(messageId)) {
+        this.expandedSummaries.delete(messageId);
+      } else {
+        this.expandedSummaries.add(messageId);
+      }
+  
+      // Trigger re-render (the ui-manager should call this)
+      const uiManager = window.module['ui-manager.js'];
+      if (uiManager && uiManager.renderChat) {
+        uiManager.renderChat();
+      }
     }
   };
   
