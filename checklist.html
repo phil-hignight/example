@@ -161,6 +161,64 @@
             text-decoration: line-through;
             opacity: 0.5;
         }
+
+        .timer-controls {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-left: auto;
+            padding-left: 12px;
+        }
+
+        .timer-display {
+            font-family: 'Courier New', monospace;
+            font-size: 1.1rem;
+            color: #4a9eff;
+            font-weight: 600;
+            min-width: 80px;
+        }
+
+        .timer-display.running {
+            color: #66bb6a;
+        }
+
+        .timer-display.finished {
+            color: #ffa726;
+        }
+
+        .timer-btn {
+            background: #2a2a2a;
+            border: 1px solid #444;
+            color: #e0e0e0;
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s;
+            font-size: 14px;
+        }
+
+        .timer-btn:hover {
+            background: #3a3a3a;
+            border-color: #4a9eff;
+        }
+
+        .timer-btn.playing {
+            background: #66bb6a;
+            border-color: #66bb6a;
+        }
+
+        .timer-btn.playing:hover {
+            background: #57a85a;
+        }
+
+        .checklist-item.has-timer {
+            display: flex;
+            align-items: center;
+        }
     </style>
 </head>
 <body>
@@ -224,15 +282,15 @@
             { time: "8:00-8:30", activity: "Kids out the door" },
             { time: "8:30-8:45", activity: "Meditation" },
             { time: "8:45-9:00", activity: "Make coffee + L-theanine (100-200mg)" },
-            { time: "9:00-11:00", activity: "Deep Work Block #1" },
+            { time: "9:00-11:00", activity: "Deep Work Block #1", hasTimer: true, duration: 120 },
             { time: "11:00-11:30", activity: "Oatmeal + second coffee (last of day)" },
             { time: "11:30-12:00", activity: "Slot 2: Cardio / Nap" },
             { time: "12:00-12:15", activity: "Meditation (skip if napped)" },
-            { time: "12:15-2:30", activity: "Deep Work Block #2" },
+            { time: "12:15-2:30", activity: "Deep Work Block #2", hasTimer: true, duration: 135 },
             { time: "2:30-3:00", activity: "Slot 3: Nap / Cardio (15 min) + NSDR (15 min)" },
             { time: "3:00-3:30", activity: "Pizza" },
             { time: "3:30-3:40", activity: "Meditation" },
-            { time: "3:40-5:00", activity: "Work Block #3" },
+            { time: "3:40-5:00", activity: "Work Block #3", hasTimer: true, duration: 80 },
             { time: "Evening", activity: "Full shower" },
             { time: "~10:00", activity: "Magnesium glycinate (200-400mg) + L-theanine (400mg)" },
             { time: "When sleepy", activity: "Bed (wake time fixed at 6:30)" }
@@ -240,6 +298,155 @@
 
         const slotPattern = ["Resistance", "Cardio", "Resistance", "Cardio", "Resistance", "Cardio", "Cardio"];
         const dayNames = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+
+        // Timer management
+        const timers = {};
+        let timerInterval = null;
+
+        function formatTime(minutes) {
+            const hrs = Math.floor(minutes / 60);
+            const mins = minutes % 60;
+            if (hrs > 0) {
+                return `${hrs}:${mins.toString().padStart(2, '0')}:00`;
+            }
+            return `${mins}:00`;
+        }
+
+        function formatTimeRemaining(seconds) {
+            const hrs = Math.floor(seconds / 3600);
+            const mins = Math.floor((seconds % 3600) / 60);
+            const secs = seconds % 60;
+            
+            if (hrs > 0) {
+                return `${hrs}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+            }
+            return `${mins}:${secs.toString().padStart(2, '0')}`;
+        }
+
+        function saveTimerState(index) {
+            const timer = timers[index];
+            localStorage.setItem(`timer-${index}`, JSON.stringify({
+                remaining: timer.remaining,
+                isRunning: timer.isRunning
+            }));
+        }
+
+        function loadTimerState(index, duration) {
+            const saved = localStorage.getItem(`timer-${index}`);
+            if (saved) {
+                const state = JSON.parse(saved);
+                return {
+                    remaining: state.remaining,
+                    isRunning: false, // Never auto-start on load
+                    total: duration * 60
+                };
+            }
+            return {
+                remaining: duration * 60,
+                isRunning: false,
+                total: duration * 60
+            };
+        }
+
+        function toggleTimer(index) {
+            const timer = timers[index];
+            timer.isRunning = !timer.isRunning;
+            saveTimerState(index);
+            updateTimerDisplay(index);
+            
+            if (!timerInterval) {
+                timerInterval = setInterval(updateTimers, 1000);
+            }
+        }
+
+        function resetTimer(index, duration) {
+            timers[index] = {
+                remaining: duration * 60,
+                isRunning: false,
+                total: duration * 60
+            };
+            saveTimerState(index);
+            updateTimerDisplay(index);
+        }
+
+        function updateTimers() {
+            let anyRunning = false;
+            
+            for (const index in timers) {
+                const timer = timers[index];
+                if (timer.isRunning && timer.remaining > 0) {
+                    timer.remaining--;
+                    saveTimerState(index);
+                    updateTimerDisplay(index);
+                    anyRunning = true;
+                    
+                    if (timer.remaining === 0) {
+                        timer.isRunning = false;
+                        const checkbox = document.getElementById(`item-${index}`);
+                        if (checkbox && !checkbox.checked) {
+                            checkbox.checked = true;
+                            localStorage.setItem(`routine-${index}`, 'true');
+                            updateLabelStyle(checkbox);
+                        }
+                        // Play a simple beep or notification
+                        playNotification();
+                    }
+                }
+            }
+            
+            if (!anyRunning && timerInterval) {
+                clearInterval(timerInterval);
+                timerInterval = null;
+            }
+        }
+
+        function playNotification() {
+            // Simple audio notification using AudioContext
+            try {
+                const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                const oscillator = audioContext.createOscillator();
+                const gainNode = audioContext.createGain();
+                
+                oscillator.connect(gainNode);
+                gainNode.connect(audioContext.destination);
+                
+                oscillator.frequency.value = 800;
+                oscillator.type = 'sine';
+                
+                gainNode.gain.setValueAtTime(0.3, audioContext.currentTime);
+                gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.5);
+                
+                oscillator.start(audioContext.currentTime);
+                oscillator.stop(audioContext.currentTime + 0.5);
+            } catch (e) {
+                console.log('Audio notification not supported');
+            }
+        }
+
+        function updateTimerDisplay(index) {
+            const timer = timers[index];
+            const display = document.getElementById(`timer-display-${index}`);
+            const button = document.getElementById(`timer-btn-${index}`);
+            
+            if (display) {
+                display.textContent = formatTimeRemaining(timer.remaining);
+                display.className = 'timer-display';
+                
+                if (timer.isRunning) {
+                    display.classList.add('running');
+                } else if (timer.remaining === 0) {
+                    display.classList.add('finished');
+                }
+            }
+            
+            if (button) {
+                button.textContent = timer.isRunning ? '⏸' : '▶';
+                button.className = 'timer-btn';
+                if (timer.isRunning) {
+                    button.classList.add('playing');
+                }
+            }
+        }
 
         function getTodaySlot() {
             const today = new Date();
@@ -272,6 +479,9 @@
             routineItems.forEach((item, index) => {
                 const div = document.createElement('div');
                 div.className = 'checklist-item';
+                if (item.hasTimer) {
+                    div.classList.add('has-timer');
+                }
                 
                 const checkbox = document.createElement('input');
                 checkbox.type = 'checkbox';
@@ -301,6 +511,31 @@
                 
                 div.appendChild(checkbox);
                 div.appendChild(label);
+                
+                // Add timer controls if this item has a timer
+                if (item.hasTimer) {
+                    const timerControls = document.createElement('div');
+                    timerControls.className = 'timer-controls';
+                    
+                    const timerDisplay = document.createElement('div');
+                    timerDisplay.className = 'timer-display';
+                    timerDisplay.id = `timer-display-${index}`;
+                    
+                    const playButton = document.createElement('button');
+                    playButton.className = 'timer-btn';
+                    playButton.id = `timer-btn-${index}`;
+                    playButton.textContent = '▶';
+                    playButton.onclick = () => toggleTimer(index);
+                    
+                    timerControls.appendChild(timerDisplay);
+                    timerControls.appendChild(playButton);
+                    div.appendChild(timerControls);
+                    
+                    // Initialize timer
+                    timers[index] = loadTimerState(index, item.duration);
+                    updateTimerDisplay(index);
+                }
+                
                 container.appendChild(div);
                 
                 updateLabelStyle(checkbox);
@@ -317,13 +552,20 @@
         }
 
         function resetChecklist() {
-            if (confirm('Are you sure you want to reset all checkboxes?')) {
+            if (confirm('Are you sure you want to reset all checkboxes and timers?')) {
                 routineItems.forEach((item, index) => {
+                    // Reset checkbox
                     localStorage.removeItem(`routine-${index}`);
                     const checkbox = document.getElementById(`item-${index}`);
                     if (checkbox) {
                         checkbox.checked = false;
                         updateLabelStyle(checkbox);
+                    }
+                    
+                    // Reset timer if item has one
+                    if (item.hasTimer) {
+                        localStorage.removeItem(`timer-${index}`);
+                        resetTimer(index, item.duration);
                     }
                 });
             }
@@ -332,6 +574,16 @@
         // Initialize on load
         displayDate();
         renderChecklist();
+        
+        // Check if any timers need to be running
+        for (const index in timers) {
+            if (timers[index].isRunning) {
+                if (!timerInterval) {
+                    timerInterval = setInterval(updateTimers, 1000);
+                }
+                break;
+            }
+        }
     </script>
 </body>
 </html>
