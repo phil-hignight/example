@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-12-01T21:27:17.409Z
+// AI Agent - Built 2025-12-01T23:45:42.213Z
 (function() {
   window.module = {};
 
@@ -967,8 +967,20 @@
   window.module['conversation-manager.js'] = {
     messages: [],
   
-    init: function() {
+    init: async function(folderPath) {
       this.messages = [];
+  
+      // Initialize persistence if folder path provided
+      if (folderPath) {
+        const persistence = window.module['conversation-persistence.js'];
+        await persistence.init(folderPath);
+  
+        // Load existing conversation
+        const loadedMessages = await persistence.loadConversation();
+        this.messages = loadedMessages;
+  
+        console.log(`[ConversationManager] Loaded ${this.messages.length} messages from disk`);
+      }
     },
   
     addMessage: async function(message) {
@@ -1009,6 +1021,12 @@
   
       // Add the message
       this.messages.push(message);
+  
+      // Save to disk
+      const persistence = window.module['conversation-persistence.js'];
+      if (persistence.isInitialized) {
+        await persistence.saveMessage(message);
+      }
   
       return message;
     },
@@ -1173,6 +1191,212 @@
   };
   
 
+  // Module: conversation-persistence.js
+  // Conversation Persistence
+  // Manages saving/loading conversations to .agent/internal/conversation.jsonl
+  window.module['conversation-persistence.js'] = {
+    conversationFilePath: null,
+    archiveFolderPath: null,
+    isInitialized: false,
+  
+    /**
+     * Initialize persistence for a given folder
+     * @param {string} folderPath - The folder where user opened the app
+     */
+    init: async function(folderPath) {
+      const fileSystem = window.module['file-system.js'];
+  
+      // Create .agent folder if needed
+      const agentFolder = folderPath + '/.agent';
+      try {
+        await fileSystem.listFolder({ path: agentFolder });
+      } catch (e) {
+        // Folder doesn't exist, create it
+        console.log('[Persistence] Creating .agent folder...');
+        // Note: We'll need to add a createFolder tool
+        await fileSystem.createFolder({ path: agentFolder });
+      }
+  
+      // Create .agent/internal folder if needed
+      const internalFolder = agentFolder + '/internal';
+      try {
+        await fileSystem.listFolder({ path: internalFolder });
+      } catch (e) {
+        console.log('[Persistence] Creating .agent/internal folder...');
+        await fileSystem.createFolder({ path: internalFolder });
+      }
+  
+      // Set file paths
+      this.conversationFilePath = internalFolder + '/conversation.jsonl';
+      this.archiveFolderPath = internalFolder + '/conversation_archive';
+  
+      this.isInitialized = true;
+      console.log('[Persistence] Initialized at:', this.conversationFilePath);
+    },
+  
+    /**
+     * Load existing conversation from disk
+     * @returns {Array} Array of message objects
+     */
+    loadConversation: async function() {
+      if (!this.isInitialized) {
+        console.error('[Persistence] Not initialized');
+        return [];
+      }
+  
+      const fileSystem = window.module['file-system.js'];
+  
+      try {
+        // Read the file
+        const result = await fileSystem.readFile({ path: this.conversationFilePath });
+        const content = result.content;
+  
+        if (!content || content.trim() === '') {
+          console.log('[Persistence] No existing conversation found');
+          return [];
+        }
+  
+        // Parse JSONL (one JSON object per line)
+        const lines = content.split('\n').filter(line => line.trim() !== '');
+        const messages = [];
+  
+        for (const line of lines) {
+          try {
+            const msg = JSON.parse(line);
+            messages.push(msg);
+          } catch (e) {
+            console.error('[Persistence] Failed to parse line:', e.message);
+          }
+        }
+  
+        console.log(`[Persistence] Loaded ${messages.length} messages from disk`);
+  
+        // Check if we need to archive old messages
+        if (lines.length > 10000) {
+          console.log('[Persistence] Conversation file has more than 10000 lines, archiving...');
+          await this.archiveOldMessages(lines);
+        }
+  
+        return messages;
+  
+      } catch (error) {
+        if (error.message && error.message.includes('not found')) {
+          console.log('[Persistence] No existing conversation file');
+          return [];
+        }
+        console.error('[Persistence] Error loading conversation:', error);
+        return [];
+      }
+    },
+  
+    /**
+     * Archive the first 1000 lines of conversation
+     * @param {Array} lines - All lines from the conversation file
+     */
+    archiveOldMessages: async function(lines) {
+      const fileSystem = window.module['file-system.js'];
+  
+      // Create archive folder if needed
+      try {
+        await fileSystem.listFolder({ path: this.archiveFolderPath });
+      } catch (e) {
+        console.log('[Persistence] Creating archive folder...');
+        await fileSystem.createFolder({ path: this.archiveFolderPath });
+      }
+  
+      // Create archive file with timestamp
+      const now = new Date();
+      const timestamp = now.toISOString().replace(/:/g, '-').replace(/\..+/, '').replace('T', '_');
+      const archiveFile = `${this.archiveFolderPath}/conversation_${timestamp}.jsonl`;
+  
+      // Take first 1000 lines for archive
+      const toArchive = lines.slice(0, 1000);
+      const remaining = lines.slice(1000);
+  
+      // Write archive file
+      console.log(`[Persistence] Archiving ${toArchive.length} lines to ${archiveFile}`);
+      await fileSystem.createFile({
+        path: archiveFile,
+        content: toArchive.join('\n')
+      });
+  
+      // Rewrite main file with remaining lines
+      console.log(`[Persistence] Rewriting conversation file with ${remaining.length} lines`);
+      await fileSystem.createFile({
+        path: this.conversationFilePath,
+        content: remaining.join('\n')
+      });
+    },
+  
+    /**
+     * Save a single message to disk (append to JSONL)
+     * @param {Object} message - The message to save
+     */
+    saveMessage: async function(message) {
+      if (!this.isInitialized) {
+        console.error('[Persistence] Not initialized');
+        return;
+      }
+  
+      const fileSystem = window.module['file-system.js'];
+  
+      // Convert message to JSON line
+      const line = JSON.stringify(message) + '\n';
+  
+      try {
+        // Check if file exists
+        let fileExists = false;
+        try {
+          await fileSystem.readFile({ path: this.conversationFilePath });
+          fileExists = true;
+        } catch (e) {
+          // File doesn't exist yet
+        }
+  
+        if (fileExists) {
+          // Append to existing file
+          await fileSystem.appendFile({
+            path: this.conversationFilePath,
+            content: line
+          });
+        } else {
+          // Create new file
+          await fileSystem.createFile({
+            path: this.conversationFilePath,
+            content: line
+          });
+        }
+  
+      } catch (error) {
+        console.error('[Persistence] Error saving message:', error);
+      }
+    },
+  
+    /**
+     * Clear all conversation data (useful for reset)
+     */
+    clearConversation: async function() {
+      if (!this.isInitialized) {
+        console.error('[Persistence] Not initialized');
+        return;
+      }
+  
+      const fileSystem = window.module['file-system.js'];
+  
+      try {
+        // Overwrite with empty file
+        await fileSystem.createFile({
+          path: this.conversationFilePath,
+          content: ''
+        });
+        console.log('[Persistence] Conversation cleared');
+      } catch (error) {
+        console.error('[Persistence] Error clearing conversation:', error);
+      }
+    }
+  };
+  
+
   // Module: file-system.js
   // File System Handler
   window.module['file-system.js'] = {
@@ -1232,25 +1456,71 @@
       });
     },
   
-    readFile: async function(fileEntry) {
-      try {
+    readFile: async function(args) {
+      // Support both old API (fileEntry object) and new API ({ path: string })
+      if (args.path) {
+        // New API: find file by path
+        const fileEntry = this.findFileInTree(this.fileTree, args.path);
+        if (!fileEntry) {
+          throw new Error(`File not found: ${args.path}`);
+        }
         const file = await fileEntry.handle.getFile();
-        const text = await file.text();
-        return text;
-      } catch (err) {
-        console.error('File read error:', err);
-        return null;
+        const content = await file.text();
+        return { content };
+      } else {
+        // Old API: fileEntry object
+        try {
+          const file = await args.handle.getFile();
+          const text = await file.text();
+          return text;
+        } catch (err) {
+          console.error('File read error:', err);
+          return null;
+        }
       }
     },
   
-    createFile: async function(path, content) {
+    listFolder: async function(args) {
+      if (!this.directoryHandle) {
+        throw new Error('No directory selected');
+      }
+  
+      // Navigate to the target folder
+      const parts = args.path.split('/').filter(p => p);
+      let currentHandle = this.directoryHandle;
+  
+      for (const part of parts) {
+        try {
+          currentHandle = await currentHandle.getDirectoryHandle(part);
+        } catch (err) {
+          throw new Error(`Folder not found: ${args.path}`);
+        }
+      }
+  
+      // List contents
+      const entries = [];
+      for await (const entry of currentHandle.values()) {
+        entries.push({
+          name: entry.name,
+          type: entry.kind
+        });
+      }
+  
+      return { entries };
+    },
+  
+    createFile: async function(args) {
+      // Support both old API (path, content) and new API ({ path, content })
+      const path = args.path || args;
+      const content = args.content || arguments[1] || '';
+  
       if (!this.directoryHandle) {
         throw new Error('No directory selected');
       }
   
       try {
         // Split path into parts
-        const parts = path.split('/');
+        const parts = path.split('/').filter(p => p);
         const fileName = parts.pop();
   
         // Navigate to the target directory, creating folders as needed
@@ -1273,6 +1543,71 @@
         return true;
       } catch (err) {
         console.error('File create error:', err);
+        throw err;
+      }
+    },
+  
+    createFolder: async function(args) {
+      const path = args.path || args;
+  
+      if (!this.directoryHandle) {
+        throw new Error('No directory selected');
+      }
+  
+      try {
+        // Split path into parts
+        const parts = path.split('/').filter(p => p);
+  
+        // Navigate/create all folders in the path
+        let currentHandle = this.directoryHandle;
+        for (const part of parts) {
+          currentHandle = await currentHandle.getDirectoryHandle(part, { create: true });
+        }
+  
+        // Rebuild file tree
+        this.fileTree = await this.buildFileTree(this.directoryHandle);
+  
+        return true;
+      } catch (err) {
+        console.error('Folder create error:', err);
+        throw err;
+      }
+    },
+  
+    appendFile: async function(args) {
+      const path = args.path;
+      const content = args.content;
+  
+      if (!this.directoryHandle) {
+        throw new Error('No directory selected');
+      }
+  
+      try {
+        // Split path into parts
+        const parts = path.split('/').filter(p => p);
+        const fileName = parts.pop();
+  
+        // Navigate to the target directory
+        let currentHandle = this.directoryHandle;
+        for (const part of parts) {
+          currentHandle = await currentHandle.getDirectoryHandle(part);
+        }
+  
+        // Get the file handle
+        const fileHandle = await currentHandle.getFileHandle(fileName);
+  
+        // Read existing content
+        const file = await fileHandle.getFile();
+        const existingContent = await file.text();
+  
+        // Write combined content
+        const writable = await fileHandle.createWritable();
+        await writable.write(existingContent + content);
+        await writable.close();
+  
+        return true;
+      } catch (err) {
+        console.error('File append error:', err);
         throw err;
       }
     },
@@ -2477,9 +2812,17 @@
   
     selectFolderAndStart: async function() {
       const fileSystem = window.module['file-system.js'];
+      const conversationManager = window.module['conversation-manager.js'];
+  
       const success = await fileSystem.requestDirectory();
   
       if (success) {
+        // Get folder path from directory handle
+        const folderPath = fileSystem.directoryHandle.name;
+  
+        // Initialize conversation manager with folder path for persistence
+        await conversationManager.init(folderPath);
+  
         this.initChatUI();
       }
     },
