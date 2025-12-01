@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-11-30T22:10:00.141Z
+// AI Agent - Built 2025-12-01T19:21:10.186Z
 (function() {
   window.module = {};
 
@@ -185,27 +185,43 @@
     getContinuation: async function(apiMessages, assistantMessageId, partialContent) {
       const config = window.module['config.js'];
   
-      console.log('=== GET CONTINUATION REQUEST ===');
-      console.log('Original messages count:', apiMessages.length);
-      console.log('Partial content length:', partialContent.length);
-      console.log('Partial content starts with:', partialContent.substring(0, 100));
-      console.log('Partial content ends with:', partialContent.substring(partialContent.length - 100));
+      console.log('\n' + '='.repeat(80));
+      console.log('CONTINUATION REQUEST');
+      console.log('='.repeat(80));
+      console.log('Messages in conversation:', apiMessages.length);
+      console.log('Partial content length:', partialContent.length, 'chars');
+      console.log('First 50 chars:', JSON.stringify(partialContent.substring(0, 50)));
+      console.log('Last 50 chars:', JSON.stringify(partialContent.substring(Math.max(0, partialContent.length - 50))));
   
       // Determine if this is a message or tool call
-      const isToolCall = partialContent.startsWith('{');
+      // The AI sometimes adds text before the JSON, so we need to check if JSON exists anywhere
+      // Use regex to be whitespace-tolerant
+      const toolJsonMatch = partialContent.match(/\{\s*"tools"\s*:\s*\[/);
+      const hasToolJson = toolJsonMatch !== null;
+      const isToolCall = partialContent.trimStart().startsWith('{') || hasToolJson;
       const isMessage = partialContent.startsWith('=');
+  
+      console.log('Response type: ' + (isToolCall ? 'TOOL_CALL' : isMessage ? 'MESSAGE' : 'UNKNOWN'));
   
       let wrappedContent;
       let continuationPrompt;
   
       if (isToolCall) {
+        // If there's text before the JSON, extract just the JSON part for wrapping
+        let jsonPart = partialContent;
+        if (hasToolJson && !partialContent.trimStart().startsWith('{')) {
+          const jsonStart = toolJsonMatch.index;
+          jsonPart = partialContent.substring(jsonStart);
+          console.log(`[WARN] AI added text before JSON. Extracted JSON starting at position ${jsonStart}`);
+        }
+  
         // For tool calls, ask for a CONTINUATION (not complete JSON)
         // Use ~ prefix to indicate it's a continuation that should be appended
-        wrappedContent = `Here's a partial response that got cut off:\n\`\`\`json\n${partialContent}\n\`\`\``;
+        wrappedContent = `Here's a partial response that got cut off:\n\`\`\`json\n${jsonPart}\n\`\`\``;
   
         continuationPrompt = `Your previous response was cut off mid-JSON. Send ONLY the continuation text that should be appended.
   
-  The response ended with: "${partialContent.substring(partialContent.length - 100)}"
+  The response ended with: "${jsonPart.substring(Math.max(0, jsonPart.length - 100))}"
   
   Start your response with ~ followed by the exact text that should come next. Do NOT send complete JSON, do NOT start with {, just send the raw continuation text that will be appended to what you already wrote.
   
@@ -245,12 +261,8 @@
         }
       ];
   
-      console.log('Continue messages count:', continueMessages.length);
-      console.log('Continuation prompt:', continuationPrompt.substring(0, 200));
-      console.log('Last 3 messages:');
-      for (let i = Math.max(0, continueMessages.length - 3); i < continueMessages.length; i++) {
-        console.log(`  [${i}] ${continueMessages[i].role}:`, continueMessages[i].content.substring(0, 150));
-      }
+      console.log('Sending continuation request...');
+      console.log('='.repeat(80));
   
       const payload = {
         stream: true,
@@ -268,8 +280,6 @@
           tags_generation: false
         }
       };
-  
-      console.log('Full continuation payload:', payload);
   
       const response = await fetch(`${config.API_BASE}/chat/completions`, {
         method: 'POST',
@@ -328,7 +338,9 @@
   
         // Collect tool uses to combine into single assistant message
         if (msg.type === 'tool_use') {
-          pendingToolUses.push(msg.tool);
+          // Handle both old format (msg.tool) and new format (msg.tools array)
+          const tools = msg.tools || [msg.tool];
+          pendingToolUses.push(...tools);
           continue;
         }
   
@@ -455,7 +467,313 @@
     API_BASE: 'https://chat.niprgpt.mil/api',
     MODEL: 'Anthropic Claude 4 Sonnet',
     MAX_RETRIES: 5,
-    TIMEOUT_MS: 30000 // 30 seconds
+    TIMEOUT_MS: 30000, // 30 seconds
+    MAX_CONVERSATION_CHARS: 500000 // 500K character limit before summarization
+  };
+  
+
+  // Module: conversation-flow.js
+  // Conversation Flow Manager
+  // Pure logic module for handling AI conversation flow
+  // NO DOM dependencies - can be tested in Node.js
+  
+  window.module['conversation-flow.js'] = {
+    /**
+     * Process a streaming AI response with continuation and error handling
+     * This is the core conversation loop extracted from ui-manager
+     *
+     * @param {ReadableStream} streamingResponse - The streaming response from API
+     * @param {string} assistantMessageId - ID for the assistant's message
+     * @param {Array} apiMessages - Current conversation messages in API format
+     * @param {Object} callbacks - Callbacks for progress updates
+     * @param {Function} callbacks.onProgress - Called with status updates (optional)
+     * @param {Function} callbacks.onChunk - Called with each content chunk (optional)
+     * @returns {Promise<Object>} - { success: boolean, content: Object|string, error: string|null }
+     */
+    handleAIResponse: async function(streamingResponse, assistantMessageId, apiMessages, callbacks = {}) {
+      const conversationManager = window.module['conversation-manager.js'];
+      const messageProcessor = window.module['message-processor.js'];
+      const apiClient = window.module['api-client.js'];
+      const config = window.module['config.js'];
+  
+      const MAX_CONTINUATION_ATTEMPTS = 20;
+      let accumulatedContent = '';
+  
+      try {
+        // Stream the initial response
+        const reader = streamingResponse.body.getReader();
+        const decoder = new TextDecoder();
+  
+        while (true) {
+          const timeoutPromise = new Promise((_, reject) => {
+            setTimeout(() => reject(new Error('Timeout')), config.TIMEOUT_MS);
+          });
+  
+          const readPromise = reader.read();
+          const result = await Promise.race([readPromise, timeoutPromise]);
+  
+          if (result.done) break;
+  
+          const chunk = decoder.decode(result.value, { stream: true });
+          const lines = chunk.split('\n');
+  
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              const data = line.slice(6);
+              if (data === '[DONE]') continue;
+  
+              try {
+                const parsed = JSON.parse(data);
+                if (parsed.choices?.[0]?.delta?.content) {
+                  const content = parsed.choices[0].delta.content;
+                  accumulatedContent += content;
+  
+                  if (callbacks.onChunk) {
+                    callbacks.onChunk(content, accumulatedContent);
+                  }
+                }
+              } catch (e) {
+                console.error('Failed to parse SSE data:', e);
+              }
+            }
+          }
+        }
+  
+        // Process the accumulated response
+        let processed = messageProcessor.processStreamedResponse(accumulatedContent);
+  
+        // Add system warning if text was trimmed
+        if (processed.systemWarning) {
+          await conversationManager.addMessage(processed.systemWarning);
+        }
+  
+        if (processed.error) {
+          // Add the AI's failed response to conversation first
+          await conversationManager.addMessage({
+            type: 'assistant',
+            id: assistantMessageId,
+            content: accumulatedContent,
+            timestamp: Date.now(),
+            parentId: null,
+            childrenIds: []
+          });
+  
+          // Then add system error message
+          await conversationManager.addMessage({
+            type: 'system_error',
+            error: processed.error,
+            originalContent: processed.originalContent || accumulatedContent
+          });
+  
+          // Return error to caller - they can decide to retry
+          return {
+            success: false,
+            content: null,
+            error: processed.error,
+            needsRetry: true
+          };
+        }
+  
+        // Handle incomplete responses - try continuation
+        let continuationAttempts = 0;
+  
+        while (!processed.complete && continuationAttempts < MAX_CONTINUATION_ATTEMPTS) {
+          continuationAttempts++;
+  
+          if (continuationAttempts === 1) {
+            // Log once at the start of continuation loop
+            console.log('\n' + '!'.repeat(80));
+            console.log('RESPONSE INCOMPLETE - STARTING CONTINUATION LOOP');
+            console.log('!'.repeat(80));
+            console.log('Accumulated so far:', accumulatedContent.length, 'chars');
+            console.log('Has terminator:', accumulatedContent.includes('|||||END|||||'));
+            console.log('Last 50 chars:', JSON.stringify(accumulatedContent.substring(Math.max(0, accumulatedContent.length - 50))));
+            console.log('!'.repeat(80));
+          }
+  
+          if (callbacks.onProgress) {
+            callbacks.onProgress(`Requesting continuation (${continuationAttempts}/${MAX_CONTINUATION_ATTEMPTS})...`);
+          }
+  
+          try {
+            // Extract the actual message content (remove = prefix if present)
+            let partialMessage = accumulatedContent;
+            if (partialMessage.startsWith('=')) {
+              partialMessage = partialMessage.substring(1);
+            }
+  
+            const continueResponse = await apiClient.getContinuation(apiMessages, assistantMessageId, partialMessage);
+            const continueReader = continueResponse.body.getReader();
+            const continueDecoder = new TextDecoder();
+            let continuationContent = '';
+  
+            while (true) {
+              const timeoutPromise = new Promise((_, reject) => {
+                setTimeout(() => reject(new Error('Timeout')), config.TIMEOUT_MS);
+              });
+  
+              const readPromise = continueReader.read();
+              const result = await Promise.race([readPromise, timeoutPromise]);
+  
+              if (result.done) break;
+  
+              const chunk = continueDecoder.decode(result.value, { stream: true });
+              const lines = chunk.split('\n');
+  
+              for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                  const data = line.slice(6);
+                  if (data === '[DONE]') continue;
+  
+                  try {
+                    const parsed = JSON.parse(data);
+                    if (parsed.choices?.[0]?.delta?.content) {
+                      const content = parsed.choices[0].delta.content;
+                      continuationContent += content;
+  
+                      if (callbacks.onChunk) {
+                        callbacks.onChunk(content, accumulatedContent + continuationContent);
+                      }
+                    }
+                  } catch (e) {
+                    console.error('Failed to parse continuation SSE data:', e);
+                  }
+                }
+              }
+            }
+  
+            // Check if AI used ~ prefix for continuation
+            console.log('\n' + '='.repeat(80));
+            console.log('CONTINUATION RECEIVED (attempt ' + continuationAttempts + ')');
+            console.log('='.repeat(80));
+            console.log('Continuation length:', continuationContent.length, 'chars');
+            console.log('First char:', JSON.stringify(continuationContent.charAt(0)));
+            console.log('Starts with ~:', continuationContent.startsWith('~'));
+            console.log('First 50 chars:', JSON.stringify(continuationContent.substring(0, 50)));
+            console.log('='.repeat(80));
+  
+            if (continuationContent.startsWith('~')) {
+              console.log('✓ AI correctly used ~ prefix');
+              // Strip ~ and append to accumulated content
+              const cleaned = continuationContent.substring(1);
+              accumulatedContent += cleaned;
+              console.log('Combined length now:', accumulatedContent.length, 'chars');
+  
+              // Re-process the combined response
+              processed = messageProcessor.processStreamedResponse(accumulatedContent);
+  
+              // Add system warning if text was trimmed (from continuation processing)
+              if (processed.systemWarning) {
+                await conversationManager.addMessage(processed.systemWarning);
+              }
+  
+              if (processed.complete && !processed.error) {
+                // Success!
+                break;
+              } else if (processed.error) {
+                // Still has error after continuation
+                await conversationManager.addMessage({
+                  type: 'assistant',
+                  id: assistantMessageId,
+                  content: accumulatedContent,
+                  timestamp: Date.now(),
+                  parentId: null,
+                  childrenIds: []
+                });
+  
+                await conversationManager.addMessage({
+                  type: 'system_error',
+                  error: processed.error,
+                  originalContent: processed.originalContent || accumulatedContent
+                });
+  
+                return {
+                  success: false,
+                  content: null,
+                  error: processed.error,
+                  needsRetry: true
+                };
+              }
+              // else: still incomplete, loop continues
+            } else {
+              // AI didn't use ~ prefix - not a proper continuation
+              console.log('✗ ERROR: AI did NOT use ~ prefix!');
+              console.log('This means AI restarted instead of continuing.');
+              console.log('Continuation response was:', JSON.stringify(continuationContent.substring(0, 100)));
+  
+              await conversationManager.addMessage({
+                type: 'system_error',
+                error: 'Response incomplete: AI did not continue properly',
+                originalContent: accumulatedContent
+              });
+  
+              return {
+                success: false,
+                content: null,
+                error: 'AI did not continue properly',
+                needsRetry: true
+              };
+            }
+  
+          } catch (error) {
+            console.error('Continuation attempt failed:', error);
+  
+            await conversationManager.addMessage({
+              type: 'system_error',
+              error: `Continuation error: ${error.message}`,
+              originalContent: accumulatedContent
+            });
+  
+            return {
+              success: false,
+              content: null,
+              error: error.message,
+              needsRetry: false
+            };
+          }
+        }
+  
+        // Check if we exhausted continuation attempts
+        if (!processed.complete) {
+          await conversationManager.addMessage({
+            type: 'system_error',
+            error: `Response incomplete after ${MAX_CONTINUATION_ATTEMPTS} continuation attempts`,
+            originalContent: accumulatedContent
+          });
+  
+          return {
+            success: false,
+            content: null,
+            error: `Too many continuation attempts (${MAX_CONTINUATION_ATTEMPTS})`,
+            needsRetry: false
+          };
+        }
+  
+        // Success! Return the processed content
+        return {
+          success: true,
+          content: processed.content,
+          error: null,
+          rawResponse: accumulatedContent
+        };
+  
+      } catch (error) {
+        console.error('handleAIResponse error:', error);
+  
+        await conversationManager.addMessage({
+          type: 'system_error',
+          error: error.message,
+          originalContent: accumulatedContent
+        });
+  
+        return {
+          success: false,
+          content: null,
+          error: error.message,
+          needsRetry: false
+        };
+      }
+    }
   };
   
 
@@ -469,8 +787,9 @@
       this.messages = [];
     },
   
-    addMessage: function(message) {
+    addMessage: async function(message) {
       const utils = window.module['utils.js'];
+      const config = window.module['config.js'];
   
       // Ensure message has required fields
       if (!message.id) {
@@ -494,8 +813,17 @@
         }
       }
   
-      // TODO: Check 500K character limit and trigger summarization
-      // For now, just add the message
+      // Check 500K character limit before adding
+      const currentCount = this.getTotalCharacterCount();
+      const messageCharCount = utils.countCharacters([message]);
+      const wouldExceedLimit = (currentCount + messageCharCount) > config.MAX_CONVERSATION_CHARS;
+  
+      if (wouldExceedLimit) {
+        console.log(`Would exceed ${config.MAX_CONVERSATION_CHARS} char limit (current: ${currentCount}, adding: ${messageCharCount}). Triggering summarization...`);
+        await this.summarize();
+      }
+  
+      // Add the message
       this.messages.push(message);
   
       return message;
@@ -510,10 +838,153 @@
       return utils.countCharacters(this.messages);
     },
   
-    // TODO: Implement summarization
-    summarize: function() {
-      console.warn('Summarization not yet implemented');
-      return null;
+    /**
+     * Summarizes conversation when it exceeds 500K characters
+     * Creates a summary message and marks which messages it summarizes
+     */
+    summarize: async function() {
+      const utils = window.module['utils.js'];
+      const apiClient = window.module['api-client.js'];
+      const config = window.module['config.js'];
+  
+      // 1. Gather messages to summarize
+      let messagesToSummarize = [];
+      let latestSummaryIndex = -1;
+  
+      // Find the latest summary (if any)
+      for (let i = this.messages.length - 1; i >= 0; i--) {
+        if (this.messages[i].type === 'summary') {
+          latestSummaryIndex = i;
+          break;
+        }
+      }
+  
+      if (latestSummaryIndex === -1) {
+        // No summaries exist - summarize all messages
+        messagesToSummarize = this.messages.slice();
+      } else {
+        // Summaries exist - summarize from latest summary to end
+        messagesToSummarize = this.messages.slice(latestSummaryIndex);
+      }
+  
+      console.log(`Summarizing ${messagesToSummarize.length} messages...`);
+  
+      // 2. Convert messages to text for summarization
+      const messagesText = messagesToSummarize.map(msg => {
+        switch (msg.type) {
+          case 'user':
+            return `User: ${msg.content}`;
+          case 'assistant':
+            return `Assistant: ${msg.content}`;
+          case 'tool_use':
+            return `Tool Use: ${JSON.stringify(msg.tool || msg.tools)}`;
+          case 'tool_result':
+            return `Tool Result (${msg.tool}): ${msg.success ? 'Success' : 'Error'}\n${msg.result || msg.error}`;
+          case 'system_error':
+            return `System Error: ${msg.error}`;
+          case 'system_warning':
+            return `System Warning: ${msg.warning}`;
+          case 'summary':
+            return `Previous Summary: ${msg.content}`;
+          default:
+            return `${msg.type}: ${JSON.stringify(msg)}`;
+        }
+      }).join('\n\n');
+  
+      // Get the last user message for context
+      let lastUserMessage = '';
+      for (let i = this.messages.length - 1; i >= 0; i--) {
+        if (this.messages[i].type === 'user') {
+          lastUserMessage = this.messages[i].content;
+          break;
+        }
+      }
+  
+      // 3. Create summary prompt
+      const summaryPrompt = `<system-reminder>
+  Summarize the previous work and provide context for the current task.
+  
+  Be concise but include:
+  - What the user originally requested
+  - What has been accomplished
+  - Current state of the codebase
+  - Any important context for continuing
+  
+  Format as a brief summary.
+  </system-reminder>
+  
+  ${messagesText}
+  
+  Last user request: ${lastUserMessage}`;
+  
+      // 4. Call API to generate summary
+      const summaryMessages = [{
+        role: 'user',
+        content: summaryPrompt
+      }];
+  
+      try {
+        const response = await fetch(`${config.API_BASE}/chat/completions`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            stream: false, // Non-streaming for simplicity
+            model: config.MODEL,
+            messages: summaryMessages,
+            params: {},
+            features: { web_search: false },
+            session_id: utils.generateSessionId(),
+            chat_id: apiClient.chatId,
+            id: utils.generateUUID()
+          })
+        });
+  
+        if (!response.ok) {
+          throw new Error(`Summary API call failed: ${response.status}`);
+        }
+  
+        const data = await response.json();
+        const summaryContent = data.choices?.[0]?.message?.content || 'Summary generation failed';
+  
+        // 5. Create summary message
+        const summaryMessage = {
+          type: 'summary',
+          id: utils.generateUUID(),
+          timestamp: utils.getTimestamp(),
+          content: summaryContent,
+          summarizes_from: messagesToSummarize[0].id,
+          summarizes_to: messagesToSummarize[messagesToSummarize.length - 1].id,
+          parentId: this.messages[this.messages.length - 1].id,
+          childrenIds: []
+        };
+  
+        // 6. Remove summarized messages (but keep old summaries as history markers)
+        if (latestSummaryIndex !== -1) {
+          // Keep everything up to and including the latest summary
+          // Remove only the messages after it (they're now summarized)
+          this.messages = this.messages.slice(0, latestSummaryIndex + 1);
+        } else {
+          // No summary exists, remove all messages (they'll be summarized)
+          this.messages = [];
+        }
+  
+        // Add the new summary
+        this.messages.push(summaryMessage);
+  
+        console.log(`✓ Summarization complete. Reduced to ${this.messages.length} messages.`);
+        console.log(`Summary: ${summaryContent.substring(0, 200)}...`);
+  
+        return summaryMessage;
+  
+      } catch (error) {
+        console.error('Summarization failed:', error);
+        // If summarization fails, just warn and continue
+        // This prevents blocking the user from continuing work
+        console.warn('Continuing without summarization - conversation may become very large');
+        return null;
+      }
     }
   };
   
@@ -713,7 +1184,8 @@
 
   // Module: message-processor.js
   // Message Processor
-  // Handles processing of streamed responses with = prefix (message) or { prefix (tools)
+  // Handles processing of streamed responses with = prefix (message), { prefix (tools), or ~ prefix (continuation)
+  // Implements 3-layer processing: Text Trimming → JSON Repair → Validation
   window.module['message-processor.js'] = {
     TERMINATOR: '|||||END|||||',
   
@@ -734,24 +1206,27 @@
       // Detect response type by first character
       const firstChar = content.charAt(0);
   
-      if (firstChar === '=') {
-        // Message response
-        return this.processMessage(content);
-      } else if (firstChar === '{') {
-        // Tool execution response
+      if (firstChar === '=' || firstChar === '~') {
+        // Message or continuation response - no trimming needed
+        return this.processMessage(content, firstChar);
+      } else if (content.includes('{')) {
+        // Tool execution response - may have text before/after JSON, apply full 3-layer processing
+        // Layer 1 will trim any text before { and after }
         return this.processTools(content);
       } else {
+        // Invalid format - doesn't start with =, ~, or contain { anywhere
         return {
           complete: true,
           content: null,
-          error: `Invalid response format: must start with = or {, got "${firstChar}"`,
-          originalContent: rawText
+          error: `Invalid response format: must start with = (message), ~ (continuation), or contain { (tools)`,
+          originalContent: rawText,
+          systemWarning: null
         };
       }
     },
   
-    processMessage: function(text) {
-      // Remove = prefix
+    processMessage: function(text, prefix) {
+      // Remove prefix (= or ~)
       const message = text.substring(1);
   
       return {
@@ -760,57 +1235,278 @@
           type: 'message',
           text: message
         },
-        error: null
+        error: null,
+        systemWarning: null
       };
     },
   
-    processTools: function(jsonText) {
-      // Parse JSON
-      try {
-        const data = JSON.parse(jsonText);
+    processTools: function(rawJsonText) {
+      // ===== LAYER 1: TEXT TRIMMING =====
+      const trimResult = this.trimToJson(rawJsonText);
+      const jsonText = trimResult.trimmed;
+      const systemWarning = trimResult.systemWarning;
   
-        // Validate structure
-        if (!data || typeof data !== 'object') {
-          return {
-            complete: true,
-            content: null,
-            error: 'Invalid tools response: not an object',
-            originalContent: jsonText
-          };
-        }
-  
-        if (!Array.isArray(data.tools)) {
-          return {
-            complete: true,
-            content: null,
-            error: 'Invalid tools response: tools must be an array',
-            originalContent: jsonText
-          };
-        }
-  
-        // TODO: Add comprehensive tool validation
-        // - Check each tool has name and args
-        // - Validate tool names
-        // - Validate args match tool requirements
-  
-        return {
-          complete: true,
-          content: {
-            type: 'execute',
-            tools: data.tools
-          },
-          error: null
-        };
-  
-      } catch (e) {
-        // TODO: Implement JSON repair logic
+      // ===== LAYER 2: JSON PARSING & REPAIR =====
+      const parseResult = this.parseAndRepairJson(jsonText);
+      if (parseResult.error) {
         return {
           complete: true,
           content: null,
-          error: `JSON parse error: ${e.message}`,
-          originalContent: jsonText
+          error: parseResult.error,
+          originalContent: rawJsonText,
+          systemWarning: systemWarning
         };
       }
+  
+      const data = parseResult.data;
+  
+      // ===== LAYER 3: VALIDATION =====
+      const validationResult = this.validateToolsResponse(data, jsonText);
+      if (validationResult.error) {
+        return {
+          complete: true,
+          content: null,
+          error: validationResult.error,
+          originalContent: rawJsonText,
+          systemWarning: systemWarning
+        };
+      }
+  
+      return {
+        complete: true,
+        content: {
+          type: 'execute',
+          tools: data.tools
+        },
+        error: null,
+        systemWarning: systemWarning
+      };
+    },
+  
+    // ===== LAYER 1: TEXT TRIMMING =====
+    trimToJson: function(text) {
+      const openBrace = text.indexOf('{');
+      const closeBrace = text.lastIndexOf('}');
+  
+      if (openBrace === -1 || closeBrace === -1 || closeBrace < openBrace) {
+        // No valid JSON structure found
+        return {
+          trimmed: text,
+          systemWarning: null
+        };
+      }
+  
+      const trimmedPrefix = text.substring(0, openBrace);
+      const trimmedSuffix = text.substring(closeBrace + 1);
+      const jsonText = text.substring(openBrace, closeBrace + 1);
+  
+      // Check if anything was trimmed
+      if (trimmedPrefix.length > 0 || trimmedSuffix.length > 0) {
+        return {
+          trimmed: jsonText,
+          systemWarning: {
+            type: 'system_warning',
+            warning: `Trimmed ${trimmedPrefix.length} characters before JSON and ${trimmedSuffix.length} characters after`,
+            trimmed_prefix: trimmedPrefix,
+            trimmed_suffix: trimmedSuffix
+          }
+        };
+      }
+  
+      return {
+        trimmed: jsonText,
+        systemWarning: null
+      };
+    },
+  
+    // ===== LAYER 2: JSON PARSING & REPAIR =====
+    parseAndRepairJson: function(jsonText) {
+      // IMPORTANT: The AI sometimes sends JSON with literal newlines despite instructions not to
+      // We need to replace literal newlines with \n escape sequences before parsing
+      // But we need to be careful not to break JSON strings that legitimately contain \n
+      const normalizedJson = jsonText.replace(/\n/g, '\\n').replace(/\r/g, '');
+  
+      let lastError = null;
+  
+      // Try parsing as-is first
+      try {
+        const data = JSON.parse(normalizedJson);
+        return { data, error: null };
+      } catch (e) {
+        lastError = e;
+        // Parsing failed, attempt repairs
+      }
+  
+      // Repair 1: Add missing trailing }
+      try {
+        const withBrace = normalizedJson + '}';
+        const data = JSON.parse(withBrace);
+        console.log('[JSON Repair] Added missing trailing }');
+        return { data, error: null };
+      } catch (e) {
+        lastError = e;
+        // Continue to next repair
+      }
+  
+      // Repair 2: Add missing trailing ]
+      try {
+        const withBracket = normalizedJson + ']';
+        const data = JSON.parse(withBracket);
+        console.log('[JSON Repair] Added missing trailing ]');
+        return { data, error: null };
+      } catch (e) {
+        lastError = e;
+        // Continue to next repair
+      }
+  
+      // Repair 3: Add missing trailing ]}
+      try {
+        const withBoth = normalizedJson + ']}';
+        const data = JSON.parse(withBoth);
+        console.log('[JSON Repair] Added missing trailing ]}');
+        return { data, error: null };
+      } catch (e) {
+        lastError = e;
+        // Continue to next repair
+      }
+  
+      // Repair 4: Remove trailing commas
+      try {
+        const withoutTrailingCommas = normalizedJson
+          .replace(/,(\s*[}\]])/g, '$1');  // Remove commas before closing braces/brackets
+        const data = JSON.parse(withoutTrailingCommas);
+        console.log('[JSON Repair] Removed trailing commas');
+        return { data, error: null };
+      } catch (e) {
+        lastError = e;
+        // Continue to next repair
+      }
+  
+      // Repair 5: Fix unescaped quotes (basic attempt)
+      try {
+        // This is a simple heuristic - replace \" inside string values with '
+        // More sophisticated repair would require proper parsing
+        const withFixedQuotes = normalizedJson.replace(/"([^"]*)"([^"]*?)"/g, (match, p1, p2) => {
+          if (p2.includes('"')) {
+            return `"${p1}${p2.replace(/"/g, "'")}"`;
+          }
+          return match;
+        });
+        const data = JSON.parse(withFixedQuotes);
+        console.log('[JSON Repair] Fixed unescaped quotes');
+        return { data, error: null };
+      } catch (e) {
+        lastError = e;
+        // All repairs failed
+      }
+  
+      // All attempts failed
+      return {
+        data: null,
+        error: `JSON parse error: ${lastError.message}`
+      };
+    },
+  
+    // ===== LAYER 3: VALIDATION =====
+    validateToolsResponse: function(data, originalJson) {
+      // Check basic structure
+      if (!data || typeof data !== 'object') {
+        return {
+          error: 'Invalid tools response: not an object'
+        };
+      }
+  
+      if (!Array.isArray(data.tools)) {
+        return {
+          error: 'Invalid tools response: tools must be an array'
+        };
+      }
+  
+      if (data.tools.length === 0) {
+        return {
+          error: 'Invalid tools response: tools array is empty'
+        };
+      }
+  
+      // Validate each tool
+      const validToolNames = [
+        'list_folder',
+        'read_file',
+        'create_file',
+        'edit_file',
+        'exit_planning',
+        'item_completed',
+        'item_failed'
+      ];
+  
+      for (let i = 0; i < data.tools.length; i++) {
+        const tool = data.tools[i];
+  
+        // Check tool has name
+        if (!tool.name) {
+          return {
+            error: `Invalid tool at index ${i}: missing "name" field`
+          };
+        }
+  
+        // Check tool name is valid
+        if (!validToolNames.includes(tool.name)) {
+          // Try to suggest similar tool names
+          const suggestions = validToolNames.filter(name =>
+            name.includes(tool.name) || tool.name.includes(name.replace('_', ''))
+          );
+          const suggestionText = suggestions.length > 0
+            ? ` Did you mean: ${suggestions.join(', ')}?`
+            : '';
+          return {
+            error: `Invalid tool name: "${tool.name}"${suggestionText}`
+          };
+        }
+  
+        // Check tool has args
+        if (!tool.args || typeof tool.args !== 'object') {
+          return {
+            error: `Invalid tool at index ${i}: "${tool.name}" must have "args" object`
+          };
+        }
+  
+        // Validate mode-specific tool availability
+        const modeValidation = this.validateToolMode(tool.name);
+        if (modeValidation.error) {
+          return modeValidation;
+        }
+      }
+  
+      return { error: null };
+    },
+  
+    // Check if tool is available in current mode
+    validateToolMode: function(toolName) {
+      const modeManager = window.module['mode-manager.js'];
+      if (!modeManager) {
+        // Mode manager not available, skip validation
+        return { error: null };
+      }
+  
+      const currentMode = modeManager.getMode();
+      const sharedTools = ['list_folder', 'read_file'];
+      const planningOnlyTools = ['exit_planning'];
+      const executionOnlyTools = ['create_file', 'edit_file', 'item_completed', 'item_failed'];
+  
+      // Check if tool is restricted to a specific mode
+      if (currentMode === 'planning' && executionOnlyTools.includes(toolName)) {
+        return {
+          error: `Tool "${toolName}" is not available in Planning Mode. Available tools: ${sharedTools.concat(planningOnlyTools).join(', ')}`
+        };
+      }
+  
+      if (currentMode === 'execution' && planningOnlyTools.includes(toolName)) {
+        return {
+          error: `Tool "${toolName}" is not available in Execution Mode. Available tools: ${sharedTools.concat(executionOnlyTools).join(', ')}`
+        };
+      }
+  
+      return { error: null };
     }
   };
   
@@ -848,6 +1544,8 @@
     getPlanningModePrompt: function() {
       return `<system-reminder>
   You are a helpful AI coding assistant in PLANNING MODE.
+  
+  ⚠️ CRITICAL: When outputting JSON for tool calls, you MUST write it as a SINGLE CONTINUOUS LINE with NO line breaks, NO indentation, NO formatting. Do NOT press Enter/Return anywhere inside the JSON. Use \\n for newlines in string values.
   
   Your goal is to understand what the user wants to accomplish through conversation.
   
@@ -916,6 +1614,8 @@
   
       return `<system-reminder>
   You are a helpful AI coding assistant in EXECUTION MODE.
+  
+  ⚠️ CRITICAL: When outputting JSON for tool calls, you MUST write it as a SINGLE CONTINUOUS LINE with NO line breaks, NO indentation, NO formatting. Do NOT press Enter/Return anywhere inside the JSON. Use \\n for newlines in string values.
   
   Your ONLY job is to complete the current checklist item.
   
@@ -1695,7 +2395,7 @@
         content: content
       };
   
-      conversationManager.addMessage(userMessage);
+      await conversationManager.addMessage(userMessage);
       this.renderChat();
       this.updateCharCounter();
     },
@@ -1705,6 +2405,7 @@
       const apiRenderer = window.module['api-renderer.js'];
       const apiClient = window.module['api-client.js'];
       const messageProcessor = window.module['message-processor.js'];
+      const conversationFlow = window.module['conversation-flow.js'];
       const toolExecutor = window.module['tool-executor.js'];
       const utils = window.module['utils.js'];
       const config = window.module['config.js'];
@@ -1729,378 +2430,144 @@
   
       let retryCount = 0;
       let success = false;
-      let accumulatedContent = '';
-      let streamingMessageId = null;
-      let responseType = null; // 'message' or 'tools'
   
       while (retryCount < config.MAX_RETRIES && !success) {
         try {
           const response = await apiClient.getCompletion(apiMessages, assistantMessageId);
-          const reader = response.body.getReader();
-          const decoder = new TextDecoder();
   
-          while (true) {
-            const timeoutPromise = new Promise((_, reject) => {
-              setTimeout(() => reject(new Error('Timeout')), config.TIMEOUT_MS);
-            });
+          // Track streaming message for real-time UI updates
+          let streamingMessageId = null;
+          let responseType = null;
   
-            const readPromise = reader.read();
-            const result = await Promise.race([readPromise, timeoutPromise]);
-  
-            if (result.done) break;
-  
-            const chunk = decoder.decode(result.value, { stream: true });
-            const lines = chunk.split('\n');
-  
-            for (const line of lines) {
-              if (line.startsWith('data: ')) {
-                const data = line.slice(6);
-                if (data === '[DONE]') continue;
-  
-                try {
-                  const parsed = JSON.parse(data);
-                  if (parsed.choices && parsed.choices[0] && parsed.choices[0].delta && parsed.choices[0].delta.content) {
-                    const deltaContent = parsed.choices[0].delta.content;
-                    accumulatedContent += deltaContent;
-  
-                    // Detect response type from first character
-                    if (responseType === null && accumulatedContent.length > 0) {
-                      const firstChar = accumulatedContent.charAt(0);
-                      if (firstChar === '=') {
-                        responseType = 'message';
-                        // Create streaming message
-                        streamingMessageId = utils.generateUUID();
-                        conversationManager.addMessage({
-                          id: streamingMessageId,
-                          type: 'assistant',
-                          content: '',
-                          streaming: true
-                        });
-                      } else if (firstChar === '{') {
-                        responseType = 'tools';
-                        // Don't create message yet, wait for complete JSON
-                      }
-                    }
-  
-                    // Update streaming message in real-time
-                    if (responseType === 'message' && streamingMessageId) {
-                      // Extract message content (remove = prefix and terminator if present)
-                      let messageContent = accumulatedContent.substring(1); // Remove =
-                      const terminatorIndex = messageContent.indexOf(messageProcessor.TERMINATOR);
-                      if (terminatorIndex !== -1) {
-                        messageContent = messageContent.substring(0, terminatorIndex);
-                      }
-  
-                      // Update the streaming message
-                      const msgs = conversationManager.getMessages();
-                      const streamingMsg = msgs.find(m => m.id === streamingMessageId);
-                      if (streamingMsg) {
-                        streamingMsg.content = messageContent;
-                        this.renderChat();
-                        this.updateCharCounter();
-                      }
-                    }
+          // Use extracted conversation-flow module
+          const result = await conversationFlow.handleAIResponse(
+            response,
+            assistantMessageId,
+            apiMessages,
+            {
+              onProgress: (status) => this.showLoading(status),
+              onChunk: (chunk, accumulated) => {
+                // Detect response type and create streaming message if needed
+                if (responseType === null && accumulated.length > 0) {
+                  const firstChar = accumulated.charAt(0);
+                  if (firstChar === '=') {
+                    responseType = 'message';
+                    streamingMessageId = utils.generateUUID();
+                    // Note: We add this synchronously - onChunk can't be async
+                    // The 500K limit check happens in addMessage, but we're creating a placeholder here
+                    // that will be removed if summarization occurs before the full message completes
+                    conversationManager.messages.push({
+                      id: streamingMessageId,
+                      type: 'assistant',
+                      content: '',
+                      streaming: true,
+                      timestamp: Date.now(),
+                      parentId: conversationManager.messages.length > 0 ? conversationManager.messages[conversationManager.messages.length - 1].id : null,
+                      childrenIds: []
+                    });
+                  } else if (firstChar === '{') {
+                    responseType = 'tools';
                   }
-                } catch (e) {
-                  // Ignore parse errors in streaming data
+                }
+  
+                // Update streaming message in real-time
+                if (responseType === 'message' && streamingMessageId) {
+                  let messageContent = accumulated.substring(1); // Remove = prefix
+                  const terminatorIndex = messageContent.indexOf(messageProcessor.TERMINATOR);
+                  if (terminatorIndex !== -1) {
+                    messageContent = messageContent.substring(0, terminatorIndex);
+                  }
+  
+                  const msgs = conversationManager.getMessages();
+                  const streamingMsg = msgs.find(m => m.id === streamingMessageId);
+                  if (streamingMsg) {
+                    streamingMsg.content = messageContent;
+                    this.renderChat();
+                    this.updateCharCounter();
+                  }
                 }
               }
             }
-          }
+          );
   
-          // Process the accumulated response
-          let processed = messageProcessor.processStreamedResponse(accumulatedContent);
+          // Handle the result
+          if (result.success) {
+            const aiResponse = result.content;
   
-          if (processed.error) {
-            // Add the AI's failed response to conversation first
-            conversationManager.addMessage({
-              type: 'assistant',
-              id: assistantMessageId,
-              content: accumulatedContent,
-              timestamp: Date.now(),
-              parentId: null,
-              childrenIds: []
-            });
+            if (aiResponse.type === 'message') {
+              // Message was already streamed, just mark as complete
+              if (streamingMessageId) {
+                const msgs = conversationManager.getMessages();
+                const streamingMsg = msgs.find(m => m.id === streamingMessageId);
+                if (streamingMsg) {
+                  streamingMsg.streaming = false;
+                  streamingMsg.content = aiResponse.text;
+                }
+              } else {
+                // Fallback: add message if streaming didn't work
+                await conversationManager.addMessage({
+                  type: 'assistant',
+                  content: aiResponse.text
+                });
+              }
+              this.renderChat();
+              this.updateCharCounter();
+              this.hideLoading();
+              success = true;
   
-            // Then add system error message
-            conversationManager.addMessage({
-              type: 'system_error',
-              error: processed.error,
-              originalContent: processed.originalContent || accumulatedContent
-            });
+            } else if (aiResponse.type === 'execute') {
+              // Tool execution - create ONE tool_use message with ALL tools
+              const toolUseMessage = await conversationManager.addMessage({
+                type: 'tool_use',
+                tools: aiResponse.tools
+              });
+  
+              this.renderChat();
+              this.updateCharCounter();
+  
+              // Execute tools sequentially, creating individual tool_result messages
+              for (const tool of aiResponse.tools) {
+                this.showLoading(`Executing ${tool.name}...`);
+  
+                const toolResults = await toolExecutor.executeTools([tool]);
+                const toolResult = toolResults[0];
+  
+                await conversationManager.addMessage({
+                  type: 'tool_result',
+                  parentId: toolUseMessage.id,
+                  tool: toolResult.tool,
+                  success: toolResult.success,
+                  result: toolResult.result,
+                  error: toolResult.error,
+                  args: toolResult.args
+                });
+  
+                this.renderChat();
+                this.updateCharCounter();
+              }
+  
+              this.hideLoading();
+  
+              // Auto-call API again to let AI respond to tool results
+              await this.getAIResponse();
+              success = true;
+            }
+  
+          } else if (result.needsRetry) {
+            // Error already added to conversation by conversation-flow
             this.renderChat();
             this.updateCharCounter();
   
             // Call AI again so it can see the error and fix it
-            console.log('Parse error detected, calling AI again with error context');
-            await this.sendMessage();
-            return;
-          }
-  
-          // Handle incomplete responses - try up to 20 continuation attempts
-          let continuationAttempts = 0;
-          const MAX_CONTINUATION_ATTEMPTS = 20;
-          let lastChunkContent = '';
-  
-          while (!processed.complete && continuationAttempts < MAX_CONTINUATION_ATTEMPTS) {
-            continuationAttempts++;
-            console.log(`Response incomplete, requesting continuation (attempt ${continuationAttempts}/${MAX_CONTINUATION_ATTEMPTS})...`);
-            this.showLoading(`Requesting continuation (${continuationAttempts}/${MAX_CONTINUATION_ATTEMPTS})...`);
-  
-            try {
-              // Extract the actual message content (remove = prefix if present)
-              let partialMessage = accumulatedContent;
-              if (partialMessage.startsWith('=')) {
-                partialMessage = partialMessage.substring(1);
-              }
-  
-              console.log('BEFORE CONTINUATION:');
-              console.log('  accumulatedContent length:', accumulatedContent.length);
-              console.log('  accumulatedContent ends with:', accumulatedContent.substring(accumulatedContent.length - 200));
-              console.log('  partialMessage length:', partialMessage.length);
-              console.log('  partialMessage ends with:', partialMessage.substring(partialMessage.length - 200));
-  
-              const continueResponse = await apiClient.getContinuation(apiMessages, assistantMessageId, partialMessage);
-              const continueReader = continueResponse.body.getReader();
-              const continueDecoder = new TextDecoder();
-              let continuationContent = '';
-  
-              while (true) {
-                const timeoutPromise = new Promise((_, reject) => {
-                  setTimeout(() => reject(new Error('Timeout')), config.TIMEOUT_MS);
-                });
-  
-                const readPromise = continueReader.read();
-                const result = await Promise.race([readPromise, timeoutPromise]);
-  
-                if (result.done) break;
-  
-                const chunk = continueDecoder.decode(result.value, { stream: true });
-                const lines = chunk.split('\n');
-  
-                for (const line of lines) {
-                  if (line.startsWith('data: ')) {
-                    const data = line.slice(6);
-                    if (data === '[DONE]') continue;
-  
-                    try {
-                      const parsed = JSON.parse(data);
-                      if (parsed.choices && parsed.choices[0] && parsed.choices[0].delta && parsed.choices[0].delta.content) {
-                        const deltaContent = parsed.choices[0].delta.content;
-                        continuationContent += deltaContent;
-  
-                        // Stream continuation to UI in real-time
-                        if (streamingMessageId) {
-                          const msgs = conversationManager.getMessages();
-                          const streamingMsg = msgs.find(m => m.id === streamingMessageId);
-                          if (streamingMsg) {
-                            streamingMsg.content = accumulatedContent + continuationContent;
-                            this.renderChat();
-                          }
-                        }
-                      }
-                    } catch (e) {
-                      // Ignore parse errors
-                    }
-                  }
-                }
-              }
-  
-              console.log('AFTER CONTINUATION:');
-              console.log('  continuationContent length:', continuationContent.length);
-              console.log('  continuationContent starts with:', continuationContent.substring(0, 200));
-              console.log('  continuationContent ends with:', continuationContent.substring(continuationContent.length - 200));
-  
-              // Validate that continuation starts with ~ (as requested)
-              if (!continuationContent.startsWith('~')) {
-                console.error('Continuation did not start with ~ as requested');
-  
-                // Add the AI's wrong response to conversation first
-                conversationManager.addMessage({
-                  type: 'assistant',
-                  id: assistantMessageId,
-                  content: continuationContent,
-                  timestamp: Date.now(),
-                  parentId: null,
-                  childrenIds: []
-                });
-  
-                // Then add system error message
-                conversationManager.addMessage({
-                  type: 'system_error',
-                  error: `Continuation validation failed: Expected response to start with ~ but got "${continuationContent.substring(0, 50)}..."`,
-                  originalContent: accumulatedContent
-                });
-  
-                this.renderChat();
-                this.updateCharCounter();
-  
-                // Call AI again so it can see the error and fix it
-                await this.sendMessage();
-                return;
-              }
-  
-              // Check for repeating content (AI is stuck)
-              if (continuationContent.length > 100 && continuationContent === lastChunkContent) {
-                console.warn('Continuation repeating same content, stopping attempts');
-                conversationManager.addMessage({
-                  type: 'system_error',
-                  error: 'Response incomplete: AI started repeating content',
-                  originalContent: accumulatedContent + continuationContent
-                });
-                this.renderChat();
-                this.updateCharCounter();
-                this.hideLoading();
-                return;
-              }
-              lastChunkContent = continuationContent;
-  
-              // Clean up the continuation content
-              let cleanedContinuation = continuationContent;
-  
-              // Handle different continuation types:
-              // = → complete message (replace)
-              // ~ → raw continuation text (append)
-              // { → complete tool call (replace)
-  
-              if (cleanedContinuation.startsWith('~')) {
-                // It's a continuation - strip ~ and append
-                cleanedContinuation = cleanedContinuation.substring(1);
-                console.log('Continuation type: raw text (starts with ~), will append');
-                console.log('  Continuation length:', cleanedContinuation.length);
-  
-                // Append to accumulated content
-                accumulatedContent += cleanedContinuation;
-  
-              } else if (cleanedContinuation.startsWith('=')) {
-                // It's a complete message response - this shouldn't happen for continuations but handle it
-                console.log('Continuation is a complete message (starts with =), will replace');
-                accumulatedContent = cleanedContinuation;
-  
-              } else {
-                // It's a tool call JSON - strip any wrapper text before first "{" and after last "}"
-                const firstBrace = cleanedContinuation.indexOf('{');
-                const lastBrace = cleanedContinuation.lastIndexOf('}');
-  
-                if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
-                  const originalLength = cleanedContinuation.length;
-                  cleanedContinuation = cleanedContinuation.substring(firstBrace, lastBrace + 1);
-                  if (originalLength !== cleanedContinuation.length) {
-                    console.log('Stripped wrapper text from JSON, extracted from first { to last }');
-                    console.log('  Original length:', originalLength, '-> Cleaned length:', cleanedContinuation.length);
-                  }
-                }
-  
-                // For tool calls, replace (this is a fallback if AI didn't use ~)
-                console.log('Continuation is complete JSON, will replace');
-                accumulatedContent = cleanedContinuation;
-              }
-  
-              console.log('Combined content length:', accumulatedContent.length);
-  
-              // Try processing the combined content
-              processed = messageProcessor.processStreamedResponse(accumulatedContent);
-  
-              if (processed.complete) {
-                console.log(`Continuation successful after ${continuationAttempts} attempt(s), response now complete`);
-                // Will exit while loop and continue with normal processing
-              }
-            } catch (continueError) {
-              console.error('Continuation failed:', continueError);
-              conversationManager.addMessage({
-                type: 'system_error',
-                error: `Continuation failed after ${continuationAttempts} attempt(s): ${continueError.message}`,
-                originalContent: accumulatedContent
-              });
-              this.renderChat();
-              this.updateCharCounter();
-              this.hideLoading();
-              return;
-            }
-          }
-  
-          // If we exhausted all continuation attempts without getting terminator
-          if (!processed.complete) {
-            console.error(`Response still incomplete after ${MAX_CONTINUATION_ATTEMPTS} continuation attempts`);
-            conversationManager.addMessage({
-              type: 'system_error',
-              error: `Response incomplete after ${MAX_CONTINUATION_ATTEMPTS} continuation attempts`,
-              originalContent: accumulatedContent
-            });
-            this.renderChat();
-            this.updateCharCounter();
-            this.hideLoading();
-            return;
-          }
-  
-          // Successfully got complete response
-          const aiResponse = processed.content;
-  
-          if (aiResponse.type === 'message') {
-            // Message was already streamed, just mark as complete
-            if (streamingMessageId) {
-              const msgs = conversationManager.getMessages();
-              const streamingMsg = msgs.find(m => m.id === streamingMessageId);
-              if (streamingMsg) {
-                streamingMsg.streaming = false;
-                streamingMsg.content = aiResponse.text;
-              }
-            } else {
-              // Fallback: add message if streaming didn't work
-              conversationManager.addMessage({
-                type: 'assistant',
-                content: aiResponse.text
-              });
-            }
-            this.renderChat();
-            this.updateCharCounter();
-            this.hideLoading();
-            success = true;
-  
-          } else if (aiResponse.type === 'execute') {
-            // Tool execution - execute tools one at a time, interleaving use/result messages
-            const utils = window.module['utils.js'];
-  
-            for (const tool of aiResponse.tools) {
-              const toolId = utils.generateUUID();
-  
-              // Add tool_use message
-              conversationManager.addMessage({
-                type: 'tool_use',
-                toolId: toolId,
-                tool: tool
-              });
-  
-              this.renderChat();
-              this.updateCharCounter();
-  
-              // Update loading indicator for this specific tool
-              this.showLoading(`Executing ${tool.name}...`);
-  
-              // Execute this single tool
-              const toolResults = await toolExecutor.executeTools([tool]);
-              const result = toolResults[0];
-  
-              // Add tool_result message immediately after
-              conversationManager.addMessage({
-                type: 'tool_result',
-                toolId: toolId,
-                tool: result.tool,
-                success: result.success,
-                result: result.result,
-                error: result.error,
-                args: result.args
-              });
-  
-              this.renderChat();
-              this.updateCharCounter();
-            }
-  
-            this.hideLoading();
-  
-            // Auto-call API again to let AI respond to tool results
+            console.log('Error detected, calling AI again with error context');
             await this.getAIResponse();
-            success = true;
+            return;
+  
+          } else {
+            // Fatal error
+            console.error('Fatal error:', result.error);
+            this.hideLoading();
+            throw new Error(result.error);
           }
   
         } catch (error) {
@@ -2114,9 +2581,6 @@
   
           // Wait 1 second before retry
           await new Promise(resolve => setTimeout(resolve, 1000));
-          accumulatedContent = ''; // Reset for retry
-          streamingMessageId = null;
-          responseType = null;
         }
       }
   
@@ -2402,20 +2866,22 @@
         content.textContent = message.content;
   
       } else if (message.type === 'tool_use') {
-        // Look for corresponding tool_result to determine color
-        const result = this.findToolResult(message.id);
+        // Handle both old format (msg.tool) and new format (msg.tools array)
+        const tools = message.tools || [message.tool];
   
-        const tool = message.tool;
-        const isChecklistTool = tool.name === 'exit_planning' || tool.name === 'item_completed' || tool.name === 'item_failed';
+        // Check if this is a checklist tool (only show special UI for single checklist tools)
+        const isChecklistTool = tools.length === 1 &&
+          (tools[0].name === 'exit_planning' || tools[0].name === 'item_completed' || tools[0].name === 'item_failed');
   
         if (isChecklistTool) {
           // Hide indicator for checklist tools - we'll show the checklist instead
           indicator.style.display = 'none';
+          const tool = tools[0];
+          const result = this.findToolResult(message.id);
   
           // Show checklist with current state
           if (tool.name === 'exit_planning' && tool.args && tool.args.checklist) {
             content.style.cssText += 'padding: 2px 0; padding-left: 20px;';
-            // Show all items as unchecked initially
             content.innerHTML = this.renderChecklist(tool.args.checklist);
           } else if (tool.name === 'item_completed' || tool.name === 'item_failed') {
             // For item updates, get current checklist state from result
@@ -2432,24 +2898,44 @@
             }
           }
         } else {
-          // Normal tools - show status indicator
-          if (result) {
-            // Result exists - show green for success, red for error
-            indicator.style.backgroundColor = result.success ? '#4ec9b0' : '#f48771';
+          // Normal tools - check if ALL tools have results
+          const allToolsComplete = tools.every(tool => {
+            // Find result for this specific tool by checking tool name
+            return this.allMessages.some(m =>
+              m.type === 'tool_result' &&
+              m.parentId === message.id &&
+              m.tool === tool.name
+            );
+          });
+  
+          if (allToolsComplete) {
+            // All tools done - check if any failed
+            const anyFailed = this.allMessages.some(m =>
+              m.type === 'tool_result' &&
+              m.parentId === message.id &&
+              !m.success
+            );
+            indicator.style.backgroundColor = anyFailed ? '#f48771' : '#4ec9b0';
           } else {
-            // No result yet - show pulsing gray (still executing)
+            // Still executing - show pulsing gray
             indicator.style.backgroundColor = '#858585';
             indicator.style.animation = 'pulse 1.5s ease-in-out infinite';
           }
   
           content.style.cssText += 'color: #d4d4d4; padding: 2px 0; cursor: pointer;';
   
-          // Render single tool as clean one-liner
-          const toolName = this.formatToolName(tool.name);
-          const params = this.formatToolParams(tool.name, tool.args);
-          content.innerHTML = `<span style="font-weight: bold;">${this.escapeHtml(toolName)}</span><span style="color: #858585;"> ${params}</span>`;
+          // Render tools list
+          if (tools.length === 1) {
+            // Single tool - show as one-liner
+            const toolName = this.formatToolName(tools[0].name);
+            const params = this.formatToolParams(tools[0].name, tools[0].args);
+            content.innerHTML = `<span style="font-weight: bold;">${this.escapeHtml(toolName)}</span><span style="color: #858585;"> ${params}</span>`;
+          } else {
+            // Multiple tools - show count
+            content.innerHTML = `<span style="font-weight: bold;">${tools.length} tools</span><span style="color: #858585;"> (${tools.map(t => this.formatToolName(t.name)).join(', ')})</span>`;
+          }
   
-          content.addEventListener('click', () => this.showToolModal('Tool Use', tool));
+          content.addEventListener('click', () => this.showToolModal('Tool Use', tools));
         }
   
       } else if (message.type === 'tool_result') {
