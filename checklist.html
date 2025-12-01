@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Daily Routine Checklist</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: #0f0f0f;
+            color: #e0e0e0;
+            padding: 20px;
+            line-height: 1.6;
+        }
+
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+        }
+
+        h1 {
+            font-size: 2rem;
+            margin-bottom: 10px;
+            color: #fff;
+        }
+
+        .date-display {
+            color: #888;
+            margin-bottom: 30px;
+            font-size: 0.9rem;
+        }
+
+        .section {
+            background: #1a1a1a;
+            border-radius: 12px;
+            padding: 24px;
+            margin-bottom: 20px;
+            border: 1px solid #2a2a2a;
+        }
+
+        .section h2 {
+            font-size: 1.3rem;
+            margin-bottom: 20px;
+            color: #fff;
+            border-bottom: 2px solid #333;
+            padding-bottom: 10px;
+        }
+
+        .checklist-item {
+            display: flex;
+            align-items: flex-start;
+            padding: 12px 0;
+            border-bottom: 1px solid #252525;
+        }
+
+        .checklist-item:last-child {
+            border-bottom: none;
+        }
+
+        .checklist-item input[type="checkbox"] {
+            margin-right: 12px;
+            margin-top: 4px;
+            width: 20px;
+            height: 20px;
+            cursor: pointer;
+            accent-color: #4a9eff;
+            flex-shrink: 0;
+        }
+
+        .checklist-item label {
+            cursor: pointer;
+            flex: 1;
+            user-select: none;
+        }
+
+        .time {
+            color: #4a9eff;
+            font-weight: 600;
+            min-width: 100px;
+            display: inline-block;
+        }
+
+        .activity {
+            color: #e0e0e0;
+        }
+
+        .slot-highlight {
+            background: #1e3a5f;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-weight: 600;
+        }
+
+        .reset-btn {
+            background: #d32f2f;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 8px;
+            font-size: 1rem;
+            cursor: pointer;
+            font-weight: 600;
+            transition: background 0.2s;
+        }
+
+        .reset-btn:hover {
+            background: #b71c1c;
+        }
+
+        .pattern-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 10px;
+        }
+
+        .pattern-table th,
+        .pattern-table td {
+            padding: 10px;
+            text-align: center;
+            border: 1px solid #333;
+        }
+
+        .pattern-table th {
+            background: #252525;
+            color: #4a9eff;
+            font-weight: 600;
+        }
+
+        .pattern-table td {
+            background: #1a1a1a;
+        }
+
+        .today-column {
+            background: #1e3a5f !important;
+            font-weight: 600;
+        }
+
+        .reminder {
+            background: #2a2a2a;
+            padding: 16px;
+            border-radius: 8px;
+            border-left: 4px solid #ffa726;
+        }
+
+        .reminder p {
+            margin: 4px 0;
+        }
+
+        .btn-container {
+            text-align: right;
+            margin-top: 20px;
+        }
+
+        .checked-label {
+            text-decoration: line-through;
+            opacity: 0.5;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Daily Routine</h1>
+        <div class="date-display" id="dateDisplay"></div>
+
+        <div class="section">
+            <h2>Morning & Work Routine</h2>
+            <div id="routineChecklist"></div>
+        </div>
+
+        <div class="section">
+            <h2>Slot 1 Weekly Pattern</h2>
+            <table class="pattern-table">
+                <thead>
+                    <tr>
+                        <th>Mon</th>
+                        <th>Tue</th>
+                        <th>Wed</th>
+                        <th>Thu</th>
+                        <th>Fri</th>
+                        <th>Sat</th>
+                        <th>Sun</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr id="patternRow">
+                        <td>Resistance</td>
+                        <td>Cardio</td>
+                        <td>Resistance</td>
+                        <td>Cardio</td>
+                        <td>Resistance</td>
+                        <td>Cardio</td>
+                        <td>Cardio</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="section">
+            <h2>Bathroom Breaks</h2>
+            <div class="reminder">
+                <p><strong>Leave phone at desk. No input. Sit with boredom.</strong></p>
+            </div>
+        </div>
+
+        <div class="btn-container">
+            <button class="reset-btn" onclick="resetChecklist()">Reset All</button>
+        </div>
+    </div>
+
+    <script>
+        const routineItems = [
+            { time: "6:30", activity: "Wake + sunscreen" },
+            { time: "6:35-6:50", activity: "Stretching/warm-up (outside)" },
+            { time: "6:50-7:15", activity: "Morning walk (no jacket in winter)" },
+            { time: "7:15-7:35", activity: "Slot 1: SLOT_PLACEHOLDER", isSlot: true },
+            { time: "7:35-7:45", activity: "Cold rinse" },
+            { time: "7:45-8:00", activity: "Breakfast + Omega-3 (1-2g) + Vitamin D3 (2000-5000 IU) + Alpha GPC (300mg) + Glutamine" },
+            { time: "8:00-8:30", activity: "Kids out the door" },
+            { time: "8:30-8:45", activity: "Meditation" },
+            { time: "8:45-9:00", activity: "Make coffee + L-theanine (100-200mg)" },
+            { time: "9:00-11:00", activity: "Deep Work Block #1" },
+            { time: "11:00-11:30", activity: "Oatmeal + second coffee (last of day)" },
+            { time: "11:30-12:00", activity: "Slot 2: Cardio / Nap" },
+            { time: "12:00-12:15", activity: "Meditation (skip if napped)" },
+            { time: "12:15-2:30", activity: "Deep Work Block #2" },
+            { time: "2:30-3:00", activity: "Slot 3: Nap / Cardio (15 min) + NSDR (15 min)" },
+            { time: "3:00-3:30", activity: "Pizza" },
+            { time: "3:30-3:40", activity: "Meditation" },
+            { time: "3:40-5:00", activity: "Work Block #3" },
+            { time: "Evening", activity: "Full shower" },
+            { time: "~10:00", activity: "Magnesium glycinate (200-400mg) + L-theanine (400mg)" },
+            { time: "When sleepy", activity: "Bed (wake time fixed at 6:30)" }
+        ];
+
+        const slotPattern = ["Resistance", "Cardio", "Resistance", "Cardio", "Resistance", "Cardio", "Cardio"];
+        const dayNames = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+
+        function getTodaySlot() {
+            const today = new Date();
+            const dayIndex = today.getDay(); // 0 = Sunday, 1 = Monday, etc.
+            const mondayIndex = (dayIndex + 6) % 7; // Convert to Monday = 0
+            return slotPattern[mondayIndex];
+        }
+
+        function displayDate() {
+            const today = new Date();
+            const dayName = dayNames[today.getDay()];
+            const dateStr = today.toLocaleDateString('en-US', { 
+                year: 'numeric', 
+                month: 'long', 
+                day: 'numeric' 
+            });
+            document.getElementById('dateDisplay').textContent = `${dayName}, ${dateStr}`;
+            
+            // Highlight today's column in pattern table
+            const todayIndex = today.getDay();
+            const mondayIndex = (todayIndex + 6) % 7;
+            const cells = document.getElementById('patternRow').children;
+            cells[mondayIndex].classList.add('today-column');
+        }
+
+        function renderChecklist() {
+            const todaySlot = getTodaySlot();
+            const container = document.getElementById('routineChecklist');
+            
+            routineItems.forEach((item, index) => {
+                const div = document.createElement('div');
+                div.className = 'checklist-item';
+                
+                const checkbox = document.createElement('input');
+                checkbox.type = 'checkbox';
+                checkbox.id = `item-${index}`;
+                checkbox.dataset.index = index;
+                
+                // Load saved state
+                const saved = localStorage.getItem(`routine-${index}`);
+                if (saved === 'true') {
+                    checkbox.checked = true;
+                }
+                
+                checkbox.addEventListener('change', function() {
+                    localStorage.setItem(`routine-${index}`, this.checked);
+                    updateLabelStyle(this);
+                });
+                
+                const label = document.createElement('label');
+                label.htmlFor = `item-${index}`;
+                
+                let activityText = item.activity;
+                if (item.isSlot) {
+                    activityText = item.activity.replace('SLOT_PLACEHOLDER', `<span class="slot-highlight">${todaySlot}</span>`);
+                }
+                
+                label.innerHTML = `<span class="time">${item.time}</span> <span class="activity">${activityText}</span>`;
+                
+                div.appendChild(checkbox);
+                div.appendChild(label);
+                container.appendChild(div);
+                
+                updateLabelStyle(checkbox);
+            });
+        }
+
+        function updateLabelStyle(checkbox) {
+            const label = document.querySelector(`label[for="${checkbox.id}"]`);
+            if (checkbox.checked) {
+                label.classList.add('checked-label');
+            } else {
+                label.classList.remove('checked-label');
+            }
+        }
+
+        function resetChecklist() {
+            if (confirm('Are you sure you want to reset all checkboxes?')) {
+                routineItems.forEach((item, index) => {
+                    localStorage.removeItem(`routine-${index}`);
+                    const checkbox = document.getElementById(`item-${index}`);
+                    if (checkbox) {
+                        checkbox.checked = false;
+                        updateLabelStyle(checkbox);
+                    }
+                });
+            }
+        }
+
+        // Initialize on load
+        displayDate();
+        renderChecklist();
+    </script>
+</body>
+</html>
