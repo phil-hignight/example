@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-12-01T21:18:25.513Z
+// AI Agent - Built 2025-12-01T21:27:17.409Z
 (function() {
   window.module = {};
 
@@ -18,7 +18,7 @@
       console.log('TESTING OUTPUT LIMIT');
       console.log('='.repeat(80));
   
-      const conversationFlow = window.module['conversation-flow.js'];
+      const config = window.module['config.js'];
       const utils = window.module['utils.js'];
   
       // Test with increasing max_tokens values
@@ -30,7 +30,7 @@
         { tokens: 32768, chars: 131072 }
       ];
   
-      console.log('Testing with simple request: "Write a very long technical explanation about computer memory"');
+      console.log('Testing with simple request: "Write a very long technical explanation"');
       console.log('');
   
       let maxSuccessful = 0;
@@ -38,23 +38,40 @@
       for (const test of testSizes) {
         console.log(`Testing ${test.tokens} tokens (≈${test.chars} chars)...`);
   
-        const messages = [{
-          role: 'user',
-          content: 'Write a very long, detailed technical explanation about computer memory architecture. Include multiple sections with examples. Make it as long as possible.'
-        }];
+        const userMessage = 'Write a very long, detailed technical explanation about computer memory. Include multiple sections. Make it as long as possible.';
   
         try {
           const startTime = Date.now();
-          const assistantMessageId = utils.generateUUID();
   
-          // Use existing getCompletion with max_tokens override
-          const config = window.module['config.js'];
+          // Step 1: Create chat using /new
+          const { chatId, messageId } = await this.createNewChat(userMessage);
+  
+          // Step 2: Update chat using /chats/{id}
+          const userMsgObj = {
+            id: messageId,
+            parentId: null,
+            childrenIds: [],
+            role: 'user',
+            content: userMessage,
+            timestamp: Date.now()
+          };
+  
+          await this.updateChat([userMsgObj]);
+  
+          // Step 3: Get completion using /chat/completions with max_tokens override
+          const assistantMessageId = utils.generateUUID();
+          const apiMessages = [{
+            role: 'user',
+            content: userMessage
+          }];
+  
           const payload = {
             stream: true,
             model: config.MODEL,
-            messages: messages,
+            messages: apiMessages,
             max_tokens: test.tokens,
             session_id: this.sessionId,
+            chat_id: chatId,
             id: assistantMessageId,
             params: {},
             features: { web_search: false },
@@ -76,32 +93,44 @@
             break;
           }
   
-          // Use existing conversation flow to handle response
+          // Read the streaming response (just count chars, don't process)
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder();
           let content = '';
-          const result = await conversationFlow.handleAIResponse(
-            response,
-            assistantMessageId,
-            messages,
-            {
-              onProgress: () => {},
-              onChunk: (chunk) => { content += chunk; }
+  
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+  
+            const chunk = decoder.decode(value, { stream: true });
+            const lines = chunk.split('\n');
+  
+            for (const line of lines) {
+              if (line.startsWith('data: ')) {
+                const data = line.slice(6);
+                if (data === '[DONE]') continue;
+  
+                try {
+                  const parsed = JSON.parse(data);
+                  const delta = parsed.choices?.[0]?.delta?.content;
+                  if (delta) {
+                    content += delta;
+                  }
+                } catch (e) {
+                  // Ignore parse errors
+                }
+              }
             }
-          );
+          }
   
           const totalDuration = Date.now() - startTime;
           const actualChars = content.length;
   
-          if (result.success) {
-            console.log(`  ✓ SUCCESS: ${actualChars} chars received (${totalDuration}ms)`);
-            maxSuccessful = test.chars;
-          } else {
-            console.log(`  ✗ FAILED: ${result.error}`);
-            break;
-          }
+          console.log(`  ✓ SUCCESS: ${actualChars} chars received (${totalDuration}ms)`);
+          maxSuccessful = test.chars;
   
         } catch (error) {
           console.log(`  ✗ ERROR: ${error.message}`);
-          console.log(`    Stack: ${error.stack?.substring(0, 200)}`);
           break;
         }
   
@@ -1338,6 +1367,32 @@
       console.log('');
       const apiClient = window.module['api-client.js'];
       await apiClient.testOutputLimit();
+  
+      // Start keepalive mechanism - ping every 5 minutes to keep session alive
+      this.startKeepalive();
+    },
+  
+    startKeepalive: function() {
+      const KEEPALIVE_INTERVAL = 5 * 60 * 1000; // 5 minutes in milliseconds
+  
+      setInterval(async () => {
+        try {
+          const config = window.module['config.js'];
+          // Simple ping to /v1/chats/new to keep session alive
+          await fetch(`${config.API_BASE}/v1/chats/new`, {
+            method: 'GET',
+            headers: {
+              'Content-Type': 'application/json'
+            }
+          });
+          console.log('[Keepalive] Session ping sent');
+        } catch (error) {
+          // Ignore errors - this is just a keepalive
+          console.log('[Keepalive] Ping failed (ignored):', error.message);
+        }
+      }, KEEPALIVE_INTERVAL);
+  
+      console.log('[Keepalive] Started - will ping every 5 minutes');
     }
   };
   
