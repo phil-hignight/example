@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-12-01T20:33:23.552Z
+// AI Agent - Built 2025-12-01T21:08:16.816Z
 (function() {
   window.module = {};
 
@@ -11,6 +11,89 @@
     init: function() {
       const utils = window.module['utils.js'];
       this.sessionId = utils.generateSessionId();
+    },
+  
+    testOutputLimit: async function() {
+      console.log('\n' + '='.repeat(80));
+      console.log('TESTING OUTPUT LIMIT');
+      console.log('='.repeat(80));
+  
+      const config = window.module['config.js'];
+  
+      // Test with increasing max_tokens values
+      // 1 token ≈ 4 chars, so: 4K, 8K, 16K, 32K, 64K tokens = 16K, 32K, 64K, 128K, 256K chars
+      const testSizes = [
+        { tokens: 4096, chars: 16384 },
+        { tokens: 8192, chars: 32768 },
+        { tokens: 16384, chars: 65536 },
+        { tokens: 32768, chars: 131072 }
+      ];
+  
+      console.log('Testing with simple request: "Write a very long technical explanation about computer memory"');
+      console.log('');
+  
+      let maxSuccessful = 0;
+  
+      for (const test of testSizes) {
+        console.log(`Testing ${test.tokens} tokens (≈${test.chars} chars)...`);
+  
+        const messages = [{
+          role: 'user',
+          content: 'Write a very long, detailed technical explanation about computer memory architecture. Include multiple sections with examples. Make it as long as possible.'
+        }];
+  
+        const payload = {
+          stream: false,
+          model: config.MODEL,
+          messages: messages,
+          max_tokens: test.tokens
+        };
+  
+        try {
+          const startTime = Date.now();
+          const response = await fetch(`${config.API_BASE}/chat/completions`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(payload)
+          });
+  
+          const duration = Date.now() - startTime;
+  
+          if (!response.ok) {
+            console.log(`  ✗ FAILED: ${response.status} ${response.statusText} (${duration}ms)`);
+            break;
+          }
+  
+          const data = await response.json();
+          const content = data.choices?.[0]?.message?.content || '';
+          const actualChars = content.length;
+  
+          console.log(`  ✓ SUCCESS: ${actualChars} chars received (${duration}ms)`);
+          maxSuccessful = test.chars;
+  
+        } catch (error) {
+          console.log(`  ✗ ERROR: ${error.message}`);
+          break;
+        }
+  
+        // Small delay between tests
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+  
+      console.log('');
+      console.log('='.repeat(80));
+      if (maxSuccessful > 0) {
+        console.log(`RESULT: Max successful output: ${maxSuccessful} chars`);
+        console.log(`Recommended safe limit: ${Math.floor(maxSuccessful * 0.8)} chars (80% of max)`);
+      } else {
+        console.log('RESULT: Unable to determine output limit (all tests failed)');
+      }
+      console.log('='.repeat(80));
+      console.log('');
+  
+      return maxSuccessful;
     },
   
     createNewChat: async function(firstMessage) {
@@ -1198,7 +1281,7 @@
   window.module['main.js'] = {
     version: '2.0.0-alpha',
   
-    run: function() {
+    run: async function() {
       console.log('Initializing API Test Interface v2.0...');
       console.log('Version:', this.version);
       console.log('Mode: Planning Mode (Execution Mode not yet implemented)');
@@ -1222,6 +1305,11 @@
       console.log('- Summarization (500K limit)');
       console.log('- Partial message continuation');
       console.log('- Auto-call after tool execution');
+  
+      // Test output limit on startup
+      console.log('');
+      const apiClient = window.module['api-client.js'];
+      await apiClient.testOutputLimit();
     }
   };
   
