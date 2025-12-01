@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-12-01T16:52:23.721Z
+// AI Agent - Built 2025-12-01T17:00:25.064Z
 (function() {
   window.module = {};
 
@@ -541,6 +541,11 @@
         // Process the accumulated response
         let processed = messageProcessor.processStreamedResponse(accumulatedContent);
   
+        // Add system warning if text was trimmed
+        if (processed.systemWarning) {
+          conversationManager.addMessage(processed.systemWarning);
+        }
+  
         if (processed.error) {
           // Add the AI's failed response to conversation first
           conversationManager.addMessage({
@@ -633,6 +638,11 @@
   
               // Re-process the combined response
               processed = messageProcessor.processStreamedResponse(accumulatedContent);
+  
+              // Add system warning if text was trimmed (from continuation processing)
+              if (processed.systemWarning) {
+                conversationManager.addMessage(processed.systemWarning);
+              }
   
               if (processed.complete && !processed.error) {
                 // Success!
@@ -995,7 +1005,8 @@
 
   // Module: message-processor.js
   // Message Processor
-  // Handles processing of streamed responses with = prefix (message) or { prefix (tools)
+  // Handles processing of streamed responses with = prefix (message), { prefix (tools), or ~ prefix (continuation)
+  // Implements 3-layer processing: Text Trimming → JSON Repair → Validation
   window.module['message-processor.js'] = {
     TERMINATOR: '|||||END|||||',
   
@@ -1016,24 +1027,27 @@
       // Detect response type by first character
       const firstChar = content.charAt(0);
   
-      if (firstChar === '=') {
-        // Message response
-        return this.processMessage(content);
-      } else if (firstChar === '{') {
-        // Tool execution response
+      if (firstChar === '=' || firstChar === '~') {
+        // Message or continuation response - no trimming needed
+        return this.processMessage(content, firstChar);
+      } else if (content.includes('{')) {
+        // Tool execution response - may have text before/after JSON, apply full 3-layer processing
+        // Layer 1 will trim any text before { and after }
         return this.processTools(content);
       } else {
+        // Invalid format - doesn't start with =, ~, or contain { anywhere
         return {
           complete: true,
           content: null,
-          error: `Invalid response format: must start with = or {, got "${firstChar}"`,
-          originalContent: rawText
+          error: `Invalid response format: must start with = (message), ~ (continuation), or contain { (tools)`,
+          originalContent: rawText,
+          systemWarning: null
         };
       }
     },
   
-    processMessage: function(text) {
-      // Remove = prefix
+    processMessage: function(text, prefix) {
+      // Remove prefix (= or ~)
       const message = text.substring(1);
   
       return {
@@ -1042,62 +1056,278 @@
           type: 'message',
           text: message
         },
-        error: null
+        error: null,
+        systemWarning: null
       };
     },
   
-    processTools: function(jsonText) {
+    processTools: function(rawJsonText) {
+      // ===== LAYER 1: TEXT TRIMMING =====
+      const trimResult = this.trimToJson(rawJsonText);
+      const jsonText = trimResult.trimmed;
+      const systemWarning = trimResult.systemWarning;
+  
+      // ===== LAYER 2: JSON PARSING & REPAIR =====
+      const parseResult = this.parseAndRepairJson(jsonText);
+      if (parseResult.error) {
+        return {
+          complete: true,
+          content: null,
+          error: parseResult.error,
+          originalContent: rawJsonText,
+          systemWarning: systemWarning
+        };
+      }
+  
+      const data = parseResult.data;
+  
+      // ===== LAYER 3: VALIDATION =====
+      const validationResult = this.validateToolsResponse(data, jsonText);
+      if (validationResult.error) {
+        return {
+          complete: true,
+          content: null,
+          error: validationResult.error,
+          originalContent: rawJsonText,
+          systemWarning: systemWarning
+        };
+      }
+  
+      return {
+        complete: true,
+        content: {
+          type: 'execute',
+          tools: data.tools
+        },
+        error: null,
+        systemWarning: systemWarning
+      };
+    },
+  
+    // ===== LAYER 1: TEXT TRIMMING =====
+    trimToJson: function(text) {
+      const openBrace = text.indexOf('{');
+      const closeBrace = text.lastIndexOf('}');
+  
+      if (openBrace === -1 || closeBrace === -1 || closeBrace < openBrace) {
+        // No valid JSON structure found
+        return {
+          trimmed: text,
+          systemWarning: null
+        };
+      }
+  
+      const trimmedPrefix = text.substring(0, openBrace);
+      const trimmedSuffix = text.substring(closeBrace + 1);
+      const jsonText = text.substring(openBrace, closeBrace + 1);
+  
+      // Check if anything was trimmed
+      if (trimmedPrefix.length > 0 || trimmedSuffix.length > 0) {
+        return {
+          trimmed: jsonText,
+          systemWarning: {
+            type: 'system_warning',
+            warning: `Trimmed ${trimmedPrefix.length} characters before JSON and ${trimmedSuffix.length} characters after`,
+            trimmed_prefix: trimmedPrefix,
+            trimmed_suffix: trimmedSuffix
+          }
+        };
+      }
+  
+      return {
+        trimmed: jsonText,
+        systemWarning: null
+      };
+    },
+  
+    // ===== LAYER 2: JSON PARSING & REPAIR =====
+    parseAndRepairJson: function(jsonText) {
       // IMPORTANT: The AI sometimes sends JSON with literal newlines despite instructions not to
       // We need to replace literal newlines with \n escape sequences before parsing
       // But we need to be careful not to break JSON strings that legitimately contain \n
       const normalizedJson = jsonText.replace(/\n/g, '\\n').replace(/\r/g, '');
   
-      // Parse JSON
+      let lastError = null;
+  
+      // Try parsing as-is first
       try {
         const data = JSON.parse(normalizedJson);
-  
-        // Validate structure
-        if (!data || typeof data !== 'object') {
-          return {
-            complete: true,
-            content: null,
-            error: 'Invalid tools response: not an object',
-            originalContent: jsonText
-          };
-        }
-  
-        if (!Array.isArray(data.tools)) {
-          return {
-            complete: true,
-            content: null,
-            error: 'Invalid tools response: tools must be an array',
-            originalContent: jsonText
-          };
-        }
-  
-        // TODO: Add comprehensive tool validation
-        // - Check each tool has name and args
-        // - Validate tool names
-        // - Validate args match tool requirements
-  
-        return {
-          complete: true,
-          content: {
-            type: 'execute',
-            tools: data.tools
-          },
-          error: null
-        };
-  
+        return { data, error: null };
       } catch (e) {
-        // TODO: Implement JSON repair logic
+        lastError = e;
+        // Parsing failed, attempt repairs
+      }
+  
+      // Repair 1: Add missing trailing }
+      try {
+        const withBrace = normalizedJson + '}';
+        const data = JSON.parse(withBrace);
+        console.log('[JSON Repair] Added missing trailing }');
+        return { data, error: null };
+      } catch (e) {
+        lastError = e;
+        // Continue to next repair
+      }
+  
+      // Repair 2: Add missing trailing ]
+      try {
+        const withBracket = normalizedJson + ']';
+        const data = JSON.parse(withBracket);
+        console.log('[JSON Repair] Added missing trailing ]');
+        return { data, error: null };
+      } catch (e) {
+        lastError = e;
+        // Continue to next repair
+      }
+  
+      // Repair 3: Add missing trailing ]}
+      try {
+        const withBoth = normalizedJson + ']}';
+        const data = JSON.parse(withBoth);
+        console.log('[JSON Repair] Added missing trailing ]}');
+        return { data, error: null };
+      } catch (e) {
+        lastError = e;
+        // Continue to next repair
+      }
+  
+      // Repair 4: Remove trailing commas
+      try {
+        const withoutTrailingCommas = normalizedJson
+          .replace(/,(\s*[}\]])/g, '$1');  // Remove commas before closing braces/brackets
+        const data = JSON.parse(withoutTrailingCommas);
+        console.log('[JSON Repair] Removed trailing commas');
+        return { data, error: null };
+      } catch (e) {
+        lastError = e;
+        // Continue to next repair
+      }
+  
+      // Repair 5: Fix unescaped quotes (basic attempt)
+      try {
+        // This is a simple heuristic - replace \" inside string values with '
+        // More sophisticated repair would require proper parsing
+        const withFixedQuotes = normalizedJson.replace(/"([^"]*)"([^"]*?)"/g, (match, p1, p2) => {
+          if (p2.includes('"')) {
+            return `"${p1}${p2.replace(/"/g, "'")}"`;
+          }
+          return match;
+        });
+        const data = JSON.parse(withFixedQuotes);
+        console.log('[JSON Repair] Fixed unescaped quotes');
+        return { data, error: null };
+      } catch (e) {
+        lastError = e;
+        // All repairs failed
+      }
+  
+      // All attempts failed
+      return {
+        data: null,
+        error: `JSON parse error: ${lastError.message}`
+      };
+    },
+  
+    // ===== LAYER 3: VALIDATION =====
+    validateToolsResponse: function(data, originalJson) {
+      // Check basic structure
+      if (!data || typeof data !== 'object') {
         return {
-          complete: true,
-          content: null,
-          error: `JSON parse error: ${e.message}`,
-          originalContent: jsonText
+          error: 'Invalid tools response: not an object'
         };
       }
+  
+      if (!Array.isArray(data.tools)) {
+        return {
+          error: 'Invalid tools response: tools must be an array'
+        };
+      }
+  
+      if (data.tools.length === 0) {
+        return {
+          error: 'Invalid tools response: tools array is empty'
+        };
+      }
+  
+      // Validate each tool
+      const validToolNames = [
+        'list_folder',
+        'read_file',
+        'create_file',
+        'edit_file',
+        'exit_planning',
+        'item_completed',
+        'item_failed'
+      ];
+  
+      for (let i = 0; i < data.tools.length; i++) {
+        const tool = data.tools[i];
+  
+        // Check tool has name
+        if (!tool.name) {
+          return {
+            error: `Invalid tool at index ${i}: missing "name" field`
+          };
+        }
+  
+        // Check tool name is valid
+        if (!validToolNames.includes(tool.name)) {
+          // Try to suggest similar tool names
+          const suggestions = validToolNames.filter(name =>
+            name.includes(tool.name) || tool.name.includes(name.replace('_', ''))
+          );
+          const suggestionText = suggestions.length > 0
+            ? ` Did you mean: ${suggestions.join(', ')}?`
+            : '';
+          return {
+            error: `Invalid tool name: "${tool.name}"${suggestionText}`
+          };
+        }
+  
+        // Check tool has args
+        if (!tool.args || typeof tool.args !== 'object') {
+          return {
+            error: `Invalid tool at index ${i}: "${tool.name}" must have "args" object`
+          };
+        }
+  
+        // Validate mode-specific tool availability
+        const modeValidation = this.validateToolMode(tool.name);
+        if (modeValidation.error) {
+          return modeValidation;
+        }
+      }
+  
+      return { error: null };
+    },
+  
+    // Check if tool is available in current mode
+    validateToolMode: function(toolName) {
+      const modeManager = window.module['mode-manager.js'];
+      if (!modeManager) {
+        // Mode manager not available, skip validation
+        return { error: null };
+      }
+  
+      const currentMode = modeManager.getMode();
+      const sharedTools = ['list_folder', 'read_file'];
+      const planningOnlyTools = ['exit_planning'];
+      const executionOnlyTools = ['create_file', 'edit_file', 'item_completed', 'item_failed'];
+  
+      // Check if tool is restricted to a specific mode
+      if (currentMode === 'planning' && executionOnlyTools.includes(toolName)) {
+        return {
+          error: `Tool "${toolName}" is not available in Planning Mode. Available tools: ${sharedTools.concat(planningOnlyTools).join(', ')}`
+        };
+      }
+  
+      if (currentMode === 'execution' && planningOnlyTools.includes(toolName)) {
+        return {
+          error: `Tool "${toolName}" is not available in Execution Mode. Available tools: ${sharedTools.concat(executionOnlyTools).join(', ')}`
+        };
+      }
+  
+      return { error: null };
     }
   };
   
