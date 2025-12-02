@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-12-02T00:20:38.433Z
+// AI Agent - Built 2025-12-02T17:03:22.445Z
 (function() {
   window.module = {};
 
@@ -547,6 +547,161 @@
   
   window.module['conversation-flow.js'] = {
     /**
+     * Main conversation loop - handles the complete AI conversation cycle
+     * This is the auto-call loop extracted from UI layer for testability
+     *
+     * @param {Object} options - Configuration options
+     * @param {Function} options.onProgress - Called with status updates (optional)
+     * @param {Function} options.onUpdate - Called after state changes for UI updates (optional)
+     * @param {number} options.maxLoops - Maximum number of loops to prevent infinite loops (default: 50)
+     * @returns {Promise<Object>} - { success: boolean, loopCount: number, error: string|null }
+     */
+    runConversationLoop: async function(options = {}) {
+      const conversationManager = window.module['conversation-manager.js'];
+      const apiRenderer = window.module['api-renderer.js'];
+      const apiClient = window.module['api-client.js'];
+      const toolExecutor = window.module['tool-executor.js'];
+      const utils = window.module['utils.js'];
+      const config = window.module['config.js'];
+  
+      const maxLoops = options.maxLoops || 50;
+      const onProgress = options.onProgress || (() => {});
+      const onUpdate = options.onUpdate || (() => {});
+  
+      let loopCount = 0;
+  
+      // Keep calling AI until it sends a message (not tools)
+      while (loopCount < maxLoops) {
+        loopCount++;
+        onProgress(`Loop ${loopCount}...`);
+  
+        // Get messages for API
+        const messages = conversationManager.getMessages();
+        const apiMessages = apiRenderer.renderMessagesForAPI(messages);
+  
+        // Create chat if needed
+        if (!apiClient.chatId && messages.length > 0) {
+          const firstUserMsg = messages.find(m => m.type === 'user');
+          if (firstUserMsg) {
+            await apiClient.createNewChat(firstUserMsg.content);
+          }
+        }
+  
+        // Get completion with streaming
+        const assistantMessageId = utils.generateUUID();
+  
+        let retryCount = 0;
+        let success = false;
+  
+        while (retryCount < config.MAX_RETRIES && !success) {
+          try {
+            const response = await apiClient.getCompletion(apiMessages, assistantMessageId);
+  
+            // Handle the streaming response
+            const result = await this.handleAIResponse(
+              response,
+              assistantMessageId,
+              apiMessages,
+              {
+                onProgress: onProgress,
+                onChunk: options.onChunk
+              }
+            );
+  
+            // Handle the result
+            if (result.success) {
+              const aiResponse = result.content;
+  
+              if (aiResponse.type === 'message') {
+                // AI sent a message - conversation complete
+                conversationManager.addMessage({
+                  type: 'assistant',
+                  content: aiResponse.text
+                });
+                onUpdate();
+  
+                // Success - exit the loop
+                return {
+                  success: true,
+                  loopCount: loopCount,
+                  error: null
+                };
+  
+              } else if (aiResponse.type === 'execute') {
+                // Tool execution - create ONE tool_use message with ALL tools
+                const toolUseMessage = conversationManager.addMessage({
+                  type: 'tool_use',
+                  tools: aiResponse.tools
+                });
+                onUpdate();
+  
+                // Execute tools sequentially, creating individual tool_result messages
+                for (const tool of aiResponse.tools) {
+                  onProgress(`Executing ${tool.name}...`);
+  
+                  const toolResults = await toolExecutor.executeTools([tool]);
+                  const toolResult = toolResults[0];
+  
+                  conversationManager.addMessage({
+                    type: 'tool_result',
+                    parentId: toolUseMessage.id,
+                    tool: toolResult.tool,
+                    success: toolResult.success,
+                    result: toolResult.result,
+                    error: toolResult.error,
+                    args: toolResult.args
+                  });
+                  onUpdate();
+                }
+  
+                // Auto-call API again to let AI respond to tool results
+                // Continue to next iteration of the while loop
+                success = true;
+              }
+  
+            } else if (result.needsRetry) {
+              // Error already added to conversation by handleAIResponse
+              onUpdate();
+  
+              // Continue to next loop iteration to let AI see the error
+              success = true;
+  
+            } else {
+              // Fatal error
+              return {
+                success: false,
+                loopCount: loopCount,
+                error: result.error
+              };
+            }
+  
+          } catch (error) {
+            retryCount++;
+            console.warn(`Attempt ${retryCount} failed:`, error.message);
+  
+            if (retryCount >= config.MAX_RETRIES) {
+              return {
+                success: false,
+                loopCount: loopCount,
+                error: error.message
+              };
+            }
+  
+            // Wait 1 second before retry
+            await new Promise(resolve => setTimeout(resolve, 1000));
+          }
+        }
+      }
+  
+      // Hit max loops
+      return {
+        success: false,
+        loopCount: loopCount,
+        error: `Hit maximum loop limit (${maxLoops})`
+      };
+    },
+  
+    /**
      * Process a streaming AI response with continuation and error handling
      * This is the core conversation loop extracted from ui-manager
      *
@@ -650,18 +805,24 @@
         }
   
         // Check if response is incomplete (missing terminator)
-        // With the new chunking system, this shouldn't happen because:
-        // 1. AI has 100K char limit (plenty of space)
-        // 2. AI uses continue: true flag in tools for large content
-        // 3. Each response should be valid JSON with terminator
+        // When this happens, include the truncated content in the error message
+        // so the AI can see what it generated and continue from there
         if (!processed.complete) {
           console.error('Response incomplete - missing terminator');
           console.error('Response length:', accumulatedContent.length);
           console.error('Last 100 chars:', accumulatedContent.substring(Math.max(0, accumulatedContent.length - 100)));
   
+          // Include the truncated content in the error message so AI can continue
+          const errorMessage = `Your previous response was truncated (${accumulatedContent.length} chars received, but missing |||||END||||| terminator).
+  
+  Here is what you generated before being cut off:
+  ${accumulatedContent}
+  
+  Please continue from exactly where you left off. Complete the JSON and add the terminator |||||END|||||`;
+  
           conversationManager.addMessage({
             type: 'system_error',
-            error: 'Response incomplete: Missing |||||END||||| terminator. Response may have been cut off.',
+            error: errorMessage,
             originalContent: accumulatedContent
           });
   
@@ -2010,31 +2171,15 @@
   
   - list_folder: Explore directories
   - read_file: Read files
-  - create_file: Create new files (can include "continue": true to signal more content coming)
-  - append_file: Append content to existing files (can include "continue": true)
+  - create_file: Create new files
   - edit_file: Edit existing files
   - item_completed: Mark task complete
   - item_failed: Mark task failed
   
-  ## Large Content Handling
+  ## Important Notes
   
-  ⚠️ IMPORTANT: Responses are limited to 100,000 characters total.
-  
-  For large files, use the chunking system:
-  1. First call create_file with partial content and "continue": true
-  2. System will respond asking for next chunk
-  3. Call append_file with next chunk and "continue": true (if more coming)
-  4. Repeat until done
-  5. Final call: append_file without "continue" flag
-  
-  Example:
-  {"tools":[{"name":"create_file","args":{"path":"large.txt","content":"Lines 1-100...","continue":true}}]}|||||END|||||
-  
-  System responds, then you continue:
-  {"tools":[{"name":"append_file","args":{"path":"large.txt","content":"Lines 101-200...","continue":true}}]}|||||END|||||
-  
-  Final chunk (no continue flag):
-  {"tools":[{"name":"append_file","args":{"path":"large.txt","content":"Lines 201-250..."}}]}|||||END|||||
+  - If your response gets cut off mid-generation, don't worry - the system will detect this and ask you to continue from where you left off.
+  - Just generate your content naturally - if it's truncated, you'll see what you generated and can continue.
   
   ## Rules
   
@@ -2068,7 +2213,7 @@
   window.module['tool-executor.js'] = {
     // Define tool availability by mode
     PLANNING_TOOLS: ['list_folder', 'read_file', 'exit_planning'],
-    EXECUTION_TOOLS: ['list_folder', 'read_file', 'create_file', 'append_file', 'edit_file', 'item_completed', 'item_failed'],
+    EXECUTION_TOOLS: ['list_folder', 'read_file', 'create_file', 'edit_file', 'item_completed', 'item_failed'],
   
     executeTools: async function(tools) {
       const results = [];
@@ -2130,9 +2275,6 @@
   
           case 'create_file':
             return await this.createFile(tool.args);
-  
-          case 'append_file':
-            return await this.appendFile(tool.args);
   
           case 'edit_file':
             return await this.editFile(tool.args);
@@ -2755,7 +2897,18 @@
           "></textarea>
           <div style="display: flex; justify-content: space-between; align-items: center; padding: 6px 10px; background: #252526; border-top: 1px solid #3e3e42;">
             <span id="folderName" style="font-size: 11px; color: #858585;"></span>
-            <span id="charCount" style="font-size: 11px; color: #858585;"></span>
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <span id="charCount" style="font-size: 11px; color: #858585;"></span>
+              <button id="menuButton" style="
+                background: transparent;
+                border: none;
+                color: #858585;
+                cursor: pointer;
+                font-size: 14px;
+                padding: 0 4px;
+                line-height: 1;
+              ">⋮</button>
+            </div>
           </div>
         </div>
         <div id="errorMsg" style="margin-top: 4px; color: #f48771; font-size: 13px;"></div>
@@ -2765,8 +2918,39 @@
       container.appendChild(chatPanel);
       document.body.appendChild(container);
   
+      // Create menu dropdown (hidden by default)
+      const menuDropdown = document.createElement('div');
+      menuDropdown.id = 'menuDropdown';
+      menuDropdown.style.cssText = `
+        position: absolute;
+        bottom: 50px;
+        right: 30px;
+        background: #2d2d30;
+        border: 1px solid #3e3e42;
+        border-radius: 3px;
+        padding: 4px 0;
+        display: none;
+        z-index: 100;
+        min-width: 160px;
+      `;
+      menuDropdown.innerHTML = `
+        <button id="clearConversationBtn" style="
+          width: 100%;
+          background: transparent;
+          border: none;
+          color: #d4d4d4;
+          padding: 6px 12px;
+          text-align: left;
+          cursor: pointer;
+          font-size: 13px;
+        " onmouseover="this.style.background='#094771'" onmouseout="this.style.background='transparent'">Clear Conversation</button>
+      `;
+      document.body.appendChild(menuDropdown);
+  
       // Event listeners
       const userInput = document.getElementById('userInput');
+      const menuButton = document.getElementById('menuButton');
+      const clearConversationBtn = document.getElementById('clearConversationBtn');
   
       // Auto-resize textarea as content changes
       const autoResize = () => {
@@ -2785,6 +2969,29 @@
         setTimeout(autoResize, 0);
       });
   
+      // Menu button click handler
+      menuButton.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const menu = document.getElementById('menuDropdown');
+        menu.style.display = menu.style.display === 'none' ? 'block' : 'none';
+      });
+  
+      // Clear conversation button
+      clearConversationBtn.addEventListener('click', () => {
+        if (confirm('Are you sure you want to clear the conversation? This cannot be undone.')) {
+          this.clearConversation();
+        }
+        document.getElementById('menuDropdown').style.display = 'none';
+      });
+  
+      // Close menu when clicking outside
+      document.addEventListener('click', (e) => {
+        const menu = document.getElementById('menuDropdown');
+        if (menu && !menuButton.contains(e.target) && !menu.contains(e.target)) {
+          menu.style.display = 'none';
+        }
+      });
+  
       // Set folder name
       const fileSystem = window.module['file-system.js'];
       const folderNameElement = document.getElementById('folderName');
@@ -2793,6 +3000,9 @@
       }
   
       this.updateCharCounter();
+  
+      // Render any existing conversation messages
+      this.renderChat();
     },
   
     handleSubmit: async function() {
@@ -3266,6 +3476,29 @@
       } catch (error) {
         console.error('TEST FAILED:', error.message, error);
       }
+    },
+  
+    clearConversation: async function() {
+      const conversationManager = window.module['conversation-manager.js'];
+      const conversationPersistence = window.module['conversation-persistence.js'];
+      const apiClient = window.module['api-client.js'];
+  
+      // Clear in-memory conversation
+      conversationManager.messages = [];
+  
+      // Clear persistence file
+      if (conversationPersistence.isInitialized) {
+        await conversationPersistence.clearConversation();
+      }
+  
+      // Reset chat ID so new conversation starts fresh
+      apiClient.chatId = null;
+  
+      // Clear UI
+      this.renderChat();
+      this.updateCharCounter();
+  
+      console.log('[UI] Conversation cleared');
     }
   };
   
