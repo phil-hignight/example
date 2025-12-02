@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-12-02T00:07:54.265Z
+// AI Agent - Built 2025-12-02T00:20:38.433Z
 (function() {
   window.module = {};
 
@@ -320,122 +320,6 @@
       console.log('Response status:', response.status);
   
       return response;
-    },
-  
-    getContinuation: async function(apiMessages, assistantMessageId, partialContent) {
-      const config = window.module['config.js'];
-  
-      console.log('\n' + '='.repeat(80));
-      console.log('CONTINUATION REQUEST');
-      console.log('='.repeat(80));
-      console.log('Messages in conversation:', apiMessages.length);
-      console.log('Partial content length:', partialContent.length, 'chars');
-      console.log('First 50 chars:', JSON.stringify(partialContent.substring(0, 50)));
-      console.log('Last 50 chars:', JSON.stringify(partialContent.substring(Math.max(0, partialContent.length - 50))));
-  
-      // Determine if this is a message or tool call
-      // The AI sometimes adds text before the JSON, so we need to check if JSON exists anywhere
-      // Use regex to be whitespace-tolerant
-      const toolJsonMatch = partialContent.match(/\{\s*"tools"\s*:\s*\[/);
-      const hasToolJson = toolJsonMatch !== null;
-      const isToolCall = partialContent.trimStart().startsWith('{') || hasToolJson;
-      const isMessage = partialContent.startsWith('=');
-  
-      console.log('Response type: ' + (isToolCall ? 'TOOL_CALL' : isMessage ? 'MESSAGE' : 'UNKNOWN'));
-  
-      let wrappedContent;
-      let continuationPrompt;
-  
-      if (isToolCall) {
-        // If there's text before the JSON, extract just the JSON part for wrapping
-        let jsonPart = partialContent;
-        if (hasToolJson && !partialContent.trimStart().startsWith('{')) {
-          const jsonStart = toolJsonMatch.index;
-          jsonPart = partialContent.substring(jsonStart);
-          console.log(`[WARN] AI added text before JSON. Extracted JSON starting at position ${jsonStart}`);
-        }
-  
-        // For tool calls, ask for a CONTINUATION (not complete JSON)
-        // Use ~ prefix to indicate it's a continuation that should be appended
-        wrappedContent = `Here's a partial response that got cut off:\n\`\`\`json\n${jsonPart}\n\`\`\``;
-  
-        continuationPrompt = `Your previous response was cut off mid-JSON. Send ONLY the continuation text that should be appended.
-  
-  The response ended with: "${jsonPart.substring(Math.max(0, jsonPart.length - 100))}"
-  
-  Start your response with ~ followed by the exact text that should come next. Do NOT send complete JSON, do NOT start with {, just send the raw continuation text that will be appended to what you already wrote.
-  
-  Example: if the partial ended with "...delay", you might send:
-  ~ed memory access made them impractical for large-scale use."}}]}|||||END|||||
-  
-  The ~ tells the system this is a continuation to be appended, not a new complete response.`;
-      } else if (isMessage) {
-        // For messages: also use ~ for continuation
-        const messageContent = partialContent.substring(1); // Remove = prefix
-        wrappedContent = `Here's a partial message that got cut off:\n\`\`\`\n${messageContent}\n\`\`\``;
-  
-        continuationPrompt = `Your previous message was cut off. Send ONLY the continuation text.
-  
-  The message ended with: "${messageContent.substring(messageContent.length - 100)}"
-  
-  Start your response with ~ followed by the next words. This will be appended to what you already wrote.
-  
-  Example: if it ended with "...early memory solution", you might send:
-  ~. These devices stored data as acoustic pulses...|||||END|||||`;
-      } else {
-        // Unknown format, send as-is
-        wrappedContent = partialContent;
-        continuationPrompt = '[System: Your previous response was cut off. Please continue from where you left off with ~ prefix.]';
-      }
-  
-      // Build continuation messages with wrapped content
-      const continueMessages = [
-        ...apiMessages,
-        {
-          role: 'assistant',
-          content: wrappedContent
-        },
-        {
-          role: 'user',
-          content: continuationPrompt
-        }
-      ];
-  
-      console.log('Sending continuation request...');
-      console.log('='.repeat(80));
-  
-      const payload = {
-        stream: true,
-        model: config.MODEL,
-        messages: continueMessages,
-        params: {},
-        features: {
-          web_search: false
-        },
-        session_id: this.sessionId,
-        chat_id: this.chatId,
-        id: assistantMessageId,
-        background_tasks: {
-          title_generation: false,
-          tags_generation: false
-        }
-      };
-  
-      const response = await fetch(`${config.API_BASE}/chat/completions`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(payload)
-      });
-  
-      if (!response.ok) {
-        throw new Error(`Failed to get continuation: ${response.status} ${response.statusText}`);
-      }
-  
-      console.log('Continuation response status:', response.status);
-  
-      return response;
     }
   };
   
@@ -677,10 +561,8 @@
     handleAIResponse: async function(streamingResponse, assistantMessageId, apiMessages, callbacks = {}) {
       const conversationManager = window.module['conversation-manager.js'];
       const messageProcessor = window.module['message-processor.js'];
-      const apiClient = window.module['api-client.js'];
       const config = window.module['config.js'];
   
-      const MAX_CONTINUATION_ATTEMPTS = 20;
       let accumulatedContent = '';
   
       try {
@@ -726,7 +608,7 @@
         // Check if response exceeds 100K character limit
         const MAX_RESPONSE_CHARS = 100000;
         if (accumulatedContent.length > MAX_RESPONSE_CHARS) {
-          await conversationManager.addMessage({
+          conversationManager.addMessage({
             type: 'system_warning',
             warning: `Response exceeded ${MAX_RESPONSE_CHARS} character limit (got ${accumulatedContent.length} chars). Response was truncated. Use chunking with "continue": true flag for large content.`
           });
@@ -737,12 +619,12 @@
   
         // Add system warning if text was trimmed
         if (processed.systemWarning) {
-          await conversationManager.addMessage(processed.systemWarning);
+          conversationManager.addMessage(processed.systemWarning);
         }
   
         if (processed.error) {
           // Add the AI's failed response to conversation first
-          await conversationManager.addMessage({
+          conversationManager.addMessage({
             type: 'assistant',
             id: assistantMessageId,
             content: accumulatedContent,
@@ -752,7 +634,7 @@
           });
   
           // Then add system error message
-          await conversationManager.addMessage({
+          conversationManager.addMessage({
             type: 'system_error',
             error: processed.error,
             originalContent: processed.originalContent || accumulatedContent
@@ -767,178 +649,27 @@
           };
         }
   
-        // Handle incomplete responses - try continuation
-        let continuationAttempts = 0;
-  
-        while (!processed.complete && continuationAttempts < MAX_CONTINUATION_ATTEMPTS) {
-          continuationAttempts++;
-  
-          if (continuationAttempts === 1) {
-            // Log once at the start of continuation loop
-            console.log('\n' + '!'.repeat(80));
-            console.log('RESPONSE INCOMPLETE - STARTING CONTINUATION LOOP');
-            console.log('!'.repeat(80));
-            console.log('Accumulated so far:', accumulatedContent.length, 'chars');
-            console.log('Has terminator:', accumulatedContent.includes('|||||END|||||'));
-            console.log('Last 50 chars:', JSON.stringify(accumulatedContent.substring(Math.max(0, accumulatedContent.length - 50))));
-            console.log('!'.repeat(80));
-          }
-  
-          if (callbacks.onProgress) {
-            callbacks.onProgress(`Requesting continuation (${continuationAttempts}/${MAX_CONTINUATION_ATTEMPTS})...`);
-          }
-  
-          try {
-            // Extract the actual message content (remove = prefix if present)
-            let partialMessage = accumulatedContent;
-            if (partialMessage.startsWith('=')) {
-              partialMessage = partialMessage.substring(1);
-            }
-  
-            const continueResponse = await apiClient.getContinuation(apiMessages, assistantMessageId, partialMessage);
-            const continueReader = continueResponse.body.getReader();
-            const continueDecoder = new TextDecoder();
-            let continuationContent = '';
-  
-            while (true) {
-              const timeoutPromise = new Promise((_, reject) => {
-                setTimeout(() => reject(new Error('Timeout')), config.TIMEOUT_MS);
-              });
-  
-              const readPromise = continueReader.read();
-              const result = await Promise.race([readPromise, timeoutPromise]);
-  
-              if (result.done) break;
-  
-              const chunk = continueDecoder.decode(result.value, { stream: true });
-              const lines = chunk.split('\n');
-  
-              for (const line of lines) {
-                if (line.startsWith('data: ')) {
-                  const data = line.slice(6);
-                  if (data === '[DONE]') continue;
-  
-                  try {
-                    const parsed = JSON.parse(data);
-                    if (parsed.choices?.[0]?.delta?.content) {
-                      const content = parsed.choices[0].delta.content;
-                      continuationContent += content;
-  
-                      if (callbacks.onChunk) {
-                        callbacks.onChunk(content, accumulatedContent + continuationContent);
-                      }
-                    }
-                  } catch (e) {
-                    console.error('Failed to parse continuation SSE data:', e);
-                  }
-                }
-              }
-            }
-  
-            // Check if AI used ~ prefix for continuation
-            console.log('\n' + '='.repeat(80));
-            console.log('CONTINUATION RECEIVED (attempt ' + continuationAttempts + ')');
-            console.log('='.repeat(80));
-            console.log('Continuation length:', continuationContent.length, 'chars');
-            console.log('First char:', JSON.stringify(continuationContent.charAt(0)));
-            console.log('Starts with ~:', continuationContent.startsWith('~'));
-            console.log('First 50 chars:', JSON.stringify(continuationContent.substring(0, 50)));
-            console.log('='.repeat(80));
-  
-            if (continuationContent.startsWith('~')) {
-              console.log('✓ AI correctly used ~ prefix');
-              // Strip ~ and append to accumulated content
-              const cleaned = continuationContent.substring(1);
-              accumulatedContent += cleaned;
-              console.log('Combined length now:', accumulatedContent.length, 'chars');
-  
-              // Re-process the combined response
-              processed = messageProcessor.processStreamedResponse(accumulatedContent);
-  
-              // Add system warning if text was trimmed (from continuation processing)
-              if (processed.systemWarning) {
-                await conversationManager.addMessage(processed.systemWarning);
-              }
-  
-              if (processed.complete && !processed.error) {
-                // Success!
-                break;
-              } else if (processed.error) {
-                // Still has error after continuation
-                await conversationManager.addMessage({
-                  type: 'assistant',
-                  id: assistantMessageId,
-                  content: accumulatedContent,
-                  timestamp: Date.now(),
-                  parentId: null,
-                  childrenIds: []
-                });
-  
-                await conversationManager.addMessage({
-                  type: 'system_error',
-                  error: processed.error,
-                  originalContent: processed.originalContent || accumulatedContent
-                });
-  
-                return {
-                  success: false,
-                  content: null,
-                  error: processed.error,
-                  needsRetry: true
-                };
-              }
-              // else: still incomplete, loop continues
-            } else {
-              // AI didn't use ~ prefix - not a proper continuation
-              console.log('✗ ERROR: AI did NOT use ~ prefix!');
-              console.log('This means AI restarted instead of continuing.');
-              console.log('Continuation response was:', JSON.stringify(continuationContent.substring(0, 100)));
-  
-              await conversationManager.addMessage({
-                type: 'system_error',
-                error: 'Response incomplete: AI did not continue properly',
-                originalContent: accumulatedContent
-              });
-  
-              return {
-                success: false,
-                content: null,
-                error: 'AI did not continue properly',
-                needsRetry: true
-              };
-            }
-  
-          } catch (error) {
-            console.error('Continuation attempt failed:', error);
-  
-            await conversationManager.addMessage({
-              type: 'system_error',
-              error: `Continuation error: ${error.message}`,
-              originalContent: accumulatedContent
-            });
-  
-            return {
-              success: false,
-              content: null,
-              error: error.message,
-              needsRetry: false
-            };
-          }
-        }
-  
-        // Check if we exhausted continuation attempts
+        // Check if response is incomplete (missing terminator)
+        // With the new chunking system, this shouldn't happen because:
+        // 1. AI has 100K char limit (plenty of space)
+        // 2. AI uses continue: true flag in tools for large content
+        // 3. Each response should be valid JSON with terminator
         if (!processed.complete) {
-          await conversationManager.addMessage({
+          console.error('Response incomplete - missing terminator');
+          console.error('Response length:', accumulatedContent.length);
+          console.error('Last 100 chars:', accumulatedContent.substring(Math.max(0, accumulatedContent.length - 100)));
+  
+          conversationManager.addMessage({
             type: 'system_error',
-            error: `Response incomplete after ${MAX_CONTINUATION_ATTEMPTS} continuation attempts`,
+            error: 'Response incomplete: Missing |||||END||||| terminator. Response may have been cut off.',
             originalContent: accumulatedContent
           });
   
           return {
             success: false,
             content: null,
-            error: `Too many continuation attempts (${MAX_CONTINUATION_ATTEMPTS})`,
-            needsRetry: false
+            error: 'Response incomplete',
+            needsRetry: true
           };
         }
   
@@ -953,7 +684,7 @@
       } catch (error) {
         console.error('handleAIResponse error:', error);
   
-        await conversationManager.addMessage({
+        conversationManager.addMessage({
           type: 'system_error',
           error: error.message,
           originalContent: accumulatedContent
@@ -992,7 +723,7 @@
       }
     },
   
-    addMessage: async function(message) {
+    addMessage: function(message) {
       const utils = window.module['utils.js'];
       const config = window.module['config.js'];
   
@@ -1025,16 +756,19 @@
   
       if (wouldExceedLimit) {
         console.log(`Would exceed ${config.MAX_CONVERSATION_CHARS} char limit (current: ${currentCount}, adding: ${messageCharCount}). Triggering summarization...`);
-        await this.summarize();
+        // Trigger summarization asynchronously (don't block)
+        this.summarize().catch(err => console.error('[ConversationManager] Summarization error:', err));
       }
   
-      // Add the message
+      // Add the message to memory immediately
       this.messages.push(message);
   
-      // Save to disk
+      // Save to disk asynchronously (don't block the UI)
       const persistence = window.module['conversation-persistence.js'];
       if (persistence.isInitialized) {
-        await persistence.saveMessage(message);
+        persistence.saveMessage(message).catch(err =>
+          console.error('[ConversationManager] Failed to persist message:', err)
+        );
       }
   
       return message;
@@ -3075,10 +2809,10 @@
       this.hideError();
   
       try {
-        // Add user message
-        await this.addUserMessage(content);
+        // Add user message (synchronous, renders immediately)
+        this.addUserMessage(content);
   
-        // Get AI response
+        // Get AI response (starts immediately, persisting happens async in background)
         await this.getAIResponse();
   
       } catch (error) {
@@ -3087,16 +2821,18 @@
       }
     },
   
-    addUserMessage: async function(content) {
+    addUserMessage: function(content) {
       const conversationManager = window.module['conversation-manager.js'];
-      const utils = window.module['utils.js'];
   
       const userMessage = {
         type: 'user',
         content: content
       };
   
-      await conversationManager.addMessage(userMessage);
+      // Add to conversation (synchronous, persists async in background)
+      conversationManager.addMessage(userMessage);
+  
+      // Render immediately
       this.renderChat();
       this.updateCharCounter();
     },
@@ -3206,7 +2942,7 @@
                 }
               } else {
                 // Fallback: add message if streaming didn't work
-                await conversationManager.addMessage({
+                conversationManager.addMessage({
                   type: 'assistant',
                   content: aiResponse.text
                 });
@@ -3218,7 +2954,7 @@
   
             } else if (aiResponse.type === 'execute') {
               // Tool execution - create ONE tool_use message with ALL tools
-              const toolUseMessage = await conversationManager.addMessage({
+              const toolUseMessage = conversationManager.addMessage({
                 type: 'tool_use',
                 tools: aiResponse.tools
               });
@@ -3233,7 +2969,7 @@
                 const toolResults = await toolExecutor.executeTools([tool]);
                 const toolResult = toolResults[0];
   
-                await conversationManager.addMessage({
+                conversationManager.addMessage({
                   type: 'tool_result',
                   parentId: toolUseMessage.id,
                   tool: toolResult.tool,
