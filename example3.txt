@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-12-02T23:30:34.987Z
+// AI Agent - Built 2025-12-02T23:35:19.857Z
 (function() {
   window.module = {};
 
@@ -1221,22 +1221,37 @@
       // Create .agent folder if needed
       // Handle empty folderPath to avoid leading slash
       const agentFolder = folderPath ? folderPath + '/.agent' : '.agent';
+      console.log('[Persistence] Agent folder path:', agentFolder);
       try {
         await fileSystem.listFolder({ path: agentFolder });
+        console.log('[Persistence] .agent folder already exists');
       } catch (e) {
         // Folder doesn't exist, create it
         console.log('[Persistence] Creating .agent folder...');
-        // Note: We'll need to add a createFolder tool
-        await fileSystem.createFolder({ path: agentFolder });
+        try {
+          await fileSystem.createFolder({ path: agentFolder });
+          console.log('[Persistence] .agent folder created successfully');
+        } catch (createError) {
+          console.error('[Persistence] Failed to create .agent folder:', createError);
+          throw createError;
+        }
       }
   
       // Create .agent/internal folder if needed
       const internalFolder = agentFolder + '/internal';
+      console.log('[Persistence] Internal folder path:', internalFolder);
       try {
         await fileSystem.listFolder({ path: internalFolder });
+        console.log('[Persistence] .agent/internal folder already exists');
       } catch (e) {
         console.log('[Persistence] Creating .agent/internal folder...');
-        await fileSystem.createFolder({ path: internalFolder });
+        try {
+          await fileSystem.createFolder({ path: internalFolder });
+          console.log('[Persistence] .agent/internal folder created successfully');
+        } catch (createError) {
+          console.error('[Persistence] Failed to create .agent/internal folder:', createError);
+          throw createError;
+        }
       }
   
       // Set file paths
