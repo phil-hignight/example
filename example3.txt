@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-12-02T18:55:52.972Z
+// AI Agent - Built 2025-12-02T19:57:22.241Z
 (function() {
   window.module = {};
 
@@ -654,6 +654,26 @@
                   onUpdate();
                 }
   
+                // If the response was truncated and auto-executed, tell the AI
+                if (aiResponse.wasTruncated) {
+                  const truncatedTool = aiResponse.tools[0];
+                  const toolName = truncatedTool.name;
+                  const contentLength = truncatedTool.args.content ? truncatedTool.args.content.length : 0;
+  
+                  let message = '';
+                  if (toolName === 'create_file') {
+                    message = `Note: Your ${toolName} response was truncated at ${aiResponse.truncatedLength} characters. I auto-completed the JSON and wrote ${contentLength} characters to ${truncatedTool.args.path}. If you need to add more content, use append_file.`;
+                  } else if (toolName === 'append_file') {
+                    message = `Note: Your ${toolName} response was truncated at ${aiResponse.truncatedLength} characters. I auto-completed the JSON and appended ${contentLength} characters to ${truncatedTool.args.path}. If you need to add more content, use append_file again.`;
+                  }
+  
+                  conversationManager.addMessage({
+                    type: 'system_warning',
+                    warning: message
+                  });
+                  onUpdate();
+                }
+  
                 // Auto-call API again to let AI respond to tool results
                 // Continue to next iteration of the while loop
                 success = true;
@@ -805,8 +825,7 @@
         }
   
         // Check if response is incomplete (missing terminator)
-        // When this happens, include the truncated content in the error message
-        // so the AI can see what it generated and continue from there
+        // Try to auto-close JSON and execute it if possible
         if (!processed.complete) {
           console.error('Response incomplete - missing terminator');
           console.error('Response length:', accumulatedContent.length);
@@ -819,37 +838,108 @@
             console.log('[Truncation] Stripped leading = from response');
           }
   
-          // Add the AI's truncated response to conversation first
-          conversationManager.addMessage({
-            type: 'assistant',
-            id: assistantMessageId,
-            content: cleanContent,
-            timestamp: Date.now(),
-            parentId: null,
-            childrenIds: []
-          });
+          // Try to auto-close and parse the JSON
+          const autoCloseResult = messageProcessor.attemptAutoClose(cleanContent);
   
-          // Include the truncated content in the error message so AI can continue
-          const errorMessage = `Your previous response was truncated (${cleanContent.length} chars received, but missing |||||END||||| terminator).
+          if (autoCloseResult.success && autoCloseResult.tools) {
+            // Successfully parsed! Check if it's a tool we can auto-execute
+            const tools = autoCloseResult.tools;
+            console.log(`[Truncation] Auto-closed JSON successfully, found ${tools.length} tool(s)`);
   
-  Here is what you generated before being cut off:
-  ${cleanContent}
+            // Check if ALL tools are create_file or append_file (safe to auto-execute)
+            const allSafeTools = tools.every(t => t.name === 'create_file' || t.name === 'append_file');
   
-  Please continue from exactly where you left off. Complete the JSON and add the terminator |||||END|||||`;
+            if (allSafeTools && tools.length > 0) {
+              // Execute the tools and tell AI we did it
+              console.log('[Truncation] All tools are create_file/append_file - auto-executing');
   
-          // Then add system error message
-          conversationManager.addMessage({
-            type: 'system_error',
-            error: errorMessage,
-            originalContent: cleanContent
-          });
+              return {
+                success: true,
+                content: {
+                  type: 'execute',
+                  tools: tools,
+                  wasTruncated: true,
+                  truncatedLength: cleanContent.length
+                },
+                error: null
+              };
+            } else if (tools.some(t => t.name === 'edit_file')) {
+              // edit_file was truncated - ask AI to resend smaller
+              console.log('[Truncation] Found edit_file tool - cannot auto-execute, asking for smaller edit');
   
-          return {
-            success: false,
-            content: null,
-            error: 'Response incomplete',
-            needsRetry: true
-          };
+              conversationManager.addMessage({
+                type: 'assistant',
+                id: assistantMessageId,
+                content: cleanContent,
+                timestamp: Date.now(),
+                parentId: null,
+                childrenIds: []
+              });
+  
+              conversationManager.addMessage({
+                type: 'system_error',
+                error: `Your edit_file tool call was truncated at ${cleanContent.length} characters. The edit content is too large to send in one request. Please break it into smaller edits or use create_file + append_file for large file creation.`,
+                originalContent: cleanContent
+              });
+  
+              return {
+                success: false,
+                content: null,
+                error: 'edit_file truncated',
+                needsRetry: true
+              };
+            } else {
+              // Other tool types - ask AI to resend smaller
+              console.log('[Truncation] Found other tool types - asking for smaller request');
+  
+              conversationManager.addMessage({
+                type: 'assistant',
+                id: assistantMessageId,
+                content: cleanContent,
+                timestamp: Date.now(),
+                parentId: null,
+                childrenIds: []
+              });
+  
+              conversationManager.addMessage({
+                type: 'system_error',
+                error: `Your tool call was truncated at ${cleanContent.length} characters. Please send a smaller request that fits within the response limit.`,
+                originalContent: cleanContent
+              });
+  
+              return {
+                success: false,
+                content: null,
+                error: 'Tool call truncated',
+                needsRetry: true
+              };
+            }
+          } else {
+            // Couldn't auto-close JSON - ask AI to resend smaller
+            console.log('[Truncation] Could not auto-close JSON - asking for smaller request');
+  
+            conversationManager.addMessage({
+              type: 'assistant',
+              id: assistantMessageId,
+              content: cleanContent,
+              timestamp: Date.now(),
+              parentId: null,
+              childrenIds: []
+            });
+  
+            conversationManager.addMessage({
+              type: 'system_error',
+              error: `Your response was truncated at ${cleanContent.length} characters and could not be parsed as valid JSON. Please send a smaller request that fits within the response limit.`,
+              originalContent: cleanContent
+            });
+  
+            return {
+              success: false,
+              content: null,
+              error: 'Response truncated - invalid JSON',
+              needsRetry: true
+            };
+          }
         }
   
         // Success! Return the processed content
@@ -1945,6 +2035,7 @@
         'list_folder',
         'read_file',
         'create_file',
+        'append_file',
         'edit_file',
         'exit_planning',
         'item_completed',
@@ -2003,7 +2094,7 @@
       const currentMode = modeManager.getMode();
       const sharedTools = ['list_folder', 'read_file'];
       const planningOnlyTools = ['exit_planning'];
-      const executionOnlyTools = ['create_file', 'edit_file', 'item_completed', 'item_failed'];
+      const executionOnlyTools = ['create_file', 'append_file', 'edit_file', 'item_completed', 'item_failed'];
   
       // Check if tool is restricted to a specific mode
       if (currentMode === 'planning' && executionOnlyTools.includes(toolName)) {
@@ -2019,6 +2110,46 @@
       }
   
       return { error: null };
+    },
+  
+    // Attempt to auto-close truncated JSON for create_file/append_file tools
+    attemptAutoClose: function(truncatedContent) {
+      // First trim to JSON (remove any text before { and after })
+      const trimResult = this.trimToJson(truncatedContent);
+      let jsonText = trimResult.trimmed;
+  
+      // Try adding closing characters in this order:
+      const closingPatterns = [
+        '"}}]}',     // Most common: close string, close args object, close tool object, close tools array
+        '}}]}',      // If string was already closed
+        '"}}]}}',    // If inside exit_planning checklist
+        '}]}',       // If both string and args were closed
+        '"]}}]}',    // If cut off in middle of array
+        '"}]}}]}'    // Complex nested case
+      ];
+  
+      for (const closing of closingPatterns) {
+        const attempt = jsonText + closing;
+        const parseResult = this.parseAndRepairJson(attempt);
+  
+        if (parseResult.data && !parseResult.error) {
+          // Successfully parsed! Validate it has the right structure
+          if (parseResult.data.tools && Array.isArray(parseResult.data.tools) && parseResult.data.tools.length > 0) {
+            console.log(`[Auto-close] Successfully closed JSON with pattern: ${closing}`);
+            return {
+              success: true,
+              tools: parseResult.data.tools
+            };
+          }
+        }
+      }
+  
+      // Could not auto-close
+      console.log('[Auto-close] Failed to auto-close JSON with any pattern');
+      return {
+        success: false,
+        tools: null
+      };
     }
   };
   
@@ -2179,14 +2310,16 @@
   - list_folder: Explore directories
   - read_file: Read files
   - create_file: Create new files
+  - append_file: Append content to existing files
   - edit_file: Edit existing files
   - item_completed: Mark task complete
   - item_failed: Mark task failed
   
   ## Important Notes
   
-  - If your response gets cut off mid-generation, don't worry - the system will detect this and ask you to continue from where you left off.
-  - Just generate your content naturally - if it's truncated, you'll see what you generated and can continue.
+  - For large files (>30K chars), use create_file for the first chunk, then append_file for additional chunks.
+  - If your tool call gets truncated due to size, the system will attempt to auto-complete and execute it, then tell you to use append_file to continue.
+  - For edit_file, if your edit is too large and gets truncated, you'll be asked to resend with smaller changes.
   
   ## Rules
   
@@ -2220,7 +2353,7 @@
   window.module['tool-executor.js'] = {
     // Define tool availability by mode
     PLANNING_TOOLS: ['list_folder', 'read_file', 'exit_planning'],
-    EXECUTION_TOOLS: ['list_folder', 'read_file', 'create_file', 'edit_file', 'item_completed', 'item_failed'],
+    EXECUTION_TOOLS: ['list_folder', 'read_file', 'create_file', 'append_file', 'edit_file', 'item_completed', 'item_failed'],
   
     executeTools: async function(tools) {
       const results = [];
@@ -2282,6 +2415,9 @@
   
           case 'create_file':
             return await this.createFile(tool.args);
+  
+          case 'append_file':
+            return await this.appendFile(tool.args);
   
           case 'edit_file':
             return await this.editFile(tool.args);
