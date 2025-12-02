@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-12-02T23:10:38.405Z
+// AI Agent - Built 2025-12-02T23:20:44.233Z
 (function() {
   window.module = {};
 
@@ -3384,6 +3384,9 @@
       const uiRenderer = window.module['ui-renderer.js'];
       const chatArea = document.getElementById('chatArea');
   
+      // Check if user is near bottom before re-rendering (within 40px)
+      const wasNearBottom = chatArea.scrollHeight - chatArea.scrollTop - chatArea.clientHeight < 40;
+  
       chatArea.innerHTML = '';
   
       const messages = conversationManager.getMessages();
@@ -3396,8 +3399,10 @@
         chatArea.appendChild(msgElement);
       });
   
-      // Scroll to bottom
-      chatArea.scrollTop = chatArea.scrollHeight;
+      // Only auto-scroll if user was already near the bottom
+      if (wasNearBottom) {
+        chatArea.scrollTop = chatArea.scrollHeight;
+      }
     },
   
     updateCharCounter: function() {
