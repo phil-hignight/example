@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-12-01T23:45:42.213Z
+// AI Agent - Built 2025-12-02T00:07:54.265Z
 (function() {
   window.module = {};
 
@@ -721,6 +721,15 @@
               }
             }
           }
+        }
+  
+        // Check if response exceeds 100K character limit
+        const MAX_RESPONSE_CHARS = 100000;
+        if (accumulatedContent.length > MAX_RESPONSE_CHARS) {
+          await conversationManager.addMessage({
+            type: 'system_warning',
+            warning: `Response exceeded ${MAX_RESPONSE_CHARS} character limit (got ${accumulatedContent.length} chars). Response was truncated. Use chunking with "continue": true flag for large content.`
+          });
         }
   
         // Process the accumulated response
@@ -1698,11 +1707,6 @@
       console.log('- Partial message continuation');
       console.log('- Auto-call after tool execution');
   
-      // Test output limit on startup
-      console.log('');
-      const apiClient = window.module['api-client.js'];
-      await apiClient.testOutputLimit();
-  
       // Start keepalive mechanism - ping every 5 minutes to keep session alive
       this.startKeepalive();
     },
@@ -2272,10 +2276,31 @@
   
   - list_folder: Explore directories
   - read_file: Read files
-  - create_file: Create new files
+  - create_file: Create new files (can include "continue": true to signal more content coming)
+  - append_file: Append content to existing files (can include "continue": true)
   - edit_file: Edit existing files
   - item_completed: Mark task complete
   - item_failed: Mark task failed
+  
+  ## Large Content Handling
+  
+  ⚠️ IMPORTANT: Responses are limited to 100,000 characters total.
+  
+  For large files, use the chunking system:
+  1. First call create_file with partial content and "continue": true
+  2. System will respond asking for next chunk
+  3. Call append_file with next chunk and "continue": true (if more coming)
+  4. Repeat until done
+  5. Final call: append_file without "continue" flag
+  
+  Example:
+  {"tools":[{"name":"create_file","args":{"path":"large.txt","content":"Lines 1-100...","continue":true}}]}|||||END|||||
+  
+  System responds, then you continue:
+  {"tools":[{"name":"append_file","args":{"path":"large.txt","content":"Lines 101-200...","continue":true}}]}|||||END|||||
+  
+  Final chunk (no continue flag):
+  {"tools":[{"name":"append_file","args":{"path":"large.txt","content":"Lines 201-250..."}}]}|||||END|||||
   
   ## Rules
   
@@ -2309,7 +2334,7 @@
   window.module['tool-executor.js'] = {
     // Define tool availability by mode
     PLANNING_TOOLS: ['list_folder', 'read_file', 'exit_planning'],
-    EXECUTION_TOOLS: ['list_folder', 'read_file', 'create_file', 'edit_file', 'item_completed', 'item_failed'],
+    EXECUTION_TOOLS: ['list_folder', 'read_file', 'create_file', 'append_file', 'edit_file', 'item_completed', 'item_failed'],
   
     executeTools: async function(tools) {
       const results = [];
@@ -2371,6 +2396,9 @@
   
           case 'create_file':
             return await this.createFile(tool.args);
+  
+          case 'append_file':
+            return await this.appendFile(tool.args);
   
           case 'edit_file':
             return await this.editFile(tool.args);
@@ -2545,15 +2573,87 @@
   
       try {
         await fileSystem.createFile(args.path, args.content);
+  
+        // Check for continue flag
+        const hasContinue = args.continue === true;
+        const message = hasContinue
+          ? `Created ${args.path} with ${args.content.length} chars. Continue with next chunk.`
+          : `Created ${args.path} with ${args.content.length} chars.`;
+  
         return {
           tool: 'create_file',
           success: true,
-          result: { path: args.path, size_bytes: args.content.length },
+          result: {
+            path: args.path,
+            size_bytes: args.content.length,
+            continue_expected: hasContinue,
+            message: message
+          },
           args: args
         };
       } catch (error) {
         return {
           tool: 'create_file',
+          success: false,
+          error: error.message,
+          args: args
+        };
+      }
+    },
+  
+    appendFile: async function(args) {
+      const fileSystem = window.module['file-system.js'];
+  
+      if (!fileSystem.directoryHandle) {
+        return {
+          tool: 'append_file',
+          success: false,
+          error: 'No directory selected. Please select a folder first.',
+          args: args
+        };
+      }
+  
+      if (!args.path) {
+        return {
+          tool: 'append_file',
+          success: false,
+          error: 'Missing required argument: path',
+          args: args
+        };
+      }
+  
+      if (!args.content && args.content !== '') {
+        return {
+          tool: 'append_file',
+          success: false,
+          error: 'Missing required argument: content',
+          args: args
+        };
+      }
+  
+      try {
+        await fileSystem.appendFile(args);
+  
+        // Check for continue flag
+        const hasContinue = args.continue === true;
+        const message = hasContinue
+          ? `Appended ${args.content.length} chars to ${args.path}. Continue with next chunk.`
+          : `Appended ${args.content.length} chars to ${args.path}. File complete.`;
+  
+        return {
+          tool: 'append_file',
+          success: true,
+          result: {
+            path: args.path,
+            appended_bytes: args.content.length,
+            continue_expected: hasContinue,
+            message: message
+          },
+          args: args
+        };
+      } catch (error) {
+        return {
+          tool: 'append_file',
           success: false,
           error: error.message,
           args: args
