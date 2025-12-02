@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-12-02T23:20:44.233Z
+// AI Agent - Built 2025-12-02T23:30:34.987Z
 (function() {
   window.module = {};
 
@@ -1219,7 +1219,8 @@
       const fileSystem = window.module['file-system.js'];
   
       // Create .agent folder if needed
-      const agentFolder = folderPath + '/.agent';
+      // Handle empty folderPath to avoid leading slash
+      const agentFolder = folderPath ? folderPath + '/.agent' : '.agent';
       try {
         await fileSystem.listFolder({ path: agentFolder });
       } catch (e) {
@@ -2937,8 +2938,8 @@
       const success = await fileSystem.requestDirectory();
   
       if (success) {
-        // Get folder path from directory handle
-        const folderPath = fileSystem.directoryHandle.name;
+        // Use empty string as folder path since fileSystem is already at the root
+        const folderPath = '';
   
         // Initialize conversation manager with folder path for persistence
         await conversationManager.init(folderPath);
