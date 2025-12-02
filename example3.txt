@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-12-02T19:57:22.241Z
+// AI Agent - Built 2025-12-02T23:10:38.405Z
 (function() {
   window.module = {};
 
@@ -553,7 +553,7 @@
      * @param {Object} options - Configuration options
      * @param {Function} options.onProgress - Called with status updates (optional)
      * @param {Function} options.onUpdate - Called after state changes for UI updates (optional)
-     * @param {number} options.maxLoops - Maximum number of loops to prevent infinite loops (default: 50)
+     * @param {number} options.maxLoops - Maximum number of loops to prevent infinite loops (default: 1000, essentially unlimited)
      * @returns {Promise<Object>} - { success: boolean, loopCount: number, error: string|null }
      */
     runConversationLoop: async function(options = {}) {
@@ -564,7 +564,7 @@
       const utils = window.module['utils.js'];
       const config = window.module['config.js'];
   
-      const maxLoops = options.maxLoops || 50;
+      const maxLoops = options.maxLoops || 1000;
       const onProgress = options.onProgress || (() => {});
       const onUpdate = options.onUpdate || (() => {});
   
@@ -785,7 +785,7 @@
         if (accumulatedContent.length > MAX_RESPONSE_CHARS) {
           conversationManager.addMessage({
             type: 'system_warning',
-            warning: `Response exceeded ${MAX_RESPONSE_CHARS} character limit (got ${accumulatedContent.length} chars). Response was truncated. Use chunking with "continue": true flag for large content.`
+            warning: `Response exceeded ${MAX_RESPONSE_CHARS} character limit (got ${accumulatedContent.length} chars). Response was truncated. For large files, use create_file for the first chunk, then append_file for additional chunks.`
           });
         }
   
@@ -1788,6 +1788,10 @@
     },
   
     processTools: function(rawJsonText) {
+      console.log('[PROCESS TOOLS] Processing tool call, length:', rawJsonText.length);
+      console.log('[PROCESS TOOLS] First 200 chars:', rawJsonText.substring(0, 200));
+      console.log('[PROCESS TOOLS] Last 200 chars:', rawJsonText.substring(Math.max(0, rawJsonText.length - 200)));
+  
       // ===== LAYER 1: TEXT TRIMMING =====
       const trimResult = this.trimToJson(rawJsonText);
       const jsonText = trimResult.trimmed;
@@ -2054,6 +2058,10 @@
   
         // Check tool name is valid
         if (!validToolNames.includes(tool.name)) {
+          console.log(`[VALIDATION ERROR] Invalid tool name: "${tool.name}"`);
+          console.log(`[VALIDATION ERROR] Valid tools: ${validToolNames.join(', ')}`);
+          console.log(`[VALIDATION ERROR] Full tool object:`, JSON.stringify(tool, null, 2));
+  
           // Try to suggest similar tool names
           const suggestions = validToolNames.filter(name =>
             name.includes(tool.name) || tool.name.includes(name.replace('_', ''))
@@ -2593,20 +2601,13 @@
       try {
         await fileSystem.createFile(args.path, args.content);
   
-        // Check for continue flag
-        const hasContinue = args.continue === true;
-        const message = hasContinue
-          ? `Created ${args.path} with ${args.content.length} chars. Continue with next chunk.`
-          : `Created ${args.path} with ${args.content.length} chars.`;
-  
         return {
           tool: 'create_file',
           success: true,
           result: {
             path: args.path,
             size_bytes: args.content.length,
-            continue_expected: hasContinue,
-            message: message
+            message: `Created ${args.path} with ${args.content.length} chars.`
           },
           args: args
         };
@@ -3156,7 +3157,7 @@
   
       // Clear input and reset height
       input.value = '';
-      input.style.height = '20px';
+      input.style.height = '38px';
   
       // Hide any previous error
       this.hideError();
@@ -3457,170 +3458,6 @@
       }
     },
   
-    testContinuation: async function() {
-      console.log('=== CONTINUATION TEST STARTED ===');
-  
-      const apiClient = window.module['api-client.js'];
-      const config = window.module['config.js'];
-      const utils = window.module['utils.js'];
-  
-      try {
-        // First make a real API call asking for a large response that will get cut off
-        const testPrompt = 'Please write a very long detailed explanation about how computers work, starting from transistors all the way to operating systems. Make it at least 5000 words.';
-  
-        console.log('1. Making initial request for large response...');
-  
-        const initialPayload = {
-          stream: true,
-          model: config.MODEL,
-          messages: [{
-            role: 'user',
-            content: testPrompt
-          }],
-          params: {},
-          features: { web_search: false },
-          session_id: utils.generateSessionId(),
-          chat_id: null,
-          id: utils.generateUUID()
-        };
-  
-        const initialResponse = await fetch(`${config.API_BASE}/chat/completions`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(initialPayload)
-        });
-  
-        console.log(`   Response status: ${initialResponse.status}`);
-  
-        // Read partial response (simulate getting cut off)
-        const reader = initialResponse.body.getReader();
-        const decoder = new TextDecoder();
-        let partialContent = '';
-        let chunkCount = 0;
-  
-        // Read only 50 chunks to simulate cutoff
-        for (let i = 0; i < 50; i++) {
-          const { done, value } = await reader.read();
-          if (done) break;
-  
-          const chunk = decoder.decode(value, { stream: true });
-          const lines = chunk.split('\n');
-  
-          for (const line of lines) {
-            if (line.startsWith('data: ')) {
-              const data = line.slice(6);
-              if (data === '[DONE]') break;
-              try {
-                const parsed = JSON.parse(data);
-                if (parsed.choices?.[0]?.delta?.content) {
-                  partialContent += parsed.choices[0].delta.content;
-                }
-              } catch (e) {}
-            }
-          }
-          chunkCount++;
-        }
-  
-        console.log(`2. Partial response received: ${chunkCount} chunks, ${partialContent.length} chars`);
-        console.log(`   First 100 chars: "${partialContent.substring(0, 100)}..."`);
-        console.log(`   Last 100 chars: "...${partialContent.substring(partialContent.length - 100)}"`);
-  
-        // Now test continuation
-        console.log('3. Testing continuation with partial content...');
-  
-        // Extract without = prefix if present
-        let cleanPartial = partialContent;
-        if (cleanPartial.startsWith('=')) {
-          cleanPartial = cleanPartial.substring(1);
-          console.log('   Removed = prefix from partial');
-        }
-  
-        const continueMessages = [{
-          role: 'user',
-          content: testPrompt
-        }, {
-          role: 'assistant',
-          content: cleanPartial
-        }, {
-          role: 'user',
-          content: '[System: Your previous response was cut off. Please continue from where you left off, starting with the exact continuation of your last incomplete response. Do not restart or summarize - just continue the exact text.]'
-        }];
-  
-        console.log(`   Sending continuation request with ${cleanPartial.length} char partial`);
-  
-        const continuePayload = {
-          stream: true,
-          model: config.MODEL,
-          messages: continueMessages,
-          params: {},
-          features: { web_search: false },
-          session_id: utils.generateSessionId(),
-          chat_id: null,
-          id: utils.generateUUID(),
-          background_tasks: {
-            title_generation: false,
-            tags_generation: false
-          }
-        };
-  
-        const continueResponse = await fetch(`${config.API_BASE}/chat/completions`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(continuePayload)
-        });
-  
-        console.log(`   Continuation response status: ${continueResponse.status}`);
-  
-        // Read first chunks of continuation
-        const continueReader = continueResponse.body.getReader();
-        const continueDecoder = new TextDecoder();
-        let continuationContent = '';
-        let continueChunkCount = 0;
-  
-        for (let i = 0; i < 10; i++) {
-          const { done, value } = await continueReader.read();
-          if (done) break;
-  
-          const chunk = continueDecoder.decode(value, { stream: true });
-          const lines = chunk.split('\n');
-  
-          for (const line of lines) {
-            if (line.startsWith('data: ')) {
-              const data = line.slice(6);
-              if (data === '[DONE]') continue;
-              try {
-                const parsed = JSON.parse(data);
-                if (parsed.choices?.[0]?.delta?.content) {
-                  continuationContent += parsed.choices[0].delta.content;
-                }
-              } catch (e) {}
-            }
-          }
-          continueChunkCount++;
-        }
-  
-        console.log(`4. Continuation received: ${continueChunkCount} chunks, ${continuationContent.length} chars`);
-        console.log(`   First 200 chars of continuation: "${continuationContent.substring(0, 200)}"`);
-        console.log(`   First char: "${continuationContent.charAt(0)}" (ASCII ${continuationContent.charCodeAt(0)})`);
-  
-        // Analysis
-        const startsWithEquals = continuationContent.startsWith('=');
-        const lastWords = cleanPartial.split(' ').slice(-5).join(' ');
-        const firstWords = continuationContent.split(' ').slice(0, 5).join(' ');
-  
-        console.log('\n5. ANALYSIS:');
-        console.log(`   Partial ended with: "...${lastWords}"`);
-        console.log(`   Continuation started with: "${firstWords}..."`);
-        console.log(`   Starts with =: ${startsWithEquals} ${startsWithEquals ? '❌ BAD - restarting' : '✅ GOOD'}`);
-        console.log(`   Looks like continuation: ${!startsWithEquals && continuationContent.length > 0 ? '✅ GOOD' : '❌ BAD'}`);
-  
-        console.log('\n=== TEST COMPLETE ===');
-  
-      } catch (error) {
-        console.error('TEST FAILED:', error.message, error);
-      }
-    },
-  
     clearConversation: async function() {
       const conversationManager = window.module['conversation-manager.js'];
       const conversationPersistence = window.module['conversation-persistence.js'];
@@ -3636,6 +3473,9 @@
   
       // Reset chat ID so new conversation starts fresh
       apiClient.chatId = null;
+  
+      // Hide any loading indicators
+      this.hideLoading();
   
       // Clear UI
       this.renderChat();
