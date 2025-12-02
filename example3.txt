@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-12-02T23:38:01.600Z
+// AI Agent - Built 2025-12-02T23:41:08.499Z
 (function() {
   window.module = {};
 
@@ -1371,6 +1371,7 @@
   
       // Convert message to JSON line
       const line = JSON.stringify(message) + '\n';
+      console.log(`[Persistence] Saving message type: ${message.type}, id: ${message.id}`);
   
       try {
         // Check if file exists
@@ -1388,12 +1389,14 @@
             path: this.conversationFilePath,
             content: line
           });
+          console.log(`[Persistence] Appended message to file`);
         } else {
           // Create new file
           await fileSystem.createFile({
             path: this.conversationFilePath,
             content: line
           });
+          console.log(`[Persistence] Created file with first message`);
         }
   
       } catch (error) {
