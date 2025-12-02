@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-12-02T17:03:22.445Z
+// AI Agent - Built 2025-12-02T17:13:21.326Z
 (function() {
   window.module = {};
 
@@ -812,6 +812,16 @@
           console.error('Response length:', accumulatedContent.length);
           console.error('Last 100 chars:', accumulatedContent.substring(Math.max(0, accumulatedContent.length - 100)));
   
+          // Add the AI's truncated response to conversation first
+          conversationManager.addMessage({
+            type: 'assistant',
+            id: assistantMessageId,
+            content: accumulatedContent,
+            timestamp: Date.now(),
+            parentId: null,
+            childrenIds: []
+          });
+  
           // Include the truncated content in the error message so AI can continue
           const errorMessage = `Your previous response was truncated (${accumulatedContent.length} chars received, but missing |||||END||||| terminator).
   
@@ -820,6 +830,7 @@
   
   Please continue from exactly where you left off. Complete the JSON and add the terminator |||||END|||||`;
   
+          // Then add system error message
           conversationManager.addMessage({
             type: 'system_error',
             error: errorMessage,
