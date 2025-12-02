@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-12-02T17:13:21.326Z
+// AI Agent - Built 2025-12-02T18:55:52.972Z
 (function() {
   window.module = {};
 
@@ -398,7 +398,7 @@
           const combinedContent = pendingPartials.map(p => p.content).join('');
           apiMessages.push({
             role: 'assistant',
-            content: '=' + combinedContent + '|||||END|||||'
+            content: combinedContent + '|||||END|||||'
           });
           pendingPartials = [];
         }
@@ -480,7 +480,7 @@
           // Assistant message responses use = prefix
           apiMessages.push({
             role: 'assistant',
-            content: '=' + msg.content + '|||||END|||||'
+            content: msg.content + '|||||END|||||'
           });
   
         } else if (msg.type === 'system_error') {
@@ -496,7 +496,7 @@
         const combinedContent = pendingPartials.map(p => p.content).join('');
         apiMessages.push({
           role: 'assistant',
-          content: '=' + combinedContent + '|||||END|||||'
+          content: combinedContent + '|||||END|||||'
         });
       }
   
@@ -812,21 +812,28 @@
           console.error('Response length:', accumulatedContent.length);
           console.error('Last 100 chars:', accumulatedContent.substring(Math.max(0, accumulatedContent.length - 100)));
   
+          // Strip leading = if present (Claude sometimes adds this prefix)
+          let cleanContent = accumulatedContent;
+          if (cleanContent.startsWith('=')) {
+            cleanContent = cleanContent.substring(1);
+            console.log('[Truncation] Stripped leading = from response');
+          }
+  
           // Add the AI's truncated response to conversation first
           conversationManager.addMessage({
             type: 'assistant',
             id: assistantMessageId,
-            content: accumulatedContent,
+            content: cleanContent,
             timestamp: Date.now(),
             parentId: null,
             childrenIds: []
           });
   
           // Include the truncated content in the error message so AI can continue
-          const errorMessage = `Your previous response was truncated (${accumulatedContent.length} chars received, but missing |||||END||||| terminator).
+          const errorMessage = `Your previous response was truncated (${cleanContent.length} chars received, but missing |||||END||||| terminator).
   
   Here is what you generated before being cut off:
-  ${accumulatedContent}
+  ${cleanContent}
   
   Please continue from exactly where you left off. Complete the JSON and add the terminator |||||END|||||`;
   
@@ -834,7 +841,7 @@
           conversationManager.addMessage({
             type: 'system_error',
             error: errorMessage,
-            originalContent: accumulatedContent
+            originalContent: cleanContent
           });
   
           return {
@@ -1663,37 +1670,27 @@
       const terminatorIndex = rawText.indexOf(this.TERMINATOR);
       const content = rawText.substring(0, terminatorIndex);
   
-      // Detect response type by first character
-      const firstChar = content.charAt(0);
+      // Detect if this is a tool call by looking for the pattern: {"tools":[{"name":
+      // This regex allows for whitespace and is case-sensitive
+      const toolPattern = /\{\s*"tools"\s*:\s*\[\s*\{\s*"name"\s*:/;
+      const isToolCall = toolPattern.test(content);
   
-      if (firstChar === '=' || firstChar === '~') {
-        // Message or continuation response - no trimming needed
-        return this.processMessage(content, firstChar);
-      } else if (content.includes('{')) {
+      if (isToolCall) {
         // Tool execution response - may have text before/after JSON, apply full 3-layer processing
         // Layer 1 will trim any text before { and after }
         return this.processTools(content);
       } else {
-        // Invalid format - doesn't start with =, ~, or contain { anywhere
-        return {
-          complete: true,
-          content: null,
-          error: `Invalid response format: must start with = (message), ~ (continuation), or contain { (tools)`,
-          originalContent: rawText,
-          systemWarning: null
-        };
+        // Message response - just return the text as-is
+        return this.processMessage(content);
       }
     },
   
-    processMessage: function(text, prefix) {
-      // Remove prefix (= or ~)
-      const message = text.substring(1);
-  
+    processMessage: function(text) {
       return {
         complete: true,
         content: {
           type: 'message',
-          text: message
+          text: text
         },
         error: null,
         systemWarning: null
@@ -2080,25 +2077,23 @@
   Two response types in planning mode:
   
   ### 1. Message Response
-  When you want to ask questions or discuss, start with = followed by your message:
+  When you want to ask questions or discuss:
   
-  =Your message to the user here. Can be multiple lines.
+  Your message to the user here. Can be multiple lines.
   You can include newlines and formatting.|||||END|||||
   
   ### 2. Tool Execution
-  When you need to use tools, start with { and provide valid JSON:
+  When you need to use tools, provide valid JSON:
   
   {"tools":[{"name":"list_folder","args":{"path":"src/"}},{"name":"read_file","args":{"path":"src/main.js"}}]}|||||END|||||
   
   CRITICAL RULES FOR TOOL USE:
-  1. When using tools, respond with ONLY the JSON. Nothing else. No explanatory text before or after.
-  2. Start your response with { immediately. Do NOT write "I'll use..." or "Let me..." first.
-  3. ALL JSON must be on a SINGLE line. NO literal line breaks anywhere in the JSON.
-  4. For newlines within JSON string values, use \\n (backslash-n), never press Enter/Return.
-  5. Example CORRECT: {"long_desc":"Line 1\\nLine 2\\nLine 3"}
-  6. Example WRONG: "I'll use exit_planning.\n{"tools":[...  ← Extra text breaks parsing!
-  7. Example WRONG: {"long_desc":"Line 1
+  1. ALL JSON must be on a SINGLE line. NO literal line breaks anywhere in the JSON.
+  2. For newlines within JSON string values, use \\n (backslash-n), never press Enter/Return.
+  3. Example CORRECT: {"long_desc":"Line 1\\nLine 2\\nLine 3"}
+  4. Example WRONG: {"long_desc":"Line 1
   Line 2"}  ← Literal line break breaks JSON!
+  5. You can include explanatory text before the JSON if needed, the system will extract the JSON automatically.
   
   ## Available Tools in Planning Mode
   
@@ -2161,12 +2156,12 @@
   Two response types:
   
   ### 1. Message Response
-  Start with = followed by your message:
+  Send a message to the user:
   
-  =Task completed successfully.|||||END|||||
+  Task completed successfully.|||||END|||||
   
   ### 2. Tool Execution
-  Start with { and provide valid JSON:
+  Provide valid JSON:
   
   {"tools":[{"name":"create_file","args":{"path":"src/new.js","content":"console.log('hello');"}}]}|||||END|||||
   
@@ -2177,6 +2172,7 @@
   - Example CORRECT: {"content":"line1\\nline2\\nline3"}
   - Example WRONG: {"content":"line1
   line2"}  ← This breaks JSON parsing!
+  - You can include explanatory text before the JSON if needed, the system will extract the JSON automatically.
   
   ## Available Tools in Execution Mode
   
@@ -3105,15 +3101,16 @@
             {
               onProgress: (status) => this.showLoading(status),
               onChunk: (chunk, accumulated) => {
-                // Detect response type and create streaming message if needed
-                if (responseType === null && accumulated.length > 0) {
-                  const firstChar = accumulated.charAt(0);
-                  if (firstChar === '=') {
+                // Detect response type using pattern matching (not prefix-based)
+                if (responseType === null && accumulated.length > 10) {
+                  // Check for tool call pattern: {"tools":[{"name":
+                  const toolPattern = /\{\s*"tools"\s*:\s*\[\s*\{\s*"name"\s*:/;
+                  if (toolPattern.test(accumulated)) {
+                    responseType = 'tools';
+                  } else {
+                    // Assume message if no tool pattern detected
                     responseType = 'message';
                     streamingMessageId = utils.generateUUID();
-                    // Note: We add this synchronously - onChunk can't be async
-                    // The 500K limit check happens in addMessage, but we're creating a placeholder here
-                    // that will be removed if summarization occurs before the full message completes
                     conversationManager.messages.push({
                       id: streamingMessageId,
                       type: 'assistant',
@@ -3123,14 +3120,13 @@
                       parentId: conversationManager.messages.length > 0 ? conversationManager.messages[conversationManager.messages.length - 1].id : null,
                       childrenIds: []
                     });
-                  } else if (firstChar === '{') {
-                    responseType = 'tools';
                   }
                 }
   
                 // Update streaming message in real-time
                 if (responseType === 'message' && streamingMessageId) {
-                  let messageContent = accumulated.substring(1); // Remove = prefix
+                  // Extract content (trim before terminator if present)
+                  let messageContent = accumulated;
                   const terminatorIndex = messageContent.indexOf(messageProcessor.TERMINATOR);
                   if (terminatorIndex !== -1) {
                     messageContent = messageContent.substring(0, terminatorIndex);
