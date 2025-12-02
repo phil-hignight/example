@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-12-02T23:35:19.857Z
+// AI Agent - Built 2025-12-02T23:38:01.600Z
 (function() {
   window.module = {};
 
@@ -977,10 +977,11 @@
     messages: [],
   
     init: async function(folderPath) {
+      console.log('[ConversationManager] init called with folderPath:', folderPath);
       this.messages = [];
   
-      // Initialize persistence if folder path provided
-      if (folderPath) {
+      // Initialize persistence if folder path provided (including empty string for root)
+      if (folderPath !== undefined && folderPath !== null) {
         const persistence = window.module['conversation-persistence.js'];
         await persistence.init(folderPath);
   
