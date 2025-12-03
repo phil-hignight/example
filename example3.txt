@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-12-03T17:12:46.728Z
+// AI Agent - Built 2025-12-03T17:25:26.049Z
 (function() {
   window.module = {};
 
@@ -699,6 +699,16 @@
                 success = true;
               }
   
+            } else if (result.cancelled) {
+              // User cancelled - exit immediately
+              console.log('[ConvFlow] User cancellation detected, exiting conversation loop');
+              return {
+                success: false,
+                loopCount: loopCount,
+                error: 'CANCELLED_BY_USER',
+                cancelled: true
+              };
+  
             } else if (result.needsRetry) {
               // Error already added to conversation by handleAIResponse
               onUpdate();
@@ -766,6 +776,14 @@
         const decoder = new TextDecoder();
   
         while (true) {
+          // Check for cancellation during streaming
+          const uiManager = window.module['ui-manager.js'];
+          if (uiManager && uiManager.cancelRequested) {
+            console.log('[ConvFlow] Streaming cancelled by user');
+            reader.cancel(); // Cancel the stream
+            throw new Error('CANCELLED_BY_USER');
+          }
+  
           const timeoutPromise = new Promise((_, reject) => {
             setTimeout(() => reject(new Error('Timeout')), config.TIMEOUT_MS);
           });
@@ -977,6 +995,19 @@
   
       } catch (error) {
         console.error('handleAIResponse error:', error);
+  
+        // Handle user cancellation specially
+        if (error.message === 'CANCELLED_BY_USER') {
+          console.log('[ConvFlow] User cancellation detected in catch block');
+          // Don't add error message - the cancelCurrentTask() method will add the cancelled message
+          return {
+            success: false,
+            content: null,
+            error: 'CANCELLED_BY_USER',
+            needsRetry: false,
+            cancelled: true
+          };
+        }
   
         conversationManager.addMessage({
           type: 'system_error',
@@ -2388,13 +2419,38 @@
   
   ## Available Tools in Execution Mode
   
-  - list_folder: Explore directories
-  - read_file: Read files
-  - create_file: Create new files
-  - edit_file: Edit existing files
-  - append_file: Append content to existing files (RARELY USED - see below)
-  - item_completed: Mark task complete
-  - item_failed: Mark task failed
+  ### list_folder
+  Explore directory contents (non-recursive).
+  Args: { "path": "folder/path" }  // Use "." for root
+  Returns: List of files and folders with types and sizes
+  
+  ### read_file
+  Read file contents.
+  Args: { "path": "file/path.js" }
+  Returns: File content as text
+  
+  ### create_file
+  Create a new file with content.
+  Args: { "path": "new/file.js", "content": "file content here" }
+  Note: Use \\n for newlines in content
+  
+  ### edit_file
+  Edit existing file by replacing text.
+  Args: { "path": "file.js", "old_text": "exact text to find", "new_text": "replacement text" }
+  CRITICAL: old_text must match EXACTLY (including whitespace, indentation, newlines)
+  Only replaces first occurrence. For multiple edits, use multiple edit_file calls.
+  
+  ### append_file
+  Append content to end of existing file (RARELY USED - see below).
+  Args: { "path": "file.js", "content": "content to append" }
+  
+  ### item_completed
+  Mark current task as completed.
+  Args: { "reason": "optional completion note" }
+  
+  ### item_failed
+  Mark current task as failed, returns to planning mode.
+  Args: { "reason": "why task failed" }
   
   ## CRITICAL: When to use append_file vs edit_file
   
@@ -3496,6 +3552,12 @@
               await this.getAIResponse();
               success = true;
             }
+  
+          } else if (result.cancelled) {
+            // User cancelled - don't continue, don't throw error
+            console.log('[UI] Cancellation detected in result, calling cancelCurrentTask');
+            this.cancelCurrentTask();
+            return;
   
           } else if (result.needsRetry) {
             // Error already added to conversation by conversation-flow
