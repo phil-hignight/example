@@ -446,7 +446,7 @@ function getIndexHTML() {
       function renderNode(name, node, depth, parentPath) {
         if (!name) return null; // Skip empty names
 
-        const fullPath = node.fullPath || (parentPath ? parentPath + '/' + name : name);
+        const fullPath = node.fullPath || (parentPath ? parentPath + '\\\\' + name : name);
         console.log('renderNode:', name, 'fullPath:', fullPath, 'node.children:', Object.keys(node.children));
         const item = getItemByPath(structure, fullPath);
         const otherItem = getItemByPath(otherStructure, fullPath);
@@ -468,8 +468,8 @@ function getIndexHTML() {
           if (isExpanded) {
             const childrenDiv = document.createElement('div');
             const childNames = Object.keys(node.children).sort((a, b) => {
-              const aPath = fullPath ? fullPath + '/' + a : a;
-              const bPath = fullPath ? fullPath + '/' + b : b;
+              const aPath = fullPath ? fullPath + '\\\\' + a : a;
+              const bPath = fullPath ? fullPath + '\\\\' + b : b;
               const aItem = structure[aPath] || otherStructure[aPath];
               const bItem = structure[bPath] || otherStructure[bPath];
               const aIsDir = aItem && aItem.type === 'dir';
@@ -536,8 +536,8 @@ function getIndexHTML() {
             if (isExpanded) {
               const childrenDiv = document.createElement('div');
               const childNames = Object.keys(node.children).sort((a, b) => {
-                const aPath = fullPath ? fullPath + '/' + a : a;
-                const bPath = fullPath ? fullPath + '/' + b : b;
+                const aPath = fullPath ? fullPath + '\\\\' + a : a;
+                const bPath = fullPath ? fullPath + '\\\\' + b : b;
                 const aItem = structure[aPath] || otherStructure[aPath];
                 const bItem = structure[bPath] || otherStructure[bPath];
                 const aIsDir = aItem && aItem.type === 'dir';
