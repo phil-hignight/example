@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-12-03T00:38:47.170Z
+// AI Agent - Built 2025-12-03T00:47:33.745Z
 (function() {
   window.module = {};
 
@@ -629,7 +629,7 @@
   
               } else if (aiResponse.type === 'execute') {
                 // Tool execution - create ONE tool_use message with ALL tools
-                const toolUseMessage = conversationManager.addMessage({
+                const { message: toolUseMessage } = conversationManager.addMessage({
                   type: 'tool_use',
                   tools: aiResponse.tools
                 });
@@ -993,7 +993,7 @@
       }
     },
   
-    addMessage: function(message) {
+    addMessage: function(message, skipPersist = false) {
       const utils = window.module['utils.js'];
       const config = window.module['config.js'];
   
@@ -1033,15 +1033,27 @@
       // Add the message to memory immediately
       this.messages.push(message);
   
-      // Save to disk asynchronously (don't block the UI)
-      const persistence = window.module['conversation-persistence.js'];
-      if (persistence.isInitialized) {
-        persistence.saveMessage(message).catch(err =>
-          console.error('[ConversationManager] Failed to persist message:', err)
-        );
+      // Create persist function
+      const persistFn = () => {
+        const persistence = window.module['conversation-persistence.js'];
+        if (persistence.isInitialized) {
+          return persistence.saveMessage(message).catch(err =>
+            console.error('[ConversationManager] Failed to persist message:', err)
+          );
+        }
+        return Promise.resolve();
+      };
+  
+      // Auto-persist unless skipPersist is true
+      if (!skipPersist) {
+        persistFn();
       }
   
-      return message;
+      // Return object with message and persist function
+      return {
+        message: message,
+        persist: persistFn
+      };
     },
   
     getMessages: function() {
@@ -3248,6 +3260,7 @@
   
           // Track streaming message for real-time UI updates
           let streamingMessageId = null;
+          let streamingPersistFn = null;
           let responseType = null;
   
           // Use extracted conversation-flow module
@@ -3267,14 +3280,15 @@
                   } else {
                     // Assume message if no tool pattern detected
                     responseType = 'message';
-                    // Create streaming message (don't persist yet - will persist when complete)
-                    const streamingMessage = {
+                    // Create streaming message (skip persistence until complete)
+                    const result = conversationManager.addMessage({
                       type: 'assistant',
                       content: '',
                       streaming: true
-                    };
-                    const addedMessage = conversationManager.addMessage(streamingMessage);
-                    streamingMessageId = addedMessage.id;
+                    }, true); // skipPersist = true
+  
+                    streamingMessageId = result.message.id;
+                    streamingPersistFn = result.persist; // Save persist function for later
                   }
                 }
   
@@ -3305,20 +3319,15 @@
   
             if (aiResponse.type === 'message') {
               // Message was already streamed, just mark as complete
-              if (streamingMessageId) {
+              if (streamingMessageId && streamingPersistFn) {
                 const msgs = conversationManager.getMessages();
                 const streamingMsg = msgs.find(m => m.id === streamingMessageId);
                 if (streamingMsg) {
                   streamingMsg.streaming = false;
                   streamingMsg.content = aiResponse.text;
   
-                  // Save the final message to persistence
-                  const persistence = window.module['conversation-persistence.js'];
-                  if (persistence.isInitialized) {
-                    persistence.saveMessage(streamingMsg).catch(err =>
-                      console.error('[UI] Failed to persist completed message:', err)
-                    );
-                  }
+                  // Now persist the completed message
+                  streamingPersistFn();
                 }
               } else {
                 // Fallback: add message if streaming didn't work
@@ -3334,7 +3343,7 @@
   
             } else if (aiResponse.type === 'execute') {
               // Tool execution - create ONE tool_use message with ALL tools
-              const toolUseMessage = conversationManager.addMessage({
+              const { message: toolUseMessage } = conversationManager.addMessage({
                 type: 'tool_use',
                 tools: aiResponse.tools
               });
