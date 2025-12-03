@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-12-03T17:43:16.880Z
+// AI Agent - Built 2025-12-03T18:26:22.656Z
 (function() {
   window.module = {};
 
@@ -1758,12 +1758,65 @@
           ? currentContentResult
           : currentContentResult.content;
   
-        // Replace old text with new text
-        const newContent = currentContent.replace(oldText, newText);
+        // Helper function to visualize whitespace characters
+        const visualizeWhitespace = (str) => {
+          return str
+            .replace(/\n/g, '\\n')
+            .replace(/\r/g, '\\r')
+            .replace(/\t/g, '\\t')
+            .replace(/ /g, '·'); // Use middle dot for spaces
+        };
+  
+        // Helper function to normalize whitespace (collapse all contiguous whitespace to single space)
+        const normalizeWhitespace = (str) => {
+          return str.replace(/\s+/g, ' ');
+        };
+  
+        // Try exact match first
+        let newContent = currentContent.replace(oldText, newText);
   
         // Check if replacement happened
         if (newContent === currentContent) {
-          throw new Error('Old text not found in file');
+          console.log('[EditFile] ========== EXACT MATCH FAILED ==========');
+          console.log('[EditFile] Trying normalized whitespace matching...');
+  
+          // Normalize both strings
+          const normalizedOldText = normalizeWhitespace(oldText);
+          const normalizedContent = normalizeWhitespace(currentContent);
+  
+          // Try to find normalized match
+          const normalizedIndex = normalizedContent.indexOf(normalizedOldText);
+  
+          if (normalizedIndex !== -1) {
+            console.log('[EditFile] ✓ Found match with normalized whitespace!');
+            console.log('[EditFile] Match index in normalized content:', normalizedIndex);
+  
+            // Show what AI sent vs what's in file
+            console.log('\n[EditFile] AI sent old_text:');
+            console.log(visualizeWhitespace(oldText.substring(0, 200)));
+  
+            console.log('\n[EditFile] Normalized AI old_text:');
+            console.log(visualizeWhitespace(normalizedOldText.substring(0, 200)));
+  
+            console.log('\n[EditFile] File content (first 500 chars):');
+            console.log(visualizeWhitespace(currentContent.substring(0, 500)));
+  
+            console.log('\n[EditFile] Normalized file content (first 500 chars):');
+            console.log(visualizeWhitespace(normalizedContent.substring(0, 500)));
+  
+            // Find approximate location in original content
+            // This is complex, so for now just report the mismatch
+            throw new Error('Old text not found in file (exact match). Found normalized match, but cannot safely replace with whitespace differences. Please ensure whitespace matches exactly.');
+          } else {
+            console.log('[EditFile] ✗ No match even with normalized whitespace');
+            console.log('\n[EditFile] AI sent old_text (first 200 chars):');
+            console.log(visualizeWhitespace(oldText.substring(0, 200)));
+  
+            console.log('\n[EditFile] File content (first 500 chars):');
+            console.log(visualizeWhitespace(currentContent.substring(0, 500)));
+  
+            throw new Error('Old text not found in file');
+          }
         }
   
         // Write new content
