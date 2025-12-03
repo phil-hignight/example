@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-12-03T00:47:33.745Z
+// AI Agent - Built 2025-12-03T01:23:58.294Z
 (function() {
   window.module = {};
 
@@ -332,19 +332,18 @@
       const modeManager = window.module['mode-manager.js'];
       const apiMessages = [];
   
-      // Find latest summary
-      let latestSummaryIndex = -1;
-      let summaryContent = null;
+      // Find the latest summary (if any) and start from there
+      // This gives us: [latest summary, all messages after it]
+      let startIndex = 0;
       for (let i = messages.length - 1; i >= 0; i--) {
         if (messages[i].type === 'summary') {
-          latestSummaryIndex = i;
-          summaryContent = messages[i].content;
+          startIndex = i;
           break;
         }
       }
   
-      // Start converting messages after the summary (or from beginning if no summary)
-      const startIndex = latestSummaryIndex >= 0 ? latestSummaryIndex + 1 : 0;
+      // Get messages from latest summary onward (or all messages if no summary)
+      const activeMsgs = messages.slice(startIndex);
   
       let firstUserMessageIndex = -1;
       let pendingWarnings = []; // Can accumulate multiple warnings
@@ -352,8 +351,26 @@
       let pendingToolResults = []; // Can accumulate multiple tool results
       let pendingPartials = []; // Can accumulate consecutive partial messages
   
-      for (let i = startIndex; i < messages.length; i++) {
-        const msg = messages[i];
+      for (let i = 0; i < activeMsgs.length; i++) {
+        const msg = activeMsgs[i];
+  
+        // Handle summary messages - treat them as user messages
+        if (msg.type === 'summary') {
+          let content = msg.content;
+  
+          // Is this the first message? Add system prompt
+          if (firstUserMessageIndex === -1) {
+            firstUserMessageIndex = apiMessages.length;
+            const prefix = modeManager.getSystemPrompt();
+            content = prefix + '\n\n' + content;
+          }
+  
+          apiMessages.push({
+            role: 'user',
+            content: content
+          });
+          continue;
+        }
   
         // Collect system_warning messages to merge with next user message
         if (msg.type === 'system_warning') {
@@ -454,13 +471,8 @@
           if (firstUserMessageIndex === -1) {
             firstUserMessageIndex = apiMessages.length;
   
-            // Build prefix: system prompt + summary (if exists)
-            let prefix = modeManager.getSystemPrompt();
-  
-            if (summaryContent) {
-              prefix += '\n\n' + summaryContent;
-            }
-  
+            // Prepend system prompt to first user message
+            const prefix = modeManager.getSystemPrompt();
             content = prefix + '\n\n' + content;
           }
   
@@ -1175,35 +1187,28 @@
         const data = await response.json();
         const summaryContent = data.choices?.[0]?.message?.content || 'Summary generation failed';
   
-        // 5. Create summary message
-        const summaryMessage = {
+        // 5. Create summary message as a USER message that will be sent to API
+        // This tells the AI: "Here's what happened, now continue with the latest request"
+        const summaryUserMessage = `<system-reminder>
+  The conversation has exceeded the character limit. Here's a summary of what happened so far:
+  
+  ${summaryContent}
+  
+  The user's latest request was: ${lastUserMessage}
+  
+  Please continue from where we left off and respond to the user's latest request.
+  </system-reminder>`;
+  
+        // Add summary as a special user message that marks the compaction point
+        this.addMessage({
           type: 'summary',
-          id: utils.generateUUID(),
-          timestamp: utils.getTimestamp(),
-          content: summaryContent,
-          summarizes_from: messagesToSummarize[0].id,
-          summarizes_to: messagesToSummarize[messagesToSummarize.length - 1].id,
-          parentId: this.messages[this.messages.length - 1].id,
-          childrenIds: []
-        };
+          content: summaryUserMessage
+        });
   
-        // 6. Remove summarized messages (but keep old summaries as history markers)
-        if (latestSummaryIndex !== -1) {
-          // Keep everything up to and including the latest summary
-          // Remove only the messages after it (they're now summarized)
-          this.messages = this.messages.slice(0, latestSummaryIndex + 1);
-        } else {
-          // No summary exists, remove all messages (they'll be summarized)
-          this.messages = [];
-        }
-  
-        // Add the new summary
-        this.messages.push(summaryMessage);
-  
-        console.log(`✓ Summarization complete. Reduced to ${this.messages.length} messages.`);
+        console.log(`✓ Summarization complete. Created summary message. Total messages: ${this.messages.length}`);
         console.log(`Summary: ${summaryContent.substring(0, 200)}...`);
   
-        return summaryMessage;
+        return { success: true, summary: summaryContent };
   
       } catch (error) {
         console.error('Summarization failed:', error);
@@ -2350,16 +2355,32 @@
   - list_folder: Explore directories
   - read_file: Read files
   - create_file: Create new files
-  - append_file: Append content to existing files
   - edit_file: Edit existing files
+  - append_file: Append content to existing files (RARELY USED - see below)
   - item_completed: Mark task complete
   - item_failed: Mark task failed
   
-  ## Important Notes
+  ## CRITICAL: When to use append_file vs edit_file
   
-  - For large files (>30K chars), use create_file for the first chunk, then append_file for additional chunks.
-  - If your tool call gets truncated due to size, the system will attempt to auto-complete and execute it, then tell you to use append_file to continue.
-  - For edit_file, if your edit is too large and gets truncated, you'll be asked to resend with smaller changes.
+  ⚠️ **append_file is ONLY for these specific cases:**
+  1. Adding content to a file YOU JUST CREATED in the same conversation that was truncated due to size limits
+  2. Appending to log files or data files where order matters
+  3. The user explicitly asks you to append to a file
+  
+  ⚠️ **For ALL code modifications, use edit_file:**
+  - Adding methods to a class → use edit_file
+  - Adding functions to a module → use edit_file
+  - Adding imports → use edit_file
+  - Adding test cases → use edit_file
+  - ANY change to existing code structure → use edit_file
+  
+  **Why?** append_file literally adds to the END of the file. This will place code OUTSIDE class definitions, AFTER closing braces, and break the file structure. Always use edit_file to insert code at the correct location.
+  
+  ## File Size Handling
+  
+  - For NEW files >30K chars: use create_file for first chunk, then append_file for additional chunks
+  - If your tool call gets truncated due to size, the system will auto-complete and tell you to use append_file to continue
+  - For edit_file: if edit is too large and gets truncated, resend with smaller changes
   
   ## Rules
   
@@ -3419,8 +3440,8 @@
       const uiRenderer = window.module['ui-renderer.js'];
       const chatArea = document.getElementById('chatArea');
   
-      // Check if user is near bottom before re-rendering (within 40px)
-      const wasNearBottom = chatArea.scrollHeight - chatArea.scrollTop - chatArea.clientHeight < 40;
+      // Check if user is near bottom before re-rendering (within 100px)
+      const wasNearBottom = chatArea.scrollHeight - chatArea.scrollTop - chatArea.clientHeight < 100;
   
       chatArea.innerHTML = '';
   
