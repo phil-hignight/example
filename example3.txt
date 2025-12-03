@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-12-02T23:43:32.293Z
+// AI Agent - Built 2025-12-03T00:38:47.170Z
 (function() {
   window.module = {};
 
@@ -3267,16 +3267,14 @@
                   } else {
                     // Assume message if no tool pattern detected
                     responseType = 'message';
-                    streamingMessageId = utils.generateUUID();
-                    conversationManager.messages.push({
-                      id: streamingMessageId,
+                    // Create streaming message (don't persist yet - will persist when complete)
+                    const streamingMessage = {
                       type: 'assistant',
                       content: '',
-                      streaming: true,
-                      timestamp: Date.now(),
-                      parentId: conversationManager.messages.length > 0 ? conversationManager.messages[conversationManager.messages.length - 1].id : null,
-                      childrenIds: []
-                    });
+                      streaming: true
+                    };
+                    const addedMessage = conversationManager.addMessage(streamingMessage);
+                    streamingMessageId = addedMessage.id;
                   }
                 }
   
@@ -3313,6 +3311,14 @@
                 if (streamingMsg) {
                   streamingMsg.streaming = false;
                   streamingMsg.content = aiResponse.text;
+  
+                  // Save the final message to persistence
+                  const persistence = window.module['conversation-persistence.js'];
+                  if (persistence.isInitialized) {
+                    persistence.saveMessage(streamingMsg).catch(err =>
+                      console.error('[UI] Failed to persist completed message:', err)
+                    );
+                  }
                 }
               } else {
                 // Fallback: add message if streaming didn't work
