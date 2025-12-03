@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-12-03T17:33:31.203Z
+// AI Agent - Built 2025-12-03T17:43:16.880Z
 (function() {
   window.module = {};
 
@@ -399,6 +399,12 @@
               if (result.success) {
                 const path = result.args?.path || '';
                 const prefix = path ? `Tool: ${result.tool} (${path})` : `Tool: ${result.tool}`;
+  
+                // Special handling for read_file - send raw content to preserve whitespace
+                if (result.tool === 'read_file' && result.result.content) {
+                  return `${prefix}\nResult:\n${result.result.content}`;
+                }
+  
                 return `${prefix}\nResult: ${JSON.stringify(result.result)}`;
               } else {
                 return `Tool: ${result.tool}\nError: ${result.error}`;
@@ -456,6 +462,12 @@
               // Include the file path in the result for read_file
               const path = result.args?.path || '';
               const prefix = path ? `Tool: ${result.tool} (${path})` : `Tool: ${result.tool}`;
+  
+              // Special handling for read_file - send raw content to preserve whitespace
+              if (result.tool === 'read_file' && result.result.content) {
+                return `${prefix}\nResult:\n${result.result.content}`;
+              }
+  
               return `${prefix}\nResult: ${JSON.stringify(result.result)}`;
             } else {
               return `Tool: ${result.tool}\nError: ${result.error}`;
@@ -3275,17 +3287,22 @@
         if (e.key === 'Enter' && !e.shiftKey) {
           e.preventDefault();
           this.handleSubmit();
-        } else if (e.key === 'Escape') {
-          console.log(`[UI] Escape key pressed - isProcessing: ${this.isProcessing}`);
+        }
+        // Shift+Enter allows newline (default textarea behavior)
+        // Trigger resize after key is processed
+        setTimeout(autoResize, 0);
+      });
+  
+      // Global Escape key handler - works regardless of focus
+      document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') {
+          console.log(`[UI] Escape key pressed (global) - isProcessing: ${this.isProcessing}`);
           if (this.isProcessing) {
             console.log('[UI] Cancelling task via Escape key');
             e.preventDefault();
             this.cancelCurrentTask();
           }
         }
-        // Shift+Enter allows newline (default textarea behavior)
-        // Trigger resize after key is processed
-        setTimeout(autoResize, 0);
       });
   
       // Menu button click handler
