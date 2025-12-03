@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-12-03T17:25:26.049Z
+// AI Agent - Built 2025-12-03T17:33:31.203Z
 (function() {
   window.module = {};
 
@@ -1736,10 +1736,15 @@
         }
   
         // Read current content
-        const currentContent = await this.readFile(fileEntry);
-        if (currentContent === null) {
+        const currentContentResult = await this.readFile(fileEntry);
+        if (currentContentResult === null) {
           throw new Error(`Failed to read file: ${path}`);
         }
+  
+        // Extract content string (readFile may return string or { content: string })
+        const currentContent = typeof currentContentResult === 'string'
+          ? currentContentResult
+          : currentContentResult.content;
   
         // Replace old text with new text
         const newContent = currentContent.replace(oldText, newText);
@@ -3270,9 +3275,13 @@
         if (e.key === 'Enter' && !e.shiftKey) {
           e.preventDefault();
           this.handleSubmit();
-        } else if (e.key === 'Escape' && this.isProcessing) {
-          e.preventDefault();
-          this.cancelCurrentTask();
+        } else if (e.key === 'Escape') {
+          console.log(`[UI] Escape key pressed - isProcessing: ${this.isProcessing}`);
+          if (this.isProcessing) {
+            console.log('[UI] Cancelling task via Escape key');
+            e.preventDefault();
+            this.cancelCurrentTask();
+          }
         }
         // Shift+Enter allows newline (default textarea behavior)
         // Trigger resize after key is processed
@@ -3352,8 +3361,10 @@
     },
   
     cancelCurrentTask: function() {
-      console.log('[UI] Cancellation requested');
+      console.log('[UI] ========== CANCELLATION REQUESTED ==========');
+      console.log('[UI] Current state - isProcessing:', this.isProcessing, 'cancelRequested:', this.cancelRequested);
       this.cancelRequested = true;
+      console.log('[UI] Set cancelRequested to true');
       this.hideLoading();
   
       // Add a cancelled assistant message to maintain the user/assistant pattern
@@ -3366,6 +3377,7 @@
       this.renderChat();
       this.updateCharCounter();
       this.isProcessing = false;
+      console.log('[UI] Cancellation complete - isProcessing set to false');
     },
   
     addUserMessage: function(content) {
@@ -3681,10 +3693,21 @@
     clearConversation: async function() {
       const conversationManager = window.module['conversation-manager.js'];
       const conversationPersistence = window.module['conversation-persistence.js'];
+      const modeManager = window.module['mode-manager.js'];
+      const uiRenderer = window.module['ui-renderer.js'];
       const apiClient = window.module['api-client.js'];
   
       // Clear in-memory conversation
       conversationManager.messages = [];
+  
+      // Reset mode manager to planning mode
+      modeManager.init();
+  
+      // Clear UI renderer state (expanded summaries, etc.)
+      if (uiRenderer.expandedSummaries) {
+        uiRenderer.expandedSummaries.clear();
+      }
+      uiRenderer.allMessages = [];
   
       // Clear persistence file
       if (conversationPersistence.isInitialized) {
@@ -3693,6 +3716,10 @@
   
       // Reset chat ID so new conversation starts fresh
       apiClient.chatId = null;
+  
+      // Reset cancellation state
+      this.cancelRequested = false;
+      this.isProcessing = false;
   
       // Hide any loading indicators
       this.hideLoading();
