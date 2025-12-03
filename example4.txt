@@ -1,0 +1,1185 @@
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const url = require('url');
+
+const PORT = 3005;
+const CHUNK_SIZE = 8192; // 8KB chunks
+
+function getIndexHTML() {
+  return `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Folder Differ</title>
+  <script src="https://cdn.jsdelivr.net/npm/diff@5.1.0/dist/diff.min.js"></script>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 20px;
+      font-family: monospace;
+      font-size: 12px;
+    }
+    .inputs {
+      margin-bottom: 20px;
+      display: flex;
+      gap: 10px;
+    }
+    .inputs input {
+      flex: 1;
+      padding: 5px;
+      font-family: monospace;
+    }
+    .inputs button {
+      padding: 5px 15px;
+    }
+    .container {
+      display: flex;
+      gap: 20px;
+      height: calc(100vh - 100px);
+    }
+    .panel {
+      flex: 1;
+      border: 1px solid #ccc;
+      overflow: auto;
+      padding: 10px;
+    }
+    .tree-item {
+      padding: 2px 0;
+      cursor: pointer;
+      user-select: none;
+      min-height: 20px;
+      line-height: 20px;
+      display: flex;
+      align-items: center;
+      white-space: nowrap;
+    }
+    .tree-item.dir {
+      font-weight: bold;
+    }
+    .tree-item.file {
+      padding-left: 20px;
+    }
+    .tree-item.diff {
+      background: #fff3cd;
+    }
+    .tree-item.only-left {
+      background: #f8d7da;
+    }
+    .tree-item.only-right {
+      background: #d1ecf1;
+    }
+    .tree-item .actions {
+      display: inline-flex;
+      gap: 3px;
+      margin-left: 10px;
+      height: 20px;
+      align-items: center;
+    }
+    .tree-item .actions button {
+      font-size: 12px;
+      padding: 0;
+      margin: 0;
+      background: transparent;
+      border: none;
+      cursor: pointer;
+      line-height: 20px;
+      height: 20px;
+      width: auto;
+      color: #666;
+    }
+    .tree-item .actions button:hover {
+      color: #000;
+      background: #f0f0f0;
+    }
+    .indent {
+      margin-left: 15px;
+    }
+    .diff-view {
+      display: none;
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background: white;
+      padding: 20px;
+      overflow: auto;
+      z-index: 1000;
+    }
+    .diff-view.active {
+      display: block;
+    }
+    .diff-header {
+      margin-bottom: 20px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .diff-container {
+      display: flex;
+      gap: 5px;
+      overflow: auto;
+      max-height: calc(100vh - 100px);
+    }
+    .diff-side {
+      flex: 1;
+      font-family: monospace;
+      font-size: 12px;
+    }
+    .diff-side-title {
+      padding: 5px 10px;
+      background: #f0f0f0;
+      font-weight: bold;
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+    .diff-chunk {
+      display: flex;
+      border-bottom: 1px solid #eee;
+      position: relative;
+      height: 20px;
+      line-height: 20px;
+      align-items: center;
+    }
+    .diff-chunk-group {
+      position: relative;
+    }
+    .diff-line-num {
+      padding: 0 5px;
+      background: #f5f5f5;
+      border-right: 1px solid #ddd;
+      text-align: right;
+      min-width: 40px;
+      user-select: none;
+      color: #666;
+      height: 20px;
+      line-height: 20px;
+    }
+    .diff-line-content {
+      padding: 0 5px;
+      white-space: pre;
+      flex: 1;
+      height: 20px;
+      line-height: 20px;
+      overflow: hidden;
+    }
+    .diff-line-added {
+      background: #d4fdd4;
+    }
+    .diff-line-removed {
+      background: #fdd4d4;
+    }
+    .diff-line-unchanged {
+      background: white;
+    }
+    .diff-actions {
+      display: flex;
+      gap: 3px;
+      align-items: center;
+      padding: 0 5px;
+      min-width: 60px;
+      height: 20px;
+    }
+    .diff-actions button {
+      font-size: 12px;
+      padding: 0;
+      background: transparent;
+      border: none;
+      cursor: pointer;
+      line-height: 20px;
+      height: 20px;
+      width: 20px;
+      color: #666;
+    }
+    .diff-actions button:hover {
+      color: #000;
+      background: #f0f0f0;
+    }
+    button {
+      cursor: pointer;
+    }
+  </style>
+</head>
+<body>
+  <div class="inputs">
+    <input type="text" id="leftPath" placeholder="Left folder path (e.g., C:\\path\\to\\folder)">
+    <input type="text" id="rightPath" placeholder="Right folder path (e.g., C:\\path\\to\\folder)">
+    <button onclick="compare()">Compare</button>
+  </div>
+
+  <div class="container">
+    <div class="panel" id="leftPanel"></div>
+    <div class="panel" id="rightPanel"></div>
+  </div>
+
+  <div class="diff-view" id="diffView">
+    <div class="diff-header">
+      <h3 id="diffTitle"></h3>
+      <div>
+        <button onclick="saveDiff()" id="saveDiffBtn">Save</button>
+        <button onclick="closeDiff()">Close</button>
+      </div>
+    </div>
+    <div class="diff-container" id="diffContainer">
+      <!-- Diff will be rendered here -->
+    </div>
+  </div>
+
+  <script>
+    let leftPath = '';
+    let rightPath = '';
+    let leftStructure = {};
+    let rightStructure = {};
+    let expandedDirs = new Set();
+    let currentDiffFile = null;
+    let fileComparisonCache = {};
+    let diffChunks = []; // Store info about each diff chunk for copy/delete operations
+
+    // Load saved paths from localStorage on page load
+    window.addEventListener('DOMContentLoaded', () => {
+      const savedLeftPath = localStorage.getItem('folderDifferLeftPath');
+      const savedRightPath = localStorage.getItem('folderDifferRightPath');
+
+      if (savedLeftPath) {
+        document.getElementById('leftPath').value = savedLeftPath;
+      }
+      if (savedRightPath) {
+        document.getElementById('rightPath').value = savedRightPath;
+      }
+
+      // Add input listeners to save on change
+      document.getElementById('leftPath').addEventListener('input', (e) => {
+        localStorage.setItem('folderDifferLeftPath', e.target.value);
+      });
+      document.getElementById('rightPath').addEventListener('input', (e) => {
+        localStorage.setItem('folderDifferRightPath', e.target.value);
+      });
+    });
+
+    async function fetchJSON(url) {
+      const res = await fetch(url);
+      return await res.json();
+    }
+
+    async function postJSON(url, data) {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data)
+      });
+      return await res.json();
+    }
+
+    async function deleteJSON(url, data) {
+      const res = await fetch(url, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data)
+      });
+      return await res.json();
+    }
+
+    async function compare() {
+      leftPath = document.getElementById('leftPath').value.trim();
+      rightPath = document.getElementById('rightPath').value.trim();
+
+      if (!leftPath || !rightPath) {
+        alert('Please enter both folder paths');
+        return;
+      }
+
+      await refresh();
+    }
+
+    async function refresh() {
+      const leftData = await fetchJSON(\`/api/list?path=\${encodeURIComponent(leftPath)}\`);
+      const rightData = await fetchJSON(\`/api/list?path=\${encodeURIComponent(rightPath)}\`);
+
+      leftStructure = leftData.structure || {};
+      rightStructure = rightData.structure || {};
+
+      console.log('leftStructure keys:', Object.keys(leftStructure));
+      console.log('rightStructure keys:', Object.keys(rightStructure));
+
+      // Clear comparison cache
+      fileComparisonCache = {};
+
+      // Compare all files that exist on both sides
+      await compareAllFiles();
+
+      render();
+    }
+
+    async function compareAllFiles() {
+      const leftPaths = getAllPaths(leftStructure);
+      const rightPaths = getAllPaths(rightStructure);
+
+      const comparisons = [];
+
+      for (const relativePath of leftPaths) {
+        if (rightPaths.has(relativePath)) {
+          const leftItem = getItemByPath(leftStructure, relativePath);
+          const rightItem = getItemByPath(rightStructure, relativePath);
+
+          if (leftItem && leftItem.type === 'file' && rightItem && rightItem.type === 'file') {
+            comparisons.push(compareFile(relativePath));
+          }
+        }
+      }
+
+      await Promise.all(comparisons);
+    }
+
+    async function compareFile(relativePath) {
+      const leftFullPath = leftPath + '\\\\' + relativePath.split('/').join('\\\\');
+      const rightFullPath = rightPath + '\\\\' + relativePath.split('/').join('\\\\');
+
+      try {
+        const result = await postJSON('/api/compare', {
+          path1: leftFullPath,
+          path2: rightFullPath
+        });
+
+        fileComparisonCache[relativePath] = result.identical;
+      } catch (err) {
+        fileComparisonCache[relativePath] = false;
+      }
+    }
+
+    function getItemByPath(structure, path) {
+      // Handle both forward slash and backslash
+      const parts = path.split('\\\\').join('/').split('/');
+      let current = structure;
+
+      console.log('getItemByPath:', path, 'parts:', parts);
+
+      for (let i = 0; i < parts.length; i++) {
+        const part = parts[i];
+        console.log('  Looking for part:', part, 'in keys:', Object.keys(current));
+        if (!current[part]) {
+          console.log('  Part not found!');
+          return null;
+        }
+
+        // If this is the last part, return the item
+        if (i === parts.length - 1) {
+          console.log('  Found item:', current[part]);
+          return current[part];
+        }
+
+        // Navigate into children for next part
+        if (current[part].type === 'dir' && current[part].children) {
+          console.log('  Navigating into children of', part);
+          current = current[part].children;
+        } else {
+          console.log('  Not a directory or no children');
+          return null;
+        }
+      }
+
+      return null;
+    }
+
+    function getAllPaths(structure, prefix = '') {
+      const paths = new Set();
+      for (const key in structure) {
+        const fullPath = prefix ? prefix + '\\\\' + key : key;
+        paths.add(fullPath);
+        if (structure[key].type === 'dir' && structure[key].children) {
+          const childPaths = getAllPaths(structure[key].children, fullPath);
+          childPaths.forEach(p => paths.add(p));
+        }
+      }
+      return paths;
+    }
+
+    function render() {
+      const allPaths = new Set([
+        ...getAllPaths(leftStructure),
+        ...getAllPaths(rightStructure)
+      ]);
+
+      const sortedPaths = Array.from(allPaths).sort();
+
+      const leftDOM = buildTree(sortedPaths, 'left');
+      const rightDOM = buildTree(sortedPaths, 'right');
+
+      document.getElementById('leftPanel').innerHTML = '';
+      document.getElementById('leftPanel').appendChild(leftDOM);
+
+      document.getElementById('rightPanel').innerHTML = '';
+      document.getElementById('rightPanel').appendChild(rightDOM);
+    }
+
+    function buildTree(paths, side) {
+      const container = document.createElement('div');
+      const structure = side === 'left' ? leftStructure : rightStructure;
+      const otherStructure = side === 'left' ? rightStructure : leftStructure;
+      const basePath = side === 'left' ? leftPath : rightPath;
+      const otherBasePath = side === 'left' ? rightPath : leftPath;
+
+      // Build tree hierarchy
+      const tree = {};
+      console.log('Building tree from paths:', paths);
+      paths.forEach(p => {
+        const parts = p.split('\\\\').join('/').split('/');
+        console.log('Processing path:', p, 'parts:', parts);
+        let current = tree;
+        let pathSoFar = '';
+        parts.forEach((part, idx) => {
+          pathSoFar = pathSoFar ? pathSoFar + '/' + part : part;
+          if (!current[part]) {
+            current[part] = { children: {}, fullPath: pathSoFar };
+          }
+          // Update fullPath to the most complete path seen
+          if (idx === parts.length - 1) {
+            current[part].fullPath = p;
+          }
+          current = current[part].children;
+        });
+      });
+      console.log('Built tree:', tree);
+
+      function renderNode(name, node, depth, parentPath) {
+        if (!name) return null; // Skip empty names
+
+        const fullPath = node.fullPath || (parentPath ? parentPath + '/' + name : name);
+        console.log('renderNode:', name, 'fullPath:', fullPath, 'node.children:', Object.keys(node.children));
+        const item = getItemByPath(structure, fullPath);
+        const otherItem = getItemByPath(otherStructure, fullPath);
+        console.log('  item:', item, 'otherItem:', otherItem);
+
+        const wrapper = document.createElement('div');
+        const div = document.createElement('div');
+        div.style.marginLeft = (depth * 15) + 'px';
+        div.className = 'tree-item';
+
+        if (item && item.type === 'dir') {
+          div.className += ' dir';
+          const isExpanded = expandedDirs.has(fullPath);
+          const arrow = isExpanded ? '▼' : '▶';
+
+          div.innerHTML = \`<span onclick="toggleDir('\${fullPath.replace(/'/g, "\\\\'")}')">\${arrow} \${name}/</span>\`;
+          wrapper.appendChild(div);
+
+          if (isExpanded) {
+            const childrenDiv = document.createElement('div');
+            const childNames = Object.keys(node.children).sort((a, b) => {
+              const aPath = fullPath ? fullPath + '/' + a : a;
+              const bPath = fullPath ? fullPath + '/' + b : b;
+              const aItem = structure[aPath] || otherStructure[aPath];
+              const bItem = structure[bPath] || otherStructure[bPath];
+              const aIsDir = aItem && aItem.type === 'dir';
+              const bIsDir = bItem && bItem.type === 'dir';
+
+              // Folders first, then files
+              if (aIsDir && !bIsDir) return -1;
+              if (!aIsDir && bIsDir) return 1;
+              return a.localeCompare(b);
+            });
+            childNames.forEach(childName => {
+              const childNode = renderNode(childName, node.children[childName], depth + 1, fullPath);
+              if (childNode) childrenDiv.appendChild(childNode);
+            });
+            wrapper.appendChild(childrenDiv);
+
+            // Auto-expand other side
+            if (otherItem && otherItem.type === 'dir') {
+              expandedDirs.add(fullPath);
+            }
+          }
+        } else if (item && item.type === 'file') {
+          div.className += ' file';
+
+          let status = '';
+          let actions = '';
+
+          if (!otherItem) {
+            // File exists only on this side
+            div.className += side === 'left' ? ' only-left' : ' only-right';
+
+            if (side === 'left') {
+              actions = \`<span class="actions">
+                <button onclick="copyFile('\${fullPath.replace(/'/g, "\\\\'")}', 'left-to-right')">Copy →</button>
+                <button onclick="deleteFile('\${fullPath.replace(/'/g, "\\\\'")}', 'left')">Delete</button>
+              </span>\`;
+            } else {
+              actions = \`<span class="actions">
+                <button onclick="copyFile('\${fullPath.replace(/'/g, "\\\\'")}', 'right-to-left')">← Copy</button>
+                <button onclick="deleteFile('\${fullPath.replace(/'/g, "\\\\'")}', 'right')">Delete</button>
+              </span>\`;
+            }
+          } else if (otherItem && otherItem.type === 'file') {
+            // File exists on both sides - check if different using comparison cache
+            const isIdentical = fileComparisonCache[fullPath];
+            if (isIdentical === false) {
+              // Files are different
+              div.className += ' diff';
+              div.ondblclick = () => openDiff(fullPath);
+            }
+          }
+
+          div.innerHTML = \`<span style="flex: 1;">\${name}\${status}</span>\${actions}\`;
+          wrapper.appendChild(div);
+        } else if (!item && otherItem) {
+          // Item exists on other side but not this side - show placeholder
+          if (otherItem.type === 'dir') {
+            div.className += ' dir';
+            const isExpanded = expandedDirs.has(fullPath);
+            const arrow = isExpanded ? '▼' : '▶';
+            div.innerHTML = \`<span onclick="toggleDir('\${fullPath.replace(/'/g, "\\\\'")}')" style="color: #ccc;">\${arrow} \${name}/ (missing)</span>\`;
+            wrapper.appendChild(div);
+
+            if (isExpanded) {
+              const childrenDiv = document.createElement('div');
+              const childNames = Object.keys(node.children).sort((a, b) => {
+                const aPath = fullPath ? fullPath + '/' + a : a;
+                const bPath = fullPath ? fullPath + '/' + b : b;
+                const aItem = structure[aPath] || otherStructure[aPath];
+                const bItem = structure[bPath] || otherStructure[bPath];
+                const aIsDir = aItem && aItem.type === 'dir';
+                const bIsDir = bItem && bItem.type === 'dir';
+
+                // Folders first, then files
+                if (aIsDir && !bIsDir) return -1;
+                if (!aIsDir && bIsDir) return 1;
+                return a.localeCompare(b);
+              });
+              childNames.forEach(childName => {
+                const childNode = renderNode(childName, node.children[childName], depth + 1, fullPath);
+                if (childNode) childrenDiv.appendChild(childNode);
+              });
+              wrapper.appendChild(childrenDiv);
+            }
+          } else if (otherItem.type === 'file') {
+            div.className += ' file';
+            div.innerHTML = \`<span style="color: #ccc;">\${name} (missing)</span>\`;
+            wrapper.appendChild(div);
+          } else {
+            // Shouldn't happen, but return null just in case
+            return null;
+          }
+        } else {
+          // No item on either side - return null
+          return null;
+        }
+
+        return wrapper;
+      }
+
+      const rootNames = Object.keys(tree).sort((a, b) => {
+        const aItem = structure[a] || otherStructure[a];
+        const bItem = structure[b] || otherStructure[b];
+        const aIsDir = aItem && aItem.type === 'dir';
+        const bIsDir = bItem && bItem.type === 'dir';
+
+        // Folders first, then files
+        if (aIsDir && !bIsDir) return -1;
+        if (!aIsDir && bIsDir) return 1;
+        return a.localeCompare(b);
+      });
+      rootNames.forEach(name => {
+        const node = renderNode(name, tree[name], 0, '');
+        if (node) container.appendChild(node);
+      });
+
+      return container;
+    }
+
+    function toggleDir(path) {
+      if (expandedDirs.has(path)) {
+        expandedDirs.delete(path);
+      } else {
+        expandedDirs.add(path);
+      }
+      render();
+    }
+
+    async function copyFile(relativePath, direction) {
+      let fromPath, toPath;
+
+      if (direction === 'left-to-right') {
+        fromPath = leftPath + '\\\\' + relativePath.split('/').join('\\\\');
+        toPath = rightPath + '\\\\' + relativePath.split('/').join('\\\\');
+      } else {
+        fromPath = rightPath + '\\\\' + relativePath.split('/').join('\\\\');
+        toPath = leftPath + '\\\\' + relativePath.split('/').join('\\\\');
+      }
+
+      await postJSON('/api/copy', { from: fromPath, to: toPath });
+      await refresh();
+    }
+
+    async function deleteFile(relativePath, side) {
+      const basePath = side === 'left' ? leftPath : rightPath;
+      const fullPath = basePath + '\\\\' + relativePath.split('/').join('\\\\');
+
+      if (!confirm(\`Delete \${fullPath}?\`)) return;
+
+      await deleteJSON('/api/delete', { path: fullPath });
+      await refresh();
+    }
+
+    let leftLines = [];
+    let rightLines = [];
+    let originalLeftLines = [];
+    let originalRightLines = [];
+
+    async function openDiff(relativePath) {
+      const leftFullPath = leftPath + '\\\\' + relativePath.split('/').join('\\\\');
+      const rightFullPath = rightPath + '\\\\' + relativePath.split('/').join('\\\\');
+
+      const leftData = await fetchJSON(\`/api/read?path=\${encodeURIComponent(leftFullPath)}\`);
+      const rightData = await fetchJSON(\`/api/read?path=\${encodeURIComponent(rightFullPath)}\`);
+
+      currentDiffFile = { relativePath, leftFullPath, rightFullPath };
+      // Normalize line endings by removing any \\r characters
+      const leftContent = (leftData.content || '').replace(/\\r/g, '');
+      const rightContent = (rightData.content || '').replace(/\\r/g, '');
+      leftLines = leftContent.split('\\n');
+      rightLines = rightContent.split('\\n');
+
+      // Store original copies for comparison
+      originalLeftLines = leftLines.slice();
+      originalRightLines = rightLines.slice();
+
+      console.log('Left lines:', JSON.stringify(leftLines));
+      console.log('Right lines:', JSON.stringify(rightLines));
+
+      document.getElementById('diffTitle').textContent = relativePath;
+
+      renderDiff();
+      document.getElementById('diffView').classList.add('active');
+    }
+
+    function renderDiff() {
+      const container = document.getElementById('diffContainer');
+      container.innerHTML = '';
+      diffChunks = []; // Reset chunk data
+
+      // Create side-by-side structure
+      const leftSide = document.createElement('div');
+      leftSide.className = 'diff-side';
+      const leftTitle = document.createElement('div');
+      leftTitle.className = 'diff-side-title';
+      leftTitle.textContent = 'Left: ' + currentDiffFile.leftFullPath;
+      leftSide.appendChild(leftTitle);
+
+      const rightSide = document.createElement('div');
+      rightSide.className = 'diff-side';
+      const rightTitle = document.createElement('div');
+      rightTitle.className = 'diff-side-title';
+      rightTitle.textContent = 'Right: ' + currentDiffFile.rightFullPath;
+      rightSide.appendChild(rightTitle);
+
+      // Compute diff using diff library
+      // Add newlines to ensure proper line boundary detection
+      const leftText = leftLines.join('\\n') + '\\n';
+      const rightText = rightLines.join('\\n') + '\\n';
+      const diffs = Diff.diffLines(leftText, rightText);
+
+      console.log('Diff results:', diffs);
+
+      let leftLineNum = 1;
+      let rightLineNum = 1;
+
+      diffs.forEach(part => {
+        // When using diffLines, part.value is a string, so split it
+        const lines = part.value.split('\\n');
+        if (lines[lines.length - 1] === '') lines.pop(); // Remove empty last line
+
+        if (part.added) {
+          // Lines added to right - store chunk info
+          const startLine = rightLineNum;
+          const currentChunkIdx = diffChunks.length; // Get index before pushing
+          diffChunks.push({
+            type: 'added',
+            lines: lines.slice(),
+            leftStartLine: leftLineNum,
+            rightStartLine: startLine
+          });
+
+          lines.forEach((line, idx) => {
+            const leftChunk = document.createElement('div');
+            leftChunk.className = 'diff-chunk';
+            leftChunk.innerHTML = \`
+              <div class="diff-line-num"></div>
+              <div class="diff-line-content" style="background: #f9f9f9;">&nbsp;</div>
+            \`;
+            leftSide.appendChild(leftChunk);
+
+            const rightChunk = document.createElement('div');
+            rightChunk.className = 'diff-chunk';
+
+            // Add action buttons only on the first line of the chunk
+            const actionsHTML = idx === 0 ? \`
+              <div class="diff-actions">
+                <button onclick="copyChunkToLeft(\${currentChunkIdx})" title="Copy to Left">←</button>
+                <button onclick="deleteChunkFromRight(\${currentChunkIdx})" title="Delete from Right">✕</button>
+              </div>
+            \` : '';
+
+            rightChunk.innerHTML = \`
+              <div class="diff-line-num">\${rightLineNum++}</div>
+              <div class="diff-line-content diff-line-added">\${line}</div>
+              \${actionsHTML}
+            \`;
+            rightSide.appendChild(rightChunk);
+          });
+
+        } else if (part.removed) {
+          // Lines removed from left - store chunk info
+          const startLine = leftLineNum;
+          const currentChunkIdx = diffChunks.length; // Get index before pushing
+          diffChunks.push({
+            type: 'removed',
+            lines: lines.slice(),
+            leftStartLine: startLine,
+            rightStartLine: rightLineNum
+          });
+
+          lines.forEach((line, idx) => {
+            const leftChunk = document.createElement('div');
+            leftChunk.className = 'diff-chunk';
+
+            // Add action buttons only on the first line of the chunk
+            const actionsHTML = idx === 0 ? \`
+              <div class="diff-actions">
+                <button onclick="copyChunkToRight(\${currentChunkIdx})" title="Copy to Right">→</button>
+                <button onclick="deleteChunkFromLeft(\${currentChunkIdx})" title="Delete from Left">✕</button>
+              </div>
+            \` : '';
+
+            leftChunk.innerHTML = \`
+              <div class="diff-line-num">\${leftLineNum++}</div>
+              <div class="diff-line-content diff-line-removed">\${line}</div>
+              \${actionsHTML}
+            \`;
+            leftSide.appendChild(leftChunk);
+
+            const rightChunk = document.createElement('div');
+            rightChunk.className = 'diff-chunk';
+            rightChunk.innerHTML = \`
+              <div class="diff-line-num"></div>
+              <div class="diff-line-content" style="background: #f9f9f9;">&nbsp;</div>
+            \`;
+            rightSide.appendChild(rightChunk);
+          });
+
+        } else {
+          // Unchanged lines
+          lines.forEach(line => {
+            const leftChunk = document.createElement('div');
+            leftChunk.className = 'diff-chunk';
+            leftChunk.innerHTML = \`
+              <div class="diff-line-num">\${leftLineNum++}</div>
+              <div class="diff-line-content diff-line-unchanged">\${line}</div>
+            \`;
+            leftSide.appendChild(leftChunk);
+
+            const rightChunk = document.createElement('div');
+            rightChunk.className = 'diff-chunk';
+            rightChunk.innerHTML = \`
+              <div class="diff-line-num">\${rightLineNum++}</div>
+              <div class="diff-line-content diff-line-unchanged">\${line}</div>
+            \`;
+            rightSide.appendChild(rightChunk);
+          });
+        }
+      });
+
+      container.appendChild(leftSide);
+      container.appendChild(rightSide);
+    }
+
+    async function copyChunkToLeft(chunkIndex) {
+      const chunk = diffChunks[chunkIndex];
+      if (!chunk || chunk.type !== 'added') return;
+
+      // Work with current in-memory content
+      const lines = leftLines.slice();
+
+      // Insert the chunk lines
+      const insertIndex = chunk.leftStartLine - 1;
+      lines.splice(insertIndex, 0, ...chunk.lines);
+
+      // Update in-memory content
+      leftLines = lines;
+
+      // Re-render diff
+      renderDiff();
+    }
+
+    async function copyChunkToRight(chunkIndex) {
+      const chunk = diffChunks[chunkIndex];
+      if (!chunk || chunk.type !== 'removed') return;
+
+      // Work with current in-memory content
+      const lines = rightLines.slice();
+
+      // Insert the chunk lines
+      const insertIndex = chunk.rightStartLine - 1;
+      lines.splice(insertIndex, 0, ...chunk.lines);
+
+      // Update in-memory content
+      rightLines = lines;
+
+      // Re-render diff
+      renderDiff();
+    }
+
+    async function deleteChunkFromLeft(chunkIndex) {
+      const chunk = diffChunks[chunkIndex];
+      if (!chunk || chunk.type !== 'removed') return;
+
+      // Work with current in-memory content
+      const lines = leftLines.slice();
+
+      // Remove the chunk lines
+      const startIndex = chunk.leftStartLine - 1;
+      lines.splice(startIndex, chunk.lines.length);
+
+      // Update in-memory content
+      leftLines = lines;
+
+      // Re-render diff
+      renderDiff();
+    }
+
+    async function deleteChunkFromRight(chunkIndex) {
+      const chunk = diffChunks[chunkIndex];
+      if (!chunk || chunk.type !== 'added') return;
+
+      // Work with current in-memory content
+      const lines = rightLines.slice();
+
+      // Remove the chunk lines
+      const startIndex = chunk.rightStartLine - 1;
+      lines.splice(startIndex, chunk.lines.length);
+
+      // Update in-memory content
+      rightLines = lines;
+
+      // Re-render diff
+      renderDiff();
+    }
+
+    async function saveDiff() {
+      // Save both files to disk
+      await postJSON('/api/write', {
+        path: currentDiffFile.leftFullPath,
+        content: leftLines.join('\\n')
+      });
+
+      await postJSON('/api/write', {
+        path: currentDiffFile.rightFullPath,
+        content: rightLines.join('\\n')
+      });
+
+      // Re-compare this specific file
+      await compareFile(currentDiffFile.relativePath);
+
+      // Re-render the folder view to update the status
+      render();
+
+      // Re-open the diff to show updated state
+      await openDiff(currentDiffFile.relativePath);
+    }
+
+    function hasUnsavedChanges() {
+      if (leftLines.length !== originalLeftLines.length || rightLines.length !== originalRightLines.length) {
+        return true;
+      }
+      for (let i = 0; i < leftLines.length; i++) {
+        if (leftLines[i] !== originalLeftLines[i]) return true;
+      }
+      for (let i = 0; i < rightLines.length; i++) {
+        if (rightLines[i] !== originalRightLines[i]) return true;
+      }
+      return false;
+    }
+
+    function closeDiff() {
+      if (hasUnsavedChanges()) {
+        if (!confirm('You have unsaved changes. Are you sure you want to close without saving?')) {
+          return;
+        }
+      }
+      document.getElementById('diffView').classList.remove('active');
+      currentDiffFile = null;
+    }
+  </script>
+</body>
+</html>
+`;
+}
+
+function compareFiles(path1, path2) {
+  try {
+    const stats1 = fs.statSync(path1);
+    const stats2 = fs.statSync(path2);
+
+    // Quick check: if sizes differ, files are different
+    if (stats1.size !== stats2.size) {
+      return false;
+    }
+
+    // Compare files in chunks
+    const fd1 = fs.openSync(path1, 'r');
+    const fd2 = fs.openSync(path2, 'r');
+
+    const buffer1 = Buffer.alloc(CHUNK_SIZE);
+    const buffer2 = Buffer.alloc(CHUNK_SIZE);
+
+    let position = 0;
+    let identical = true;
+
+    try {
+      while (position < stats1.size) {
+        const bytesRead1 = fs.readSync(fd1, buffer1, 0, CHUNK_SIZE, position);
+        const bytesRead2 = fs.readSync(fd2, buffer2, 0, CHUNK_SIZE, position);
+
+        if (bytesRead1 !== bytesRead2) {
+          identical = false;
+          break;
+        }
+
+        if (!buffer1.slice(0, bytesRead1).equals(buffer2.slice(0, bytesRead2))) {
+          identical = false;
+          break;
+        }
+
+        position += bytesRead1;
+
+        // If we've read less than chunk size, we're at the end
+        if (bytesRead1 < CHUNK_SIZE) {
+          break;
+        }
+      }
+    } finally {
+      fs.closeSync(fd1);
+      fs.closeSync(fd2);
+    }
+
+    return identical;
+  } catch (err) {
+    return false;
+  }
+}
+
+function readDirRecursive(dirPath, basePath = dirPath) {
+  const result = {};
+  try {
+    const items = fs.readdirSync(dirPath);
+    for (const item of items) {
+      const fullPath = path.join(dirPath, item);
+      const stats = fs.statSync(fullPath);
+
+      if (stats.isDirectory()) {
+        result[item] = {
+          type: 'dir',
+          children: readDirRecursive(fullPath, basePath)
+        };
+      } else {
+        result[item] = {
+          type: 'file',
+          size: stats.size,
+          mtime: stats.mtime.getTime()
+        };
+      }
+    }
+  } catch (err) {
+    return { error: err.message };
+  }
+  return result;
+}
+
+const server = http.createServer((req, res) => {
+  const parsedUrl = url.parse(req.url, true);
+  const pathname = parsedUrl.pathname;
+
+  // CORS headers
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(200);
+    res.end();
+    return;
+  }
+
+  // Serve index.html
+  if (pathname === '/' || pathname === '/index.html') {
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end(getIndexHTML());
+    return;
+  }
+
+  // API: List directory structure
+  if (pathname === '/api/list' && req.method === 'GET') {
+    const dirPath = parsedUrl.query.path;
+    if (!dirPath) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Missing path parameter' }));
+      return;
+    }
+
+    try {
+      const structure = readDirRecursive(dirPath);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ path: dirPath, structure }));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  // API: Read file content
+  if (pathname === '/api/read' && req.method === 'GET') {
+    const filePath = parsedUrl.query.path;
+    if (!filePath) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Missing path parameter' }));
+      return;
+    }
+
+    fs.readFile(filePath, 'utf8', (err, data) => {
+      if (err) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: err.message }));
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ content: data }));
+    });
+    return;
+  }
+
+  // API: Write file content
+  if (pathname === '/api/write' && req.method === 'POST') {
+    let body = '';
+    req.on('data', chunk => {
+      body += chunk.toString();
+    });
+    req.on('end', () => {
+      try {
+        const { path: filePath, content } = JSON.parse(body);
+        if (!filePath) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Missing path' }));
+          return;
+        }
+
+        // Ensure directory exists
+        const dir = path.dirname(filePath);
+        if (!fs.existsSync(dir)) {
+          fs.mkdirSync(dir, { recursive: true });
+        }
+
+        fs.writeFileSync(filePath, content, 'utf8');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true }));
+      } catch (err) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
+  // API: Copy file
+  if (pathname === '/api/copy' && req.method === 'POST') {
+    let body = '';
+    req.on('data', chunk => {
+      body += chunk.toString();
+    });
+    req.on('end', () => {
+      try {
+        const { from, to } = JSON.parse(body);
+        if (!from || !to) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Missing from or to path' }));
+          return;
+        }
+
+        // Ensure directory exists
+        const dir = path.dirname(to);
+        if (!fs.existsSync(dir)) {
+          fs.mkdirSync(dir, { recursive: true });
+        }
+
+        fs.copyFileSync(from, to);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true }));
+      } catch (err) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
+  // API: Delete file
+  if (pathname === '/api/delete' && req.method === 'DELETE') {
+    let body = '';
+    req.on('data', chunk => {
+      body += chunk.toString();
+    });
+    req.on('end', () => {
+      try {
+        const { path: filePath } = JSON.parse(body);
+        if (!filePath) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Missing path' }));
+          return;
+        }
+
+        fs.unlinkSync(filePath);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true }));
+      } catch (err) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
+  // API: Compare two files
+  if (pathname === '/api/compare' && req.method === 'POST') {
+    let body = '';
+    req.on('data', chunk => {
+      body += chunk.toString();
+    });
+    req.on('end', () => {
+      try {
+        const { path1, path2 } = JSON.parse(body);
+        if (!path1 || !path2) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Missing path1 or path2' }));
+          return;
+        }
+
+        const identical = compareFiles(path1, path2);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ identical }));
+      } catch (err) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
+  res.writeHead(404);
+  res.end('Not found');
+});
+
+server.listen(PORT, () => {
+  console.log(`Server running at http://localhost:${PORT}/`);
+});
