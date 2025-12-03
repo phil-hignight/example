@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-12-03T16:09:54.418Z
+// AI Agent - Built 2025-12-03T16:59:32.717Z
 (function() {
   window.module = {};
 
@@ -2617,8 +2617,8 @@
       }
   
       // Read the file
-      const content = await fileSystem.readFile(file);
-      if (content === null) {
+      const fileResult = await fileSystem.readFile(file);
+      if (fileResult === null) {
         console.log(`[ToolExec] readFile ERROR - failed to read file: ${args.path}`);
         return {
           tool: 'read_file',
@@ -2628,7 +2628,10 @@
         };
       }
   
+      // fileSystem.readFile returns { content: "..." } so extract the content
+      const content = typeof fileResult === 'string' ? fileResult : fileResult.content;
       console.log(`[ToolExec] readFile SUCCESS - read ${content.length} chars from ${args.path}`);
+  
       // TODO: Handle start_line and end_line parameters
       return {
         tool: 'read_file',
