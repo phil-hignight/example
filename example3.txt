@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-12-03T16:59:32.717Z
+// AI Agent - Built 2025-12-03T17:12:46.728Z
 (function() {
   window.module = {};
 
@@ -2965,6 +2965,10 @@
   // UI Manager v2.0
   // Coordinates UI rendering and handles user interactions
   window.module['ui-manager.js'] = {
+    // Track cancellation state
+    cancelRequested: false,
+    isProcessing: false,
+  
     init: function() {
       const conversationManager = window.module['conversation-manager.js'];
       const modeManager = window.module['mode-manager.js'];
@@ -3210,6 +3214,9 @@
         if (e.key === 'Enter' && !e.shiftKey) {
           e.preventDefault();
           this.handleSubmit();
+        } else if (e.key === 'Escape' && this.isProcessing) {
+          e.preventDefault();
+          this.cancelCurrentTask();
         }
         // Shift+Enter allows newline (default textarea behavior)
         // Trigger resize after key is processed
@@ -3258,6 +3265,11 @@
   
       if (!content) return;
   
+      // Don't allow submit while processing (unless canceling)
+      if (this.isProcessing) {
+        return;
+      }
+  
       // Clear input and reset height
       input.value = '';
       input.style.height = '38px';
@@ -3270,12 +3282,34 @@
         this.addUserMessage(content);
   
         // Get AI response (starts immediately, persisting happens async in background)
+        this.isProcessing = true;
+        this.cancelRequested = false;
         await this.getAIResponse();
   
       } catch (error) {
         console.error('Error:', error);
         this.showError(error.message);
+      } finally {
+        this.isProcessing = false;
+        this.cancelRequested = false;
       }
+    },
+  
+    cancelCurrentTask: function() {
+      console.log('[UI] Cancellation requested');
+      this.cancelRequested = true;
+      this.hideLoading();
+  
+      // Add a cancelled assistant message to maintain the user/assistant pattern
+      const conversationManager = window.module['conversation-manager.js'];
+      conversationManager.addMessage({
+        type: 'assistant',
+        content: '[Cancelled by user]'
+      });
+  
+      this.renderChat();
+      this.updateCharCounter();
+      this.isProcessing = false;
     },
   
     addUserMessage: function(content) {
@@ -3424,6 +3458,13 @@
   
               // Execute tools sequentially, creating individual tool_result messages
               for (const tool of aiResponse.tools) {
+                // Check for cancellation before each tool execution
+                if (this.cancelRequested) {
+                  console.log('[UI] Tool execution cancelled');
+                  this.hideLoading();
+                  return;
+                }
+  
                 this.showLoading(`Executing ${tool.name}...`);
   
                 const toolResults = await toolExecutor.executeTools([tool]);
@@ -3444,6 +3485,12 @@
               }
   
               this.hideLoading();
+  
+              // Check for cancellation before auto-calling AI again
+              if (this.cancelRequested) {
+                console.log('[UI] Auto-call cancelled after tool execution');
+                return;
+              }
   
               // Auto-call API again to let AI respond to tool results
               await this.getAIResponse();
@@ -3632,62 +3679,11 @@
         content.textContent = message.content;
   
       } else if (message.type === 'tool_use') {
-        // Handle both old format (msg.tool) and new format (msg.tools array)
-        const tools = message.tools || [message.tool];
-  
-        // Check if this is a checklist tool (only show special UI for single checklist tools)
-        const isChecklistTool = tools.length === 1 &&
-          (tools[0].name === 'exit_planning' || tools[0].name === 'item_completed' || tools[0].name === 'item_failed');
-  
-        if (isChecklistTool) {
-          // For checklist tools, don't show anything for tool_use - we'll show the checklist in tool_result
-          // Just hide this message completely
-          container.style.display = 'none';
-        } else {
-          // Normal tools - check if ALL tools have results
-          const allToolsComplete = tools.every(tool => {
-            // Find result for this specific tool by checking tool name
-            return this.allMessages.some(m =>
-              m.type === 'tool_result' &&
-              m.parentId === message.id &&
-              m.tool === tool.name
-            );
-          });
-  
-          if (allToolsComplete) {
-            // All tools done - check if any failed
-            const anyFailed = this.allMessages.some(m =>
-              m.type === 'tool_result' &&
-              m.parentId === message.id &&
-              !m.success
-            );
-            indicator.style.backgroundColor = anyFailed ? '#f48771' : '#4ec9b0';
-          } else {
-            // Still executing - show pulsing gray
-            indicator.style.backgroundColor = '#858585';
-            indicator.style.animation = 'pulse 1.5s ease-in-out infinite';
-          }
-  
-          content.style.cssText += 'color: #d4d4d4; padding: 2px 0; cursor: pointer;';
-  
-          // Render tools list
-          if (tools.length === 1) {
-            // Single tool - show as one-liner
-            const toolName = this.formatToolName(tools[0].name);
-            const params = this.formatToolParams(tools[0].name, tools[0].args);
-            content.innerHTML = `<span style="font-weight: bold;">${this.escapeHtml(toolName)}</span><span style="color: #858585;"> ${params}</span>`;
-          } else {
-            // Multiple tools - show count
-            content.innerHTML = `<span style="font-weight: bold;">${tools.length} tools</span><span style="color: #858585;"> (${tools.map(t => this.formatToolName(t.name)).join(', ')})</span>`;
-          }
-  
-          content.addEventListener('click', () => this.showToolModal('Tool Use', tools));
-        }
+        // Don't show tool_use messages - we'll show the individual tool results instead
+        // This eliminates the "3 tools (List Folder, List Folder, List Folder)" line
+        container.style.display = 'none';
   
       } else if (message.type === 'tool_result') {
-        // Add circle indicator for the result
-        indicator.style.backgroundColor = message.success ? '#4ec9b0' : '#f48771'; // Green or red
-  
         // Special rendering for checklist tools
         if (message.tool === 'exit_planning' || message.tool === 'item_completed' || message.tool === 'item_failed') {
           // Hide indicator for these special tools - we'll show checklist card instead
@@ -3707,9 +3703,9 @@
             content.textContent = this.formatToolResult(message);
           }
         } else {
-          // Normal tool results - no indicator, just text indented to align with content
-          indicator.style.display = 'none';
-          content.style.cssText += 'color: #858585; padding: 2px 0; padding-left: 20px; cursor: pointer;';
+          // Normal tool results - show green/red indicator
+          indicator.style.backgroundColor = message.success ? '#4ec9b0' : '#f48771'; // Green or red
+          content.style.cssText += 'color: #858585; padding: 2px 0; cursor: pointer; white-space: pre-wrap;';
           content.textContent = this.formatToolResult(message);
           content.addEventListener('click', () => this.showToolModal(`Tool Result: ${message.tool}`, message.result));
         }
@@ -3826,27 +3822,35 @@
       }
   
       const result = message.result;
+      const args = message.args || {};
       console.log(`[UIRenderer] Tool result content:`, result);
   
       // Format based on tool type
       if (message.tool === 'read_file') {
+        const path = args.path || '';
         if (result.content) {
           const lines = result.content.split('\n').length;
-          return `${lines} line${lines !== 1 ? 's' : ''} read`;
+          return `Read ${path}\n${lines} line${lines !== 1 ? 's' : ''} read`;
         }
-        return 'File read';
+        return `Read ${path}`;
       } else if (message.tool === 'list_folder') {
+        const path = args.path || '.';
         if (result.entries) {
           const count = result.entries.length;
           console.log(`[UIRenderer] list_folder result has ${count} entries`);
-          return `${count} item${count !== 1 ? 's' : ''} found`;
+          return `List ${path}\n${count} item${count !== 1 ? 's' : ''} found`;
         }
         console.log(`[UIRenderer] list_folder result has NO entries property`);
-        return 'Folder listed';
+        return `List ${path}`;
       } else if (message.tool === 'create_file') {
-        return 'File created';
+        const path = args.path || '';
+        return `Created ${path}`;
       } else if (message.tool === 'edit_file') {
-        return 'File edited';
+        const path = args.path || '';
+        return `Edited ${path}`;
+      } else if (message.tool === 'append_file') {
+        const path = args.path || '';
+        return `Appended to ${path}`;
       } else if (message.tool === 'exit_planning') {
         return 'Entering execution mode';
       } else if (message.tool === 'item_completed') {
