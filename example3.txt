@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-12-03T01:23:58.294Z
+// AI Agent - Built 2025-12-03T16:09:54.418Z
 (function() {
   window.module = {};
 
@@ -329,6 +329,7 @@
   // Transforms internal message format to API format
   window.module['api-renderer.js'] = {
     renderMessagesForAPI: function(messages) {
+      console.log(`[APIRenderer] renderMessagesForAPI called with ${messages.length} total messages`);
       const modeManager = window.module['mode-manager.js'];
       const apiMessages = [];
   
@@ -338,12 +339,14 @@
       for (let i = messages.length - 1; i >= 0; i--) {
         if (messages[i].type === 'summary') {
           startIndex = i;
+          console.log(`[APIRenderer] Found latest summary at index ${i}, id: ${messages[i].id}`);
           break;
         }
       }
   
       // Get messages from latest summary onward (or all messages if no summary)
       const activeMsgs = messages.slice(startIndex);
+      console.log(`[APIRenderer] Active messages (from index ${startIndex}): ${activeMsgs.length} messages`);
   
       let firstUserMessageIndex = -1;
       let pendingWarnings = []; // Can accumulate multiple warnings
@@ -356,6 +359,7 @@
   
         // Handle summary messages - treat them as user messages
         if (msg.type === 'summary') {
+          console.log(`[APIRenderer] Processing summary message - id: ${msg.id}`);
           let content = msg.content;
   
           // Is this the first message? Add system prompt
@@ -363,12 +367,14 @@
             firstUserMessageIndex = apiMessages.length;
             const prefix = modeManager.getSystemPrompt();
             content = prefix + '\n\n' + content;
+            console.log(`[APIRenderer] Added system prompt to first message (summary)`);
           }
   
           apiMessages.push({
             role: 'user',
             content: content
           });
+          console.log(`[APIRenderer] Added summary as user message to API`);
           continue;
         }
   
@@ -536,6 +542,8 @@
         });
       }
   
+      console.log(`[APIRenderer] Final API messages count: ${apiMessages.length}`);
+      console.log(`[APIRenderer] First 3 API messages:`, apiMessages.slice(0, 3).map(m => ({ role: m.role, contentLength: m.content.length })));
       return apiMessages;
     }
   };
@@ -792,9 +800,12 @@
           }
         }
   
+        console.log(`[ConvFlow] Finished streaming, accumulated content length: ${accumulatedContent.length}`);
+  
         // Check if response exceeds 100K character limit
         const MAX_RESPONSE_CHARS = 100000;
         if (accumulatedContent.length > MAX_RESPONSE_CHARS) {
+          console.log(`[ConvFlow] Response EXCEEDED ${MAX_RESPONSE_CHARS} char limit`);
           conversationManager.addMessage({
             type: 'system_warning',
             warning: `Response exceeded ${MAX_RESPONSE_CHARS} character limit (got ${accumulatedContent.length} chars). Response was truncated. For large files, use create_file for the first chunk, then append_file for additional chunks.`
@@ -802,7 +813,9 @@
         }
   
         // Process the accumulated response
+        console.log(`[ConvFlow] Processing accumulated response...`);
         let processed = messageProcessor.processStreamedResponse(accumulatedContent);
+        console.log(`[ConvFlow] Processing result - complete: ${processed.complete}, error: ${processed.error}, type: ${processed.content?.type}`);
   
         // Add system warning if text was trimmed
         if (processed.systemWarning) {
@@ -839,9 +852,9 @@
         // Check if response is incomplete (missing terminator)
         // Try to auto-close JSON and execute it if possible
         if (!processed.complete) {
-          console.error('Response incomplete - missing terminator');
-          console.error('Response length:', accumulatedContent.length);
-          console.error('Last 100 chars:', accumulatedContent.substring(Math.max(0, accumulatedContent.length - 100)));
+          console.log(`[ConvFlow] Response INCOMPLETE - missing terminator`);
+          console.log(`[ConvFlow] Response length: ${accumulatedContent.length}`);
+          console.log(`[ConvFlow] Last 100 chars:`, accumulatedContent.substring(Math.max(0, accumulatedContent.length - 100)));
   
           // Strip leading = if present (Claude sometimes adds this prefix)
           let cleanContent = accumulatedContent;
@@ -1009,6 +1022,8 @@
       const utils = window.module['utils.js'];
       const config = window.module['config.js'];
   
+      console.log(`[ConvMgr] addMessage called - type: ${message.type}, skipPersist: ${skipPersist}`);
+  
       // Ensure message has required fields
       if (!message.id) {
         message.id = utils.generateUUID();
@@ -1036,10 +1051,12 @@
       const messageCharCount = utils.countCharacters([message]);
       const wouldExceedLimit = (currentCount + messageCharCount) > config.MAX_CONVERSATION_CHARS;
   
+      console.log(`[ConvMgr] Character count - current: ${currentCount}, adding: ${messageCharCount}, limit: ${config.MAX_CONVERSATION_CHARS}, wouldExceed: ${wouldExceedLimit}`);
+  
       if (wouldExceedLimit) {
-        console.log(`Would exceed ${config.MAX_CONVERSATION_CHARS} char limit (current: ${currentCount}, adding: ${messageCharCount}). Triggering summarization...`);
+        console.log(`[ConvMgr] ⚠️ TRIGGERING SUMMARIZATION - limit would be exceeded`);
         // Trigger summarization asynchronously (don't block)
-        this.summarize().catch(err => console.error('[ConversationManager] Summarization error:', err));
+        this.summarize().catch(err => console.error('[ConvMgr] Summarization error:', err));
       }
   
       // Add the message to memory immediately
@@ -1082,9 +1099,13 @@
      * Creates a summary message and marks which messages it summarizes
      */
     summarize: async function() {
+      console.log(`[ConvMgr] ========== SUMMARIZATION STARTED ==========`);
       const utils = window.module['utils.js'];
       const apiClient = window.module['api-client.js'];
       const config = window.module['config.js'];
+  
+      console.log(`[ConvMgr] Current message count: ${this.messages.length}`);
+      console.log(`[ConvMgr] Current character count: ${this.getTotalCharacterCount()}`);
   
       // 1. Gather messages to summarize
       let messagesToSummarize = [];
@@ -1101,12 +1122,14 @@
       if (latestSummaryIndex === -1) {
         // No summaries exist - summarize all messages
         messagesToSummarize = this.messages.slice();
+        console.log(`[ConvMgr] No existing summaries - summarizing ALL ${messagesToSummarize.length} messages`);
       } else {
         // Summaries exist - summarize from latest summary to end
         messagesToSummarize = this.messages.slice(latestSummaryIndex);
+        console.log(`[ConvMgr] Found existing summary at index ${latestSummaryIndex} - summarizing ${messagesToSummarize.length} messages from there`);
       }
   
-      console.log(`Summarizing ${messagesToSummarize.length} messages...`);
+      console.log(`[ConvMgr] Summarizing ${messagesToSummarize.length} messages...`);
   
       // 2. Convert messages to text for summarization
       const messagesText = messagesToSummarize.map(msg => {
@@ -1163,6 +1186,7 @@
       }];
   
       try {
+        console.log(`[ConvMgr] Calling API for summarization...`);
         const response = await fetch(`${config.API_BASE}/chat/completions`, {
           method: 'POST',
           headers: {
@@ -1180,12 +1204,15 @@
           })
         });
   
+        console.log(`[ConvMgr] API response status: ${response.status}`);
         if (!response.ok) {
           throw new Error(`Summary API call failed: ${response.status}`);
         }
   
         const data = await response.json();
         const summaryContent = data.choices?.[0]?.message?.content || 'Summary generation failed';
+        console.log(`[ConvMgr] Received summary content (length: ${summaryContent.length})`);
+        console.log(`[ConvMgr] Summary preview:`, summaryContent.substring(0, 200));
   
         // 5. Create summary message as a USER message that will be sent to API
         // This tells the AI: "Here's what happened, now continue with the latest request"
@@ -1200,13 +1227,15 @@
   </system-reminder>`;
   
         // Add summary as a special user message that marks the compaction point
+        console.log(`[ConvMgr] Adding summary message to conversation...`);
         this.addMessage({
           type: 'summary',
           content: summaryUserMessage
         });
   
-        console.log(`✓ Summarization complete. Created summary message. Total messages: ${this.messages.length}`);
-        console.log(`Summary: ${summaryContent.substring(0, 200)}...`);
+        console.log(`[ConvMgr] ========== SUMMARIZATION COMPLETE ==========`);
+        console.log(`[ConvMgr] ✓ Created summary message. Total messages now: ${this.messages.length}`);
+        console.log(`[ConvMgr] Summary preview: ${summaryContent.substring(0, 200)}...`);
   
         return { success: true, summary: summaryContent };
   
@@ -1388,7 +1417,7 @@
   
       // Convert message to JSON line
       const line = JSON.stringify(message) + '\n';
-      console.log(`[Persistence] Saving message type: ${message.type}, id: ${message.id}`);
+      console.log(`[Persistence] saveMessage called - type: ${message.type}, id: ${message.id}, content length: ${message.content?.length || 0}`);
   
       try {
         // Check if file exists
@@ -1402,18 +1431,20 @@
   
         if (fileExists) {
           // Append to existing file
+          console.log(`[Persistence] File exists, appending message...`);
           await fileSystem.appendFile({
             path: this.conversationFilePath,
             content: line
           });
-          console.log(`[Persistence] Appended message to file`);
+          console.log(`[Persistence] ✓ Successfully appended message to file`);
         } else {
           // Create new file
+          console.log(`[Persistence] File does not exist, creating new file...`);
           await fileSystem.createFile({
             path: this.conversationFilePath,
             content: line
           });
-          console.log(`[Persistence] Created file with first message`);
+          console.log(`[Persistence] ✓ Successfully created file with first message`);
         }
   
       } catch (error) {
@@ -1873,11 +1904,14 @@
   
     // ===== LAYER 1: TEXT TRIMMING =====
     trimToJson: function(text) {
+      console.log(`[MsgProcessor] trimToJson - input length: ${text.length}`);
       const openBrace = text.indexOf('{');
       const closeBrace = text.lastIndexOf('}');
+      console.log(`[MsgProcessor] trimToJson - openBrace at: ${openBrace}, closeBrace at: ${closeBrace}`);
   
       if (openBrace === -1 || closeBrace === -1 || closeBrace < openBrace) {
         // No valid JSON structure found
+        console.log(`[MsgProcessor] trimToJson - NO valid JSON structure found`);
         return {
           trimmed: text,
           systemWarning: null
@@ -1890,6 +1924,7 @@
   
       // Check if anything was trimmed
       if (trimmedPrefix.length > 0 || trimmedSuffix.length > 0) {
+        console.log(`[MsgProcessor] trimToJson - Trimmed ${trimmedPrefix.length} chars before, ${trimmedSuffix.length} chars after`);
         return {
           trimmed: jsonText,
           systemWarning: {
@@ -1901,6 +1936,7 @@
         };
       }
   
+      console.log(`[MsgProcessor] trimToJson - No trimming needed, JSON is clean`);
       return {
         trimmed: jsonText,
         systemWarning: null
@@ -2511,9 +2547,11 @@
     },
   
     listFolder: async function(args) {
+      console.log(`[ToolExec] listFolder called with path: "${args.path}"`);
       const fileSystem = window.module['file-system.js'];
   
       if (!fileSystem.directoryHandle) {
+        console.log(`[ToolExec] listFolder ERROR - no directory handle`);
         return {
           tool: 'list_folder',
           success: false,
@@ -2524,7 +2562,10 @@
   
       // Find the folder in the file tree
       const folder = this.findFolderInTree(fileSystem.fileTree, args.path);
+      console.log(`[ToolExec] findFolderInTree result:`, folder ? `found, ${folder.children?.length || 0} children` : 'NOT FOUND');
+  
       if (!folder) {
+        console.log(`[ToolExec] listFolder ERROR - folder not found: ${args.path}`);
         return {
           tool: 'list_folder',
           success: false,
@@ -2540,18 +2581,21 @@
         size_bytes: child.type === 'file' ? child.charCount : 0
       }));
   
+      console.log(`[ToolExec] listFolder SUCCESS - returning ${entries.length} entries`);
       return {
         tool: 'list_folder',
         success: true,
-        result: entries,
+        result: { entries: entries }, // IMPORTANT: Wrap in { entries: ... } object
         args: args
       };
     },
   
     readFile: async function(args) {
+      console.log(`[ToolExec] readFile called with path: "${args.path}"`);
       const fileSystem = window.module['file-system.js'];
   
       if (!fileSystem.directoryHandle) {
+        console.log(`[ToolExec] readFile ERROR - no directory handle`);
         return {
           tool: 'read_file',
           success: false,
@@ -2563,6 +2607,7 @@
       // Find the file in the file tree
       const file = this.findFileInTree(fileSystem.fileTree, args.path);
       if (!file) {
+        console.log(`[ToolExec] readFile ERROR - file not found: ${args.path}`);
         return {
           tool: 'read_file',
           success: false,
@@ -2574,6 +2619,7 @@
       // Read the file
       const content = await fileSystem.readFile(file);
       if (content === null) {
+        console.log(`[ToolExec] readFile ERROR - failed to read file: ${args.path}`);
         return {
           tool: 'read_file',
           success: false,
@@ -2582,11 +2628,12 @@
         };
       }
   
+      console.log(`[ToolExec] readFile SUCCESS - read ${content.length} chars from ${args.path}`);
       // TODO: Handle start_line and end_line parameters
       return {
         tool: 'read_file',
         success: true,
-        result: content,
+        result: { content: content }, // IMPORTANT: Wrap in { content: ... } object
         args: args
       };
     },
@@ -3555,6 +3602,7 @@
     expandedSummaries: new Set(), // Track which summaries are expanded
   
     renderMessage: function(message) {
+      console.log(`[UIRenderer] Rendering message - type: ${message.type}, id: ${message.id}`);
       const container = document.createElement('div');
       container.style.cssText = 'display: flex; gap: 12px; margin-bottom: 4px; align-items: flex-start; font-family: monospace; font-size: 13px;';
   
@@ -3684,10 +3732,18 @@
         const summaryId = 'summary-' + message.id;
         const isExpanded = this.expandedSummaries && this.expandedSummaries.has(message.id);
   
+        // Log summary rendering info
+        console.log(`[UIRenderer] Rendering summary - id: ${message.id}, summarizes_from: ${message.summarizes_from}, summarizes_to: ${message.summarizes_to}, isExpanded: ${isExpanded}`);
+  
+        // Calculate message count - check if summarizes_from and summarizes_to exist
+        const messageCount = (message.summarizes_to !== undefined && message.summarizes_from !== undefined)
+          ? (message.summarizes_to - message.summarizes_from + 1)
+          : 'N/A';
+  
         if (isExpanded) {
-          content.innerHTML = `<div style="font-weight: bold; margin-bottom: 4px;">📋 Summary (summarizes ${message.summarizes_to - message.summarizes_from + 1} messages) [Click to collapse]</div><div style="white-space: pre-wrap;">${this.escapeHtml(message.content)}</div>`;
+          content.innerHTML = `<div style="font-weight: bold; margin-bottom: 4px;">📋 Summary (summarizes ${messageCount} messages) [Click to collapse]</div><div style="white-space: pre-wrap;">${this.escapeHtml(message.content)}</div>`;
         } else {
-          content.innerHTML = `<div style="font-weight: bold;">📋 Summary (summarizes ${message.summarizes_to - message.summarizes_from + 1} messages) [Click to expand]</div>`;
+          content.innerHTML = `<div style="font-weight: bold;">📋 Summary (summarizes ${messageCount} messages) [Click to expand]</div>`;
         }
   
         content.addEventListener('click', () => this.toggleSummary(message.id));
@@ -3761,11 +3817,13 @@
     },
   
     formatToolResult: function(message) {
+      console.log(`[UIRenderer] Formatting tool result - tool: ${message.tool}, success: ${message.success}`);
       if (!message.success) {
         return `Error: ${message.error}`;
       }
   
       const result = message.result;
+      console.log(`[UIRenderer] Tool result content:`, result);
   
       // Format based on tool type
       if (message.tool === 'read_file') {
@@ -3777,8 +3835,10 @@
       } else if (message.tool === 'list_folder') {
         if (result.entries) {
           const count = result.entries.length;
+          console.log(`[UIRenderer] list_folder result has ${count} entries`);
           return `${count} item${count !== 1 ? 's' : ''} found`;
         }
+        console.log(`[UIRenderer] list_folder result has NO entries property`);
         return 'Folder listed';
       } else if (message.tool === 'create_file') {
         return 'File created';
