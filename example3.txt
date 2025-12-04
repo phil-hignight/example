@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-12-03T18:26:22.656Z
+// AI Agent - Built 2025-12-04T15:01:41.781Z
 (function() {
   window.module = {};
 
@@ -789,8 +789,8 @@
   
         while (true) {
           // Check for cancellation during streaming
-          const uiManager = window.module['ui-manager.js'];
-          if (uiManager && uiManager.cancelRequested) {
+          const domAdapter = window.module['dom-adapter.js'];
+          if (domAdapter && domAdapter.getCancelRequested()) {
             console.log('[ConvFlow] Streaming cancelled by user');
             reader.cancel(); // Cancel the stream
             throw new Error('CANCELLED_BY_USER');
@@ -1061,11 +1061,11 @@
       }
     },
   
-    addMessage: function(message, skipPersist = false) {
+    addMessage: function(message) {
       const utils = window.module['utils.js'];
       const config = window.module['config.js'];
   
-      console.log(`[ConvMgr] addMessage called - type: ${message.type}, skipPersist: ${skipPersist}`);
+      console.log(`[ConvMgr] addMessage called - type: ${message.type}`);
   
       // Ensure message has required fields
       if (!message.id) {
@@ -1105,26 +1105,16 @@
       // Add the message to memory immediately
       this.messages.push(message);
   
-      // Create persist function
-      const persistFn = () => {
-        const persistence = window.module['conversation-persistence.js'];
-        if (persistence.isInitialized) {
-          return persistence.saveMessage(message).catch(err =>
-            console.error('[ConversationManager] Failed to persist message:', err)
-          );
-        }
-        return Promise.resolve();
-      };
-  
-      // Auto-persist unless skipPersist is true
-      if (!skipPersist) {
-        persistFn();
+      // Auto-persist if persistence is initialized
+      const persistence = window.module['conversation-persistence.js'];
+      if (persistence && persistence.isInitialized) {
+        persistence.saveMessage(message).catch(err =>
+          console.error('[ConversationManager] Failed to persist message:', err)
+        );
       }
   
-      // Return object with message and persist function
       return {
-        message: message,
-        persist: persistFn
+        message: message
       };
     },
   
@@ -1289,6 +1279,145 @@
         console.warn('Continuing without summarization - conversation may become very large');
         return null;
       }
+    }
+  };
+  
+
+  // Module: conversation-orchestrator.js
+  // Conversation Orchestrator
+  // Auto-triggers conversation processing when user messages are added
+  // Uses dependency injection for DOM operations - works in both production and tests
+  
+  window.module['conversation-orchestrator.js'] = {
+    domAdapter: null, // Injected DOM adapter (real or mock)
+    isProcessing: false,
+  
+    /**
+     * Initialize with a DOM adapter
+     * @param {Object} adapter - DOM adapter implementation (real or mock)
+     */
+    init: function(adapter) {
+      this.domAdapter = adapter;
+      console.log('[Orchestrator] Initialized with adapter');
+    },
+  
+    /**
+     * Add a user message and automatically trigger conversation processing
+     * This is the main entry point for both production and tests
+     * @param {string} content - The user's message content
+     * @returns {Promise<Object>} - { success: boolean, error: string|null }
+     */
+    addUserMessageAndProcess: async function(content) {
+      const conversationManager = window.module['conversation-manager.js'];
+      const conversationFlow = window.module['conversation-flow.js'];
+  
+      console.log(`[Orchestrator] addUserMessageAndProcess called - content length: ${content.length}`);
+  
+      // Add user message to conversation
+      conversationManager.addMessage({
+        type: 'user',
+        content: content
+      });
+  
+      // Update UI if adapter available
+      if (this.domAdapter) {
+        this.domAdapter.renderChat();
+        this.domAdapter.updateCharCounter();
+        this.domAdapter.hideError();
+      }
+  
+      // Auto-trigger conversation processing
+      return await this.processConversation();
+    },
+  
+    /**
+     * Process the conversation until AI sends a message (not tools)
+     * Handles the complete conversation loop including tool execution
+     * @returns {Promise<Object>} - { success: boolean, error: string|null }
+     */
+    processConversation: async function() {
+      const conversationFlow = window.module['conversation-flow.js'];
+      const config = window.module['config.js'];
+  
+      console.log('[Orchestrator] Starting conversation processing...');
+  
+      if (!this.domAdapter) {
+        console.error('[Orchestrator] No DOM adapter configured');
+        return { success: false, error: 'No DOM adapter configured' };
+      }
+  
+      this.domAdapter.setIsProcessing(true);
+      this.domAdapter.setCancelRequested(false);
+      this.domAdapter.showLoading('Thinking...');
+  
+      try {
+        // Run conversation loop with UI callbacks
+        const result = await conversationFlow.runConversationLoop({
+          onProgress: (status) => {
+            console.log(`[Orchestrator] Progress: ${status}`);
+            this.domAdapter.showLoading(status);
+          },
+          onUpdate: () => {
+            this.domAdapter.renderChat();
+            this.domAdapter.updateCharCounter();
+          },
+          onChunk: (chunk, accumulated) => {
+            // Handle streaming updates if needed
+            // For now, updates happen in onUpdate callbacks
+          }
+        });
+  
+        console.log(`[Orchestrator] Conversation processing complete - success: ${result.success}, loops: ${result.loopCount}`);
+  
+        // Update UI
+        this.domAdapter.hideLoading();
+        this.domAdapter.renderChat();
+        this.domAdapter.updateCharCounter();
+  
+        if (result.success) {
+          return { success: true, error: null, loopCount: result.loopCount };
+        } else if (result.cancelled) {
+          console.log('[Orchestrator] Conversation cancelled by user');
+          return { success: false, error: 'CANCELLED_BY_USER', cancelled: true };
+        } else {
+          console.error('[Orchestrator] Conversation failed:', result.error);
+          this.domAdapter.showError(result.error);
+          return { success: false, error: result.error };
+        }
+  
+      } catch (error) {
+        console.error('[Orchestrator] Error during processing:', error);
+        this.domAdapter.hideLoading();
+        this.domAdapter.showError(error.message);
+        return { success: false, error: error.message };
+  
+      } finally {
+        this.domAdapter.setIsProcessing(false);
+        this.domAdapter.setCancelRequested(false);
+      }
+    },
+  
+    /**
+     * Cancel the current conversation processing
+     */
+    cancelCurrentTask: function() {
+      console.log('[Orchestrator] Cancellation requested');
+  
+      if (!this.domAdapter) return;
+  
+      this.domAdapter.setCancelRequested(true);
+      this.domAdapter.hideLoading();
+  
+      // Add a cancelled assistant message to maintain the user/assistant pattern
+      const conversationManager = window.module['conversation-manager.js'];
+      conversationManager.addMessage({
+        type: 'assistant',
+        content: '[Cancelled by user]'
+      });
+  
+      this.domAdapter.renderChat();
+      this.domAdapter.updateCharCounter();
+      this.domAdapter.setIsProcessing(false);
     }
   };
   
@@ -1515,6 +1644,130 @@
         console.log('[Persistence] Conversation cleared');
       } catch (error) {
         console.error('[Persistence] Error clearing conversation:', error);
+      }
+    }
+  };
+  
+
+  // Module: dom-adapter.js
+  // DOM Adapter - Real DOM Implementation
+  // Abstracts all DOM operations behind an interface
+  // Can be swapped with mock implementation for testing
+  
+  window.module['dom-adapter.js'] = {
+    // UI Rendering Operations
+    renderChat: function() {
+      const conversationManager = window.module['conversation-manager.js'];
+      const uiRenderer = window.module['ui-renderer.js'];
+      const chatArea = document.getElementById('chatArea');
+  
+      if (!chatArea) return;
+  
+      // Check if user is near bottom before re-rendering (within 100px)
+      const wasNearBottom = chatArea.scrollHeight - chatArea.scrollTop - chatArea.clientHeight < 100;
+  
+      chatArea.innerHTML = '';
+  
+      const messages = conversationManager.getMessages();
+  
+      // Store messages in ui-renderer for tool_use/result lookups
+      uiRenderer.allMessages = messages;
+  
+      messages.forEach(msg => {
+        const msgElement = uiRenderer.renderMessage(msg);
+        chatArea.appendChild(msgElement);
+      });
+  
+      // Only auto-scroll if user was already near the bottom
+      if (wasNearBottom) {
+        chatArea.scrollTop = chatArea.scrollHeight;
+      }
+    },
+  
+    updateCharCounter: function() {
+      const conversationManager = window.module['conversation-manager.js'];
+      const utils = window.module['utils.js'];
+      const charCount = document.getElementById('charCount');
+  
+      if (!charCount) return;
+  
+      const total = conversationManager.getTotalCharacterCount();
+      charCount.textContent = `Total: ${utils.formatCharCount(total)}`;
+    },
+  
+    showLoading: function(text = 'Processing...') {
+      const chatArea = document.getElementById('chatArea');
+      if (!chatArea) return;
+  
+      // Remove any existing loading message
+      const existing = document.getElementById('loading-message');
+      if (existing) {
+        existing.remove();
+      }
+  
+      // Create loading pseudo-message
+      const loadingDiv = document.createElement('div');
+      loadingDiv.id = 'loading-message';
+      loadingDiv.style.cssText = 'display: flex; gap: 12px; margin-bottom: 4px; align-items: flex-start; font-family: monospace; font-size: 13px;';
+  
+      // Gray circle indicator that pulses
+      const indicator = document.createElement('div');
+      indicator.style.cssText = 'width: 8px; height: 8px; border-radius: 50%; margin-top: 6px; flex-shrink: 0; background: #858585; animation: pulse 1.5s ease-in-out infinite;';
+  
+      // Text content
+      const content = document.createElement('div');
+      content.style.cssText = 'flex: 1; min-width: 0; color: #858585; padding: 2px 0;';
+      content.textContent = text;
+  
+      loadingDiv.appendChild(indicator);
+      loadingDiv.appendChild(content);
+      chatArea.appendChild(loadingDiv);
+  
+      // Scroll to bottom
+      chatArea.scrollTop = chatArea.scrollHeight;
+    },
+  
+    hideLoading: function() {
+      const loadingMessage = document.getElementById('loading-message');
+      if (loadingMessage) {
+        loadingMessage.remove();
+      }
+    },
+  
+    showError: function(message) {
+      const errorMsg = document.getElementById('errorMsg');
+      if (!errorMsg) return;
+      errorMsg.textContent = message;
+    },
+  
+    hideError: function() {
+      const errorMsg = document.getElementById('errorMsg');
+      if (!errorMsg) return;
+      errorMsg.textContent = '';
+    },
+  
+    // Cancellation state management
+    getCancelRequested: function() {
+      const uiManager = window.module['ui-manager.js'];
+      return uiManager ? uiManager.cancelRequested : false;
+    },
+  
+    setCancelRequested: function(value) {
+      const uiManager = window.module['ui-manager.js'];
+      if (uiManager) {
+        uiManager.cancelRequested = value;
+      }
+    },
+  
+    getIsProcessing: function() {
+      const uiManager = window.module['ui-manager.js'];
+      return uiManager ? uiManager.isProcessing : false;
+    },
+  
+    setIsProcessing: function(value) {
+      const uiManager = window.module['ui-manager.js'];
+      if (uiManager) {
+        uiManager.isProcessing = value;
       }
     }
   };
@@ -3099,10 +3352,15 @@
       const conversationManager = window.module['conversation-manager.js'];
       const modeManager = window.module['mode-manager.js'];
       const apiClient = window.module['api-client.js'];
+      const conversationOrchestrator = window.module['conversation-orchestrator.js'];
+      const domAdapter = window.module['dom-adapter.js'];
   
       conversationManager.init();
       modeManager.init();
       apiClient.init();
+  
+      // Initialize orchestrator with real DOM adapter
+      conversationOrchestrator.init(domAdapter);
   
       this.showIntroScreen();
     },
@@ -3400,7 +3658,7 @@
   
       if (!content) return;
   
-      // Don't allow submit while processing (unless canceling)
+      // Don't allow submit while processing
       if (this.isProcessing) {
         return;
       }
@@ -3409,271 +3667,25 @@
       input.value = '';
       input.style.height = '38px';
   
-      // Hide any previous error
-      this.hideError();
-  
       try {
-        // Add user message (synchronous, renders immediately)
-        this.addUserMessage(content);
+        // Use orchestrator to add message and process automatically
+        const conversationOrchestrator = window.module['conversation-orchestrator.js'];
+        const result = await conversationOrchestrator.addUserMessageAndProcess(content);
   
-        // Get AI response (starts immediately, persisting happens async in background)
-        this.isProcessing = true;
-        this.cancelRequested = false;
-        await this.getAIResponse();
+        if (!result.success && !result.cancelled) {
+          this.showError(result.error);
+        }
   
       } catch (error) {
         console.error('Error:', error);
         this.showError(error.message);
-      } finally {
-        this.isProcessing = false;
-        this.cancelRequested = false;
       }
     },
   
     cancelCurrentTask: function() {
       console.log('[UI] ========== CANCELLATION REQUESTED ==========');
-      console.log('[UI] Current state - isProcessing:', this.isProcessing, 'cancelRequested:', this.cancelRequested);
-      this.cancelRequested = true;
-      console.log('[UI] Set cancelRequested to true');
-      this.hideLoading();
-  
-      // Add a cancelled assistant message to maintain the user/assistant pattern
-      const conversationManager = window.module['conversation-manager.js'];
-      conversationManager.addMessage({
-        type: 'assistant',
-        content: '[Cancelled by user]'
-      });
-  
-      this.renderChat();
-      this.updateCharCounter();
-      this.isProcessing = false;
-      console.log('[UI] Cancellation complete - isProcessing set to false');
-    },
-  
-    addUserMessage: function(content) {
-      const conversationManager = window.module['conversation-manager.js'];
-  
-      const userMessage = {
-        type: 'user',
-        content: content
-      };
-  
-      // Add to conversation (synchronous, persists async in background)
-      conversationManager.addMessage(userMessage);
-  
-      // Render immediately
-      this.renderChat();
-      this.updateCharCounter();
-    },
-  
-    getAIResponse: async function() {
-      const conversationManager = window.module['conversation-manager.js'];
-      const apiRenderer = window.module['api-renderer.js'];
-      const apiClient = window.module['api-client.js'];
-      const messageProcessor = window.module['message-processor.js'];
-      const conversationFlow = window.module['conversation-flow.js'];
-      const toolExecutor = window.module['tool-executor.js'];
-      const utils = window.module['utils.js'];
-      const config = window.module['config.js'];
-  
-      // Show loading indicator
-      this.showLoading('Thinking...');
-  
-      // Render messages for API
-      const messages = conversationManager.getMessages();
-      const apiMessages = apiRenderer.renderMessagesForAPI(messages);
-  
-      // Create chat if needed
-      if (!apiClient.chatId && messages.length > 0) {
-        const firstUserMsg = messages.find(m => m.type === 'user');
-        if (firstUserMsg) {
-          await apiClient.createNewChat(firstUserMsg.content);
-        }
-      }
-  
-      // Get completion with streaming
-      const assistantMessageId = utils.generateUUID();
-  
-      let retryCount = 0;
-      let success = false;
-  
-      while (retryCount < config.MAX_RETRIES && !success) {
-        try {
-          const response = await apiClient.getCompletion(apiMessages, assistantMessageId);
-  
-          // Track streaming message for real-time UI updates
-          let streamingMessageId = null;
-          let streamingPersistFn = null;
-          let responseType = null;
-  
-          // Use extracted conversation-flow module
-          const result = await conversationFlow.handleAIResponse(
-            response,
-            assistantMessageId,
-            apiMessages,
-            {
-              onProgress: (status) => this.showLoading(status),
-              onChunk: (chunk, accumulated) => {
-                // Detect response type using pattern matching (not prefix-based)
-                if (responseType === null && accumulated.length > 10) {
-                  // Check for tool call pattern: {"tools":[{"name":
-                  const toolPattern = /\{\s*"tools"\s*:\s*\[\s*\{\s*"name"\s*:/;
-                  if (toolPattern.test(accumulated)) {
-                    responseType = 'tools';
-                  } else {
-                    // Assume message if no tool pattern detected
-                    responseType = 'message';
-                    // Create streaming message (skip persistence until complete)
-                    const result = conversationManager.addMessage({
-                      type: 'assistant',
-                      content: '',
-                      streaming: true
-                    }, true); // skipPersist = true
-  
-                    streamingMessageId = result.message.id;
-                    streamingPersistFn = result.persist; // Save persist function for later
-                  }
-                }
-  
-                // Update streaming message in real-time
-                if (responseType === 'message' && streamingMessageId) {
-                  // Extract content (trim before terminator if present)
-                  let messageContent = accumulated;
-                  const terminatorIndex = messageContent.indexOf(messageProcessor.TERMINATOR);
-                  if (terminatorIndex !== -1) {
-                    messageContent = messageContent.substring(0, terminatorIndex);
-                  }
-  
-                  const msgs = conversationManager.getMessages();
-                  const streamingMsg = msgs.find(m => m.id === streamingMessageId);
-                  if (streamingMsg) {
-                    streamingMsg.content = messageContent;
-                    this.renderChat();
-                    this.updateCharCounter();
-                  }
-                }
-              }
-            }
-          );
-  
-          // Handle the result
-          if (result.success) {
-            const aiResponse = result.content;
-  
-            if (aiResponse.type === 'message') {
-              // Message was already streamed, just mark as complete
-              if (streamingMessageId && streamingPersistFn) {
-                const msgs = conversationManager.getMessages();
-                const streamingMsg = msgs.find(m => m.id === streamingMessageId);
-                if (streamingMsg) {
-                  streamingMsg.streaming = false;
-                  streamingMsg.content = aiResponse.text;
-  
-                  // Now persist the completed message
-                  streamingPersistFn();
-                }
-              } else {
-                // Fallback: add message if streaming didn't work
-                conversationManager.addMessage({
-                  type: 'assistant',
-                  content: aiResponse.text
-                });
-              }
-              this.renderChat();
-              this.updateCharCounter();
-              this.hideLoading();
-              success = true;
-  
-            } else if (aiResponse.type === 'execute') {
-              // Tool execution - create ONE tool_use message with ALL tools
-              const { message: toolUseMessage } = conversationManager.addMessage({
-                type: 'tool_use',
-                tools: aiResponse.tools
-              });
-  
-              this.renderChat();
-              this.updateCharCounter();
-  
-              // Execute tools sequentially, creating individual tool_result messages
-              for (const tool of aiResponse.tools) {
-                // Check for cancellation before each tool execution
-                if (this.cancelRequested) {
-                  console.log('[UI] Tool execution cancelled');
-                  this.hideLoading();
-                  return;
-                }
-  
-                this.showLoading(`Executing ${tool.name}...`);
-  
-                const toolResults = await toolExecutor.executeTools([tool]);
-                const toolResult = toolResults[0];
-  
-                conversationManager.addMessage({
-                  type: 'tool_result',
-                  parentId: toolUseMessage.id,
-                  tool: toolResult.tool,
-                  success: toolResult.success,
-                  result: toolResult.result,
-                  error: toolResult.error,
-                  args: toolResult.args
-                });
-  
-                this.renderChat();
-                this.updateCharCounter();
-              }
-  
-              this.hideLoading();
-  
-              // Check for cancellation before auto-calling AI again
-              if (this.cancelRequested) {
-                console.log('[UI] Auto-call cancelled after tool execution');
-                return;
-              }
-  
-              // Auto-call API again to let AI respond to tool results
-              await this.getAIResponse();
-              success = true;
-            }
-  
-          } else if (result.cancelled) {
-            // User cancelled - don't continue, don't throw error
-            console.log('[UI] Cancellation detected in result, calling cancelCurrentTask');
-            this.cancelCurrentTask();
-            return;
-  
-          } else if (result.needsRetry) {
-            // Error already added to conversation by conversation-flow
-            this.renderChat();
-            this.updateCharCounter();
-  
-            // Call AI again so it can see the error and fix it
-            console.log('Error detected, calling AI again with error context');
-            await this.getAIResponse();
-            return;
-  
-          } else {
-            // Fatal error
-            console.error('Fatal error:', result.error);
-            this.hideLoading();
-            throw new Error(result.error);
-          }
-  
-        } catch (error) {
-          retryCount++;
-          console.warn(`Attempt ${retryCount} failed:`, error.message);
-  
-          if (retryCount >= config.MAX_RETRIES) {
-            this.hideLoading();
-            throw error;
-          }
-  
-          // Wait 1 second before retry
-          await new Promise(resolve => setTimeout(resolve, 1000));
-        }
-      }
-  
-      this.hideLoading();
-      this.updateCharCounter();
+      const conversationOrchestrator = window.module['conversation-orchestrator.js'];
+      conversationOrchestrator.cancelCurrentTask();
     },
   
     renderChat: function() {
