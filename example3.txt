@@ -1,4 +1,4 @@
-// AI Agent - Built 2025-12-04T15:01:41.781Z
+// AI Agent - Built 2025-12-04T18:56:32.873Z
 (function() {
   window.module = {};
 
@@ -690,13 +690,19 @@
                 if (aiResponse.wasTruncated) {
                   const truncatedTool = aiResponse.tools[0];
                   const toolName = truncatedTool.name;
-                  const contentLength = truncatedTool.args.content ? truncatedTool.args.content.length : 0;
+                  const content = truncatedTool.args.content || '';
+                  const contentLength = content.length;
+  
+                  // Get the last few lines to show AI exactly where it was cut off
+                  const lines = content.split('\n');
+                  const lastLines = lines.slice(-5).join('\n'); // Last 5 lines
+                  const lastLinesPreview = lastLines.length > 300 ? '...' + lastLines.slice(-300) : lastLines;
   
                   let message = '';
                   if (toolName === 'create_file') {
-                    message = `Note: Your ${toolName} response was truncated at ${aiResponse.truncatedLength} characters. I auto-completed the JSON and wrote ${contentLength} characters to ${truncatedTool.args.path}. If you need to add more content, use append_file.`;
+                    message = `Note: Your ${toolName} response was truncated at ${aiResponse.truncatedLength} characters. I auto-completed the JSON and wrote ${contentLength} characters to ${truncatedTool.args.path}.\n\nLast lines written:\n\`\`\`\n${lastLinesPreview}\n\`\`\`\n\nTo continue, use append_file and start exactly where this left off. Do NOT repeat any of the content above.`;
                   } else if (toolName === 'append_file') {
-                    message = `Note: Your ${toolName} response was truncated at ${aiResponse.truncatedLength} characters. I auto-completed the JSON and appended ${contentLength} characters to ${truncatedTool.args.path}. If you need to add more content, use append_file again.`;
+                    message = `Note: Your ${toolName} response was truncated at ${aiResponse.truncatedLength} characters. I auto-completed the JSON and appended ${contentLength} characters to ${truncatedTool.args.path}.\n\nLast lines appended:\n\`\`\`\n${lastLinesPreview}\n\`\`\`\n\nTo continue, use append_file again and start exactly where this left off. Do NOT repeat any of the content above.`;
                   }
   
                   conversationManager.addMessage({
@@ -2299,10 +2305,14 @@
   
     // ===== LAYER 2: JSON PARSING & REPAIR =====
     parseAndRepairJson: function(jsonText) {
-      // IMPORTANT: The AI sometimes sends JSON with literal newlines despite instructions not to
-      // We need to replace literal newlines with \n escape sequences before parsing
-      // But we need to be careful not to break JSON strings that legitimately contain \n
-      const normalizedJson = jsonText.replace(/\n/g, '\\n').replace(/\r/g, '');
+      // IMPORTANT: The AI sometimes sends JSON with literal control characters despite instructions not to
+      // We need to escape these control characters to make valid JSON
+      // Order matters: escape backslashes FIRST to avoid double-escaping
+      const normalizedJson = jsonText
+        .replace(/\\/g, '\\\\')  // Escape existing backslashes first
+        .replace(/\n/g, '\\n')   // Escape newlines
+        .replace(/\r/g, '\\r')   // Escape carriage returns
+        .replace(/\t/g, '\\t');  // Escape tabs
   
       let lastError = null;
   
@@ -2678,16 +2688,44 @@
   Example exit_planning:
   {"tools":[{"name":"exit_planning","args":{"checklist":[{"short_desc":"Brief description for UI","long_desc":"Detailed description for execution. Use \\n for line breaks in long_desc."}]}}]}|||||END|||||
   
+  ## Checklist Best Practices
+  
+  ⚠️ CRITICAL: Break work into SMALL, SPECIFIC items. Each item = ONE file operation or ONE logical unit.
+  
+  ❌ BAD (too vague):
+  - "Create the todo app" → This is 10+ files!
+  - "Implement authentication" → This is 5+ files!
+  - "Build the shopping cart" → This is multiple files!
+  
+  ✅ GOOD (specific, actionable):
+  - "Create index.html with basic structure"
+  - "Create styles.css with layout and color scheme"
+  - "Create app.js with TodoList class and methods"
+  - "Create auth.js with login/register functions"
+  - "Add authentication UI to index.html"
+  
+  **Guidelines:**
+  1. One checklist item = One file to create OR one specific edit to one file
+  2. If a task involves multiple files, create separate items for each file
+  3. Order items logically (create HTML before JS that references it)
+  4. Each item should take 1-3 minutes to complete
+  5. Break "build X feature" into: create HTML structure → create CSS styles → create JS logic → integrate components
+  
+  **Example for "Build todo app":**
+  Instead of 1 item "Create todo app", break into:
+  - "Create todo.html with form, list container, filter buttons"
+  - "Create todo.css with card layout, button styles, animations"
+  - "Create todo.js with TodoApp class, add/delete/filter methods"
+  - "Add localStorage persistence to todo.js"
+  
   ## Rules
   
   1. Be conversational and ask questions when requirements are unclear
   2. Don't start implementing until you call exit_planning
   3. If user asks to create/modify files, immediately call exit_planning - do NOT try to use file operation tools in planning mode
-  4. Break down complex tasks into discrete checklist items
-  5. Each checklist item should be independently verifiable
-  6. Keep short_desc concise (for UI display)
-  7. Make long_desc detailed (for execution context)
-  8. **ACTION OVER ANNOUNCEMENT**: When you need to use tools, just use them immediately. Don't send a message saying "Let me check..." or "I'll read..." - just execute the tools. The user will see the tool results.
+  4. Keep short_desc concise (for UI display, e.g. "Create index.html")
+  5. Make long_desc detailed (for execution context, include file paths, key content requirements)
+  6. **ACTION OVER ANNOUNCEMENT**: When you need to use tools, just use them immediately. Don't send a message saying "Let me check..." or "I'll read..." - just execute the tools. The user will see the tool results.
   
   </system-reminder>`;
     },
