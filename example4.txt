@@ -58,6 +58,11 @@ function getIndexHTML() {
     .tree-item.dir {
       font-weight: bold;
     }
+    .tree-item .arrow {
+      display: inline-block;
+      width: 12px;
+      font-size: 10px;
+    }
     .tree-item.file {
       padding-left: 20px;
     }
@@ -461,8 +466,9 @@ function getIndexHTML() {
           div.className += ' dir';
           const isExpanded = expandedDirs.has(fullPath);
           const arrow = isExpanded ? '▼' : '▶';
+          console.log('  Rendering DIR (has item):', fullPath, 'isExpanded:', isExpanded);
 
-          div.innerHTML = \`<span onclick="toggleDir('\${fullPath.replace(/'/g, "\\\\'")}')">\${arrow} \${name}/</span>\`;
+          div.innerHTML = \`<span onclick="toggleDir('\${fullPath.replace(/\\\\/g, '\\\\\\\\').replace(/'/g, "\\\\'")}')" style="cursor: pointer;"><span class="arrow">\${arrow}</span> \${name}/</span>\`;
           wrapper.appendChild(div);
 
           if (isExpanded) {
@@ -470,15 +476,15 @@ function getIndexHTML() {
             const childNames = Object.keys(node.children).sort((a, b) => {
               const aPath = fullPath ? fullPath + '\\\\' + a : a;
               const bPath = fullPath ? fullPath + '\\\\' + b : b;
-              const aItem = structure[aPath] || otherStructure[aPath];
-              const bItem = structure[bPath] || otherStructure[bPath];
+              const aItem = getItemByPath(structure, aPath) || getItemByPath(otherStructure, aPath);
+              const bItem = getItemByPath(structure, bPath) || getItemByPath(otherStructure, bPath);
               const aIsDir = aItem && aItem.type === 'dir';
               const bIsDir = bItem && bItem.type === 'dir';
 
               // Folders first, then files
               if (aIsDir && !bIsDir) return -1;
               if (!aIsDir && bIsDir) return 1;
-              return a.localeCompare(b);
+              return a.toLowerCase().localeCompare(b.toLowerCase());
             });
             childNames.forEach(childName => {
               const childNode = renderNode(childName, node.children[childName], depth + 1, fullPath);
@@ -503,13 +509,13 @@ function getIndexHTML() {
 
             if (side === 'left') {
               actions = \`<span class="actions">
-                <button onclick="copyFile('\${fullPath.replace(/'/g, "\\\\'")}', 'left-to-right')">Copy →</button>
-                <button onclick="deleteFile('\${fullPath.replace(/'/g, "\\\\'")}', 'left')">Delete</button>
+                <button onclick="copyFile('\${fullPath.replace(/\\\\/g, '\\\\\\\\').replace(/'/g, "\\\\'")}', 'left-to-right')">Copy →</button>
+                <button onclick="deleteFile('\${fullPath.replace(/\\\\/g, '\\\\\\\\').replace(/'/g, "\\\\'")}', 'left')">Delete</button>
               </span>\`;
             } else {
               actions = \`<span class="actions">
-                <button onclick="copyFile('\${fullPath.replace(/'/g, "\\\\'")}', 'right-to-left')">← Copy</button>
-                <button onclick="deleteFile('\${fullPath.replace(/'/g, "\\\\'")}', 'right')">Delete</button>
+                <button onclick="copyFile('\${fullPath.replace(/\\\\/g, '\\\\\\\\').replace(/'/g, "\\\\'")}', 'right-to-left')">← Copy</button>
+                <button onclick="deleteFile('\${fullPath.replace(/\\\\/g, '\\\\\\\\').replace(/'/g, "\\\\'")}', 'right')">Delete</button>
               </span>\`;
             }
           } else if (otherItem && otherItem.type === 'file') {
@@ -530,7 +536,8 @@ function getIndexHTML() {
             div.className += ' dir';
             const isExpanded = expandedDirs.has(fullPath);
             const arrow = isExpanded ? '▼' : '▶';
-            div.innerHTML = \`<span onclick="toggleDir('\${fullPath.replace(/'/g, "\\\\'")}')" style="color: #ccc;">\${arrow} \${name}/ (missing)</span>\`;
+            console.log('  Rendering MISSING DIR:', fullPath, 'isExpanded:', isExpanded);
+            div.innerHTML = \`<span onclick="toggleDir('\${fullPath.replace(/\\\\/g, '\\\\\\\\').replace(/'/g, "\\\\'")}')" style="color: #ccc; cursor: pointer;"><span class="arrow">\${arrow}</span> \${name}/ (missing)</span>\`;
             wrapper.appendChild(div);
 
             if (isExpanded) {
@@ -538,15 +545,15 @@ function getIndexHTML() {
               const childNames = Object.keys(node.children).sort((a, b) => {
                 const aPath = fullPath ? fullPath + '\\\\' + a : a;
                 const bPath = fullPath ? fullPath + '\\\\' + b : b;
-                const aItem = structure[aPath] || otherStructure[aPath];
-                const bItem = structure[bPath] || otherStructure[bPath];
+                const aItem = getItemByPath(structure, aPath) || getItemByPath(otherStructure, aPath);
+                const bItem = getItemByPath(structure, bPath) || getItemByPath(otherStructure, bPath);
                 const aIsDir = aItem && aItem.type === 'dir';
                 const bIsDir = bItem && bItem.type === 'dir';
 
                 // Folders first, then files
                 if (aIsDir && !bIsDir) return -1;
                 if (!aIsDir && bIsDir) return 1;
-                return a.localeCompare(b);
+                return a.toLowerCase().localeCompare(b.toLowerCase());
               });
               childNames.forEach(childName => {
                 const childNode = renderNode(childName, node.children[childName], depth + 1, fullPath);
@@ -556,7 +563,22 @@ function getIndexHTML() {
             }
           } else if (otherItem.type === 'file') {
             div.className += ' file';
-            div.innerHTML = \`<span style="color: #ccc;">\${name} (missing)</span>\`;
+
+            // Add copy button so file can be copied from the other side
+            let actions = '';
+            if (side === 'left') {
+              // File missing on left, exists on right - show copy from right button
+              actions = \`<span class="actions">
+                <button onclick="copyFile('\${fullPath.replace(/\\\\/g, '\\\\\\\\').replace(/'/g, "\\\\'")}', 'right-to-left')">← Copy</button>
+              </span>\`;
+            } else {
+              // File missing on right, exists on left - show copy to right button
+              actions = \`<span class="actions">
+                <button onclick="copyFile('\${fullPath.replace(/\\\\/g, '\\\\\\\\').replace(/'/g, "\\\\'")}', 'left-to-right')">Copy →</button>
+              </span>\`;
+            }
+
+            div.innerHTML = \`<span style="color: #ccc; flex: 1;">\${name} (missing)</span>\${actions}\`;
             wrapper.appendChild(div);
           } else {
             // Shouldn't happen, but return null just in case
@@ -571,15 +593,15 @@ function getIndexHTML() {
       }
 
       const rootNames = Object.keys(tree).sort((a, b) => {
-        const aItem = structure[a] || otherStructure[a];
-        const bItem = structure[b] || otherStructure[b];
+        const aItem = getItemByPath(structure, a) || getItemByPath(otherStructure, a);
+        const bItem = getItemByPath(structure, b) || getItemByPath(otherStructure, b);
         const aIsDir = aItem && aItem.type === 'dir';
         const bIsDir = bItem && bItem.type === 'dir';
 
         // Folders first, then files
         if (aIsDir && !bIsDir) return -1;
         if (!aIsDir && bIsDir) return 1;
-        return a.localeCompare(b);
+        return a.toLowerCase().localeCompare(b.toLowerCase());
       });
       rootNames.forEach(name => {
         const node = renderNode(name, tree[name], 0, '');
@@ -590,11 +612,16 @@ function getIndexHTML() {
     }
 
     function toggleDir(path) {
+      console.log('toggleDir called with path:', path);
+      console.log('expandedDirs before:', Array.from(expandedDirs));
       if (expandedDirs.has(path)) {
+        console.log('  Removing from expandedDirs');
         expandedDirs.delete(path);
       } else {
+        console.log('  Adding to expandedDirs');
         expandedDirs.add(path);
       }
+      console.log('expandedDirs after:', Array.from(expandedDirs));
       render();
     }
 
@@ -1107,16 +1134,29 @@ const server = http.createServer((req, res) => {
           return;
         }
 
+        console.log('Copy request - from:', from);
+        console.log('Copy request - to:', to);
+
+        // Check if source file exists
+        if (!fs.existsSync(from)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: `Source file does not exist: ${from}` }));
+          return;
+        }
+
         // Ensure directory exists
         const dir = path.dirname(to);
+        console.log('Creating directory:', dir);
         if (!fs.existsSync(dir)) {
           fs.mkdirSync(dir, { recursive: true });
         }
 
         fs.copyFileSync(from, to);
+        console.log('Copy successful');
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ success: true }));
       } catch (err) {
+        console.error('Copy error:', err);
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: err.message }));
       }
