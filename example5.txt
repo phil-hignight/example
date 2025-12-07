@@ -5,11 +5,12 @@
  * This is a self-contained bundle with no external dependencies.
  * Copy to production and run with: node clipboard-chat.js
  */
+"use strict";
 
+function _interopRequireWildcard(e, t) { if ("function" == typeof WeakMap) var r = new WeakMap(), n = new WeakMap(); return (_interopRequireWildcard = function (e, t) { if (!t && e && e.__esModule) return e; var o, i, f = { __proto__: null, default: e }; if (null === e || "object" != typeof e && "function" != typeof e) return f; if (o = t ? n : r) { if (o.has(e)) return o.get(e); o.set(e, f); } for (const t in e) "default" !== t && {}.hasOwnProperty.call(e, t) && ((i = (o = Object.defineProperty) && Object.getOwnPropertyDescriptor(e, t)) && (i.get || i.set) ? o(f, t, i) : f[t] = e[t]); return f; })(e, t); }
 const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
-
 const cwd = process.cwd();
 
 // FileSystem Transport for backend
@@ -21,18 +22,16 @@ class FileSystemTransport {
     this.lastCheck = 0;
     this.startWatching();
   }
-
   onReceive(callback) {
     this.callback = callback;
   }
-
   send(event, data) {
-    fs.writeFileSync(
-      this.backendMessagePath,
-      JSON.stringify({ event, payload: data, timestamp: Date.now() })
-    );
+    fs.writeFileSync(this.backendMessagePath, JSON.stringify({
+      event,
+      payload: data,
+      timestamp: Date.now()
+    }));
   }
-
   startWatching() {
     setInterval(() => {
       try {
@@ -64,27 +63,22 @@ class ClipboardAI {
     this.chatId = null;
     this.messageHistory = [];
   }
-
   generateSessionId() {
     return `session-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
   }
-
   generateUUID() {
-    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
-      const r = (Math.random() * 16) | 0;
-      const v = c === 'x' ? r : (r & 0x3) | 0x8;
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+      const r = Math.random() * 16 | 0;
+      const v = c === 'x' ? r : r & 0x3 | 0x8;
       return v.toString(16);
     });
   }
-
   getTimestamp() {
     return Date.now();
   }
-
   async createNewChat(firstMessage) {
     const messageId = this.generateUUID();
     const timestamp = this.getTimestamp();
-
     const payload = {
       chat: {
         id: '',
@@ -118,24 +112,25 @@ class ClipboardAI {
         timestamp: Date.now()
       }
     };
-
     const response = await fetch(`${this.apiBase}/v1/chats/new`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json'
+      },
       body: JSON.stringify(payload)
     });
-
     if (!response.ok) {
       throw new Error(`Failed to create chat: ${response.status}`);
     }
-
     const data = await response.json();
-    return { chatId: data.id, messageId };
+    return {
+      chatId: data.id,
+      messageId
+    };
   }
-
   async updateChat(messages) {
     const historyMessages = {};
-    messages.forEach((msg) => {
+    messages.forEach(msg => {
       historyMessages[msg.id] = {
         id: msg.id,
         parentId: msg.parentId,
@@ -143,7 +138,9 @@ class ClipboardAI {
         content: msg.content,
         role: msg.role,
         timestamp: msg.timestamp,
-        ...(msg.role === 'user' ? { models: [this.model] } : {
+        ...(msg.role === 'user' ? {
+          models: [this.model]
+        } : {
           model: this.model,
           modelIdx: 0,
           modelName: this.model,
@@ -151,9 +148,7 @@ class ClipboardAI {
         })
       };
     });
-
     const currentId = messages[messages.length - 1].id;
-
     const payload = {
       chat: {
         models: [this.model],
@@ -163,14 +158,16 @@ class ClipboardAI {
           messages: historyMessages,
           currentId: currentId
         },
-        messages: messages.map((msg) => ({
+        messages: messages.map(msg => ({
           id: msg.id,
           parentId: msg.parentId,
           childrenIds: msg.childrenIds,
           content: msg.content,
           role: msg.role,
           timestamp: msg.timestamp,
-          ...(msg.role === 'user' ? { models: [this.model] } : {
+          ...(msg.role === 'user' ? {
+            models: [this.model]
+          } : {
             model: this.model,
             modelIdx: 0,
             modelName: this.model,
@@ -179,34 +176,29 @@ class ClipboardAI {
         }))
       }
     };
-
     const response = await fetch(`${this.apiBase}/v1/chats/${this.chatId}`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json'
+      },
       body: JSON.stringify(payload)
     });
-
     if (!response.ok) {
       throw new Error(`Failed to update chat: ${response.status}`);
     }
-
     return await response.json();
   }
-
   convertMessagesToClipboardFormat(simpleMessages) {
     const messages = [];
     let previousId = null;
-
     for (let i = 0; i < simpleMessages.length; i++) {
       const msg = simpleMessages[i];
       let messageId;
-
       if (i < this.messageHistory.length) {
         messageId = this.messageHistory[i].id;
       } else {
         messageId = this.generateUUID();
       }
-
       let childrenIds = [];
       if (i < simpleMessages.length - 1) {
         if (i + 1 < this.messageHistory.length) {
@@ -215,7 +207,6 @@ class ClipboardAI {
           childrenIds = [this.generateUUID()];
         }
       }
-
       const clipboardMsg = {
         id: messageId,
         parentId: previousId,
@@ -224,38 +215,35 @@ class ClipboardAI {
         content: msg.content,
         timestamp: this.getTimestamp()
       };
-
       messages.push(clipboardMsg);
       previousId = messageId;
     }
-
     return messages;
   }
-
   async *streamMessage(messages) {
     const clipboardMessages = this.convertMessagesToClipboardFormat(messages);
     this.messageHistory = clipboardMessages;
-
     if (!this.chatId) {
-      const { chatId } = await this.createNewChat(messages[0]);
+      const {
+        chatId
+      } = await this.createNewChat(messages[0]);
       this.chatId = chatId;
     }
-
     await this.updateChat(clipboardMessages);
-
     const assistantMessageId = this.generateUUID();
-    const apiMessages = messages.map((msg) => ({
+    const apiMessages = messages.map(msg => ({
       role: msg.role,
       content: msg.content
     }));
-
     const payload = {
       stream: true,
       model: this.model,
       messages: apiMessages,
       max_tokens: this.maxTokens,
       params: {},
-      features: { web_search: false },
+      features: {
+        web_search: false
+      },
       session_id: this.sessionId,
       chat_id: this.chatId,
       id: assistantMessageId,
@@ -264,37 +252,38 @@ class ClipboardAI {
         tags_generation: true
       }
     };
-
     const response = await fetch(`${this.apiBase}/chat/completions`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json'
+      },
       body: JSON.stringify(payload)
     });
-
     if (!response.ok) {
       throw new Error(`Failed to get completion: ${response.status}`);
     }
-
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
-
     while (true) {
-      const { done, value } = await reader.read();
+      const {
+        done,
+        value
+      } = await reader.read();
       if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
+      buffer += decoder.decode(value, {
+        stream: true
+      });
       const lines = buffer.split('\n');
       buffer = lines.pop() || '';
-
       for (const line of lines) {
         if (line.startsWith('data: ')) {
           const data = line.slice(6);
           if (data === '[DONE]') continue;
-
           try {
+            var _parsed$choices;
             const parsed = JSON.parse(data);
-            const delta = parsed.choices?.[0]?.delta?.content;
+            const delta = (_parsed$choices = parsed.choices) === null || _parsed$choices === void 0 || (_parsed$choices = _parsed$choices[0]) === null || _parsed$choices === void 0 || (_parsed$choices = _parsed$choices.delta) === null || _parsed$choices === void 0 ? void 0 : _parsed$choices.content;
             if (delta) {
               yield delta;
             }
@@ -304,7 +293,6 @@ class ClipboardAI {
         }
       }
     }
-
     const assistantMsg = {
       id: assistantMessageId,
       parentId: clipboardMessages[clipboardMessages.length - 1].id,
@@ -323,38 +311,30 @@ function createBackend(transport, ai) {
     messages: [],
     isLoading: false
   };
-
   function syncState() {
     transport.send('state-update', state);
   }
-
   transport.onReceive(async (event, data) => {
     console.log('[BACKEND] Received:', event, data);
-
     if (event === 'send-message') {
       const userMessage = data.message;
-
       state.messages.push({
         role: 'user',
         content: userMessage
       });
       state.isLoading = true;
       syncState();
-
       let assistantMessage = '';
-
       try {
         for await (const chunk of ai.streamMessage(state.messages)) {
           assistantMessage += chunk;
           transport.send('stream-chunk', chunk);
         }
-
         state.messages.push({
           role: 'assistant',
           content: assistantMessage
         });
         state.isLoading = false;
-
         transport.send('stream-end', null);
         syncState();
       } catch (error) {
@@ -365,12 +345,12 @@ function createBackend(transport, ai) {
       }
     }
   });
-
   syncState();
-  return { getState: () => state, syncState };
+  return {
+    getState: () => state,
+    syncState
+  };
 }
-
-
 
 // UI Bundle Template
 const UI_BUNDLE_TEMPLATE = `
@@ -587,12 +567,10 @@ const UI_BUNDLE_TEMPLATE = `
 async function main() {
   // Check if running in build mode
   const buildMode = process.argv.includes('--build');
-
   if (buildMode) {
     console.log('❌ This is already a built file. Run without --build flag.');
     return;
   }
-
   console.log('🚀 Clipboard Chat Server');
   console.log('========================\n');
   console.log(`📁 Working Directory: ${cwd}\n`);
@@ -601,7 +579,6 @@ async function main() {
   const transport = new FileSystemTransport(cwd);
   const ai = new ClipboardAI();
   const backend = createBackend(transport, ai);
-
   console.log('✅ Backend server running');
   console.log(`📂 Watching: ${cwd}`);
   console.log(`📝 Files: frontend-message.json, backend-message.json\n`);
@@ -611,7 +588,6 @@ async function main() {
     input: process.stdin,
     output: process.stdout
   });
-
   rl.question('Press Enter to copy UI JavaScript to clipboard... ', async () => {
     rl.close();
 
@@ -620,7 +596,7 @@ async function main() {
 
     // Try to copy to clipboard, fallback to file
     try {
-      const clipboardy = await import('clipboardy');
+      const clipboardy = await Promise.resolve().then(() => _interopRequireWildcard(require('clipboardy')));
       await clipboardy.default.write(injectedUI);
       console.log('\n✅ UI JavaScript copied to clipboard!');
       console.log('\n📋 Next steps:');
@@ -639,5 +615,4 @@ async function main() {
     }
   });
 }
-
 main().catch(console.error);
