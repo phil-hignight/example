@@ -1,29 +1,16 @@
 #!/usr/bin/env node
 /**
- * Clipboard Chat - Single File Executable
+ * Clipboard Chat - Single File Executable (CommonJS)
  *
- * Usage:
- *   1. Copy this file to production server
- *   2. Run: node clipboard-chat.js
- *   3. Press Enter to copy UI to clipboard
- *   4. Paste in employer's AI UI browser console
- *   5. Grant directory access
- *   6. Chat!
+ * This is a self-contained bundle with no external dependencies.
+ * Copy to production and run with: node clipboard-chat.js
  */
 
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
-import readline from 'readline';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-console.log('🚀 Clipboard Chat Server');
-console.log('========================\n');
+const fs = require('fs');
+const path = require('path');
+const readline = require('readline');
 
 const cwd = process.cwd();
-console.log(`📁 Working Directory: ${cwd}\n`);
 
 // FileSystem Transport for backend
 class FileSystemTransport {
@@ -67,7 +54,7 @@ class FileSystemTransport {
   }
 }
 
-// ClipboardAI
+// ClipboardAI implementation
 class ClipboardAI {
   constructor(options = {}) {
     this.apiBase = options.apiBase || 'https://chat.niprgpt.mil/api';
@@ -383,7 +370,9 @@ function createBackend(transport, ai) {
   return { getState: () => state, syncState };
 }
 
-// UI Bundle (embedded as string - will be injected with CWD)
+
+
+// UI Bundle Template
 const UI_BUNDLE_TEMPLATE = `
 (async function() {
   'use strict';
@@ -470,33 +459,33 @@ const UI_BUNDLE_TEMPLATE = `
   function render() {
     const messagesHtml = state.messages.map(msg => {
       const isUser = msg.role === 'user';
-      return \`
-        <div style="display: flex; justify-content: \${isUser ? 'flex-end' : 'flex-start'}; margin-bottom: 12px;">
+      return \\\`
+        <div style="display: flex; justify-content: \\\${isUser ? 'flex-end' : 'flex-start'}; margin-bottom: 12px;">
           <div style="max-width: 70%; padding: 12px 16px; border-radius: 12px;
-                      background: \${isUser ? 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)' : '#fff'};
-                      color: \${isUser ? 'white' : '#333'}; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
-            \${msg.content.replace(/\\n/g, '<br>')}
+                      background: \\\${isUser ? 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)' : '#fff'};
+                      color: \\\${isUser ? 'white' : '#333'}; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
+            \\\${msg.content.replace(/\\\\n/g, '<br>')}
           </div>
         </div>
-      \`;
+      \\\`;
     }).join('');
 
-    const streamingHtml = state.streamingContent ? \`
+    const streamingHtml = state.streamingContent ? \\\`
       <div style="display: flex; justify-content: flex-start; margin-bottom: 12px;">
         <div style="max-width: 70%; padding: 12px 16px; border-radius: 12px; background: #fff; color: #333; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
-          \${state.streamingContent.replace(/\\n/g, '<br>')}
+          \\\${state.streamingContent.replace(/\\\\n/g, '<br>')}
           <span style="animation: blink 1s infinite;">▊</span>
         </div>
       </div>
-    \` : '';
+    \\\` : '';
 
-    const errorHtml = state.error ? \`
+    const errorHtml = state.error ? \\\`
       <div style="padding: 12px; background: #fee; color: #c00; border-radius: 8px; margin-bottom: 12px;">
-        Error: \${state.error}
+        Error: \\\${state.error}
       </div>
-    \` : '';
+    \\\` : '';
 
-    app.innerHTML = \`
+    app.innerHTML = \\\`
       <style>
         @keyframes blink { 0%, 50% { opacity: 1; } 51%, 100% { opacity: 0; } }
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -506,29 +495,29 @@ const UI_BUNDLE_TEMPLATE = `
         <header style="color: white; padding: 20px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);">
           <h1 style="font-size: 24px; font-weight: 600; margin: 0;">Clipboard Chat</h1>
           <p style="font-size: 14px; margin-top: 4px; opacity: 0.9;">📁 {{CWD}}</p>
-          <p style="font-size: 12px; margin-top: 2px; opacity: 0.8;">📂 Connected to: \${dirHandle.name}</p>
+          <p style="font-size: 12px; margin-top: 2px; opacity: 0.8;">📂 Connected to: \\\${dirHandle.name}</p>
         </header>
 
         <div id="messages" style="flex: 1; overflow-y: auto; padding: 20px; background: #f9fafb;">
-          \${messagesHtml}
-          \${streamingHtml}
-          \${errorHtml}
+          \\\${messagesHtml}
+          \\\${streamingHtml}
+          \\\${errorHtml}
         </div>
 
         <div style="padding: 20px; background: white; border-top: 1px solid #e5e7eb;">
           <div style="display: flex; gap: 12px;">
             <input id="messageInput" type="text" placeholder="Type your message..."
               style="flex: 1; padding: 12px 16px; border: 1px solid #d1d5db; border-radius: 8px; outline: none;"
-              \${state.isLoading ? 'disabled' : ''} />
+              \\\${state.isLoading ? 'disabled' : ''} />
             <button id="sendButton"
               style="padding: 12px 24px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border: none; border-radius: 8px; cursor: pointer;"
-              \${state.isLoading ? 'disabled' : ''}>
-              \${state.isLoading ? 'Sending...' : 'Send'}
+              \\\${state.isLoading ? 'disabled' : ''}>
+              \\\${state.isLoading ? 'Sending...' : 'Send'}
             </button>
           </div>
         </div>
       </div>
-    \`;
+    \\\`;
 
     const input = document.getElementById('messageInput');
     const button = document.getElementById('sendButton');
@@ -592,7 +581,7 @@ const UI_BUNDLE_TEMPLATE = `
   console.log('✅ Chat UI initialized!');
   console.log('💬 Type a message to start chatting');
 })();
-`.trim();
+`;
 
 // Main
 async function main() {
@@ -600,24 +589,15 @@ async function main() {
   const buildMode = process.argv.includes('--build');
 
   if (buildMode) {
-    // Build mode: copy this file to dist
-    const rootDir = path.resolve(__dirname, '../../');
-    const distDir = path.join(rootDir, 'dist');
-    const outputPath = path.join(distDir, 'clipboard-chat.js');
-
-    // Ensure dist directory exists
-    if (!fs.existsSync(distDir)) {
-      fs.mkdirSync(distDir, { recursive: true });
-    }
-
-    // Copy this file to dist
-    fs.copyFileSync(__filename, outputPath);
-    console.log(`✅ Built clipboard app to: ${outputPath}`);
-    console.log(`📦 Usage: node dist/clipboard-chat.js\n`);
+    console.log('❌ This is already a built file. Run without --build flag.');
     return;
   }
 
-  // Runtime mode: start server
+  console.log('🚀 Clipboard Chat Server');
+  console.log('========================\n');
+  console.log(`📁 Working Directory: ${cwd}\n`);
+
+  // Initialize backend
   const transport = new FileSystemTransport(cwd);
   const ai = new ClipboardAI();
   const backend = createBackend(transport, ai);
@@ -638,10 +618,10 @@ async function main() {
     // Inject CWD into UI bundle
     const injectedUI = UI_BUNDLE_TEMPLATE.replace(/{{CWD}}/g, cwd);
 
-    // Copy to clipboard
+    // Try to copy to clipboard, fallback to file
     try {
-      const { default: clipboardy } = await import('clipboardy');
-      await clipboardy.write(injectedUI);
+      const clipboardy = await import('clipboardy');
+      await clipboardy.default.write(injectedUI);
       console.log('\n✅ UI JavaScript copied to clipboard!');
       console.log('\n📋 Next steps:');
       console.log('1. Go to your employer\'s AI UI (or any website)');
@@ -652,8 +632,7 @@ async function main() {
       console.log('5. Start chatting!');
       console.log('\n💡 The browser and this server communicate via JSON files\n');
     } catch (err) {
-      console.error('\n❌ Failed to copy to clipboard:', err.message);
-      console.log('\n💾 Saving to clipboard-ui.js instead...\n');
+      console.log('\n💾 Saving to clipboard-ui.js (clipboard not available)\n');
       fs.writeFileSync(path.join(cwd, 'clipboard-ui.js'), injectedUI);
       console.log(`📄 Saved to: ${path.join(cwd, 'clipboard-ui.js')}`);
       console.log('Copy the file contents manually and paste in browser console.\n');
