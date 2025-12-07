@@ -7,7 +7,6 @@
  */
 "use strict";
 
-function _interopRequireWildcard(e, t) { if ("function" == typeof WeakMap) var r = new WeakMap(), n = new WeakMap(); return (_interopRequireWildcard = function (e, t) { if (!t && e && e.__esModule) return e; var o, i, f = { __proto__: null, default: e }; if (null === e || "object" != typeof e && "function" != typeof e) return f; if (o = t ? n : r) { if (o.has(e)) return o.get(e); o.set(e, f); } for (const t in e) "default" !== t && {}.hasOwnProperty.call(e, t) && ((i = (o = Object.defineProperty) && Object.getOwnPropertyDescriptor(e, t)) && (i.get || i.set) ? o(f, t, i) : f[t] = e[t]); return f; })(e, t); }
 const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
@@ -437,67 +436,65 @@ const UI_BUNDLE_TEMPLATE = `
 
   // Render function
   function render() {
-    const messagesHtml = state.messages.map(msg => {
+    const messagesHtml = state.messages.map(function(msg) {
       const isUser = msg.role === 'user';
-      return \\\`
-        <div style="display: flex; justify-content: \\\${isUser ? 'flex-end' : 'flex-start'}; margin-bottom: 12px;">
-          <div style="max-width: 70%; padding: 12px 16px; border-radius: 12px;
-                      background: \\\${isUser ? 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)' : '#fff'};
-                      color: \\\${isUser ? 'white' : '#333'}; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
-            \\\${msg.content.replace(/\\\\n/g, '<br>')}
-          </div>
-        </div>
-      \\\`;
+      const justify = isUser ? 'flex-end' : 'flex-start';
+      const bg = isUser ? 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)' : '#fff';
+      const color = isUser ? 'white' : '#333';
+      const content = msg.content.replace(/\\n/g, '<br>');
+
+      return '<div style="display: flex; justify-content: ' + justify + '; margin-bottom: 12px;">' +
+        '<div style="max-width: 70%; padding: 12px 16px; border-radius: 12px; background: ' + bg + '; color: ' + color + '; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">' +
+        content +
+        '</div>' +
+        '</div>';
     }).join('');
 
-    const streamingHtml = state.streamingContent ? \\\`
-      <div style="display: flex; justify-content: flex-start; margin-bottom: 12px;">
-        <div style="max-width: 70%; padding: 12px 16px; border-radius: 12px; background: #fff; color: #333; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">
-          \\\${state.streamingContent.replace(/\\\\n/g, '<br>')}
-          <span style="animation: blink 1s infinite;">▊</span>
-        </div>
-      </div>
-    \\\` : '';
+    const streamingHtml = state.streamingContent ?
+      '<div style="display: flex; justify-content: flex-start; margin-bottom: 12px;">' +
+        '<div style="max-width: 70%; padding: 12px 16px; border-radius: 12px; background: #fff; color: #333; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">' +
+        state.streamingContent.replace(/\\n/g, '<br>') +
+        '<span style="animation: blink 1s infinite;">▊</span>' +
+        '</div>' +
+        '</div>'
+      : '';
 
-    const errorHtml = state.error ? \\\`
-      <div style="padding: 12px; background: #fee; color: #c00; border-radius: 8px; margin-bottom: 12px;">
-        Error: \\\${state.error}
-      </div>
-    \\\` : '';
+    const errorHtml = state.error ?
+      '<div style="padding: 12px; background: #fee; color: #c00; border-radius: 8px; margin-bottom: 12px;">' +
+        'Error: ' + state.error +
+        '</div>'
+      : '';
 
-    app.innerHTML = \\\`
-      <style>
-        @keyframes blink { 0%, 50% { opacity: 1; } 51%, 100% { opacity: 0; } }
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: -apple-system, sans-serif; height: 100vh; overflow: hidden; }
-      </style>
-      <div style="display: flex; flex-direction: column; height: 100vh;">
-        <header style="color: white; padding: 20px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);">
-          <h1 style="font-size: 24px; font-weight: 600; margin: 0;">Clipboard Chat</h1>
-          <p style="font-size: 14px; margin-top: 4px; opacity: 0.9;">📁 {{CWD}}</p>
-          <p style="font-size: 12px; margin-top: 2px; opacity: 0.8;">📂 Connected to: \\\${dirHandle.name}</p>
-        </header>
-
-        <div id="messages" style="flex: 1; overflow-y: auto; padding: 20px; background: #f9fafb;">
-          \\\${messagesHtml}
-          \\\${streamingHtml}
-          \\\${errorHtml}
-        </div>
-
-        <div style="padding: 20px; background: white; border-top: 1px solid #e5e7eb;">
-          <div style="display: flex; gap: 12px;">
-            <input id="messageInput" type="text" placeholder="Type your message..."
-              style="flex: 1; padding: 12px 16px; border: 1px solid #d1d5db; border-radius: 8px; outline: none;"
-              \\\${state.isLoading ? 'disabled' : ''} />
-            <button id="sendButton"
-              style="padding: 12px 24px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border: none; border-radius: 8px; cursor: pointer;"
-              \\\${state.isLoading ? 'disabled' : ''}>
-              \\\${state.isLoading ? 'Sending...' : 'Send'}
-            </button>
-          </div>
-        </div>
-      </div>
-    \\\`;
+    app.innerHTML =
+      '<style>' +
+        '@keyframes blink { 0%, 50% { opacity: 1; } 51%, 100% { opacity: 0; } }' +
+        '* { margin: 0; padding: 0; box-sizing: border-box; }' +
+        'body { font-family: -apple-system, sans-serif; height: 100vh; overflow: hidden; }' +
+      '</style>' +
+      '<div style="display: flex; flex-direction: column; height: 100vh;">' +
+        '<header style="color: white; padding: 20px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);">' +
+          '<h1 style="font-size: 24px; font-weight: 600; margin: 0;">Clipboard Chat</h1>' +
+          '<p style="font-size: 14px; margin-top: 4px; opacity: 0.9;">📁 {{CWD}}</p>' +
+          '<p style="font-size: 12px; margin-top: 2px; opacity: 0.8;">📂 Connected to: ' + dirHandle.name + '</p>' +
+        '</header>' +
+        '<div id="messages" style="flex: 1; overflow-y: auto; padding: 20px; background: #f9fafb;">' +
+          messagesHtml +
+          streamingHtml +
+          errorHtml +
+        '</div>' +
+        '<div style="padding: 20px; background: white; border-top: 1px solid #e5e7eb;">' +
+          '<div style="display: flex; gap: 12px;">' +
+            '<input id="messageInput" type="text" placeholder="Type your message..." ' +
+              'style="flex: 1; padding: 12px 16px; border: 1px solid #d1d5db; border-radius: 8px; outline: none;" ' +
+              (state.isLoading ? 'disabled' : '') + ' />' +
+            '<button id="sendButton" ' +
+              'style="padding: 12px 24px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border: none; border-radius: 8px; cursor: pointer;" ' +
+              (state.isLoading ? 'disabled' : '') + '>' +
+              (state.isLoading ? 'Sending...' : 'Send') +
+            '</button>' +
+          '</div>' +
+        '</div>' +
+      '</div>';
 
     const input = document.getElementById('messageInput');
     const button = document.getElementById('sendButton');
@@ -588,31 +585,27 @@ async function main() {
     input: process.stdin,
     output: process.stdout
   });
-  rl.question('Press Enter to copy UI JavaScript to clipboard... ', async () => {
+  rl.question('Press Enter to generate UI JavaScript file... ', () => {
     rl.close();
 
     // Inject CWD into UI bundle
     const injectedUI = UI_BUNDLE_TEMPLATE.replace(/{{CWD}}/g, cwd);
 
-    // Try to copy to clipboard, fallback to file
-    try {
-      const clipboardy = await Promise.resolve().then(() => _interopRequireWildcard(require('clipboardy')));
-      await clipboardy.default.write(injectedUI);
-      console.log('\n✅ UI JavaScript copied to clipboard!');
-      console.log('\n📋 Next steps:');
-      console.log('1. Go to your employer\'s AI UI (or any website)');
-      console.log('2. Open browser console (F12)');
-      console.log('3. Paste and press Enter');
-      console.log('4. Grant directory access when prompted');
-      console.log('   (Select the same directory where this is running)');
-      console.log('5. Start chatting!');
-      console.log('\n💡 The browser and this server communicate via JSON files\n');
-    } catch (err) {
-      console.log('\n💾 Saving to clipboard-ui.js (clipboard not available)\n');
-      fs.writeFileSync(path.join(cwd, 'clipboard-ui.js'), injectedUI);
-      console.log(`📄 Saved to: ${path.join(cwd, 'clipboard-ui.js')}`);
-      console.log('Copy the file contents manually and paste in browser console.\n');
-    }
+    // Save to file
+    const outputFile = path.join(cwd, 'clipboard-ui.js');
+    fs.writeFileSync(outputFile, injectedUI);
+    console.log('\n✅ UI JavaScript generated!');
+    console.log(`📄 File: ${outputFile}`);
+    console.log(`📦 Size: ${(injectedUI.length / 1024).toFixed(1)}KB\n`);
+    console.log('📋 Next steps:');
+    console.log('1. Copy the contents of clipboard-ui.js');
+    console.log('2. Go to your employer\'s AI UI (or any website)');
+    console.log('3. Open browser console (F12)');
+    console.log('4. Paste and press Enter');
+    console.log('5. Grant directory access when prompted');
+    console.log('   (Select this directory: ' + cwd + ')');
+    console.log('6. Start chatting!\n');
+    console.log('💡 The browser and this server communicate via JSON files\n');
   });
 }
 main().catch(console.error);
