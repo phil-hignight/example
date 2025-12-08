@@ -83,6 +83,10 @@
   // Browser ClipboardAI Implementation
   // ==========================================================================
 
+  function getTimestamp() {
+    return Date.now();
+  }
+
   class BrowserClipboardAI {
     constructor() {
       this.apiBase = API_BASE;
@@ -94,122 +98,262 @@
 
     async createNewChat(firstMessage) {
       const messageId = generateUUID();
+      const timestamp = getTimestamp();
+
+      const payload = {
+        chat: {
+          id: '',
+          title: 'Chat Pending',
+          models: [this.model],
+          params: {},
+          history: {
+            messages: {
+              [messageId]: {
+                id: messageId,
+                parentId: null,
+                childrenIds: [],
+                role: 'user',
+                content: firstMessage,
+                timestamp: timestamp,
+                models: [this.model]
+              }
+            },
+            currentId: messageId
+          },
+          messages: [
+            {
+              id: messageId,
+              parentId: null,
+              childrenIds: [],
+              role: 'user',
+              content: firstMessage,
+              timestamp: timestamp,
+              models: [this.model]
+            }
+          ],
+          tags: [],
+          timestamp: Date.now()
+        }
+      };
+
       const response = await fetch(this.apiBase + '/v1/chats/new', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          session_id: this.sessionId,
-          message: {
-            id: messageId,
-            author: { role: 'user' },
-            content: { content_type: 'text', parts: [firstMessage.content] },
-            metadata: {},
-            create_time: Date.now() / 1000
-          }
-        })
+        body: JSON.stringify(payload)
       });
-      if (!response.ok) throw new Error('Failed to create chat: ' + response.statusText);
+
+      if (!response.ok) {
+        throw new Error('Failed to create chat: ' + response.status + ' ' + response.statusText);
+      }
+
       const data = await response.json();
-      return { chatId: data.chat_id, messageId: messageId };
+      this.chatId = data.id;
+
+      return { chatId: data.id, messageId: messageId };
     }
 
     async updateChat(messages) {
+      const historyMessages = {};
+      messages.forEach(function(msg) {
+        historyMessages[msg.id] = {
+          id: msg.id,
+          parentId: msg.parentId,
+          childrenIds: msg.childrenIds,
+          content: msg.content,
+          role: msg.role,
+          timestamp: msg.timestamp
+        };
+        if (msg.role === 'user') {
+          historyMessages[msg.id].models = [this.model];
+        } else {
+          historyMessages[msg.id].model = this.model;
+          historyMessages[msg.id].modelIdx = 0;
+          historyMessages[msg.id].modelName = this.model;
+          historyMessages[msg.id].userContext = null;
+        }
+      }.bind(this));
+
+      const currentId = messages[messages.length - 1].id;
+
+      const payload = {
+        chat: {
+          models: [this.model],
+          files: [],
+          params: {},
+          history: {
+            messages: historyMessages,
+            currentId: currentId
+          },
+          messages: messages.map(function(msg) {
+            const result = {
+              id: msg.id,
+              parentId: msg.parentId,
+              childrenIds: msg.childrenIds,
+              content: msg.content,
+              role: msg.role,
+              timestamp: msg.timestamp
+            };
+            if (msg.role === 'user') {
+              result.models = [this.model];
+            } else {
+              result.model = this.model;
+              result.modelIdx = 0;
+              result.modelName = this.model;
+              result.userContext = null;
+            }
+            return result;
+          }.bind(this))
+        }
+      };
+
       const response = await fetch(this.apiBase + '/v1/chats/' + this.chatId, {
-        method: 'PATCH',
+        method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          session_id: this.sessionId,
-          messages: messages,
-          enable_title_generation: true,
-          enable_tag_generation: true
-        })
+        body: JSON.stringify(payload)
       });
-      if (!response.ok) throw new Error('Failed to update chat: ' + response.statusText);
+
+      if (!response.ok) {
+        throw new Error('Failed to update chat: ' + response.status + ' ' + response.statusText);
+      }
+
       return await response.json();
     }
 
-    convertMessagesToClipboardFormat(messages) {
-      const clipboardMessages = [];
+    async *streamMessage(messages) {
+      // On first message, create the chat
+      if (!this.chatId) {
+        const firstMessage = messages[0].content;
+        const result = await this.createNewChat(firstMessage);
+        const messageId = result.messageId;
+
+        // Store in history
+        this.messageHistory.push({
+          id: messageId,
+          parentId: null,
+          childrenIds: [],
+          role: 'user',
+          content: firstMessage,
+          timestamp: getTimestamp()
+        });
+      }
+
+      // Build the message chain for update
+      const messagesToUpdate = [];
       let parentId = null;
+
       for (let i = 0; i < messages.length; i++) {
         const msg = messages[i];
-        let existing = null;
+
+        // Check if this message is already in history
+        let found = false;
         for (let j = 0; j < this.messageHistory.length; j++) {
           const h = this.messageHistory[j];
-          if (h.author.role === msg.role && h.content.parts[0] === msg.content) {
-            existing = h;
+          if (h.role === msg.role && h.content === msg.content) {
+            parentId = h.id;
+            found = true;
             break;
           }
         }
-        if (existing) {
-          parentId = existing.id;
-          continue;
-        }
-        const messageId = generateUUID();
-        const clipboardMsg = {
-          id: messageId,
-          author: { role: msg.role },
-          content: { content_type: 'text', parts: [msg.content] },
-          metadata: {},
-          create_time: Date.now() / 1000
-        };
-        if (parentId) clipboardMsg.metadata.parent_id = parentId;
-        clipboardMessages.push(clipboardMsg);
-        this.messageHistory.push(clipboardMsg);
-        parentId = messageId;
-      }
-      return clipboardMessages;
-    }
 
-    async *streamMessage(messages) {
-      const clipboardMessages = this.convertMessagesToClipboardFormat(messages);
-      if (!this.chatId) {
-        const firstMessage = messages[0];
-        const result = await this.createNewChat(firstMessage);
-        this.chatId = result.chatId;
-      }
-      if (clipboardMessages.length > 0) await this.updateChat(clipboardMessages);
-      let lastUserMessage = null;
-      for (let i = messages.length - 1; i >= 0; i--) {
-        if (messages[i].role === 'user') {
-          lastUserMessage = messages[i];
-          break;
+        if (!found) {
+          const messageId = generateUUID();
+          const newMsg = {
+            id: messageId,
+            parentId: parentId,
+            childrenIds: [],
+            role: msg.role,
+            content: msg.content,
+            timestamp: getTimestamp()
+          };
+
+          // Update parent's childrenIds
+          if (parentId) {
+            for (let j = 0; j < this.messageHistory.length; j++) {
+              if (this.messageHistory[j].id === parentId) {
+                this.messageHistory[j].childrenIds.push(messageId);
+                break;
+              }
+            }
+          }
+
+          this.messageHistory.push(newMsg);
+          messagesToUpdate.push(newMsg);
+          parentId = messageId;
         }
       }
-      if (!lastUserMessage) throw new Error('No user message found');
+
+      // Update the chat with new messages
+      if (messagesToUpdate.length > 0) {
+        await this.updateChat(this.messageHistory);
+      }
+
+      // Convert to API format for completion
+      const apiMessages = messages.map(function(m) {
+        return {
+          role: m.role,
+          content: m.content
+        };
+      });
+
+      // Generate assistant message ID
+      const assistantMessageId = generateUUID();
+
+      // Get completion
+      const payload = {
+        stream: true,
+        model: this.model,
+        messages: apiMessages,
+        params: {},
+        features: {
+          web_search: false
+        },
+        session_id: this.sessionId,
+        chat_id: this.chatId,
+        id: assistantMessageId,
+        background_tasks: {
+          title_generation: true,
+          tags_generation: true
+        }
+      };
+
       const response = await fetch(this.apiBase + '/chat/completions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: this.model,
-          messages: this.messageHistory,
-          stream: true,
-          session_id: this.sessionId,
-          chat_id: this.chatId,
-          timeout: 30,
-          max_retries: 5
-        })
+        body: JSON.stringify(payload)
       });
-      if (!response.ok) throw new Error('Failed to get completion: ' + response.statusText);
+
+      if (!response.ok) {
+        throw new Error('Failed to get completion: ' + response.status + ' ' + response.statusText);
+      }
+
+      // Parse SSE stream
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
+
       while (true) {
         const result = await reader.read();
         if (result.done) break;
+
         buffer = buffer + decoder.decode(result.value, { stream: true });
         const lines = buffer.split('\\n');
         buffer = lines.pop() || '';
+
         for (let i = 0; i < lines.length; i++) {
           const line = lines[i];
           if (line.indexOf('data: ') === 0) {
             const data = line.slice(6);
             if (data === '[DONE]') continue;
+
             try {
               const parsed = JSON.parse(data);
               const content = parsed.choices && parsed.choices[0] && parsed.choices[0].delta && parsed.choices[0].delta.content;
-              if (content) yield content;
-            } catch (e) {}
+              if (content) {
+                yield content;
+              }
+            } catch (e) {
+              // Ignore parse errors
+            }
           }
         }
       }
