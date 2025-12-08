@@ -330,6 +330,7 @@
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
+      let fullAssistantMessage = '';
 
       while (true) {
         const result = await reader.read();
@@ -349,6 +350,7 @@
               const parsed = JSON.parse(data);
               const content = parsed.choices && parsed.choices[0] && parsed.choices[0].delta && parsed.choices[0].delta.content;
               if (content) {
+                fullAssistantMessage = fullAssistantMessage + content;
                 yield content;
               }
             } catch (e) {
@@ -356,6 +358,23 @@
             }
           }
         }
+      }
+
+      // After streaming completes, add assistant message to history
+      if (fullAssistantMessage) {
+        const lastUserMsg = this.messageHistory[this.messageHistory.length - 1];
+        const assistantMsg = {
+          id: assistantMessageId,
+          parentId: lastUserMsg.id,
+          childrenIds: [],
+          role: 'assistant',
+          content: fullAssistantMessage,
+          timestamp: getTimestamp()
+        };
+
+        // Update parent's childrenIds
+        lastUserMsg.childrenIds.push(assistantMessageId);
+        this.messageHistory.push(assistantMsg);
       }
     }
   }
