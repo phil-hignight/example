@@ -1,611 +1,476 @@
-#!/usr/bin/env node
-/**
- * Clipboard Chat - Single File Executable (CommonJS)
- *
- * This is a self-contained bundle with no external dependencies.
- * Copy to production and run with: node clipboard-chat.js
- */
-"use strict";
 
-const fs = require('fs');
-const path = require('path');
-const readline = require('readline');
-const cwd = process.cwd();
+// ============================================================================
+// Browser-only Clipboard Chat with Datastore
+// ============================================================================
 
-// FileSystem Transport for backend
-class FileSystemTransport {
-  constructor(dirPath) {
-    this.dirPath = dirPath;
-    this.frontendMessagePath = path.join(dirPath, 'frontend-message.json');
-    this.backendMessagePath = path.join(dirPath, 'backend-message.json');
-    this.lastCheck = 0;
-    this.startWatching();
-  }
-  onReceive(callback) {
-    this.callback = callback;
-  }
-  send(event, data) {
-    fs.writeFileSync(this.backendMessagePath, JSON.stringify({
-      event,
-      payload: data,
-      timestamp: Date.now()
-    }));
-  }
-  startWatching() {
-    setInterval(() => {
-      try {
-        if (fs.existsSync(this.frontendMessagePath)) {
-          const stats = fs.statSync(this.frontendMessagePath);
-          if (stats.mtimeMs > this.lastCheck) {
-            this.lastCheck = stats.mtimeMs;
-            const content = fs.readFileSync(this.frontendMessagePath, 'utf8');
-            const data = JSON.parse(content);
-            if (this.callback) {
-              this.callback(data.event, data.payload);
-            }
-          }
-        }
-      } catch (e) {
-        // Ignore errors
-      }
-    }, 500);
-  }
-}
+(function() {
+  'use strict';
 
-// ClipboardAI implementation
-class ClipboardAI {
-  constructor(options = {}) {
-    this.apiBase = options.apiBase || 'https://chat.niprgpt.mil/api';
-    this.model = options.model || 'Anthropic Claude 4 Sonnet';
-    this.maxTokens = options.maxTokens || 4096;
-    this.sessionId = this.generateSessionId();
-    this.chatId = null;
-    this.messageHistory = [];
-  }
-  generateSessionId() {
-    return `session-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-  }
-  generateUUID() {
-    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+  const API_BASE = 'https://chat.niprgpt.mil/api';
+  const MODEL = 'Anthropic Claude 4 Sonnet';
+
+  // ==========================================================================
+  // Utility: UUID Generation
+  // ==========================================================================
+
+  function generateUUID() {
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
       const r = Math.random() * 16 | 0;
-      const v = c === 'x' ? r : r & 0x3 | 0x8;
+      const v = c === 'x' ? r : (r & 0x3 | 0x8);
       return v.toString(16);
     });
   }
-  getTimestamp() {
-    return Date.now();
-  }
-  async createNewChat(firstMessage) {
-    const messageId = this.generateUUID();
-    const timestamp = this.getTimestamp();
-    const payload = {
-      chat: {
-        id: '',
-        title: 'Chat Pending',
-        models: [this.model],
-        params: {},
-        history: {
-          messages: {
-            [messageId]: {
-              id: messageId,
-              parentId: null,
-              childrenIds: [],
-              role: 'user',
-              content: firstMessage.content,
-              timestamp: timestamp,
-              models: [this.model]
-            }
-          },
-          currentId: messageId
-        },
-        messages: [{
-          id: messageId,
-          parentId: null,
-          childrenIds: [],
-          role: 'user',
-          content: firstMessage.content,
-          timestamp: timestamp,
-          models: [this.model]
-        }],
-        tags: [],
-        timestamp: Date.now()
-      }
-    };
-    const response = await fetch(`${this.apiBase}/v1/chats/new`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(payload)
-    });
-    if (!response.ok) {
-      throw new Error(`Failed to create chat: ${response.status}`);
-    }
-    const data = await response.json();
-    return {
-      chatId: data.id,
-      messageId
-    };
-  }
-  async updateChat(messages) {
-    const historyMessages = {};
-    messages.forEach(msg => {
-      historyMessages[msg.id] = {
-        id: msg.id,
-        parentId: msg.parentId,
-        childrenIds: msg.childrenIds,
-        content: msg.content,
-        role: msg.role,
-        timestamp: msg.timestamp,
-        ...(msg.role === 'user' ? {
-          models: [this.model]
-        } : {
-          model: this.model,
-          modelIdx: 0,
-          modelName: this.model,
-          userContext: null
-        })
-      };
-    });
-    const currentId = messages[messages.length - 1].id;
-    const payload = {
-      chat: {
-        models: [this.model],
-        files: [],
-        params: {},
-        history: {
-          messages: historyMessages,
-          currentId: currentId
-        },
-        messages: messages.map(msg => ({
-          id: msg.id,
-          parentId: msg.parentId,
-          childrenIds: msg.childrenIds,
-          content: msg.content,
-          role: msg.role,
-          timestamp: msg.timestamp,
-          ...(msg.role === 'user' ? {
-            models: [this.model]
-          } : {
-            model: this.model,
-            modelIdx: 0,
-            modelName: this.model,
-            userContext: null
-          })
-        }))
-      }
-    };
-    const response = await fetch(`${this.apiBase}/v1/chats/${this.chatId}`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(payload)
-    });
-    if (!response.ok) {
-      throw new Error(`Failed to update chat: ${response.status}`);
-    }
-    return await response.json();
-  }
-  convertMessagesToClipboardFormat(simpleMessages) {
-    const messages = [];
-    let previousId = null;
-    for (let i = 0; i < simpleMessages.length; i++) {
-      const msg = simpleMessages[i];
-      let messageId;
-      if (i < this.messageHistory.length) {
-        messageId = this.messageHistory[i].id;
-      } else {
-        messageId = this.generateUUID();
-      }
-      let childrenIds = [];
-      if (i < simpleMessages.length - 1) {
-        if (i + 1 < this.messageHistory.length) {
-          childrenIds = [this.messageHistory[i + 1].id];
-        } else {
-          childrenIds = [this.generateUUID()];
-        }
-      }
-      const clipboardMsg = {
-        id: messageId,
-        parentId: previousId,
-        childrenIds: childrenIds,
-        role: msg.role,
-        content: msg.content,
-        timestamp: this.getTimestamp()
-      };
-      messages.push(clipboardMsg);
-      previousId = messageId;
-    }
-    return messages;
-  }
-  async *streamMessage(messages) {
-    const clipboardMessages = this.convertMessagesToClipboardFormat(messages);
-    this.messageHistory = clipboardMessages;
-    if (!this.chatId) {
-      const {
-        chatId
-      } = await this.createNewChat(messages[0]);
-      this.chatId = chatId;
-    }
-    await this.updateChat(clipboardMessages);
-    const assistantMessageId = this.generateUUID();
-    const apiMessages = messages.map(msg => ({
-      role: msg.role,
-      content: msg.content
-    }));
-    const payload = {
-      stream: true,
-      model: this.model,
-      messages: apiMessages,
-      max_tokens: this.maxTokens,
-      params: {},
-      features: {
-        web_search: false
-      },
-      session_id: this.sessionId,
-      chat_id: this.chatId,
-      id: assistantMessageId,
-      background_tasks: {
-        title_generation: true,
-        tags_generation: true
-      }
-    };
-    const response = await fetch(`${this.apiBase}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(payload)
-    });
-    if (!response.ok) {
-      throw new Error(`Failed to get completion: ${response.status}`);
-    }
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-    while (true) {
-      const {
-        done,
-        value
-      } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, {
-        stream: true
-      });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
-      for (const line of lines) {
-        if (line.startsWith('data: ')) {
-          const data = line.slice(6);
-          if (data === '[DONE]') continue;
-          try {
-            var _parsed$choices;
-            const parsed = JSON.parse(data);
-            const delta = (_parsed$choices = parsed.choices) === null || _parsed$choices === void 0 || (_parsed$choices = _parsed$choices[0]) === null || _parsed$choices === void 0 || (_parsed$choices = _parsed$choices.delta) === null || _parsed$choices === void 0 ? void 0 : _parsed$choices.content;
-            if (delta) {
-              yield delta;
-            }
-          } catch (e) {
-            // Skip invalid JSON
-          }
-        }
-      }
-    }
-    const assistantMsg = {
-      id: assistantMessageId,
-      parentId: clipboardMessages[clipboardMessages.length - 1].id,
-      childrenIds: [],
-      role: 'assistant',
-      content: '',
-      timestamp: this.getTimestamp()
-    };
-    this.messageHistory.push(assistantMsg);
-  }
-}
 
-// Backend core
-function createBackend(transport, ai) {
-  const state = {
-    messages: [],
-    isLoading: false
-  };
-  function syncState() {
-    transport.send('state-update', state);
+  function generateSessionId() {
+    return Date.now().toString();
   }
-  transport.onReceive(async (event, data) => {
-    console.log('[BACKEND] Received:', event, data);
-    if (event === 'send-message') {
-      const userMessage = data.message;
-      state.messages.push({
-        role: 'user',
-        content: userMessage
-      });
-      state.isLoading = true;
-      syncState();
-      let assistantMessage = '';
+
+  // ==========================================================================
+  // Browser FileSystem Datastore
+  // ==========================================================================
+
+  class BrowserFileSystemDatastore {
+    constructor(options) {
+      const directoryHandle = options.directoryHandle;
+      if (!directoryHandle) {
+        throw new Error('directoryHandle is required');
+      }
+      this.rootHandle = directoryHandle;
+      this.agentHandle = null;
+    }
+
+    async init() {
+      this.agentHandle = await this.rootHandle.getDirectoryHandle('.agent', { create: true });
+    }
+
+    async _ensureInit() {
+      if (!this.agentHandle) {
+        await this.init();
+      }
+    }
+
+    async read(filename) {
+      await this._ensureInit();
       try {
-        for await (const chunk of ai.streamMessage(state.messages)) {
-          assistantMessage += chunk;
-          transport.send('stream-chunk', chunk);
-        }
-        state.messages.push({
-          role: 'assistant',
-          content: assistantMessage
-        });
-        state.isLoading = false;
-        transport.send('stream-end', null);
-        syncState();
-      } catch (error) {
-        console.error('[BACKEND] Error streaming message:', error);
-        state.isLoading = false;
-        transport.send('stream-error', error.message);
-        syncState();
+        const fileHandle = await this.agentHandle.getFileHandle(filename);
+        const file = await fileHandle.getFile();
+        return await file.text();
+      } catch (err) {
+        throw new Error('File not found: ' + filename);
       }
     }
-  });
-  syncState();
-  return {
-    getState: () => state,
-    syncState
-  };
-}
 
-// UI Bundle Template
-const UI_BUNDLE_TEMPLATE = `
-(async function() {
-  'use strict';
-
-  console.log('🎯 Clipboard Chat - Initializing...');
-  console.log('📁 Working Directory: {{CWD}}');
-
-  // Clear existing UI
-  document.body.innerHTML = '';
-  document.head.innerHTML = '<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Clipboard Chat</title>';
-
-  // Request directory access
-  let dirHandle;
-  try {
-    dirHandle = await window.showDirectoryPicker({
-      mode: 'readwrite',
-      startIn: 'desktop'
-    });
-    console.log('✅ Directory access granted:', dirHandle.name);
-  } catch (e) {
-    alert('Directory access required for File System transport. Please grant permission.');
-    return;
-  }
-
-  // FileSystem Transport for frontend
-  class FileSystemTransport {
-    constructor(dirHandle) {
-      this.dirHandle = dirHandle;
-      this.pollInterval = 500;
-      this.listeners = [];
-      this.lastTimestamp = 0;
-    }
-
-    async send(event, data) {
-      const fileHandle = await this.dirHandle.getFileHandle('frontend-message.json', { create: true });
+    async write(filename, content) {
+      await this._ensureInit();
+      const fileHandle = await this.agentHandle.getFileHandle(filename, { create: true });
       const writable = await fileHandle.createWritable();
-      await writable.write(JSON.stringify({ event, payload: data, timestamp: Date.now() }));
+      await writable.write(content);
       await writable.close();
-      console.log('[FRONTEND] Sent:', event, data);
     }
 
-    onReceive(callback) {
-      this.listeners.push(callback);
-      if (this.listeners.length === 1) {
-        this.startPolling();
+    async exists(filename) {
+      await this._ensureInit();
+      try {
+        await this.agentHandle.getFileHandle(filename);
+        return true;
+      } catch (err) {
+        return false;
       }
     }
+  }
 
-    async startPolling() {
-      while (true) {
-        await new Promise(resolve => setTimeout(resolve, this.pollInterval));
+  // ==========================================================================
+  // Browser ClipboardAI Implementation
+  // ==========================================================================
 
-        try {
-          const fileHandle = await this.dirHandle.getFileHandle('backend-message.json');
-          const file = await fileHandle.getFile();
-          const content = await file.text();
-          const data = JSON.parse(content);
+  class BrowserClipboardAI {
+    constructor() {
+      this.apiBase = API_BASE;
+      this.model = MODEL;
+      this.sessionId = generateSessionId();
+      this.chatId = null;
+      this.messageHistory = [];
+    }
 
-          if (data.timestamp > this.lastTimestamp) {
-            this.lastTimestamp = data.timestamp;
-            console.log('[FRONTEND] Received:', data.event, data.payload);
-            this.listeners.forEach(fn => fn(data.event, data.payload));
+    async createNewChat(firstMessage) {
+      const messageId = generateUUID();
+      const response = await fetch(this.apiBase + '/v1/chats/new', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session_id: this.sessionId,
+          message: {
+            id: messageId,
+            author: { role: 'user' },
+            content: { content_type: 'text', parts: [firstMessage.content] },
+            metadata: {},
+            create_time: Date.now() / 1000
           }
-        } catch (e) {
-          // File doesn't exist yet
+        })
+      });
+      if (!response.ok) throw new Error('Failed to create chat: ' + response.statusText);
+      const data = await response.json();
+      return { chatId: data.chat_id, messageId: messageId };
+    }
+
+    async updateChat(messages) {
+      const response = await fetch(this.apiBase + '/v1/chats/' + this.chatId, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session_id: this.sessionId,
+          messages: messages,
+          enable_title_generation: true,
+          enable_tag_generation: true
+        })
+      });
+      if (!response.ok) throw new Error('Failed to update chat: ' + response.statusText);
+      return await response.json();
+    }
+
+    convertMessagesToClipboardFormat(messages) {
+      const clipboardMessages = [];
+      let parentId = null;
+      for (let i = 0; i < messages.length; i++) {
+        const msg = messages[i];
+        let existing = null;
+        for (let j = 0; j < this.messageHistory.length; j++) {
+          const h = this.messageHistory[j];
+          if (h.author.role === msg.role && h.content.parts[0] === msg.content) {
+            existing = h;
+            break;
+          }
+        }
+        if (existing) {
+          parentId = existing.id;
+          continue;
+        }
+        const messageId = generateUUID();
+        const clipboardMsg = {
+          id: messageId,
+          author: { role: msg.role },
+          content: { content_type: 'text', parts: [msg.content] },
+          metadata: {},
+          create_time: Date.now() / 1000
+        };
+        if (parentId) clipboardMsg.metadata.parent_id = parentId;
+        clipboardMessages.push(clipboardMsg);
+        this.messageHistory.push(clipboardMsg);
+        parentId = messageId;
+      }
+      return clipboardMessages;
+    }
+
+    async *streamMessage(messages) {
+      const clipboardMessages = this.convertMessagesToClipboardFormat(messages);
+      if (!this.chatId) {
+        const firstMessage = messages[0];
+        const result = await this.createNewChat(firstMessage);
+        this.chatId = result.chatId;
+      }
+      if (clipboardMessages.length > 0) await this.updateChat(clipboardMessages);
+      let lastUserMessage = null;
+      for (let i = messages.length - 1; i >= 0; i--) {
+        if (messages[i].role === 'user') {
+          lastUserMessage = messages[i];
+          break;
+        }
+      }
+      if (!lastUserMessage) throw new Error('No user message found');
+      const response = await fetch(this.apiBase + '/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: this.model,
+          messages: this.messageHistory,
+          stream: true,
+          session_id: this.sessionId,
+          chat_id: this.chatId,
+          timeout: 30,
+          max_retries: 5
+        })
+      });
+      if (!response.ok) throw new Error('Failed to get completion: ' + response.statusText);
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      while (true) {
+        const result = await reader.read();
+        if (result.done) break;
+        buffer = buffer + decoder.decode(result.value, { stream: true });
+        const lines = buffer.split('\\n');
+        buffer = lines.pop() || '';
+        for (let i = 0; i < lines.length; i++) {
+          const line = lines[i];
+          if (line.indexOf('data: ') === 0) {
+            const data = line.slice(6);
+            if (data === '[DONE]') continue;
+            try {
+              const parsed = JSON.parse(data);
+              const content = parsed.choices && parsed.choices[0] && parsed.choices[0].delta && parsed.choices[0].delta.content;
+              if (content) yield content;
+            } catch (e) {}
+          }
         }
       }
     }
   }
 
-  // Frontend state
-  let state = {
-    messages: [],
-    isLoading: false,
-    streamingContent: '',
-    error: null
-  };
+  // ==========================================================================
+  // State Manager
+  // ==========================================================================
 
-  const app = document.createElement('div');
-  app.id = 'app';
-  document.body.appendChild(app);
+  function createStateManager(options) {
+    const onStateChange = options.onStateChange || function() {};
+    const state = {
+      messages: [],
+      isLoading: false,
+      streamingContent: '',
+      error: null
+    };
 
-  // Render function
+    function notifyStateChange() {
+      onStateChange(Object.assign({}, state));
+    }
+
+    function addMessage(message) {
+      state.messages.push(message);
+      notifyStateChange();
+    }
+
+    function setLoading(isLoading) {
+      state.isLoading = isLoading;
+      notifyStateChange();
+    }
+
+    function setError(error) {
+      state.error = error;
+      notifyStateChange();
+    }
+
+    function clearError() {
+      state.error = null;
+      notifyStateChange();
+    }
+
+    function setStreamingContent(content) {
+      state.streamingContent = content;
+      notifyStateChange();
+    }
+
+    function getState() {
+      return Object.assign({}, state);
+    }
+
+    function getMessagesForAI() {
+      return state.messages.map(function(m) {
+        return { role: m.role, content: m.content };
+      });
+    }
+
+    return {
+      addMessage: addMessage,
+      setLoading: setLoading,
+      setError: setError,
+      clearError: clearError,
+      setStreamingContent: setStreamingContent,
+      getState: getState,
+      getMessagesForAI: getMessagesForAI,
+      notifyStateChange: notifyStateChange
+    };
+  }
+
+  // ==========================================================================
+  // Orchestrator
+  // ==========================================================================
+
+  function createOrchestrator(options) {
+    const stateManager = options.stateManager;
+    const aiCaller = options.aiCaller;
+    const datastore = options.datastore;
+
+    async function handleSendMessage(message) {
+      stateManager.addMessage({ role: 'user', content: message });
+      stateManager.setLoading(true);
+      stateManager.setStreamingContent('');
+      stateManager.clearError();
+
+      try {
+        const messages = stateManager.getMessagesForAI();
+        let assistantMessage = '';
+        const stream = aiCaller.streamMessage(messages);
+
+        while (true) {
+          const result = await stream.next();
+          if (result.done) break;
+          const chunk = result.value;
+          assistantMessage = assistantMessage + chunk;
+          stateManager.setStreamingContent(assistantMessage);
+        }
+
+        stateManager.addMessage({ role: 'assistant', content: assistantMessage });
+        stateManager.setLoading(false);
+        stateManager.setStreamingContent('');
+
+        if (datastore) await saveConversation();
+      } catch (error) {
+        console.error('[ORCHESTRATOR] Error:', error);
+        stateManager.setLoading(false);
+        stateManager.setError(error.message);
+      }
+    }
+
+    async function saveConversation() {
+      if (!datastore) return;
+      try {
+        const state = stateManager.getState();
+        const data = {
+          messages: state.messages,
+          timestamp: Date.now()
+        };
+        await datastore.write('conversation.json', JSON.stringify(data, null, 2));
+      } catch (error) {
+        console.error('[ORCHESTRATOR] Failed to save:', error);
+      }
+    }
+
+    async function loadConversation() {
+      if (!datastore) return;
+      try {
+        const exists = await datastore.exists('conversation.json');
+        if (exists) {
+          const content = await datastore.read('conversation.json');
+          const data = JSON.parse(content);
+          if (data.messages && Array.isArray(data.messages)) {
+            data.messages.forEach(function(msg) {
+              stateManager.addMessage(msg);
+            });
+          }
+        }
+      } catch (error) {
+        console.error('[ORCHESTRATOR] Failed to load:', error);
+      }
+    }
+
+    return {
+      handleSendMessage: handleSendMessage,
+      loadConversation: loadConversation
+    };
+  }
+
+  // ==========================================================================
+  // UI Rendering
+  // ==========================================================================
+
+  let app = null;
+  let stateManager = null;
+  let orchestrator = null;
+
   function render() {
+    if (!app || !stateManager) return;
+    const state = stateManager.getState();
+
     const messagesHtml = state.messages.map(function(msg) {
       const isUser = msg.role === 'user';
       const justify = isUser ? 'flex-end' : 'flex-start';
       const bg = isUser ? 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)' : '#fff';
       const color = isUser ? 'white' : '#333';
       const content = msg.content.replace(/\\n/g, '<br>');
-
       return '<div style="display: flex; justify-content: ' + justify + '; margin-bottom: 12px;">' +
-        '<div style="max-width: 70%; padding: 12px 16px; border-radius: 12px; background: ' + bg + '; color: ' + color + '; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">' +
-        content +
-        '</div>' +
-        '</div>';
+        '<div style="max-width: 70%; padding: 12px 16px; border-radius: 12px; background: ' + bg + '; color: ' + color + '; box-shadow: 0 2px 8px rgba(0,0,0,0.1);">' +
+        content + '</div></div>';
     }).join('');
 
     const streamingHtml = state.streamingContent ?
       '<div style="display: flex; justify-content: flex-start; margin-bottom: 12px;">' +
-        '<div style="max-width: 70%; padding: 12px 16px; border-radius: 12px; background: #fff; color: #333; box-shadow: 0 1px 3px rgba(0,0,0,0.1);">' +
-        state.streamingContent.replace(/\\n/g, '<br>') +
-        '<span style="animation: blink 1s infinite;">▊</span>' +
-        '</div>' +
-        '</div>'
-      : '';
+      '<div style="max-width: 70%; padding: 12px 16px; border-radius: 12px; background: #fff; color: #333; box-shadow: 0 2px 8px rgba(0,0,0,0.1); opacity: 0.7;">' +
+      state.streamingContent.replace(/\\n/g, '<br>') + '</div></div>' : '';
 
     const errorHtml = state.error ?
-      '<div style="padding: 12px; background: #fee; color: #c00; border-radius: 8px; margin-bottom: 12px;">' +
-        'Error: ' + state.error +
-        '</div>'
-      : '';
+      '<div style="background: #fee; color: #c33; padding: 12px; border-radius: 8px; margin-bottom: 12px;">Error: ' + state.error + '</div>' : '';
 
-    app.innerHTML =
-      '<style>' +
-        '@keyframes blink { 0%, 50% { opacity: 1; } 51%, 100% { opacity: 0; } }' +
-        '* { margin: 0; padding: 0; box-sizing: border-box; }' +
-        'body { font-family: -apple-system, sans-serif; height: 100vh; overflow: hidden; }' +
-      '</style>' +
-      '<div style="display: flex; flex-direction: column; height: 100vh;">' +
-        '<header style="color: white; padding: 20px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);">' +
-          '<h1 style="font-size: 24px; font-weight: 600; margin: 0;">Clipboard Chat</h1>' +
-          '<p style="font-size: 14px; margin-top: 4px; opacity: 0.9;">📁 {{CWD}}</p>' +
-          '<p style="font-size: 12px; margin-top: 2px; opacity: 0.8;">📂 Connected to: ' + dirHandle.name + '</p>' +
-        '</header>' +
-        '<div id="messages" style="flex: 1; overflow-y: auto; padding: 20px; background: #f9fafb;">' +
-          messagesHtml +
-          streamingHtml +
-          errorHtml +
-        '</div>' +
-        '<div style="padding: 20px; background: white; border-top: 1px solid #e5e7eb;">' +
-          '<div style="display: flex; gap: 12px;">' +
-            '<input id="messageInput" type="text" placeholder="Type your message..." ' +
-              'style="flex: 1; padding: 12px 16px; border: 1px solid #d1d5db; border-radius: 8px; outline: none;" ' +
-              (state.isLoading ? 'disabled' : '') + ' />' +
-            '<button id="sendButton" ' +
-              'style="padding: 12px 24px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border: none; border-radius: 8px; cursor: pointer;" ' +
-              (state.isLoading ? 'disabled' : '') + '>' +
-              (state.isLoading ? 'Sending...' : 'Send') +
-            '</button>' +
-          '</div>' +
-        '</div>' +
-      '</div>';
+    app.innerHTML = '<style>* { box-sizing: border-box; margin: 0; padding: 0; } body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }</style>' +
+      '<div style="display: flex; flex-direction: column; height: 100vh; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);">' +
+      '<div style="flex: 1; overflow-y: auto; padding: 20px;">' + messagesHtml + streamingHtml + errorHtml + '</div>' +
+      '<div style="padding: 20px; background: white; box-shadow: 0 -2px 10px rgba(0,0,0,0.1);">' +
+      '<div style="display: flex; gap: 12px;">' +
+      '<input id="message-input" type="text" placeholder="Type your message..." ' +
+      'style="flex: 1; padding: 12px 16px; border: 2px solid #e0e0e0; border-radius: 24px; font-size: 14px; outline: none;" ' +
+      (state.isLoading ? 'disabled' : '') + '>' +
+      '<button id="send-button" style="padding: 12px 24px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border: none; border-radius: 24px; font-size: 14px; cursor: pointer; font-weight: 600;" ' +
+      (state.isLoading ? 'disabled' : '') + '>' + (state.isLoading ? 'Sending...' : 'Send') + '</button>' +
+      '</div></div></div>';
 
-    const input = document.getElementById('messageInput');
-    const button = document.getElementById('sendButton');
-    const messagesDiv = document.getElementById('messages');
+    const input = document.getElementById('message-input');
+    const button = document.getElementById('send-button');
 
     if (input && button) {
-      const handleSend = () => {
+      const handleSend = async function() {
         const message = input.value.trim();
         if (message && !state.isLoading) {
-          transport.send('send-message', { message });
-          state.messages.push({ role: 'user', content: message });
-          state.isLoading = true;
-          state.streamingContent = '';
           input.value = '';
-          render();
+          await orchestrator.handleSendMessage(message);
         }
       };
-
       button.onclick = handleSend;
-      input.onkeypress = (e) => {
+      input.onkeypress = function(e) {
         if (e.key === 'Enter') handleSend();
       };
-
       if (!state.isLoading) input.focus();
     }
 
-    if (messagesDiv) {
-      messagesDiv.scrollTop = messagesDiv.scrollHeight;
+    const messagesContainer = app.querySelector('div > div');
+    if (messagesContainer) {
+      messagesContainer.scrollTop = messagesContainer.scrollHeight;
     }
   }
 
-  // Create transport
-  const transport = new FileSystemTransport(dirHandle);
+  // ==========================================================================
+  // Initialization
+  // ==========================================================================
 
-  // Listen for backend messages
-  transport.onReceive((event, data) => {
-    if (event === 'state-update') {
-      state = data;
-      render();
-    }
-    if (event === 'stream-chunk') {
-      state.streamingContent += data;
-      render();
-    }
-    if (event === 'stream-end') {
-      state.messages.push({ role: 'assistant', content: state.streamingContent });
-      state.streamingContent = '';
-      state.isLoading = false;
-      render();
-    }
-    if (event === 'stream-error') {
-      state.error = data;
-      state.isLoading = false;
-      render();
-    }
-  });
+  async function init() {
+    console.log('[CLIPBOARD CHAT] Initializing...');
 
-  // Initial render
-  render();
+    // Remove existing page content
+    document.body.innerHTML = '';
+    document.body.style.margin = '0';
+    document.body.style.padding = '0';
 
-  console.log('✅ Chat UI initialized!');
-  console.log('💬 Type a message to start chatting');
+    // Create app container
+    app = document.createElement('div');
+    app.id = 'clipboard-chat-app';
+    document.body.appendChild(app);
+
+    // Request directory access
+    let directoryHandle;
+    try {
+      directoryHandle = await window.showDirectoryPicker();
+    } catch (err) {
+      app.innerHTML = '<div style="padding: 20px; background: #fee; color: #c33;">Failed to get directory access</div>';
+      return;
+    }
+
+    // Initialize components
+    const datastore = new BrowserFileSystemDatastore({ directoryHandle: directoryHandle });
+    await datastore.init();
+
+    const ai = new BrowserClipboardAI();
+    stateManager = createStateManager({ onStateChange: render });
+    orchestrator = createOrchestrator({
+      stateManager: stateManager,
+      aiCaller: ai,
+      datastore: datastore
+    });
+
+    // Load conversation history
+    await orchestrator.loadConversation();
+
+    // Initial render
+    render();
+
+    console.log('[CLIPBOARD CHAT] Ready!');
+  }
+
+  init();
 })();
-`;
-
-// Main
-async function main() {
-  // Check if running in build mode
-  const buildMode = process.argv.includes('--build');
-  if (buildMode) {
-    console.log('❌ This is already a built file. Run without --build flag.');
-    return;
-  }
-  console.log('🚀 Clipboard Chat Server');
-  console.log('========================\n');
-  console.log(`📁 Working Directory: ${cwd}\n`);
-
-  // Initialize backend
-  const transport = new FileSystemTransport(cwd);
-  const ai = new ClipboardAI();
-  const backend = createBackend(transport, ai);
-  console.log('✅ Backend server running');
-  console.log(`📂 Watching: ${cwd}`);
-  console.log(`📝 Files: frontend-message.json, backend-message.json\n`);
-
-  // Wait for user to press Enter
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout
-  });
-  rl.question('Press Enter to generate UI JavaScript file... ', () => {
-    rl.close();
-
-    // Inject CWD into UI bundle
-    const injectedUI = UI_BUNDLE_TEMPLATE.replace(/{{CWD}}/g, cwd);
-
-    // Save to file
-    const outputFile = path.join(cwd, 'clipboard-ui.js');
-    fs.writeFileSync(outputFile, injectedUI);
-    console.log('\n✅ UI JavaScript generated!');
-    console.log(`📄 File: ${outputFile}`);
-    console.log(`📦 Size: ${(injectedUI.length / 1024).toFixed(1)}KB\n`);
-    console.log('📋 Next steps:');
-    console.log('1. Copy the contents of clipboard-ui.js');
-    console.log('2. Go to your employer\'s AI UI (or any website)');
-    console.log('3. Open browser console (F12)');
-    console.log('4. Paste and press Enter');
-    console.log('5. Grant directory access when prompted');
-    console.log('   (Select this directory: ' + cwd + ')');
-    console.log('6. Start chatting!\n');
-    console.log('💡 The browser and this server communicate via JSON files\n');
-  });
-}
-main().catch(console.error);
