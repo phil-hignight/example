@@ -2,152 +2,245 @@
  * Clipboard Chat - Bundled Browser Version
  * Copy this entire file and paste into browser devtools console
  *
- * Generated: 2025-12-10T17:00:02.578Z
+ * Generated: 2025-12-10T17:08:57.279Z
  */
 
 (() => {
-  // packages/ai/src/browser-clipboard.js
-  function generateUUID() {
-    return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, function(c) {
-      const r = Math.random() * 16 | 0;
-      const v = c === "x" ? r : r & 3 | 8;
-      return v.toString(16);
-    });
-  }
-  function generateSessionId() {
-    return Date.now().toString();
-  }
-  var BrowserClipboardAI = class {
+  // packages/backend/src/ai/clipboard.js
+  var ClipboardAI = class {
+    /**
+     * @param {Object} options - Optional configuration
+     */
     constructor(options = {}) {
       this.apiBase = options.apiBase || "https://chat.niprgpt.mil/api";
       this.model = options.model || "Anthropic Claude 4 Sonnet";
-      this.sessionId = generateSessionId();
+      this.maxTokens = options.maxTokens || 4096;
+      this.timeout = options.timeout || 3e4;
+      this.maxRetries = options.maxRetries || 5;
+      this.sessionId = this.generateSessionId();
       this.chatId = null;
       this.messageHistory = [];
     }
     /**
-     * Create a new chat
+     * Generate unique session ID
+     */
+    generateSessionId() {
+      return `session-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    }
+    /**
+     * Generate UUID for messages
+     */
+    generateUUID() {
+      return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+        const r = Math.random() * 16 | 0;
+        const v = c === "x" ? r : r & 3 | 8;
+        return v.toString(16);
+      });
+    }
+    /**
+     * Get current timestamp
+     */
+    getTimestamp() {
+      return Date.now();
+    }
+    /**
+     * Create new chat with first message
+     * @param {Object} firstMessage - First user message
+     * @returns {Promise<string>} Chat ID
      */
     async createNewChat(firstMessage) {
-      const messageId = generateUUID();
+      const messageId = this.generateUUID();
+      const timestamp = this.getTimestamp();
+      const payload = {
+        chat: {
+          id: "",
+          title: "Chat Pending",
+          models: [this.model],
+          params: {},
+          history: {
+            messages: {
+              [messageId]: {
+                id: messageId,
+                parentId: null,
+                childrenIds: [],
+                role: "user",
+                content: firstMessage.content,
+                timestamp,
+                models: [this.model]
+              }
+            },
+            currentId: messageId
+          },
+          messages: [
+            {
+              id: messageId,
+              parentId: null,
+              childrenIds: [],
+              role: "user",
+              content: firstMessage.content,
+              timestamp,
+              models: [this.model]
+            }
+          ],
+          tags: [],
+          timestamp: Date.now()
+        }
+      };
       const response = await fetch(`${this.apiBase}/v1/chats/new`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json"
         },
-        body: JSON.stringify({
-          session_id: this.sessionId,
-          message: {
-            id: messageId,
-            author: { role: "user" },
-            content: {
-              content_type: "text",
-              parts: [firstMessage.content]
-            },
-            metadata: {},
-            create_time: Date.now() / 1e3
-          }
-        })
+        body: JSON.stringify(payload)
       });
       if (!response.ok) {
-        throw new Error(`Failed to create chat: ${response.statusText}`);
+        throw new Error(`Failed to create chat: ${response.status} ${response.statusText}`);
       }
       const data = await response.json();
-      return {
-        chatId: data.chat_id,
-        messageId
-      };
+      return { chatId: data.id, messageId };
     }
     /**
-     * Update chat with new messages
+     * Update chat with message history
+     * @param {Array} messages - Array of message objects with IDs
      */
     async updateChat(messages) {
+      const historyMessages = {};
+      messages.forEach((msg) => {
+        historyMessages[msg.id] = {
+          id: msg.id,
+          parentId: msg.parentId,
+          childrenIds: msg.childrenIds,
+          content: msg.content,
+          role: msg.role,
+          timestamp: msg.timestamp,
+          ...msg.role === "user" ? { models: [this.model] } : {
+            model: this.model,
+            modelIdx: 0,
+            modelName: this.model,
+            userContext: null
+          }
+        };
+      });
+      const currentId = messages[messages.length - 1].id;
+      const payload = {
+        chat: {
+          models: [this.model],
+          files: [],
+          params: {},
+          history: {
+            messages: historyMessages,
+            currentId
+          },
+          messages: messages.map((msg) => ({
+            id: msg.id,
+            parentId: msg.parentId,
+            childrenIds: msg.childrenIds,
+            content: msg.content,
+            role: msg.role,
+            timestamp: msg.timestamp,
+            ...msg.role === "user" ? { models: [this.model] } : {
+              model: this.model,
+              modelIdx: 0,
+              modelName: this.model,
+              userContext: null
+            }
+          }))
+        }
+      };
       const response = await fetch(`${this.apiBase}/v1/chats/${this.chatId}`, {
-        method: "PATCH",
+        method: "POST",
         headers: {
           "Content-Type": "application/json"
         },
-        body: JSON.stringify({
-          session_id: this.sessionId,
-          messages,
-          enable_title_generation: true,
-          enable_tag_generation: true
-        })
+        body: JSON.stringify(payload)
       });
       if (!response.ok) {
-        throw new Error(`Failed to update chat: ${response.statusText}`);
+        throw new Error(`Failed to update chat: ${response.status} ${response.statusText}`);
       }
       return await response.json();
     }
     /**
-     * Convert simple messages to clipboard format
+     * Convert simple messages to clipboard format with IDs
+     * @param {Array} simpleMessages - Simple [{role, content}] format
+     * @returns {Array} Messages with IDs and relationships
      */
-    convertMessagesToClipboardFormat(messages) {
-      const clipboardMessages = [];
-      let parentId = null;
-      for (const msg of messages) {
-        const existing = this.messageHistory.find(
-          (h) => h.author.role === msg.role && h.content.parts[0] === msg.content
-        );
-        if (existing) {
-          parentId = existing.id;
-          continue;
+    convertMessagesToClipboardFormat(simpleMessages) {
+      const messages = [];
+      let previousId = null;
+      for (let i = 0; i < simpleMessages.length; i++) {
+        const msg = simpleMessages[i];
+        let messageId;
+        if (i < this.messageHistory.length) {
+          messageId = this.messageHistory[i].id;
+        } else {
+          messageId = this.generateUUID();
         }
-        const messageId = generateUUID();
+        let childrenIds = [];
+        if (i < simpleMessages.length - 1) {
+          if (i + 1 < this.messageHistory.length) {
+            childrenIds = [this.messageHistory[i + 1].id];
+          } else {
+            const nextId = this.generateUUID();
+            childrenIds = [nextId];
+          }
+        }
         const clipboardMsg = {
           id: messageId,
-          author: { role: msg.role },
-          content: {
-            content_type: "text",
-            parts: [msg.content]
-          },
-          metadata: {},
-          create_time: Date.now() / 1e3
+          parentId: previousId,
+          childrenIds,
+          role: msg.role,
+          content: msg.content,
+          timestamp: this.getTimestamp()
         };
-        if (parentId) {
-          clipboardMsg.metadata.parent_id = parentId;
-        }
-        clipboardMessages.push(clipboardMsg);
-        this.messageHistory.push(clipboardMsg);
-        parentId = messageId;
+        messages.push(clipboardMsg);
+        previousId = messageId;
       }
-      return clipboardMessages;
+      return messages;
     }
     /**
-     * Stream message from AI
-     * @param {Array} messages - Message history
+     * Stream a message using clipboard API
+     * @param {Array} messages - Array of message objects with role and content
+     * @yields {string} Text chunks as they arrive
      */
     async *streamMessage(messages) {
       const clipboardMessages = this.convertMessagesToClipboardFormat(messages);
+      this.messageHistory = clipboardMessages;
       if (!this.chatId) {
-        const firstMessage = messages[0];
-        const { chatId } = await this.createNewChat(firstMessage);
+        const { chatId } = await this.createNewChat(messages[0]);
         this.chatId = chatId;
       }
-      if (clipboardMessages.length > 0) {
-        await this.updateChat(clipboardMessages);
-      }
-      const lastUserMessage = messages.filter((m) => m.role === "user").pop();
-      if (!lastUserMessage) {
-        throw new Error("No user message found");
-      }
+      await this.updateChat(clipboardMessages);
+      const assistantMessageId = this.generateUUID();
+      const apiMessages = messages.map((msg) => ({
+        role: msg.role,
+        content: msg.content
+      }));
+      const payload = {
+        stream: true,
+        model: this.model,
+        messages: apiMessages,
+        max_tokens: this.maxTokens,
+        params: {},
+        features: {
+          web_search: false
+        },
+        session_id: this.sessionId,
+        chat_id: this.chatId,
+        id: assistantMessageId,
+        background_tasks: {
+          title_generation: true,
+          tags_generation: true
+        }
+      };
       const response = await fetch(`${this.apiBase}/chat/completions`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json"
         },
-        body: JSON.stringify({
-          model: this.model,
-          messages: this.messageHistory,
-          stream: true,
-          session_id: this.sessionId,
-          chat_id: this.chatId,
-          timeout: 30,
-          max_retries: 5
-        })
+        body: JSON.stringify(payload)
       });
       if (!response.ok) {
-        throw new Error(`Failed to get completion: ${response.statusText}`);
+        throw new Error(`Failed to get completion: ${response.status} ${response.statusText}`);
       }
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
@@ -164,15 +257,25 @@
             if (data === "[DONE]") continue;
             try {
               const parsed = JSON.parse(data);
-              const content = parsed.choices?.[0]?.delta?.content;
-              if (content) {
-                yield content;
+              const delta = parsed.choices?.[0]?.delta?.content;
+              if (delta) {
+                yield delta;
               }
             } catch (e) {
             }
           }
         }
       }
+      const assistantMsg = {
+        id: assistantMessageId,
+        parentId: clipboardMessages[clipboardMessages.length - 1].id,
+        childrenIds: [],
+        role: "assistant",
+        content: "",
+        // Will be filled by backend/core/app.js
+        timestamp: this.getTimestamp()
+      };
+      this.messageHistory.push(assistantMsg);
     }
   };
 
@@ -475,7 +578,7 @@
     });
     try {
       if (!clipboardAI) {
-        clipboardAI = new BrowserClipboardAI({
+        clipboardAI = new ClipboardAI({
           apiBase: "https://chat.niprgpt.mil/api",
           model: "Anthropic Claude 4 Sonnet"
         });
