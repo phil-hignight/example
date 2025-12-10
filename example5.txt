@@ -2,7 +2,7 @@
  * Clipboard Chat - Bundled Browser Version
  * Copy this entire file and paste into browser devtools console
  *
- * Generated: 2025-12-10T17:17:07.156Z
+ * Generated: 2025-12-10T17:25:27.524Z
  */
 
 (() => {
@@ -512,7 +512,8 @@
     messages: [],
     isLoading: false,
     streamingContent: "",
-    error: null
+    error: null,
+    datastoreReady: false
   };
   var stateListeners = [];
   function setState(updates) {
@@ -531,10 +532,14 @@
       });
       datastore = new BrowserFileSystemDatastore({ directoryHandle: dirHandle });
       await datastore.init();
+      setState({ datastoreReady: true, error: null });
       await loadConversation();
     } catch (err) {
       console.error("Failed to initialize datastore:", err);
-      setState({ error: "Failed to access directory. Please refresh and try again." });
+      setState({
+        datastoreReady: false,
+        error: "Failed to access directory. Please refresh and try again."
+      });
     }
   }
   async function saveConversation() {
