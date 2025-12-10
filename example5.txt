@@ -235,55 +235,42 @@
           content: firstMessage,
           timestamp: getTimestamp()
         });
-      }
+      } else {
+        // Not the first message - need to add new user messages to history
+        // Find which messages are new
+        for (let i = 0; i < messages.length; i++) {
+          const msg = messages[i];
 
-      // Build the message chain for update
-      const messagesToUpdate = [];
-      let parentId = null;
-
-      for (let i = 0; i < messages.length; i++) {
-        const msg = messages[i];
-
-        // Check if this message is already in history
-        let found = false;
-        for (let j = 0; j < this.messageHistory.length; j++) {
-          const h = this.messageHistory[j];
-          if (h.role === msg.role && h.content === msg.content) {
-            parentId = h.id;
-            found = true;
-            break;
-          }
-        }
-
-        if (!found) {
-          const messageId = generateUUID();
-          const newMsg = {
-            id: messageId,
-            parentId: parentId,
-            childrenIds: [],
-            role: msg.role,
-            content: msg.content,
-            timestamp: getTimestamp()
-          };
-
-          // Update parent's childrenIds
-          if (parentId) {
-            for (let j = 0; j < this.messageHistory.length; j++) {
-              if (this.messageHistory[j].id === parentId) {
-                this.messageHistory[j].childrenIds.push(messageId);
-                break;
-              }
+          // Check if this message is already in history
+          let found = false;
+          for (let j = 0; j < this.messageHistory.length; j++) {
+            const h = this.messageHistory[j];
+            if (h.role === msg.role && h.content === msg.content) {
+              found = true;
+              break;
             }
           }
 
-          this.messageHistory.push(newMsg);
-          messagesToUpdate.push(newMsg);
-          parentId = messageId;
-        }
-      }
+          // Add new message
+          if (!found) {
+            const messageId = generateUUID();
+            const lastMsg = this.messageHistory[this.messageHistory.length - 1];
+            const newMsg = {
+              id: messageId,
+              parentId: lastMsg.id,
+              childrenIds: [],
+              role: msg.role,
+              content: msg.content,
+              timestamp: getTimestamp()
+            };
 
-      // Update the chat with new messages
-      if (messagesToUpdate.length > 0) {
+            // Update parent's childrenIds
+            lastMsg.childrenIds.push(messageId);
+            this.messageHistory.push(newMsg);
+          }
+        }
+
+        // Update chat with full history
         await this.updateChat(this.messageHistory);
       }
 
