@@ -2,7 +2,7 @@
  * Clipboard Chat - Bundled Browser Version
  * Copy this entire file and paste into browser devtools console
  *
- * Generated: 2025-12-10T17:25:27.524Z
+ * Generated: 2025-12-10T17:34:52.695Z
  */
 
 (() => {
@@ -668,6 +668,7 @@
     onStateChange(render);
     render();
     await initDatastore();
+    render();
     console.log("[Clipboard Chat] Ready!");
   }
   if (typeof window !== "undefined") {
