@@ -1,4 +1,13 @@
+/**
+ * Clipboard Chat v3 - Pure Browser Implementation
+ * No backend required - everything runs in browser
+ * Uses File System Access API for .agent/ folder persistence
+ */
 
+// This file generates a single JavaScript bundle that runs entirely in the browser
+// Just paste it into console on any website
+
+const BROWSER_BUNDLE = `
 // ============================================================================
 // Browser-only Clipboard Chat with Datastore
 // ============================================================================
@@ -624,3 +633,7 @@
 
   init();
 })();
+`.trim();
+
+// Export the bundle
+console.log(BROWSER_BUNDLE);
