@@ -2,7 +2,7 @@
  * Clipboard Chat - Bundled Browser Version
  * Copy this entire file and paste into browser devtools console
  *
- * Generated: 2025-12-10T17:34:52.695Z
+ * Generated: 2025-12-10T17:54:58.262Z
  */
 
 (() => {
@@ -441,6 +441,9 @@
   `;
   }
   function renderChatInput(state) {
+    console.log("[renderChatInput] state.isLoading:", state.isLoading, "state.datastoreReady:", state.datastoreReady);
+    const isDisabled = state.isLoading || !state.datastoreReady;
+    console.log("[renderChatInput] isDisabled:", isDisabled);
     return `
     <div style="
       padding: 20px;
@@ -464,7 +467,7 @@
           id="clipboard-chat-input"
           type="text"
           placeholder="Type your message..."
-          ${state.isLoading ? "disabled" : ""}
+          ${isDisabled ? "disabled" : ""}
           style="
             flex: 1;
             padding: 12px 16px;
@@ -472,12 +475,12 @@
             border-radius: 8px;
             font-size: 14px;
             font-family: inherit;
-            ${state.isLoading ? "opacity: 0.5; cursor: not-allowed;" : ""}
+            ${isDisabled ? "opacity: 0.5; cursor: not-allowed;" : ""}
           "
         />
         <button
           id="clipboard-send-btn"
-          ${state.isLoading ? "disabled" : ""}
+          ${isDisabled ? "disabled" : ""}
           style="
             padding: 12px 24px;
             background: #667eea;
@@ -487,7 +490,7 @@
             font-size: 14px;
             font-weight: 600;
             cursor: pointer;
-            ${state.isLoading ? "opacity: 0.5; cursor: not-allowed;" : ""}
+            ${isDisabled ? "opacity: 0.5; cursor: not-allowed;" : ""}
           "
         >
           Send
@@ -517,7 +520,11 @@
   };
   var stateListeners = [];
   function setState(updates) {
+    console.log("[setState] Before:", { ...appState });
+    console.log("[setState] Updates:", updates);
     appState = { ...appState, ...updates };
+    console.log("[setState] After:", { ...appState });
+    console.log("[setState] Calling", stateListeners.length, "listeners");
     stateListeners.forEach((fn) => fn(appState));
   }
   function onStateChange(fn) {
@@ -526,16 +533,23 @@
   var clipboardAI = null;
   var datastore = null;
   async function initDatastore() {
+    console.log("[initDatastore] Starting...");
     try {
+      console.log("[initDatastore] Showing directory picker...");
       const dirHandle = await window.showDirectoryPicker({
         mode: "readwrite"
       });
+      console.log("[initDatastore] Directory selected:", dirHandle.name);
       datastore = new BrowserFileSystemDatastore({ directoryHandle: dirHandle });
       await datastore.init();
+      console.log("[initDatastore] Datastore initialized");
+      console.log("[initDatastore] Calling setState with datastoreReady: true");
       setState({ datastoreReady: true, error: null });
+      console.log("[initDatastore] Loading conversation...");
       await loadConversation();
+      console.log("[initDatastore] Complete!");
     } catch (err) {
-      console.error("Failed to initialize datastore:", err);
+      console.error("[initDatastore] Failed:", err);
       setState({
         datastoreReady: false,
         error: "Failed to access directory. Please refresh and try again."
@@ -618,6 +632,7 @@
     let previousMessageCount = 0;
     let previousIsLoading = false;
     function render() {
+      console.log("[render] Called with state:", { ...appState });
       const currentState = appState;
       const messageJustStarted = !previousIsLoading && currentState.isLoading;
       const messageCountChanged = currentState.messages.length !== previousMessageCount;
