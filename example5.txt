@@ -2,10 +2,1494 @@
  * Clipboard Chat - Bundled Browser Version
  * Copy this entire file and paste into browser devtools console
  *
- * Generated: 2025-12-11T03:36:16.938Z
+ * Generated: 2025-12-11T05:44:09.815Z
  */
 
 (() => {
+  // packages/frontend/src/state.js
+  var state = {
+    messages: [],
+    // Array of message objects: { role: 'user' | 'assistant' | 'tool' | 'tool-result', content, ... }
+    isLoading: false,
+    error: null,
+    streamingContent: "",
+    // Current streaming message content
+    workspaceFolder: null
+    // Selected workspace folder path
+  };
+  var renderFn = null;
+  function getState() {
+    return state;
+  }
+  function setState(newState) {
+    state = { ...state, ...newState };
+    if (renderFn) {
+      renderFn();
+    }
+  }
+  function onStateChange(fn) {
+    renderFn = fn;
+  }
+
+  // packages/frontend/src/handlers.js
+  var handlerRegistry = /* @__PURE__ */ new Map();
+  var handlerId = 0;
+  function handler(fn) {
+    const id = `handler_${handlerId++}`;
+    handlerRegistry.set(id, fn);
+    return `window.__callHandler('${id}', event)`;
+  }
+  function callHandler(id, event) {
+    const fn = handlerRegistry.get(id);
+    if (fn) {
+      fn(event);
+    } else {
+      console.warn(`Handler ${id} not found in registry`);
+    }
+  }
+  function initHandlers() {
+    window.__callHandler = callHandler;
+  }
+
+  // packages/frontend/src/components/ChatMessages.js
+  function renderMessage(message) {
+    if (message.role === "tool") {
+      return `
+      <div style="display: flex; justify-content: flex-start; margin-bottom: 16px;">
+        <div style="
+          max-width: 70%;
+          padding: 12px 16px;
+          border-radius: 12px;
+          background: #fef3c7;
+          color: #92400e;
+          word-wrap: break-word;
+          border-left: 4px solid #f59e0b;
+        ">
+          <div style="font-size: 12px; opacity: 0.8; margin-bottom: 4px; font-weight: 600;">
+            \u{1F527} Tool: ${escapeHtml(message.name)}
+          </div>
+          <div style="font-size: 13px; font-family: 'Courier New', monospace; white-space: pre-wrap;">${escapeHtml(JSON.stringify(message.input, null, 2))}</div>
+        </div>
+      </div>
+    `;
+    }
+    if (message.role === "tool-result") {
+      const success = message.success !== false;
+      const bgColor2 = success ? "#d1fae5" : "#fee2e2";
+      const textColor2 = success ? "#065f46" : "#991b1b";
+      const borderColor = success ? "#10b981" : "#ef4444";
+      const icon = success ? "\u2713" : "\u2717";
+      return `
+      <div style="display: flex; justify-content: flex-start; margin-bottom: 16px;">
+        <div style="
+          max-width: 70%;
+          padding: 12px 16px;
+          border-radius: 12px;
+          background: ${bgColor2};
+          color: ${textColor2};
+          word-wrap: break-word;
+          border-left: 4px solid ${borderColor};
+        ">
+          <div style="font-size: 12px; opacity: 0.8; margin-bottom: 4px; font-weight: 600;">
+            ${icon} Result: ${escapeHtml(message.name)}
+          </div>
+          <div style="font-size: 13px; font-family: 'Courier New', monospace; white-space: pre-wrap; max-height: 200px; overflow-y: auto;">${escapeHtml(typeof message.result === "string" ? message.result : JSON.stringify(message.result, null, 2))}</div>
+        </div>
+      </div>
+    `;
+    }
+    const isUser = message.role === "user";
+    const bgColor = isUser ? "#667eea" : "#f3f4f6";
+    const textColor = isUser ? "white" : "#1f2937";
+    const align = isUser ? "flex-end" : "flex-start";
+    return `
+    <div style="display: flex; justify-content: ${align}; margin-bottom: 16px;">
+      <div style="
+        max-width: 70%;
+        padding: 12px 16px;
+        border-radius: 12px;
+        background: ${bgColor};
+        color: ${textColor};
+        word-wrap: break-word;
+      ">
+        <div style="font-size: 12px; opacity: 0.7; margin-bottom: 4px;">
+          ${isUser ? "You" : "Assistant"}
+        </div>
+        <div style="white-space: pre-wrap;">${escapeHtml(message.content)}</div>
+      </div>
+    </div>
+  `;
+  }
+  function escapeHtml(text) {
+    const div = document.createElement("div");
+    div.textContent = text;
+    return div.innerHTML;
+  }
+  function render(state2) {
+    const messagesHtml = state2.messages.map((msg) => renderMessage(msg)).join("");
+    return `
+    <div style="
+      flex: 1;
+      overflow-y: auto;
+      padding: 20px;
+      background: white;
+    ">
+      ${messagesHtml}
+      ${state2.isLoading && state2.streamingContent ? `
+        <div style="display: flex; justify-content: flex-start; margin-bottom: 16px;">
+          <div style="
+            max-width: 70%;
+            padding: 12px 16px;
+            border-radius: 12px;
+            background: #f3f4f6;
+            color: #1f2937;
+            word-wrap: break-word;
+          ">
+            <div style="font-size: 12px; opacity: 0.7; margin-bottom: 4px;">Assistant</div>
+            <div style="white-space: pre-wrap;">${escapeHtml(state2.streamingContent)}<span style="animation: blink 1s infinite;">\u258A</span></div>
+          </div>
+        </div>
+      ` : state2.isLoading ? `
+        <div style="display: flex; justify-content: flex-start; margin-bottom: 16px;">
+          <div style="
+            padding: 12px 16px;
+            border-radius: 12px;
+            background: #f3f4f6;
+            color: #1f2937;
+          ">
+            <div style="font-size: 12px; opacity: 0.7; margin-bottom: 4px;">Assistant</div>
+            <div>Thinking...</div>
+          </div>
+        </div>
+      ` : ""}
+      ${state2.messages.length === 0 && !state2.isLoading ? `
+        <div style="
+          text-align: center;
+          color: #9ca3af;
+          padding: 40px 20px;
+        ">
+          <p style="font-size: 18px; margin-bottom: 8px;">Welcome to AI Chat</p>
+          <p>Send a message to start the conversation</p>
+        </div>
+      ` : ""}
+      <style>
+        @keyframes blink {
+          0%, 50% { opacity: 1; }
+          51%, 100% { opacity: 0; }
+        }
+      </style>
+    </div>
+  `;
+  }
+
+  // packages/frontend/src/components/ChatInput.js
+  function render2(state2) {
+    return `
+    <div style="
+      padding: 20px;
+      background: white;
+      border-top: 1px solid #e5e7eb;
+    ">
+      ${state2.error ? `
+        <div style="
+          background: #fee2e2;
+          color: #991b1b;
+          padding: 12px;
+          border-radius: 8px;
+          margin-bottom: 12px;
+          font-size: 14px;
+        ">
+          ${state2.error}
+        </div>
+      ` : ""}
+      <div style="display: flex; gap: 12px;">
+        <input
+          id="chat-input"
+          type="text"
+          placeholder="Type your message..."
+          ${state2.isLoading ? "disabled" : ""}
+          onkeydown="${handler((e) => {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        const input = document.getElementById("chat-input");
+        if (input && input.value.trim()) {
+          handleSendMessage(input.value.trim());
+          input.value = "";
+        }
+      }
+    })}"
+          style="
+            flex: 1;
+            padding: 12px 16px;
+            border: 1px solid #d1d5db;
+            border-radius: 8px;
+            font-size: 14px;
+            font-family: inherit;
+            ${state2.isLoading ? "opacity: 0.5; cursor: not-allowed;" : ""}
+          "
+        />
+        <button
+          onclick="${handler(() => {
+      const input = document.getElementById("chat-input");
+      if (input && input.value.trim()) {
+        handleSendMessage(input.value.trim());
+        input.value = "";
+      }
+    })}"
+          ${state2.isLoading ? "disabled" : ""}
+          style="
+            padding: 12px 24px;
+            background: #667eea;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            ${state2.isLoading ? "opacity: 0.5; cursor: not-allowed;" : ""}
+          "
+        >
+          Send
+        </button>
+      </div>
+    </div>
+  `;
+  }
+  function handleSendMessage(content) {
+    const transport2 = getTransport();
+    if (!transport2) {
+      console.error("Transport not initialized");
+      return;
+    }
+    transport2.send("send-message", { message: content });
+  }
+
+  // packages/frontend/src/components/FolderSelect.js
+  function render3(state2) {
+    return `
+    <div style="
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+      padding: 40px;
+      text-align: center;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+    ">
+      <h1 style="font-size: 48px; margin-bottom: 16px; font-weight: 600;">
+        AI Coding Assistant
+      </h1>
+      <p style="font-size: 18px; margin-bottom: 40px; max-width: 500px; opacity: 0.9;">
+        Select a folder to get started. Your AI assistant will have access to read and explore files in this directory.
+      </p>
+      <button
+        onclick="window.selectFolder()"
+        style="
+          background: white;
+          color: #667eea;
+          border: none;
+          padding: 16px 32px;
+          font-size: 16px;
+          font-weight: 600;
+          border-radius: 8px;
+          cursor: pointer;
+          box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+          transition: transform 0.2s;
+        "
+        onmouseover="this.style.transform='scale(1.05)'"
+        onmouseout="this.style.transform='scale(1)'"
+      >
+        Select Folder
+      </button>
+      ${state2.error ? `
+        <div style="
+          margin-top: 24px;
+          padding: 16px;
+          background: rgba(255, 0, 0, 0.2);
+          border-radius: 8px;
+          max-width: 500px;
+        ">
+          ${state2.error}
+        </div>
+      ` : ""}
+    </div>
+  `;
+  }
+
+  // packages/frontend/src/styles.js
+  function cx(...classes) {
+    return classes.filter(Boolean).map((cls) => styleMap[cls] || "").filter(Boolean).join(" ");
+  }
+  var flex = "display: flex;";
+  var flexCol = "display: flex; flex-direction: column;";
+  var flex1 = "flex: 1;";
+  var itemsCenter = "align-items: center;";
+  var justifyCenter = "justify-content: center;";
+  var justifyStart = "justify-content: flex-start;";
+  var justifyEnd = "justify-content: flex-end;";
+  var p0 = "padding: 0;";
+  var p2 = "padding: 8px;";
+  var p3 = "padding: 12px;";
+  var p4 = "padding: 16px;";
+  var p5 = "padding: 20px;";
+  var p10 = "padding: 40px;";
+  var px4 = "padding-left: 16px; padding-right: 16px;";
+  var py3 = "padding-top: 12px; padding-bottom: 12px;";
+  var m0 = "margin: 0;";
+  var mb2 = "margin-bottom: 8px;";
+  var mb4 = "margin-bottom: 16px;";
+  var gap2 = "gap: 8px;";
+  var gap3 = "gap: 12px;";
+  var w_full = "width: 100%;";
+  var h_full = "height: 100%;";
+  var h_screen = "height: 100vh;";
+  var maxW_70 = "max-width: 70%;";
+  var bg_white = "background: white;";
+  var bg_gray_50 = "background: #f9fafb;";
+  var bg_gray_100 = "background: #f3f4f6;";
+  var bg_blue_500 = "background: #3b82f6;";
+  var bg_blue_600 = "background: #2563eb;";
+  var text_white = "color: white;";
+  var text_gray_700 = "color: #374151;";
+  var text_gray_900 = "color: #111827;";
+  var text_gray_400 = "color: #9ca3af;";
+  var text_xs = "font-size: 12px;";
+  var text_sm = "font-size: 14px;";
+  var text_base = "font-size: 16px;";
+  var text_lg = "font-size: 18px;";
+  var text_center = "text-align: center;";
+  var font_medium = "font-weight: 500;";
+  var whitespace_pre_wrap = "white-space: pre-wrap;";
+  var rounded = "border-radius: 4px;";
+  var rounded_lg = "border-radius: 12px;";
+  var rounded_xl = "border-radius: 16px;";
+  var border = "border: 1px solid #e5e7eb;";
+  var border_none = "border: none;";
+  var shadow_sm = "box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05);";
+  var opacity_70 = "opacity: 0.7;";
+  var cursor_pointer = "cursor: pointer;";
+  var overflow_auto = "overflow: auto;";
+  var overflow_y_auto = "overflow-y: auto;";
+  var outline_none = "outline: none;";
+  var resize_none = "resize: none;";
+  var word_wrap = "word-wrap: break-word;";
+  var styleMap = {
+    // Layout
+    flex,
+    "flex-col": flexCol,
+    "flex-1": flex1,
+    "items-center": itemsCenter,
+    "justify-center": justifyCenter,
+    "justify-start": justifyStart,
+    "justify-end": justifyEnd,
+    // Spacing
+    "p-0": p0,
+    "p-2": p2,
+    "p-3": p3,
+    "p-4": p4,
+    "p-5": p5,
+    "p-10": p10,
+    "px-4": px4,
+    "py-3": py3,
+    "m-0": m0,
+    "mb-2": mb2,
+    "mb-4": mb4,
+    "gap-2": gap2,
+    "gap-3": gap3,
+    // Sizing
+    "w-full": w_full,
+    "h-full": h_full,
+    "h-screen": h_screen,
+    "max-w-70": maxW_70,
+    // Colors
+    "bg-white": bg_white,
+    "bg-gray-50": bg_gray_50,
+    "bg-gray-100": bg_gray_100,
+    "bg-blue-500": bg_blue_500,
+    "bg-blue-600": bg_blue_600,
+    "text-white": text_white,
+    "text-gray-700": text_gray_700,
+    "text-gray-900": text_gray_900,
+    "text-gray-400": text_gray_400,
+    // Typography
+    "text-xs": text_xs,
+    "text-sm": text_sm,
+    "text-base": text_base,
+    "text-lg": text_lg,
+    "text-center": text_center,
+    "font-medium": font_medium,
+    "whitespace-pre-wrap": whitespace_pre_wrap,
+    // Borders
+    rounded,
+    "rounded-lg": rounded_lg,
+    "rounded-xl": rounded_xl,
+    border,
+    "border-none": border_none,
+    // Effects
+    "shadow-sm": shadow_sm,
+    "opacity-70": opacity_70,
+    "cursor-pointer": cursor_pointer,
+    // Overflow
+    "overflow-auto": overflow_auto,
+    "overflow-y-auto": overflow_y_auto,
+    // Misc
+    "outline-none": outline_none,
+    "resize-none": resize_none,
+    "word-wrap": word_wrap
+  };
+
+  // packages/frontend/src/components/App.js
+  function render4(state2) {
+    if (!state2.workspaceFolder) {
+      return render3(state2);
+    }
+    return `
+    <div style="${cx("flex", "flex-col", "h-screen", "bg-gray-50")} font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;">
+      <header style="${cx("text-white", "p-5")} background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); box-shadow: 0 2px 8px rgba(0,0,0,0.1);">
+        <h1 style="${cx("m-0")} font-size: 24px; font-weight: 600;">AI Coding Assistant</h1>
+        <p style="${cx("text-sm", "m-0")} margin-top: 4px; opacity: 0.9;">Workspace: ${state2.workspaceFolder}</p>
+      </header>
+      ${render(state2)}
+      ${render2(state2)}
+    </div>
+  `;
+  }
+
+  // node_modules/morphdom/dist/morphdom-esm.js
+  var DOCUMENT_FRAGMENT_NODE = 11;
+  function morphAttrs(fromNode, toNode) {
+    var toNodeAttrs = toNode.attributes;
+    var attr;
+    var attrName;
+    var attrNamespaceURI;
+    var attrValue;
+    var fromValue;
+    if (toNode.nodeType === DOCUMENT_FRAGMENT_NODE || fromNode.nodeType === DOCUMENT_FRAGMENT_NODE) {
+      return;
+    }
+    for (var i = toNodeAttrs.length - 1; i >= 0; i--) {
+      attr = toNodeAttrs[i];
+      attrName = attr.name;
+      attrNamespaceURI = attr.namespaceURI;
+      attrValue = attr.value;
+      if (attrNamespaceURI) {
+        attrName = attr.localName || attrName;
+        fromValue = fromNode.getAttributeNS(attrNamespaceURI, attrName);
+        if (fromValue !== attrValue) {
+          if (attr.prefix === "xmlns") {
+            attrName = attr.name;
+          }
+          fromNode.setAttributeNS(attrNamespaceURI, attrName, attrValue);
+        }
+      } else {
+        fromValue = fromNode.getAttribute(attrName);
+        if (fromValue !== attrValue) {
+          fromNode.setAttribute(attrName, attrValue);
+        }
+      }
+    }
+    var fromNodeAttrs = fromNode.attributes;
+    for (var d = fromNodeAttrs.length - 1; d >= 0; d--) {
+      attr = fromNodeAttrs[d];
+      attrName = attr.name;
+      attrNamespaceURI = attr.namespaceURI;
+      if (attrNamespaceURI) {
+        attrName = attr.localName || attrName;
+        if (!toNode.hasAttributeNS(attrNamespaceURI, attrName)) {
+          fromNode.removeAttributeNS(attrNamespaceURI, attrName);
+        }
+      } else {
+        if (!toNode.hasAttribute(attrName)) {
+          fromNode.removeAttribute(attrName);
+        }
+      }
+    }
+  }
+  var range;
+  var NS_XHTML = "http://www.w3.org/1999/xhtml";
+  var doc = typeof document === "undefined" ? void 0 : document;
+  var HAS_TEMPLATE_SUPPORT = !!doc && "content" in doc.createElement("template");
+  var HAS_RANGE_SUPPORT = !!doc && doc.createRange && "createContextualFragment" in doc.createRange();
+  function createFragmentFromTemplate(str) {
+    var template = doc.createElement("template");
+    template.innerHTML = str;
+    return template.content.childNodes[0];
+  }
+  function createFragmentFromRange(str) {
+    if (!range) {
+      range = doc.createRange();
+      range.selectNode(doc.body);
+    }
+    var fragment = range.createContextualFragment(str);
+    return fragment.childNodes[0];
+  }
+  function createFragmentFromWrap(str) {
+    var fragment = doc.createElement("body");
+    fragment.innerHTML = str;
+    return fragment.childNodes[0];
+  }
+  function toElement(str) {
+    str = str.trim();
+    if (HAS_TEMPLATE_SUPPORT) {
+      return createFragmentFromTemplate(str);
+    } else if (HAS_RANGE_SUPPORT) {
+      return createFragmentFromRange(str);
+    }
+    return createFragmentFromWrap(str);
+  }
+  function compareNodeNames(fromEl, toEl) {
+    var fromNodeName = fromEl.nodeName;
+    var toNodeName = toEl.nodeName;
+    var fromCodeStart, toCodeStart;
+    if (fromNodeName === toNodeName) {
+      return true;
+    }
+    fromCodeStart = fromNodeName.charCodeAt(0);
+    toCodeStart = toNodeName.charCodeAt(0);
+    if (fromCodeStart <= 90 && toCodeStart >= 97) {
+      return fromNodeName === toNodeName.toUpperCase();
+    } else if (toCodeStart <= 90 && fromCodeStart >= 97) {
+      return toNodeName === fromNodeName.toUpperCase();
+    } else {
+      return false;
+    }
+  }
+  function createElementNS(name, namespaceURI) {
+    return !namespaceURI || namespaceURI === NS_XHTML ? doc.createElement(name) : doc.createElementNS(namespaceURI, name);
+  }
+  function moveChildren(fromEl, toEl) {
+    var curChild = fromEl.firstChild;
+    while (curChild) {
+      var nextChild = curChild.nextSibling;
+      toEl.appendChild(curChild);
+      curChild = nextChild;
+    }
+    return toEl;
+  }
+  function syncBooleanAttrProp(fromEl, toEl, name) {
+    if (fromEl[name] !== toEl[name]) {
+      fromEl[name] = toEl[name];
+      if (fromEl[name]) {
+        fromEl.setAttribute(name, "");
+      } else {
+        fromEl.removeAttribute(name);
+      }
+    }
+  }
+  var specialElHandlers = {
+    OPTION: function(fromEl, toEl) {
+      var parentNode = fromEl.parentNode;
+      if (parentNode) {
+        var parentName = parentNode.nodeName.toUpperCase();
+        if (parentName === "OPTGROUP") {
+          parentNode = parentNode.parentNode;
+          parentName = parentNode && parentNode.nodeName.toUpperCase();
+        }
+        if (parentName === "SELECT" && !parentNode.hasAttribute("multiple")) {
+          if (fromEl.hasAttribute("selected") && !toEl.selected) {
+            fromEl.setAttribute("selected", "selected");
+            fromEl.removeAttribute("selected");
+          }
+          parentNode.selectedIndex = -1;
+        }
+      }
+      syncBooleanAttrProp(fromEl, toEl, "selected");
+    },
+    /**
+     * The "value" attribute is special for the <input> element since it sets
+     * the initial value. Changing the "value" attribute without changing the
+     * "value" property will have no effect since it is only used to the set the
+     * initial value.  Similar for the "checked" attribute, and "disabled".
+     */
+    INPUT: function(fromEl, toEl) {
+      syncBooleanAttrProp(fromEl, toEl, "checked");
+      syncBooleanAttrProp(fromEl, toEl, "disabled");
+      if (fromEl.value !== toEl.value) {
+        fromEl.value = toEl.value;
+      }
+      if (!toEl.hasAttribute("value")) {
+        fromEl.removeAttribute("value");
+      }
+    },
+    TEXTAREA: function(fromEl, toEl) {
+      var newValue = toEl.value;
+      if (fromEl.value !== newValue) {
+        fromEl.value = newValue;
+      }
+      var firstChild = fromEl.firstChild;
+      if (firstChild) {
+        var oldValue = firstChild.nodeValue;
+        if (oldValue == newValue || !newValue && oldValue == fromEl.placeholder) {
+          return;
+        }
+        firstChild.nodeValue = newValue;
+      }
+    },
+    SELECT: function(fromEl, toEl) {
+      if (!toEl.hasAttribute("multiple")) {
+        var selectedIndex = -1;
+        var i = 0;
+        var curChild = fromEl.firstChild;
+        var optgroup;
+        var nodeName;
+        while (curChild) {
+          nodeName = curChild.nodeName && curChild.nodeName.toUpperCase();
+          if (nodeName === "OPTGROUP") {
+            optgroup = curChild;
+            curChild = optgroup.firstChild;
+            if (!curChild) {
+              curChild = optgroup.nextSibling;
+              optgroup = null;
+            }
+          } else {
+            if (nodeName === "OPTION") {
+              if (curChild.hasAttribute("selected")) {
+                selectedIndex = i;
+                break;
+              }
+              i++;
+            }
+            curChild = curChild.nextSibling;
+            if (!curChild && optgroup) {
+              curChild = optgroup.nextSibling;
+              optgroup = null;
+            }
+          }
+        }
+        fromEl.selectedIndex = selectedIndex;
+      }
+    }
+  };
+  var ELEMENT_NODE = 1;
+  var DOCUMENT_FRAGMENT_NODE$1 = 11;
+  var TEXT_NODE = 3;
+  var COMMENT_NODE = 8;
+  function noop() {
+  }
+  function defaultGetNodeKey(node) {
+    if (node) {
+      return node.getAttribute && node.getAttribute("id") || node.id;
+    }
+  }
+  function morphdomFactory(morphAttrs2) {
+    return function morphdom2(fromNode, toNode, options) {
+      if (!options) {
+        options = {};
+      }
+      if (typeof toNode === "string") {
+        if (fromNode.nodeName === "#document" || fromNode.nodeName === "HTML" || fromNode.nodeName === "BODY") {
+          var toNodeHtml = toNode;
+          toNode = doc.createElement("html");
+          toNode.innerHTML = toNodeHtml;
+        } else {
+          toNode = toElement(toNode);
+        }
+      } else if (toNode.nodeType === DOCUMENT_FRAGMENT_NODE$1) {
+        toNode = toNode.firstElementChild;
+      }
+      var getNodeKey = options.getNodeKey || defaultGetNodeKey;
+      var onBeforeNodeAdded = options.onBeforeNodeAdded || noop;
+      var onNodeAdded = options.onNodeAdded || noop;
+      var onBeforeElUpdated = options.onBeforeElUpdated || noop;
+      var onElUpdated = options.onElUpdated || noop;
+      var onBeforeNodeDiscarded = options.onBeforeNodeDiscarded || noop;
+      var onNodeDiscarded = options.onNodeDiscarded || noop;
+      var onBeforeElChildrenUpdated = options.onBeforeElChildrenUpdated || noop;
+      var skipFromChildren = options.skipFromChildren || noop;
+      var addChild = options.addChild || function(parent, child) {
+        return parent.appendChild(child);
+      };
+      var childrenOnly = options.childrenOnly === true;
+      var fromNodesLookup = /* @__PURE__ */ Object.create(null);
+      var keyedRemovalList = [];
+      function addKeyedRemoval(key) {
+        keyedRemovalList.push(key);
+      }
+      function walkDiscardedChildNodes(node, skipKeyedNodes) {
+        if (node.nodeType === ELEMENT_NODE) {
+          var curChild = node.firstChild;
+          while (curChild) {
+            var key = void 0;
+            if (skipKeyedNodes && (key = getNodeKey(curChild))) {
+              addKeyedRemoval(key);
+            } else {
+              onNodeDiscarded(curChild);
+              if (curChild.firstChild) {
+                walkDiscardedChildNodes(curChild, skipKeyedNodes);
+              }
+            }
+            curChild = curChild.nextSibling;
+          }
+        }
+      }
+      function removeNode(node, parentNode, skipKeyedNodes) {
+        if (onBeforeNodeDiscarded(node) === false) {
+          return;
+        }
+        if (parentNode) {
+          parentNode.removeChild(node);
+        }
+        onNodeDiscarded(node);
+        walkDiscardedChildNodes(node, skipKeyedNodes);
+      }
+      function indexTree(node) {
+        if (node.nodeType === ELEMENT_NODE || node.nodeType === DOCUMENT_FRAGMENT_NODE$1) {
+          var curChild = node.firstChild;
+          while (curChild) {
+            var key = getNodeKey(curChild);
+            if (key) {
+              fromNodesLookup[key] = curChild;
+            }
+            indexTree(curChild);
+            curChild = curChild.nextSibling;
+          }
+        }
+      }
+      indexTree(fromNode);
+      function handleNodeAdded(el) {
+        onNodeAdded(el);
+        var curChild = el.firstChild;
+        while (curChild) {
+          var nextSibling = curChild.nextSibling;
+          var key = getNodeKey(curChild);
+          if (key) {
+            var unmatchedFromEl = fromNodesLookup[key];
+            if (unmatchedFromEl && compareNodeNames(curChild, unmatchedFromEl)) {
+              curChild.parentNode.replaceChild(unmatchedFromEl, curChild);
+              morphEl(unmatchedFromEl, curChild);
+            } else {
+              handleNodeAdded(curChild);
+            }
+          } else {
+            handleNodeAdded(curChild);
+          }
+          curChild = nextSibling;
+        }
+      }
+      function cleanupFromEl(fromEl, curFromNodeChild, curFromNodeKey) {
+        while (curFromNodeChild) {
+          var fromNextSibling = curFromNodeChild.nextSibling;
+          if (curFromNodeKey = getNodeKey(curFromNodeChild)) {
+            addKeyedRemoval(curFromNodeKey);
+          } else {
+            removeNode(
+              curFromNodeChild,
+              fromEl,
+              true
+              /* skip keyed nodes */
+            );
+          }
+          curFromNodeChild = fromNextSibling;
+        }
+      }
+      function morphEl(fromEl, toEl, childrenOnly2) {
+        var toElKey = getNodeKey(toEl);
+        if (toElKey) {
+          delete fromNodesLookup[toElKey];
+        }
+        if (!childrenOnly2) {
+          var beforeUpdateResult = onBeforeElUpdated(fromEl, toEl);
+          if (beforeUpdateResult === false) {
+            return;
+          } else if (beforeUpdateResult instanceof HTMLElement) {
+            fromEl = beforeUpdateResult;
+            indexTree(fromEl);
+          }
+          morphAttrs2(fromEl, toEl);
+          onElUpdated(fromEl);
+          if (onBeforeElChildrenUpdated(fromEl, toEl) === false) {
+            return;
+          }
+        }
+        if (fromEl.nodeName !== "TEXTAREA") {
+          morphChildren(fromEl, toEl);
+        } else {
+          specialElHandlers.TEXTAREA(fromEl, toEl);
+        }
+      }
+      function morphChildren(fromEl, toEl) {
+        var skipFrom = skipFromChildren(fromEl, toEl);
+        var curToNodeChild = toEl.firstChild;
+        var curFromNodeChild = fromEl.firstChild;
+        var curToNodeKey;
+        var curFromNodeKey;
+        var fromNextSibling;
+        var toNextSibling;
+        var matchingFromEl;
+        outer: while (curToNodeChild) {
+          toNextSibling = curToNodeChild.nextSibling;
+          curToNodeKey = getNodeKey(curToNodeChild);
+          while (!skipFrom && curFromNodeChild) {
+            fromNextSibling = curFromNodeChild.nextSibling;
+            if (curToNodeChild.isSameNode && curToNodeChild.isSameNode(curFromNodeChild)) {
+              curToNodeChild = toNextSibling;
+              curFromNodeChild = fromNextSibling;
+              continue outer;
+            }
+            curFromNodeKey = getNodeKey(curFromNodeChild);
+            var curFromNodeType = curFromNodeChild.nodeType;
+            var isCompatible = void 0;
+            if (curFromNodeType === curToNodeChild.nodeType) {
+              if (curFromNodeType === ELEMENT_NODE) {
+                if (curToNodeKey) {
+                  if (curToNodeKey !== curFromNodeKey) {
+                    if (matchingFromEl = fromNodesLookup[curToNodeKey]) {
+                      if (fromNextSibling === matchingFromEl) {
+                        isCompatible = false;
+                      } else {
+                        fromEl.insertBefore(matchingFromEl, curFromNodeChild);
+                        if (curFromNodeKey) {
+                          addKeyedRemoval(curFromNodeKey);
+                        } else {
+                          removeNode(
+                            curFromNodeChild,
+                            fromEl,
+                            true
+                            /* skip keyed nodes */
+                          );
+                        }
+                        curFromNodeChild = matchingFromEl;
+                        curFromNodeKey = getNodeKey(curFromNodeChild);
+                      }
+                    } else {
+                      isCompatible = false;
+                    }
+                  }
+                } else if (curFromNodeKey) {
+                  isCompatible = false;
+                }
+                isCompatible = isCompatible !== false && compareNodeNames(curFromNodeChild, curToNodeChild);
+                if (isCompatible) {
+                  morphEl(curFromNodeChild, curToNodeChild);
+                }
+              } else if (curFromNodeType === TEXT_NODE || curFromNodeType == COMMENT_NODE) {
+                isCompatible = true;
+                if (curFromNodeChild.nodeValue !== curToNodeChild.nodeValue) {
+                  curFromNodeChild.nodeValue = curToNodeChild.nodeValue;
+                }
+              }
+            }
+            if (isCompatible) {
+              curToNodeChild = toNextSibling;
+              curFromNodeChild = fromNextSibling;
+              continue outer;
+            }
+            if (curFromNodeKey) {
+              addKeyedRemoval(curFromNodeKey);
+            } else {
+              removeNode(
+                curFromNodeChild,
+                fromEl,
+                true
+                /* skip keyed nodes */
+              );
+            }
+            curFromNodeChild = fromNextSibling;
+          }
+          if (curToNodeKey && (matchingFromEl = fromNodesLookup[curToNodeKey]) && compareNodeNames(matchingFromEl, curToNodeChild)) {
+            if (!skipFrom) {
+              addChild(fromEl, matchingFromEl);
+            }
+            morphEl(matchingFromEl, curToNodeChild);
+          } else {
+            var onBeforeNodeAddedResult = onBeforeNodeAdded(curToNodeChild);
+            if (onBeforeNodeAddedResult !== false) {
+              if (onBeforeNodeAddedResult) {
+                curToNodeChild = onBeforeNodeAddedResult;
+              }
+              if (curToNodeChild.actualize) {
+                curToNodeChild = curToNodeChild.actualize(fromEl.ownerDocument || doc);
+              }
+              addChild(fromEl, curToNodeChild);
+              handleNodeAdded(curToNodeChild);
+            }
+          }
+          curToNodeChild = toNextSibling;
+          curFromNodeChild = fromNextSibling;
+        }
+        cleanupFromEl(fromEl, curFromNodeChild, curFromNodeKey);
+        var specialElHandler = specialElHandlers[fromEl.nodeName];
+        if (specialElHandler) {
+          specialElHandler(fromEl, toEl);
+        }
+      }
+      var morphedNode = fromNode;
+      var morphedNodeType = morphedNode.nodeType;
+      var toNodeType = toNode.nodeType;
+      if (!childrenOnly) {
+        if (morphedNodeType === ELEMENT_NODE) {
+          if (toNodeType === ELEMENT_NODE) {
+            if (!compareNodeNames(fromNode, toNode)) {
+              onNodeDiscarded(fromNode);
+              morphedNode = moveChildren(fromNode, createElementNS(toNode.nodeName, toNode.namespaceURI));
+            }
+          } else {
+            morphedNode = toNode;
+          }
+        } else if (morphedNodeType === TEXT_NODE || morphedNodeType === COMMENT_NODE) {
+          if (toNodeType === morphedNodeType) {
+            if (morphedNode.nodeValue !== toNode.nodeValue) {
+              morphedNode.nodeValue = toNode.nodeValue;
+            }
+            return morphedNode;
+          } else {
+            morphedNode = toNode;
+          }
+        }
+      }
+      if (morphedNode === toNode) {
+        onNodeDiscarded(fromNode);
+      } else {
+        if (toNode.isSameNode && toNode.isSameNode(morphedNode)) {
+          return;
+        }
+        morphEl(morphedNode, toNode, childrenOnly);
+        if (keyedRemovalList) {
+          for (var i = 0, len = keyedRemovalList.length; i < len; i++) {
+            var elToRemove = fromNodesLookup[keyedRemovalList[i]];
+            if (elToRemove) {
+              removeNode(elToRemove, elToRemove.parentNode, false);
+            }
+          }
+        }
+      }
+      if (!childrenOnly && morphedNode !== fromNode && fromNode.parentNode) {
+        if (morphedNode.actualize) {
+          morphedNode = morphedNode.actualize(fromNode.ownerDocument || doc);
+        }
+        fromNode.parentNode.replaceChild(morphedNode, fromNode);
+      }
+      return morphedNode;
+    };
+  }
+  var morphdom = morphdomFactory(morphAttrs);
+  var morphdom_esm_default = morphdom;
+
+  // packages/frontend/src/index.js
+  var transport = null;
+  function getTransport() {
+    return transport;
+  }
+  function init(container, transportInstance) {
+    transport = transportInstance;
+    initHandlers();
+    transport.onReceive((event, data) => {
+      console.log("[FRONTEND] Received event:", event, data);
+      if (event === "state-update") {
+        setState(data);
+      }
+      if (event === "stream-chunk") {
+        const state2 = getState();
+        setState({
+          streamingContent: state2.streamingContent + data
+        });
+      }
+      if (event === "stream-end") {
+        const state2 = getState();
+        if (state2.streamingContent) {
+          setState({
+            messages: [...state2.messages, { role: "assistant", content: state2.streamingContent }],
+            streamingContent: ""
+          });
+        }
+      }
+      if (event === "tool-executing") {
+        const state2 = getState();
+        setState({
+          messages: [...state2.messages, {
+            role: "tool",
+            name: data.name,
+            input: data.input
+          }],
+          streamingContent: ""
+        });
+      }
+      if (event === "tool-result") {
+        const state2 = getState();
+        setState({
+          messages: [...state2.messages, {
+            role: "tool-result",
+            name: data.name,
+            success: data.success,
+            result: data.success ? data.result : data.error
+          }]
+        });
+      }
+      if (event === "stream-error") {
+        setState({
+          isLoading: false,
+          streamingContent: "",
+          error: `Failed to send message: ${data}`
+        });
+      }
+    });
+    let isScrollAnchored = true;
+    let previousMessageCount = 0;
+    let previousIsLoading = false;
+    let scrollListenerAttached = false;
+    function renderApp() {
+      const currentState = getState();
+      const messageJustStarted = !previousIsLoading && currentState.isLoading;
+      const messageCountChanged = currentState.messages.length !== previousMessageCount;
+      const messagesContainer = container.querySelector('[style*="overflow-y: auto"]');
+      const isNearBottom = !messagesContainer || // If no container yet, assume at bottom
+      messagesContainer.scrollHeight - messagesContainer.scrollTop <= messagesContainer.clientHeight + 100;
+      if ((messageJustStarted || messageCountChanged) && isNearBottom) {
+        isScrollAnchored = true;
+      }
+      if (!currentState.isLoading && isNearBottom) {
+        isScrollAnchored = true;
+      }
+      morphdom_esm_default(container, `<div>${render4(currentState)}</div>`, {
+        childrenOnly: true
+      });
+      const newMessagesContainer = container.querySelector('[style*="overflow-y: auto"]');
+      if (isScrollAnchored && newMessagesContainer) {
+        newMessagesContainer.scrollTop = newMessagesContainer.scrollHeight;
+      }
+      if (newMessagesContainer && !scrollListenerAttached) {
+        scrollListenerAttached = true;
+        let lastScrollTop = newMessagesContainer.scrollTop;
+        newMessagesContainer.addEventListener("scroll", () => {
+          const currentScrollTop = newMessagesContainer.scrollTop;
+          const state2 = getState();
+          const userScrolledUp = currentScrollTop < lastScrollTop - 5;
+          const userScrolledDown = currentScrollTop > lastScrollTop + 5;
+          const isNearBottomNow = newMessagesContainer.scrollHeight - currentScrollTop <= newMessagesContainer.clientHeight + 100;
+          console.log("[SCROLL]", {
+            isLoading: state2.isLoading,
+            userScrolledUp,
+            userScrolledDown,
+            isNearBottomNow,
+            isScrollAnchored,
+            distanceFromBottom: newMessagesContainer.scrollHeight - currentScrollTop - newMessagesContainer.clientHeight
+          });
+          if (state2.isLoading && userScrolledUp) {
+            console.log("[SCROLL] Un-anchoring - user scrolled up during stream");
+            isScrollAnchored = false;
+          } else if (state2.isLoading && isNearBottomNow && userScrolledDown) {
+            console.log("[SCROLL] Re-anchoring - user scrolled down near bottom during stream");
+            isScrollAnchored = true;
+          } else if (!state2.isLoading && isNearBottomNow && userScrolledDown) {
+            console.log("[SCROLL] Re-anchoring - user scrolled down near bottom between messages");
+            isScrollAnchored = true;
+          }
+          lastScrollTop = currentScrollTop;
+        });
+      }
+      previousMessageCount = currentState.messages.length;
+      previousIsLoading = currentState.isLoading;
+    }
+    onStateChange(renderApp);
+    renderApp();
+  }
+
+  // packages/frontend/src/transports/in-memory.js
+  var InMemoryTransport = class {
+    constructor() {
+      this.callbacks = [];
+    }
+    /**
+     * Register callback for receiving messages
+     * @param {Function} callback - Function to call with (event, data)
+     */
+    onReceive(callback) {
+      this.callbacks.push(callback);
+    }
+    /**
+     * Send message to all registered callbacks
+     * @param {string} event - Event name
+     * @param {any} data - Event data
+     */
+    send(event, data) {
+      this.callbacks.forEach((cb) => cb(event, data));
+    }
+  };
+
+  // packages/backend/src/tools/definitions.js
+  function getToolDefinitions() {
+    return [
+      {
+        name: "list_directory",
+        description: "List files and directories in a given path within the workspace. Use this to explore the codebase structure.",
+        input_schema: {
+          type: "object",
+          properties: {
+            path: {
+              type: "string",
+              description: 'Relative path from workspace root (e.g., "src/components"). Use "." for workspace root.'
+            },
+            recursive: {
+              type: "boolean",
+              description: "Whether to list subdirectories recursively (max depth: 3)",
+              default: false
+            }
+          },
+          required: ["path"]
+        }
+      },
+      {
+        name: "read_file",
+        description: "Read the contents of a file. For large files, use start_line and end_line to read specific sections.",
+        input_schema: {
+          type: "object",
+          properties: {
+            path: {
+              type: "string",
+              description: 'Relative path to the file from workspace root (e.g., "src/App.js")'
+            },
+            start_line: {
+              type: "integer",
+              description: "Starting line number (1-indexed, optional). Omit to read from beginning.",
+              minimum: 1
+            },
+            end_line: {
+              type: "integer",
+              description: "Ending line number (inclusive, optional). Omit to read to end (up to limits).",
+              minimum: 1
+            }
+          },
+          required: ["path"]
+        }
+      }
+    ];
+  }
+
+  // packages/backend/src/tools/index.js
+  var toolHandler = null;
+  function setToolHandler(handler2) {
+    toolHandler = handler2;
+  }
+  async function executeTool(toolName, params, workspaceRoot) {
+    if (!toolHandler) {
+      throw new Error("Tool handler not initialized. Call setToolHandler() first.");
+    }
+    return await toolHandler.executeTool(toolName, params, workspaceRoot);
+  }
+
+  // packages/backend/src/core/compaction.js
+  var TOKEN_LIMIT = 5e3;
+  var CHARS_PER_TOKEN = 4;
+  var COMPACTION_PROMPT = `You are helping to summarize a conversation between a user and an AI coding assistant. The conversation has become too long and needs to be compacted.
+
+Please provide a detailed summary that captures:
+1. The flow of the conversation - what topics were discussed and in what order
+2. All technical steps taken - tools used, files read, code written, errors encountered and fixed
+3. Key decisions made and their rationale
+4. Any plans or next steps discussed
+5. The user's most recent request and its context
+
+Be thorough and specific. Include file paths, function names, error messages, and technical details that would be needed to continue the conversation seamlessly. The summary will replace the full conversation history.
+
+Format your response as a clear, well-organized summary that another AI could read to understand the full context.`;
+  function countTokens(messages) {
+    let totalChars = 0;
+    for (const message of messages) {
+      totalChars += message.role.length;
+      if (typeof message.content === "string") {
+        totalChars += message.content.length;
+      } else if (Array.isArray(message.content)) {
+        for (const block of message.content) {
+          if (block.type === "text") {
+            totalChars += block.text.length;
+          } else if (block.type === "tool_use") {
+            totalChars += block.name.length;
+            totalChars += JSON.stringify(block.input).length;
+          } else if (block.type === "tool_result") {
+            totalChars += block.content.length;
+          }
+        }
+      }
+    }
+    return Math.ceil(totalChars / CHARS_PER_TOKEN);
+  }
+  function formatMessagesForCompaction(messages, previousSummary = null) {
+    let formatted = "";
+    if (previousSummary) {
+      formatted += "=== PREVIOUS SUMMARY ===\n\n";
+      formatted += previousSummary;
+      formatted += "\n\n=== CONVERSATION CONTINUATION ===\n\n";
+    } else {
+      formatted += "=== FULL CONVERSATION ===\n\n";
+    }
+    for (const message of messages) {
+      if (message.role === "user") {
+        if (typeof message.content === "string") {
+          formatted += `USER: ${message.content}
+
+`;
+        } else if (Array.isArray(message.content)) {
+          formatted += "TOOL RESULTS:\n";
+          for (const block of message.content) {
+            if (block.type === "tool_result") {
+              formatted += `  ${block.content}
+`;
+            }
+          }
+          formatted += "\n";
+        }
+      } else if (message.role === "assistant") {
+        if (typeof message.content === "string") {
+          formatted += `ASSISTANT: ${message.content}
+
+`;
+        } else if (Array.isArray(message.content)) {
+          for (const block of message.content) {
+            if (block.type === "text") {
+              formatted += `ASSISTANT: ${block.text}
+
+`;
+            } else if (block.type === "tool_use") {
+              formatted += `TOOL USED: ${block.name}
+`;
+              formatted += `  Input: ${JSON.stringify(block.input, null, 2)}
+
+`;
+            }
+          }
+        }
+      }
+    }
+    return formatted;
+  }
+  function findSafeCutoffPoint(messages) {
+    let lastUserTextIndex = -1;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === "user" && typeof messages[i].content === "string") {
+        lastUserTextIndex = i;
+        break;
+      }
+    }
+    if (lastUserTextIndex <= 0) {
+      return messages.length;
+    }
+    if (lastUserTextIndex > 0 && messages[lastUserTextIndex - 1].role === "user") {
+      const prevMessage = messages[lastUserTextIndex - 1];
+      if (Array.isArray(prevMessage.content) && prevMessage.content[0]?.type === "tool_result") {
+        if (lastUserTextIndex >= 2 && messages[lastUserTextIndex - 2].role === "assistant") {
+          return lastUserTextIndex - 2;
+        }
+      }
+    }
+    return lastUserTextIndex;
+  }
+  async function compactConversation(ai, messages, previousSummary = null) {
+    console.log("[COMPACTION] Starting conversation compaction...");
+    console.log("[COMPACTION] Messages to compact:", messages.length);
+    const cutoffIndex = findSafeCutoffPoint(messages);
+    const messagesToCompact = cutoffIndex > 0 ? messages.slice(0, cutoffIndex) : messages;
+    const messagesToKeep = cutoffIndex > 0 ? messages.slice(cutoffIndex) : [];
+    console.log("[COMPACTION] Compacting", messagesToCompact.length, "messages, keeping", messagesToKeep.length);
+    const conversationText = formatMessagesForCompaction(messagesToCompact, previousSummary);
+    const compactionMessages = [
+      {
+        role: "user",
+        content: `${COMPACTION_PROMPT}
+
+${conversationText}`
+      }
+    ];
+    let summary = "";
+    for await (const event of ai.streamMessage(compactionMessages)) {
+      if (event.type === "text") {
+        summary += event.text;
+      }
+    }
+    console.log("[COMPACTION] Generated summary:", summary.length, "chars");
+    return {
+      summary,
+      remainingMessages: messagesToKeep
+    };
+  }
+  async function checkAndCompact(ai, messages, newMessage, currentSummary = null) {
+    const testMessages = [...messages, newMessage];
+    const tokenCount = countTokens(testMessages);
+    console.log(`[COMPACTION] Current token count: ${tokenCount} / ${TOKEN_LIMIT}`);
+    if (tokenCount > TOKEN_LIMIT) {
+      console.log("[COMPACTION] Token limit exceeded, compacting conversation...");
+      const { summary, remainingMessages } = await compactConversation(ai, messages, currentSummary);
+      const summaryMessage = {
+        role: "user",
+        content: `[Previous conversation summary]
+
+${summary}`
+      };
+      return {
+        messages: [summaryMessage, ...remainingMessages, newMessage],
+        summary,
+        compacted: true
+      };
+    }
+    return {
+      messages: testMessages,
+      summary: currentSummary,
+      compacted: false
+    };
+  }
+
+  // packages/backend/src/core/app.js
+  var MAX_TOOL_ITERATIONS = 100;
+  function createApp(transport2, ai, workspaceRoot) {
+    const state2 = {
+      messages: [],
+      isLoading: false,
+      conversationSummary: null
+      // Track conversation summary for compaction
+    };
+    function syncState() {
+      transport2.send("state-update", state2);
+    }
+    transport2.onReceive(async (event, data) => {
+      if (event === "send-message") {
+        const userMessage = data.message;
+        const userMessageObj = {
+          role: "user",
+          content: userMessage
+        };
+        const compactionResult = await checkAndCompact(
+          ai,
+          state2.messages,
+          userMessageObj,
+          state2.conversationSummary
+        );
+        state2.messages = compactionResult.messages;
+        state2.conversationSummary = compactionResult.summary;
+        if (compactionResult.compacted) {
+          console.log("[APP] Conversation compacted before adding user message");
+        }
+        state2.isLoading = true;
+        syncState();
+        try {
+          let toolIterations = 0;
+          let continueLoop = true;
+          while (continueLoop && toolIterations < MAX_TOOL_ITERATIONS) {
+            continueLoop = false;
+            let assistantMessage = "";
+            const toolUses = [];
+            for await (const event2 of ai.streamMessage(state2.messages)) {
+              if (event2.type === "text") {
+                assistantMessage += event2.text;
+                transport2.send("stream-chunk", event2.text);
+              } else if (event2.type === "tool_use") {
+                toolUses.push(event2);
+              }
+            }
+            if (toolUses.length > 0) {
+              console.log(`[BACKEND] AI requested ${toolUses.length} tool(s)`);
+              transport2.send("stream-end", null);
+              const assistantContent = [];
+              if (assistantMessage) {
+                assistantContent.push({
+                  type: "text",
+                  text: assistantMessage
+                });
+              }
+              for (const toolUse of toolUses) {
+                assistantContent.push({
+                  type: "tool_use",
+                  id: toolUse.id,
+                  name: toolUse.name,
+                  input: toolUse.input
+                });
+              }
+              const assistantMessageObj = {
+                role: "assistant",
+                content: assistantContent
+              };
+              state2.messages.push(assistantMessageObj);
+              const toolResults = [];
+              for (const toolUse of toolUses) {
+                transport2.send("tool-executing", {
+                  name: toolUse.name,
+                  input: toolUse.input
+                });
+                try {
+                  const result = await executeTool(toolUse.name, toolUse.input, workspaceRoot);
+                  toolResults.push({
+                    type: "tool_result",
+                    tool_use_id: toolUse.id,
+                    content: JSON.stringify(result, null, 2)
+                  });
+                  transport2.send("tool-result", {
+                    name: toolUse.name,
+                    success: true,
+                    result
+                  });
+                } catch (error) {
+                  console.error(`[BACKEND] Tool execution error:`, error);
+                  toolResults.push({
+                    type: "tool_result",
+                    tool_use_id: toolUse.id,
+                    content: `Error: ${error.message}`,
+                    is_error: true
+                  });
+                  transport2.send("tool-result", {
+                    name: toolUse.name,
+                    success: false,
+                    error: error.message
+                  });
+                }
+              }
+              const toolResultsMessageObj = {
+                role: "user",
+                content: toolResults
+              };
+              state2.messages.push(toolResultsMessageObj);
+              continueLoop = true;
+              toolIterations++;
+            } else {
+              const finalMessageObj = {
+                role: "assistant",
+                content: assistantMessage
+              };
+              const finalCompaction = await checkAndCompact(
+                ai,
+                state2.messages,
+                finalMessageObj,
+                state2.conversationSummary
+              );
+              state2.messages = finalCompaction.messages;
+              state2.conversationSummary = finalCompaction.summary;
+              if (finalCompaction.compacted) {
+                console.log("[APP] Conversation compacted before adding final assistant message");
+              }
+              state2.isLoading = false;
+              transport2.send("stream-end", null);
+              syncState();
+            }
+          }
+          if (toolIterations >= MAX_TOOL_ITERATIONS) {
+            console.warn(`[BACKEND] Max tool iterations (${MAX_TOOL_ITERATIONS}) reached`);
+            state2.messages.push({
+              role: "assistant",
+              content: `[Tool execution limit reached after ${MAX_TOOL_ITERATIONS} iterations]`
+            });
+            state2.isLoading = false;
+            transport2.send("stream-end", null);
+            syncState();
+          }
+        } catch (error) {
+          console.error("[BACKEND] Error streaming message:", error);
+          state2.isLoading = false;
+          const errorMessage = error.message || error.code || String(error);
+          console.error("[BACKEND] Error details:", errorMessage);
+          transport2.send("stream-error", errorMessage);
+          syncState();
+        }
+      }
+      if (event === "get-state") {
+        syncState();
+      }
+    });
+    syncState();
+    return {
+      getState: () => state2,
+      syncState
+    };
+  }
+
   // packages/backend/src/ai/clipboard.js
   var ClipboardAI = class {
     /**
@@ -294,6 +1778,141 @@ ${firstUserMsg.content}`
     }
   };
 
+  // packages/backend/src/prompts/system.js
+  var CODING_ASSISTANT_PROMPT = `You are a skilled software developer working as the primary developer on this project. Your role is to:
+
+- Implement features and requirements provided by the user
+- Write clean, maintainable, and well-structured code
+- Debug issues and fix bugs efficiently
+- Suggest technical approaches and design patterns when appropriate
+- Provide clear explanations of what you're implementing and why
+- Ask clarifying questions when requirements are ambiguous
+
+Guidelines:
+- Be concise and action-oriented in your responses
+- Provide working code ready for integration
+- Explain your implementation approach clearly
+- Highlight important technical decisions and trade-offs
+- Respond to code review feedback constructively
+- Keep responses focused on the task at hand
+
+Remember: You are the primary developer. The user will provide requirements and review your work. Focus on delivering working solutions, not teaching.`;
+  function getSystemPrompt(context = "coding") {
+    switch (context) {
+      case "coding":
+        return CODING_ASSISTANT_PROMPT;
+      default:
+        return CODING_ASSISTANT_PROMPT;
+    }
+  }
+
+  // packages/backend/src/tools/file-access-handler.js
+  var FileAccessToolHandler = class {
+    /**
+     * @param {FileSystemDirectoryHandle} directoryHandle - Root directory handle
+     */
+    constructor(directoryHandle) {
+      this.directoryHandle = directoryHandle;
+    }
+    /**
+     * Execute a tool with the given parameters
+     * @param {string} toolName - Name of the tool
+     * @param {Object} params - Tool parameters
+     * @param {string} workspaceRoot - Ignored (not needed for browser)
+     * @returns {Promise<Object>} Tool result
+     */
+    async executeTool(toolName, params, workspaceRoot) {
+      switch (toolName) {
+        case "list_directory":
+          return await this.listDirectory(params);
+        case "read_file":
+          return await this.readFile(params);
+        default:
+          throw new Error(`Unknown tool: ${toolName}`);
+      }
+    }
+    /**
+     * List directory contents
+     * @param {Object} params - Parameters
+     * @param {string} params.path - Relative path from workspace root (default: '.')
+     * @returns {Promise<Object>} Directory listing
+     */
+    async listDirectory(params) {
+      const { path = "." } = params;
+      try {
+        let targetDir = this.directoryHandle;
+        if (path !== ".") {
+          const parts = path.split("/").filter((p) => p && p !== ".");
+          for (const part of parts) {
+            targetDir = await targetDir.getDirectoryHandle(part);
+          }
+        }
+        const entries = [];
+        for await (const [name, handle] of targetDir.entries()) {
+          entries.push({
+            name,
+            type: handle.kind === "directory" ? "directory" : "file",
+            path: path === "." ? name : `${path}/${name}`
+          });
+        }
+        return {
+          path: path === "." ? "." : path,
+          entries
+        };
+      } catch (error) {
+        if (error.name === "NotFoundError") {
+          throw new Error(`Directory not found: ${path}`);
+        }
+        throw error;
+      }
+    }
+    /**
+     * Read file contents
+     * @param {Object} params - Parameters
+     * @param {string} params.path - Relative path from workspace root
+     * @param {number} params.start_line - Starting line (1-indexed, optional)
+     * @param {number} params.end_line - Ending line (inclusive, optional)
+     * @returns {Promise<Object>} File contents
+     */
+    async readFile(params) {
+      const { path, start_line, end_line } = params;
+      if (!path) {
+        throw new Error('Parameter "path" is required');
+      }
+      try {
+        let current = this.directoryHandle;
+        const parts = path.split("/").filter((p) => p && p !== ".");
+        for (let i = 0; i < parts.length - 1; i++) {
+          current = await current.getDirectoryHandle(parts[i]);
+        }
+        const fileHandle = await current.getFileHandle(parts[parts.length - 1]);
+        const file = await fileHandle.getFile();
+        const content = await file.text();
+        const lines = content.split("\n");
+        const totalLines = lines.length;
+        let startLine = start_line ? Math.max(1, Math.min(start_line, totalLines)) : 1;
+        let endLine = end_line ? Math.max(startLine, Math.min(end_line, totalLines)) : totalLines;
+        const selectedLines = lines.slice(startLine - 1, endLine);
+        const selectedContent = selectedLines.join("\n");
+        return {
+          path,
+          content: selectedContent,
+          line_range: {
+            start: startLine,
+            end: endLine
+          },
+          total_lines: totalLines,
+          truncated: end_line && end_line < totalLines
+        };
+      } catch (error) {
+        if (error.name === "NotFoundError") {
+          throw new Error(`File not found: ${path}`);
+        }
+        throw error;
+      }
+    }
+  };
+
   // packages/datastore/src/browser-filesystem.js
   var BrowserFileSystemDatastore = class {
     /**
@@ -370,240 +1989,30 @@ ${firstUserMsg.content}`
     }
   };
 
-  // packages/backend/src/prompts/system.js
-  var CODING_ASSISTANT_PROMPT = `You are a skilled software developer working as the primary developer on this project. Your role is to:
-
-- Implement features and requirements provided by the user
-- Write clean, maintainable, and well-structured code
-- Debug issues and fix bugs efficiently
-- Suggest technical approaches and design patterns when appropriate
-- Provide clear explanations of what you're implementing and why
-- Ask clarifying questions when requirements are ambiguous
-
-Guidelines:
-- Be concise and action-oriented in your responses
-- Provide working code ready for integration
-- Explain your implementation approach clearly
-- Highlight important technical decisions and trade-offs
-- Respond to code review feedback constructively
-- Keep responses focused on the task at hand
-
-Remember: You are the primary developer. The user will provide requirements and review your work. Focus on delivering working solutions, not teaching.`;
-  function getSystemPrompt(context = "coding") {
-    switch (context) {
-      case "coding":
-        return CODING_ASSISTANT_PROMPT;
-      default:
-        return CODING_ASSISTANT_PROMPT;
-    }
-  }
-
   // apps/clipboard/src/clipboard-chat.js
-  function escapeHtml(text) {
-    const div = document.createElement("div");
-    div.textContent = text;
-    return div.innerHTML;
-  }
-  function renderMessage(message) {
-    const isUser = message.role === "user";
-    const bgColor = isUser ? "#667eea" : "#f3f4f6";
-    const textColor = isUser ? "white" : "#1f2937";
-    const align = isUser ? "flex-end" : "flex-start";
-    return `
-    <div style="display: flex; justify-content: ${align}; margin-bottom: 16px;">
-      <div style="
-        max-width: 70%;
-        padding: 12px 16px;
-        border-radius: 12px;
-        background: ${bgColor};
-        color: ${textColor};
-        word-wrap: break-word;
-      ">
-        <div style="font-size: 12px; opacity: 0.7; margin-bottom: 4px;">
-          ${isUser ? "You" : "Assistant"}
-        </div>
-        <div style="white-space: pre-wrap;">${escapeHtml(message.content)}</div>
-      </div>
-    </div>
-  `;
-  }
-  function renderChatMessages(state) {
-    const messagesHtml = state.messages.map((msg) => renderMessage(msg)).join("");
-    return `
-    <div id="messages-container" style="
-      flex: 1;
-      overflow-y: auto;
-      padding: 20px;
-      background: white;
-    ">
-      ${messagesHtml}
-      ${state.isLoading && state.streamingContent ? `
-        <div style="display: flex; justify-content: flex-start; margin-bottom: 16px;">
-          <div style="
-            max-width: 70%;
-            padding: 12px 16px;
-            border-radius: 12px;
-            background: #f3f4f6;
-            color: #1f2937;
-            word-wrap: break-word;
-          ">
-            <div style="font-size: 12px; opacity: 0.7; margin-bottom: 4px;">Assistant</div>
-            <div style="white-space: pre-wrap;">${escapeHtml(state.streamingContent)}<span style="animation: blink 1s infinite;">\u258A</span></div>
-          </div>
-        </div>
-      ` : state.isLoading ? `
-        <div style="display: flex; justify-content: flex-start; margin-bottom: 16px;">
-          <div style="
-            padding: 12px 16px;
-            border-radius: 12px;
-            background: #f3f4f6;
-            color: #1f2937;
-          ">
-            <div style="font-size: 12px; opacity: 0.7; margin-bottom: 4px;">Assistant</div>
-            <div>Thinking...</div>
-          </div>
-        </div>
-      ` : ""}
-      ${state.messages.length === 0 && !state.isLoading ? `
-        <div style="
-          text-align: center;
-          color: #9ca3af;
-          padding: 40px 20px;
-        ">
-          <p style="font-size: 18px; margin-bottom: 8px;">Welcome to AI Chat</p>
-          <p>Send a message to start the conversation</p>
-        </div>
-      ` : ""}
-      <style>
-        @keyframes blink {
-          0%, 50% { opacity: 1; }
-          51%, 100% { opacity: 0; }
-        }
-      </style>
-    </div>
-  `;
-  }
-  function renderChatInput(state) {
-    console.log("[renderChatInput] state.isLoading:", state.isLoading, "state.datastoreReady:", state.datastoreReady);
-    const isDisabled = state.isLoading || !state.datastoreReady;
-    console.log("[renderChatInput] isDisabled:", isDisabled);
-    return `
-    <div style="
-      padding: 20px;
-      background: white;
-      border-top: 1px solid #e5e7eb;
-    ">
-      ${state.error ? `
-        <div style="
-          background: #fee2e2;
-          color: #991b1b;
-          padding: 12px;
-          border-radius: 8px;
-          margin-bottom: 12px;
-          font-size: 14px;
-        ">
-          ${state.error}
-        </div>
-      ` : ""}
-      <div style="display: flex; gap: 12px;">
-        <input
-          id="clipboard-chat-input"
-          type="text"
-          placeholder="Type your message..."
-          ${isDisabled ? "disabled" : ""}
-          style="
-            flex: 1;
-            padding: 12px 16px;
-            border: 1px solid #d1d5db;
-            border-radius: 8px;
-            font-size: 14px;
-            font-family: inherit;
-            ${isDisabled ? "opacity: 0.5; cursor: not-allowed;" : ""}
-          "
-        />
-        <button
-          id="clipboard-send-btn"
-          ${isDisabled ? "disabled" : ""}
-          style="
-            padding: 12px 24px;
-            background: #667eea;
-            color: white;
-            border: none;
-            border-radius: 8px;
-            font-size: 14px;
-            font-weight: 600;
-            cursor: pointer;
-            ${isDisabled ? "opacity: 0.5; cursor: not-allowed;" : ""}
-          "
-        >
-          Send
-        </button>
-      </div>
-    </div>
-  `;
-  }
-  function renderApp(state) {
-    return `
-    <div style="display: flex; flex-direction: column; height: 100vh; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif; background: #f9fafb;">
-      <header style="color: white; padding: 20px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); box-shadow: 0 2px 8px rgba(0,0,0,0.1);">
-        <h1 style="margin: 0; font-size: 24px; font-weight: 600;">AI Chat</h1>
-        <p style="font-size: 14px; margin: 4px 0 0 0; opacity: 0.9;">Powered by Claude</p>
-      </header>
-      ${renderChatMessages(state)}
-      ${renderChatInput(state)}
-    </div>
-  `;
-  }
-  var appState = {
-    messages: [],
-    isLoading: false,
-    streamingContent: "",
-    error: null,
-    datastoreReady: false
-  };
-  var stateListeners = [];
-  function setState(updates) {
-    console.log("[setState] Before:", { ...appState });
-    console.log("[setState] Updates:", updates);
-    appState = { ...appState, ...updates };
-    console.log("[setState] After:", { ...appState });
-    console.log("[setState] Calling", stateListeners.length, "listeners");
-    stateListeners.forEach((fn) => fn(appState));
-  }
-  function onStateChange(fn) {
-    stateListeners.push(fn);
-  }
-  var clipboardAI = null;
   var datastore = null;
-  async function initDatastore() {
-    console.log("[initDatastore] Starting...");
+  var backendApp = null;
+  var dirHandle = null;
+  window.selectFolder = async () => {
     try {
-      console.log("[initDatastore] Showing directory picker...");
-      const dirHandle = await window.showDirectoryPicker({
-        mode: "readwrite"
-      });
-      console.log("[initDatastore] Directory selected:", dirHandle.name);
+      dirHandle = await window.showDirectoryPicker({ mode: "readwrite" });
+      const toolHandler2 = new FileAccessToolHandler(dirHandle);
+      setToolHandler(toolHandler2);
       datastore = new BrowserFileSystemDatastore({ directoryHandle: dirHandle });
       await datastore.init();
-      console.log("[initDatastore] Datastore initialized");
-      console.log("[initDatastore] Calling setState with datastoreReady: true");
-      setState({ datastoreReady: true, error: null });
-      console.log("[initDatastore] Loading conversation...");
+      setState({ workspaceFolder: dirHandle.name });
       await loadConversation();
-      console.log("[initDatastore] Complete!");
     } catch (err) {
-      console.error("[initDatastore] Failed:", err);
-      setState({
-        datastoreReady: false,
-        error: "Failed to access directory. Please refresh and try again."
-      });
+      console.error("Failed to select folder:", err);
+      setState({ error: "Failed to access directory. Please try again." });
     }
-  }
+  };
   async function saveConversation() {
     if (!datastore) return;
     try {
+      const state2 = getState();
       const data = {
-        messages: appState.messages,
+        messages: state2.messages,
         timestamp: Date.now()
       };
       await datastore.write("conversation.json", JSON.stringify(data, null, 2));
@@ -626,109 +2035,31 @@ Remember: You are the primary developer. The user will provide requirements and 
       console.error("Failed to load conversation:", err);
     }
   }
-  async function handleSendMessage() {
-    const input = document.getElementById("clipboard-chat-input");
-    if (!input || !input.value.trim()) return;
-    const userMessage = input.value.trim();
-    input.value = "";
-    const newMessages = [...appState.messages, { role: "user", content: userMessage }];
-    setState({
-      messages: newMessages,
-      isLoading: true,
-      streamingContent: "",
-      error: null
-    });
-    try {
-      if (!clipboardAI) {
-        clipboardAI = new ClipboardAI({
-          apiBase: "https://chat.niprgpt.mil/api",
-          model: "Anthropic Claude 4 Sonnet",
-          systemPrompt: getSystemPrompt("coding")
-        });
-      }
-      let fullResponse = "";
-      for await (const chunk of clipboardAI.streamMessage(newMessages)) {
-        fullResponse += chunk;
-        setState({ streamingContent: fullResponse });
-      }
-      setState({
-        messages: [...newMessages, { role: "assistant", content: fullResponse }],
-        isLoading: false,
-        streamingContent: ""
-      });
-      await saveConversation();
-    } catch (err) {
-      console.error("Failed to send message:", err);
-      setState({
-        isLoading: false,
-        streamingContent: "",
-        error: `Failed to send message: ${err.message}`
-      });
-    }
-  }
   async function initClipboardChat() {
     console.log("[Clipboard Chat] Initializing...");
     const container = document.createElement("div");
     container.id = "clipboard-chat-app";
     container.style.cssText = "position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: 999999;";
     document.body.appendChild(container);
-    let isScrollAnchored = true;
-    let previousMessageCount = 0;
-    let previousIsLoading = false;
-    function render() {
-      console.log("[render] Called with state:", { ...appState });
-      const currentState = appState;
-      const messageJustStarted = !previousIsLoading && currentState.isLoading;
-      const messageCountChanged = currentState.messages.length !== previousMessageCount;
-      const messagesContainer = container.querySelector("#messages-container");
-      const isNearBottom = !messagesContainer || messagesContainer.scrollHeight - messagesContainer.scrollTop <= messagesContainer.clientHeight + 100;
-      if ((messageJustStarted || messageCountChanged) && isNearBottom) {
-        isScrollAnchored = true;
-      }
-      container.innerHTML = renderApp(currentState);
-      const newMessagesContainer = container.querySelector("#messages-container");
-      if (isScrollAnchored && newMessagesContainer) {
-        newMessagesContainer.scrollTop = newMessagesContainer.scrollHeight;
-      }
-      const input = document.getElementById("clipboard-chat-input");
-      const sendBtn = document.getElementById("clipboard-send-btn");
-      if (input) {
-        input.onkeydown = (e) => {
-          if (e.key === "Enter" && !e.shiftKey) {
-            e.preventDefault();
-            handleSendMessage();
-          }
-        };
-        if (!currentState.isLoading) {
-          input.focus();
+    const transport2 = new InMemoryTransport();
+    const clipboardAI = new ClipboardAI({
+      apiBase: "https://chat.niprgpt.mil/api",
+      model: "Anthropic Claude 4 Sonnet",
+      systemPrompt: getSystemPrompt("coding"),
+      tools: getToolDefinitions()
+    });
+    backendApp = createApp(transport2, clipboardAI, null);
+    init(container, transport2);
+    const originalOnReceive = transport2.onReceive.bind(transport2);
+    transport2.onReceive = (callback) => {
+      originalOnReceive((event, data) => {
+        callback(event, data);
+        if (event === "stream-end") {
+          saveConversation();
         }
-      }
-      if (sendBtn) {
-        sendBtn.onclick = handleSendMessage;
-      }
-      if (newMessagesContainer) {
-        let lastScrollTop = newMessagesContainer.scrollTop;
-        newMessagesContainer.addEventListener("scroll", () => {
-          const currentScrollTop = newMessagesContainer.scrollTop;
-          const userScrolledUp = currentScrollTop < lastScrollTop - 5;
-          const userScrolledDown = currentScrollTop > lastScrollTop + 5;
-          const isNearBottomNow = newMessagesContainer.scrollHeight - currentScrollTop <= newMessagesContainer.clientHeight + 100;
-          if (currentState.isLoading && userScrolledUp) {
-            isScrollAnchored = false;
-          } else if (isNearBottomNow && userScrolledDown) {
-            isScrollAnchored = true;
-          }
-          lastScrollTop = currentScrollTop;
-        });
-      }
-      previousMessageCount = currentState.messages.length;
-      previousIsLoading = currentState.isLoading;
-    }
-    onStateChange(render);
-    render();
-    await initDatastore();
-    render();
-    console.log("[Clipboard Chat] Ready!");
+      });
+    };
+    console.log('[Clipboard Chat] Ready! Click "Select Folder" to begin.');
   }
   if (typeof window !== "undefined") {
     initClipboardChat().catch(console.error);
