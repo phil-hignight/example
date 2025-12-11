@@ -2,7 +2,7 @@
  * Clipboard Chat - Bundled Browser Version
  * Copy this entire file and paste into browser devtools console
  *
- * Generated: 2025-12-11T05:53:04.657Z
+ * Generated: 2025-12-11T05:56:57.742Z
  */
 
 (() => {
@@ -1999,8 +1999,11 @@ Remember: You are the primary developer. The user will provide requirements and 
   var backendApp = null;
   var dirHandle = null;
   window.selectFolder = async () => {
+    console.log("[CLIPBOARD] selectFolder called");
     try {
+      console.log("[CLIPBOARD] Requesting directory picker...");
       dirHandle = await window.showDirectoryPicker({ mode: "readwrite" });
+      console.log("[CLIPBOARD] Directory selected:", dirHandle.name);
       const toolHandler2 = new FileAccessToolHandler(dirHandle);
       setToolHandler(toolHandler2);
       datastore = new BrowserFileSystemDatastore({ directoryHandle: dirHandle });
