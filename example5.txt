@@ -2,7 +2,7 @@
  * Clipboard Chat - Bundled Browser Version
  * Copy this entire file and paste into browser devtools console
  *
- * Generated: 2025-12-11T13:24:20.505Z
+ * Generated: 2025-12-11T14:11:40.987Z
  */
 
 (() => {
@@ -22,9 +22,7 @@
     return state;
   }
   function setState(newState) {
-    console.log("[STATE] setState called with:", newState);
     state = { ...state, ...newState };
-    console.log("[STATE] New state:", { isLoading: state.isLoading, workspaceFolder: state.workspaceFolder, messagesCount: state.messages.length });
     if (renderFn) {
       renderFn();
     }
@@ -55,6 +53,7 @@
 
   // packages/frontend/src/components/ChatMessages.js
   function renderMessage(message) {
+    console.log("[ChatMessages] Rendering message:", { role: message.role, contentType: typeof message.content, content: message.content });
     if (message.role === "tool") {
       return `
       <div style="display: flex; justify-content: flex-start; margin-bottom: 16px;">
@@ -978,7 +977,10 @@
     transport = transportInstance;
     initHandlers();
     transport.onReceive((event, data) => {
-      console.log("[FRONTEND] Received event:", event, data);
+      console.log("[FRONTEND] Received event:", event);
+      if (event === "state-update") {
+        console.log("[FRONTEND] State update - messages:", JSON.stringify(data.messages, null, 2));
+      }
       if (event === "state-update") {
         setState(data);
       }
@@ -1098,7 +1100,6 @@
      * @param {Function} callback - Function to call with (event, data)
      */
     onReceive(callback) {
-      console.log("[InMemoryTransport] Callback registered, total callbacks:", this.callbacks.length + 1);
       this.callbacks.push(callback);
     }
     /**
@@ -1107,7 +1108,6 @@
      * @param {any} data - Event data
      */
     send(event, data) {
-      console.log("[InMemoryTransport] send() called with event:", event, "callbacks:", this.callbacks.length);
       this.callbacks.forEach((cb) => cb(event, data));
     }
   };
@@ -1507,6 +1507,7 @@ ${summary}`
       this.timeout = options.timeout || 3e4;
       this.maxRetries = options.maxRetries || 5;
       this.systemPrompt = options.systemPrompt || null;
+      this.tools = options.tools || [];
       this.sessionId = this.generateSessionId();
       this.chatId = null;
       this.messageHistory = [];
@@ -1516,6 +1517,76 @@ ${summary}`
      */
     generateSessionId() {
       return `session-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    }
+    /**
+     * Parse tool uses from AI response text
+     * Looks for JSON blocks in format: {"tool": "tool_name", "parameters": {...}}
+     * @param {string} text - Full response text from AI
+     * @returns {Array} Array of tool use objects
+     */
+    parseToolUses(text) {
+      const toolUses = [];
+      const codeBlockRegex = /```json\s*\n([\s\S]*?)\n```/g;
+      let match;
+      while ((match = codeBlockRegex.exec(text)) !== null) {
+        try {
+          const jsonContent = match[1].trim();
+          const parsed = JSON.parse(jsonContent);
+          if (parsed.tool && parsed.parameters) {
+            toolUses.push({
+              tool: parsed.tool,
+              parameters: parsed.parameters
+            });
+          }
+        } catch (e) {
+          console.warn("[ClipboardAI] Failed to parse tool use JSON:", e);
+        }
+      }
+      return toolUses;
+    }
+    /**
+     * Format tool definitions as text instructions for the system prompt
+     * @param {Array} tools - Array of tool definition objects
+     * @returns {string} Formatted tool instructions
+     */
+    formatToolInstructions(tools) {
+      let instructions = "# Available Tools\n\n";
+      instructions += "You have access to the following tools to help you complete tasks:\n\n";
+      for (const tool of tools) {
+        instructions += `## ${tool.name}
+`;
+        instructions += `${tool.description}
+
+`;
+        instructions += "**Parameters:**\n";
+        const props = tool.input_schema.properties;
+        const required = tool.input_schema.required || [];
+        for (const [propName, propDef] of Object.entries(props)) {
+          const isRequired = required.includes(propName);
+          const requiredTag = isRequired ? "(required)" : "(optional)";
+          instructions += `- \`${propName}\` ${requiredTag}: ${propDef.description}
+`;
+          if (propDef.default !== void 0) {
+            instructions += `  - Default: ${propDef.default}
+`;
+          }
+        }
+        instructions += "\n";
+      }
+      instructions += "# How to Use Tools\n\n";
+      instructions += "To use a tool, respond with a JSON block in this exact format:\n\n";
+      instructions += "```json\n";
+      instructions += "{\n";
+      instructions += '  "tool": "tool_name",\n';
+      instructions += '  "parameters": {\n';
+      instructions += '    "param1": "value1",\n';
+      instructions += '    "param2": "value2"\n';
+      instructions += "  }\n";
+      instructions += "}\n";
+      instructions += "```\n\n";
+      instructions += "You can use multiple tools by including multiple JSON blocks in your response.\n";
+      instructions += "After using tools, you will receive the results and can continue the conversation.\n";
+      return instructions;
     }
     /**
      * Generate UUID for messages
@@ -1705,14 +1776,22 @@ ${summary}`
         role: msg.role,
         content: msg.content
       }));
-      if (this.systemPrompt && apiMessages.length > 0) {
+      if ((this.systemPrompt || this.tools.length > 0) && apiMessages.length > 0) {
         const firstUserIndex = apiMessages.findIndex((msg) => msg.role === "user");
         if (firstUserIndex !== -1) {
           const firstUserMsg = apiMessages[firstUserIndex];
+          let systemContent = "";
+          if (this.systemPrompt) {
+            systemContent += this.systemPrompt;
+          }
+          if (this.tools.length > 0) {
+            if (systemContent) systemContent += "\n\n";
+            systemContent += this.formatToolInstructions(this.tools);
+          }
           apiMessages[firstUserIndex] = {
             ...firstUserMsg,
             content: `<system-reminder>
-${this.systemPrompt}
+${systemContent}
 </system-reminder>
 
 ${firstUserMsg.content}`
@@ -1749,6 +1828,7 @@ ${firstUserMsg.content}`
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
+      let fullResponseText = "";
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -1763,12 +1843,22 @@ ${firstUserMsg.content}`
               const parsed = JSON.parse(data);
               const delta = parsed.choices?.[0]?.delta?.content;
               if (delta) {
-                yield delta;
+                fullResponseText += delta;
+                yield { type: "text", text: delta };
               }
             } catch (e) {
             }
           }
         }
+      }
+      const toolUses = this.parseToolUses(fullResponseText);
+      for (const toolUse of toolUses) {
+        yield {
+          type: "tool_use",
+          id: this.generateUUID(),
+          name: toolUse.tool,
+          input: toolUse.parameters
+        };
       }
       const assistantMsg = {
         id: assistantMessageId,
@@ -1999,45 +2089,13 @@ Remember: You are the primary developer. The user will provide requirements and 
   var backendApp = null;
   var dirHandle = null;
   window.selectFolder = async () => {
-    console.log("[CLIPBOARD] selectFolder called");
     try {
-      console.log("[CLIPBOARD] Requesting directory picker...");
       dirHandle = await window.showDirectoryPicker({ mode: "readwrite" });
-      console.log("[CLIPBOARD] Directory selected:", dirHandle.name);
       const toolHandler2 = new FileAccessToolHandler(dirHandle);
       setToolHandler(toolHandler2);
       datastore = new BrowserFileSystemDatastore({ directoryHandle: dirHandle });
       await datastore.init();
       setState({ workspaceFolder: dirHandle.name, isLoading: false });
-      setTimeout(() => {
-        const input = document.getElementById("claude-code-chat-input");
-        console.log("[DEBUG] Input element:", input);
-        console.log("[DEBUG] Input disabled:", input?.disabled);
-        console.log("[DEBUG] Input readonly:", input?.readOnly);
-        console.log("[DEBUG] Input type:", input?.type);
-        console.log("[DEBUG] Input can focus:", input ? "yes" : "no");
-        if (input) {
-          const styles = window.getComputedStyle(input);
-          console.log("[DEBUG] pointer-events:", styles.pointerEvents);
-          console.log("[DEBUG] z-index:", styles.zIndex);
-          console.log("[DEBUG] opacity:", styles.opacity);
-          console.log("[DEBUG] visibility:", styles.visibility);
-          const rect = input.getBoundingClientRect();
-          const centerX = rect.left + rect.width / 2;
-          const centerY = rect.top + rect.height / 2;
-          const elementAtPoint = document.elementFromPoint(centerX, centerY);
-          console.log("[DEBUG] Element at input center:", elementAtPoint);
-          console.log("[DEBUG] Is it the input?", elementAtPoint === input);
-          input.focus();
-          console.log("[DEBUG] Attempted to focus input");
-          input.addEventListener("input", (e) => {
-            console.log("[DEBUG] INPUT EVENT FIRED:", e.target.value);
-          });
-          input.addEventListener("keydown", (e) => {
-            console.log("[DEBUG] KEYDOWN EVENT FIRED:", e.key);
-          });
-        }
-      }, 100);
       await loadConversation();
     } catch (err) {
       console.error("Failed to select folder:", err);
@@ -2073,10 +2131,8 @@ Remember: You are the primary developer. The user will provide requirements and 
     }
   }
   async function initClipboardChat() {
-    console.log("[Clipboard Chat] Initializing...");
     const existing = document.getElementById("clipboard-chat-app");
     if (existing) {
-      console.log("[Clipboard Chat] Already initialized, removing old instance...");
       existing.remove();
     }
     const container = document.createElement("div");
@@ -2097,7 +2153,6 @@ Remember: You are the primary developer. The user will provide requirements and 
         saveConversation();
       }
     });
-    console.log('[Clipboard Chat] Ready! Click "Select Folder" to begin.');
   }
   if (typeof window !== "undefined") {
     initClipboardChat().catch(console.error);
