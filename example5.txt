@@ -2,7 +2,7 @@
  * Clipboard Chat - Bundled Browser Version
  * Copy this entire file and paste into browser devtools console
  *
- * Generated: 2025-12-11T05:50:40.689Z
+ * Generated: 2025-12-11T05:53:04.657Z
  */
 
 (() => {
@@ -22,7 +22,9 @@
     return state;
   }
   function setState(newState) {
+    console.log("[STATE] setState called with:", newState);
     state = { ...state, ...newState };
+    console.log("[STATE] New state:", { isLoading: state.isLoading, workspaceFolder: state.workspaceFolder, messagesCount: state.messages.length });
     if (renderFn) {
       renderFn();
     }
@@ -1096,6 +1098,7 @@
      * @param {Function} callback - Function to call with (event, data)
      */
     onReceive(callback) {
+      console.log("[InMemoryTransport] Callback registered, total callbacks:", this.callbacks.length + 1);
       this.callbacks.push(callback);
     }
     /**
@@ -1104,6 +1107,7 @@
      * @param {any} data - Event data
      */
     send(event, data) {
+      console.log("[InMemoryTransport] send() called with event:", event, "callbacks:", this.callbacks.length);
       this.callbacks.forEach((cb) => cb(event, data));
     }
   };
@@ -1339,6 +1343,7 @@ ${summary}`
       // Track conversation summary for compaction
     };
     function syncState() {
+      console.log("[BACKEND] syncState called, sending state:", { isLoading: state2.isLoading, messagesCount: state2.messages.length });
       transport2.send("state-update", state2);
     }
     transport2.onReceive(async (event, data) => {
