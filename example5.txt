@@ -2,7 +2,7 @@
  * Clipboard Chat - Bundled Browser Version
  * Copy this entire file and paste into browser devtools console
  *
- * Generated: 2025-12-11T05:56:57.742Z
+ * Generated: 2025-12-11T06:01:59.748Z
  */
 
 (() => {
@@ -2009,6 +2009,24 @@ Remember: You are the primary developer. The user will provide requirements and 
       datastore = new BrowserFileSystemDatastore({ directoryHandle: dirHandle });
       await datastore.init();
       setState({ workspaceFolder: dirHandle.name, isLoading: false });
+      setTimeout(() => {
+        const input = document.getElementById("chat-input");
+        console.log("[DEBUG] Input element:", input);
+        console.log("[DEBUG] Input disabled:", input?.disabled);
+        console.log("[DEBUG] Input readonly:", input?.readOnly);
+        console.log("[DEBUG] Input type:", input?.type);
+        console.log("[DEBUG] Input can focus:", input ? "yes" : "no");
+        if (input) {
+          input.focus();
+          console.log("[DEBUG] Attempted to focus input");
+          input.addEventListener("input", (e) => {
+            console.log("[DEBUG] INPUT EVENT FIRED:", e.target.value);
+          });
+          input.addEventListener("keydown", (e) => {
+            console.log("[DEBUG] KEYDOWN EVENT FIRED:", e.key);
+          });
+        }
+      }, 100);
       await loadConversation();
     } catch (err) {
       console.error("Failed to select folder:", err);
