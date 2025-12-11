@@ -2,7 +2,7 @@
  * Clipboard Chat - Bundled Browser Version
  * Copy this entire file and paste into browser devtools console
  *
- * Generated: 2025-12-10T19:35:57.588Z
+ * Generated: 2025-12-11T03:27:15.732Z
  */
 
 (() => {
@@ -17,6 +17,7 @@
       this.maxTokens = options.maxTokens || 4096;
       this.timeout = options.timeout || 3e4;
       this.maxRetries = options.maxRetries || 5;
+      this.systemPrompt = options.systemPrompt || null;
       this.sessionId = this.generateSessionId();
       this.chatId = null;
       this.messageHistory = [];
@@ -126,7 +127,7 @@
         chat: {
           models: [this.model],
           files: [],
-          params: {},
+          params: this.systemPrompt ? { system: this.systemPrompt } : {},
           history: {
             messages: historyMessages,
             currentId
@@ -354,6 +355,34 @@
       }
     }
   };
+
+  // packages/backend/src/prompts/system.js
+  var CODING_ASSISTANT_PROMPT = `You are a skilled software developer working as the primary developer on this project. Your role is to:
+
+- Implement features and requirements provided by the user
+- Write clean, maintainable, and well-structured code
+- Debug issues and fix bugs efficiently
+- Suggest technical approaches and design patterns when appropriate
+- Provide clear explanations of what you're implementing and why
+- Ask clarifying questions when requirements are ambiguous
+
+Guidelines:
+- Be concise and action-oriented in your responses
+- Provide working code ready for integration
+- Explain your implementation approach clearly
+- Highlight important technical decisions and trade-offs
+- Respond to code review feedback constructively
+- Keep responses focused on the task at hand
+
+Remember: You are the primary developer. The user will provide requirements and review your work. Focus on delivering working solutions, not teaching.`;
+  function getSystemPrompt(context = "coding") {
+    switch (context) {
+      case "coding":
+        return CODING_ASSISTANT_PROMPT;
+      default:
+        return CODING_ASSISTANT_PROMPT;
+    }
+  }
 
   // apps/clipboard/src/clipboard-chat.js
   function escapeHtml(text) {
@@ -599,7 +628,8 @@
       if (!clipboardAI) {
         clipboardAI = new ClipboardAI({
           apiBase: "https://chat.niprgpt.mil/api",
-          model: "Anthropic Claude 4 Sonnet"
+          model: "Anthropic Claude 4 Sonnet",
+          systemPrompt: getSystemPrompt("coding")
         });
       }
       let fullResponse = "";
