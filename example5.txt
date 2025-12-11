@@ -2,7 +2,7 @@
  * Clipboard Chat - Bundled Browser Version
  * Copy this entire file and paste into browser devtools console
  *
- * Generated: 2025-12-11T05:47:12.151Z
+ * Generated: 2025-12-11T05:50:40.689Z
  */
 
 (() => {
@@ -2042,6 +2042,7 @@ Remember: You are the primary developer. The user will provide requirements and 
     container.style.cssText = "position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: 999999;";
     document.body.appendChild(container);
     const transport2 = new InMemoryTransport();
+    init(container, transport2);
     const clipboardAI = new ClipboardAI({
       apiBase: "https://chat.niprgpt.mil/api",
       model: "Anthropic Claude 4 Sonnet",
@@ -2049,7 +2050,6 @@ Remember: You are the primary developer. The user will provide requirements and 
       tools: getToolDefinitions()
     });
     backendApp = createApp(transport2, clipboardAI, null);
-    init(container, transport2);
     const originalOnReceive = transport2.onReceive.bind(transport2);
     transport2.onReceive = (callback) => {
       originalOnReceive((event, data) => {
