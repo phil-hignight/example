@@ -2,7 +2,7 @@
  * Clipboard Chat - Bundled Browser Version
  * Copy this entire file and paste into browser devtools console
  *
- * Generated: 2025-12-11T06:09:46.955Z
+ * Generated: 2025-12-11T13:24:20.505Z
  */
 
 (() => {
@@ -2017,6 +2017,17 @@ Remember: You are the primary developer. The user will provide requirements and 
         console.log("[DEBUG] Input type:", input?.type);
         console.log("[DEBUG] Input can focus:", input ? "yes" : "no");
         if (input) {
+          const styles = window.getComputedStyle(input);
+          console.log("[DEBUG] pointer-events:", styles.pointerEvents);
+          console.log("[DEBUG] z-index:", styles.zIndex);
+          console.log("[DEBUG] opacity:", styles.opacity);
+          console.log("[DEBUG] visibility:", styles.visibility);
+          const rect = input.getBoundingClientRect();
+          const centerX = rect.left + rect.width / 2;
+          const centerY = rect.top + rect.height / 2;
+          const elementAtPoint = document.elementFromPoint(centerX, centerY);
+          console.log("[DEBUG] Element at input center:", elementAtPoint);
+          console.log("[DEBUG] Is it the input?", elementAtPoint === input);
           input.focus();
           console.log("[DEBUG] Attempted to focus input");
           input.addEventListener("input", (e) => {
@@ -2081,15 +2092,11 @@ Remember: You are the primary developer. The user will provide requirements and 
       tools: getToolDefinitions()
     });
     backendApp = createApp(transport2, clipboardAI, null);
-    const originalOnReceive = transport2.onReceive.bind(transport2);
-    transport2.onReceive = (callback) => {
-      originalOnReceive((event, data) => {
-        callback(event, data);
-        if (event === "stream-end") {
-          saveConversation();
-        }
-      });
-    };
+    transport2.onReceive((event, data) => {
+      if (event === "stream-end") {
+        saveConversation();
+      }
+    });
     console.log('[Clipboard Chat] Ready! Click "Select Folder" to begin.');
   }
   if (typeof window !== "undefined") {
