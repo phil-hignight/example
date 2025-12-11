@@ -2,7 +2,7 @@
  * Clipboard Chat - Bundled Browser Version
  * Copy this entire file and paste into browser devtools console
  *
- * Generated: 2025-12-11T03:27:15.732Z
+ * Generated: 2025-12-11T03:36:16.938Z
  */
 
 (() => {
@@ -216,6 +216,20 @@
         role: msg.role,
         content: msg.content
       }));
+      if (this.systemPrompt && apiMessages.length > 0) {
+        const firstUserIndex = apiMessages.findIndex((msg) => msg.role === "user");
+        if (firstUserIndex !== -1) {
+          const firstUserMsg = apiMessages[firstUserIndex];
+          apiMessages[firstUserIndex] = {
+            ...firstUserMsg,
+            content: `<system-reminder>
+${this.systemPrompt}
+</system-reminder>
+
+${firstUserMsg.content}`
+          };
+        }
+      }
       const payload = {
         stream: true,
         model: this.model,
