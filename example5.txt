@@ -2,7 +2,7 @@
  * Clipboard Chat - Bundled Browser Version
  * Copy this entire file and paste into browser devtools console
  *
- * Generated: 2025-12-11T06:01:59.748Z
+ * Generated: 2025-12-11T06:09:46.955Z
  */
 
 (() => {
@@ -206,14 +206,14 @@
       ` : ""}
       <div style="display: flex; gap: 12px;">
         <input
-          id="chat-input"
+          id="claude-code-chat-input"
           type="text"
           placeholder="Type your message..."
           ${state2.isLoading ? "disabled" : ""}
           onkeydown="${handler((e) => {
       if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault();
-        const input = document.getElementById("chat-input");
+        const input = document.getElementById("claude-code-chat-input");
         if (input && input.value.trim()) {
           handleSendMessage(input.value.trim());
           input.value = "";
@@ -232,7 +232,7 @@
         />
         <button
           onclick="${handler(() => {
-      const input = document.getElementById("chat-input");
+      const input = document.getElementById("claude-code-chat-input");
       if (input && input.value.trim()) {
         handleSendMessage(input.value.trim());
         input.value = "";
@@ -2010,7 +2010,7 @@ Remember: You are the primary developer. The user will provide requirements and 
       await datastore.init();
       setState({ workspaceFolder: dirHandle.name, isLoading: false });
       setTimeout(() => {
-        const input = document.getElementById("chat-input");
+        const input = document.getElementById("claude-code-chat-input");
         console.log("[DEBUG] Input element:", input);
         console.log("[DEBUG] Input disabled:", input?.disabled);
         console.log("[DEBUG] Input readonly:", input?.readOnly);
@@ -2063,6 +2063,11 @@ Remember: You are the primary developer. The user will provide requirements and 
   }
   async function initClipboardChat() {
     console.log("[Clipboard Chat] Initializing...");
+    const existing = document.getElementById("clipboard-chat-app");
+    if (existing) {
+      console.log("[Clipboard Chat] Already initialized, removing old instance...");
+      existing.remove();
+    }
     const container = document.createElement("div");
     container.id = "clipboard-chat-app";
     container.style.cssText = "position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: 999999;";
