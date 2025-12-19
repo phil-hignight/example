@@ -1,225 +1,106 @@
-/**
- * All-in-One Pastable API Test
- * Copy this entire file and paste into Chrome DevTools console
- */
+(async () => {
+  const configId = "f5df5665-52d6-4e1b-8f7d-ddbb6a2fd450d";
+  const createSessionUrl =
+    "https://content-us-discoveryengine.googleapis.com/v1alpha/locations/us/widgetCreateSession";
+  const streamAssistUrl =
+    "https://content-us-discoveryengine.googleapis.com/v1alpha/locations/us/widgetStreamAssist";
 
-(function() {
-  console.log('🧪 Pastable API Test Suite loaded');
-  console.log('Available commands:');
-  console.log('  runWorkingExample() - Run the working example code');
-  console.log('  runPastableApp() - Run the pastable app code');
-  console.log('  showCapturedRequests() - Show all captured requests');
-  console.log('  clearRequests() - Clear captured requests');
+  const postApi = async (url, body) => {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) throw new Error(`API request failed: ${response.status}`);
+    let responseText = await response.text();
+    if (responseText.startsWith(')]}"')) {
+      responseText = responseText.substring(5);
+    }
+    return JSON.parse(responseText);
+  };
 
-  // ========================================================================
-  // FETCH INTERCEPTOR
-  // ========================================================================
-  const capturedRequests = [];
-  const originalFetch = window.fetch;
+  const streamAndProcess = async (url, body) => {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok)
+      throw new Error(`Streaming request failed: ${response.status}`);
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let fullResponseText = "";
 
-  window.fetch = async function(...args) {
-    const [url, options = {}] = args;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      fullResponseText += decoder.decode(value);
+    }
 
-    // Only intercept widgetCreateSession requests
-    if (url && url.includes('widgetCreateSession')) {
-      console.log('\n' + '='.repeat(80));
-      console.log('📡 INTERCEPTED widgetCreateSession REQUEST');
-      console.log('='.repeat(80));
+    if (fullResponseText.startsWith(')]}"')) {
+      fullResponseText = fullResponseText.substring(5);
+    }
+    const parsedData = JSON.parse(fullResponseText);
+    return Array.isArray(parsedData) ? parsedData : [parsedData];
+  };
 
-      const requestBody = options.body;
-      const requestBodyString = typeof requestBody === 'string' ? requestBody : JSON.stringify(requestBody);
-
-      const charLength = requestBodyString.length;
-      const byteLength = new TextEncoder().encode(requestBodyString).length;
-      const buffer = new TextEncoder().encode(requestBodyString);
-
-      const capturedRequest = {
-        timestamp: Date.now(),
-        url,
-        method: options.method,
-        headers: options.headers,
-        body: requestBodyString,
-        charLength,
-        byteLength,
-        buffer: Array.from(buffer)
-      };
-
-      capturedRequests.push(capturedRequest);
-
-      console.log('Request #' + capturedRequests.length);
-      console.log('  Char length:', charLength);
-      console.log('  Byte length:', byteLength);
-      console.log('  Body:', requestBodyString);
-
-      // If we have 2+ requests, compare them
-      if (capturedRequests.length >= 2) {
-        console.log('\n' + '='.repeat(80));
-        console.log('🔬 COMPARING REQUESTS');
-        console.log('='.repeat(80));
-
-        const req1 = capturedRequests[0];
-        const req2 = capturedRequests[capturedRequests.length - 1];
-
-        console.log('\nRequest 1:', req1.charLength, 'chars,', req1.byteLength, 'bytes');
-        console.log('Request 2:', req2.charLength, 'chars,', req2.byteLength, 'bytes');
-        console.log('Difference:', req2.charLength - req1.charLength, 'chars,', req2.byteLength - req1.byteLength, 'bytes');
-        console.log('Bodies equal:', req1.body === req2.body);
-
-        if (req1.body !== req2.body) {
-          console.log('\n❌ BODIES ARE DIFFERENT!');
-
-          // Find first difference
-          const maxLen = Math.max(req1.body.length, req2.body.length);
-          for (let i = 0; i < maxLen; i++) {
-            if (req1.body[i] !== req2.body[i]) {
-              console.log('\nFirst difference at position', i + ':');
-              console.log('  Req1: "' + req1.body[i] + '" (code:', (req1.body[i]?.charCodeAt(0) ?? 'EOF') + ')');
-              console.log('  Req2: "' + req2.body[i] + '" (code:', (req2.body[i]?.charCodeAt(0) ?? 'EOF') + ')');
-
-              const start = Math.max(0, i - 20);
-              const end = Math.min(maxLen, i + 20);
-              console.log('  Req1 context: "' + req1.body.slice(start, end) + '"');
-              console.log('  Req2 context: "' + req2.body.slice(start, end) + '"');
-              break;
-            }
+  const getReplyText = (responseArray) => {
+    let fullText = "";
+    for (const chunk of responseArray) {
+      const replies = chunk?.streamAssistResponse?.answer?.replies;
+      if (replies) {
+        for (const reply of replies) {
+          const text = reply?.groundedContent?.content?.text;
+          if (text && !reply?.groundedContent?.content?.thought) {
+            fullText += text;
           }
-        } else {
-          console.log('\n✅ BODIES ARE IDENTICAL!');
         }
-
-        console.log('='.repeat(80) + '\n');
       }
     }
-
-    // Call original fetch
-    return originalFetch.apply(this, args);
+    return fullText.replace(/\\n/g, "\n").trim();
   };
 
-  console.log('✅ Fetch interceptor installed\n');
+  try {
+    const sessionResponse = await postApi(createSessionUrl, {
+      configId: configId,
+      additionalParams: { token: "-" },
+      createSessionRequest: { session: { name: "-", displayName: "" } },
+    });
+    const sessionName = sessionResponse.session.name;
+    if (!sessionName) throw new Error("Failed to get session name.");
 
-  // ========================================================================
-  // WORKING EXAMPLE
-  // ========================================================================
-  window.runWorkingExample = async function() {
-    console.log('\n' + '='.repeat(80));
-    console.log('🚀 Running Working Example');
-    console.log('='.repeat(80) + '\n');
-
-    const configId = "f5df5665-52d6-4e1b-8f7d-ddbb6a2fd450d";
-    const createSessionUrl = "https://content-us-discoveryengine.googleapis.com/v1alpha/locations/us/widgetCreateSession";
-
-    try {
-      const response = await fetch(createSessionUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          configId: configId,
-          additionalParams: { token: "-" },
-          createSessionRequest: { session: { name: "-", displayName: "" } },
-        }),
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error('❌ Working example failed:', response.status);
-        console.error('Error:', errorText);
-        return;
-      }
-
-      let responseText = await response.text();
-      if (responseText.startsWith(')]}"')) {
-        responseText = responseText.substring(5);
-      }
-
-      const data = JSON.parse(responseText);
-      console.log('✅ Working example succeeded!');
-      console.log('Session:', data.session?.name || 'N/A');
-
-    } catch (error) {
-      console.error('❌ Working example error:', error.message);
-      console.error(error);
-    }
-
-    console.log('\n' + '='.repeat(80) + '\n');
-  };
-
-  // ========================================================================
-  // PASTABLE APP (Simplified - just the initialize part)
-  // ========================================================================
-  window.runPastableApp = async function() {
-    console.log('\n' + '='.repeat(80));
-    console.log('🚀 Running Pastable App');
-    console.log('='.repeat(80) + '\n');
-
-    const CONFIG_ID = "f5df5665-52d6-4e1b-8f7d-ddbb6a2fd450d";
-    const CREATE_SESSION_URL = "https://content-us-discoveryengine.googleapis.com/v1alpha/locations/us/widgetCreateSession";
-
-    try {
-      const requestBody = JSON.stringify({
-        configId: CONFIG_ID,
-        additionalParams: { token: "-" },
-        createSessionRequest: { session: { name: "-", displayName: "" } }
-      });
-
-      console.log('[AI] Request body length:', requestBody.length);
-      console.log('[AI] Request body bytes:', new TextEncoder().encode(requestBody).length);
-
-      const response = await fetch(CREATE_SESSION_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: requestBody
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error('❌ Pastable app failed:', response.status);
-        console.error('Error:', errorText);
-        return;
-      }
-
-      let responseText = await response.text();
-      if (responseText.startsWith(')]}"')) {
-        responseText = responseText.substring(5);
-      }
-
-      const data = JSON.parse(responseText);
-      console.log('✅ Pastable app succeeded!');
-      console.log('Session:', data.session?.name || 'N/A');
-
-    } catch (error) {
-      console.error('❌ Pastable app error:', error.message);
-      console.error(error);
-    }
-
-    console.log('\n' + '='.repeat(80) + '\n');
-  };
-
-  // ========================================================================
-  // UTILITY FUNCTIONS
-  // ========================================================================
-  window.showCapturedRequests = function() {
-    console.log('\n' + '='.repeat(80));
-    console.log('📊 Captured', capturedRequests.length, 'request(s)');
-    console.log('='.repeat(80));
-
-    capturedRequests.forEach((req, idx) => {
-      console.log('\nRequest #' + (idx + 1) + ':');
-      console.log('  Timestamp:', new Date(req.timestamp).toLocaleTimeString());
-      console.log('  Char length:', req.charLength);
-      console.log('  Byte length:', req.byteLength);
-      console.log('  Body:', req.body);
+    await streamAndProcess(streamAssistUrl, {
+      configId: configId,
+      additionalParams: { token: "-" },
+      streamAssistRequest: {
+        session: sessionName,
+        query: { parts: [{ text: "My name is John." }] },
+      },
     });
 
-    console.log('\n' + '='.repeat(80) + '\n');
-  };
+    const secondResponse = await streamAndProcess(streamAssistUrl, {
+      configId: configId,
+      additionalParams: { token: "-" },
+      streamAssistRequest: {
+        session: sessionName,
+        query: { parts: [{ text: "What is my name?" }] },
+      },
+    });
+    const secondReply = getReplyText(secondResponse);
 
-  window.clearRequests = function() {
-    capturedRequests.length = 0;
-    console.log('✅ Cleared all captured requests\n');
-  };
+    console.log(`--- TEST RESULT ---`);
+    console.log(`AI's final answer to "What is my name?":\n"${secondReply}"`);
 
-  // Expose for console access
-  window.__capturedRequests = capturedRequests;
-
-  console.log('\n✨ Ready! Run runWorkingExample() and then runPastableApp() to compare\n');
+    if (secondReply.toLowerCase().includes("john")) {
+      console.log(
+        "✅ SUCCESS: The AI remembered the name 'John', proving the conversation is stateful."
+      );
+    } else {
+      console.log(
+        "❌ FAILURE: The AI did not remember the name or the text was not extracted correctly."
+      );
+    }
+  } catch (error) {
+    console.error("An error occurred during the replication:", error.message);
+  }
 })();
