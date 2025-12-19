@@ -1,316 +1,225 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Pastable API Test - All-in-One</title>
-  <style>
-    body {
-      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-      max-width: 1200px;
-      margin: 40px auto;
-      padding: 20px;
-      background: #0d1117;
-      color: #e6edf3;
-    }
-    .container {
-      background: #161b22;
-      border: 1px solid #30363d;
-      border-radius: 8px;
-      padding: 24px;
-      margin-bottom: 20px;
-    }
-    h1 {
-      color: #58a6ff;
-      margin-top: 0;
-    }
-    h2 {
-      color: #58a6ff;
-      border-bottom: 1px solid #30363d;
-      padding-bottom: 10px;
-    }
-    button {
-      background: #238636;
-      border: 1px solid #2ea043;
-      color: white;
-      padding: 10px 20px;
-      font-size: 14px;
-      border-radius: 6px;
-      cursor: pointer;
-      margin-right: 10px;
-      margin-bottom: 10px;
-    }
-    button:hover {
-      background: #2ea043;
-    }
-    button.secondary {
-      background: #21262d;
-      border: 1px solid #30363d;
-      color: #e6edf3;
-    }
-    button.secondary:hover {
-      background: #30363d;
-    }
-    .log {
-      background: #0d1117;
-      border: 1px solid #30363d;
-      border-radius: 6px;
-      padding: 12px;
-      margin-top: 12px;
-      font-family: 'Courier New', monospace;
-      font-size: 12px;
-      max-height: 400px;
-      overflow-y: auto;
-      white-space: pre-wrap;
-    }
-    .success {
-      color: #3fb950;
-    }
-    .error {
-      color: #f85149;
-    }
-    .info {
-      color: #58a6ff;
-    }
-    .warning {
-      color: #d29922;
-    }
-  </style>
-</head>
-<body>
-  <h1>🧪 Pastable API Test Suite</h1>
+/**
+ * All-in-One Pastable API Test
+ * Copy this entire file and paste into Chrome DevTools console
+ */
 
-  <div class="container">
-    <h2>Test Controls</h2>
-    <p>This page tests the pastable agent with an interceptor to compare requests.</p>
-    <button onclick="runWorkingExample()">1. Run Working Example</button>
-    <button onclick="runPastableApp()">2. Run Pastable App</button>
-    <button class="secondary" onclick="clearLog()">Clear Log</button>
-    <button class="secondary" onclick="showCapturedRequests()">Show Captured Requests</button>
-  </div>
+(function() {
+  console.log('🧪 Pastable API Test Suite loaded');
+  console.log('Available commands:');
+  console.log('  runWorkingExample() - Run the working example code');
+  console.log('  runPastableApp() - Run the pastable app code');
+  console.log('  showCapturedRequests() - Show all captured requests');
+  console.log('  clearRequests() - Clear captured requests');
 
-  <div class="container">
-    <h2>Console Output</h2>
-    <div id="log" class="log">Ready. Click a button above to start testing.</div>
-  </div>
+  // ========================================================================
+  // FETCH INTERCEPTOR
+  // ========================================================================
+  const capturedRequests = [];
+  const originalFetch = window.fetch;
 
-  <script>
-    // ========================================================================
-    // LOGGING UTILITIES
-    // ========================================================================
-    function log(message, type = 'info') {
-      const logDiv = document.getElementById('log');
-      const timestamp = new Date().toLocaleTimeString();
-      const className = type;
-      const line = `<span class="${className}">[${timestamp}] ${message}</span>\n`;
-      logDiv.innerHTML += line;
-      logDiv.scrollTop = logDiv.scrollHeight;
-      console.log(`[${type.toUpperCase()}] ${message}`);
-    }
+  window.fetch = async function(...args) {
+    const [url, options = {}] = args;
 
-    function clearLog() {
-      document.getElementById('log').innerHTML = 'Log cleared.\n';
-    }
+    // Only intercept widgetCreateSession requests
+    if (url && url.includes('widgetCreateSession')) {
+      console.log('\n' + '='.repeat(80));
+      console.log('📡 INTERCEPTED widgetCreateSession REQUEST');
+      console.log('='.repeat(80));
 
-    // ========================================================================
-    // FETCH INTERCEPTOR
-    // ========================================================================
-    const capturedRequests = [];
-    const originalFetch = window.fetch;
+      const requestBody = options.body;
+      const requestBodyString = typeof requestBody === 'string' ? requestBody : JSON.stringify(requestBody);
 
-    window.fetch = async function(...args) {
-      const [url, options = {}] = args;
+      const charLength = requestBodyString.length;
+      const byteLength = new TextEncoder().encode(requestBodyString).length;
+      const buffer = new TextEncoder().encode(requestBodyString);
 
-      // Only intercept widgetCreateSession requests
-      if (url && url.includes('widgetCreateSession')) {
-        log('📡 Intercepted widgetCreateSession request', 'info');
+      const capturedRequest = {
+        timestamp: Date.now(),
+        url,
+        method: options.method,
+        headers: options.headers,
+        body: requestBodyString,
+        charLength,
+        byteLength,
+        buffer: Array.from(buffer)
+      };
 
-        const requestBody = options.body;
-        const requestBodyString = typeof requestBody === 'string' ? requestBody : JSON.stringify(requestBody);
+      capturedRequests.push(capturedRequest);
 
-        const charLength = requestBodyString.length;
-        const byteLength = new TextEncoder().encode(requestBodyString).length;
-        const buffer = new TextEncoder().encode(requestBodyString);
+      console.log('Request #' + capturedRequests.length);
+      console.log('  Char length:', charLength);
+      console.log('  Byte length:', byteLength);
+      console.log('  Body:', requestBodyString);
 
-        const capturedRequest = {
-          timestamp: Date.now(),
-          url,
-          method: options.method,
-          headers: options.headers,
-          body: requestBodyString,
-          charLength,
-          byteLength,
-          buffer: Array.from(buffer)
-        };
+      // If we have 2+ requests, compare them
+      if (capturedRequests.length >= 2) {
+        console.log('\n' + '='.repeat(80));
+        console.log('🔬 COMPARING REQUESTS');
+        console.log('='.repeat(80));
 
-        capturedRequests.push(capturedRequest);
+        const req1 = capturedRequests[0];
+        const req2 = capturedRequests[capturedRequests.length - 1];
 
-        log(`Request #${capturedRequests.length}`, 'info');
-        log(`  Char length: ${charLength}`, 'info');
-        log(`  Byte length: ${byteLength}`, 'info');
-        log(`  Body: ${requestBodyString}`, 'info');
+        console.log('\nRequest 1:', req1.charLength, 'chars,', req1.byteLength, 'bytes');
+        console.log('Request 2:', req2.charLength, 'chars,', req2.byteLength, 'bytes');
+        console.log('Difference:', req2.charLength - req1.charLength, 'chars,', req2.byteLength - req1.byteLength, 'bytes');
+        console.log('Bodies equal:', req1.body === req2.body);
 
-        // If we have 2+ requests, compare them
-        if (capturedRequests.length >= 2) {
-          log('═'.repeat(60), 'warning');
-          log('🔬 COMPARING REQUESTS', 'warning');
-          log('═'.repeat(60), 'warning');
+        if (req1.body !== req2.body) {
+          console.log('\n❌ BODIES ARE DIFFERENT!');
 
-          const req1 = capturedRequests[0];
-          const req2 = capturedRequests[capturedRequests.length - 1];
+          // Find first difference
+          const maxLen = Math.max(req1.body.length, req2.body.length);
+          for (let i = 0; i < maxLen; i++) {
+            if (req1.body[i] !== req2.body[i]) {
+              console.log('\nFirst difference at position', i + ':');
+              console.log('  Req1: "' + req1.body[i] + '" (code:', (req1.body[i]?.charCodeAt(0) ?? 'EOF') + ')');
+              console.log('  Req2: "' + req2.body[i] + '" (code:', (req2.body[i]?.charCodeAt(0) ?? 'EOF') + ')');
 
-          log(`Request 1: ${req1.charLength} chars, ${req1.byteLength} bytes`, 'info');
-          log(`Request 2: ${req2.charLength} chars, ${req2.byteLength} bytes`, 'info');
-          log(`Difference: ${req2.charLength - req1.charLength} chars, ${req2.byteLength - req1.byteLength} bytes`, 'warning');
-          log(`Bodies equal: ${req1.body === req2.body}`, req1.body === req2.body ? 'success' : 'error');
-
-          if (req1.body !== req2.body) {
-            log('❌ BODIES ARE DIFFERENT!', 'error');
-
-            // Find differences
-            const maxLen = Math.max(req1.body.length, req2.body.length);
-            for (let i = 0; i < maxLen; i++) {
-              if (req1.body[i] !== req2.body[i]) {
-                log(`First difference at position ${i}:`, 'error');
-                log(`  Req1: '${req1.body[i]}' (code: ${req1.body[i]?.charCodeAt(0) ?? 'EOF'})`, 'error');
-                log(`  Req2: '${req2.body[i]}' (code: ${req2.body[i]?.charCodeAt(0) ?? 'EOF'})`, 'error');
-
-                const start = Math.max(0, i - 20);
-                const end = Math.min(maxLen, i + 20);
-                log(`  Req1 context: "${req1.body.slice(start, end)}"`, 'error');
-                log(`  Req2 context: "${req2.body.slice(start, end)}"`, 'error');
-                break;
-              }
+              const start = Math.max(0, i - 20);
+              const end = Math.min(maxLen, i + 20);
+              console.log('  Req1 context: "' + req1.body.slice(start, end) + '"');
+              console.log('  Req2 context: "' + req2.body.slice(start, end) + '"');
+              break;
             }
-          } else {
-            log('✅ BODIES ARE IDENTICAL!', 'success');
           }
-
-          log('═'.repeat(60), 'warning');
+        } else {
+          console.log('\n✅ BODIES ARE IDENTICAL!');
         }
+
+        console.log('='.repeat(80) + '\n');
       }
-
-      // Call original fetch
-      return originalFetch.apply(this, args);
-    };
-
-    log('✅ Fetch interceptor installed', 'success');
-
-    // ========================================================================
-    // WORKING EXAMPLE
-    // ========================================================================
-    async function runWorkingExample() {
-      log('═'.repeat(60), 'info');
-      log('🚀 Running Working Example', 'info');
-      log('═'.repeat(60), 'info');
-
-      const configId = "f5df5665-52d6-4e1b-8f7d-ddbb6a2fd450d";
-      const createSessionUrl = "https://content-us-discoveryengine.googleapis.com/v1alpha/locations/us/widgetCreateSession";
-
-      try {
-        const response = await fetch(createSessionUrl, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            configId: configId,
-            additionalParams: { token: "-" },
-            createSessionRequest: { session: { name: "-", displayName: "" } },
-          }),
-        });
-
-        if (!response.ok) {
-          const errorText = await response.text();
-          log(`❌ Working example failed: ${response.status}`, 'error');
-          log(`Error: ${errorText}`, 'error');
-          return;
-        }
-
-        let responseText = await response.text();
-        if (responseText.startsWith(')]}"')) {
-          responseText = responseText.substring(5);
-        }
-
-        const data = JSON.parse(responseText);
-        log(`✅ Working example succeeded!`, 'success');
-        log(`Session: ${data.session?.name || 'N/A'}`, 'success');
-
-      } catch (error) {
-        log(`❌ Working example error: ${error.message}`, 'error');
-      }
-
-      log('═'.repeat(60), 'info');
     }
 
-    // ========================================================================
-    // PASTABLE APP (Simplified - just the initialize part)
-    // ========================================================================
-    async function runPastableApp() {
-      log('═'.repeat(60), 'info');
-      log('🚀 Running Pastable App', 'info');
-      log('═'.repeat(60), 'info');
+    // Call original fetch
+    return originalFetch.apply(this, args);
+  };
 
-      const CONFIG_ID = "f5df5665-52d6-4e1b-8f7d-ddbb6a2fd450d";
-      const CREATE_SESSION_URL = "https://content-us-discoveryengine.googleapis.com/v1alpha/locations/us/widgetCreateSession";
+  console.log('✅ Fetch interceptor installed\n');
 
-      try {
-        const requestBody = JSON.stringify({
-          configId: CONFIG_ID,
+  // ========================================================================
+  // WORKING EXAMPLE
+  // ========================================================================
+  window.runWorkingExample = async function() {
+    console.log('\n' + '='.repeat(80));
+    console.log('🚀 Running Working Example');
+    console.log('='.repeat(80) + '\n');
+
+    const configId = "f5df5665-52d6-4e1b-8f7d-ddbb6a2fd450d";
+    const createSessionUrl = "https://content-us-discoveryengine.googleapis.com/v1alpha/locations/us/widgetCreateSession";
+
+    try {
+      const response = await fetch(createSessionUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          configId: configId,
           additionalParams: { token: "-" },
-          createSessionRequest: { session: { name: "-", displayName: "" } }
-        });
-
-        log(`[AI] Request body length: ${requestBody.length}`, 'info');
-        log(`[AI] Request body bytes: ${new TextEncoder().encode(requestBody).length}`, 'info');
-
-        const response = await fetch(CREATE_SESSION_URL, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: requestBody
-        });
-
-        if (!response.ok) {
-          const errorText = await response.text();
-          log(`❌ Pastable app failed: ${response.status}`, 'error');
-          log(`Error: ${errorText}`, 'error');
-          return;
-        }
-
-        let responseText = await response.text();
-        if (responseText.startsWith(')]}"')) {
-          responseText = responseText.substring(5);
-        }
-
-        const data = JSON.parse(responseText);
-        log(`✅ Pastable app succeeded!`, 'success');
-        log(`Session: ${data.session?.name || 'N/A'}`, 'success');
-
-      } catch (error) {
-        log(`❌ Pastable app error: ${error.message}`, 'error');
-      }
-
-      log('═'.repeat(60), 'info');
-    }
-
-    // ========================================================================
-    // UTILITY FUNCTIONS
-    // ========================================================================
-    function showCapturedRequests() {
-      log('═'.repeat(60), 'info');
-      log(`📊 Captured ${capturedRequests.length} request(s)`, 'info');
-
-      capturedRequests.forEach((req, idx) => {
-        log(`\nRequest #${idx + 1}:`, 'info');
-        log(`  Timestamp: ${new Date(req.timestamp).toLocaleTimeString()}`, 'info');
-        log(`  Char length: ${req.charLength}`, 'info');
-        log(`  Byte length: ${req.byteLength}`, 'info');
-        log(`  Body: ${req.body}`, 'info');
+          createSessionRequest: { session: { name: "-", displayName: "" } },
+        }),
       });
 
-      log('═'.repeat(60), 'info');
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error('❌ Working example failed:', response.status);
+        console.error('Error:', errorText);
+        return;
+      }
+
+      let responseText = await response.text();
+      if (responseText.startsWith(')]}"')) {
+        responseText = responseText.substring(5);
+      }
+
+      const data = JSON.parse(responseText);
+      console.log('✅ Working example succeeded!');
+      console.log('Session:', data.session?.name || 'N/A');
+
+    } catch (error) {
+      console.error('❌ Working example error:', error.message);
+      console.error(error);
     }
 
-    // Expose for console access
-    window.__capturedRequests = capturedRequests;
-  </script>
-</body>
-</html>
+    console.log('\n' + '='.repeat(80) + '\n');
+  };
+
+  // ========================================================================
+  // PASTABLE APP (Simplified - just the initialize part)
+  // ========================================================================
+  window.runPastableApp = async function() {
+    console.log('\n' + '='.repeat(80));
+    console.log('🚀 Running Pastable App');
+    console.log('='.repeat(80) + '\n');
+
+    const CONFIG_ID = "f5df5665-52d6-4e1b-8f7d-ddbb6a2fd450d";
+    const CREATE_SESSION_URL = "https://content-us-discoveryengine.googleapis.com/v1alpha/locations/us/widgetCreateSession";
+
+    try {
+      const requestBody = JSON.stringify({
+        configId: CONFIG_ID,
+        additionalParams: { token: "-" },
+        createSessionRequest: { session: { name: "-", displayName: "" } }
+      });
+
+      console.log('[AI] Request body length:', requestBody.length);
+      console.log('[AI] Request body bytes:', new TextEncoder().encode(requestBody).length);
+
+      const response = await fetch(CREATE_SESSION_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: requestBody
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error('❌ Pastable app failed:', response.status);
+        console.error('Error:', errorText);
+        return;
+      }
+
+      let responseText = await response.text();
+      if (responseText.startsWith(')]}"')) {
+        responseText = responseText.substring(5);
+      }
+
+      const data = JSON.parse(responseText);
+      console.log('✅ Pastable app succeeded!');
+      console.log('Session:', data.session?.name || 'N/A');
+
+    } catch (error) {
+      console.error('❌ Pastable app error:', error.message);
+      console.error(error);
+    }
+
+    console.log('\n' + '='.repeat(80) + '\n');
+  };
+
+  // ========================================================================
+  // UTILITY FUNCTIONS
+  // ========================================================================
+  window.showCapturedRequests = function() {
+    console.log('\n' + '='.repeat(80));
+    console.log('📊 Captured', capturedRequests.length, 'request(s)');
+    console.log('='.repeat(80));
+
+    capturedRequests.forEach((req, idx) => {
+      console.log('\nRequest #' + (idx + 1) + ':');
+      console.log('  Timestamp:', new Date(req.timestamp).toLocaleTimeString());
+      console.log('  Char length:', req.charLength);
+      console.log('  Byte length:', req.byteLength);
+      console.log('  Body:', req.body);
+    });
+
+    console.log('\n' + '='.repeat(80) + '\n');
+  };
+
+  window.clearRequests = function() {
+    capturedRequests.length = 0;
+    console.log('✅ Cleared all captured requests\n');
+  };
+
+  // Expose for console access
+  window.__capturedRequests = capturedRequests;
+
+  console.log('\n✨ Ready! Run runWorkingExample() and then runPastableApp() to compare\n');
+})();
