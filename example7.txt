@@ -1,5 +1,5 @@
 (async () => {
-  const configId = "f5df5665-52d6-4e1b-8f7d-ddbb6a2fd450d";
+  const configId = "f5df5665-52d6-4e1b-8f7d-ddb6a2fd450d";
   const createSessionUrl =
     "https://content-us-discoveryengine.googleapis.com/v1alpha/locations/us/widgetCreateSession";
   const streamAssistUrl =
