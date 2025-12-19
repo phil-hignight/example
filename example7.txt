@@ -1,184 +1,3593 @@
-/**
- * Fetch Interceptor & Comparator
- * Paste this into the browser console BEFORE running either the example or the app
- * It will intercept fetch calls and compare request bodies
- */
+// Claude Agent - Paste into browser console
+// Usage: Copy and paste this entire file into Chrome DevTools console
+// Repository: https://github.com/yourusername/claude-agent
+// Built: 2025-12-19T03:39:52.310Z
 
-(function() {
-  console.log('🔍 Fetch Interceptor Active');
+(() => {
+  var __defProp = Object.defineProperty;
+  var __defNormalProp = (obj, key, value) => key in obj ? __defProp(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
+  var __publicField = (obj, key, value) => __defNormalProp(obj, typeof key !== "symbol" ? key + "" : key, value);
 
-  // Store captured requests
-  const capturedRequests = [];
-
-  // Save original fetch
-  const originalFetch = window.fetch;
-
-  // Override fetch
-  window.fetch = async function(...args) {
-    const [url, options = {}] = args;
-
-    // Only intercept widgetCreateSession requests
-    if (url && url.includes('widgetCreateSession')) {
-      console.log('\n='.repeat(80));
-      console.log('📡 INTERCEPTED widgetCreateSession REQUEST');
-      console.log('='.repeat(80));
-
-      const requestBody = options.body;
-      const requestBodyString = typeof requestBody === 'string' ? requestBody : JSON.stringify(requestBody);
-
-      // Calculate metrics
-      const charLength = requestBodyString.length;
-      const byteLength = new TextEncoder().encode(requestBodyString).length;
-      const buffer = new TextEncoder().encode(requestBodyString);
-
-      // Store this request
-      const capturedRequest = {
-        timestamp: Date.now(),
-        url,
-        method: options.method,
-        headers: options.headers,
-        body: requestBodyString,
-        charLength,
-        byteLength,
-        buffer: Array.from(buffer) // Convert to array for comparison
-      };
-
-      capturedRequests.push(capturedRequest);
-
-      console.log('Request #' + capturedRequests.length);
-      console.log('URL:', url);
-      console.log('Method:', options.method);
-      console.log('Headers:', options.headers);
-      console.log('Body (string length):', charLength);
-      console.log('Body (byte length):', byteLength);
-      console.log('Body content:', requestBodyString);
-      console.log('First 20 bytes:', buffer.slice(0, 20));
-      console.log('Last 20 bytes:', buffer.slice(-20));
-
-      // If we have 2+ requests, compare them
-      if (capturedRequests.length >= 2) {
-        console.log('\n' + '='.repeat(80));
-        console.log('🔬 COMPARING REQUESTS');
-        console.log('='.repeat(80));
-
-        const req1 = capturedRequests[0];
-        const req2 = capturedRequests[capturedRequests.length - 1];
-
-        console.log('\n--- REQUEST 1 (First Capture) ---');
-        console.log('Char length:', req1.charLength);
-        console.log('Byte length:', req1.byteLength);
-        console.log('Body:', req1.body);
-
-        console.log('\n--- REQUEST 2 (Latest Capture) ---');
-        console.log('Char length:', req2.charLength);
-        console.log('Byte length:', req2.byteLength);
-        console.log('Body:', req2.body);
-
-        console.log('\n--- DIFFERENCES ---');
-        console.log('Char length diff:', req2.charLength - req1.charLength);
-        console.log('Byte length diff:', req2.byteLength - req1.byteLength);
-        console.log('Bodies equal:', req1.body === req2.body);
-
-        // Character-by-character comparison
-        if (req1.body !== req2.body) {
-          console.log('\n--- CHARACTER DIFFERENCES ---');
-          const maxLen = Math.max(req1.body.length, req2.body.length);
-          let diffCount = 0;
-
-          for (let i = 0; i < maxLen; i++) {
-            const char1 = req1.body[i];
-            const char2 = req2.body[i];
-
-            if (char1 !== char2) {
-              diffCount++;
-              if (diffCount <= 10) {
-                console.log(`Position ${i}:`);
-                console.log(`  Req1: '${char1}' (code: ${char1?.charCodeAt(0) ?? 'EOF'})`);
-                console.log(`  Req2: '${char2}' (code: ${char2?.charCodeAt(0) ?? 'EOF'})`);
-
-                // Show context
-                const start = Math.max(0, i - 10);
-                const end = Math.min(maxLen, i + 10);
-                console.log(`  Req1 context: "${req1.body.slice(start, end)}"`);
-                console.log(`  Req2 context: "${req2.body.slice(start, end)}"`);
-              }
-            }
-          }
-
-          if (diffCount > 10) {
-            console.log(`... and ${diffCount - 10} more character differences`);
-          }
-
-          console.log(`\nTotal character differences: ${diffCount}`);
-        }
-
-        // Byte-by-byte comparison
-        if (req1.byteLength !== req2.byteLength || req1.body !== req2.body) {
-          console.log('\n--- BYTE DIFFERENCES ---');
-          const maxLen = Math.max(req1.buffer.length, req2.buffer.length);
-          let byteDiffCount = 0;
-
-          for (let i = 0; i < maxLen; i++) {
-            const byte1 = req1.buffer[i];
-            const byte2 = req2.buffer[i];
-
-            if (byte1 !== byte2) {
-              byteDiffCount++;
-              if (byteDiffCount <= 10) {
-                console.log(`Byte ${i}:`);
-                console.log(`  Req1: ${byte1 ?? 'EOF'} (0x${byte1?.toString(16).padStart(2, '0') ?? '--'}) '${String.fromCharCode(byte1 ?? 0)}'`);
-                console.log(`  Req2: ${byte2 ?? 'EOF'} (0x${byte2?.toString(16).padStart(2, '0') ?? '--'}) '${String.fromCharCode(byte2 ?? 0)}'`);
-              }
-            }
-          }
-
-          if (byteDiffCount > 10) {
-            console.log(`... and ${byteDiffCount - 10} more byte differences`);
-          }
-
-          console.log(`\nTotal byte differences: ${byteDiffCount}`);
-        }
-
-        // JSON comparison
-        console.log('\n--- PARSED JSON COMPARISON ---');
-        try {
-          const json1 = JSON.parse(req1.body);
-          const json2 = JSON.parse(req2.body);
-
-          console.log('Req1 parsed:', JSON.stringify(json1, null, 2));
-          console.log('\nReq2 parsed:', JSON.stringify(json2, null, 2));
-
-          const deepEqual = JSON.stringify(json1) === JSON.stringify(json2);
-          console.log('\nParsed objects equal:', deepEqual);
-
-          // Compare keys
-          const keys1 = Object.keys(json1);
-          const keys2 = Object.keys(json2);
-          console.log('Req1 keys:', keys1);
-          console.log('Req2 keys:', keys2);
-          console.log('Keys equal:', JSON.stringify(keys1) === JSON.stringify(keys2));
-
-        } catch (e) {
-          console.error('Failed to parse JSON:', e.message);
-        }
-
-        console.log('\n' + '='.repeat(80));
-      }
-
-      console.log('\n💡 TIP: Captured ' + capturedRequests.length + ' request(s). Run more requests to compare.');
-      console.log('💡 Access captured data: window.__capturedRequests');
-      console.log('='.repeat(80) + '\n');
+  // apps/pastable/src/transport.js
+  var InMemoryTransport = class {
+    constructor() {
+      this.frontendHandler = null;
+      this.backendHandler = null;
     }
+    /**
+     * Set up frontend-side listener
+     * @param {Function} handler - (event, data) => void
+     */
+    onReceiveFromBackend(handler2) {
+      this.frontendHandler = handler2;
+    }
+    /**
+     * Set up backend-side listener
+     * @param {Function} handler - (event, data) => void
+     */
+    onReceive(handler2) {
+      this.backendHandler = handler2;
+    }
+    /**
+     * Send from frontend to backend
+     * @param {string} event - Event name
+     * @param {*} data - Event data
+     */
+    send(event, data) {
+      if (this.backendHandler) {
+        setTimeout(() => this.backendHandler(event, data), 0);
+      }
+    }
+    /**
+     * Send from backend to frontend
+     * @param {string} event - Event name
+     * @param {*} data - Event data
+     */
+    sendToFrontend(event, data) {
+      if (this.frontendHandler) {
+        setTimeout(() => this.frontendHandler(event, data), 0);
+      }
+    }
+  };
+  function createTransportPair() {
+    const sharedTransport = new InMemoryTransport();
+    const frontendTransport = {
+      send: (event, data) => sharedTransport.send(event, data),
+      onReceive: (handler2) => sharedTransport.onReceiveFromBackend(handler2)
+    };
+    const backendTransport = {
+      send: (event, data) => sharedTransport.sendToFrontend(event, data),
+      onReceive: (handler2) => sharedTransport.onReceive(handler2)
+    };
+    return { frontendTransport, backendTransport };
+  }
 
-    // Call original fetch
-    return originalFetch.apply(this, args);
+  // apps/pastable/src/ai.js
+  var CONFIG_ID = "f5df5665-52d6-4e1b-8f7d-ddbb6a2fd450d";
+  var CREATE_SESSION_URL = "https://content-us-discoveryengine.googleapis.com/v1alpha/locations/us/widgetCreateSession";
+  var STREAM_ASSIST_URL = "https://content-us-discoveryengine.googleapis.com/v1alpha/locations/us/widgetStreamAssist";
+  var BrowserAI = class {
+    constructor() {
+      this.sessionName = null;
+    }
+    async initialize() {
+      const requestBody = JSON.stringify({
+        configId: CONFIG_ID,
+        additionalParams: { token: "-" },
+        createSessionRequest: { session: { name: "-", displayName: "" } }
+      });
+      console.log("[AI] Request body length:", requestBody.length);
+      console.log("[AI] Request body:", requestBody);
+      console.log("[AI] Request body bytes:", new TextEncoder().encode(requestBody).length);
+      const response = await fetch(CREATE_SESSION_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: requestBody
+      });
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error("[AI] Error response:", errorText);
+        throw new Error(`Failed to create session: ${response.status}`);
+      }
+      let responseText = await response.text();
+      if (responseText.startsWith(')]}"')) {
+        responseText = responseText.substring(5);
+      }
+      const data = JSON.parse(responseText);
+      this.sessionName = data.session.name;
+      if (!this.sessionName) {
+        throw new Error("Failed to get session name");
+      }
+      console.log("[AI] Session initialized:", this.sessionName);
+    }
+    /**
+     * Stream a message and yield events
+     * @param {Array} conversationNodes - Not used (API maintains state)
+     * @param {string} currentMode - Not used
+     * @yields {Object} Events: { type: 'text', text } or { type: 'tool_use', id, name, input }
+     */
+    async *streamMessage(conversationNodes, currentMode = "discussion") {
+      if (!this.sessionName) {
+        await this.initialize();
+      }
+      const lastUserMessage = conversationNodes.filter((node) => node.role === "user").pop();
+      if (!lastUserMessage) {
+        console.warn("[AI] No user message found");
+        return;
+      }
+      const userText = typeof lastUserMessage.content === "string" ? lastUserMessage.content : JSON.stringify(lastUserMessage.content);
+      const response = await fetch(STREAM_ASSIST_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          configId: CONFIG_ID,
+          additionalParams: { token: "-" },
+          streamAssistRequest: {
+            session: this.sessionName,
+            query: { parts: [{ text: userText }] }
+          }
+        })
+      });
+      if (!response.ok) {
+        throw new Error(`Streaming request failed: ${response.status}`);
+      }
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let fullResponseText = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        fullResponseText += decoder.decode(value);
+      }
+      if (fullResponseText.startsWith(')]}"')) {
+        fullResponseText = fullResponseText.substring(5);
+      }
+      const parsedData = JSON.parse(fullResponseText);
+      const responseArray = Array.isArray(parsedData) ? parsedData : [parsedData];
+      for (const chunk of responseArray) {
+        const replies = chunk?.streamAssistResponse?.answer?.replies;
+        if (replies) {
+          for (const reply of replies) {
+            const text = reply?.groundedContent?.content?.text;
+            if (text && !reply?.groundedContent?.content?.thought) {
+              yield {
+                type: "text",
+                text: text.replace(/\\n/g, "\n")
+              };
+            }
+          }
+        }
+      }
+    }
   };
 
-  // Expose captured requests globally
-  window.__capturedRequests = capturedRequests;
+  // apps/pastable/src/filesystem.js
+  var workspaceHandle = null;
+  var agentDirHandle = null;
+  async function selectWorkspace() {
+    try {
+      workspaceHandle = await window.showDirectoryPicker({
+        mode: "readwrite",
+        startIn: "documents"
+      });
+      console.log("[FS] Workspace selected:", workspaceHandle.name);
+      try {
+        agentDirHandle = await workspaceHandle.getDirectoryHandle(".agent", { create: true });
+        console.log("[FS] .agent directory ready");
+      } catch (error) {
+        console.warn("[FS] Could not create .agent directory:", error);
+      }
+      return workspaceHandle.name;
+    } catch (error) {
+      if (error.name === "AbortError") {
+        throw new Error("User cancelled folder selection");
+      }
+      throw error;
+    }
+  }
+  async function readAgentFile(filename) {
+    if (!agentDirHandle) {
+      throw new Error("No .agent directory available");
+    }
+    const fileHandle = await agentDirHandle.getFileHandle(filename);
+    const file = await fileHandle.getFile();
+    return await file.text();
+  }
+  async function writeAgentFile(filename, content) {
+    if (!agentDirHandle) {
+      throw new Error("No .agent directory available");
+    }
+    const fileHandle = await agentDirHandle.getFileHandle(filename, { create: true });
+    const writable = await fileHandle.createWritable();
+    await writable.write(content);
+    await writable.close();
+  }
+  async function agentFileExists(filename) {
+    if (!agentDirHandle) {
+      return false;
+    }
+    try {
+      await agentDirHandle.getFileHandle(filename);
+      return true;
+    } catch {
+      return false;
+    }
+  }
 
-  console.log('✅ Fetch interceptor installed successfully!');
-  console.log('📌 Now run your example or app code');
-  console.log('📌 All widgetCreateSession requests will be captured and compared');
-  console.log('\n');
+  // apps/pastable/src/persistence.js
+  var CONVERSATION_FILE = "conversation.jsonl";
+  async function loadConversation() {
+    try {
+      const exists = await agentFileExists(CONVERSATION_FILE);
+      if (!exists) {
+        console.log("[PERSISTENCE] No saved conversation found");
+        return null;
+      }
+      console.log("[PERSISTENCE] Loading conversation");
+      const content = await readAgentFile(CONVERSATION_FILE);
+      const lines = content.trim().split("\n").filter((line) => line.trim());
+      if (lines.length === 0) {
+        console.log("[PERSISTENCE] Conversation file is empty");
+        return null;
+      }
+      const lastLine = lines[lines.length - 1];
+      const state2 = JSON.parse(lastLine);
+      console.log("[PERSISTENCE] Loaded conversation:", {
+        messages: state2.messages?.length || 0,
+        currentMode: state2.currentMode
+      });
+      return state2;
+    } catch (error) {
+      console.error("[PERSISTENCE] Error loading conversation:", error);
+      return null;
+    }
+  }
+  async function saveConversation(state2) {
+    try {
+      const snapshot = {
+        messages: state2.messages,
+        conversationSummary: state2.conversationSummary,
+        currentMode: state2.currentMode,
+        timestamp: (/* @__PURE__ */ new Date()).toISOString()
+      };
+      const line = JSON.stringify(snapshot) + "\n";
+      let existingContent = "";
+      try {
+        existingContent = await readAgentFile(CONVERSATION_FILE);
+      } catch {
+      }
+      await writeAgentFile(CONVERSATION_FILE, existingContent + line);
+      console.log("[PERSISTENCE] Saved conversation snapshot");
+    } catch (error) {
+      console.error("[PERSISTENCE] Error saving conversation:", error);
+    }
+  }
+  async function clearConversation() {
+    try {
+      await writeAgentFile(CONVERSATION_FILE, "");
+      console.log("[PERSISTENCE] Cleared conversation history");
+    } catch (error) {
+      console.error("[PERSISTENCE] Error clearing conversation:", error);
+    }
+  }
+
+  // apps/pastable/src/app.js
+  function createApp(transport2, ai) {
+    let savedState = null;
+    const loadPromise = loadConversation().then((state2) => {
+      savedState = state2;
+      if (savedState) {
+        Object.assign(appState, {
+          messages: savedState.messages || [],
+          conversationSummary: savedState.conversationSummary || null,
+          currentMode: savedState.currentMode || "discussion"
+        });
+        console.log("[APP] Restored conversation state:", {
+          messages: appState.messages.length,
+          currentMode: appState.currentMode
+        });
+        syncState();
+      }
+    }).catch((err) => {
+      console.warn("[APP] Could not load conversation:", err);
+    });
+    const appState = {
+      messages: [],
+      isLoading: false,
+      conversationSummary: null,
+      currentMode: "discussion"
+    };
+    function syncState() {
+      transport2.send("state-update", {
+        messages: appState.messages,
+        isLoading: appState.isLoading
+      });
+      saveConversation(appState).catch((err) => {
+        console.warn("[APP] Could not save conversation:", err);
+      });
+    }
+    async function executeMessageLoop() {
+      appState.isLoading = true;
+      syncState();
+      try {
+        let assistantMessage = "";
+        for await (const event of ai.streamMessage(appState.messages, appState.currentMode)) {
+          if (event.type === "text") {
+            assistantMessage += event.text;
+            transport2.send("stream-chunk", event.text);
+          }
+        }
+        transport2.send("stream-end", null);
+        if (assistantMessage.trim()) {
+          appState.messages.push({
+            role: "assistant",
+            content: assistantMessage.trim()
+          });
+        }
+        appState.isLoading = false;
+        syncState();
+      } catch (error) {
+        console.error("[APP] Error during execution:", error);
+        appState.isLoading = false;
+        syncState();
+      }
+    }
+    transport2.onReceive(async (event, data) => {
+      if (event === "send-message") {
+        const userMessage = data.message;
+        appState.messages.push({
+          role: "user",
+          content: userMessage
+        });
+        syncState();
+        await executeMessageLoop();
+      }
+      if (event === "get-state") {
+        await loadPromise;
+        syncState();
+      }
+      if (event === "clear-conversation") {
+        console.log("[APP] Clearing conversation");
+        await clearConversation();
+        appState.messages = [];
+        appState.conversationSummary = null;
+        appState.currentMode = "discussion";
+        syncState();
+      }
+    });
+    return {
+      getState: () => appState,
+      syncState
+    };
+  }
+
+  // packages/frontend/src/state.js
+  var state = {
+    messages: [],
+    // Array of message objects: { role: 'user' | 'assistant' | 'tool' | 'tool-result', content, ... }
+    isLoading: false,
+    error: null,
+    streamingContent: "",
+    // Current streaming message content
+    streamingStarted: false,
+    // Flag to track if we've seen first non-whitespace in stream
+    workspaceFolder: null,
+    // Selected workspace folder path
+    pendingPlan: null,
+    // Plan awaiting user approval (array of tasks)
+    awaitingPlanApproval: false,
+    // True when plan is pending approval
+    currentMode: "discussion",
+    // Current agent mode (discussion, planning, execute, review)
+    executionPlan: null,
+    // Current plan being executed (array of tasks with completed flags)
+    currentTaskIndex: -1
+    // Index of current task being executed (-1 if not executing)
+  };
+  var renderFn = null;
+  function getState() {
+    return state;
+  }
+  function setState(newState) {
+    state = { ...state, ...newState };
+    if (renderFn) {
+      renderFn();
+    }
+  }
+  function onStateChange(fn) {
+    renderFn = fn;
+  }
+
+  // packages/frontend/src/handlers.js
+  var handlerRegistry = /* @__PURE__ */ new Map();
+  var handlerId = 0;
+  function handler(fn) {
+    const id = `handler_${handlerId++}`;
+    handlerRegistry.set(id, fn);
+    return `window.__callHandler('${id}', event)`;
+  }
+  function callHandler(id, event) {
+    const fn = handlerRegistry.get(id);
+    if (fn) {
+      fn(event);
+    } else {
+      console.warn(`Handler ${id} not found in registry`);
+    }
+  }
+  function initHandlers() {
+    window.__callHandler = callHandler;
+  }
+
+  // node_modules/marked/lib/marked.esm.js
+  function L() {
+    return { async: false, breaks: false, extensions: null, gfm: true, hooks: null, pedantic: false, renderer: null, silent: false, tokenizer: null, walkTokens: null };
+  }
+  var T = L();
+  function Z(u3) {
+    T = u3;
+  }
+  var C = { exec: () => null };
+  function k(u3, e = "") {
+    let t = typeof u3 == "string" ? u3 : u3.source, n = { replace: (r, i) => {
+      let s = typeof i == "string" ? i : i.source;
+      return s = s.replace(m.caret, "$1"), t = t.replace(r, s), n;
+    }, getRegex: () => new RegExp(t, e) };
+    return n;
+  }
+  var me = (() => {
+    try {
+      return !!new RegExp("(?<=1)(?<!1)");
+    } catch {
+      return false;
+    }
+  })();
+  var m = { codeRemoveIndent: /^(?: {1,4}| {0,3}\t)/gm, outputLinkReplace: /\\([\[\]])/g, indentCodeCompensation: /^(\s+)(?:```)/, beginningSpace: /^\s+/, endingHash: /#$/, startingSpaceChar: /^ /, endingSpaceChar: / $/, nonSpaceChar: /[^ ]/, newLineCharGlobal: /\n/g, tabCharGlobal: /\t/g, multipleSpaceGlobal: /\s+/g, blankLine: /^[ \t]*$/, doubleBlankLine: /\n[ \t]*\n[ \t]*$/, blockquoteStart: /^ {0,3}>/, blockquoteSetextReplace: /\n {0,3}((?:=+|-+) *)(?=\n|$)/g, blockquoteSetextReplace2: /^ {0,3}>[ \t]?/gm, listReplaceTabs: /^\t+/, listReplaceNesting: /^ {1,4}(?=( {4})*[^ ])/g, listIsTask: /^\[[ xX]\] +\S/, listReplaceTask: /^\[[ xX]\] +/, listTaskCheckbox: /\[[ xX]\]/, anyLine: /\n.*\n/, hrefBrackets: /^<(.*)>$/, tableDelimiter: /[:|]/, tableAlignChars: /^\||\| *$/g, tableRowBlankLine: /\n[ \t]*$/, tableAlignRight: /^ *-+: *$/, tableAlignCenter: /^ *:-+: *$/, tableAlignLeft: /^ *:-+ *$/, startATag: /^<a /i, endATag: /^<\/a>/i, startPreScriptTag: /^<(pre|code|kbd|script)(\s|>)/i, endPreScriptTag: /^<\/(pre|code|kbd|script)(\s|>)/i, startAngleBracket: /^</, endAngleBracket: />$/, pedanticHrefTitle: /^([^'"]*[^\s])\s+(['"])(.*)\2/, unicodeAlphaNumeric: /[\p{L}\p{N}]/u, escapeTest: /[&<>"']/, escapeReplace: /[&<>"']/g, escapeTestNoEncode: /[<>"']|&(?!(#\d{1,7}|#[Xx][a-fA-F0-9]{1,6}|\w+);)/, escapeReplaceNoEncode: /[<>"']|&(?!(#\d{1,7}|#[Xx][a-fA-F0-9]{1,6}|\w+);)/g, unescapeTest: /&(#(?:\d+)|(?:#x[0-9A-Fa-f]+)|(?:\w+));?/ig, caret: /(^|[^\[])\^/g, percentDecode: /%25/g, findPipe: /\|/g, splitPipe: / \|/, slashPipe: /\\\|/g, carriageReturn: /\r\n|\r/g, spaceLine: /^ +$/gm, notSpaceStart: /^\S*/, endingNewline: /\n$/, listItemRegex: (u3) => new RegExp(`^( {0,3}${u3})((?:[	 ][^\\n]*)?(?:\\n|$))`), nextBulletRegex: (u3) => new RegExp(`^ {0,${Math.min(3, u3 - 1)}}(?:[*+-]|\\d{1,9}[.)])((?:[ 	][^\\n]*)?(?:\\n|$))`), hrRegex: (u3) => new RegExp(`^ {0,${Math.min(3, u3 - 1)}}((?:- *){3,}|(?:_ *){3,}|(?:\\* *){3,})(?:\\n+|$)`), fencesBeginRegex: (u3) => new RegExp(`^ {0,${Math.min(3, u3 - 1)}}(?:\`\`\`|~~~)`), headingBeginRegex: (u3) => new RegExp(`^ {0,${Math.min(3, u3 - 1)}}#`), htmlBeginRegex: (u3) => new RegExp(`^ {0,${Math.min(3, u3 - 1)}}<(?:[a-z].*>|!--)`, "i") };
+  var xe = /^(?:[ \t]*(?:\n|$))+/;
+  var be = /^((?: {4}| {0,3}\t)[^\n]+(?:\n(?:[ \t]*(?:\n|$))*)?)+/;
+  var Re = /^ {0,3}(`{3,}(?=[^`\n]*(?:\n|$))|~{3,})([^\n]*)(?:\n|$)(?:|([\s\S]*?)(?:\n|$))(?: {0,3}\1[~`]* *(?=\n|$)|$)/;
+  var I = /^ {0,3}((?:-[\t ]*){3,}|(?:_[ \t]*){3,}|(?:\*[ \t]*){3,})(?:\n+|$)/;
+  var Te = /^ {0,3}(#{1,6})(?=\s|$)(.*)(?:\n+|$)/;
+  var N = /(?:[*+-]|\d{1,9}[.)])/;
+  var re = /^(?!bull |blockCode|fences|blockquote|heading|html|table)((?:.|\n(?!\s*?\n|bull |blockCode|fences|blockquote|heading|html|table))+?)\n {0,3}(=+|-+) *(?:\n+|$)/;
+  var se = k(re).replace(/bull/g, N).replace(/blockCode/g, /(?: {4}| {0,3}\t)/).replace(/fences/g, / {0,3}(?:`{3,}|~{3,})/).replace(/blockquote/g, / {0,3}>/).replace(/heading/g, / {0,3}#{1,6}/).replace(/html/g, / {0,3}<[^\n>]+>\n/).replace(/\|table/g, "").getRegex();
+  var Oe = k(re).replace(/bull/g, N).replace(/blockCode/g, /(?: {4}| {0,3}\t)/).replace(/fences/g, / {0,3}(?:`{3,}|~{3,})/).replace(/blockquote/g, / {0,3}>/).replace(/heading/g, / {0,3}#{1,6}/).replace(/html/g, / {0,3}<[^\n>]+>\n/).replace(/table/g, / {0,3}\|?(?:[:\- ]*\|)+[\:\- ]*\n/).getRegex();
+  var Q = /^([^\n]+(?:\n(?!hr|heading|lheading|blockquote|fences|list|html|table| +\n)[^\n]+)*)/;
+  var we = /^[^\n]+/;
+  var F = /(?!\s*\])(?:\\[\s\S]|[^\[\]\\])+/;
+  var ye = k(/^ {0,3}\[(label)\]: *(?:\n[ \t]*)?([^<\s][^\s]*|<.*?>)(?:(?: +(?:\n[ \t]*)?| *\n[ \t]*)(title))? *(?:\n+|$)/).replace("label", F).replace("title", /(?:"(?:\\"?|[^"\\])*"|'[^'\n]*(?:\n[^'\n]+)*\n?'|\([^()]*\))/).getRegex();
+  var Pe = k(/^( {0,3}bull)([ \t][^\n]+?)?(?:\n|$)/).replace(/bull/g, N).getRegex();
+  var v = "address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|meta|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul";
+  var j = /<!--(?:-?>|[\s\S]*?(?:-->|$))/;
+  var Se = k("^ {0,3}(?:<(script|pre|style|textarea)[\\s>][\\s\\S]*?(?:</\\1>[^\\n]*\\n+|$)|comment[^\\n]*(\\n+|$)|<\\?[\\s\\S]*?(?:\\?>\\n*|$)|<![A-Z][\\s\\S]*?(?:>\\n*|$)|<!\\[CDATA\\[[\\s\\S]*?(?:\\]\\]>\\n*|$)|</?(tag)(?: +|\\n|/?>)[\\s\\S]*?(?:(?:\\n[ 	]*)+\\n|$)|<(?!script|pre|style|textarea)([a-z][\\w-]*)(?:attribute)*? */?>(?=[ \\t]*(?:\\n|$))[\\s\\S]*?(?:(?:\\n[ 	]*)+\\n|$)|</(?!script|pre|style|textarea)[a-z][\\w-]*\\s*>(?=[ \\t]*(?:\\n|$))[\\s\\S]*?(?:(?:\\n[ 	]*)+\\n|$))", "i").replace("comment", j).replace("tag", v).replace("attribute", / +[a-zA-Z:_][\w.:-]*(?: *= *"[^"\n]*"| *= *'[^'\n]*'| *= *[^\s"'=<>`]+)?/).getRegex();
+  var ie = k(Q).replace("hr", I).replace("heading", " {0,3}#{1,6}(?:\\s|$)").replace("|lheading", "").replace("|table", "").replace("blockquote", " {0,3}>").replace("fences", " {0,3}(?:`{3,}(?=[^`\\n]*\\n)|~{3,})[^\\n]*\\n").replace("list", " {0,3}(?:[*+-]|1[.)]) ").replace("html", "</?(?:tag)(?: +|\\n|/?>)|<(?:script|pre|style|textarea|!--)").replace("tag", v).getRegex();
+  var $e = k(/^( {0,3}> ?(paragraph|[^\n]*)(?:\n|$))+/).replace("paragraph", ie).getRegex();
+  var U = { blockquote: $e, code: be, def: ye, fences: Re, heading: Te, hr: I, html: Se, lheading: se, list: Pe, newline: xe, paragraph: ie, table: C, text: we };
+  var te = k("^ *([^\\n ].*)\\n {0,3}((?:\\| *)?:?-+:? *(?:\\| *:?-+:? *)*(?:\\| *)?)(?:\\n((?:(?! *\\n|hr|heading|blockquote|code|fences|list|html).*(?:\\n|$))*)\\n*|$)").replace("hr", I).replace("heading", " {0,3}#{1,6}(?:\\s|$)").replace("blockquote", " {0,3}>").replace("code", "(?: {4}| {0,3}	)[^\\n]").replace("fences", " {0,3}(?:`{3,}(?=[^`\\n]*\\n)|~{3,})[^\\n]*\\n").replace("list", " {0,3}(?:[*+-]|1[.)]) ").replace("html", "</?(?:tag)(?: +|\\n|/?>)|<(?:script|pre|style|textarea|!--)").replace("tag", v).getRegex();
+  var _e = { ...U, lheading: Oe, table: te, paragraph: k(Q).replace("hr", I).replace("heading", " {0,3}#{1,6}(?:\\s|$)").replace("|lheading", "").replace("table", te).replace("blockquote", " {0,3}>").replace("fences", " {0,3}(?:`{3,}(?=[^`\\n]*\\n)|~{3,})[^\\n]*\\n").replace("list", " {0,3}(?:[*+-]|1[.)]) ").replace("html", "</?(?:tag)(?: +|\\n|/?>)|<(?:script|pre|style|textarea|!--)").replace("tag", v).getRegex() };
+  var Le = { ...U, html: k(`^ *(?:comment *(?:\\n|\\s*$)|<(tag)[\\s\\S]+?</\\1> *(?:\\n{2,}|\\s*$)|<tag(?:"[^"]*"|'[^']*'|\\s[^'"/>\\s]*)*?/?> *(?:\\n{2,}|\\s*$))`).replace("comment", j).replace(/tag/g, "(?!(?:a|em|strong|small|s|cite|q|dfn|abbr|data|time|code|var|samp|kbd|sub|sup|i|b|u|mark|ruby|rt|rp|bdi|bdo|span|br|wbr|ins|del|img)\\b)\\w+(?!:|[^\\w\\s@]*@)\\b").getRegex(), def: /^ *\[([^\]]+)\]: *<?([^\s>]+)>?(?: +(["(][^\n]+[")]))? *(?:\n+|$)/, heading: /^(#{1,6})(.*)(?:\n+|$)/, fences: C, lheading: /^(.+?)\n {0,3}(=+|-+) *(?:\n+|$)/, paragraph: k(Q).replace("hr", I).replace("heading", ` *#{1,6} *[^
+]`).replace("lheading", se).replace("|table", "").replace("blockquote", " {0,3}>").replace("|fences", "").replace("|list", "").replace("|html", "").replace("|tag", "").getRegex() };
+  var Me = /^\\([!"#$%&'()*+,\-./:;<=>?@\[\]\\^_`{|}~])/;
+  var ze = /^(`+)([^`]|[^`][\s\S]*?[^`])\1(?!`)/;
+  var oe = /^( {2,}|\\)\n(?!\s*$)/;
+  var Ae = /^(`+|[^`])(?:(?= {2,}\n)|[\s\S]*?(?:(?=[\\<!\[`*_]|\b_|$)|[^ ](?= {2,}\n)))/;
+  var D = /[\p{P}\p{S}]/u;
+  var K = /[\s\p{P}\p{S}]/u;
+  var ae = /[^\s\p{P}\p{S}]/u;
+  var Ce = k(/^((?![*_])punctSpace)/, "u").replace(/punctSpace/g, K).getRegex();
+  var le = /(?!~)[\p{P}\p{S}]/u;
+  var Ie = /(?!~)[\s\p{P}\p{S}]/u;
+  var Ee = /(?:[^\s\p{P}\p{S}]|~)/u;
+  var Be = k(/link|precode-code|html/, "g").replace("link", /\[(?:[^\[\]`]|(?<a>`+)[^`]+\k<a>(?!`))*?\]\((?:\\[\s\S]|[^\\\(\)]|\((?:\\[\s\S]|[^\\\(\)])*\))*\)/).replace("precode-", me ? "(?<!`)()" : "(^^|[^`])").replace("code", /(?<b>`+)[^`]+\k<b>(?!`)/).replace("html", /<(?! )[^<>]*?>/).getRegex();
+  var ue = /^(?:\*+(?:((?!\*)punct)|[^\s*]))|^_+(?:((?!_)punct)|([^\s_]))/;
+  var qe = k(ue, "u").replace(/punct/g, D).getRegex();
+  var ve = k(ue, "u").replace(/punct/g, le).getRegex();
+  var pe = "^[^_*]*?__[^_*]*?\\*[^_*]*?(?=__)|[^*]+(?=[^*])|(?!\\*)punct(\\*+)(?=[\\s]|$)|notPunctSpace(\\*+)(?!\\*)(?=punctSpace|$)|(?!\\*)punctSpace(\\*+)(?=notPunctSpace)|[\\s](\\*+)(?!\\*)(?=punct)|(?!\\*)punct(\\*+)(?!\\*)(?=punct)|notPunctSpace(\\*+)(?=notPunctSpace)";
+  var De = k(pe, "gu").replace(/notPunctSpace/g, ae).replace(/punctSpace/g, K).replace(/punct/g, D).getRegex();
+  var He = k(pe, "gu").replace(/notPunctSpace/g, Ee).replace(/punctSpace/g, Ie).replace(/punct/g, le).getRegex();
+  var Ze = k("^[^_*]*?\\*\\*[^_*]*?_[^_*]*?(?=\\*\\*)|[^_]+(?=[^_])|(?!_)punct(_+)(?=[\\s]|$)|notPunctSpace(_+)(?!_)(?=punctSpace|$)|(?!_)punctSpace(_+)(?=notPunctSpace)|[\\s](_+)(?!_)(?=punct)|(?!_)punct(_+)(?!_)(?=punct)", "gu").replace(/notPunctSpace/g, ae).replace(/punctSpace/g, K).replace(/punct/g, D).getRegex();
+  var Ge = k(/\\(punct)/, "gu").replace(/punct/g, D).getRegex();
+  var Ne = k(/^<(scheme:[^\s\x00-\x1f<>]*|email)>/).replace("scheme", /[a-zA-Z][a-zA-Z0-9+.-]{1,31}/).replace("email", /[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+(@)[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+(?![-_])/).getRegex();
+  var Qe = k(j).replace("(?:-->|$)", "-->").getRegex();
+  var Fe = k("^comment|^</[a-zA-Z][\\w:-]*\\s*>|^<[a-zA-Z][\\w-]*(?:attribute)*?\\s*/?>|^<\\?[\\s\\S]*?\\?>|^<![a-zA-Z]+\\s[\\s\\S]*?>|^<!\\[CDATA\\[[\\s\\S]*?\\]\\]>").replace("comment", Qe).replace("attribute", /\s+[a-zA-Z:_][\w.:-]*(?:\s*=\s*"[^"]*"|\s*=\s*'[^']*'|\s*=\s*[^\s"'=<>`]+)?/).getRegex();
+  var q = /(?:\[(?:\\[\s\S]|[^\[\]\\])*\]|\\[\s\S]|`+[^`]*?`+(?!`)|[^\[\]\\`])*?/;
+  var je = k(/^!?\[(label)\]\(\s*(href)(?:(?:[ \t]*(?:\n[ \t]*)?)(title))?\s*\)/).replace("label", q).replace("href", /<(?:\\.|[^\n<>\\])+>|[^ \t\n\x00-\x1f]*/).replace("title", /"(?:\\"?|[^"\\])*"|'(?:\\'?|[^'\\])*'|\((?:\\\)?|[^)\\])*\)/).getRegex();
+  var ce = k(/^!?\[(label)\]\[(ref)\]/).replace("label", q).replace("ref", F).getRegex();
+  var he = k(/^!?\[(ref)\](?:\[\])?/).replace("ref", F).getRegex();
+  var Ue = k("reflink|nolink(?!\\()", "g").replace("reflink", ce).replace("nolink", he).getRegex();
+  var ne = /[hH][tT][tT][pP][sS]?|[fF][tT][pP]/;
+  var W = { _backpedal: C, anyPunctuation: Ge, autolink: Ne, blockSkip: Be, br: oe, code: ze, del: C, emStrongLDelim: qe, emStrongRDelimAst: De, emStrongRDelimUnd: Ze, escape: Me, link: je, nolink: he, punctuation: Ce, reflink: ce, reflinkSearch: Ue, tag: Fe, text: Ae, url: C };
+  var Ke = { ...W, link: k(/^!?\[(label)\]\((.*?)\)/).replace("label", q).getRegex(), reflink: k(/^!?\[(label)\]\s*\[([^\]]*)\]/).replace("label", q).getRegex() };
+  var G = { ...W, emStrongRDelimAst: He, emStrongLDelim: ve, url: k(/^((?:protocol):\/\/|www\.)(?:[a-zA-Z0-9\-]+\.?)+[^\s<]*|^email/).replace("protocol", ne).replace("email", /[A-Za-z0-9._+-]+(@)[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+(?![-_])/).getRegex(), _backpedal: /(?:[^?!.,:;*_'"~()&]+|\([^)]*\)|&(?![a-zA-Z0-9]+;$)|[?!.,:;*_'"~)]+(?!$))+/, del: /^(~~?)(?=[^\s~])((?:\\[\s\S]|[^\\])*?(?:\\[\s\S]|[^\s~\\]))\1(?=[^~]|$)/, text: k(/^([`~]+|[^`~])(?:(?= {2,}\n)|(?=[a-zA-Z0-9.!#$%&'*+\/=?_`{\|}~-]+@)|[\s\S]*?(?:(?=[\\<!\[`*~_]|\b_|protocol:\/\/|www\.|$)|[^ ](?= {2,}\n)|[^a-zA-Z0-9.!#$%&'*+\/=?_`{\|}~-](?=[a-zA-Z0-9.!#$%&'*+\/=?_`{\|}~-]+@)))/).replace("protocol", ne).getRegex() };
+  var We = { ...G, br: k(oe).replace("{2,}", "*").getRegex(), text: k(G.text).replace("\\b_", "\\b_| {2,}\\n").replace(/\{2,\}/g, "*").getRegex() };
+  var E = { normal: U, gfm: _e, pedantic: Le };
+  var M = { normal: W, gfm: G, breaks: We, pedantic: Ke };
+  var Xe = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+  var ke = (u3) => Xe[u3];
+  function w(u3, e) {
+    if (e) {
+      if (m.escapeTest.test(u3)) return u3.replace(m.escapeReplace, ke);
+    } else if (m.escapeTestNoEncode.test(u3)) return u3.replace(m.escapeReplaceNoEncode, ke);
+    return u3;
+  }
+  function X(u3) {
+    try {
+      u3 = encodeURI(u3).replace(m.percentDecode, "%");
+    } catch {
+      return null;
+    }
+    return u3;
+  }
+  function J(u3, e) {
+    let t = u3.replace(m.findPipe, (i, s, a) => {
+      let o = false, l = s;
+      for (; --l >= 0 && a[l] === "\\"; ) o = !o;
+      return o ? "|" : " |";
+    }), n = t.split(m.splitPipe), r = 0;
+    if (n[0].trim() || n.shift(), n.length > 0 && !n.at(-1)?.trim() && n.pop(), e) if (n.length > e) n.splice(e);
+    else for (; n.length < e; ) n.push("");
+    for (; r < n.length; r++) n[r] = n[r].trim().replace(m.slashPipe, "|");
+    return n;
+  }
+  function z(u3, e, t) {
+    let n = u3.length;
+    if (n === 0) return "";
+    let r = 0;
+    for (; r < n; ) {
+      let i = u3.charAt(n - r - 1);
+      if (i === e && !t) r++;
+      else if (i !== e && t) r++;
+      else break;
+    }
+    return u3.slice(0, n - r);
+  }
+  function de(u3, e) {
+    if (u3.indexOf(e[1]) === -1) return -1;
+    let t = 0;
+    for (let n = 0; n < u3.length; n++) if (u3[n] === "\\") n++;
+    else if (u3[n] === e[0]) t++;
+    else if (u3[n] === e[1] && (t--, t < 0)) return n;
+    return t > 0 ? -2 : -1;
+  }
+  function ge(u3, e, t, n, r) {
+    let i = e.href, s = e.title || null, a = u3[1].replace(r.other.outputLinkReplace, "$1");
+    n.state.inLink = true;
+    let o = { type: u3[0].charAt(0) === "!" ? "image" : "link", raw: t, href: i, title: s, text: a, tokens: n.inlineTokens(a) };
+    return n.state.inLink = false, o;
+  }
+  function Je(u3, e, t) {
+    let n = u3.match(t.other.indentCodeCompensation);
+    if (n === null) return e;
+    let r = n[1];
+    return e.split(`
+`).map((i) => {
+      let s = i.match(t.other.beginningSpace);
+      if (s === null) return i;
+      let [a] = s;
+      return a.length >= r.length ? i.slice(r.length) : i;
+    }).join(`
+`);
+  }
+  var y = class {
+    constructor(e) {
+      __publicField(this, "options");
+      __publicField(this, "rules");
+      __publicField(this, "lexer");
+      this.options = e || T;
+    }
+    space(e) {
+      let t = this.rules.block.newline.exec(e);
+      if (t && t[0].length > 0) return { type: "space", raw: t[0] };
+    }
+    code(e) {
+      let t = this.rules.block.code.exec(e);
+      if (t) {
+        let n = t[0].replace(this.rules.other.codeRemoveIndent, "");
+        return { type: "code", raw: t[0], codeBlockStyle: "indented", text: this.options.pedantic ? n : z(n, `
+`) };
+      }
+    }
+    fences(e) {
+      let t = this.rules.block.fences.exec(e);
+      if (t) {
+        let n = t[0], r = Je(n, t[3] || "", this.rules);
+        return { type: "code", raw: n, lang: t[2] ? t[2].trim().replace(this.rules.inline.anyPunctuation, "$1") : t[2], text: r };
+      }
+    }
+    heading(e) {
+      let t = this.rules.block.heading.exec(e);
+      if (t) {
+        let n = t[2].trim();
+        if (this.rules.other.endingHash.test(n)) {
+          let r = z(n, "#");
+          (this.options.pedantic || !r || this.rules.other.endingSpaceChar.test(r)) && (n = r.trim());
+        }
+        return { type: "heading", raw: t[0], depth: t[1].length, text: n, tokens: this.lexer.inline(n) };
+      }
+    }
+    hr(e) {
+      let t = this.rules.block.hr.exec(e);
+      if (t) return { type: "hr", raw: z(t[0], `
+`) };
+    }
+    blockquote(e) {
+      let t = this.rules.block.blockquote.exec(e);
+      if (t) {
+        let n = z(t[0], `
+`).split(`
+`), r = "", i = "", s = [];
+        for (; n.length > 0; ) {
+          let a = false, o = [], l;
+          for (l = 0; l < n.length; l++) if (this.rules.other.blockquoteStart.test(n[l])) o.push(n[l]), a = true;
+          else if (!a) o.push(n[l]);
+          else break;
+          n = n.slice(l);
+          let p = o.join(`
+`), c = p.replace(this.rules.other.blockquoteSetextReplace, `
+    $1`).replace(this.rules.other.blockquoteSetextReplace2, "");
+          r = r ? `${r}
+${p}` : p, i = i ? `${i}
+${c}` : c;
+          let g = this.lexer.state.top;
+          if (this.lexer.state.top = true, this.lexer.blockTokens(c, s, true), this.lexer.state.top = g, n.length === 0) break;
+          let h = s.at(-1);
+          if (h?.type === "code") break;
+          if (h?.type === "blockquote") {
+            let R = h, f = R.raw + `
+` + n.join(`
+`), O = this.blockquote(f);
+            s[s.length - 1] = O, r = r.substring(0, r.length - R.raw.length) + O.raw, i = i.substring(0, i.length - R.text.length) + O.text;
+            break;
+          } else if (h?.type === "list") {
+            let R = h, f = R.raw + `
+` + n.join(`
+`), O = this.list(f);
+            s[s.length - 1] = O, r = r.substring(0, r.length - h.raw.length) + O.raw, i = i.substring(0, i.length - R.raw.length) + O.raw, n = f.substring(s.at(-1).raw.length).split(`
+`);
+            continue;
+          }
+        }
+        return { type: "blockquote", raw: r, tokens: s, text: i };
+      }
+    }
+    list(e) {
+      let t = this.rules.block.list.exec(e);
+      if (t) {
+        let n = t[1].trim(), r = n.length > 1, i = { type: "list", raw: "", ordered: r, start: r ? +n.slice(0, -1) : "", loose: false, items: [] };
+        n = r ? `\\d{1,9}\\${n.slice(-1)}` : `\\${n}`, this.options.pedantic && (n = r ? n : "[*+-]");
+        let s = this.rules.other.listItemRegex(n), a = false;
+        for (; e; ) {
+          let l = false, p = "", c = "";
+          if (!(t = s.exec(e)) || this.rules.block.hr.test(e)) break;
+          p = t[0], e = e.substring(p.length);
+          let g = t[2].split(`
+`, 1)[0].replace(this.rules.other.listReplaceTabs, (O) => " ".repeat(3 * O.length)), h = e.split(`
+`, 1)[0], R = !g.trim(), f = 0;
+          if (this.options.pedantic ? (f = 2, c = g.trimStart()) : R ? f = t[1].length + 1 : (f = t[2].search(this.rules.other.nonSpaceChar), f = f > 4 ? 1 : f, c = g.slice(f), f += t[1].length), R && this.rules.other.blankLine.test(h) && (p += h + `
+`, e = e.substring(h.length + 1), l = true), !l) {
+            let O = this.rules.other.nextBulletRegex(f), V = this.rules.other.hrRegex(f), Y = this.rules.other.fencesBeginRegex(f), ee = this.rules.other.headingBeginRegex(f), fe = this.rules.other.htmlBeginRegex(f);
+            for (; e; ) {
+              let H = e.split(`
+`, 1)[0], A;
+              if (h = H, this.options.pedantic ? (h = h.replace(this.rules.other.listReplaceNesting, "  "), A = h) : A = h.replace(this.rules.other.tabCharGlobal, "    "), Y.test(h) || ee.test(h) || fe.test(h) || O.test(h) || V.test(h)) break;
+              if (A.search(this.rules.other.nonSpaceChar) >= f || !h.trim()) c += `
+` + A.slice(f);
+              else {
+                if (R || g.replace(this.rules.other.tabCharGlobal, "    ").search(this.rules.other.nonSpaceChar) >= 4 || Y.test(g) || ee.test(g) || V.test(g)) break;
+                c += `
+` + h;
+              }
+              !R && !h.trim() && (R = true), p += H + `
+`, e = e.substring(H.length + 1), g = A.slice(f);
+            }
+          }
+          i.loose || (a ? i.loose = true : this.rules.other.doubleBlankLine.test(p) && (a = true)), i.items.push({ type: "list_item", raw: p, task: !!this.options.gfm && this.rules.other.listIsTask.test(c), loose: false, text: c, tokens: [] }), i.raw += p;
+        }
+        let o = i.items.at(-1);
+        if (o) o.raw = o.raw.trimEnd(), o.text = o.text.trimEnd();
+        else return;
+        i.raw = i.raw.trimEnd();
+        for (let l of i.items) {
+          if (this.lexer.state.top = false, l.tokens = this.lexer.blockTokens(l.text, []), l.task) {
+            if (l.text = l.text.replace(this.rules.other.listReplaceTask, ""), l.tokens[0]?.type === "text" || l.tokens[0]?.type === "paragraph") {
+              l.tokens[0].raw = l.tokens[0].raw.replace(this.rules.other.listReplaceTask, ""), l.tokens[0].text = l.tokens[0].text.replace(this.rules.other.listReplaceTask, "");
+              for (let c = this.lexer.inlineQueue.length - 1; c >= 0; c--) if (this.rules.other.listIsTask.test(this.lexer.inlineQueue[c].src)) {
+                this.lexer.inlineQueue[c].src = this.lexer.inlineQueue[c].src.replace(this.rules.other.listReplaceTask, "");
+                break;
+              }
+            }
+            let p = this.rules.other.listTaskCheckbox.exec(l.raw);
+            if (p) {
+              let c = { type: "checkbox", raw: p[0] + " ", checked: p[0] !== "[ ]" };
+              l.checked = c.checked, i.loose ? l.tokens[0] && ["paragraph", "text"].includes(l.tokens[0].type) && "tokens" in l.tokens[0] && l.tokens[0].tokens ? (l.tokens[0].raw = c.raw + l.tokens[0].raw, l.tokens[0].text = c.raw + l.tokens[0].text, l.tokens[0].tokens.unshift(c)) : l.tokens.unshift({ type: "paragraph", raw: c.raw, text: c.raw, tokens: [c] }) : l.tokens.unshift(c);
+            }
+          }
+          if (!i.loose) {
+            let p = l.tokens.filter((g) => g.type === "space"), c = p.length > 0 && p.some((g) => this.rules.other.anyLine.test(g.raw));
+            i.loose = c;
+          }
+        }
+        if (i.loose) for (let l of i.items) {
+          l.loose = true;
+          for (let p of l.tokens) p.type === "text" && (p.type = "paragraph");
+        }
+        return i;
+      }
+    }
+    html(e) {
+      let t = this.rules.block.html.exec(e);
+      if (t) return { type: "html", block: true, raw: t[0], pre: t[1] === "pre" || t[1] === "script" || t[1] === "style", text: t[0] };
+    }
+    def(e) {
+      let t = this.rules.block.def.exec(e);
+      if (t) {
+        let n = t[1].toLowerCase().replace(this.rules.other.multipleSpaceGlobal, " "), r = t[2] ? t[2].replace(this.rules.other.hrefBrackets, "$1").replace(this.rules.inline.anyPunctuation, "$1") : "", i = t[3] ? t[3].substring(1, t[3].length - 1).replace(this.rules.inline.anyPunctuation, "$1") : t[3];
+        return { type: "def", tag: n, raw: t[0], href: r, title: i };
+      }
+    }
+    table(e) {
+      let t = this.rules.block.table.exec(e);
+      if (!t || !this.rules.other.tableDelimiter.test(t[2])) return;
+      let n = J(t[1]), r = t[2].replace(this.rules.other.tableAlignChars, "").split("|"), i = t[3]?.trim() ? t[3].replace(this.rules.other.tableRowBlankLine, "").split(`
+`) : [], s = { type: "table", raw: t[0], header: [], align: [], rows: [] };
+      if (n.length === r.length) {
+        for (let a of r) this.rules.other.tableAlignRight.test(a) ? s.align.push("right") : this.rules.other.tableAlignCenter.test(a) ? s.align.push("center") : this.rules.other.tableAlignLeft.test(a) ? s.align.push("left") : s.align.push(null);
+        for (let a = 0; a < n.length; a++) s.header.push({ text: n[a], tokens: this.lexer.inline(n[a]), header: true, align: s.align[a] });
+        for (let a of i) s.rows.push(J(a, s.header.length).map((o, l) => ({ text: o, tokens: this.lexer.inline(o), header: false, align: s.align[l] })));
+        return s;
+      }
+    }
+    lheading(e) {
+      let t = this.rules.block.lheading.exec(e);
+      if (t) return { type: "heading", raw: t[0], depth: t[2].charAt(0) === "=" ? 1 : 2, text: t[1], tokens: this.lexer.inline(t[1]) };
+    }
+    paragraph(e) {
+      let t = this.rules.block.paragraph.exec(e);
+      if (t) {
+        let n = t[1].charAt(t[1].length - 1) === `
+` ? t[1].slice(0, -1) : t[1];
+        return { type: "paragraph", raw: t[0], text: n, tokens: this.lexer.inline(n) };
+      }
+    }
+    text(e) {
+      let t = this.rules.block.text.exec(e);
+      if (t) return { type: "text", raw: t[0], text: t[0], tokens: this.lexer.inline(t[0]) };
+    }
+    escape(e) {
+      let t = this.rules.inline.escape.exec(e);
+      if (t) return { type: "escape", raw: t[0], text: t[1] };
+    }
+    tag(e) {
+      let t = this.rules.inline.tag.exec(e);
+      if (t) return !this.lexer.state.inLink && this.rules.other.startATag.test(t[0]) ? this.lexer.state.inLink = true : this.lexer.state.inLink && this.rules.other.endATag.test(t[0]) && (this.lexer.state.inLink = false), !this.lexer.state.inRawBlock && this.rules.other.startPreScriptTag.test(t[0]) ? this.lexer.state.inRawBlock = true : this.lexer.state.inRawBlock && this.rules.other.endPreScriptTag.test(t[0]) && (this.lexer.state.inRawBlock = false), { type: "html", raw: t[0], inLink: this.lexer.state.inLink, inRawBlock: this.lexer.state.inRawBlock, block: false, text: t[0] };
+    }
+    link(e) {
+      let t = this.rules.inline.link.exec(e);
+      if (t) {
+        let n = t[2].trim();
+        if (!this.options.pedantic && this.rules.other.startAngleBracket.test(n)) {
+          if (!this.rules.other.endAngleBracket.test(n)) return;
+          let s = z(n.slice(0, -1), "\\");
+          if ((n.length - s.length) % 2 === 0) return;
+        } else {
+          let s = de(t[2], "()");
+          if (s === -2) return;
+          if (s > -1) {
+            let o = (t[0].indexOf("!") === 0 ? 5 : 4) + t[1].length + s;
+            t[2] = t[2].substring(0, s), t[0] = t[0].substring(0, o).trim(), t[3] = "";
+          }
+        }
+        let r = t[2], i = "";
+        if (this.options.pedantic) {
+          let s = this.rules.other.pedanticHrefTitle.exec(r);
+          s && (r = s[1], i = s[3]);
+        } else i = t[3] ? t[3].slice(1, -1) : "";
+        return r = r.trim(), this.rules.other.startAngleBracket.test(r) && (this.options.pedantic && !this.rules.other.endAngleBracket.test(n) ? r = r.slice(1) : r = r.slice(1, -1)), ge(t, { href: r && r.replace(this.rules.inline.anyPunctuation, "$1"), title: i && i.replace(this.rules.inline.anyPunctuation, "$1") }, t[0], this.lexer, this.rules);
+      }
+    }
+    reflink(e, t) {
+      let n;
+      if ((n = this.rules.inline.reflink.exec(e)) || (n = this.rules.inline.nolink.exec(e))) {
+        let r = (n[2] || n[1]).replace(this.rules.other.multipleSpaceGlobal, " "), i = t[r.toLowerCase()];
+        if (!i) {
+          let s = n[0].charAt(0);
+          return { type: "text", raw: s, text: s };
+        }
+        return ge(n, i, n[0], this.lexer, this.rules);
+      }
+    }
+    emStrong(e, t, n = "") {
+      let r = this.rules.inline.emStrongLDelim.exec(e);
+      if (!r || r[3] && n.match(this.rules.other.unicodeAlphaNumeric)) return;
+      if (!(r[1] || r[2] || "") || !n || this.rules.inline.punctuation.exec(n)) {
+        let s = [...r[0]].length - 1, a, o, l = s, p = 0, c = r[0][0] === "*" ? this.rules.inline.emStrongRDelimAst : this.rules.inline.emStrongRDelimUnd;
+        for (c.lastIndex = 0, t = t.slice(-1 * e.length + s); (r = c.exec(t)) != null; ) {
+          if (a = r[1] || r[2] || r[3] || r[4] || r[5] || r[6], !a) continue;
+          if (o = [...a].length, r[3] || r[4]) {
+            l += o;
+            continue;
+          } else if ((r[5] || r[6]) && s % 3 && !((s + o) % 3)) {
+            p += o;
+            continue;
+          }
+          if (l -= o, l > 0) continue;
+          o = Math.min(o, o + l + p);
+          let g = [...r[0]][0].length, h = e.slice(0, s + r.index + g + o);
+          if (Math.min(s, o) % 2) {
+            let f = h.slice(1, -1);
+            return { type: "em", raw: h, text: f, tokens: this.lexer.inlineTokens(f) };
+          }
+          let R = h.slice(2, -2);
+          return { type: "strong", raw: h, text: R, tokens: this.lexer.inlineTokens(R) };
+        }
+      }
+    }
+    codespan(e) {
+      let t = this.rules.inline.code.exec(e);
+      if (t) {
+        let n = t[2].replace(this.rules.other.newLineCharGlobal, " "), r = this.rules.other.nonSpaceChar.test(n), i = this.rules.other.startingSpaceChar.test(n) && this.rules.other.endingSpaceChar.test(n);
+        return r && i && (n = n.substring(1, n.length - 1)), { type: "codespan", raw: t[0], text: n };
+      }
+    }
+    br(e) {
+      let t = this.rules.inline.br.exec(e);
+      if (t) return { type: "br", raw: t[0] };
+    }
+    del(e) {
+      let t = this.rules.inline.del.exec(e);
+      if (t) return { type: "del", raw: t[0], text: t[2], tokens: this.lexer.inlineTokens(t[2]) };
+    }
+    autolink(e) {
+      let t = this.rules.inline.autolink.exec(e);
+      if (t) {
+        let n, r;
+        return t[2] === "@" ? (n = t[1], r = "mailto:" + n) : (n = t[1], r = n), { type: "link", raw: t[0], text: n, href: r, tokens: [{ type: "text", raw: n, text: n }] };
+      }
+    }
+    url(e) {
+      let t;
+      if (t = this.rules.inline.url.exec(e)) {
+        let n, r;
+        if (t[2] === "@") n = t[0], r = "mailto:" + n;
+        else {
+          let i;
+          do
+            i = t[0], t[0] = this.rules.inline._backpedal.exec(t[0])?.[0] ?? "";
+          while (i !== t[0]);
+          n = t[0], t[1] === "www." ? r = "http://" + t[0] : r = t[0];
+        }
+        return { type: "link", raw: t[0], text: n, href: r, tokens: [{ type: "text", raw: n, text: n }] };
+      }
+    }
+    inlineText(e) {
+      let t = this.rules.inline.text.exec(e);
+      if (t) {
+        let n = this.lexer.state.inRawBlock;
+        return { type: "text", raw: t[0], text: t[0], escaped: n };
+      }
+    }
+  };
+  var x = class u {
+    constructor(e) {
+      __publicField(this, "tokens");
+      __publicField(this, "options");
+      __publicField(this, "state");
+      __publicField(this, "inlineQueue");
+      __publicField(this, "tokenizer");
+      this.tokens = [], this.tokens.links = /* @__PURE__ */ Object.create(null), this.options = e || T, this.options.tokenizer = this.options.tokenizer || new y(), this.tokenizer = this.options.tokenizer, this.tokenizer.options = this.options, this.tokenizer.lexer = this, this.inlineQueue = [], this.state = { inLink: false, inRawBlock: false, top: true };
+      let t = { other: m, block: E.normal, inline: M.normal };
+      this.options.pedantic ? (t.block = E.pedantic, t.inline = M.pedantic) : this.options.gfm && (t.block = E.gfm, this.options.breaks ? t.inline = M.breaks : t.inline = M.gfm), this.tokenizer.rules = t;
+    }
+    static get rules() {
+      return { block: E, inline: M };
+    }
+    static lex(e, t) {
+      return new u(t).lex(e);
+    }
+    static lexInline(e, t) {
+      return new u(t).inlineTokens(e);
+    }
+    lex(e) {
+      e = e.replace(m.carriageReturn, `
+`), this.blockTokens(e, this.tokens);
+      for (let t = 0; t < this.inlineQueue.length; t++) {
+        let n = this.inlineQueue[t];
+        this.inlineTokens(n.src, n.tokens);
+      }
+      return this.inlineQueue = [], this.tokens;
+    }
+    blockTokens(e, t = [], n = false) {
+      for (this.options.pedantic && (e = e.replace(m.tabCharGlobal, "    ").replace(m.spaceLine, "")); e; ) {
+        let r;
+        if (this.options.extensions?.block?.some((s) => (r = s.call({ lexer: this }, e, t)) ? (e = e.substring(r.raw.length), t.push(r), true) : false)) continue;
+        if (r = this.tokenizer.space(e)) {
+          e = e.substring(r.raw.length);
+          let s = t.at(-1);
+          r.raw.length === 1 && s !== void 0 ? s.raw += `
+` : t.push(r);
+          continue;
+        }
+        if (r = this.tokenizer.code(e)) {
+          e = e.substring(r.raw.length);
+          let s = t.at(-1);
+          s?.type === "paragraph" || s?.type === "text" ? (s.raw += (s.raw.endsWith(`
+`) ? "" : `
+`) + r.raw, s.text += `
+` + r.text, this.inlineQueue.at(-1).src = s.text) : t.push(r);
+          continue;
+        }
+        if (r = this.tokenizer.fences(e)) {
+          e = e.substring(r.raw.length), t.push(r);
+          continue;
+        }
+        if (r = this.tokenizer.heading(e)) {
+          e = e.substring(r.raw.length), t.push(r);
+          continue;
+        }
+        if (r = this.tokenizer.hr(e)) {
+          e = e.substring(r.raw.length), t.push(r);
+          continue;
+        }
+        if (r = this.tokenizer.blockquote(e)) {
+          e = e.substring(r.raw.length), t.push(r);
+          continue;
+        }
+        if (r = this.tokenizer.list(e)) {
+          e = e.substring(r.raw.length), t.push(r);
+          continue;
+        }
+        if (r = this.tokenizer.html(e)) {
+          e = e.substring(r.raw.length), t.push(r);
+          continue;
+        }
+        if (r = this.tokenizer.def(e)) {
+          e = e.substring(r.raw.length);
+          let s = t.at(-1);
+          s?.type === "paragraph" || s?.type === "text" ? (s.raw += (s.raw.endsWith(`
+`) ? "" : `
+`) + r.raw, s.text += `
+` + r.raw, this.inlineQueue.at(-1).src = s.text) : this.tokens.links[r.tag] || (this.tokens.links[r.tag] = { href: r.href, title: r.title }, t.push(r));
+          continue;
+        }
+        if (r = this.tokenizer.table(e)) {
+          e = e.substring(r.raw.length), t.push(r);
+          continue;
+        }
+        if (r = this.tokenizer.lheading(e)) {
+          e = e.substring(r.raw.length), t.push(r);
+          continue;
+        }
+        let i = e;
+        if (this.options.extensions?.startBlock) {
+          let s = 1 / 0, a = e.slice(1), o;
+          this.options.extensions.startBlock.forEach((l) => {
+            o = l.call({ lexer: this }, a), typeof o == "number" && o >= 0 && (s = Math.min(s, o));
+          }), s < 1 / 0 && s >= 0 && (i = e.substring(0, s + 1));
+        }
+        if (this.state.top && (r = this.tokenizer.paragraph(i))) {
+          let s = t.at(-1);
+          n && s?.type === "paragraph" ? (s.raw += (s.raw.endsWith(`
+`) ? "" : `
+`) + r.raw, s.text += `
+` + r.text, this.inlineQueue.pop(), this.inlineQueue.at(-1).src = s.text) : t.push(r), n = i.length !== e.length, e = e.substring(r.raw.length);
+          continue;
+        }
+        if (r = this.tokenizer.text(e)) {
+          e = e.substring(r.raw.length);
+          let s = t.at(-1);
+          s?.type === "text" ? (s.raw += (s.raw.endsWith(`
+`) ? "" : `
+`) + r.raw, s.text += `
+` + r.text, this.inlineQueue.pop(), this.inlineQueue.at(-1).src = s.text) : t.push(r);
+          continue;
+        }
+        if (e) {
+          let s = "Infinite loop on byte: " + e.charCodeAt(0);
+          if (this.options.silent) {
+            console.error(s);
+            break;
+          } else throw new Error(s);
+        }
+      }
+      return this.state.top = true, t;
+    }
+    inline(e, t = []) {
+      return this.inlineQueue.push({ src: e, tokens: t }), t;
+    }
+    inlineTokens(e, t = []) {
+      let n = e, r = null;
+      if (this.tokens.links) {
+        let o = Object.keys(this.tokens.links);
+        if (o.length > 0) for (; (r = this.tokenizer.rules.inline.reflinkSearch.exec(n)) != null; ) o.includes(r[0].slice(r[0].lastIndexOf("[") + 1, -1)) && (n = n.slice(0, r.index) + "[" + "a".repeat(r[0].length - 2) + "]" + n.slice(this.tokenizer.rules.inline.reflinkSearch.lastIndex));
+      }
+      for (; (r = this.tokenizer.rules.inline.anyPunctuation.exec(n)) != null; ) n = n.slice(0, r.index) + "++" + n.slice(this.tokenizer.rules.inline.anyPunctuation.lastIndex);
+      let i;
+      for (; (r = this.tokenizer.rules.inline.blockSkip.exec(n)) != null; ) i = r[2] ? r[2].length : 0, n = n.slice(0, r.index + i) + "[" + "a".repeat(r[0].length - i - 2) + "]" + n.slice(this.tokenizer.rules.inline.blockSkip.lastIndex);
+      n = this.options.hooks?.emStrongMask?.call({ lexer: this }, n) ?? n;
+      let s = false, a = "";
+      for (; e; ) {
+        s || (a = ""), s = false;
+        let o;
+        if (this.options.extensions?.inline?.some((p) => (o = p.call({ lexer: this }, e, t)) ? (e = e.substring(o.raw.length), t.push(o), true) : false)) continue;
+        if (o = this.tokenizer.escape(e)) {
+          e = e.substring(o.raw.length), t.push(o);
+          continue;
+        }
+        if (o = this.tokenizer.tag(e)) {
+          e = e.substring(o.raw.length), t.push(o);
+          continue;
+        }
+        if (o = this.tokenizer.link(e)) {
+          e = e.substring(o.raw.length), t.push(o);
+          continue;
+        }
+        if (o = this.tokenizer.reflink(e, this.tokens.links)) {
+          e = e.substring(o.raw.length);
+          let p = t.at(-1);
+          o.type === "text" && p?.type === "text" ? (p.raw += o.raw, p.text += o.text) : t.push(o);
+          continue;
+        }
+        if (o = this.tokenizer.emStrong(e, n, a)) {
+          e = e.substring(o.raw.length), t.push(o);
+          continue;
+        }
+        if (o = this.tokenizer.codespan(e)) {
+          e = e.substring(o.raw.length), t.push(o);
+          continue;
+        }
+        if (o = this.tokenizer.br(e)) {
+          e = e.substring(o.raw.length), t.push(o);
+          continue;
+        }
+        if (o = this.tokenizer.del(e)) {
+          e = e.substring(o.raw.length), t.push(o);
+          continue;
+        }
+        if (o = this.tokenizer.autolink(e)) {
+          e = e.substring(o.raw.length), t.push(o);
+          continue;
+        }
+        if (!this.state.inLink && (o = this.tokenizer.url(e))) {
+          e = e.substring(o.raw.length), t.push(o);
+          continue;
+        }
+        let l = e;
+        if (this.options.extensions?.startInline) {
+          let p = 1 / 0, c = e.slice(1), g;
+          this.options.extensions.startInline.forEach((h) => {
+            g = h.call({ lexer: this }, c), typeof g == "number" && g >= 0 && (p = Math.min(p, g));
+          }), p < 1 / 0 && p >= 0 && (l = e.substring(0, p + 1));
+        }
+        if (o = this.tokenizer.inlineText(l)) {
+          e = e.substring(o.raw.length), o.raw.slice(-1) !== "_" && (a = o.raw.slice(-1)), s = true;
+          let p = t.at(-1);
+          p?.type === "text" ? (p.raw += o.raw, p.text += o.text) : t.push(o);
+          continue;
+        }
+        if (e) {
+          let p = "Infinite loop on byte: " + e.charCodeAt(0);
+          if (this.options.silent) {
+            console.error(p);
+            break;
+          } else throw new Error(p);
+        }
+      }
+      return t;
+    }
+  };
+  var P = class {
+    constructor(e) {
+      __publicField(this, "options");
+      __publicField(this, "parser");
+      this.options = e || T;
+    }
+    space(e) {
+      return "";
+    }
+    code({ text: e, lang: t, escaped: n }) {
+      let r = (t || "").match(m.notSpaceStart)?.[0], i = e.replace(m.endingNewline, "") + `
+`;
+      return r ? '<pre><code class="language-' + w(r) + '">' + (n ? i : w(i, true)) + `</code></pre>
+` : "<pre><code>" + (n ? i : w(i, true)) + `</code></pre>
+`;
+    }
+    blockquote({ tokens: e }) {
+      return `<blockquote>
+${this.parser.parse(e)}</blockquote>
+`;
+    }
+    html({ text: e }) {
+      return e;
+    }
+    def(e) {
+      return "";
+    }
+    heading({ tokens: e, depth: t }) {
+      return `<h${t}>${this.parser.parseInline(e)}</h${t}>
+`;
+    }
+    hr(e) {
+      return `<hr>
+`;
+    }
+    list(e) {
+      let t = e.ordered, n = e.start, r = "";
+      for (let a = 0; a < e.items.length; a++) {
+        let o = e.items[a];
+        r += this.listitem(o);
+      }
+      let i = t ? "ol" : "ul", s = t && n !== 1 ? ' start="' + n + '"' : "";
+      return "<" + i + s + `>
+` + r + "</" + i + `>
+`;
+    }
+    listitem(e) {
+      return `<li>${this.parser.parse(e.tokens)}</li>
+`;
+    }
+    checkbox({ checked: e }) {
+      return "<input " + (e ? 'checked="" ' : "") + 'disabled="" type="checkbox"> ';
+    }
+    paragraph({ tokens: e }) {
+      return `<p>${this.parser.parseInline(e)}</p>
+`;
+    }
+    table(e) {
+      let t = "", n = "";
+      for (let i = 0; i < e.header.length; i++) n += this.tablecell(e.header[i]);
+      t += this.tablerow({ text: n });
+      let r = "";
+      for (let i = 0; i < e.rows.length; i++) {
+        let s = e.rows[i];
+        n = "";
+        for (let a = 0; a < s.length; a++) n += this.tablecell(s[a]);
+        r += this.tablerow({ text: n });
+      }
+      return r && (r = `<tbody>${r}</tbody>`), `<table>
+<thead>
+` + t + `</thead>
+` + r + `</table>
+`;
+    }
+    tablerow({ text: e }) {
+      return `<tr>
+${e}</tr>
+`;
+    }
+    tablecell(e) {
+      let t = this.parser.parseInline(e.tokens), n = e.header ? "th" : "td";
+      return (e.align ? `<${n} align="${e.align}">` : `<${n}>`) + t + `</${n}>
+`;
+    }
+    strong({ tokens: e }) {
+      return `<strong>${this.parser.parseInline(e)}</strong>`;
+    }
+    em({ tokens: e }) {
+      return `<em>${this.parser.parseInline(e)}</em>`;
+    }
+    codespan({ text: e }) {
+      return `<code>${w(e, true)}</code>`;
+    }
+    br(e) {
+      return "<br>";
+    }
+    del({ tokens: e }) {
+      return `<del>${this.parser.parseInline(e)}</del>`;
+    }
+    link({ href: e, title: t, tokens: n }) {
+      let r = this.parser.parseInline(n), i = X(e);
+      if (i === null) return r;
+      e = i;
+      let s = '<a href="' + e + '"';
+      return t && (s += ' title="' + w(t) + '"'), s += ">" + r + "</a>", s;
+    }
+    image({ href: e, title: t, text: n, tokens: r }) {
+      r && (n = this.parser.parseInline(r, this.parser.textRenderer));
+      let i = X(e);
+      if (i === null) return w(n);
+      e = i;
+      let s = `<img src="${e}" alt="${n}"`;
+      return t && (s += ` title="${w(t)}"`), s += ">", s;
+    }
+    text(e) {
+      return "tokens" in e && e.tokens ? this.parser.parseInline(e.tokens) : "escaped" in e && e.escaped ? e.text : w(e.text);
+    }
+  };
+  var $ = class {
+    strong({ text: e }) {
+      return e;
+    }
+    em({ text: e }) {
+      return e;
+    }
+    codespan({ text: e }) {
+      return e;
+    }
+    del({ text: e }) {
+      return e;
+    }
+    html({ text: e }) {
+      return e;
+    }
+    text({ text: e }) {
+      return e;
+    }
+    link({ text: e }) {
+      return "" + e;
+    }
+    image({ text: e }) {
+      return "" + e;
+    }
+    br() {
+      return "";
+    }
+    checkbox({ raw: e }) {
+      return e;
+    }
+  };
+  var b = class u2 {
+    constructor(e) {
+      __publicField(this, "options");
+      __publicField(this, "renderer");
+      __publicField(this, "textRenderer");
+      this.options = e || T, this.options.renderer = this.options.renderer || new P(), this.renderer = this.options.renderer, this.renderer.options = this.options, this.renderer.parser = this, this.textRenderer = new $();
+    }
+    static parse(e, t) {
+      return new u2(t).parse(e);
+    }
+    static parseInline(e, t) {
+      return new u2(t).parseInline(e);
+    }
+    parse(e) {
+      let t = "";
+      for (let n = 0; n < e.length; n++) {
+        let r = e[n];
+        if (this.options.extensions?.renderers?.[r.type]) {
+          let s = r, a = this.options.extensions.renderers[s.type].call({ parser: this }, s);
+          if (a !== false || !["space", "hr", "heading", "code", "table", "blockquote", "list", "html", "def", "paragraph", "text"].includes(s.type)) {
+            t += a || "";
+            continue;
+          }
+        }
+        let i = r;
+        switch (i.type) {
+          case "space": {
+            t += this.renderer.space(i);
+            break;
+          }
+          case "hr": {
+            t += this.renderer.hr(i);
+            break;
+          }
+          case "heading": {
+            t += this.renderer.heading(i);
+            break;
+          }
+          case "code": {
+            t += this.renderer.code(i);
+            break;
+          }
+          case "table": {
+            t += this.renderer.table(i);
+            break;
+          }
+          case "blockquote": {
+            t += this.renderer.blockquote(i);
+            break;
+          }
+          case "list": {
+            t += this.renderer.list(i);
+            break;
+          }
+          case "checkbox": {
+            t += this.renderer.checkbox(i);
+            break;
+          }
+          case "html": {
+            t += this.renderer.html(i);
+            break;
+          }
+          case "def": {
+            t += this.renderer.def(i);
+            break;
+          }
+          case "paragraph": {
+            t += this.renderer.paragraph(i);
+            break;
+          }
+          case "text": {
+            t += this.renderer.text(i);
+            break;
+          }
+          default: {
+            let s = 'Token with "' + i.type + '" type was not found.';
+            if (this.options.silent) return console.error(s), "";
+            throw new Error(s);
+          }
+        }
+      }
+      return t;
+    }
+    parseInline(e, t = this.renderer) {
+      let n = "";
+      for (let r = 0; r < e.length; r++) {
+        let i = e[r];
+        if (this.options.extensions?.renderers?.[i.type]) {
+          let a = this.options.extensions.renderers[i.type].call({ parser: this }, i);
+          if (a !== false || !["escape", "html", "link", "image", "strong", "em", "codespan", "br", "del", "text"].includes(i.type)) {
+            n += a || "";
+            continue;
+          }
+        }
+        let s = i;
+        switch (s.type) {
+          case "escape": {
+            n += t.text(s);
+            break;
+          }
+          case "html": {
+            n += t.html(s);
+            break;
+          }
+          case "link": {
+            n += t.link(s);
+            break;
+          }
+          case "image": {
+            n += t.image(s);
+            break;
+          }
+          case "checkbox": {
+            n += t.checkbox(s);
+            break;
+          }
+          case "strong": {
+            n += t.strong(s);
+            break;
+          }
+          case "em": {
+            n += t.em(s);
+            break;
+          }
+          case "codespan": {
+            n += t.codespan(s);
+            break;
+          }
+          case "br": {
+            n += t.br(s);
+            break;
+          }
+          case "del": {
+            n += t.del(s);
+            break;
+          }
+          case "text": {
+            n += t.text(s);
+            break;
+          }
+          default: {
+            let a = 'Token with "' + s.type + '" type was not found.';
+            if (this.options.silent) return console.error(a), "";
+            throw new Error(a);
+          }
+        }
+      }
+      return n;
+    }
+  };
+  var _a;
+  var S = (_a = class {
+    constructor(e) {
+      __publicField(this, "options");
+      __publicField(this, "block");
+      this.options = e || T;
+    }
+    preprocess(e) {
+      return e;
+    }
+    postprocess(e) {
+      return e;
+    }
+    processAllTokens(e) {
+      return e;
+    }
+    emStrongMask(e) {
+      return e;
+    }
+    provideLexer() {
+      return this.block ? x.lex : x.lexInline;
+    }
+    provideParser() {
+      return this.block ? b.parse : b.parseInline;
+    }
+  }, __publicField(_a, "passThroughHooks", /* @__PURE__ */ new Set(["preprocess", "postprocess", "processAllTokens", "emStrongMask"])), __publicField(_a, "passThroughHooksRespectAsync", /* @__PURE__ */ new Set(["preprocess", "postprocess", "processAllTokens"])), _a);
+  var B = class {
+    constructor(...e) {
+      __publicField(this, "defaults", L());
+      __publicField(this, "options", this.setOptions);
+      __publicField(this, "parse", this.parseMarkdown(true));
+      __publicField(this, "parseInline", this.parseMarkdown(false));
+      __publicField(this, "Parser", b);
+      __publicField(this, "Renderer", P);
+      __publicField(this, "TextRenderer", $);
+      __publicField(this, "Lexer", x);
+      __publicField(this, "Tokenizer", y);
+      __publicField(this, "Hooks", S);
+      this.use(...e);
+    }
+    walkTokens(e, t) {
+      let n = [];
+      for (let r of e) switch (n = n.concat(t.call(this, r)), r.type) {
+        case "table": {
+          let i = r;
+          for (let s of i.header) n = n.concat(this.walkTokens(s.tokens, t));
+          for (let s of i.rows) for (let a of s) n = n.concat(this.walkTokens(a.tokens, t));
+          break;
+        }
+        case "list": {
+          let i = r;
+          n = n.concat(this.walkTokens(i.items, t));
+          break;
+        }
+        default: {
+          let i = r;
+          this.defaults.extensions?.childTokens?.[i.type] ? this.defaults.extensions.childTokens[i.type].forEach((s) => {
+            let a = i[s].flat(1 / 0);
+            n = n.concat(this.walkTokens(a, t));
+          }) : i.tokens && (n = n.concat(this.walkTokens(i.tokens, t)));
+        }
+      }
+      return n;
+    }
+    use(...e) {
+      let t = this.defaults.extensions || { renderers: {}, childTokens: {} };
+      return e.forEach((n) => {
+        let r = { ...n };
+        if (r.async = this.defaults.async || r.async || false, n.extensions && (n.extensions.forEach((i) => {
+          if (!i.name) throw new Error("extension name required");
+          if ("renderer" in i) {
+            let s = t.renderers[i.name];
+            s ? t.renderers[i.name] = function(...a) {
+              let o = i.renderer.apply(this, a);
+              return o === false && (o = s.apply(this, a)), o;
+            } : t.renderers[i.name] = i.renderer;
+          }
+          if ("tokenizer" in i) {
+            if (!i.level || i.level !== "block" && i.level !== "inline") throw new Error("extension level must be 'block' or 'inline'");
+            let s = t[i.level];
+            s ? s.unshift(i.tokenizer) : t[i.level] = [i.tokenizer], i.start && (i.level === "block" ? t.startBlock ? t.startBlock.push(i.start) : t.startBlock = [i.start] : i.level === "inline" && (t.startInline ? t.startInline.push(i.start) : t.startInline = [i.start]));
+          }
+          "childTokens" in i && i.childTokens && (t.childTokens[i.name] = i.childTokens);
+        }), r.extensions = t), n.renderer) {
+          let i = this.defaults.renderer || new P(this.defaults);
+          for (let s in n.renderer) {
+            if (!(s in i)) throw new Error(`renderer '${s}' does not exist`);
+            if (["options", "parser"].includes(s)) continue;
+            let a = s, o = n.renderer[a], l = i[a];
+            i[a] = (...p) => {
+              let c = o.apply(i, p);
+              return c === false && (c = l.apply(i, p)), c || "";
+            };
+          }
+          r.renderer = i;
+        }
+        if (n.tokenizer) {
+          let i = this.defaults.tokenizer || new y(this.defaults);
+          for (let s in n.tokenizer) {
+            if (!(s in i)) throw new Error(`tokenizer '${s}' does not exist`);
+            if (["options", "rules", "lexer"].includes(s)) continue;
+            let a = s, o = n.tokenizer[a], l = i[a];
+            i[a] = (...p) => {
+              let c = o.apply(i, p);
+              return c === false && (c = l.apply(i, p)), c;
+            };
+          }
+          r.tokenizer = i;
+        }
+        if (n.hooks) {
+          let i = this.defaults.hooks || new S();
+          for (let s in n.hooks) {
+            if (!(s in i)) throw new Error(`hook '${s}' does not exist`);
+            if (["options", "block"].includes(s)) continue;
+            let a = s, o = n.hooks[a], l = i[a];
+            S.passThroughHooks.has(s) ? i[a] = (p) => {
+              if (this.defaults.async && S.passThroughHooksRespectAsync.has(s)) return (async () => {
+                let g = await o.call(i, p);
+                return l.call(i, g);
+              })();
+              let c = o.call(i, p);
+              return l.call(i, c);
+            } : i[a] = (...p) => {
+              if (this.defaults.async) return (async () => {
+                let g = await o.apply(i, p);
+                return g === false && (g = await l.apply(i, p)), g;
+              })();
+              let c = o.apply(i, p);
+              return c === false && (c = l.apply(i, p)), c;
+            };
+          }
+          r.hooks = i;
+        }
+        if (n.walkTokens) {
+          let i = this.defaults.walkTokens, s = n.walkTokens;
+          r.walkTokens = function(a) {
+            let o = [];
+            return o.push(s.call(this, a)), i && (o = o.concat(i.call(this, a))), o;
+          };
+        }
+        this.defaults = { ...this.defaults, ...r };
+      }), this;
+    }
+    setOptions(e) {
+      return this.defaults = { ...this.defaults, ...e }, this;
+    }
+    lexer(e, t) {
+      return x.lex(e, t ?? this.defaults);
+    }
+    parser(e, t) {
+      return b.parse(e, t ?? this.defaults);
+    }
+    parseMarkdown(e) {
+      return (n, r) => {
+        let i = { ...r }, s = { ...this.defaults, ...i }, a = this.onError(!!s.silent, !!s.async);
+        if (this.defaults.async === true && i.async === false) return a(new Error("marked(): The async option was set to true by an extension. Remove async: false from the parse options object to return a Promise."));
+        if (typeof n > "u" || n === null) return a(new Error("marked(): input parameter is undefined or null"));
+        if (typeof n != "string") return a(new Error("marked(): input parameter is of type " + Object.prototype.toString.call(n) + ", string expected"));
+        if (s.hooks && (s.hooks.options = s, s.hooks.block = e), s.async) return (async () => {
+          let o = s.hooks ? await s.hooks.preprocess(n) : n, p = await (s.hooks ? await s.hooks.provideLexer() : e ? x.lex : x.lexInline)(o, s), c = s.hooks ? await s.hooks.processAllTokens(p) : p;
+          s.walkTokens && await Promise.all(this.walkTokens(c, s.walkTokens));
+          let h = await (s.hooks ? await s.hooks.provideParser() : e ? b.parse : b.parseInline)(c, s);
+          return s.hooks ? await s.hooks.postprocess(h) : h;
+        })().catch(a);
+        try {
+          s.hooks && (n = s.hooks.preprocess(n));
+          let l = (s.hooks ? s.hooks.provideLexer() : e ? x.lex : x.lexInline)(n, s);
+          s.hooks && (l = s.hooks.processAllTokens(l)), s.walkTokens && this.walkTokens(l, s.walkTokens);
+          let c = (s.hooks ? s.hooks.provideParser() : e ? b.parse : b.parseInline)(l, s);
+          return s.hooks && (c = s.hooks.postprocess(c)), c;
+        } catch (o) {
+          return a(o);
+        }
+      };
+    }
+    onError(e, t) {
+      return (n) => {
+        if (n.message += `
+Please report this to https://github.com/markedjs/marked.`, e) {
+          let r = "<p>An error occurred:</p><pre>" + w(n.message + "", true) + "</pre>";
+          return t ? Promise.resolve(r) : r;
+        }
+        if (t) return Promise.reject(n);
+        throw n;
+      };
+    }
+  };
+  var _ = new B();
+  function d(u3, e) {
+    return _.parse(u3, e);
+  }
+  d.options = d.setOptions = function(u3) {
+    return _.setOptions(u3), d.defaults = _.defaults, Z(d.defaults), d;
+  };
+  d.getDefaults = L;
+  d.defaults = T;
+  d.use = function(...u3) {
+    return _.use(...u3), d.defaults = _.defaults, Z(d.defaults), d;
+  };
+  d.walkTokens = function(u3, e) {
+    return _.walkTokens(u3, e);
+  };
+  d.parseInline = _.parseInline;
+  d.Parser = b;
+  d.parser = b.parse;
+  d.Renderer = P;
+  d.TextRenderer = $;
+  d.Lexer = x;
+  d.lexer = x.lex;
+  d.Tokenizer = y;
+  d.Hooks = S;
+  d.parse = d;
+  var Dt = d.options;
+  var Ht = d.setOptions;
+  var Zt = d.use;
+  var Gt = d.walkTokens;
+  var Nt = d.parseInline;
+  var Ft = b.parse;
+  var jt = x.lex;
+
+  // packages/frontend/src/components/PlanApproval.js
+  d.setOptions({
+    breaks: true,
+    // Convert \n to <br>
+    gfm: true,
+    // GitHub Flavored Markdown
+    headerIds: false,
+    // Don't add IDs to headers
+    mangle: false
+    // Don't escape email addresses
+  });
+  function render(plan, onApprove, onViewPlan) {
+    const taskCount = plan.tasks ? plan.tasks.length : 0;
+    return `
+    <div style="
+      margin: 24px 0;
+      padding: 16px 20px;
+      background: #1c2128;
+      border: 2px solid #58a6ff;
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+    ">
+      <div style="flex: 1;">
+        <div style="
+          font-size: 14px;
+          font-weight: 600;
+          color: #e6edf3;
+          margin-bottom: 4px;
+        ">
+          Implementation Plan Ready
+        </div>
+        <div style="
+          font-size: 12px;
+          color: #7d868f;
+        ">
+          ${taskCount} task${taskCount !== 1 ? "s" : ""} \u2022 Click to review details
+        </div>
+      </div>
+      <div style="display: flex; gap: 12px; align-items: center;">
+        <button
+          onclick="${handler(onViewPlan)}"
+          style="
+            background: #21262d;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            padding: 8px 16px;
+            font-size: 13px;
+            color: #b8bfc7;
+            cursor: pointer;
+            font-family: monospace;
+            transition: all 0.2s;
+          "
+          onmouseover="this.style.background='#30363d'; this.style.borderColor='#484f58';"
+          onmouseout="this.style.background='#21262d'; this.style.borderColor='#30363d';"
+        >
+          View Plan
+        </button>
+        <button
+          onclick="${handler(onApprove)}"
+          style="
+            background: #238636;
+            border: 1px solid #2ea043;
+            border-radius: 6px;
+            padding: 8px 20px;
+            font-size: 13px;
+            font-weight: 600;
+            color: #ffffff;
+            cursor: pointer;
+            font-family: monospace;
+            transition: all 0.2s;
+          "
+          onmouseover="this.style.background='#2ea043';"
+          onmouseout="this.style.background='#238636';"
+        >
+          Approve & Start
+        </button>
+      </div>
+    </div>
+  `;
+  }
+  function showPlanModal(plan) {
+    const modal = document.createElement("div");
+    modal.id = "plan-modal";
+    modal.style.cssText = `
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.8);
+    z-index: 10000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 40px 20px;
+  `;
+    modal.onclick = (e) => {
+      if (e.target === modal) {
+        modal.remove();
+      }
+    };
+    const container = document.createElement("div");
+    container.style.cssText = `
+    background: #161b22;
+    border: 2px solid #58a6ff;
+    border-radius: 12px;
+    width: 800px;
+    max-width: 100%;
+    max-height: 80vh;
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 8px 32px rgba(88, 166, 255, 0.2);
+    overflow: hidden;
+  `;
+    const header = document.createElement("div");
+    header.style.cssText = `
+    padding: 14px 18px;
+    border-bottom: 1px solid #30363d;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  `;
+    const title = document.createElement("div");
+    title.style.cssText = `
+    font-size: 15px;
+    font-weight: 600;
+    color: #e6edf3;
+  `;
+    title.textContent = `Implementation Plan (${plan.tasks.length} tasks)`;
+    const closeButton = document.createElement("button");
+    closeButton.textContent = "\xD7";
+    closeButton.style.cssText = `
+    background: transparent;
+    border: none;
+    color: #7d868f;
+    font-size: 28px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 0;
+    width: 32px;
+    height: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 6px;
+    transition: all 0.2s;
+  `;
+    closeButton.onclick = () => modal.remove();
+    closeButton.onmouseover = () => {
+      closeButton.style.background = "#30363d";
+      closeButton.style.color = "#e6edf3";
+    };
+    closeButton.onmouseout = () => {
+      closeButton.style.background = "transparent";
+      closeButton.style.color = "#7d868f";
+    };
+    header.appendChild(title);
+    header.appendChild(closeButton);
+    const content = document.createElement("div");
+    content.style.cssText = `
+    padding: 16px 18px;
+    overflow-y: auto;
+    flex: 1;
+  `;
+    let tasksHtml = "";
+    plan.tasks.forEach((task, index) => {
+      tasksHtml += `
+      <div style="
+        margin-bottom: ${index < plan.tasks.length - 1 ? "20px" : "0"};
+        padding-bottom: ${index < plan.tasks.length - 1 ? "20px" : "0"};
+        border-bottom: ${index < plan.tasks.length - 1 ? "1px solid #21262d" : "none"};
+      ">
+        <div style="display: flex; align-items: start; gap: 16px;">
+          <div style="flex: 1;">
+            <div style="
+              font-size: 14px;
+              font-weight: 600;
+              color: #e6edf3;
+              margin-bottom: 8px;
+              line-height: 1.4;
+            ">
+              ${escapeHtml(task.shortDesc)}
+            </div>
+            <div style="
+              font-size: 13px;
+              color: #8b949e;
+              line-height: 1.5;
+            ">
+              ${renderMarkdown(task.longDesc)}
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+    });
+    content.innerHTML = tasksHtml;
+    container.appendChild(header);
+    container.appendChild(content);
+    modal.appendChild(container);
+    document.body.appendChild(modal);
+    document.body.style.overflow = "hidden";
+    const originalRemove = modal.remove.bind(modal);
+    modal.remove = () => {
+      document.body.style.overflow = "";
+      originalRemove();
+    };
+  }
+  function escapeHtml(text) {
+    const div = document.createElement("div");
+    div.textContent = text;
+    return div.innerHTML;
+  }
+  function renderMarkdown(markdown) {
+    try {
+      return d.parse(markdown);
+    } catch (error) {
+      console.error("Markdown parsing error:", error);
+      return escapeHtml(markdown);
+    }
+  }
+
+  // packages/frontend/src/components/Checklist.js
+  function render2(tasks, currentTaskIndex = -1) {
+    if (!tasks || tasks.length === 0) {
+      return "";
+    }
+    let tasksHtml = "";
+    tasks.forEach((task, index) => {
+      const isCompleted = task.completed || false;
+      const isCurrent = index === currentTaskIndex;
+      let statusIcon, statusColor, textColor;
+      if (isCompleted) {
+        statusIcon = "\u2713";
+        statusColor = "#3fb950";
+        textColor = "#7d868f";
+      } else if (isCurrent) {
+        statusIcon = "\u25CF";
+        statusColor = "#58a6ff";
+        textColor = "#e6edf3";
+      } else {
+        statusIcon = "\u25CB";
+        statusColor = "#484f58";
+        textColor = "#8b949e";
+      }
+      tasksHtml += `
+      <div style="
+        display: flex;
+        align-items: start;
+        gap: 12px;
+        padding: 8px 0;
+        ${index < tasks.length - 1 ? "border-bottom: 1px solid #21262d;" : ""}
+      ">
+        <div style="
+          width: 20px;
+          height: 20px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          font-size: 16px;
+          color: ${statusColor};
+          flex-shrink: 0;
+          margin-top: 2px;
+        ">
+          ${statusIcon}
+        </div>
+        <div style="
+          flex: 1;
+          font-size: 13px;
+          color: ${textColor};
+          line-height: 1.6;
+          ${isCompleted ? "text-decoration: line-through;" : ""}
+          ${isCurrent ? "font-weight: 600;" : ""}
+        ">
+          ${escapeHtml2(task.shortDesc)}
+        </div>
+      </div>
+    `;
+    });
+    return `
+    <div style="
+      margin: 20px 0;
+      padding: 16px 20px;
+      background: #0d1117;
+      border: 1px solid #30363d;
+      border-left: 3px solid #58a6ff;
+      border-radius: 6px;
+    ">
+      <div style="
+        font-size: 12px;
+        font-weight: 600;
+        color: #58a6ff;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        margin-bottom: 12px;
+      ">
+        Implementation Checklist
+      </div>
+      ${tasksHtml}
+    </div>
+  `;
+  }
+  function escapeHtml2(text) {
+    const div = document.createElement("div");
+    div.textContent = text;
+    return div.innerHTML;
+  }
+
+  // packages/frontend/src/components/TaskFailure.js
+  function render3(failure) {
+    return `
+    <div style="
+      margin: 24px 0;
+      padding: 16px 20px;
+      background: #2d1117;
+      border: 2px solid #da3633;
+      border-radius: 8px;
+    ">
+      <div style="
+        font-size: 14px;
+        font-weight: 600;
+        color: #f85149;
+        margin-bottom: 12px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      ">
+        <span style="font-size: 18px;">\u26A0</span>
+        Task Failed
+      </div>
+      <div style="
+        font-size: 13px;
+        color: #e6edf3;
+        margin-bottom: 8px;
+        font-weight: 500;
+      ">
+        ${escapeHtml3(failure.shortDesc)}
+      </div>
+      <div style="
+        font-size: 12px;
+        color: #b8bfc7;
+        line-height: 1.6;
+        padding: 12px;
+        background: #161b22;
+        border-radius: 6px;
+        border-left: 3px solid #da3633;
+      ">
+        <div style="
+          font-weight: 600;
+          color: #f85149;
+          margin-bottom: 6px;
+        ">
+          Reason:
+        </div>
+        ${escapeHtml3(failure.reason)}
+      </div>
+      <div style="
+        margin-top: 12px;
+        font-size: 11px;
+        color: #7d868f;
+        font-style: italic;
+      ">
+        Returning to planning mode to create a revised plan...
+      </div>
+    </div>
+  `;
+  }
+  function escapeHtml3(text) {
+    const div = document.createElement("div");
+    div.textContent = text;
+    return div.innerHTML;
+  }
+
+  // packages/frontend/src/components/ChatMessages.js
+  d.setOptions({
+    breaks: true,
+    // Convert \n to <br>
+    gfm: true,
+    // GitHub Flavored Markdown
+    headerIds: false,
+    // Don't add IDs to headers
+    mangle: false
+    // Don't escape email addresses
+  });
+  var diffRegistry = /* @__PURE__ */ new Map();
+  function showDiffModal(diffId, filePath) {
+    const changes = diffRegistry.get(diffId);
+    if (!changes) {
+      console.error(`Diff data not found for ID: ${diffId}`);
+      return;
+    }
+    const modal = document.createElement("div");
+    modal.style.cssText = "position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.8); z-index: 10000; display: flex; align-items: center; justify-content: center; padding: 20px;";
+    modal.onclick = (e) => {
+      if (e.target === modal) modal.remove();
+    };
+    const container = document.createElement("div");
+    container.style.cssText = "background: #161b22; border: 1px solid #30363d; border-radius: 8px; width: 900px; max-width: 100%; height: calc(100vh - 40px); display: flex; flex-direction: column;";
+    const header = document.createElement("div");
+    header.style.cssText = "padding: 12px 16px; border-bottom: 1px solid #30363d; display: flex; justify-content: space-between; align-items: center;";
+    const titleDiv = document.createElement("div");
+    titleDiv.style.cssText = "font-family: monospace; font-size: 13px; color: #b8bfc7; font-weight: 600;";
+    titleDiv.textContent = filePath;
+    const closeButton = document.createElement("button");
+    closeButton.textContent = "\xD7";
+    closeButton.style.cssText = "background: transparent; border: none; color: #7d868f; cursor: pointer; font-size: 18px; padding: 0 4px; line-height: 1;";
+    closeButton.onclick = () => modal.remove();
+    header.appendChild(titleDiv);
+    header.appendChild(closeButton);
+    const content = document.createElement("div");
+    content.style.cssText = "overflow-y: auto; font-family: monospace; font-size: 11px; flex: 1;";
+    let diffHtml = "";
+    for (const change of changes) {
+      const escapedContent = escapeHtml4(change.content);
+      if (change.type === "removed") {
+        diffHtml += `<div style="color: #e6edf3; background: #2d1519; padding: 0 8px;"><span style="color: #f85149;">-</span> ${change.line}: ${escapedContent}</div>`;
+      } else if (change.type === "added") {
+        diffHtml += `<div style="color: #e6edf3; background: #172818; padding: 0 8px;"><span style="color: #3fb950;">+</span> ${change.line}: ${escapedContent}</div>`;
+      } else if (change.type === "unchanged") {
+        diffHtml += `<div style="color: #7d868f; background: transparent; padding: 0 8px;">&nbsp;&nbsp;${change.line}: ${escapedContent}</div>`;
+      }
+    }
+    content.innerHTML = diffHtml;
+    container.appendChild(header);
+    container.appendChild(content);
+    modal.appendChild(container);
+    document.body.appendChild(modal);
+  }
+  function escapeHtml4(text) {
+    const div = document.createElement("div");
+    div.textContent = text;
+    return div.innerHTML;
+  }
+  function renderMarkdown2(markdown) {
+    try {
+      return d.parse(markdown);
+    } catch (error) {
+      console.error("Markdown parsing error:", error);
+      return escapeHtml4(markdown);
+    }
+  }
+  function formatToolDisplay(toolName, input) {
+    if (toolName === "enter_planning_mode" || toolName === "enter_execute_mode" || toolName === "enter_review_mode") {
+      return null;
+    }
+    switch (toolName) {
+      case "list_directory": {
+        const path = input.path || ".";
+        const recursive = input.recursive ? "recursive " : "";
+        return `List ${recursive}${path}`;
+      }
+      case "read_file": {
+        const path = input.path || "";
+        const hasRange = input.start_line || input.end_line;
+        if (hasRange) {
+          const start = input.start_line || 1;
+          const end = input.end_line || "";
+          const rangeText = end ? `${start}-${end}` : `${start}`;
+          return `Read ${path} lines ${rangeText}`;
+        }
+        return `Read ${path}`;
+      }
+      case "create_folder": {
+        return `Create folder ${input.path}`;
+      }
+      case "delete_folder": {
+        return `Delete folder ${input.path}`;
+      }
+      case "move_folder": {
+        return `Move folder ${input.source} \u2192 ${input.destination}`;
+      }
+      case "create_file": {
+        return `Create file ${input.path}`;
+      }
+      case "delete_file": {
+        return `Delete file ${input.path}`;
+      }
+      case "move_file": {
+        return `Move file ${input.source} \u2192 ${input.destination}`;
+      }
+      case "edit_file": {
+        return `Edit file ${input.path}`;
+      }
+      case "search_code": {
+        const query = input.query || "";
+        const truncated = query.length > 40 ? query.substring(0, 40) + "..." : query;
+        return `Search code: "${truncated}"`;
+      }
+      case "search_all_files": {
+        const query = input.query || "";
+        const truncated = query.length > 40 ? query.substring(0, 40) + "..." : query;
+        return `Search all files: "${truncated}"`;
+      }
+      case "find_files": {
+        const pattern = input.pattern || "";
+        return `Find: ${pattern}`;
+      }
+      default: {
+        const params = Object.entries(input || {}).map(([key, value]) => {
+          if (typeof value === "string" && value.length < 30) {
+            return value;
+          }
+          return null;
+        }).filter((v2) => v2).join(", ");
+        return params ? `${toolName} ${params}` : toolName;
+      }
+    }
+  }
+  function isToolResultMessage(message) {
+    if (message.role !== "user") return false;
+    if (!Array.isArray(message.content)) return false;
+    return message.content.every((item) => item && item.type === "tool_result");
+  }
+  function groupMessagesIntoTurns(messages) {
+    const items = [];
+    let currentTurn = null;
+    for (const message of messages) {
+      if (message.type === "plan_approval") {
+        if (currentTurn) {
+          items.push(currentTurn);
+          currentTurn = null;
+        }
+        items.push({ type: "plan_approval", message });
+        continue;
+      }
+      if (message.type === "checklist") {
+        if (currentTurn) {
+          items.push(currentTurn);
+          currentTurn = null;
+        }
+        items.push({ type: "checklist", message });
+        continue;
+      }
+      if (message.type === "task_failure") {
+        if (currentTurn) {
+          items.push(currentTurn);
+          currentTurn = null;
+        }
+        items.push({ type: "task_failure", message });
+        continue;
+      }
+      if (message.type === "mode_transition") {
+        continue;
+      }
+      if (isToolResultMessage(message)) {
+        if (currentTurn) {
+          currentTurn.agentMessages.push(message);
+        }
+        continue;
+      }
+      if (message.role === "user") {
+        if (currentTurn) {
+          items.push(currentTurn);
+        }
+        currentTurn = {
+          type: "turn",
+          userMessage: message,
+          agentMessages: []
+        };
+      } else if (currentTurn) {
+        currentTurn.agentMessages.push(message);
+      }
+    }
+    if (currentTurn) {
+      items.push(currentTurn);
+    }
+    return items;
+  }
+  function renderUserMessage(message) {
+    let textContent = "";
+    if (typeof message.content === "string") {
+      textContent = message.content;
+    } else if (Array.isArray(message.content)) {
+      const textParts = message.content.map((item) => {
+        if (typeof item === "string") return item;
+        if (item.type === "text") return item.text;
+        if (item.type === "tool_result") return `[Tool result: ${item.content}]`;
+        return "";
+      }).filter((s) => s);
+      textContent = textParts.join("\n");
+    }
+    return `
+    <div style="margin-bottom: 16px;">
+      <div class="markdown-content" style="
+        background: #1c2128;
+        border: 1px solid #30363d;
+        border-radius: 8px;
+        padding: 14px 16px;
+        font-size: 14px;
+        line-height: 1.6;
+        color: #b8bfc7;
+      ">
+        ${renderMarkdown2(textContent)}
+      </div>
+    </div>
+  `;
+  }
+  function renderAgentMessage(message, agentMessages = []) {
+    if (isToolResultMessage(message)) {
+      return "";
+    }
+    if (message.role === "tool") {
+      return `
+      <div style="position: relative; margin-bottom: 8px;">
+        <div style="
+          position: absolute;
+          left: -29px;
+          top: 6px;
+          width: 10px;
+          height: 10px;
+          border-radius: 50%;
+          background: #d29922;
+        "></div>
+        <div style="line-height: 1.6; font-size: 13px; color: #c9d1d9;">
+          <div style="margin: 8px 0;">
+            <span style="font-size: 12px; color: #c9d1d9; font-weight: 600; display: inline;">${escapeHtml4(message.name)}</span>
+            <span style="font-size: 12px; color: #6e7681; display: inline; margin-left: 6px;">
+              ${message.input ? escapeHtml4(JSON.stringify(message.input)) : ""}
+            </span>
+          </div>
+        </div>
+      </div>
+    `;
+    }
+    if (message.role === "tool-result") {
+      const isSuccess = message.success !== false;
+      const indicatorColor = isSuccess ? "#3fb950" : "#f85149";
+      return `
+      <div style="position: relative; margin-bottom: 8px;">
+        <div style="
+          position: absolute;
+          left: -29px;
+          top: 6px;
+          width: 10px;
+          height: 10px;
+          border-radius: 50%;
+          background: ${indicatorColor};
+        "></div>
+        <div style="line-height: 1.6; font-size: 13px; color: #c9d1d9;">
+          <div style="margin: 8px 0;">
+            <span style="font-size: 12px; color: #c9d1d9; font-weight: 600; display: inline;">${escapeHtml4(message.name)}</span>
+            <div style="font-size: 11px; color: #8b949e; margin-top: 4px; line-height: 1.5;">
+              ${escapeHtml4(typeof message.result === "string" ? message.result.substring(0, 200) : JSON.stringify(message.result).substring(0, 200))}
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+    }
+    if (message.role === "assistant") {
+      if (typeof message.content === "string") {
+        const trimmedContent = message.content.trim();
+        if (!trimmedContent) return "";
+        return `<div style="position: relative; margin-bottom: 8px;"><div style="position: absolute; left: -29px; top: 6px; width: 10px; height: 10px; border-radius: 50%; background: #b8bfc7;"></div><div class="markdown-content" style="line-height: 1.6; font-size: 13px; color: #b8bfc7;">${renderMarkdown2(trimmedContent)}</div></div>`;
+      } else if (Array.isArray(message.content)) {
+        const blocks = message.content.map((block) => {
+          if (!block) return "";
+          if (block.type === "text") {
+            const trimmedText = block.text.trim();
+            if (!trimmedText) return "";
+            return `<div style="position: relative; margin-bottom: 8px;"><div style="position: absolute; left: -29px; top: 6px; width: 10px; height: 10px; border-radius: 50%; background: #b8bfc7;"></div><div class="markdown-content" style="line-height: 1.6; font-size: 13px; color: #b8bfc7;">${renderMarkdown2(trimmedText)}</div></div>`;
+          } else if (block.type === "tool_use") {
+            const toolName = block.name;
+            const formattedDisplay = formatToolDisplay(block.name, block.input);
+            if (formattedDisplay === null) {
+              return "";
+            }
+            let toolNamePart = toolName;
+            let paramsPart = "";
+            if (formattedDisplay.startsWith("List ")) {
+              toolNamePart = "List";
+              paramsPart = formattedDisplay.substring(5);
+            } else if (formattedDisplay.startsWith("Read ")) {
+              toolNamePart = "Read";
+              paramsPart = formattedDisplay.substring(5);
+            } else {
+              const spaceIndex = formattedDisplay.indexOf(" ");
+              if (spaceIndex > 0) {
+                toolNamePart = formattedDisplay.substring(0, spaceIndex);
+                paramsPart = formattedDisplay.substring(spaceIndex + 1);
+              } else {
+                toolNamePart = formattedDisplay;
+              }
+            }
+            const toolResult = findToolResult(block.id, agentMessages);
+            const hideResult = toolName === "read_file" || toolName === "list_directory" || toolName === "create_file" || toolName === "create_folder" || toolName === "delete_file" || toolName === "delete_folder" || toolName === "move_file" || toolName === "move_folder" || toolName === "search_code" || toolName === "search_all_files" || toolName === "find_files";
+            let resultHtml = "";
+            if (toolName === "edit_file" && toolResult) {
+              try {
+                const result = typeof toolResult.content === "string" ? JSON.parse(toolResult.content) : toolResult.content;
+                if (result.success && result.diff) {
+                  const { changes } = result.diff;
+                  const totalLines = changes.length;
+                  const maxInlineLines = 12;
+                  const needsExpand = totalLines > maxInlineLines;
+                  const displayChanges = needsExpand ? changes.slice(0, 13) : changes;
+                  const diffId = `diff_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+                  const filePath = block.input?.path || "file";
+                  if (needsExpand) {
+                    diffRegistry.set(diffId, changes);
+                  }
+                  const showModalCallback = () => showDiffModal(diffId, filePath);
+                  const truncatedStyle = needsExpand ? "overflow: hidden; max-height: 211px;" : "";
+                  let diffHtml = `<div style="position: relative; font-family: monospace; font-size: 11px; margin-top: 8px; background: #22272e; border: 1px solid #30363d; border-radius: 8px; ${truncatedStyle} ${needsExpand ? "cursor: pointer;" : ""}" class="diff-container" ${needsExpand ? `onclick="${handler(showModalCallback)}"` : ""} onmouseenter="document.getElementById('${diffId}-expand-btn').style.opacity='1'" onmouseleave="document.getElementById('${diffId}-expand-btn').style.opacity='0'">`;
+                  for (let i = 0; i < displayChanges.length; i++) {
+                    const change = displayChanges[i];
+                    const isLastLine = i === displayChanges.length - 1;
+                    const lastLineBackground = needsExpand && isLastLine ? " background: #22272e;" : "";
+                    if (change.type === "removed") {
+                      diffHtml += `<div style="color: #e6edf3; background: #2d1519; padding: 0 8px;${lastLineBackground}"><span style="color: #f85149;">-</span> ${change.line}: ${escapeHtml4(change.content)}</div>`;
+                    } else if (change.type === "added") {
+                      diffHtml += `<div style="color: #e6edf3; background: #172818; padding: 0 8px;${lastLineBackground}"><span style="color: #3fb950;">+</span> ${change.line}: ${escapeHtml4(change.content)}</div>`;
+                    } else if (change.type === "unchanged") {
+                      diffHtml += `<div style="color: #7d868f; background: transparent; padding: 0 8px;${lastLineBackground}">&nbsp;&nbsp;${change.line}: ${escapeHtml4(change.content)}</div>`;
+                    }
+                  }
+                  if (needsExpand) {
+                    diffHtml += `<div style="position: absolute; bottom: 0; left: 0; right: 0; height: 49px; background: linear-gradient(to bottom, rgba(34, 39, 46, 0), rgba(34, 39, 46, 1)); pointer-events: none; border-radius: 0 0 8px 8px;"></div>`;
+                  }
+                  if (needsExpand) {
+                    diffHtml += `<button id="${diffId}-expand-btn" onclick="${handler(showModalCallback)}" style="position: absolute; bottom: 8px; right: 8px; opacity: 0; transition: opacity 0.2s; background: #30363d; border: 1px solid #484f58; border-radius: 4px; padding: 4px 8px; font-size: 11px; color: #b8bfc7; cursor: pointer; font-family: monospace;">Click to Expand</button>`;
+                  }
+                  diffHtml += "</div>";
+                  resultHtml = diffHtml;
+                }
+              } catch (e) {
+                console.error("Failed to parse edit_file result:", e, toolResult.content);
+              }
+            } else if (toolName === "create_file" && toolResult) {
+              try {
+                const result = typeof toolResult.content === "string" ? JSON.parse(toolResult.content) : toolResult.content;
+                if (result.success && result.content) {
+                  const lines = result.content.split("\n");
+                  const totalLines = lines.length;
+                  const maxInlineLines = 12;
+                  const needsExpand = totalLines > maxInlineLines;
+                  const displayLines = needsExpand ? lines.slice(0, 13) : lines;
+                  const diffId = `diff_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+                  const filePath = block.input?.path || "file";
+                  if (needsExpand) {
+                    const fileChanges = lines.map((content, i) => ({
+                      type: "added",
+                      line: i + 1,
+                      content
+                    }));
+                    diffRegistry.set(diffId, fileChanges);
+                  }
+                  const showModalCallback = () => showDiffModal(diffId, filePath);
+                  const truncatedStyle = needsExpand ? "overflow: hidden; max-height: 211px;" : "";
+                  let diffHtml = `<div style="position: relative; font-family: monospace; font-size: 11px; margin-top: 8px; background: #22272e; border: 1px solid #30363d; border-radius: 8px; ${truncatedStyle} ${needsExpand ? "cursor: pointer;" : ""}" class="diff-container" ${needsExpand ? `onclick="${handler(showModalCallback)}"` : ""} onmouseenter="document.getElementById('${diffId}-expand-btn').style.opacity='1'" onmouseleave="document.getElementById('${diffId}-expand-btn').style.opacity='0'">`;
+                  for (let i = 0; i < displayLines.length; i++) {
+                    const line = displayLines[i];
+                    const lineNum = i + 1;
+                    const isLastLine = i === displayLines.length - 1;
+                    const lastLineBackground = needsExpand && isLastLine ? " background: #22272e;" : "";
+                    diffHtml += `<div style="color: #e6edf3; background: #172818; padding: 0 8px;${lastLineBackground}"><span style="color: #3fb950;">+</span> ${lineNum}: ${escapeHtml4(line)}</div>`;
+                  }
+                  if (needsExpand) {
+                    diffHtml += `<div style="position: absolute; bottom: 0; left: 0; right: 0; height: 49px; background: linear-gradient(to bottom, rgba(34, 39, 46, 0), rgba(34, 39, 46, 1)); pointer-events: none; border-radius: 0 0 8px 8px;"></div>`;
+                    diffHtml += `<button id="${diffId}-expand-btn" onclick="${handler(showModalCallback)}" style="position: absolute; bottom: 8px; right: 8px; opacity: 0; transition: opacity 0.2s; background: #30363d; border: 1px solid #484f58; border-radius: 4px; padding: 4px 8px; font-size: 11px; color: #b8bfc7; cursor: pointer; font-family: monospace;">Click to Expand</button>`;
+                  }
+                  diffHtml += "</div>";
+                  resultHtml = diffHtml;
+                }
+              } catch (e) {
+                console.error("Failed to parse create_file result:", e, toolResult.content);
+              }
+            } else if (toolResult && !hideResult) {
+              resultHtml = `
+              <div style="font-size: 12px; color: #7d868f; margin-top: 2px; line-height: 1.5; max-height: 300px; overflow-y: auto;">
+                ${escapeHtml4(toolResult.content.length > 1e3 ? toolResult.content.substring(0, 1e3) + "..." : toolResult.content)}
+              </div>
+            `;
+            }
+            return `
+            <div style="position: relative; margin-bottom: 12px;">
+              <div style="
+                position: absolute;
+                left: -29px;
+                top: 6px;
+                width: 10px;
+                height: 10px;
+                border-radius: 50%;
+                background: ${toolResult && !toolResult.is_error ? "#3fb950" : "#d29922"};
+              "></div>
+              <div style="line-height: 1.6; font-size: 14px;">
+                <span style="font-size: 13px; color: #b8bfc7; font-weight: 600;">${escapeHtml4(toolNamePart)}</span>
+                ${paramsPart ? `<span style="font-size: 13px; color: #7d868f;"> ${escapeHtml4(paramsPart)}</span>` : ""}
+                ${resultHtml}
+              </div>
+            </div>
+          `;
+          }
+          return "";
+        }).filter((html) => html);
+        return blocks.join("");
+      }
+      return "";
+    }
+    return "";
+  }
+  function findToolResult(toolUseId, agentMessages) {
+    for (const msg of agentMessages) {
+      if (isToolResultMessage(msg)) {
+        for (const block of msg.content) {
+          if (block.type === "tool_result" && block.tool_use_id === toolUseId) {
+            return block;
+          }
+        }
+      }
+    }
+    return null;
+  }
+  function renderAgentTurn(agentMessages) {
+    if (agentMessages.length === 0) return "";
+    const messagesHtml = agentMessages.map((msg) => renderAgentMessage(msg, agentMessages)).join("");
+    return `
+    <div style="display: flex; margin-bottom: 16px; margin-left: 12px; position: relative;">
+      <div style="width: 24px; flex-shrink: 0; position: relative;">
+        <!-- Gutter for indicators -->
+      </div>
+      <div style="flex: 1;">
+        ${messagesHtml}
+      </div>
+    </div>
+  `;
+  }
+  function render4(state2) {
+    const items = groupMessagesIntoTurns(state2.messages);
+    let messagesHtml = "";
+    for (const item of items) {
+      if (item.type === "turn") {
+        messagesHtml += renderUserMessage(item.userMessage);
+        messagesHtml += renderAgentTurn(item.agentMessages);
+      } else if (item.type === "plan_approval") {
+        const plan = item.message.plan;
+        const onViewPlan = () => showPlanModal(plan);
+        const onApprove = () => {
+          const transport2 = getTransport();
+          if (transport2) {
+            transport2.send("approve-plan", null);
+          }
+        };
+        messagesHtml += render(plan, onApprove, onViewPlan);
+      } else if (item.type === "checklist") {
+        messagesHtml += render2(item.message.tasks, item.message.currentTaskIndex);
+      } else if (item.type === "task_failure") {
+        const failure = {
+          shortDesc: item.message.shortDesc,
+          reason: item.message.reason
+        };
+        messagesHtml += render3(failure);
+      }
+    }
+    if (state2.isLoading && state2.streamingContent) {
+      messagesHtml += `
+      <div style="display: flex; margin-bottom: 16px; margin-left: 12px; position: relative;">
+        <div style="width: 24px; flex-shrink: 0; position: relative;"></div>
+        <div style="flex: 1;">
+          <div style="position: relative; margin-bottom: 8px;">
+            <div style="
+              position: absolute;
+              left: -29px;
+              top: 6px;
+              width: 10px;
+              height: 10px;
+              border-radius: 50%;
+              background: #c9d1d9;
+            "></div>
+            <div class="markdown-content" style="line-height: 1.6; font-size: 13px; color: #c9d1d9;">
+              ${renderMarkdown2(state2.streamingContent.trim())}
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+    } else if (state2.isLoading) {
+      messagesHtml += `
+      <style>
+        @keyframes pulse {
+          0%, 100% { opacity: 1; }
+          50% { opacity: 0.4; }
+        }
+      </style>
+      <div style="display: flex; margin-bottom: 16px; margin-left: 12px; position: relative;">
+        <div style="width: 24px; flex-shrink: 0; position: relative;"></div>
+        <div style="flex: 1;">
+          <div style="position: relative; margin-bottom: 8px;">
+            <div style="
+              position: absolute;
+              left: -29px;
+              top: 6px;
+              width: 10px;
+              height: 10px;
+              border-radius: 50%;
+              background: #c9d1d9;
+              animation: pulse 1.5s ease-in-out infinite;
+            "></div>
+            <div style="line-height: 1.6; font-size: 13px; color: #6e7681; font-style: italic;">
+              Thinking...
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+    }
+    return `
+    <div style="max-width: 900px; margin: 0 auto; padding: 32px 24px;">
+      ${state2.messages.length === 0 && !state2.isLoading ? `
+        <div style="
+          text-align: center;
+          color: #6e7681;
+          padding: 40px 20px;
+        ">
+          <p style="font-size: 16px; margin-bottom: 8px;">Ready to assist</p>
+          <p style="font-size: 13px;">Send a message to start the conversation</p>
+        </div>
+      ` : messagesHtml}
+    </div>
+  `;
+  }
+
+  // packages/frontend/src/components/ChatInput.js
+  function handleClearConversation() {
+    if (confirm("Clear conversation history? This will delete all messages and start fresh.")) {
+      const transport2 = getTransport();
+      if (transport2) {
+        transport2.send("clear-conversation", null);
+      }
+    }
+  }
+  function render5(state2) {
+    return `
+    <div style="
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      padding: 16px 24px 12px;
+      background: linear-gradient(transparent, #161b22 20%);
+    ">
+      <div style="max-width: 900px; margin: 0 auto; position: relative;">
+        ${state2.error ? `
+          <div style="
+            background: #3d1117;
+            border: 1px solid #da3633;
+            border-radius: 6px;
+            padding: 12px 16px;
+            margin-bottom: 12px;
+            font-size: 13px;
+            color: #f85149;
+          ">
+            ${state2.error}
+          </div>
+        ` : ""}
+        <div style="position: relative;">
+          <textarea
+          id="claude-code-chat-input"
+          placeholder="Message the agent..."
+          rows="1"
+          ${state2.isLoading ? "disabled" : ""}
+          oninput="${handler((e) => {
+      const textarea = e.target;
+      textarea.style.height = "auto";
+      const lineHeight = 24;
+      const maxHeight = lineHeight * 5;
+      const newHeight = Math.min(textarea.scrollHeight, maxHeight);
+      textarea.style.height = newHeight + "px";
+    })}"
+          onkeydown="${handler((e) => {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        const textarea = document.getElementById("claude-code-chat-input");
+        if (textarea && textarea.value.trim()) {
+          handleSendMessage(textarea.value.trim());
+          textarea.value = "";
+          textarea.style.height = "auto";
+        }
+      }
+    })}"
+          style="
+            width: 100%;
+            background: #1c2128;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            padding: 14px 50px 14px 16px;
+            font-size: 13px;
+            color: #b8bfc7;
+            font-family: monospace;
+            outline: none;
+            resize: none;
+            overflow-y: auto;
+            min-height: 47px;
+            max-height: 104px;
+            line-height: 1.5;
+            ${state2.isLoading ? "opacity: 0.5; cursor: not-allowed;" : ""}
+          "
+        ></textarea>
+
+        <!-- 3-dot menu button -->
+        <button
+          id="menu-button"
+          onclick="${handler((e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const menu = document.getElementById("dropdown-menu");
+      if (menu) {
+        const isVisible = menu.style.display === "block";
+        menu.style.display = isVisible ? "none" : "block";
+        if (!isVisible) {
+          setTimeout(() => {
+            const closeMenu = (event) => {
+              const menuEl = document.getElementById("dropdown-menu");
+              const buttonEl = document.getElementById("menu-button");
+              if (menuEl && !menuEl.contains(event.target) && !buttonEl.contains(event.target)) {
+                menuEl.style.display = "none";
+                document.removeEventListener("click", closeMenu);
+              }
+            };
+            document.addEventListener("click", closeMenu);
+          }, 0);
+        }
+      }
+    })}"
+          style="
+            position: absolute;
+            right: 8px;
+            top: 8px;
+            background: transparent;
+            border: none;
+            color: #7d868f;
+            padding: 8px;
+            cursor: pointer;
+            border-radius: 6px;
+            font-size: 16px;
+            line-height: 1;
+            transition: all 0.2s;
+            ${state2.isLoading ? "opacity: 0.3; cursor: not-allowed;" : ""}
+          "
+          ${state2.isLoading ? "disabled" : ""}
+          onmouseover="if (!this.disabled) { this.style.background='#21262d'; this.style.color='#e6edf3'; }"
+          onmouseout="this.style.background='transparent'; this.style.color='#7d868f';"
+        >\u22EE</button>
+
+        <!-- Dropdown menu -->
+        <div
+          id="dropdown-menu"
+          style="
+            display: none;
+            position: absolute;
+            right: 8px;
+            bottom: 55px;
+            background: #1c2128;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+            min-width: 200px;
+            z-index: 1000;
+          "
+        >
+          <button
+            onclick="${handler(() => {
+      const menu = document.getElementById("dropdown-menu");
+      if (menu) menu.style.display = "none";
+      handleClearConversation();
+    })}"
+            style="
+              width: 100%;
+              background: transparent;
+              border: none;
+              color: #f85149;
+              padding: 10px 16px;
+              text-align: left;
+              cursor: pointer;
+              font-size: 13px;
+              font-family: monospace;
+              border-radius: 6px;
+              transition: background 0.2s;
+            "
+            onmouseover="this.style.background='#21262d';"
+            onmouseout="this.style.background='transparent';"
+          >Clear Conversation</button>
+        </div>
+      </div>
+
+        <div style="
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          margin-top: 8px;
+          font-size: 10px;
+          color: #484f58;
+          padding: 0 4px;
+        ">
+          <div>${state2.workspaceFolder || ""}</div>
+          <div style="display: flex; gap: 12px; align-items: center;">
+            <!-- Uncomment to show connection status
+            <span>
+              <span style="width: 6px; height: 6px; border-radius: 50%; background: #3fb950; display: inline-block; margin-right: 4px;"></span>
+              Connected
+            </span>
+            -->
+            <!-- Uncomment to show model info
+            <span>Model: ${state2.model || "claude-sonnet-4.5"}</span>
+            -->
+            <!-- Uncomment to show token count
+            <span>Tokens: ${state2.tokenCount || "0"}K</span>
+            -->
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+  }
+  function handleSendMessage(content) {
+    const transport2 = getTransport();
+    if (!transport2) {
+      console.error("Transport not initialized");
+      return;
+    }
+    transport2.send("send-message", { message: content });
+  }
+
+  // packages/frontend/src/components/FolderSelect.js
+  function render6(state2) {
+    return `
+    <div style="
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+      padding: 40px;
+      text-align: center;
+      background: #161b22;
+      color: #b8bfc7;
+      font-family: monospace;
+    ">
+      <h1 style="font-size: 48px; margin-bottom: 16px; font-weight: 600; color: #c9d1d9;">
+        AI Coding Assistant
+      </h1>
+      <p style="font-size: 16px; margin-bottom: 40px; max-width: 500px; color: #8b949e; line-height: 1.6;">
+        Select a folder to get started. Your AI assistant will have access to read and explore files in this directory.
+      </p>
+      <button
+        onclick="window.selectFolder()"
+        style="
+          background: #238636;
+          color: white;
+          border: 1px solid #2ea043;
+          padding: 12px 24px;
+          font-size: 14px;
+          font-weight: 600;
+          border-radius: 6px;
+          cursor: pointer;
+          font-family: monospace;
+          transition: background 0.2s;
+        "
+        onmouseover="this.style.background='#2ea043'"
+        onmouseout="this.style.background='#238636'"
+      >
+        Select Folder
+      </button>
+      ${state2.error ? `
+        <div style="
+          margin-top: 24px;
+          padding: 16px;
+          background: #3d1117;
+          border: 1px solid #da3633;
+          border-radius: 6px;
+          max-width: 500px;
+          color: #f85149;
+          font-size: 14px;
+        ">
+          ${state2.error}
+        </div>
+      ` : ""}
+    </div>
+  `;
+  }
+
+  // packages/frontend/src/components/App.js
+  function render7(state2) {
+    if (!state2.workspaceFolder) {
+      return render6(state2);
+    }
+    return `
+    <style>
+      /* Custom scrollbar styling */
+      ::-webkit-scrollbar {
+        width: 8px;
+      }
+      ::-webkit-scrollbar-track {
+        background: #161b22;
+      }
+      ::-webkit-scrollbar-thumb {
+        background: #30363d;
+        border-radius: 4px;
+      }
+      ::-webkit-scrollbar-thumb:hover {
+        background: #484f58;
+      }
+
+      /* Markdown content styling */
+      .markdown-content {
+        word-wrap: break-word;
+      }
+      .markdown-content p {
+        margin: 0 0 12px 0;
+      }
+      .markdown-content p:last-child {
+        margin-bottom: 0;
+      }
+      .markdown-content code {
+        background: #0d1117;
+        border: 1px solid #30363d;
+        border-radius: 3px;
+        padding: 2px 6px;
+        font-size: 13px;
+        font-family: monospace;
+        color: #e6edf3;
+      }
+      .markdown-content pre {
+        background: #0d1117;
+        border: 1px solid #30363d;
+        border-radius: 6px;
+        padding: 12px;
+        overflow-x: auto;
+        margin: 12px 0;
+      }
+      .markdown-content pre code {
+        background: none;
+        border: none;
+        padding: 0;
+        color: #e6edf3;
+      }
+      .markdown-content ul, .markdown-content ol {
+        margin: 8px 0;
+        padding-left: 24px;
+      }
+      .markdown-content li {
+        margin: 4px 0;
+      }
+      .markdown-content h1, .markdown-content h2, .markdown-content h3 {
+        margin: 16px 0 8px 0;
+        font-weight: 600;
+        color: #c9d1d9;
+      }
+      .markdown-content h1 {
+        font-size: 20px;
+        border-bottom: 1px solid #30363d;
+        padding-bottom: 8px;
+      }
+      .markdown-content h2 {
+        font-size: 18px;
+      }
+      .markdown-content h3 {
+        font-size: 16px;
+      }
+      .markdown-content a {
+        color: #58a6ff;
+        text-decoration: none;
+      }
+      .markdown-content a:hover {
+        text-decoration: underline;
+      }
+      .markdown-content strong {
+        font-weight: 600;
+        color: #c9d1d9;
+      }
+      .markdown-content em {
+        font-style: italic;
+      }
+      .markdown-content blockquote {
+        border-left: 3px solid #30363d;
+        padding-left: 12px;
+        margin: 8px 0;
+        color: #7d868f;
+      }
+    </style>
+    <div style="
+      background: #161b22;
+      color: #b8bfc7;
+      font-family: monospace;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    ">
+      <div style="
+        flex: 1;
+        overflow-y: auto;
+        padding-bottom: 120px;
+      ">
+        ${render4(state2)}
+      </div>
+      ${render5(state2)}
+    </div>
+  `;
+  }
+
+  // node_modules/morphdom/dist/morphdom-esm.js
+  var DOCUMENT_FRAGMENT_NODE = 11;
+  function morphAttrs(fromNode, toNode) {
+    var toNodeAttrs = toNode.attributes;
+    var attr;
+    var attrName;
+    var attrNamespaceURI;
+    var attrValue;
+    var fromValue;
+    if (toNode.nodeType === DOCUMENT_FRAGMENT_NODE || fromNode.nodeType === DOCUMENT_FRAGMENT_NODE) {
+      return;
+    }
+    for (var i = toNodeAttrs.length - 1; i >= 0; i--) {
+      attr = toNodeAttrs[i];
+      attrName = attr.name;
+      attrNamespaceURI = attr.namespaceURI;
+      attrValue = attr.value;
+      if (attrNamespaceURI) {
+        attrName = attr.localName || attrName;
+        fromValue = fromNode.getAttributeNS(attrNamespaceURI, attrName);
+        if (fromValue !== attrValue) {
+          if (attr.prefix === "xmlns") {
+            attrName = attr.name;
+          }
+          fromNode.setAttributeNS(attrNamespaceURI, attrName, attrValue);
+        }
+      } else {
+        fromValue = fromNode.getAttribute(attrName);
+        if (fromValue !== attrValue) {
+          fromNode.setAttribute(attrName, attrValue);
+        }
+      }
+    }
+    var fromNodeAttrs = fromNode.attributes;
+    for (var d2 = fromNodeAttrs.length - 1; d2 >= 0; d2--) {
+      attr = fromNodeAttrs[d2];
+      attrName = attr.name;
+      attrNamespaceURI = attr.namespaceURI;
+      if (attrNamespaceURI) {
+        attrName = attr.localName || attrName;
+        if (!toNode.hasAttributeNS(attrNamespaceURI, attrName)) {
+          fromNode.removeAttributeNS(attrNamespaceURI, attrName);
+        }
+      } else {
+        if (!toNode.hasAttribute(attrName)) {
+          fromNode.removeAttribute(attrName);
+        }
+      }
+    }
+  }
+  var range;
+  var NS_XHTML = "http://www.w3.org/1999/xhtml";
+  var doc = typeof document === "undefined" ? void 0 : document;
+  var HAS_TEMPLATE_SUPPORT = !!doc && "content" in doc.createElement("template");
+  var HAS_RANGE_SUPPORT = !!doc && doc.createRange && "createContextualFragment" in doc.createRange();
+  function createFragmentFromTemplate(str) {
+    var template = doc.createElement("template");
+    template.innerHTML = str;
+    return template.content.childNodes[0];
+  }
+  function createFragmentFromRange(str) {
+    if (!range) {
+      range = doc.createRange();
+      range.selectNode(doc.body);
+    }
+    var fragment = range.createContextualFragment(str);
+    return fragment.childNodes[0];
+  }
+  function createFragmentFromWrap(str) {
+    var fragment = doc.createElement("body");
+    fragment.innerHTML = str;
+    return fragment.childNodes[0];
+  }
+  function toElement(str) {
+    str = str.trim();
+    if (HAS_TEMPLATE_SUPPORT) {
+      return createFragmentFromTemplate(str);
+    } else if (HAS_RANGE_SUPPORT) {
+      return createFragmentFromRange(str);
+    }
+    return createFragmentFromWrap(str);
+  }
+  function compareNodeNames(fromEl, toEl) {
+    var fromNodeName = fromEl.nodeName;
+    var toNodeName = toEl.nodeName;
+    var fromCodeStart, toCodeStart;
+    if (fromNodeName === toNodeName) {
+      return true;
+    }
+    fromCodeStart = fromNodeName.charCodeAt(0);
+    toCodeStart = toNodeName.charCodeAt(0);
+    if (fromCodeStart <= 90 && toCodeStart >= 97) {
+      return fromNodeName === toNodeName.toUpperCase();
+    } else if (toCodeStart <= 90 && fromCodeStart >= 97) {
+      return toNodeName === fromNodeName.toUpperCase();
+    } else {
+      return false;
+    }
+  }
+  function createElementNS(name, namespaceURI) {
+    return !namespaceURI || namespaceURI === NS_XHTML ? doc.createElement(name) : doc.createElementNS(namespaceURI, name);
+  }
+  function moveChildren(fromEl, toEl) {
+    var curChild = fromEl.firstChild;
+    while (curChild) {
+      var nextChild = curChild.nextSibling;
+      toEl.appendChild(curChild);
+      curChild = nextChild;
+    }
+    return toEl;
+  }
+  function syncBooleanAttrProp(fromEl, toEl, name) {
+    if (fromEl[name] !== toEl[name]) {
+      fromEl[name] = toEl[name];
+      if (fromEl[name]) {
+        fromEl.setAttribute(name, "");
+      } else {
+        fromEl.removeAttribute(name);
+      }
+    }
+  }
+  var specialElHandlers = {
+    OPTION: function(fromEl, toEl) {
+      var parentNode = fromEl.parentNode;
+      if (parentNode) {
+        var parentName = parentNode.nodeName.toUpperCase();
+        if (parentName === "OPTGROUP") {
+          parentNode = parentNode.parentNode;
+          parentName = parentNode && parentNode.nodeName.toUpperCase();
+        }
+        if (parentName === "SELECT" && !parentNode.hasAttribute("multiple")) {
+          if (fromEl.hasAttribute("selected") && !toEl.selected) {
+            fromEl.setAttribute("selected", "selected");
+            fromEl.removeAttribute("selected");
+          }
+          parentNode.selectedIndex = -1;
+        }
+      }
+      syncBooleanAttrProp(fromEl, toEl, "selected");
+    },
+    /**
+     * The "value" attribute is special for the <input> element since it sets
+     * the initial value. Changing the "value" attribute without changing the
+     * "value" property will have no effect since it is only used to the set the
+     * initial value.  Similar for the "checked" attribute, and "disabled".
+     */
+    INPUT: function(fromEl, toEl) {
+      syncBooleanAttrProp(fromEl, toEl, "checked");
+      syncBooleanAttrProp(fromEl, toEl, "disabled");
+      if (fromEl.value !== toEl.value) {
+        fromEl.value = toEl.value;
+      }
+      if (!toEl.hasAttribute("value")) {
+        fromEl.removeAttribute("value");
+      }
+    },
+    TEXTAREA: function(fromEl, toEl) {
+      var newValue = toEl.value;
+      if (fromEl.value !== newValue) {
+        fromEl.value = newValue;
+      }
+      var firstChild = fromEl.firstChild;
+      if (firstChild) {
+        var oldValue = firstChild.nodeValue;
+        if (oldValue == newValue || !newValue && oldValue == fromEl.placeholder) {
+          return;
+        }
+        firstChild.nodeValue = newValue;
+      }
+    },
+    SELECT: function(fromEl, toEl) {
+      if (!toEl.hasAttribute("multiple")) {
+        var selectedIndex = -1;
+        var i = 0;
+        var curChild = fromEl.firstChild;
+        var optgroup;
+        var nodeName;
+        while (curChild) {
+          nodeName = curChild.nodeName && curChild.nodeName.toUpperCase();
+          if (nodeName === "OPTGROUP") {
+            optgroup = curChild;
+            curChild = optgroup.firstChild;
+            if (!curChild) {
+              curChild = optgroup.nextSibling;
+              optgroup = null;
+            }
+          } else {
+            if (nodeName === "OPTION") {
+              if (curChild.hasAttribute("selected")) {
+                selectedIndex = i;
+                break;
+              }
+              i++;
+            }
+            curChild = curChild.nextSibling;
+            if (!curChild && optgroup) {
+              curChild = optgroup.nextSibling;
+              optgroup = null;
+            }
+          }
+        }
+        fromEl.selectedIndex = selectedIndex;
+      }
+    }
+  };
+  var ELEMENT_NODE = 1;
+  var DOCUMENT_FRAGMENT_NODE$1 = 11;
+  var TEXT_NODE = 3;
+  var COMMENT_NODE = 8;
+  function noop() {
+  }
+  function defaultGetNodeKey(node) {
+    if (node) {
+      return node.getAttribute && node.getAttribute("id") || node.id;
+    }
+  }
+  function morphdomFactory(morphAttrs2) {
+    return function morphdom2(fromNode, toNode, options) {
+      if (!options) {
+        options = {};
+      }
+      if (typeof toNode === "string") {
+        if (fromNode.nodeName === "#document" || fromNode.nodeName === "HTML" || fromNode.nodeName === "BODY") {
+          var toNodeHtml = toNode;
+          toNode = doc.createElement("html");
+          toNode.innerHTML = toNodeHtml;
+        } else {
+          toNode = toElement(toNode);
+        }
+      } else if (toNode.nodeType === DOCUMENT_FRAGMENT_NODE$1) {
+        toNode = toNode.firstElementChild;
+      }
+      var getNodeKey = options.getNodeKey || defaultGetNodeKey;
+      var onBeforeNodeAdded = options.onBeforeNodeAdded || noop;
+      var onNodeAdded = options.onNodeAdded || noop;
+      var onBeforeElUpdated = options.onBeforeElUpdated || noop;
+      var onElUpdated = options.onElUpdated || noop;
+      var onBeforeNodeDiscarded = options.onBeforeNodeDiscarded || noop;
+      var onNodeDiscarded = options.onNodeDiscarded || noop;
+      var onBeforeElChildrenUpdated = options.onBeforeElChildrenUpdated || noop;
+      var skipFromChildren = options.skipFromChildren || noop;
+      var addChild = options.addChild || function(parent, child) {
+        return parent.appendChild(child);
+      };
+      var childrenOnly = options.childrenOnly === true;
+      var fromNodesLookup = /* @__PURE__ */ Object.create(null);
+      var keyedRemovalList = [];
+      function addKeyedRemoval(key) {
+        keyedRemovalList.push(key);
+      }
+      function walkDiscardedChildNodes(node, skipKeyedNodes) {
+        if (node.nodeType === ELEMENT_NODE) {
+          var curChild = node.firstChild;
+          while (curChild) {
+            var key = void 0;
+            if (skipKeyedNodes && (key = getNodeKey(curChild))) {
+              addKeyedRemoval(key);
+            } else {
+              onNodeDiscarded(curChild);
+              if (curChild.firstChild) {
+                walkDiscardedChildNodes(curChild, skipKeyedNodes);
+              }
+            }
+            curChild = curChild.nextSibling;
+          }
+        }
+      }
+      function removeNode(node, parentNode, skipKeyedNodes) {
+        if (onBeforeNodeDiscarded(node) === false) {
+          return;
+        }
+        if (parentNode) {
+          parentNode.removeChild(node);
+        }
+        onNodeDiscarded(node);
+        walkDiscardedChildNodes(node, skipKeyedNodes);
+      }
+      function indexTree(node) {
+        if (node.nodeType === ELEMENT_NODE || node.nodeType === DOCUMENT_FRAGMENT_NODE$1) {
+          var curChild = node.firstChild;
+          while (curChild) {
+            var key = getNodeKey(curChild);
+            if (key) {
+              fromNodesLookup[key] = curChild;
+            }
+            indexTree(curChild);
+            curChild = curChild.nextSibling;
+          }
+        }
+      }
+      indexTree(fromNode);
+      function handleNodeAdded(el) {
+        onNodeAdded(el);
+        var curChild = el.firstChild;
+        while (curChild) {
+          var nextSibling = curChild.nextSibling;
+          var key = getNodeKey(curChild);
+          if (key) {
+            var unmatchedFromEl = fromNodesLookup[key];
+            if (unmatchedFromEl && compareNodeNames(curChild, unmatchedFromEl)) {
+              curChild.parentNode.replaceChild(unmatchedFromEl, curChild);
+              morphEl(unmatchedFromEl, curChild);
+            } else {
+              handleNodeAdded(curChild);
+            }
+          } else {
+            handleNodeAdded(curChild);
+          }
+          curChild = nextSibling;
+        }
+      }
+      function cleanupFromEl(fromEl, curFromNodeChild, curFromNodeKey) {
+        while (curFromNodeChild) {
+          var fromNextSibling = curFromNodeChild.nextSibling;
+          if (curFromNodeKey = getNodeKey(curFromNodeChild)) {
+            addKeyedRemoval(curFromNodeKey);
+          } else {
+            removeNode(
+              curFromNodeChild,
+              fromEl,
+              true
+              /* skip keyed nodes */
+            );
+          }
+          curFromNodeChild = fromNextSibling;
+        }
+      }
+      function morphEl(fromEl, toEl, childrenOnly2) {
+        var toElKey = getNodeKey(toEl);
+        if (toElKey) {
+          delete fromNodesLookup[toElKey];
+        }
+        if (!childrenOnly2) {
+          var beforeUpdateResult = onBeforeElUpdated(fromEl, toEl);
+          if (beforeUpdateResult === false) {
+            return;
+          } else if (beforeUpdateResult instanceof HTMLElement) {
+            fromEl = beforeUpdateResult;
+            indexTree(fromEl);
+          }
+          morphAttrs2(fromEl, toEl);
+          onElUpdated(fromEl);
+          if (onBeforeElChildrenUpdated(fromEl, toEl) === false) {
+            return;
+          }
+        }
+        if (fromEl.nodeName !== "TEXTAREA") {
+          morphChildren(fromEl, toEl);
+        } else {
+          specialElHandlers.TEXTAREA(fromEl, toEl);
+        }
+      }
+      function morphChildren(fromEl, toEl) {
+        var skipFrom = skipFromChildren(fromEl, toEl);
+        var curToNodeChild = toEl.firstChild;
+        var curFromNodeChild = fromEl.firstChild;
+        var curToNodeKey;
+        var curFromNodeKey;
+        var fromNextSibling;
+        var toNextSibling;
+        var matchingFromEl;
+        outer: while (curToNodeChild) {
+          toNextSibling = curToNodeChild.nextSibling;
+          curToNodeKey = getNodeKey(curToNodeChild);
+          while (!skipFrom && curFromNodeChild) {
+            fromNextSibling = curFromNodeChild.nextSibling;
+            if (curToNodeChild.isSameNode && curToNodeChild.isSameNode(curFromNodeChild)) {
+              curToNodeChild = toNextSibling;
+              curFromNodeChild = fromNextSibling;
+              continue outer;
+            }
+            curFromNodeKey = getNodeKey(curFromNodeChild);
+            var curFromNodeType = curFromNodeChild.nodeType;
+            var isCompatible = void 0;
+            if (curFromNodeType === curToNodeChild.nodeType) {
+              if (curFromNodeType === ELEMENT_NODE) {
+                if (curToNodeKey) {
+                  if (curToNodeKey !== curFromNodeKey) {
+                    if (matchingFromEl = fromNodesLookup[curToNodeKey]) {
+                      if (fromNextSibling === matchingFromEl) {
+                        isCompatible = false;
+                      } else {
+                        fromEl.insertBefore(matchingFromEl, curFromNodeChild);
+                        if (curFromNodeKey) {
+                          addKeyedRemoval(curFromNodeKey);
+                        } else {
+                          removeNode(
+                            curFromNodeChild,
+                            fromEl,
+                            true
+                            /* skip keyed nodes */
+                          );
+                        }
+                        curFromNodeChild = matchingFromEl;
+                        curFromNodeKey = getNodeKey(curFromNodeChild);
+                      }
+                    } else {
+                      isCompatible = false;
+                    }
+                  }
+                } else if (curFromNodeKey) {
+                  isCompatible = false;
+                }
+                isCompatible = isCompatible !== false && compareNodeNames(curFromNodeChild, curToNodeChild);
+                if (isCompatible) {
+                  morphEl(curFromNodeChild, curToNodeChild);
+                }
+              } else if (curFromNodeType === TEXT_NODE || curFromNodeType == COMMENT_NODE) {
+                isCompatible = true;
+                if (curFromNodeChild.nodeValue !== curToNodeChild.nodeValue) {
+                  curFromNodeChild.nodeValue = curToNodeChild.nodeValue;
+                }
+              }
+            }
+            if (isCompatible) {
+              curToNodeChild = toNextSibling;
+              curFromNodeChild = fromNextSibling;
+              continue outer;
+            }
+            if (curFromNodeKey) {
+              addKeyedRemoval(curFromNodeKey);
+            } else {
+              removeNode(
+                curFromNodeChild,
+                fromEl,
+                true
+                /* skip keyed nodes */
+              );
+            }
+            curFromNodeChild = fromNextSibling;
+          }
+          if (curToNodeKey && (matchingFromEl = fromNodesLookup[curToNodeKey]) && compareNodeNames(matchingFromEl, curToNodeChild)) {
+            if (!skipFrom) {
+              addChild(fromEl, matchingFromEl);
+            }
+            morphEl(matchingFromEl, curToNodeChild);
+          } else {
+            var onBeforeNodeAddedResult = onBeforeNodeAdded(curToNodeChild);
+            if (onBeforeNodeAddedResult !== false) {
+              if (onBeforeNodeAddedResult) {
+                curToNodeChild = onBeforeNodeAddedResult;
+              }
+              if (curToNodeChild.actualize) {
+                curToNodeChild = curToNodeChild.actualize(fromEl.ownerDocument || doc);
+              }
+              addChild(fromEl, curToNodeChild);
+              handleNodeAdded(curToNodeChild);
+            }
+          }
+          curToNodeChild = toNextSibling;
+          curFromNodeChild = fromNextSibling;
+        }
+        cleanupFromEl(fromEl, curFromNodeChild, curFromNodeKey);
+        var specialElHandler = specialElHandlers[fromEl.nodeName];
+        if (specialElHandler) {
+          specialElHandler(fromEl, toEl);
+        }
+      }
+      var morphedNode = fromNode;
+      var morphedNodeType = morphedNode.nodeType;
+      var toNodeType = toNode.nodeType;
+      if (!childrenOnly) {
+        if (morphedNodeType === ELEMENT_NODE) {
+          if (toNodeType === ELEMENT_NODE) {
+            if (!compareNodeNames(fromNode, toNode)) {
+              onNodeDiscarded(fromNode);
+              morphedNode = moveChildren(fromNode, createElementNS(toNode.nodeName, toNode.namespaceURI));
+            }
+          } else {
+            morphedNode = toNode;
+          }
+        } else if (morphedNodeType === TEXT_NODE || morphedNodeType === COMMENT_NODE) {
+          if (toNodeType === morphedNodeType) {
+            if (morphedNode.nodeValue !== toNode.nodeValue) {
+              morphedNode.nodeValue = toNode.nodeValue;
+            }
+            return morphedNode;
+          } else {
+            morphedNode = toNode;
+          }
+        }
+      }
+      if (morphedNode === toNode) {
+        onNodeDiscarded(fromNode);
+      } else {
+        if (toNode.isSameNode && toNode.isSameNode(morphedNode)) {
+          return;
+        }
+        morphEl(morphedNode, toNode, childrenOnly);
+        if (keyedRemovalList) {
+          for (var i = 0, len = keyedRemovalList.length; i < len; i++) {
+            var elToRemove = fromNodesLookup[keyedRemovalList[i]];
+            if (elToRemove) {
+              removeNode(elToRemove, elToRemove.parentNode, false);
+            }
+          }
+        }
+      }
+      if (!childrenOnly && morphedNode !== fromNode && fromNode.parentNode) {
+        if (morphedNode.actualize) {
+          morphedNode = morphedNode.actualize(fromNode.ownerDocument || doc);
+        }
+        fromNode.parentNode.replaceChild(morphedNode, fromNode);
+      }
+      return morphedNode;
+    };
+  }
+  var morphdom = morphdomFactory(morphAttrs);
+  var morphdom_esm_default = morphdom;
+
+  // packages/frontend/src/index.js
+  var transport = null;
+  function getTransport() {
+    return transport;
+  }
+  function init(container, transportInstance) {
+    transport = transportInstance;
+    initHandlers();
+    transport.onReceive((event, data) => {
+      if (event === "state-update") {
+        setState(data);
+      }
+      if (event === "stream-chunk") {
+        const state2 = getState();
+        console.log("[FRONTEND STREAM] Received chunk:", JSON.stringify(data));
+        console.log("[FRONTEND STREAM] streamingStarted:", state2.streamingStarted);
+        if (!state2.streamingStarted) {
+          const trimmedChunk = data.trimStart();
+          console.log("[FRONTEND STREAM] First chunk trimmed:", JSON.stringify(trimmedChunk));
+          if (trimmedChunk) {
+            console.log("[FRONTEND STREAM] Starting stream with trimmed chunk");
+            setState({
+              streamingContent: trimmedChunk,
+              streamingStarted: true
+            });
+          } else {
+            console.log("[FRONTEND STREAM] Skipping all-whitespace chunk");
+          }
+        } else {
+          console.log("[FRONTEND STREAM] Appending to existing content");
+          setState({
+            streamingContent: state2.streamingContent + data
+          });
+        }
+      }
+      if (event === "stream-end") {
+        const state2 = getState();
+        const trimmedContent = state2.streamingContent.trim();
+        if (trimmedContent) {
+          setState({
+            messages: [...state2.messages, { role: "assistant", content: trimmedContent }],
+            streamingContent: "",
+            streamingStarted: false
+          });
+        } else {
+          setState({
+            streamingContent: "",
+            streamingStarted: false
+          });
+        }
+      }
+      if (event === "stream-error") {
+        setState({
+          isLoading: false,
+          streamingContent: "",
+          error: `Failed to send message: ${data}`
+        });
+      }
+    });
+    let isScrollAnchored = true;
+    let previousMessageCount = 0;
+    let previousIsLoading = false;
+    let scrollListenerAttached = false;
+    function renderApp() {
+      const currentState = getState();
+      currentState.messages.forEach((msg, idx) => {
+        if (msg.role === "assistant") {
+          if (typeof msg.content === "string") {
+            console.log(`[WHITESPACE DEBUG] Message ${idx} (string):`, JSON.stringify(msg.content));
+          } else if (Array.isArray(msg.content)) {
+            msg.content.forEach((block, blockIdx) => {
+              if (block.type === "text") {
+                console.log(`[WHITESPACE DEBUG] Message ${idx} Block ${blockIdx} (text):`, JSON.stringify(block.text));
+              }
+            });
+          }
+        }
+      });
+      const messageJustStarted = !previousIsLoading && currentState.isLoading;
+      const messageCountChanged = currentState.messages.length !== previousMessageCount;
+      const messagesContainer = container.querySelector('[style*="overflow-y: auto"]');
+      const isNearBottom = !messagesContainer || // If no container yet, assume at bottom
+      messagesContainer.scrollHeight - messagesContainer.scrollTop <= messagesContainer.clientHeight + 100;
+      if ((messageJustStarted || messageCountChanged) && isNearBottom) {
+        isScrollAnchored = true;
+      }
+      if (!currentState.isLoading && isNearBottom) {
+        isScrollAnchored = true;
+      }
+      morphdom_esm_default(container, `<div>${render7(currentState)}</div>`, {
+        childrenOnly: true
+      });
+      const newMessagesContainer = container.querySelector('[style*="overflow-y: auto"]');
+      if (isScrollAnchored && newMessagesContainer) {
+        newMessagesContainer.scrollTop = newMessagesContainer.scrollHeight;
+      }
+      if (newMessagesContainer && !scrollListenerAttached) {
+        scrollListenerAttached = true;
+        let lastScrollTop = newMessagesContainer.scrollTop;
+        newMessagesContainer.addEventListener("scroll", () => {
+          const currentScrollTop = newMessagesContainer.scrollTop;
+          const state2 = getState();
+          const userScrolledUp = currentScrollTop < lastScrollTop - 5;
+          const userScrolledDown = currentScrollTop > lastScrollTop + 5;
+          const isNearBottomNow = newMessagesContainer.scrollHeight - currentScrollTop <= newMessagesContainer.clientHeight + 100;
+          if (state2.isLoading && userScrolledUp) {
+            isScrollAnchored = false;
+          } else if (state2.isLoading && isNearBottomNow && userScrolledDown) {
+            isScrollAnchored = true;
+          } else if (!state2.isLoading && isNearBottomNow && userScrolledDown) {
+            isScrollAnchored = true;
+          }
+          lastScrollTop = currentScrollTop;
+        });
+      }
+      previousMessageCount = currentState.messages.length;
+      previousIsLoading = currentState.isLoading;
+    }
+    onStateChange(renderApp);
+    renderApp();
+    transport.send("get-state", null);
+  }
+
+  // apps/pastable/src/index.js
+  (async () => {
+    console.log("\u{1F916} Claude Agent - Browser Console Edition");
+    console.log("==========================================");
+    if (!("showDirectoryPicker" in window)) {
+      console.error("\u274C File System Access API is not supported in this browser.");
+      console.error("Please use Chrome, Edge, or another Chromium-based browser.");
+      return;
+    }
+    let container = document.getElementById("claude-agent-container");
+    if (!container) {
+      container = document.createElement("div");
+      container.id = "claude-agent-container";
+      container.style.cssText = `
+      position: fixed;
+      top: 0;
+      right: 0;
+      width: 600px;
+      height: 100vh;
+      z-index: 999999;
+      box-shadow: -4px 0 20px rgba(0,0,0,0.3);
+    `;
+      document.body.appendChild(container);
+    }
+    console.log("\u{1F4C1} Please select your workspace folder...");
+    try {
+      const workspacePath = await selectWorkspace();
+      console.log("\u2705 Workspace selected:", workspacePath);
+      const { frontendTransport, backendTransport } = createTransportPair();
+      console.log("\u{1F9E0} Initializing AI session...");
+      const ai = new BrowserAI();
+      await ai.initialize();
+      console.log("\u2705 AI initialized");
+      const app = createApp(backendTransport, ai);
+      console.log("\u2705 Backend initialized");
+      init(container, frontendTransport);
+      console.log("\u2705 Frontend initialized");
+      frontendTransport.send("get-state", null);
+      console.log("");
+      console.log("\u{1F389} Claude Agent is ready!");
+      console.log("==========================================");
+      console.log("The agent UI is now visible on the right side of your screen.");
+      console.log("");
+      console.log("To close: Run closeAgent()");
+      console.log("To reopen: Run openAgent()");
+      window.closeAgent = () => {
+        container.style.display = "none";
+        console.log("Agent UI hidden. Run openAgent() to show it again.");
+      };
+      window.openAgent = () => {
+        container.style.display = "block";
+        console.log("Agent UI shown.");
+      };
+    } catch (error) {
+      console.error("\u274C Error initializing agent:", error);
+      if (error.message.includes("cancelled")) {
+        console.log("User cancelled workspace selection. Please try again.");
+      }
+    }
+  })();
 })();
