@@ -36,7 +36,10 @@ let query;
  *   for await (const chunk of a.completeStream(openaiRequest)) { ... }
  *
  * Production behaviours wired in here:
- *   - 401 with `unlock_url` → GET the unlock URL, retry once
+ *   - 401 with `unlock_url` → open the URL in the default browser, prompt the
+ *     user to press Enter once they've unlocked in the browser, then retry
+ *     once. The /user-ui/unlock/... endpoints are browser pages, not API
+ *     endpoints — programmatic GET doesn't actually unlock the key.
  *   - 429 with Retry-After header or retry_after_seconds body → sleep, retry
  *     (max 3 attempts, exponential floor)
  *   - SSE streaming parsed into OpenAI ChatCompletionChunk async iterator
@@ -45,7 +48,27 @@ let query;
  * No npm deps. Node 18+ built-in fetch only.
  */
 
+
 const DEFAULT_BASE_URL = 'https://api.genai.mil/v1';
+
+function openInBrowser(url) {
+  // Windows: `start "" "<url>"` via cmd. macOS: open. Linux: xdg-open.
+  // We're targeting Windows by default; the others are a courtesy.
+  if (process.platform === 'win32') {
+    spawn('cmd', ['/c', 'start', '""', url], { stdio: 'ignore', detached: true, windowsHide: true }).unref();
+  } else if (process.platform === 'darwin') {
+    spawn('open', [url], { stdio: 'ignore', detached: true }).unref();
+  } else {
+    spawn('xdg-open', [url], { stdio: 'ignore', detached: true }).unref();
+  }
+}
+
+function promptEnter(message) {
+  return new Promise((resolve) => {
+    const rl = createInterface({ input: process.stdin, output: process.stderr });
+    rl.question(message, () => { rl.close(); resolve(); });
+  });
+}
 
 class HttpError extends Error {
   constructor(status, statusText, body) {
@@ -122,8 +145,8 @@ function createHttpAdapter(opts = {}) {
         const unlockUrl = body?.unlock_url ?? body?.error?.unlock_url;
         if (unlockUrl) {
           onUnlock(unlockUrl);
-          const u = await fetchImpl(unlockUrl);
-          if (!u.ok) throw new HttpError(u.status, u.statusText, await readJson(u));
+          if (opts.openBrowser !== false) openInBrowser(unlockUrl);
+          await promptEnter(`\n[unlock] API key is locked. A browser tab should have opened:\n  ${unlockUrl}\nUnlock the key in your browser, then press Enter to retry... `);
           unlocked = true;
           continue;
         }
@@ -645,6 +668,7 @@ async function __main() {
   const useStream = process.env.AGENT_STREAM === '1';
 
   let adapter;
+  let modelToUse = MODEL;
   if (LLM_MODE === 'openai-http') {
     adapter = createHttpAdapter({
       baseURL: BASE_URL,
@@ -653,6 +677,17 @@ async function __main() {
       onRateLimit: (ms) => console.error(`[rate-limit] sleeping ${ms}ms`),
       onUsage: (u) => console.error(`[usage] ${JSON.stringify(u)}`),
     });
+
+    console.error('[models] fetching list from ' + BASE_URL + '/models ...');
+    const models = await adapter.listModels();
+    console.error('[models] response:');
+    console.error(JSON.stringify(models, null, 2));
+    const list = Array.isArray(models?.data) ? models.data
+                : Array.isArray(models) ? models
+                : [];
+    if (!list.length) throw new Error('models endpoint returned no entries');
+    modelToUse = list[0].id ?? list[0].name ?? list[0];
+    console.error('[models] picked first: ' + modelToUse);
   } else if (LLM_MODE === 'claude-code-headless') {
     ({ query } = await import('@anthropic-ai/claude-agent-sdk'));
     adapter = createAdapter();
@@ -660,9 +695,9 @@ async function __main() {
     throw new Error(`unknown LLM_MODE: ${LLM_MODE}`);
   }
 
-  console.error(`[mode=${LLM_MODE} stream=${useStream}] Q: ${question}`);
+  console.error(`[mode=${LLM_MODE} stream=${useStream} model=${modelToUse}] Q: ${question}`);
   const request = {
-    model: MODEL,
+    model: modelToUse,
     messages: [
       { role: 'system', content: 'Answer concisely.' },
       { role: 'user', content: question },
