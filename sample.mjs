@@ -768,9 +768,43 @@ function proseBefore(text) {
   return (idx === -1 ? text : text.slice(0, idx)).trim();
 }
 
-async function runPromptedAgent({ adapter, messages, model, maxTurns = DEFAULT_MAX_TURNS, onTurn }) {
+function flattenContent(content) {
+  if (content == null) return '';
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content.map((p) => (typeof p === 'string' ? p : p?.type === 'text' ? p.text ?? '' : '')).join('');
+  }
+  return String(content);
+}
+
+/**
+ * The production endpoint frequently ignores or overrides the `system`
+ * message with its own platform prompt — the model reports it knows nothing
+ * about the remote workspace. So we inject the instructions into the FIRST
+ * user message (wrapped in <system-reminder>), which the platform cannot
+ * strip because it's the actual query. No separate system message is sent.
+ */
+function injectInstructions(messages) {
+  const instructions = buildSystemPrompt();
   const nonSystem = (messages ?? []).filter((m) => m.role !== 'system');
-  const convo = [{ role: 'system', content: buildSystemPrompt() }, ...nonSystem];
+  const out = [];
+  let injected = false;
+  for (const m of nonSystem) {
+    if (!injected && m.role === 'user') {
+      out.push({ role: 'user', content: `<system-reminder>\n${instructions}\n</system-reminder>\n\n${flattenContent(m.content)}` });
+      injected = true;
+    } else {
+      out.push(m);
+    }
+  }
+  if (!injected) {
+    out.unshift({ role: 'user', content: `<system-reminder>\n${instructions}\n</system-reminder>` });
+  }
+  return out;
+}
+
+async function runPromptedAgent({ adapter, messages, model, maxTurns = DEFAULT_MAX_TURNS, onTurn }) {
+  const convo = injectInstructions(messages);
 
   const stats = { turns: 0, toolCalls: 0, toolHistogram: {}, batches: [], loopBreaks: 0 };
   let lastKey = '';
