@@ -24,6 +24,7 @@ import { createInterface } from 'node:readline';
 import { createServer } from 'node:http';
 import { homedir } from 'node:os';
 import { readFile as _readFile, writeFile as _writeFile, mkdir as _mkdir, stat as _stat, readdir as _readdir } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { randomUUID as _randomUUID } from 'node:crypto';
 import path from 'node:path';
 const readFile = _readFile, writeFile = _writeFile, mkdir = _mkdir, stat = _stat, readdir = _readdir;
@@ -66,15 +67,34 @@ const randomUUID = _randomUUID;
 
 const DEFAULT_BASE_URL = 'https://api.genai.mil/v1';
 
+// Standard Chrome install locations on Windows (per-user + per-machine).
+const CHROME_PATHS_WIN = [
+  (process.env.LOCALAPPDATA || '') + '\\Google\\Chrome\\Application\\chrome.exe',
+  'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+  'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+];
+function findChromeWin() {
+  for (const p of CHROME_PATHS_WIN) {
+    try { if (p && existsSync(p)) return p; } catch {}
+  }
+  return null;
+}
+
 function openInBrowser(url) {
-  // Windows: `start "" "<url>"` via cmd. macOS: open. Linux: xdg-open.
-  // We're targeting Windows by default; the others are a courtesy.
+  // Prefer Chrome; fall back to the OS default if Chrome isn't installed.
   if (process.platform === 'win32') {
-    spawn('cmd', ['/c', 'start', '""', url], { stdio: 'ignore', detached: true, windowsHide: true }).unref();
+    const chrome = findChromeWin();
+    if (chrome) {
+      spawn(chrome, [url], { stdio: 'ignore', detached: true }).unref();
+    } else {
+      spawn('cmd', ['/c', 'start', '""', url], { stdio: 'ignore', detached: true, windowsHide: true }).unref();
+    }
   } else if (process.platform === 'darwin') {
-    spawn('open', [url], { stdio: 'ignore', detached: true }).unref();
+    spawn('open', ['-a', 'Google Chrome', url], { stdio: 'ignore', detached: true }).unref();
   } else {
-    spawn('xdg-open', [url], { stdio: 'ignore', detached: true }).unref();
+    spawn('google-chrome', [url], { stdio: 'ignore', detached: true })
+      .on('error', () => spawn('xdg-open', [url], { stdio: 'ignore', detached: true }).unref())
+      .unref();
   }
 }
 
@@ -245,9 +265,13 @@ function createHttpAdapter(opts = {}) {
       if (flow.toolMessageIds.length) console.error(`[http>]   tool message ids:           ${JSON.stringify(flow.toolMessageIds)}`);
     }
     const t0 = Date.now();
+    // Snapshot the request shape BEFORE we send, because the agent loop
+    // shares its messages array by reference and will mutate it after the
+    // call returns. Without this clone, snapshots show a misleading body.
+    const requestSnapshot = JSON.parse(JSON.stringify(body));
     const res = await safeFetch('/chat/completions', { method: 'POST', body: JSON.stringify(body) });
     const json = await res.json();
-    onTransaction({ type: 'chat_completions', request: body, response: json, durationMs: Date.now() - t0 });
+    onTransaction({ type: 'chat_completions', request: requestSnapshot, response: json, durationMs: Date.now() - t0 });
     if (debug) {
       const summary = summarizeResponseExtras(json);
       const finish = json?.choices?.[0]?.finish_reason;
@@ -447,6 +471,7 @@ const tools = {
           path: { type: 'string', description: 'Absolute or project-relative file path.' },
         },
         required: ['path'],
+        additionalProperties: false,
       },
     },
     impl: async ({ path: p }) => {
@@ -476,6 +501,7 @@ const tools = {
           limit: { type: 'integer', description: 'Optional max number of LINES to read (NOT bytes). If omitted, reads to end of file.' },
         },
         required: ['path'],
+        additionalProperties: false,
       },
     },
     impl: async ({ path: p, offset, limit }) => {
@@ -503,6 +529,7 @@ const tools = {
           flags: { type: 'string', description: 'Optional regex flags (e.g. "i" for case-insensitive).' },
         },
         required: ['pattern'],
+        additionalProperties: false,
       },
     },
     impl: async ({ pattern, path: subPath, glob, flags }) => {
@@ -545,6 +572,7 @@ const tools = {
           pattern: { type: 'string', description: 'Glob pattern. Supports **, *, ?, {a,b}.' },
         },
         required: ['pattern'],
+        additionalProperties: false,
       },
     },
     impl: async ({ pattern }) => {
@@ -574,6 +602,8 @@ const tools = {
         properties: {
           path: { type: 'string', description: 'Absolute or project-relative directory path. Defaults to project root.' },
         },
+        required: [],
+        additionalProperties: false,
       },
     },
     impl: async ({ path: p }) => {
@@ -615,141 +645,195 @@ async function execute(name, args) {
   }
 }
 
-// ====== agent/loop.mjs ======
+// ====== agent/prompted.mjs ======
 /**
- * Initial agent loop.
+ * Prompted-format tool calling.
  *
- *   runAgent({ adapter, userPrompt, model, maxTurns, onTurn })
+ * The production endpoint (api.genai.mil) is a managed-agent platform that
+ * silently drops the OpenAI `tools` parameter, so native function calling is
+ * impossible. Instead we describe our tools in the system prompt and have the
+ * model emit tool calls as XML text, which we parse and execute locally.
  *
- * Sends a user prompt through the adapter with the project's read-only tools
- * attached. Each turn either:
- *   - finish_reason='stop' → return the assistant's text as the final answer
- *   - finish_reason='tool_calls' → execute the tool, append the result as a
- *     {role:'tool'} message, loop
+ * Wire format (model -> us):
+ *   <use_tools>
+ *     <call name="read_file"><arg name="path">pom.xml</arg></call>
+ *     <call name="grep"><arg name="pattern">dependency</arg></call>
+ *   </use_tools>
  *
- * Safety rails:
- *   - maxTurns hard cap (default 15) — prevents runaway loops
- *   - loop detection: if the same tool+args fires REPEAT_LIMIT times in a
- *     row, inject a system reminder telling the model to stop and answer
- *   - empty tool_calls list → returns whatever text the assistant produced
+ * Feedback (us -> model), as a normal user message:
+ *   <tool_result name="read_file" status="ok">
+ *   ...contents...
+ *   </tool_result>
+ *
+ * We parse only <call> blocks and ignore anything the model writes after them
+ * (it sometimes hallucinates its own <tool_result>). XML args are used rather
+ * than JSON args because they survive the model wrapping output in prose or
+ * markdown fences.
  */
+
+const CALL_RE = /<call\s+name=["']([^"']+)["']\s*\/?>([\s\S]*?)<\/call>/gi;
+const SELFCLOSE_CALL_RE = /<call\s+name=["']([^"']+)["']\s*\/>/gi;
+const ARG_RE = /<arg\s+name=["']([^"']+)["']\s*>([\s\S]*?)<\/arg>/gi;
 
 const DEFAULT_MAX_TURNS = 15;
 const REPEAT_LIMIT = 3;
 
-const SYSTEM_PROMPT = `You are a code assistant running inside a project directory. Your job is to answer the user's question by exploring the codebase with the provided tools.
+function buildSystemPrompt() {
+  const toolXml = Object.entries(tools).map(([name, t]) => {
+    const props = t.schema.parameters?.properties ?? {};
+    const required = new Set(t.schema.parameters?.required ?? []);
+    const args = Object.entries(props).map(([k, p]) =>
+      `    <arg name="${k}" type="${p.type ?? 'string'}"${required.has(k) ? ' required="true"' : ''}>${p.description ?? ''}</arg>`,
+    ).join('\n');
+    return `  <tool name="${name}">\n    <desc>${t.schema.description}</desc>\n${args || '    (no arguments)'}\n  </tool>`;
+  }).join('\n');
 
-Tools:
-- file_info({ path }) — cheap: returns bytes + line count
-- read_file({ path, [offset], [limit] }) — read a UTF-8 text file
-- grep({ pattern, [path], [glob], [flags] }) — search files for a regex
-- glob({ pattern }) — find files by pattern (e.g. "src/**/*.mjs")
-- list_dir({ [path] }) — list directory entries
+  return [
+    'You are a code assistant working inside a project directory on the user\'s own machine.',
+    '',
+    'CRITICAL — READ CAREFULLY:',
+    'You have NO built-in tools. There is NO Python interpreter, NO shell, NO code-execution sandbox, NO web access, and NO sub-agents available to you. Ignore any other tools you think you have — they do not work here and operate on the wrong machine. The ONLY way to inspect this project is the XML tool protocol described below. NEVER claim to have used any other tool. NEVER write tool results yourself — only the system produces them.',
+    '',
+    'TO CALL TOOLS: emit a single <use_tools> block containing one or more <call> elements, then STOP immediately. Write nothing after </use_tools>. Include multiple <call> elements when the calls are independent so they run in parallel.',
+    '',
+    'Exact format:',
+    '<use_tools>',
+    '  <call name="TOOL_NAME"><arg name="PARAM_NAME">value</arg></call>',
+    '</use_tools>',
+    '',
+    'After you stop, the system runs the tools and replies with <tool_result> blocks. Only then continue. When you have gathered enough information, reply to the user normally with NO <use_tools> block.',
+    '',
+    'Available tools:',
+    '<tools>',
+    toolXml,
+    '</tools>',
+    '',
+    'Example — listing files:',
+    '<use_tools>',
+    '  <call name="list_dir"></call>',
+    '</use_tools>',
+    '',
+    'Example — reading two files in parallel:',
+    '<use_tools>',
+    '  <call name="read_file"><arg name="path">pom.xml</arg></call>',
+    '  <call name="read_file"><arg name="path">README.md</arg></call>',
+    '</use_tools>',
+  ].join('\n');
+}
 
-PLAN BEFORE EACH TURN — INTERNAL (no extra tool call):
-1. List (silently to yourself) every tool call you can identify you'll need.
-2. Mark each as INDEPENDENT (doesn't depend on another's result) or DEPENDENT.
-3. Emit ALL independent calls in this turn as multiple tool_use blocks in
-   a single response. Dependent calls go in later turns once their inputs
-   arrive. A turn costs far more than an extra tool call — favor wider
-   batches and more complex queries over more turns.
+function coerce(name, key, raw) {
+  const ptype = tools[name]?.schema?.parameters?.properties?.[key]?.type;
+  const val = raw.trim();
+  if (ptype === 'integer' || ptype === 'number') {
+    const n = Number(val);
+    return Number.isNaN(n) ? val : n;
+  }
+  if (ptype === 'boolean') return val === 'true';
+  return val;
+}
 
-WORKED EXAMPLE:
-User: "Summarize each of foo.mjs, bar.mjs, baz.mjs."
-Correct first turn (one assistant message, three tool_use blocks):
-  tool_use: read_file({"path":"foo.mjs"})
-  tool_use: read_file({"path":"bar.mjs"})
-  tool_use: read_file({"path":"baz.mjs"})
-Incorrect (three separate turns, each calling one file).
+function parseToolCalls(text) {
+  const calls = [];
+  if (typeof text !== 'string' || !text) return calls;
 
-Rules:
-1. Explore before answering. Don't guess from file names alone.
-2. Prefer grep to find specific symbols, then read the matching files.
-3. Once you have enough information, stop calling tools and answer directly.
-4. Cite file paths (and line numbers where useful) in your final answer.
-5. If a tool returns ERROR, try a different approach. Do NOT retry with the same arguments.
-6. Be concise. Summarize file contents, don't dump them.`;
-
-async function runAgent({ adapter, userPrompt, messages: initialMessages, model, maxTurns = DEFAULT_MAX_TURNS, onTurn }) {
-  // Accept either a single userPrompt (legacy) or a full messages array
-  // (web UI passes the whole conversation history). System prompt is
-  // injected at the front if not already present.
-  let messages;
-  if (Array.isArray(initialMessages) && initialMessages.length > 0) {
-    messages = initialMessages[0]?.role === 'system'
-      ? initialMessages.slice()
-      : [{ role: 'system', content: SYSTEM_PROMPT }, ...initialMessages];
-  } else {
-    messages = [
-      { role: 'system', content: SYSTEM_PROMPT },
-      { role: 'user', content: userPrompt },
-    ];
+  // Self-closing calls with no args: <call name="list_dir"/>
+  SELFCLOSE_CALL_RE.lastIndex = 0;
+  let sc;
+  while ((sc = SELFCLOSE_CALL_RE.exec(text)) !== null) {
+    calls.push({ id: mkId(), name: sc[1], args: {}, _pos: sc.index });
   }
 
-  const stats = { turns: 0, toolCalls: 0, toolHistogram: {}, loopBreaks: 0, batches: [] };
-  let lastToolKey = '';
-  let repeatCount = 0;
+  // Normal <call ...>...</call> blocks.
+  CALL_RE.lastIndex = 0;
+  let m;
+  while ((m = CALL_RE.exec(text)) !== null) {
+    const name = m[1];
+    const inner = m[2] ?? '';
+    const args = {};
+    ARG_RE.lastIndex = 0;
+    let am;
+    while ((am = ARG_RE.exec(inner)) !== null) {
+      args[am[1]] = coerce(name, am[1], am[2]);
+    }
+    calls.push({ id: mkId(), name, args, _pos: m.index });
+  }
+
+  // De-dup self-closing matches that also matched the normal regex; order by position.
+  const seen = new Set();
+  const ordered = calls
+    .sort((a, b) => a._pos - b._pos)
+    .filter((c) => {
+      const key = c._pos + ':' + c.name;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .map(({ id, name, args }) => ({ id, name, args }));
+  return ordered;
+}
+
+function mkId() {
+  return 'call_' + randomUUID().replace(/-/g, '').slice(0, 16);
+}
+
+function formatToolResults(results) {
+  const blocks = results.map((r) =>
+    `<tool_result name="${r.name}" status="${r.status}">\n${r.content}\n</tool_result>`,
+  ).join('\n');
+  return blocks + '\n\nContinue using these results, or answer the user if you have enough information.';
+}
+
+/** Strip the <use_tools> block out of assistant text so we can show only prose. */
+function proseBefore(text) {
+  if (typeof text !== 'string') return '';
+  const idx = text.search(/<use_tools>/i);
+  return (idx === -1 ? text : text.slice(0, idx)).trim();
+}
+
+async function runPromptedAgent({ adapter, messages, model, maxTurns = DEFAULT_MAX_TURNS, onTurn }) {
+  const nonSystem = (messages ?? []).filter((m) => m.role !== 'system');
+  const convo = [{ role: 'system', content: buildSystemPrompt() }, ...nonSystem];
+
+  const stats = { turns: 0, toolCalls: 0, toolHistogram: {}, batches: [], loopBreaks: 0 };
+  let lastKey = '';
+  let repeat = 0;
 
   for (let turn = 1; turn <= maxTurns; turn++) {
     stats.turns = turn;
-    const res = await adapter.complete({ model, messages, tools: toolDefs });
-    const choice = res.choices?.[0];
-    if (!choice) throw new Error('adapter returned no choices');
-    const msg = choice.message;
-    messages.push(msg);
+    const res = await adapter.complete({ model, messages: convo, stop: ['</use_tools>'] });
+    const text = res.choices?.[0]?.message?.content ?? '';
+    const calls = parseToolCalls(text);
 
-    if (onTurn) onTurn({ turn, msg, finish: choice.finish_reason, stats });
+    if (onTurn) onTurn({ turn, text, calls, stats });
 
-    if (choice.finish_reason !== 'tool_calls') {
-      return { content: msg.content ?? '', stats, messages, terminated: 'stop' };
+    if (calls.length === 0) {
+      return { content: text, stats, terminated: 'stop', convo };
     }
+    stats.batches.push(calls.length);
 
-    const toolCalls = msg.tool_calls ?? [];
-    if (toolCalls.length === 0) {
-      // Model said tool_calls but produced none — bail with whatever content it gave.
-      return { content: msg.content ?? '', stats, messages, terminated: 'empty-tool-calls' };
-    }
-    stats.batches.push(toolCalls.length);
+    // Record the assistant turn (re-close the tag if the stop sequence ate it).
+    const assistantText = /<\/use_tools>/i.test(text) ? text : `${text}\n</use_tools>`;
+    convo.push({ role: 'assistant', content: assistantText });
 
-    for (const tc of toolCalls) {
+    const results = [];
+    for (const c of calls) {
       stats.toolCalls++;
-      stats.toolHistogram[tc.function.name] = (stats.toolHistogram[tc.function.name] ?? 0) + 1;
-      let args;
-      try { args = JSON.parse(tc.function.arguments || '{}'); }
-      catch (e) {
-        messages.push({
-          role: 'tool',
-          tool_call_id: tc.id,
-          content: `ERROR: arguments was not valid JSON: ${e.message}. Raw: ${tc.function.arguments?.slice(0, 200)}`,
-        });
-        continue;
-      }
-
-      const key = `${tc.function.name}|${JSON.stringify(args)}`;
-      if (key === lastToolKey) {
-        repeatCount++;
-      } else {
-        lastToolKey = key;
-        repeatCount = 1;
-      }
-
+      stats.toolHistogram[c.name] = (stats.toolHistogram[c.name] ?? 0) + 1;
+      const key = c.name + '|' + JSON.stringify(c.args);
+      if (key === lastKey) repeat++; else { lastKey = key; repeat = 1; }
       let content;
-      if (repeatCount >= REPEAT_LIMIT) {
+      if (repeat >= REPEAT_LIMIT) {
         stats.loopBreaks++;
-        content = `LOOP DETECTED: this exact tool call has fired ${repeatCount} times in a row. Stop calling tools and answer based on what you already know. If you genuinely lack the information, say so.`;
+        content = `LOOP DETECTED: this exact call has fired ${repeat} times. Stop calling tools and answer with what you know.`;
       } else {
-        content = await execute(tc.function.name, args);
+        content = await execute(c.name, c.args);
       }
-      messages.push({ role: 'tool', tool_call_id: tc.id, content });
+      results.push({ name: c.name, status: content.startsWith('ERROR') ? 'error' : 'ok', content });
     }
+    convo.push({ role: 'user', content: formatToolResults(results) });
   }
 
-  return {
-    content: '[MAX TURNS REACHED — agent failed to converge]',
-    stats,
-    messages,
-    terminated: 'max-turns',
-  };
+  return { content: '[MAX TURNS REACHED — agent did not converge]', stats, terminated: 'max-turns', convo };
 }
 
 // ====== server.mjs ======
@@ -1003,23 +1087,33 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
         }
 
         try {
-          const result = await runAgent({
+          let lastTurnHadContent = false;
+          let lastTurnHadTools = false;
+          const result = await runPromptedAgent({
             adapter,
             messages: body.messages,
             model: body.model,
             maxTurns: 15,
-            onTurn: ({ turn, msg, finish, stats }) => {
-              if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) {
-                for (const tc of msg.tool_calls) {
-                  let argsPretty = tc.function?.arguments ?? '{}';
-                  if (argsPretty.length > 120) argsPretty = argsPretty.slice(0, 117) + '…';
-                  emitText(`\n🔧 \`${tc.function?.name}(${argsPretty})\`\n`);
+            onTurn: ({ turn, text, calls }) => {
+              lastTurnHadTools = calls.length > 0;
+              lastTurnHadContent = !!(text && text.trim().length > 0);
+              if (calls.length > 0) {
+                const prose = proseBefore(text);
+                if (prose) emitText(prose + '\n');
+                for (const c of calls) {
+                  emitText(`\n🔧 \`${c.name}(${JSON.stringify(c.args)})\`\n`);
                 }
-              } else if (msg.content) {
-                emitText(msg.content);
+              } else if (text) {
+                emitText(text);
               }
             },
           });
+          // Detect the "model returned nothing useful" case.
+          if (!lastTurnHadContent && !lastTurnHadTools && (!result.content || result.content.trim().length === 0)) {
+            emitText('\n⚠️ Model returned an empty response (terminated=' +
+              (result.terminated ?? 'unknown') +
+              '). Open the Snapshot to see the raw response.\n');
+          }
           emitFinish('stop', { total_tokens: result.stats.toolCalls });
           logEvent('agent_run', {
             turns: result.stats.turns,
@@ -1456,6 +1550,18 @@ const UI_HTML = `<!DOCTYPE html>
     border-radius: 0 6px 6px 0;
   }
   .error-banner strong { color: var(--error); }
+  /* Dense, high-contrast block optimized for a single screenshot (photo of screen). */
+  pre.dense {
+    background: #fff;
+    color: #000;
+    border: 2px solid #000;
+    font: bold 15px/1.4 ui-monospace, Consolas, Menlo, monospace;
+    padding: 12px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    margin: 0 0 12px;
+  }
+  .modal.error pre.dense { border-color: var(--error); }
 </style>
 </head>
 <body>
@@ -1774,7 +1880,22 @@ const UI_HTML = `<!DOCTYPE html>
       const cls = n > 1 ? 'dot dot-multi' : 'dot dot-single';
       return '<span class="' + cls + '" title="turn with ' + n + ' tool call(s)">' + n + '</span>';
     }).join('');
+    // Dense one-screenshot summary at the very top.
+    const lastFinish = lastTx?.response?.choices?.[0]?.finish_reason ?? '?';
+    const lastTools = lastTx?.response?.choices?.[0]?.message?.tool_calls ? 'yes' : 'no';
+    const dense = [
+      '== snapshot ' + new Date().toISOString().slice(0, 19) + 'Z ==',
+      'proj   ' + (d.activeProject ?? '(none)'),
+      'base   ' + (d.baseURL ?? '?'),
+      'model  ' + (d.defaultModel ?? '?') + '   key ' + (d.apiKeyPrefix ?? '?'),
+      'tokens ' + (d.totalTokens ?? 0) + '   events ' + events.length,
+      'parallel runs=' + (p.runs ?? 0) + ' turns=' + (p.turnsWithTools ?? 0) +
+        ' calls=' + (p.totalToolCalls ?? 0) + ' max=' + (p.maxParallel ?? 0) +
+        ' batches=[' + batches.join(',') + ']',
+      'lastTx ' + (lastTx ? (lastTx.type + ' finish=' + lastFinish + ' tool_calls=' + lastTools) : '(none)'),
+    ].join('\\n');
     $modalBody.innerHTML = [
+      '<pre class="dense">' + escapeHtml(dense) + '</pre>',
       '<div class="kv">',
       '<div class="k">Started</div><div class="v">' + escapeHtml(d.startedAt) + '</div>',
       '<div class="k">Active project</div><div class="v">' + escapeHtml(d.activeProject ?? '(none)') + '</div>',
@@ -1811,11 +1932,17 @@ const UI_HTML = `<!DOCTYPE html>
     $modal.classList.add('error');
     $modalTitle.textContent = title;
     const message = err?.message ?? String(err);
-    const stack = err?.stack ?? '';
-    $modalBody.innerHTML =
-      '<div class="error-banner"><strong>' + escapeHtml(message) + '</strong></div>' +
-      (stack ? '<h3>Stack</h3><pre>' + escapeHtml(stack) + '</pre>' : '') +
-      '<h3>Tip</h3><p style="color:var(--muted);font-size:13px">Take a phone photo of this dialog to share — it contains the full error and any non-OpenAI fields seen.</p>';
+    const stack = (err?.stack ?? '').split('\\n').slice(0, 6).join('\\n');
+    const dense = [
+      'ERR   ' + title,
+      'msg   ' + message,
+      'proj  ' + (activeProject || '(none)'),
+      'model ' + ($model.value || SERVER.defaultModel || '?'),
+      'tok   ' + totalTokens,
+      'time  ' + new Date().toISOString().slice(0, 19) + 'Z',
+      stack ? 'stack ' + stack.replace(/\\n/g, '\\n      ') : '',
+    ].filter(Boolean).join('\\n');
+    $modalBody.innerHTML = '<pre class="dense">' + escapeHtml(dense) + '</pre>';
     $modalBg.classList.add('show');
   }
 
@@ -1847,12 +1974,22 @@ const UI_HTML = `<!DOCTYPE html>
 `;
 
 function openInDefaultBrowser(url) {
+  // Prefer Chrome; fall back to the OS default if Chrome isn't installed.
   if (process.platform === 'win32') {
-    spawn('cmd', ['/c', 'start', '""', url], { stdio: 'ignore', detached: true, windowsHide: true }).unref();
+    const candidates = [
+      (process.env.LOCALAPPDATA || '') + '\\Google\\Chrome\\Application\\chrome.exe',
+      'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+      'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+    ];
+    const chrome = candidates.find((p) => { try { return p && existsSync(p); } catch { return false; } });
+    if (chrome) spawn(chrome, [url], { stdio: 'ignore', detached: true }).unref();
+    else spawn('cmd', ['/c', 'start', '""', url], { stdio: 'ignore', detached: true, windowsHide: true }).unref();
   } else if (process.platform === 'darwin') {
-    spawn('open', [url], { stdio: 'ignore', detached: true }).unref();
+    spawn('open', ['-a', 'Google Chrome', url], { stdio: 'ignore', detached: true }).unref();
   } else {
-    spawn('xdg-open', [url], { stdio: 'ignore', detached: true }).unref();
+    spawn('google-chrome', [url], { stdio: 'ignore', detached: true })
+      .on('error', () => spawn('xdg-open', [url], { stdio: 'ignore', detached: true }).unref())
+      .unref();
   }
 }
 
