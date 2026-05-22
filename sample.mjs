@@ -298,6 +298,23 @@ function createHttpAdapter(opts = {}) {
     }
     const res = await safeFetch('/chat/completions', { method: 'POST', body: JSON.stringify(body) });
 
+    // Graceful fallback: if the endpoint ignored stream:true and returned a
+    // normal JSON completion (some managed platforms do), yield it as a single
+    // chunk so the caller's streaming loop still works.
+    const ctype = res.headers.get('content-type') || '';
+    if (!ctype.includes('text/event-stream')) {
+      const json = await res.json();
+      if (json?.usage) onUsage(json.usage);
+      const msg = json?.choices?.[0]?.message ?? {};
+      yield {
+        id: json?.id ?? 'nostream',
+        object: 'chat.completion.chunk',
+        choices: [{ index: 0, delta: { role: 'assistant', content: msg.content ?? '' }, finish_reason: json?.choices?.[0]?.finish_reason ?? 'stop' }],
+        ...(json?.usage ? { usage: json.usage } : {}),
+      };
+      return;
+    }
+
     if (!res.body) throw new Error('completeStream: response has no body');
 
     const reader = res.body.getReader();
@@ -803,7 +820,50 @@ function injectInstructions(messages) {
   return out;
 }
 
-async function runPromptedAgent({ adapter, messages, model, maxTurns = DEFAULT_MAX_TURNS, onTurn }) {
+// Longest opening-tag prefix we must hold back so we never stream half of
+// "<remote-workspace>" to the user before we know it's a command block.
+const HOLDBACK = '<remote-workspace>'.length + 2;
+
+/**
+ * Run one turn, streaming the model's PROSE (text before any <remote-workspace>
+ * block) to onText as it arrives. Returns the full turn text. Falls back to a
+ * non-streaming call if the adapter has no completeStream.
+ */
+async function runTurnStreaming(adapter, opts, onText) {
+  let text = '';
+  let sent = 0;       // chars of prose already forwarded
+  let inCommands = false;
+
+  const pump = () => {
+    if (inCommands) return;
+    const idx = text.search(/<remote-workspace/i);
+    if (idx === -1) {
+      const flushTo = Math.max(sent, text.length - HOLDBACK);
+      if (flushTo > sent) { onText?.(text.slice(sent, flushTo)); sent = flushTo; }
+    } else {
+      if (idx > sent) { onText?.(text.slice(sent, idx)); }
+      sent = idx;
+      inCommands = true;
+    }
+  };
+
+  if (typeof adapter.completeStream === 'function') {
+    for await (const chunk of adapter.completeStream(opts)) {
+      const d = chunk?.choices?.[0]?.delta?.content;
+      if (d) { text += d; pump(); }
+    }
+  } else {
+    const res = await adapter.complete(opts);
+    text = res?.choices?.[0]?.message?.content ?? '';
+    pump();
+  }
+
+  // If this turn never entered a command block, flush whatever prose remains.
+  if (!inCommands && sent < text.length) { onText?.(text.slice(sent)); sent = text.length; }
+  return text;
+}
+
+async function runPromptedAgent({ adapter, messages, model, maxTurns = DEFAULT_MAX_TURNS, onText, onToolCalls }) {
   const convo = injectInstructions(messages);
 
   const stats = { turns: 0, toolCalls: 0, toolHistogram: {}, batches: [], loopBreaks: 0 };
@@ -812,16 +872,18 @@ async function runPromptedAgent({ adapter, messages, model, maxTurns = DEFAULT_M
 
   for (let turn = 1; turn <= maxTurns; turn++) {
     stats.turns = turn;
-    const res = await adapter.complete({ model, messages: convo, stop: ['</remote-workspace>'] });
-    const text = res.choices?.[0]?.message?.content ?? '';
+    const text = await runTurnStreaming(
+      adapter,
+      { model, messages: convo, stop: ['</remote-workspace>'] },
+      onText,
+    );
     const calls = parseToolCalls(text);
-
-    if (onTurn) onTurn({ turn, text, calls, stats });
 
     if (calls.length === 0) {
       return { content: text, stats, terminated: 'stop', convo };
     }
     stats.batches.push(calls.length);
+    if (onToolCalls) onToolCalls(calls);
 
     const assistantText = /<\/remote-workspace>/i.test(text) ? text : `${text}\n</remote-workspace>`;
     convo.push({ role: 'assistant', content: assistantText });
@@ -1098,29 +1160,24 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
         }
 
         try {
-          let lastTurnHadContent = false;
-          let lastTurnHadTools = false;
+          let emittedAnything = false;
           const result = await runPromptedAgent({
             adapter,
             messages: body.messages,
             model: body.model,
             maxTurns: 15,
-            onTurn: ({ turn, text, calls }) => {
-              lastTurnHadTools = calls.length > 0;
-              lastTurnHadContent = !!(text && text.trim().length > 0);
-              if (calls.length > 0) {
-                const prose = proseBefore(text);
-                if (prose) emitText(prose + '\n');
-                for (const c of calls) {
-                  emitText(`\n🔧 \`${c.name}(${JSON.stringify(c.args)})\`\n`);
-                }
-              } else if (text) {
-                emitText(text);
+            onText: (delta) => {
+              if (delta) { emittedAnything = true; emitText(delta); }
+            },
+            onToolCalls: (calls) => {
+              for (const c of calls) {
+                emittedAnything = true;
+                emitText(`\n🔧 \`${c.name}(${JSON.stringify(c.args)})\`\n`);
               }
             },
           });
           // Detect the "model returned nothing useful" case.
-          if (!lastTurnHadContent && !lastTurnHadTools && (!result.content || result.content.trim().length === 0)) {
+          if (!emittedAnything && (!result.content || result.content.trim().length === 0)) {
             emitText('\n⚠️ Model returned an empty response (terminated=' +
               (result.terminated ?? 'unknown') +
               '). Open the Snapshot to see the raw response.\n');
