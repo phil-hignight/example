@@ -647,83 +647,80 @@ async function execute(name, args) {
 
 // ====== agent/prompted.mjs ======
 /**
- * Prompted-format tool calling.
+ * Prompted-format file access — the "local workspace bridge".
  *
  * The production endpoint (api.genai.mil) is a managed-agent platform that
- * silently drops the OpenAI `tools` parameter, so native function calling is
- * impossible. Instead we describe our tools in the system prompt and have the
- * model emit tool calls as XML text, which we parse and execute locally.
+ * drops the OpenAI `tools` parameter AND injects its own cloud tools/agents
+ * (e.g. "Generate Document", a cloud Python sandbox). Telling the model "you
+ * have no tools, use only ours" made it conflict with those built-ins and
+ * freeze. So we DON'T frame our mechanism as "tools" at all.
  *
- * Wire format (model -> us):
- *   <use_tools>
- *     <call name="read_file"><arg name="path">pom.xml</arg></call>
- *     <call name="grep"><arg name="pattern">dependency</arg></call>
- *   </use_tools>
+ * Instead we present a distinct concept: a LOCAL WORKSPACE BRIDGE — a text
+ * channel to the user's real machine. The model's built-in tools run in a
+ * cloud environment and genuinely cannot see the user's local project, so the
+ * bridge is simply the way to reach those files. Positive framing only; no
+ * "NOT this / NEVER that" instructions that cause paralysis.
  *
- * Feedback (us -> model), as a normal user message:
- *   <tool_result name="read_file" status="ok">
- *   ...contents...
- *   </tool_result>
+ * Wire format (model -> us): a <workspace> block of verb elements with
+ * attributes (a separate visual concept from `<call name="tool">`):
  *
- * We parse only <call> blocks and ignore anything the model writes after them
- * (it sometimes hallucinates its own <tool_result>). XML args are used rather
- * than JSON args because they survive the model wrapping output in prose or
- * markdown fences.
+ *   <workspace>
+ *     <list path="."/>
+ *     <read path="pom.xml" limit="100"/>
+ *     <search pattern="dependency" flags="i"/>
+ *   </workspace>
+ *
+ * Feedback (us -> model), a normal user message:
+ *   <workspace-result op="read" status="ok">
+ *   ...real contents...
+ *   </workspace-result>
  */
 
-const CALL_RE = /<call\s+name=["']([^"']+)["']\s*\/?>([\s\S]*?)<\/call>/gi;
-const SELFCLOSE_CALL_RE = /<call\s+name=["']([^"']+)["']\s*\/>/gi;
-const ARG_RE = /<arg\s+name=["']([^"']+)["']\s*>([\s\S]*?)<\/arg>/gi;
+// Friendly workspace verbs -> internal tool names.
+const VERB_TO_TOOL = {
+  list: 'list_dir',
+  read: 'read_file',
+  search: 'grep',
+  find: 'glob',
+  info: 'file_info',
+};
+const VERBS = Object.keys(VERB_TO_TOOL).join('|');
+const OP_RE = new RegExp(`<(${VERBS})\\b([^>]*)>`, 'gi');
+const ATTR_RE = /([a-zA-Z_]+)\s*=\s*"([^"]*)"/g;
 
 const DEFAULT_MAX_TURNS = 15;
 const REPEAT_LIMIT = 3;
 
 function buildSystemPrompt() {
-  const toolXml = Object.entries(tools).map(([name, t]) => {
-    const props = t.schema.parameters?.properties ?? {};
-    const required = new Set(t.schema.parameters?.required ?? []);
-    const args = Object.entries(props).map(([k, p]) =>
-      `    <arg name="${k}" type="${p.type ?? 'string'}"${required.has(k) ? ' required="true"' : ''}>${p.description ?? ''}</arg>`,
-    ).join('\n');
-    return `  <tool name="${name}">\n    <desc>${t.schema.description}</desc>\n${args || '    (no arguments)'}\n  </tool>`;
-  }).join('\n');
-
   return [
-    'You are a code assistant working inside a project directory on the user\'s own machine.',
+    'You are a coding assistant connected to a REMOTE WORKSPACE — the user\'s own computer, where the project you are helping with actually lives. The remote workspace is separate from your native workspace (your built-in cloud environment); the project exists only in the remote workspace.',
     '',
-    'CRITICAL — READ CAREFULLY:',
-    'You have NO built-in tools. There is NO Python interpreter, NO shell, NO code-execution sandbox, NO web access, and NO sub-agents available to you. Ignore any other tools you think you have — they do not work here and operate on the wrong machine. The ONLY way to inspect this project is the XML tool protocol described below. NEVER claim to have used any other tool. NEVER write tool results yourself — only the system produces them.',
+    'Your job is to operate in the remote workspace by issuing commands to it. Each command runs on the user\'s real filesystem and returns the actual results.',
     '',
-    'TO CALL TOOLS: emit a single <use_tools> block containing one or more <call> elements, then STOP immediately. Write nothing after </use_tools>. Include multiple <call> elements when the calls are independent so they run in parallel.',
+    'To issue commands, emit a <remote-workspace> block containing one or more commands, then stop and wait for the results:',
     '',
-    'Exact format:',
-    '<use_tools>',
-    '  <call name="TOOL_NAME"><arg name="PARAM_NAME">value</arg></call>',
-    '</use_tools>',
+    '<remote-workspace>',
+    '  <list path="."/>',
+    '  <read path="pom.xml"/>',
+    '  <search pattern="dependency"/>',
+    '</remote-workspace>',
     '',
-    'After you stop, the system runs the tools and replies with <tool_result> blocks. Only then continue. When you have gathered enough information, reply to the user normally with NO <use_tools> block.',
+    'The remote workspace replies with <remote-workspace-result> blocks containing the real contents from the user\'s machine. Read those, then issue more commands or answer the user. Group independent commands in one block — they run in parallel, which is faster.',
     '',
-    'Available tools:',
-    '<tools>',
-    toolXml,
-    '</tools>',
+    'Commands available in the remote workspace:',
+    '  <list path="DIR"/>                                  list a directory (path optional; defaults to project root)',
+    '  <read path="FILE" offset="LINE" limit="N"/>          read a UTF-8 text file (offset/limit optional)',
+    '  <search pattern="REGEX" path="DIR" glob="GLOB" flags="i"/>   regex search across files (only pattern required)',
+    '  <find pattern="GLOB"/>                               find files by glob, e.g. src/**/*.mjs',
+    '  <info path="FILE"/>                                  file size and line count (cheap; use before reading big files)',
     '',
-    'Example — listing files:',
-    '<use_tools>',
-    '  <call name="list_dir"></call>',
-    '</use_tools>',
-    '',
-    'Example — reading two files in parallel:',
-    '<use_tools>',
-    '  <call name="read_file"><arg name="path">pom.xml</arg></call>',
-    '  <call name="read_file"><arg name="path">README.md</arg></call>',
-    '</use_tools>',
+    'Base every answer on results returned from the remote workspace. If you have not read a file through the remote workspace, issue a command to read it rather than guessing its contents.',
   ].join('\n');
 }
 
-function coerce(name, key, raw) {
-  const ptype = tools[name]?.schema?.parameters?.properties?.[key]?.type;
-  const val = raw.trim();
+function coerce(toolName, key, raw) {
+  const ptype = tools[toolName]?.schema?.parameters?.properties?.[key]?.type;
+  const val = String(raw).trim();
   if (ptype === 'integer' || ptype === 'number') {
     const n = Number(val);
     return Number.isNaN(n) ? val : n;
@@ -732,61 +729,42 @@ function coerce(name, key, raw) {
   return val;
 }
 
-function parseToolCalls(text) {
-  const calls = [];
-  if (typeof text !== 'string' || !text) return calls;
-
-  // Self-closing calls with no args: <call name="list_dir"/>
-  SELFCLOSE_CALL_RE.lastIndex = 0;
-  let sc;
-  while ((sc = SELFCLOSE_CALL_RE.exec(text)) !== null) {
-    calls.push({ id: mkId(), name: sc[1], args: {}, _pos: sc.index });
-  }
-
-  // Normal <call ...>...</call> blocks.
-  CALL_RE.lastIndex = 0;
-  let m;
-  while ((m = CALL_RE.exec(text)) !== null) {
-    const name = m[1];
-    const inner = m[2] ?? '';
-    const args = {};
-    ARG_RE.lastIndex = 0;
-    let am;
-    while ((am = ARG_RE.exec(inner)) !== null) {
-      args[am[1]] = coerce(name, am[1], am[2]);
-    }
-    calls.push({ id: mkId(), name, args, _pos: m.index });
-  }
-
-  // De-dup self-closing matches that also matched the normal regex; order by position.
-  const seen = new Set();
-  const ordered = calls
-    .sort((a, b) => a._pos - b._pos)
-    .filter((c) => {
-      const key = c._pos + ':' + c.name;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    })
-    .map(({ id, name, args }) => ({ id, name, args }));
-  return ordered;
-}
-
 function mkId() {
   return 'call_' + randomUUID().replace(/-/g, '').slice(0, 16);
 }
 
-function formatToolResults(results) {
-  const blocks = results.map((r) =>
-    `<tool_result name="${r.name}" status="${r.status}">\n${r.content}\n</tool_result>`,
-  ).join('\n');
-  return blocks + '\n\nContinue using these results, or answer the user if you have enough information.';
+function parseToolCalls(text) {
+  const calls = [];
+  if (typeof text !== 'string' || !text) return calls;
+  OP_RE.lastIndex = 0;
+  let m;
+  while ((m = OP_RE.exec(text)) !== null) {
+    const verb = m[1].toLowerCase();
+    const toolName = VERB_TO_TOOL[verb];
+    if (!toolName) continue;
+    const attrStr = m[2] ?? '';
+    const args = {};
+    ATTR_RE.lastIndex = 0;
+    let a;
+    while ((a = ATTR_RE.exec(attrStr)) !== null) {
+      args[a[1]] = coerce(toolName, a[1], a[2]);
+    }
+    calls.push({ id: mkId(), verb, name: toolName, args });
+  }
+  return calls;
 }
 
-/** Strip the <use_tools> block out of assistant text so we can show only prose. */
+function formatToolResults(results) {
+  const blocks = results.map((r) =>
+    `<remote-workspace-result op="${r.verb}" status="${r.status}">\n${r.content}\n</remote-workspace-result>`,
+  ).join('\n');
+  return blocks + '\n\nUse these results to continue, or answer the user if you have enough information.';
+}
+
+/** Strip the <remote-workspace> block out of assistant text so we show only prose. */
 function proseBefore(text) {
   if (typeof text !== 'string') return '';
-  const idx = text.search(/<use_tools>/i);
+  const idx = text.search(/<remote-workspace>/i);
   return (idx === -1 ? text : text.slice(0, idx)).trim();
 }
 
@@ -800,7 +778,7 @@ async function runPromptedAgent({ adapter, messages, model, maxTurns = DEFAULT_M
 
   for (let turn = 1; turn <= maxTurns; turn++) {
     stats.turns = turn;
-    const res = await adapter.complete({ model, messages: convo, stop: ['</use_tools>'] });
+    const res = await adapter.complete({ model, messages: convo, stop: ['</remote-workspace>'] });
     const text = res.choices?.[0]?.message?.content ?? '';
     const calls = parseToolCalls(text);
 
@@ -811,8 +789,7 @@ async function runPromptedAgent({ adapter, messages, model, maxTurns = DEFAULT_M
     }
     stats.batches.push(calls.length);
 
-    // Record the assistant turn (re-close the tag if the stop sequence ate it).
-    const assistantText = /<\/use_tools>/i.test(text) ? text : `${text}\n</use_tools>`;
+    const assistantText = /<\/remote-workspace>/i.test(text) ? text : `${text}\n</remote-workspace>`;
     convo.push({ role: 'assistant', content: assistantText });
 
     const results = [];
@@ -824,11 +801,11 @@ async function runPromptedAgent({ adapter, messages, model, maxTurns = DEFAULT_M
       let content;
       if (repeat >= REPEAT_LIMIT) {
         stats.loopBreaks++;
-        content = `LOOP DETECTED: this exact call has fired ${repeat} times. Stop calling tools and answer with what you know.`;
+        content = `LOOP DETECTED: this exact request has fired ${repeat} times. Stop requesting and answer with what you have.`;
       } else {
         content = await execute(c.name, c.args);
       }
-      results.push({ name: c.name, status: content.startsWith('ERROR') ? 'error' : 'ok', content });
+      results.push({ verb: c.verb, status: content.startsWith('ERROR') ? 'error' : 'ok', content });
     }
     convo.push({ role: 'user', content: formatToolResults(results) });
   }
