@@ -562,7 +562,7 @@ function createTasksStore(projectDir) {
    * Initialize the store. If no state exists, creates a root task and makes it current.
    * Returns the initial state object.
    */
-  async function init({ rootTitle = 'session', rootGoal = 'project session' } = {}) {
+  async function init() {
     await ensureDir();
     state = await loadState();
     if (!state) {
@@ -570,8 +570,7 @@ function createTasksStore(projectDir) {
       const rootId = newId();
       const root = {
         id: rootId,
-        title: rootTitle,
-        goal: rootGoal,
+        userRequest: null,         // agent fills this in when the task closes
         parentId: null,
         childIds: [],
         started: nowMs(),
@@ -594,13 +593,23 @@ function createTasksStore(projectDir) {
   async function getCurrent() { return loadTask(currentId()); }
 
   /**
-   * Close the current task with a summary and open a new sibling task that
-   * becomes current. Returns the new task record.
+   * Close the CURRENT task and open a new one as its sibling.
+   *
+   * Both `summary` and `userRequest` describe the CURRENT (closing) task:
+   *   - userRequest: a synthesized statement of what the user wanted across
+   *     the just-finished work (NOT the latest user message that prompted this close).
+   *   - summary: what was actually accomplished.
+   *
+   * The new task starts with userRequest=null and summary=null; the agent
+   * fills them in when IT closes via another <next-task>.
+   *
+   * Returns the new task record.
    */
-  async function transitionTo({ summary, title, goal }) {
+  async function transitionTo({ summary, userRequest }) {
     if (!state?.currentId) throw new Error('store not initialized');
     const cur = await loadTask(state.currentId);
     cur.summary = summary ?? cur.summary ?? '(no summary provided)';
+    cur.userRequest = userRequest ?? cur.userRequest ?? null;
     cur.ended = nowMs();
     await saveTask(cur);
 
@@ -611,8 +620,7 @@ function createTasksStore(projectDir) {
     const id = newId();
     const t = {
       id,
-      title: title ?? 'untitled',
-      goal: goal ?? '',
+      userRequest: null,
       parentId: realParentId,
       childIds: [],
       started: nowMs(),
@@ -676,7 +684,7 @@ function createTasksStore(projectDir) {
       if (parentId !== undefined && t.parentId !== parentId) continue;
       if (tier !== undefined && t.tier !== tier) continue;
       out.push({
-        id: t.id, title: t.title, goal: t.goal, parentId: t.parentId,
+        id: t.id, userRequest: t.userRequest, parentId: t.parentId,
         childIds: t.childIds, started: t.started, ended: t.ended,
         tier: t.tier, summary: t.summary,
         rolledUpInto: t.rolledUpInto ?? null,
@@ -690,14 +698,14 @@ function createTasksStore(projectDir) {
     const t = await loadTask(id);
     if (!t) return null;
     return {
-      id: t.id, title: t.title, goal: t.goal, parentId: t.parentId,
+      id: t.id, userRequest: t.userRequest, parentId: t.parentId,
       childIds: t.childIds, started: t.started, ended: t.ended,
       tier: t.tier, summary: t.summary,
       messageCount: (t.messages ?? []).length,
     };
   }
 
-  /** Case-insensitive substring search across title/goal/summary. */
+  /** Case-insensitive substring search across userRequest/summary. */
   async function searchTasks(query) {
     if (!query) return listTasks();
     const q = query.toLowerCase();
@@ -705,9 +713,9 @@ function createTasksStore(projectDir) {
     for (const id of state.allTaskIds) {
       const t = await loadTask(id);
       if (!t) continue;
-      const hay = [t.title, t.goal, t.summary].filter(Boolean).join(' ').toLowerCase();
+      const hay = [t.userRequest, t.summary].filter(Boolean).join(' ').toLowerCase();
       if (hay.includes(q)) {
-        hits.push({ id: t.id, title: t.title, goal: t.goal, parentId: t.parentId, started: t.started, ended: t.ended, tier: t.tier, summary: t.summary });
+        hits.push({ id: t.id, userRequest: t.userRequest, parentId: t.parentId, started: t.started, ended: t.ended, tier: t.tier, summary: t.summary });
       }
     }
     return hits;
@@ -769,11 +777,23 @@ function createTasksStore(projectDir) {
   }
 
   /**
-   * Roll up N tier-3 tasks into a single synthetic tier-4 task with a
-   * mechanically-concatenated summary. The children get `rolledUpInto` set
-   * so they're skipped in convo building (still searchable via the search tool).
+   * Roll up N tier-3 tasks into a single synthetic tier-4 task. The children
+   * get `rolledUpInto` set so they're skipped in convo building (still
+   * searchable via the search tool).
+   *
+   * If `override` provides `{ title, summary }`, those replace the mechanical
+   * defaults (used when an LLM call has produced a real clustered rollup).
+   * Otherwise the rollup uses a concatenation of child summaries.
    */
-  async function rollupTier3Tasks(childIds) {
+  /**
+   * Group N tier-3 tasks into a tier-4 "project" rollup. Children get
+   * `rolledUpInto` set; the rollup is a new task with its own userRequest
+   * and summary (synthesized by the LLM if `override` is provided,
+   * otherwise mechanical fallback).
+   *
+   * `override`: { userRequest, summary } from the LLM clustering call.
+   */
+  async function rollupTier3Tasks(childIds, override) {
     if (!Array.isArray(childIds) || childIds.length === 0) return null;
     const children = [];
     for (const cid of childIds) {
@@ -782,18 +802,26 @@ function createTasksStore(projectDir) {
     }
     if (children.length === 0) return null;
 
-    const lines = [`Rollup of ${children.length} task(s):`];
-    for (const c of children) {
-      const firstLine = (c.summary ?? '').split('\n')[0].slice(0, 200);
-      lines.push(`- ${c.id} "${c.title}": ${firstLine}`);
+    let userRequest, summary;
+    if (override && typeof override.userRequest === 'string' && typeof override.summary === 'string') {
+      userRequest = override.userRequest;
+      summary = override.summary;
+    } else {
+      // Mechanical fallback: stitch the child summaries together.
+      userRequest = `Project covering ${children.length} tasks (${children.map((c) => c.id).join(', ')})`;
+      const lines = [`Rollup of ${children.length} task(s):`];
+      for (const c of children) {
+        const ur = c.userRequest ? ` ↳ ${c.userRequest.split('\n')[0].slice(0, 120)}` : '';
+        const sm = (c.summary ?? '').split('\n')[0].slice(0, 200);
+        lines.push(`- ${c.id}${ur} — ${sm}`);
+      }
+      summary = lines.join('\n');
     }
-    const summary = lines.join('\n');
 
     const id = newId();
     const t = {
       id,
-      title: `Rollup of ${children.length} tasks`,
-      goal: '',
+      userRequest,
       parentId: children[0].parentId ?? null,
       childIds: children.map((c) => c.id),
       started: children[0].started,
@@ -911,6 +939,12 @@ function isTextFile(p) {
 }
 
 function globToRegex(glob) {
+  // Auto-promote bare-filename globs to recursive. Users (and models) often
+  // write `*.java` or `*Owner*` and expect it to match anywhere in the tree.
+  // If the pattern has no separators and doesn't start with **, prepend **/.
+  if (!glob.includes('/') && !glob.includes('\\') && !glob.startsWith('**')) {
+    glob = '**/' + glob;
+  }
   // Convert a glob to a regex. Supports: ** (any path), * (any non-separator), ? (one char), {a,b}.
   let re = '';
   for (let i = 0; i < glob.length; i++) {
@@ -1037,14 +1071,14 @@ const tools = {
 
   grep: {
     schema: {
-      description: 'Search files in the project for a regular expression. Returns matching lines with file:line prefix. Up to ' + MAX_GREP_MATCHES + ' matches.',
+      description: 'Recursively search files in the project for a regular expression (Extended-regex / POSIX). Returns "file:line:text" entries. Up to ' + MAX_GREP_MATCHES + ' matches. Backed by real grep — bare globs like "*.java" work recursively.',
       parameters: {
         type: 'object',
         properties: {
-          pattern: { type: 'string', description: 'JavaScript regex pattern (no slashes).' },
+          pattern: { type: 'string', description: 'Extended-regex pattern (passed to grep -E).' },
           path: { type: 'string', description: 'Optional subdirectory to search. Defaults to project root.' },
-          glob: { type: 'string', description: 'Optional glob filter for file paths (e.g. "**/*.mjs").' },
-          flags: { type: 'string', description: 'Optional regex flags (e.g. "i" for case-insensitive).' },
+          glob: { type: 'string', description: 'Optional filename glob (e.g. "*.java", "*.mjs").' },
+          flags: { type: 'string', description: 'Optional flags. "i" → case-insensitive.' },
         },
         required: ['pattern'],
         additionalProperties: false,
@@ -1052,32 +1086,53 @@ const tools = {
     },
     impl: async ({ pattern, path: subPath, glob, flags }) => {
       if (typeof pattern !== 'string' || !pattern) throw new Error('pattern is required');
-      const re = new RegExp(pattern, flags ?? '');
-      const root = subPath
-        ? (path.isAbsolute(subPath) ? subPath : path.join(process.cwd(), subPath))
-        : process.cwd();
-      const globRe = glob ? globToRegex(glob) : null;
-      const files = await walkDir(root);
-      const lines = [];
-      let count = 0;
-      outer: for (const f of files) {
-        if (globRe && !globRe.test(relForDisplay(f).replace(/\\/g, '/'))) continue;
-        if (!isTextFile(f)) continue;
-        let text;
-        try { text = await safeReadText(f); } catch { continue; }
-        const ls = text.split('\n');
-        for (let i = 0; i < ls.length; i++) {
-          if (re.test(ls[i])) {
-            lines.push(`${relForDisplay(f)}:${i + 1}:${ls[i]}`);
-            count++;
-            if (count >= MAX_GREP_MATCHES) {
-              lines.push(`\n[stopped at ${MAX_GREP_MATCHES} matches]`);
-              break outer;
-            }
-          }
-        }
+      // Build a real grep invocation. -r recursive, -n line numbers, -E
+      // extended regex, -I skip binary files, --exclude-dir to skip noise.
+      const args = ['-rnEI'];
+      if ((flags ?? '').includes('i')) args.push('-i');
+      for (const d of ['.git', 'node_modules', 'dist', 'target', '.agent', '.idea', '.gradle', 'build']) {
+        args.push(`--exclude-dir=${d}`);
       }
-      return ensureFits(lines.length ? lines.join('\n') : '(no matches)');
+      if (glob) args.push(`--include=${glob}`);
+      args.push('-m', String(MAX_GREP_MATCHES));   // grep's per-file cap; close enough
+      args.push('-e', pattern);
+      args.push(subPath || '.');
+
+      const isWin = process.platform === 'win32';
+      // On Windows, grep typically comes from Git for Windows. Spawn it
+      // directly (works in PowerShell-or-cmd environments alike).
+      // On POSIX, /usr/bin/grep is in PATH.
+      const result = await new Promise((resolve) => {
+        let out = '', err = '', settled = false;
+        const child = spawn('grep', args, {
+          cwd: process.cwd(),
+          windowsHide: true,
+          env: process.env,
+        });
+        const timer = setTimeout(() => {
+          if (process.platform === 'win32' && child.pid) {
+            try { spawn('taskkill', ['/F', '/T', '/PID', String(child.pid)], { windowsHide: true }); } catch {}
+          } else {
+            try { child.kill('SIGKILL'); } catch {}
+          }
+        }, 30000); // 30s cap — grep is fast
+        child.stdout.on('data', (d) => { if (out.length < MAX_RESULT_BYTES) out += d.toString('utf8'); });
+        child.stderr.on('data', (d) => { if (err.length < 4096) err += d.toString('utf8'); });
+        child.on('error', (e) => { if (!settled) { settled = true; clearTimeout(timer); resolve({ code: -1, out: '', err: 'grep not found: ' + e.message }); } });
+        child.on('close', (code) => { if (!settled) { settled = true; clearTimeout(timer); resolve({ code, out, err }); } });
+      });
+
+      // grep exit codes: 0 = found, 1 = no match, 2 = error
+      if (result.code === 1 || (result.code === 0 && !result.out)) return '(no matches)';
+      if (result.code !== 0 && result.code !== 1) {
+        return `ERROR: grep exited ${result.code}: ${result.err.split('\n')[0].slice(0, 200)}`;
+      }
+      // Normalize Windows path separators to forward slash for consistency.
+      const lines = result.out.split('\n').filter(Boolean).map((l) => l.replace(/\\/g, '/'));
+      const trimmed = lines.length > MAX_GREP_MATCHES
+        ? lines.slice(0, MAX_GREP_MATCHES).concat([`[stopped at ${MAX_GREP_MATCHES} matches]`])
+        : lines;
+      return ensureFits(trimmed.join('\n'));
     },
   },
 
@@ -1182,13 +1237,13 @@ const tools = {
     },
   },
 
-  bash: {
+  powershell: {
     schema: {
-      description: 'Run a shell command in the project root. Stdout, stderr, and exit code are returned. Use this for builds (mvn compile, npm test), git (git status, git diff), and any other shell operation. The agent runs as the same user as the server.',
+      description: 'Run a PowerShell command on the developer\'s Windows machine, in the project root. Returns stdout, stderr, and exit code. Use this for builds (mvnw.cmd, npm test), git (git status, git diff), any shell operation. PowerShell syntax: Get-ChildItem, Get-Content, $env:VAR, etc. The `ls` and `cat` aliases work too.',
       parameters: {
         type: 'object',
         properties: {
-          command: { type: 'string', description: 'Shell command to run. Pipes and redirects supported (executed via shell).' },
+          command: { type: 'string', description: 'PowerShell command. Pipes, redirects, variables, etc. work normally.' },
           timeout_ms: { type: 'integer', description: `Timeout in milliseconds. Default ${BASH_DEFAULT_TIMEOUT_MS} (2 min), max ${BASH_MAX_TIMEOUT_MS} (10 min).` },
         },
         required: ['command'],
@@ -1202,24 +1257,19 @@ const tools = {
       const t0 = Date.now();
       return await new Promise((resolve) => {
         let stdout = '', stderr = '', timedOut = false, settled = false;
-        // shell:true lets the system shell handle quoting natively. Without
-        // it, Node's argv-escaping (especially on Windows) mangles inner
-        // quotes — `node -e "process.exit(7)"` becomes unparseable.
-        const child = spawn(command, {
+        // PowerShell-only deployment. cmd.exe is often blocked by enterprise
+        // policy and lacks the unix aliases the agent expects (ls, cat, etc.).
+        const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', command], {
           cwd: process.cwd(),
           windowsHide: true,
           env: process.env,
-          shell: true,
         });
         const timer = setTimeout(() => {
           timedOut = true;
-          // On Windows, child.kill() only kills the shell wrapper, not the
-          // actual command (e.g. node.exe under cmd.exe). taskkill /T kills
-          // the whole process tree.
-          if (process.platform === 'win32' && child.pid) {
+          // taskkill /T kills the whole process tree (child.kill() only stops
+          // the powershell wrapper, leaving e.g. mvn.exe orphaned).
+          if (child.pid) {
             try { spawn('taskkill', ['/F', '/T', '/PID', String(child.pid)], { windowsHide: true }); } catch {}
-          } else {
-            try { child.kill('SIGKILL'); } catch {}
           }
         }, timeout);
 
@@ -1362,18 +1412,25 @@ function extractDiff(r) {
  */
 
 // ── Tier budgets and thresholds ─────────────────────────────────────────────
-// All four tiers live in context. When a tier exceeds budget, the oldest
-// eligible task in that tier is demoted to the next tier. Tier 4 overflow
-// archives to disk (still searchable, not in context).
+// All four tiers live in context. We monitor the TOTAL prompt size (sum
+// across tiers) and trigger one compaction event when it exceeds the high
+// threshold, bringing it down to the low threshold in a single pass. Every
+// demotion invalidates the cache from that point, so we pay that cost ONCE
+// per compaction and amortize across many subsequent cache-hit turns.
+//
+// Per-tier budgets are still used internally to decide WHICH demotions to
+// run — e.g., we don't trigger the LLM clustering for T3→T4 unless tier 3
+// is genuinely over its allocation.
 const TIER_1_BUDGET = 12000;     // full messages (current + recent tasks)
 const TIER_2_BUDGET = 8000;      // masked-results tasks
 const TIER_3_BUDGET = 4000;      // per-task summaries
 const TIER_4_BUDGET = 2000;      // group-rollup summaries
-const TIER_3_ROLLUP_BATCH = 5;   // how many tier-3 tasks group into one tier-4 rollup
-const HYST_HIGH = 1.10;          // demote when tier exceeds 110% of budget
-const HYST_LOW  = 0.50;          // demote DEEPLY to 50% so cache invalidations are rare (cost-of-miss amortized over many turns of cache hits)
-const TASK_NUDGE = 0.75;         // soft nudge at 75% of TIER 1 budget
-const TASK_FORCE = 1.00;         // firm push at 100%
+const TOTAL_BUDGET  = TIER_1_BUDGET + TIER_2_BUDGET + TIER_3_BUDGET + TIER_4_BUDGET; // 26000
+const HYST_HIGH = 1.10;          // trigger compaction when total > 110% of TOTAL_BUDGET
+const HYST_LOW  = 0.50;          // compact down to 50% of TOTAL_BUDGET in one pass
+const TASK_NUDGE = 0.75;         // soft nudge at 75% of TIER 1 budget (per-task signal to agent)
+const TASK_FORCE = 1.00;
+const MIN_T3_FOR_LLM_ROLLUP = 8; // skip LLM call unless we have at least this many tier-3 tasks to cluster
 const TOKENS_PER_CHAR = 0.25;
 
 function estTokens(s) { return Math.ceil((s ?? '').length * TOKENS_PER_CHAR); }
@@ -1387,7 +1444,7 @@ const VERB_TO_TOOL = {
   info: 'file_info',
   write: 'write_file',
   edit: 'edit_file',
-  bash: 'bash',
+  powershell: 'powershell',
 };
 const TASK_VERBS = new Set(['next-task', 'list-tasks', 'task-detail', 'search-tasks']);
 // Sort longer first so that e.g. "list-tasks" matches before "list".
@@ -1403,29 +1460,29 @@ const DEFAULT_MAX_TURNS = 20;
 const REPEAT_LIMIT = 3;
 
 // ── System prompt ───────────────────────────────────────────────────────────
-function buildSystemPrompt({ taskId, taskTitle, taskGoal, tier1Tokens, tier1Pct }) {
+function buildSystemPrompt({ taskId, taskUserRequest, tier1Tokens, tier1Pct }) {
   const lines = [
-    'You are a coding assistant connected to a REMOTE WORKSPACE — the user\'s real machine, where the project lives. The remote workspace is separate from your native cloud workspace; the project files exist only on the remote side.',
+    'You are a coding assistant. The project lives on the developer\'s remote Windows machine. You access it ONLY through <remote-workspace> commands.',
     '',
-    'You always operate INSIDE a task. The current task scopes your work. When the task is naturally complete, signal <next-task summary="..." title="..." goal="..."/> to close it and open a fresh task — this keeps context sharp and lets you (and the user) navigate work later.',
+    'NEVER use built-in tools (Python, code interpreter, file browsers, document generators, memory tools, anything that runs in a cloud sandbox). They do not see the developer\'s project. Use <remote-workspace> exclusively.',
     '',
-    `Current task: ${taskId} "${taskTitle}"  · goal: ${taskGoal}`,
-    `Task budget: ${tier1Tokens} / ${TIER_1_BUDGET} tokens used (${tier1Pct}%)` + (tier1Pct >= 95
-      ? '  ← please finish soon: emit <next-task summary="..." title="..." goal="..."/>'
+    `Current task: ${taskId}` + (taskUserRequest ? `  ↳ ${taskUserRequest}` : ''),
+    `Task budget: ${tier1Tokens} / ${TIER_1_BUDGET} tokens (${tier1Pct}%)` + (tier1Pct >= 95
+      ? '  ← please finish soon: emit <next-task user-request="..." summary="..."/>'
       : tier1Pct >= 75
         ? '  ← nearing budget; consider closing this task at a natural stopping point'
         : ''),
     '',
-    'Issue commands by emitting a <remote-workspace> block. Group independent commands in one block — they run in parallel, which is faster. Then stop and wait for the results.',
+    'Emit a <remote-workspace> block to issue commands. Group independent commands in one block — they run in parallel. Then stop and wait for real results.',
     '',
     'Read commands (self-closing):',
-    '  <list path="DIR"/>                                  list a directory',
-    '  <read path="FILE" offset="N" limit="N"/>            read a UTF-8 text file',
-    '  <search pattern="REGEX" path="DIR" glob="GLOB" flags="i"/>   regex search',
-    '  <find pattern="GLOB"/>                              find files by glob',
-    '  <info path="FILE"/>                                 file size and line count',
+    '  <list path="DIR"/>',
+    '  <read path="FILE" offset="N" limit="N"/>',
+    '  <search pattern="REGEX" path="DIR" glob="GLOB" flags="i"/>      backed by real grep; bare "*.java" works recursively',
+    '  <find pattern="GLOB"/>                                          bare patterns also work recursively',
+    '  <info path="FILE"/>',
     '',
-    'Write commands (use the body, not attributes, for file content):',
+    'Write commands (body holds the content, not attributes):',
     '  <write path="FILE">',
     '  full file content goes here',
     '  </write>',
@@ -1435,18 +1492,20 @@ function buildSystemPrompt({ taskId, taskTitle, taskGoal, tier1Tokens, tier1Pct 
     '  <replace>replacement string</replace>',
     '  </edit>',
     '',
-    'Shell execution (for builds, tests, git, etc.):',
-    '  <bash>git status</bash>                              command in body',
-    '  <bash timeout_ms="300000">mvn -q clean install</bash>   override timeout (default 2 min, max 10 min)',
-    '  Returns stdout + stderr + exit code. Use this to run builds, tests, linters, git commands, and any other shell operation. Pipes and redirects are supported.',
+    'Shell (builds, tests, git — runs in PowerShell on the developer\'s Windows machine):',
+    '  <powershell>git status</powershell>',
+    '  <powershell timeout_ms="600000">mvnw.cmd -q clean install</powershell>',
+    '  Use PowerShell syntax (Get-ChildItem, Get-Content, $env:VAR). The `ls`, `cat`, `pwd` aliases also work. To run a maven wrapper script use `mvnw.cmd` — not `./mvnw`.',
     '',
     'Task management:',
-    '  <next-task summary="what just finished" title="next task" goal="what to do next"/>   atomically close current and open new',
-    '  <list-tasks parent="T-1"/>                          list tasks (omit parent for top-level)',
-    '  <task-detail id="T-3"/>                             one task\'s summary + metadata',
-    '  <search-tasks query="auth middleware"/>             keyword search across all task summaries',
+    '  <next-task user-request="WHAT THE USER WANTED IN THE CURRENT TASK" summary="WHAT WAS DONE IN THE CURRENT TASK"/>',
+    '       Closes the CURRENT task and opens a new one. Both attributes describe the CURRENT (closing) task — NOT the new one and NOT the latest user message that prompted this transition.',
+    '       The user-request is a single sentence that captures what the user wanted across the work just finished. It is a synthesized statement, not a quote of any single user message.',
+    '  <list-tasks parent="T-1"/>',
+    '  <task-detail id="T-3"/>',
+    '  <search-tasks query="auth middleware"/>',
     '',
-    'The remote workspace replies with <remote-workspace-result> blocks. Read those, then issue more commands or answer the user. Base every answer on real results; never invent file or directory names you have not seen.',
+    'The remote workspace replies with <remote-workspace-result> blocks. Read real results before answering. Never invent file or directory names you have not seen.',
   ];
   return lines.join('\n');
 }
@@ -1463,6 +1522,45 @@ function coerce(toolName, key, raw) {
   return val;
 }
 function mkId() { return 'call_' + randomUUID().replace(/-/g, '').slice(0, 16); }
+
+/**
+ * Truncate an assistant response to just the first real <remote-workspace>
+ * block — everything after the close tag (or before a hallucinated result
+ * tag) is dropped.
+ *
+ * Why this exists: backends that ignore our `stop` parameter (e.g., the
+ * Claude Agent SDK in dev mode) let the model "imagine" multi-turn
+ * conversations within a single response — writing fake
+ * <remote-workspace-result> blocks and follow-up turns. Our parser already
+ * ignores the imagined content when extracting calls, but if we store the
+ * full text in the task history, the model on the NEXT loop iteration sees
+ * its own imagined turns and concludes the work is already done.
+ *
+ * By truncating at storage time, the task store contains only what actually
+ * happened — same view the model would have if `stop` had been honored
+ * at the token level.
+ */
+function truncateAtFirstBlock(text) {
+  if (typeof text !== 'string' || !text) return text;
+  const closeMatch = text.match(/<\/remote-workspace>/i);
+  const resultMatch = text.match(/<remote-workspace-result|<workspace-result/i);
+
+  // Case A: no markers → leave as-is (final answers / pure prose).
+  if (!closeMatch && !resultMatch) return text;
+
+  // Case B: close tag comes first (or is the only marker) → keep through close.
+  if (closeMatch && (!resultMatch || closeMatch.index < resultMatch.index)) {
+    return text.slice(0, closeMatch.index + closeMatch[0].length);
+  }
+
+  // Case C: a hallucinated result tag appears before any close. Cut there
+  // and append a synthetic close so the block is well-formed in storage.
+  const before = text.slice(0, resultMatch.index).trimEnd();
+  if (/<remote-workspace>/i.test(before) && !/<\/remote-workspace>/i.test(before)) {
+    return before + '\n</remote-workspace>';
+  }
+  return before;
+}
 
 function parseAttrs(attrStr, toolName) {
   const out = {};
@@ -1520,7 +1618,7 @@ function parseToolCalls(text) {
           if (fM) args.find = fM[1];
           if (rM) args.replace = rM[1];
         }
-        if (verb === 'bash' && body.trim()) args.command = body.trim();
+        if (verb === 'powershell' && body.trim()) args.command = body.trim();
       }
     }
     pos = nextPos;
@@ -1564,12 +1662,12 @@ async function buildConvoFromStore(store) {
     if (t.tier === 4) {
       out.push({
         role: 'user',
-        content: `<task-rollup id="${t.id}" children="${(t.childIds ?? []).join(',')}">\n${t.summary || '(no summary)'}\n</task-rollup>`,
+        content: `<task-rollup id="${t.id}" children="${(t.childIds ?? []).join(',')}">\n  ↳ ${t.userRequest || '(no user request synthesized)'}\n${t.summary || '(no summary)'}\n</task-rollup>`,
       });
     } else if (t.tier === 3) {
       out.push({
         role: 'user',
-        content: `<task-history id="${t.id}" title="${t.title.replace(/"/g, '&quot;')}" parent="${t.parentId ?? 'root'}" status="${t.ended ? 'done' : 'open'}">\n${t.summary || '(no summary)'}\n</task-history>`,
+        content: `<task-history id="${t.id}" parent="${t.parentId ?? 'root'}" status="${t.ended ? 'done' : 'open'}">\n  ↳ ${t.userRequest || '(no user request synthesized)'}\n${t.summary || '(no summary)'}\n</task-history>`,
       });
     } else {
       // tier 1 and 2 both emit messages; tier 2 already has results masked in storage
@@ -1631,85 +1729,180 @@ async function tier4TokensFor(store) {
   return n;
 }
 
-async function maybeDemote(store) {
-  // Hysteresis: trigger demotion when current > HIGH × budget, then KEEP
-  // demoting until current < LOW × budget. With HYST_LOW = 0.50, we demote
-  // deeply on every trigger, so cache invalidations are rare.
+async function totalContextTokens(store) {
+  return (await tier1TokensFor(store))
+    + (await tier2TokensFor(store))
+    + (await tier3TokensFor(store))
+    + (await tier4TokensFor(store));
+}
 
-  // ── Tier 1 -> Tier 2 (mechanical: mask tool results) ──
-  {
-    let t = await tier1TokensFor(store);
-    const limit = TIER_1_BUDGET * HYST_HIGH;
-    const stop  = TIER_1_BUDGET * HYST_LOW;
-    if (t > limit) {
-      while (t > stop) {
-        const id = await store.findOldestDemotionCandidate(1);
-        if (!id) break;
-        const before = await loadTaskFull(store, id);
-        let removed = 0;
-        for (const m of before?.messages ?? []) if (m.kind === 'tool-result') removed += estTokens(m.content);
-        await store.demoteToTier2(id);
-        t -= removed;
-      }
+/**
+ * LLM-driven clustering of tier-3 tasks into tier-4 rollups. ONE LLM call
+ * groups N tier-3 summaries into 4-8 "project" rollups, each with a custom
+ * title + summary. Falls back to mechanical concatenation if the call fails
+ * or the response can't be parsed.
+ *
+ * Returns the number of rollup tasks created.
+ */
+async function llmClusterTier3({ store, adapter, model, log }) {
+  const tier3 = (await store.listTasks({ tier: 3 }))
+    .filter((x) => !x.rolledUpInto && !x.archived)
+    .sort((a, b) => (a.ended ?? a.started ?? 0) - (b.ended ?? b.started ?? 0));
+  if (tier3.length < MIN_T3_FOR_LLM_ROLLUP) {
+    log?.(`tier3 cluster: only ${tier3.length} tasks (< ${MIN_T3_FOR_LLM_ROLLUP}); falling back to mechanical`);
+    if (tier3.length >= 2) {
+      // mechanical fallback: roll up everything into one batch
+      await store.rollupTier3Tasks(tier3.map((t) => t.id));
+      return 1;
+    }
+    return 0;
+  }
+
+  const taskLines = tier3
+    .map((t) => {
+      const ur = (t.userRequest || '').replace(/\s+/g, ' ').trim().slice(0, 200);
+      const sm = (t.summary || '').replace(/\s+/g, ' ').trim().slice(0, 200);
+      return `${t.id}  ↳ ${ur || '(no request)'} — ${sm}`;
+    })
+    .join('\n');
+
+  const prompt = [
+    `You will compact a coding session's history. There are ${tier3.length} completed task summaries below.`,
+    '',
+    'Group them into 4-8 logical "projects" — sets of tasks that form coherent units of work (e.g., "auth refactor", "build system upgrade"). For each project, produce:',
+    '  user-request: a single synthesized sentence representing what the user wanted ACROSS this project (NOT a copy of any single message).',
+    '  summary: one dense 1-2 sentence recap of what was actually accomplished across the project.',
+    '',
+    'Tasks (id, user-request, summary):',
+    taskLines,
+    '',
+    'Output ONLY a single JSON object in this exact shape, no other text, no markdown fences:',
+    '{"projects":[{"userRequest":"...","summary":"...","taskIds":["T-3","T-8"]}]}',
+    '',
+    'Constraints:',
+    '- Every task ID from the list above must appear in exactly one project.',
+    '- Use the task IDs verbatim.',
+    '- Keep each user-request and summary under 200 characters.',
+  ].join('\n');
+
+  let raw;
+  try {
+    const res = await adapter.complete({
+      model,
+      messages: [{ role: 'user', content: prompt }],
+      max_tokens: 2000,
+    });
+    raw = res?.choices?.[0]?.message?.content ?? '';
+  } catch (e) {
+    log?.(`tier3 cluster: LLM call failed (${e.message}); falling back to mechanical`);
+  }
+
+  // Try to parse JSON out of the response. Tolerant of prose around the object.
+  let parsed = null;
+  if (raw) {
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      try { parsed = JSON.parse(jsonMatch[0]); } catch {}
     }
   }
 
-  // ── Tier 2 -> Tier 3 (mechanical: drop messages, keep agent-written summary) ──
-  {
-    let t = await tier2TokensFor(store);
-    const limit = TIER_2_BUDGET * HYST_HIGH;
-    const stop  = TIER_2_BUDGET * HYST_LOW;
-    if (t > limit) {
-      while (t > stop) {
-        const id = await store.findOldestDemotionCandidate(2);
-        if (!id) break;
-        const before = await loadTaskFull(store, id);
-        let removed = 0;
-        for (const m of before?.messages ?? []) removed += estTokens(m.content);
-        await store.demoteToTier3(id, before?.summary || '(no summary)');
-        t -= removed;
-      }
+  if (!parsed || !Array.isArray(parsed.projects) || parsed.projects.length === 0) {
+    log?.(`tier3 cluster: LLM response unparseable; falling back to one mechanical rollup`);
+    await store.rollupTier3Tasks(tier3.map((t) => t.id));
+    return 1;
+  }
+
+  // Build set of valid IDs (the ones we asked about); ignore any hallucinated IDs.
+  const validIds = new Set(tier3.map((t) => t.id));
+  let createdCount = 0;
+  const claimed = new Set();
+  for (const p of parsed.projects) {
+    if (typeof p?.userRequest !== 'string' || typeof p?.summary !== 'string') continue;
+    if (!Array.isArray(p?.taskIds)) continue;
+    const ids = p.taskIds.filter((id) => validIds.has(id) && !claimed.has(id));
+    if (ids.length === 0) continue;
+    const rollup = await store.rollupTier3Tasks(ids, { userRequest: p.userRequest, summary: p.summary });
+    if (rollup) {
+      createdCount++;
+      for (const id of ids) claimed.add(id);
     }
   }
 
-  // ── Tier 3 -> Tier 4 (rollup: combine oldest N tier-3 tasks into one rollup) ──
-  {
-    let t = await tier3TokensFor(store);
-    const limit = TIER_3_BUDGET * HYST_HIGH;
-    const stop  = TIER_3_BUDGET * HYST_LOW;
-    if (t > limit) {
-      while (t > stop) {
-        const tier3 = (await store.listTasks({ tier: 3 }))
-          .filter((x) => !x.rolledUpInto && !x.archived)
-          .sort((a, b) => (a.ended ?? a.started ?? 0) - (b.ended ?? b.started ?? 0));
-        if (tier3.length < 2) break;
-        const batch = tier3.slice(0, Math.min(TIER_3_ROLLUP_BATCH, tier3.length));
-        const removed = batch.reduce((s, x) => s + estTokens(x.summary), 0);
-        const rollup = await store.rollupTier3Tasks(batch.map((x) => x.id));
-        if (!rollup) break;
-        t -= removed;
-      }
-    }
+  // Sweep up any unclaimed task IDs into one final mechanical rollup so nothing is left orphaned.
+  const orphans = [...validIds].filter((id) => !claimed.has(id));
+  if (orphans.length >= 2) {
+    await store.rollupTier3Tasks(orphans);
+    createdCount++;
   }
+  log?.(`tier3 cluster: created ${createdCount} rollups covering ${claimed.size + Math.max(0, orphans.length)} tasks`);
+  return createdCount;
+}
 
-  // ── Tier 4 -> archived (oldest tier-4 rollup leaves context entirely) ──
-  {
-    let t = await tier4TokensFor(store);
-    const limit = TIER_4_BUDGET * HYST_HIGH;
-    const stop  = TIER_4_BUDGET * HYST_LOW;
-    if (t > limit) {
-      while (t > stop) {
-        const tier4 = (await store.listTasks({ tier: 4 }))
-          .filter((x) => !x.archived)
-          .sort((a, b) => (a.ended ?? a.started ?? 0) - (b.ended ?? b.started ?? 0));
-        if (!tier4.length) break;
-        const oldest = tier4[0];
-        const removed = estTokens(oldest.summary);
-        await store.archiveTask(oldest.id);
-        t -= removed;
-      }
-    }
+/**
+ * Compact when total context exceeds the high threshold. Bring it down to
+ * the low threshold in one pass:
+ *   1. T1→T2 (mechanical mask) until under LOW or no more candidates
+ *   2. T2→T3 (mechanical drop messages) until under LOW or no candidates
+ *   3. If still over and tier-3 is at or above its allocation: ONE LLM call
+ *      to cluster all tier-3 tasks into tier-4 rollups
+ *   4. T4→archive (mechanical flag flip) for oldest if still over
+ */
+async function maybeCompact({ store, adapter, model, log }) {
+  const HIGH = TOTAL_BUDGET * HYST_HIGH;
+  const LOW  = TOTAL_BUDGET * HYST_LOW;
+
+  let total = await totalContextTokens(store);
+  if (total <= HIGH) return;
+
+  log?.(`compact: total=${total} > HIGH=${HIGH}; target LOW=${LOW}`);
+
+  // Step 1: T1 → T2 mask (cheap)
+  while (total > LOW) {
+    const id = await store.findOldestDemotionCandidate(1);
+    if (!id) break;
+    const before = await loadTaskFull(store, id);
+    let removed = 0;
+    for (const m of before?.messages ?? []) if (m.kind === 'tool-result') removed += estTokens(m.content);
+    await store.demoteToTier2(id);
+    total -= removed;
   }
+  if (total <= LOW) { log?.(`compact: done after T1→T2 (total=${total})`); return; }
+
+  // Step 2: T2 → T3 drop (cheap)
+  while (total > LOW) {
+    const id = await store.findOldestDemotionCandidate(2);
+    if (!id) break;
+    const before = await loadTaskFull(store, id);
+    let removedMsgs = 0;
+    for (const m of before?.messages ?? []) removedMsgs += estTokens(m.content);
+    const addedSummary = estTokens(before?.summary ?? '');
+    await store.demoteToTier3(id, before?.summary || '(no summary)');
+    total -= (removedMsgs - addedSummary);
+  }
+  if (total <= LOW) { log?.(`compact: done after T2→T3 (total=${total})`); return; }
+
+  // Step 3: T3 → T4 via LLM clustering (expensive — only if mechanical didn't suffice)
+  const t3 = await tier3TokensFor(store);
+  if (t3 >= TIER_3_BUDGET) {
+    log?.(`compact: tier3=${t3} >= ${TIER_3_BUDGET}; invoking LLM cluster`);
+    await llmClusterTier3({ store, adapter, model, log });
+    total = await totalContextTokens(store);
+    log?.(`compact: after LLM cluster total=${total}`);
+  }
+  if (total <= LOW) { log?.(`compact: done after T3→T4 (total=${total})`); return; }
+
+  // Step 4: T4 → archive (mechanical)
+  while (total > LOW) {
+    const tier4 = (await store.listTasks({ tier: 4 }))
+      .filter((x) => !x.archived)
+      .sort((a, b) => (a.ended ?? a.started ?? 0) - (b.ended ?? b.started ?? 0));
+    if (!tier4.length) break;
+    const oldest = tier4[0];
+    const removed = estTokens(oldest.summary);
+    await store.archiveTask(oldest.id);
+    total -= removed;
+  }
+  log?.(`compact: done (total=${total}, target=${LOW})`);
 }
 
 // ── Stream-aware turn (prose forwarding) ───────────────────────────────────
@@ -1749,12 +1942,13 @@ async function runTurnStreaming(adapter, opts, onText) {
 async function dispatchTaskOp(c, store) {
   const a = c.args;
   if (c.verb === 'next-task') {
+    // user-request and summary describe the task being CLOSED (the current one),
+    // not the new one being opened. See system prompt.
     const t = await store.transitionTo({
       summary: a.summary ?? '',
-      title: a.title ?? 'untitled',
-      goal: a.goal ?? '',
+      userRequest: a['user-request'] ?? '',
     });
-    return { ok: true, content: `opened new task ${t.id}: "${t.title}"  goal: ${t.goal || '(none)'}` };
+    return { ok: true, content: `closed previous task with summary "${a.summary ?? ''}"; opened new task ${t.id}` };
   }
   if (c.verb === 'list-tasks') {
     const list = await store.listTasks({ parentId: a.parent });
@@ -1762,8 +1956,9 @@ async function dispatchTaskOp(c, store) {
     const lines = list.map((t) => {
       const status = t.ended ? 'done' : 'open';
       const tier = `tier${t.tier}`;
+      const ur = t.userRequest ? ` ↳ ${t.userRequest.split('\n')[0].slice(0, 100)}` : '';
       const summary = t.summary ? ` — ${t.summary.split('\n')[0].slice(0, 120)}` : '';
-      return `${t.id}  [${status}]  [${tier}]  ${t.title}${summary}`;
+      return `${t.id}  [${status}]  [${tier}]${ur}${summary}`;
     });
     return { ok: true, content: lines.join('\n') };
   }
@@ -1775,7 +1970,11 @@ async function dispatchTaskOp(c, store) {
   if (c.verb === 'search-tasks') {
     const hits = await store.searchTasks(a.query ?? '');
     if (!hits.length) return { ok: true, content: '(no matches)' };
-    const lines = hits.map((t) => `${t.id}  ${t.title}  — ${(t.summary ?? '').split('\n')[0].slice(0, 140)}`);
+    const lines = hits.map((t) => {
+      const ur = t.userRequest ? ` ↳ ${t.userRequest.split('\n')[0].slice(0, 100)}` : '';
+      const sm = (t.summary ?? '').split('\n')[0].slice(0, 140);
+      return `${t.id}${ur} — ${sm}`;
+    });
     return { ok: true, content: lines.join('\n') };
   }
   return { ok: false, content: `unknown task op: ${c.verb}` };
@@ -1788,11 +1987,31 @@ async function runPromptedAgent({
   model,
   projectDir,         // required: where .agent/tasks/ lives
   maxTurns = DEFAULT_MAX_TURNS,
+  // Legacy callbacks (used by /api/chat SSE response):
   onText, onToolCalls, onToolResult, onLog,
+  // New chat-event callback (used by /api/message + chat state on server):
+  //   onChatEvent({ type, taskId, ...payload })
+  // emitted for: 'user-message', 'assistant-text', 'tool-call', 'tool-result',
+  //              'diff', 'task-end'.
+  onChatEvent,
+  // New phase callback:
+  //   onPhase('idle' | 'uploading' | 'thinking' | 'downloading')
+  onPhase,
+  // Abort signal — checked between turns and when waiting on the model.
+  signal,
 }) {
   if (!projectDir) throw new Error('projectDir required for task-scoped agent');
 
   const log = (m) => { try { onLog?.(m); } catch {} };
+  const emitChat = (ev) => { try { onChatEvent?.(ev); } catch (e) { log(`onChatEvent error: ${e.message}`); } };
+  const emitPhase = (p) => { try { onPhase?.(p); } catch {} };
+  const checkAbort = () => {
+    if (signal?.aborted) {
+      const e = new Error('aborted');
+      e.name = 'AbortError';
+      throw e;
+    }
+  };
 
   // Initialize tasks store; this either loads existing state or creates a root task.
   const store = createTasksStore(projectDir);
@@ -1807,6 +2026,7 @@ async function runPromptedAgent({
       role: 'user',
       content: userText,
     });
+    emitChat({ type: 'user-message', taskId: store.currentId(), content: userText });
   }
 
   const stats = { turns: 0, toolCalls: 0, toolHistogram: {}, batches: [], loopBreaks: 0, taskOps: 0 };
@@ -1824,8 +2044,7 @@ async function runPromptedAgent({
 
     const sys = buildSystemPrompt({
       taskId: cur?.id ?? '?',
-      taskTitle: cur?.title ?? 'session',
-      taskGoal: cur?.goal ?? '',
+      taskUserRequest: cur?.userRequest ?? '',
       tier1Tokens: t1Tokens,
       tier1Pct,
     });
@@ -1849,36 +2068,62 @@ async function runPromptedAgent({
 
     log(`turn ${turn}: ${convo.length} msgs · current=${cur?.id} · t1=${t1Tokens}/${TIER_1_BUDGET}`);
 
+    checkAbort();
+    emitPhase('uploading');
     const t0 = Date.now();
+    emitPhase('thinking');
     const text = await runTurnStreaming(
       adapter,
       { model, messages: convo, stop: ['</remote-workspace>'] },
-      onText,
+      (delta) => { onText?.(delta); emitPhase('downloading'); },
     );
+    emitPhase('thinking');
+    checkAbort();
     const calls = parseToolCalls(text);
     log(`turn ${turn}: ${text.length} chars in ${Date.now() - t0}ms, ${calls.length} call(s)`);
 
     if (calls.length === 0) {
-      // Final answer reached. Record assistant prose to current task.
-      if (text.trim()) {
-        await store.appendMessage({ kind: 'assistant', role: 'assistant', content: text });
+      // Final answer reached. Truncate any hallucinated continuation, then
+      // store. (Final answers shouldn't contain <remote-workspace> blocks
+      // anyway, but the truncate is a no-op in that case.)
+      const finalText = truncateAtFirstBlock(text);
+      if (finalText.trim()) {
+        await store.appendMessage({ kind: 'assistant', role: 'assistant', content: finalText });
+        emitChat({ type: 'assistant-text', taskId: cur?.id, content: finalText });
       }
       // Always check budgets before returning — even on the final turn — so
       // long sessions stay within bounds.
-      await maybeDemote(store);
+      await maybeCompact({ store, adapter, model, log });
       log(`done: ${stats.turns} turns, ${stats.toolCalls} tool calls, ${stats.taskOps} task ops`);
-      return { content: text, stats, terminated: 'stop', store };
+      return { content: finalText, stats, terminated: 'stop', store };
     }
     stats.batches.push(calls.length);
 
-    // Record the assistant message exactly as the model emitted it (so the
-    // model sees its own prior reasoning when we reconstruct the convo).
-    const assistantText = /<\/remote-workspace>/i.test(text) ? text : `${text}\n</remote-workspace>`;
+    // Store ONLY the first real block. Hallucinated continuation past the
+    // close tag is discarded so the model can't "remember" imagined turns
+    // on the next loop iteration.
+    const assistantText = truncateAtFirstBlock(text);
     await store.appendMessage({ kind: 'assistant', role: 'assistant', content: assistantText });
+    // Emit the prose portion (before the <remote-workspace> block) as a chat event.
+    const blockIdx = assistantText.search(/<remote-workspace>/i);
+    const proseOnly = (blockIdx === -1 ? assistantText : assistantText.slice(0, blockIdx)).trim();
+    if (proseOnly) {
+      emitChat({ type: 'assistant-text', taskId: cur?.id, content: proseOnly });
+    }
 
     const results = [];
     for (const c of calls) {
+      checkAbort();
       if (onToolCalls) onToolCalls([c]);
+      // Emit tool-call chat event
+      emitChat({
+        type: 'tool-call',
+        taskId: cur?.id,
+        callId: c.id,
+        verb: c.verb,
+        name: c.name ?? c.verb,
+        args: c.args,
+      });
 
       // Loop detection — useful for read tools that the model gets stuck on
       const key = c.verb + '|' + JSON.stringify(c.args);
@@ -1895,6 +2140,15 @@ async function runPromptedAgent({
         resultContent = r.content;
         resultStatus = r.ok ? 'ok' : 'error';
         log(`  ${c.verb}(${JSON.stringify(c.args)}) -> ${resultStatus}`);
+        // If this was a <next-task>, emit a task-end event for the (just-closed) prior task.
+        if (c.verb === 'next-task' && r.ok) {
+          emitChat({
+            type: 'task-end',
+            taskId: cur?.id,                      // the task that just closed
+            userRequest: c.args['user-request'] ?? '',
+            summary: c.args.summary ?? '',
+          });
+        }
       } else {
         stats.toolCalls++;
         stats.toolHistogram[c.name] = (stats.toolHistogram[c.name] ?? 0) + 1;
@@ -1913,6 +2167,24 @@ async function runPromptedAgent({
         onToolResult({
           verb: c.verb, name: c.name ?? c.verb, args: c.args,
           status: resultStatus, content: resultContent,
+          diff: resultDiff,
+        });
+      }
+      // Emit tool-result chat event
+      emitChat({
+        type: 'tool-result',
+        taskId: cur?.id,
+        callId: c.id,
+        verb: c.verb,
+        name: c.name ?? c.verb,
+        status: resultStatus,
+        content: resultContent.slice(0, 8000),
+      });
+      if (resultDiff) {
+        emitChat({
+          type: 'diff',
+          taskId: cur?.id,
+          callId: c.id,
           diff: resultDiff,
         });
       }
@@ -1936,8 +2208,9 @@ async function runPromptedAgent({
     // what we stored, but the store already has them per-message; the LLM input
     // is rebuilt fresh next turn from the store anyway).
 
-    // Demote if any tier is over budget.
-    await maybeDemote(store);
+    // Compact if total context is over budget. Cheap mechanical demotions
+    // first; LLM clustering only if tier 3 still over after that.
+    await maybeCompact({ store, adapter, model, log });
   }
 
   log(`done: max turns (${maxTurns}) reached without converging`);
@@ -2022,15 +2295,136 @@ const SUMMARIZE = {
 
 async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, adapter: providedAdapter, modelsList, initialProject = null }) {
   const session = {
+    // Static config
     startedAt: new Date().toISOString(),
     baseURL: baseURL ?? '(dev)',
     defaultModel,
     apiKeyPrefix: (apiKey || '').slice(0, 8) + (apiKey ? '…' : '(empty)'),
-    events: [],
-    totalTokens: 0,
     startMs: Date.now(),
     activeProject: null,
     recent: await loadRecentProjects(),
+
+    // Legacy transaction log (kept for /api/snapshot debugging)
+    events: [],
+    totalTokens: 0,
+
+    // ── Chat state (Phase 1 of server-as-source-of-truth refactor) ──
+    // Monotonic counter — every state change bumps it; browsers detect gaps.
+    version: 0,
+    // chatEvents: the ordered list the UI renders. Each: { id, appendedAtVersion, taskId, type, ...payload }
+    chatEvents: [],
+    nextEventId: 1,
+    // Lifecycle
+    status: 'idle',           // 'idle' | 'running' | 'done' | 'error'
+    phase: 'idle',            // 'idle' | 'uploading' | 'thinking' | 'downloading'
+    error: null,
+    // Token counters maintained server-side (browser used to do this)
+    chatTokens: { up: 0, down: 0 },
+    // Server-enforced timeout for the current chat (settable per /api/extend-timeout)
+    chatTimeoutMs: 30 * 60 * 1000,
+    chatStartedAt: null,
+    // Abort signal for the running agent loop (null when idle)
+    abortController: null,
+    // SSE subscribers (Phase 2 will populate; Set of res objects)
+    streamSubscribers: new Set(),
+  };
+
+  // Bumps version, returns the new value. Used by all chat-state setters.
+  function bumpVersion() { session.version += 1; return session.version; }
+
+  // Rough token estimate (~4 chars/token) for tracking input/output sizes.
+  function estimateTokens(s) { return Math.ceil((s ?? '').length / 4); }
+
+  // ── Chat-state mutators ─────────────────────────────────────────────────
+  // Each mutator updates state, bumps version, and (in Phase 2) broadcasts
+  // a delta to all SSE subscribers. For now the broadcast is a no-op stub.
+  function broadcast(message) {
+    // Phase 2 will fill this in. message: { type, version, ...payload }
+    for (const res of session.streamSubscribers) {
+      try { res.write(`data: ${JSON.stringify(message)}\n\n`); }
+      catch { /* dead subscriber; will be cleaned on next iteration */ }
+    }
+  }
+  function setStatus(status) {
+    if (session.status === status) return;
+    session.status = status;
+    broadcast({ type: 'status', version: bumpVersion(), status });
+  }
+  function setPhase(phase) {
+    if (session.phase === phase) return;
+    session.phase = phase;
+    broadcast({ type: 'phase', version: bumpVersion(), phase });
+  }
+  function setError(err) {
+    session.error = err == null ? null : (err.message || String(err));
+    broadcast({ type: 'error', version: bumpVersion(), error: session.error });
+  }
+  function setTimeout_(ms) {
+    session.chatTimeoutMs = Number(ms) || session.chatTimeoutMs;
+    broadcast({ type: 'timeout', version: bumpVersion(), timeoutMs: session.chatTimeoutMs });
+  }
+  function updateTokens(delta) {
+    if (delta.up) session.chatTokens.up += delta.up;
+    if (delta.down) session.chatTokens.down += delta.down;
+    broadcast({ type: 'tokens', version: bumpVersion(), tokens: { ...session.chatTokens } });
+  }
+  function resetTokens() {
+    session.chatTokens = { up: 0, down: 0 };
+    broadcast({ type: 'tokens', version: bumpVersion(), tokens: { ...session.chatTokens } });
+  }
+  // Append a new chat event. Assigns id + appendedAtVersion. Returns the event.
+  function appendChatEvent(event) {
+    const id = `e${session.nextEventId++}`;
+    const ev = { id, appendedAtVersion: session.version + 1, ...event };
+    session.chatEvents.push(ev);
+    broadcast({ type: 'event', version: bumpVersion(), event: ev });
+    return ev;
+  }
+  // Patch an existing event in place (e.g., to mute tool result on tier 1→2 demotion).
+  function patchChatEvent(eventId, patch) {
+    const ev = session.chatEvents.find((e) => e.id === eventId);
+    if (!ev) return null;
+    Object.assign(ev, patch);
+    broadcast({ type: 'event-patch', version: bumpVersion(), eventId, patch });
+    return ev;
+  }
+  // Replace entire chat state (used by /api/reset).
+  function resetChatState() {
+    session.chatEvents = [];
+    session.nextEventId = 1;
+    session.status = 'idle';
+    session.phase = 'idle';
+    session.error = null;
+    session.chatTokens = { up: 0, down: 0 };
+    session.chatStartedAt = null;
+    session.abortController = null;
+    broadcast({ type: 'reset', version: bumpVersion() });
+  }
+  // Snapshot of chat state for /api/state.
+  function chatStateSnapshot({ eventLimit } = {}) {
+    const events = eventLimit && eventLimit < session.chatEvents.length
+      ? session.chatEvents.slice(-eventLimit)
+      : session.chatEvents;
+    return {
+      version: session.version,
+      status: session.status,
+      phase: session.phase,
+      tokens: { ...session.chatTokens },
+      timeoutMs: session.chatTimeoutMs,
+      chatStartedAt: session.chatStartedAt,
+      error: session.error,
+      activeProject: session.activeProject,
+      defaultModel: session.defaultModel,
+      recent: session.recent,
+      events,
+      hasMoreOlder: !!(eventLimit && eventLimit < session.chatEvents.length),
+    };
+  }
+  // Expose helpers so we can use them from /api/chat and from new endpoints later.
+  const chatState = {
+    bumpVersion, broadcast, setStatus, setPhase, setError, setTimeout: setTimeout_,
+    updateTokens, resetTokens, appendChatEvent, patchChatEvent,
+    resetChatState, chatStateSnapshot,
   };
 
   // Append-only project log at <project>/.agent/code-boss.log. Synchronous
@@ -2121,7 +2515,9 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
       if (req.method === 'GET' && path === '/api/health') {
         return sendJson(res, 200, { ok: true });
       }
-      if (req.method === 'GET' && path === '/api/state') {
+      if (req.method === 'GET' && path === '/api/project-state') {
+        // Legacy endpoint kept for the existing browser project picker.
+        // New code should use /api/state.
         return sendJson(res, 200, { activeProject: session.activeProject, recent: session.recent });
       }
       if (req.method === 'POST' && path === '/api/pick-folder') {
@@ -2185,10 +2581,151 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
         });
       }
       if (req.method === 'POST' && path === '/api/reset') {
+        if (session.status === 'running') {
+          return sendJson(res, 409, { error: 'chat is running; cancel first' });
+        }
         session.events = [];
         session.totalTokens = 0;
         session.startMs = Date.now();
-        return sendJson(res, 200, { ok: true });
+        chatState.resetChatState();
+        return sendJson(res, 200, { ok: true, version: session.version });
+      }
+
+      // ── New chat-state endpoints ───────────────────────────────────────
+      if (req.method === 'GET' && path === '/api/state') {
+        const limit = Number(url.searchParams.get('limit')) || 100;
+        return sendJson(res, 200, chatState.chatStateSnapshot({ eventLimit: limit }));
+      }
+      if (req.method === 'GET' && path === '/api/events') {
+        const beforeId = url.searchParams.get('before');
+        const limit = Math.min(Number(url.searchParams.get('limit')) || 50, 500);
+        let endIdx = session.chatEvents.length;
+        if (beforeId) {
+          const idx = session.chatEvents.findIndex((e) => e.id === beforeId);
+          if (idx > 0) endIdx = idx;
+          else if (idx === 0) endIdx = 0;
+        }
+        const startIdx = Math.max(0, endIdx - limit);
+        const slice = session.chatEvents.slice(startIdx, endIdx);
+        return sendJson(res, 200, {
+          events: slice,
+          hasMoreOlder: startIdx > 0,
+          version: session.version,
+        });
+      }
+      if (req.method === 'GET' && path === '/api/stream') {
+        // SSE subscriber — pushes session state deltas as they happen.
+        // Browser opens this once per page load; auto-reconnects on drop.
+        res.writeHead(200, {
+          'content-type': 'text/event-stream',
+          'cache-control': 'no-cache, no-store',
+          'connection': 'keep-alive',
+        });
+        // Send full state once on connect so the browser has a starting point.
+        const initial = chatState.chatStateSnapshot({ eventLimit: 100 });
+        res.write(`data: ${JSON.stringify({ type: 'init', version: session.version, session: initial })}\n\n`);
+        // Subscribe to broadcasts.
+        session.streamSubscribers.add(res);
+        // Heartbeat every 25s so proxies don't close the connection.
+        const heartbeat = setInterval(() => {
+          try { res.write(`: heartbeat\n\n`); } catch {}
+        }, 25000);
+        req.on('close', () => {
+          clearInterval(heartbeat);
+          session.streamSubscribers.delete(res);
+        });
+        return;
+      }
+      if (req.method === 'POST' && path === '/api/message') {
+        // Accept user text, kick off agent in background, return immediately.
+        const raw = await readBody(req);
+        let body; try { body = JSON.parse(raw); } catch { return sendJson(res, 400, { error: 'invalid JSON' }); }
+        const text = (body?.text ?? '').toString();
+        if (!text.trim()) return sendJson(res, 400, { error: 'text is required' });
+        if (!session.activeProject) return sendJson(res, 400, { error: 'no project open' });
+        if (session.status === 'running') return sendJson(res, 409, { error: 'chat is already running' });
+
+        // Lock in running state BEFORE we return, so a fast second call sees the lock.
+        session.chatStartedAt = Date.now();
+        session.abortController = new AbortController();
+        chatState.setStatus('running');
+        chatState.setPhase('uploading');
+        chatState.setError(null);
+        chatState.resetTokens();
+        chatState.updateTokens({ up: estimateTokens(text) });
+
+        const signal = session.abortController.signal;
+        const model = body?.model ?? session.defaultModel;
+        const startedAt = Date.now();
+
+        // Server-side timeout: auto-abort if it runs past chatTimeoutMs.
+        const timeoutId = setTimeout(() => {
+          if (session.abortController) {
+            try { session.abortController.abort(); } catch {}
+            chatState.setError(`timed out after ${Math.round(session.chatTimeoutMs / 1000)}s`);
+          }
+        }, session.chatTimeoutMs);
+
+        // Fire-and-forget: run the agent loop async, return 200 now.
+        (async () => {
+          const prevCwd = process.cwd();
+          let cwdChanged = false;
+          try {
+            try { process.chdir(session.activeProject); cwdChanged = true; }
+            catch (e) { throw new Error('cannot enter project directory: ' + e.message); }
+            fileLog(`chat: model=${model} q="${text.slice(0, 200).replace(/\s+/g, ' ')}"`);
+            const result = await runPromptedAgent({
+              adapter,
+              messages: [{ role: 'user', content: text }],
+              model,
+              projectDir: session.activeProject,
+              maxTurns: 20,
+              signal,
+              onChatEvent: (ev) => chatState.appendChatEvent(ev),
+              onPhase: (p) => chatState.setPhase(p),
+              onLog: (msg) => fileLog(msg),
+            });
+            fileLog(`chat done: terminated=${result.terminated} turns=${result.stats.turns} calls=${result.stats.toolCalls}`);
+            logEvent('agent_run', {
+              turns: result.stats.turns,
+              toolCalls: result.stats.toolCalls,
+              batches: result.stats.batches,
+              terminated: result.terminated,
+            });
+            chatState.setStatus('done');
+          } catch (e) {
+            const aborted = e?.name === 'AbortError' || /aborted/i.test(e?.message ?? '');
+            chatState.setError(aborted ? (session.error || 'aborted') : e.message);
+            chatState.setStatus('error');
+            fileLog(`chat ${aborted ? 'aborted' : 'ERROR'}: ${e.message}`);
+            logEvent('error', { message: e.message });
+          } finally {
+            clearTimeout(timeoutId);
+            session.abortController = null;
+            session.chatStartedAt = null;
+            chatState.setPhase('idle');
+            if (cwdChanged) try { process.chdir(prevCwd); } catch {}
+          }
+        })().catch(() => { /* errors handled inside */ });
+
+        return sendJson(res, 200, { ok: true, version: session.version });
+      }
+      if (req.method === 'POST' && path === '/api/cancel') {
+        if (session.abortController) {
+          try { session.abortController.abort(); } catch {}
+          return sendJson(res, 200, { ok: true, version: session.version });
+        }
+        return sendJson(res, 200, { ok: true, version: session.version, note: 'no chat in progress' });
+      }
+      if (req.method === 'POST' && path === '/api/extend-timeout') {
+        const raw = await readBody(req);
+        let body; try { body = JSON.parse(raw); } catch { return sendJson(res, 400, { error: 'invalid JSON' }); }
+        const ms = Number(body?.ms);
+        if (!ms || ms < 60000 || ms > 6 * 3600 * 1000) {
+          return sendJson(res, 400, { error: 'ms must be 60000..21600000' });
+        }
+        chatState.setTimeout(ms);
+        return sendJson(res, 200, { ok: true, version: session.version, timeoutMs: ms });
       }
       if (req.method === 'POST' && path === '/api/chat') {
         const raw = await readBody(req);
@@ -2267,7 +2804,11 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
               else if (name === 'glob' || v === 'find') summary = content.startsWith('(no matches') ? 'No files' : `${nonEmptyLines} files`;
               else if (name === 'write_file' || v === 'write') summary = content.replace(/^wrote\s+/, '');
               else if (name === 'edit_file' || v === 'edit') summary = content.replace(/^edited\s+/, '');
-              else if (v === 'next-task') summary = content.replace(/^opened new task\s+/, '');
+              else if (name === 'powershell' || v === 'powershell') {
+                const m = content.match(/^exit (\S+)\s+in\s+(\d+ms)/);
+                summary = m ? `exit ${m[1]} in ${m[2]}` : `${content.length} bytes`;
+              }
+              else if (v === 'next-task') summary = content.replace(/^closed previous task.*?opened new task /, '→ ');
               else if (v === 'list-tasks') summary = `${nonEmptyLines} tasks`;
               else if (v === 'task-detail') summary = 'task detail';
               else if (v === 'search-tasks') summary = `${nonEmptyLines} matches`;
@@ -2633,6 +3174,72 @@ const UI_HTML = `<!DOCTYPE html>
   .diff-block .dl.hunk { color: var(--muted); }
   .diff-block .dl.same { color: var(--muted); }
 
+  /* ── Task wraps (Phase 5) ───────────────────────────────────────────────
+     Reserve a fixed-width gutter on the left for ALL chat content. The
+     gutter is empty when an event is outside any wrap; when inside a closed
+     task or a project rollup, vertical line(s) fill the gutter.
+     Crucially: message content x-position is CONSTANT regardless of nesting. */
+  .log {
+    /* Constant left padding reserves gutter space for up to 2 lines (~12px). */
+    padding-left: 16px;
+  }
+  .task-wrap {
+    position: relative;
+    margin: 12px 0;
+  }
+  .task-wrap .task-head,
+  .task-wrap .task-foot {
+    /* Headers/footers extend full width INCLUDING the gutter columns. */
+    color: var(--muted);
+    font-size: 12px;
+    margin-left: -12px;       /* span into the gutter */
+    padding: 2px 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .task-wrap .task-head { color: var(--accent); }
+  .task-wrap .task-head .ur { color: var(--fg); font-weight: normal; margin-left: 6px; }
+  .task-wrap .task-foot::before { content: '└─ '; color: var(--muted); }
+  .task-wrap .task-head .toggle {
+    cursor: pointer;
+    user-select: none;
+    margin-right: 4px;
+  }
+  /* Gutter line — sits in the reserved gutter space, between header and footer. */
+  .task-wrap::before {
+    content: '';
+    position: absolute;
+    left: -8px;              /* into the .log padding-left area */
+    top: 22px;
+    bottom: 22px;
+    width: 1px;
+    background: var(--muted);
+    opacity: 0.5;
+  }
+  /* Project (tier-4) wrap: a second gutter line at a slightly different x. */
+  .task-wrap.project::before { left: -10px; }
+  .task-wrap.project::after {
+    content: '';
+    position: absolute;
+    left: -6px;
+    top: 22px;
+    bottom: 22px;
+    width: 1px;
+    background: var(--muted);
+    opacity: 0.5;
+  }
+  /* Collapsed: hide everything inside but the header (which carries the summary). */
+  .task-wrap.collapsed .task-body,
+  .task-wrap.collapsed .task-foot { display: none; }
+  .task-wrap.collapsed::before,
+  .task-wrap.collapsed::after { display: none; }
+
+  /* Mute: applied to content the LLM no longer sees (results masked at tier 2,
+     whole task at tier 3, whole project's children at tier 4). */
+  .muted, .muted * { opacity: 0.42; }
+  .muted:hover, .muted:hover * { opacity: 0.85; }
+
   /* Welcome box (rounded terminal banner). */
   .welcome {
     border: 1px solid var(--accent);
@@ -2852,6 +3459,7 @@ const UI_HTML = `<!DOCTYPE html>
     <select id="model" title="Model"></select>
     <div class="grow"></div>
     <div class="chip" id="tokenChip" title="Total tokens this session">0 tokens</div>
+    <div class="chip" id="timeoutChip" title="Click to change agent timeout" onclick="changeTimeout()" style="cursor:pointer">⏱ 30m</div>
     <button class="btn" onclick="openLog()" title="View the project log (.agent/code-boss.log)">Log</button>
     <button class="btn" onclick="openSnapshot()">Snapshot</button>
     <button class="btn" onclick="resetSession()">Reset</button>
@@ -2900,8 +3508,12 @@ const UI_HTML = `<!DOCTYPE html>
   const $modalBody = document.getElementById('modalBody');
 
   const SERVER = window.SERVER_CONFIG || {};
-  let conversation = [];
-  let totalTokens = 0;
+  // Server-as-source-of-truth state mirror. Local UI state is kept minimal.
+  let session = null;             // { version, status, phase, tokens, timeoutMs, events, ... }
+  let expectedNextVersion = 0;
+  let chatStartedAtLocal = null;  // for elapsed-time display
+  let conversation = [];          // legacy — still used by /api/chat path. New flow ignores.
+  let totalTokens = 0;            // legacy
   let activeProject = null;
 
   // ---- Inline status row (spinner + verb + timer + tokens) ----
@@ -3031,7 +3643,7 @@ const UI_HTML = `<!DOCTYPE html>
 
   async function loadState() {
     try {
-      const r = await fetch('/api/state');
+      const r = await fetch('/api/project-state');
       const s = await r.json();
       if (s.activeProject) {
         showChat(s.activeProject);
@@ -3121,7 +3733,7 @@ const UI_HTML = `<!DOCTYPE html>
   async function changeProject() {
     if (!confirm('Switch projects? This will clear the current chat.')) return;
     try { await fetch('/api/close-project', { method: 'POST' }); } catch {}
-    const r = await fetch('/api/state');
+    const r = await fetch('/api/project-state');
     const s = await r.json();
     showLanding(s.recent ?? []);
   }
@@ -3276,110 +3888,31 @@ const UI_HTML = `<!DOCTYPE html>
     scrollToBottom();
   }
 
+  // Send a user message. Server pushes back the user-message event via SSE,
+  // then drives the agent and emits all subsequent events. Browser is a view.
   async function send() {
     const text = $input.value.trim();
     if (!text) return;
     $input.value = '';
-    $input.disabled = true;
-    $send.disabled = true;
-
-    addBubble('user', text);
-    conversation.push({ role: 'user', content: text });
-
-    let proseBody = null;        // current streaming prose row's body
-    let proseText = '';          // accumulated text for the current prose row
-    let anyOutput = false;
-
-    // Reset counters for a fresh send; animate ↑ from 0 to estimated total.
-    upTokens = 0; downTokens = 0;
-    const estUp = 1600 + conversation.reduce((s, m) => s + estimateTokens(m.content), 0);
-    setUploading(estUp, 700);
-
-    currentAbort = new AbortController();
     try {
-      const res = await fetch('/api/chat', {
+      const r = await fetch('/api/message', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ model: $model.value, messages: conversation }),
-        signal: currentAbort.signal,
+        body: JSON.stringify({ text, model: $model.value }),
       });
-      if (!res.ok) {
-        const body = await res.text();
-        throw new Error('HTTP ' + res.status + ' — ' + body.slice(0, 400));
+      if (!r.ok) {
+        const body = await r.text();
+        throw new Error('HTTP ' + r.status + ' — ' + body.slice(0, 400));
       }
-      const reader = res.body.getReader();
-      const dec = new TextDecoder();
-      let buf = '';
-      let finalText = '';
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += dec.decode(value, { stream: true });
-        let idx;
-        while ((idx = buf.indexOf('\\n')) !== -1) {
-          const line = buf.slice(0, idx).replace(/\\r$/, '');
-          buf = buf.slice(idx + 1);
-          if (!line.startsWith('data:')) continue;
-          const data = line.slice(5).trim();
-          if (data === '[DONE]') continue;
-          let chunk;
-          try { chunk = JSON.parse(data); } catch { continue; }
-
-          if (chunk._cb) {
-            // Structured UI event: tool call or result.
-            proseBody = null; proseText = '';
-            if (chunk._cb.t === 'tool') {
-              anyOutput = true;
-              setThinking();   // model finished a turn; tool is executing locally
-              addRow('tool', chunk._cb.name + '(' + chunk._cb.args + ')');
-            } else if (chunk._cb.t === 'result') {
-              const grow = estimateTokens(chunk._cb.full || chunk._cb.summary);
-              setUploading(upTokens + grow, 300);  // animate ↑ growing by result size
-              addResultRow(chunk._cb);
-            } else if (chunk._cb.t === 'diff') {
-              addDiffBlock(chunk._cb);
-            }
-            continue;
-          }
-          const d = chunk.choices?.[0]?.delta ?? {};
-          if (d.content) {
-            anyOutput = true;
-            // First byte or wake from stall — back to actively downloading.
-            if (phase !== PHASE.DOWNLOADING) setDownloading();
-            lastDeltaTime = Date.now();
-            if (statusRow) statusRow.classList.remove('thinking');
-            if (!proseBody) { proseBody = addRow('assistant', ''); proseText = ''; }
-            proseText += d.content;
-            finalText = proseText;
-            proseBody.innerHTML = renderInline(proseText);
-            downTokens += estimateTokens(d.content);
-            pinStatusToBottom();
-            scrollToBottom();
-          }
-          if (chunk.usage) {
-            totalTokens += chunk.usage.total_tokens ?? 0;
-            $tokenChip.textContent = totalTokens.toLocaleString() + ' tokens';
-            if (chunk.usage.total_tokens) downTokens = Math.max(downTokens, chunk.usage.completion_tokens ?? downTokens);
-          }
-          if (chunk.error) throw new Error(chunk.error.message ?? JSON.stringify(chunk.error));
-        }
-      }
-      if (!anyOutput) addRow('assistant', '(no output)');
-      conversation.push({ role: 'assistant', content: finalText });
     } catch (e) {
-      if (e.name === 'AbortError') {
-        addBubble('system', 'Interrupted.');
-      } else {
-        conversation.pop();
-        showError('Chat request failed', e);
-      }
-    } finally {
-      setDone();  // persist status with final ↓ count
-      currentAbort = null;
-      $input.disabled = false;
-      $send.disabled = false;
-      $input.focus();
+      $input.value = text;   // restore the input so the user can retry
+      showError('Send failed', e);
     }
+  }
+
+  async function cancelChat() {
+    try { await fetch('/api/cancel', { method: 'POST' }); }
+    catch (e) { showError('Cancel failed', e); }
   }
 
   // Minimal inline rendering: \`code\` spans only (keep it terminal-plain).
@@ -3521,27 +4054,347 @@ const UI_HTML = `<!DOCTYPE html>
 
   async function resetSession() {
     if (!confirm('Clear the chat and reset the snapshot log?')) return;
-    conversation = [];
-    totalTokens = 0;
-    $tokenChip.textContent = '0 tokens';
-    $log.innerHTML = '<div class="bubble system">Session reset.</div>';
-    try { await fetch('/api/reset', { method: 'POST' }); } catch {}
+    try {
+      const r = await fetch('/api/reset', { method: 'POST' });
+      if (!r.ok && r.status === 409) {
+        alert('Cannot reset while agent is running. Cancel first.');
+        return;
+      }
+    } catch (e) { showError('Reset failed', e); }
+    // The server will broadcast a 'reset' delta that clears our render.
+  }
+
+  // ── SSE stream — pushes every server-side state change here ──
+  // Browser is a view: we mirror session, render from session.events.
+  let _es = null;
+  function connectStream() {
+    if (_es) { try { _es.close(); } catch {} _es = null; }
+    _es = new EventSource('/api/stream');
+    _es.onmessage = (e) => {
+      let msg;
+      try { msg = JSON.parse(e.data); } catch { return; }
+      if (msg.type === 'init') {
+        onInit(msg.session);
+        expectedNextVersion = msg.session.version + 1;
+        return;
+      }
+      // Gap detection
+      if (typeof msg.version !== 'number') return;
+      if (msg.version === expectedNextVersion) {
+        applyDelta(msg);
+        expectedNextVersion = msg.version + 1;
+      } else if (msg.version > expectedNextVersion) {
+        // Missed some — refetch full state
+        console.warn(\`SSE gap: expected v\${expectedNextVersion}, got v\${msg.version} — refetching\`);
+        try { _es.close(); } catch {}
+        _es = null;
+        refetchAndReconnect();
+      }
+      // else: stale, ignore
+    };
+    _es.onerror = () => {
+      // EventSource auto-reconnects on its own; we don't need to do anything.
+    };
+  }
+  async function refetchAndReconnect() {
+    try {
+      const r = await fetch('/api/state');
+      const s = await r.json();
+      onInit(s);
+      expectedNextVersion = s.version + 1;
+      connectStream();
+    } catch (e) {
+      console.error('refetch failed:', e);
+      // Retry in a few seconds
+      setTimeout(refetchAndReconnect, 2000);
+    }
+  }
+
+  // Spinner tick — runs only while a chat is in progress so the spinner glyph
+  // animates and the elapsed timer counts up.
+  let _spinTick = null;
+  function startSpinTick() {
+    if (_spinTick) return;
+    chatStartedAtLocal = chatStartedAtLocal || Date.now();
+    _spinTick = setInterval(renderStatus, 100);
+  }
+  function stopSpinTick() {
+    if (_spinTick) { clearInterval(_spinTick); _spinTick = null; }
+    renderStatus();
+  }
+
+  function onInit(s) {
+    session = s;
+    window.__sessionRef = s;     // for tests; mirror the live session object
+    activeProject = s.activeProject;
+    if (!activeProject) {
+      showLanding(s.recent || []);
+      stopSpinTick();
+      return;
+    }
+    showChat(activeProject);
+    // Replace the welcome content with the actual events
+    clearLog();
+    for (const ev of (s.events || [])) renderEvent(ev);
+    applyControlsForStatus();
+    renderTimeoutChip();
+    if (s.status === 'running') {
+      chatStartedAtLocal = s.chatStartedAt || Date.now();
+      startSpinTick();
+    } else {
+      stopSpinTick();
+    }
+    renderStatus();
+  }
+
+  function applyDelta(msg) {
+    if (!session) return;
+    session.version = msg.version;
+    switch (msg.type) {
+      case 'event':
+        session.events.push(msg.event);
+        renderEvent(msg.event);
+        break;
+      case 'event-patch': {
+        const ev = session.events.find((e) => e.id === msg.eventId);
+        if (ev) {
+          Object.assign(ev, msg.patch);
+          // Simple Phase 4 strategy: re-render all events (Phase 5 will be smarter)
+          clearLog();
+          for (const e2 of session.events) renderEvent(e2);
+        }
+        break;
+      }
+      case 'status':
+        session.status = msg.status;
+        applyControlsForStatus();
+        if (msg.status === 'running') {
+          chatStartedAtLocal = Date.now();
+          startSpinTick();
+        } else {
+          stopSpinTick();
+        }
+        renderStatus();
+        break;
+      case 'phase':
+        session.phase = msg.phase;
+        renderStatus();
+        break;
+      case 'tokens':
+        session.tokens = msg.tokens;
+        $tokenChip.textContent = ((msg.tokens.up || 0) + (msg.tokens.down || 0)).toLocaleString() + ' tokens';
+        renderStatus();
+        break;
+      case 'error':
+        session.error = msg.error;
+        if (msg.error) showError('Agent error', new Error(msg.error));
+        break;
+      case 'timeout':
+        session.timeoutMs = msg.timeoutMs;
+        renderTimeoutChip();
+        break;
+      case 'reset':
+        session.events = [];
+        clearLog();
+        break;
+    }
+  }
+
+  function clearLog() {
+    $log.innerHTML = '';
+    statusRow = null;
+  }
+
+  function renderEvent(ev) {
+    if (!ev || !ev.type) return;
+
+    // task-end is special: it wraps prior events instead of appending a row.
+    if (ev.type === 'task-end') {
+      wrapTaskRetroactively(ev);
+      return;
+    }
+
+    let node = null;
+    switch (ev.type) {
+      case 'user-message': node = addBubble('user', ev.content || ''); break;
+      case 'assistant-text': {
+        const body = addRow('assistant', '');
+        body.innerHTML = renderInline(ev.content || '');
+        node = body.parentElement;     // the .row
+        break;
+      }
+      case 'tool-call': {
+        const argStr = Object.entries(ev.args || {})
+          .filter(([k]) => k !== 'content')
+          .map(([k, v]) => \`\${k}=\${String(v).slice(0, 60)}\`)
+          .join(', ');
+        const body = addRow('tool', \`\${ev.verb || ev.name}(\${argStr})\`);
+        node = body.parentElement;
+        break;
+      }
+      case 'tool-result': {
+        addResultRow({
+          status: ev.status,
+          summary: summarizeResult(ev),
+          full: ev.content || '',
+        });
+        node = $log.lastElementChild;
+        break;
+      }
+      case 'diff':
+        addDiffBlock({ diff: ev.diff || '', summary: ev.summary || '' });
+        node = $log.lastElementChild;
+        break;
+    }
+
+    // Tag the rendered node with its task id so task-end can wrap it later.
+    if (node && ev.taskId) node.dataset.taskId = ev.taskId;
+  }
+
+  // When <next-task> closes a task, wrap all the just-rendered rows that belong
+  // to that task in a .task-wrap with a header (user-request) and footer (summary).
+  // The events stay at the same horizontal position; the wrap adds decoration only.
+  function wrapTaskRetroactively(ev) {
+    const taskId = ev.taskId;
+    if (!taskId) return;
+    // Find all rows for this task that are NOT already inside a wrap.
+    const rows = Array.from($log.querySelectorAll(\`[data-task-id="\${taskId}"]\`))
+      .filter((r) => !r.closest('.task-wrap'));
+    if (rows.length === 0) {
+      // No body rows (e.g., task with no user message and no tool calls). Still
+      // render a small footer-only marker so the user sees the boundary.
+      const marker = document.createElement('div');
+      marker.className = 'task-foot';
+      marker.style.color = 'var(--muted)';
+      marker.style.fontSize = '12px';
+      marker.textContent = \`└─ \${taskId}\` + (ev.userRequest ? \`  ↳ \${ev.userRequest}\` : '') + (ev.summary ? \`  — \${ev.summary}\` : '');
+      $log.appendChild(marker);
+      scrollToBottom();
+      return;
+    }
+    const wrap = document.createElement('div');
+    wrap.className = 'task-wrap';
+    wrap.dataset.taskId = taskId;
+
+    // Header
+    const head = document.createElement('div');
+    head.className = 'task-head';
+    const toggle = document.createElement('span');
+    toggle.className = 'toggle';
+    toggle.textContent = '▼';
+    toggle.onclick = () => {
+      const collapsed = wrap.classList.toggle('collapsed');
+      toggle.textContent = collapsed ? '▶' : '▼';
+    };
+    head.appendChild(toggle);
+    head.appendChild(document.createTextNode(\`┌ \${taskId}\`));
+    if (ev.userRequest) {
+      const ur = document.createElement('span');
+      ur.className = 'ur';
+      ur.textContent = \`  ↳ \${ev.userRequest}\`;
+      head.appendChild(ur);
+    }
+    wrap.appendChild(head);
+
+    // Body container (events are moved here, preserving original order)
+    const body = document.createElement('div');
+    body.className = 'task-body';
+    wrap.appendChild(body);
+
+    // Insert wrap at the position of the first row
+    const firstRow = rows[0];
+    $log.insertBefore(wrap, firstRow);
+    // Move rows into the body
+    for (const r of rows) body.appendChild(r);
+
+    // Footer
+    const foot = document.createElement('div');
+    foot.className = 'task-foot';
+    foot.textContent = ev.summary || '(no summary)';
+    wrap.appendChild(foot);
+
+    scrollToBottom();
+  }
+
+  function summarizeResult(ev) {
+    const c = ev.content || '';
+    const nonEmpty = c.split('\\n').filter((l) => l.trim()).length;
+    const v = ev.verb || ev.name;
+    if (ev.status === 'error') return c.split('\\n')[0].slice(0, 140);
+    if (v === 'list' || ev.name === 'list_dir') return \`\${nonEmpty} entries\`;
+    if (v === 'read' || ev.name === 'read_file') return \`Read \${c.split('\\n').length} lines\`;
+    if (v === 'search' || ev.name === 'grep') return c.startsWith('(no matches') ? 'No matches' : \`\${nonEmpty} matching lines\`;
+    if (v === 'find' || ev.name === 'glob') return c.startsWith('(no matches') ? 'No files' : \`\${nonEmpty} files\`;
+    if (v === 'write' || ev.name === 'write_file') return c.replace(/^wrote\\s+/, '');
+    if (v === 'edit' || ev.name === 'edit_file') return c.replace(/^edited\\s+/, '');
+    if (v === 'powershell' || ev.name === 'powershell') {
+      const m = c.match(/^exit (\\S+)\\s+in\\s+(\\d+ms)/);
+      return m ? \`exit \${m[1]} in \${m[2]}\` : \`\${c.length} bytes\`;
+    }
+    if (v === 'next-task') return c.replace(/^closed previous task.*?opened new task /, '→ ');
+    if (v === 'list-tasks') return \`\${nonEmpty} tasks\`;
+    if (v === 'task-detail') return 'task detail';
+    if (v === 'search-tasks') return \`\${nonEmpty} matches\`;
+    return \`\${c.length} bytes\`;
+  }
+
+  function applyControlsForStatus() {
+    const running = session?.status === 'running';
+    $input.disabled = running;
+    $send.disabled = running;
+    $send.textContent = running ? 'Cancel' : 'Send';
+    $send.onclick = running ? cancelChat : send;
+    if (!running) {
+      try { $input.focus(); } catch {}
+    }
+  }
+
+  function renderTimeoutChip() {
+    const $c = document.getElementById('timeoutChip');
+    if (!$c || !session) return;
+    const mins = Math.round((session.timeoutMs || 0) / 60000);
+    $c.textContent = \`⏱ \${mins}m\`;
+    $c.title = 'Click to change agent timeout (per chat)';
+  }
+
+  async function changeTimeout() {
+    if (!session) return;
+    const cur = Math.round((session.timeoutMs || 1800000) / 60000);
+    const raw = prompt(\`Set agent timeout in minutes (current: \${cur})\`, String(cur));
+    if (!raw) return;
+    const mins = Number(raw);
+    if (!Number.isFinite(mins) || mins < 1 || mins > 360) {
+      alert('Enter a number between 1 and 360 (minutes).');
+      return;
+    }
+    try {
+      await fetch('/api/extend-timeout', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ ms: Math.round(mins * 60 * 1000) }),
+      });
+    } catch (e) { showError('Update timeout failed', e); }
   }
 
   $input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
-      send();
+      if (!$send.disabled || $send.textContent === 'Cancel') {
+        // do nothing while running — Enter shouldn't fire cancel by accident
+        if (!$input.disabled) send();
+      }
     }
   });
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
       if ($modalBg.classList.contains('show')) { closeModal(); return; }
-      if (currentAbort) { currentAbort.abort(); }  // esc to interrupt
+      if (session?.status === 'running') cancelChat();
     }
   });
 
+  // Initial load
   loadState();
+  connectStream();
 </script>
 </body>
 </html>
