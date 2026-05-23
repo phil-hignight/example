@@ -363,6 +363,502 @@ function createHttpAdapter(opts = {}) {
   return { complete, completeStream, listModels };
 }
 
+// ====== agent/diff.mjs ======
+/**
+ * Small unified-diff helper. Zero deps.
+ *
+ * Why custom: we only need a readable line-by-line diff for the chat UI; we
+ * don't want to add a package. The implementation is a Myers-style LCS with
+ * the diff serialized as { type: 'same'|'add'|'del', line: '...' } entries.
+ *
+ * Public API:
+ *   diffLines(a, b)            -> [{type, line}, ...]
+ *   renderUnifiedDiff(a, b, opts)  -> string in unified-diff style
+ *   shortDiffSummary(a, b)     -> "+12 / -3"
+ */
+
+/** Compute LCS table for two arrays. O(n*m) time and memory; fine for files up to a few thousand lines. */
+function lcsTable(a, b) {
+  const n = a.length, m = b.length;
+  const dp = Array.from({ length: n + 1 }, () => new Uint32Array(m + 1));
+  for (let i = 1; i <= n; i++) {
+    for (let j = 1; j <= m; j++) {
+      dp[i][j] = a[i - 1] === b[j - 1] ? dp[i - 1][j - 1] + 1 : Math.max(dp[i - 1][j], dp[i][j - 1]);
+    }
+  }
+  return dp;
+}
+
+/**
+ * Walk back through the LCS table to build the diff sequence.
+ * Returns entries in original (top-to-bottom) order.
+ */
+function diffLines(oldText, newText) {
+  const a = (oldText ?? '').split('\n');
+  const b = (newText ?? '').split('\n');
+  const dp = lcsTable(a, b);
+  const out = [];
+  let i = a.length, j = b.length;
+  while (i > 0 && j > 0) {
+    if (a[i - 1] === b[j - 1]) { out.push({ type: 'same', line: a[i - 1] }); i--; j--; }
+    else if (dp[i - 1][j] >= dp[i][j - 1]) { out.push({ type: 'del', line: a[i - 1] }); i--; }
+    else { out.push({ type: 'add', line: b[j - 1] }); j--; }
+  }
+  while (i > 0) { out.push({ type: 'del', line: a[i - 1] }); i--; }
+  while (j > 0) { out.push({ type: 'add', line: b[j - 1] }); j--; }
+  out.reverse();
+  return out;
+}
+
+/**
+ * Render a unified-diff-like string. Context is the number of unchanged lines
+ * to keep around each hunk. Default 2.
+ */
+function renderUnifiedDiff(oldText, newText, { context = 2, pathLabel = 'file' } = {}) {
+  const diff = diffLines(oldText, newText);
+  // Find hunk ranges (contiguous regions of changes, padded by `context`).
+  const lines = [];
+  lines.push(`--- ${pathLabel}`);
+  lines.push(`+++ ${pathLabel}`);
+  let i = 0;
+  while (i < diff.length) {
+    if (diff[i].type === 'same') { i++; continue; }
+    let start = Math.max(0, i - context);
+    let end = i;
+    while (end < diff.length) {
+      if (diff[end].type !== 'same') { end++; continue; }
+      // is this a long run of 'same'?
+      let runLen = 0;
+      while (end + runLen < diff.length && diff[end + runLen].type === 'same') runLen++;
+      if (runLen > context * 2) { end += context; break; }
+      end += runLen;
+    }
+    end = Math.min(diff.length, end);
+    let oldStart = 0, newStart = 0;
+    for (let k = 0; k < start; k++) {
+      if (diff[k].type !== 'add') oldStart++;
+      if (diff[k].type !== 'del') newStart++;
+    }
+    let oldCount = 0, newCount = 0;
+    for (let k = start; k < end; k++) {
+      if (diff[k].type !== 'add') oldCount++;
+      if (diff[k].type !== 'del') newCount++;
+    }
+    lines.push(`@@ -${oldStart + 1},${oldCount} +${newStart + 1},${newCount} @@`);
+    for (let k = start; k < end; k++) {
+      const e = diff[k];
+      if (e.type === 'same') lines.push(' ' + e.line);
+      else if (e.type === 'add') lines.push('+' + e.line);
+      else lines.push('-' + e.line);
+    }
+    i = end;
+  }
+  return lines.join('\n');
+}
+
+function shortDiffSummary(oldText, newText) {
+  const diff = diffLines(oldText, newText);
+  let add = 0, del = 0;
+  for (const d of diff) { if (d.type === 'add') add++; else if (d.type === 'del') del++; }
+  return `+${add} / -${del}`;
+}
+
+// ====== agent/tasks.mjs ======
+/**
+ * Task-scoped memory store.
+ *
+ * A "task" is a coherent unit of work the agent is doing. The agent is ALWAYS
+ * inside exactly one task; it transitions between tasks with <next-task>.
+ *
+ * Tiers (most-fidelity to least):
+ *   1  current + recent finished tasks, full messages incl. tool results
+ *   2  finished tasks, messages visible but tool RESULTS replaced by a
+ *      one-line placeholder (e.g. "[T-3 op=read pom.xml -> 240 lines]")
+ *   3  finished tasks, replaced entirely by a one-paragraph summary
+ *   4  parent task = single summary covering a group of tier-3 children
+ *
+ * Demotion runs lazily when a tier exceeds budget (with hysteresis).
+ *
+ * Storage layout (per project):
+ *   <project>/.agent/tasks/
+ *     state.json                  { nextId, currentId, rootId, allTaskIds: [...] }
+ *     T-1.json                    full task record (see TaskRecord shape below)
+ *     T-2.json
+ *
+ * TaskRecord:
+ *   {
+ *     id:         "T-3",
+ *     title:      "Refactor auth middleware",
+ *     goal:       "Move session tokens to encrypted storage",
+ *     parentId:   "T-1" | null,
+ *     childIds:   ["T-4", "T-5"],
+ *     started:    1717180000000,    epoch ms
+ *     ended:      1717180550000 | null,
+ *     tier:       1 | 2 | 3 | 4,
+ *     summary:    "..." | null,     written when task closes
+ *     messages:   [TaskMessage],    discarded once task reaches tier 3
+ *   }
+ *
+ * TaskMessage (one entry per LLM-loop event in this task):
+ *   {
+ *     kind:   "assistant" | "tool-call" | "tool-result",
+ *     role:   "assistant" | "user",        // the OpenAI-protocol role
+ *     content:    string,                  // raw text
+ *     toolName:   string | undefined,      // for tool-call / tool-result
+ *     toolArgs:   object | undefined,      // for tool-call
+ *     toolStatus: "ok" | "error" | undefined,  // for tool-result
+ *     bytes:      number,                  // size of content for budget calc
+ *   }
+ */
+
+const STATE_FILE = 'state.json';
+const TASK_FILE = (id) => `${id}.json`;
+
+function nowMs() { return Date.now(); }
+function tokensOf(s) { return Math.ceil((s || '').length / 4); }
+
+function createTasksStore(projectDir) {
+  if (!projectDir) throw new Error('projectDir required');
+  const dir = path.join(projectDir, '.agent', 'tasks');
+
+  let state = null;            // { nextId, currentId, rootId, allTaskIds: [] }
+  const cache = new Map();     // id -> TaskRecord (lazy)
+
+  async function ensureDir() { await mkdir(dir, { recursive: true }); }
+
+  async function loadState() {
+    try {
+      const raw = await readFile(path.join(dir, STATE_FILE), 'utf8');
+      return JSON.parse(raw);
+    } catch { return null; }
+  }
+  async function saveState() {
+    await ensureDir();
+    await writeFile(path.join(dir, STATE_FILE), JSON.stringify(state, null, 2), 'utf8');
+  }
+
+  async function loadTask(id) {
+    if (cache.has(id)) return cache.get(id);
+    try {
+      const raw = await readFile(path.join(dir, TASK_FILE(id)), 'utf8');
+      const t = JSON.parse(raw);
+      cache.set(id, t);
+      return t;
+    } catch { return null; }
+  }
+  async function saveTask(t) {
+    await ensureDir();
+    cache.set(t.id, t);
+    await writeFile(path.join(dir, TASK_FILE(t.id)), JSON.stringify(t, null, 2), 'utf8');
+  }
+
+  function newId() {
+    const id = `T-${state.nextId}`;
+    state.nextId++;
+    return id;
+  }
+
+  /**
+   * Initialize the store. If no state exists, creates a root task and makes it current.
+   * Returns the initial state object.
+   */
+  async function init({ rootTitle = 'session', rootGoal = 'project session' } = {}) {
+    await ensureDir();
+    state = await loadState();
+    if (!state) {
+      state = { nextId: 1, currentId: null, rootId: null, allTaskIds: [] };
+      const rootId = newId();
+      const root = {
+        id: rootId,
+        title: rootTitle,
+        goal: rootGoal,
+        parentId: null,
+        childIds: [],
+        started: nowMs(),
+        ended: null,
+        tier: 1,
+        summary: null,
+        messages: [],
+      };
+      await saveTask(root);
+      state.currentId = rootId;
+      state.rootId = rootId;
+      state.allTaskIds.push(rootId);
+      await saveState();
+    }
+    return state;
+  }
+
+  function currentId() { return state?.currentId ?? null; }
+  function rootId() { return state?.rootId ?? null; }
+  async function getCurrent() { return loadTask(currentId()); }
+
+  /**
+   * Close the current task with a summary and open a new sibling task that
+   * becomes current. Returns the new task record.
+   */
+  async function transitionTo({ summary, title, goal }) {
+    if (!state?.currentId) throw new Error('store not initialized');
+    const cur = await loadTask(state.currentId);
+    cur.summary = summary ?? cur.summary ?? '(no summary provided)';
+    cur.ended = nowMs();
+    await saveTask(cur);
+
+    // If `cur` IS the root, the new task becomes a child of root.
+    // Otherwise the new task is a sibling of `cur` (same parent).
+    const realParentId = cur.id === state.rootId ? state.rootId : (cur.parentId ?? state.rootId);
+
+    const id = newId();
+    const t = {
+      id,
+      title: title ?? 'untitled',
+      goal: goal ?? '',
+      parentId: realParentId,
+      childIds: [],
+      started: nowMs(),
+      ended: null,
+      tier: 1,
+      summary: null,
+      messages: [],
+    };
+    await saveTask(t);
+
+    // Link as child of parent.
+    if (realParentId) {
+      const parent = await loadTask(realParentId);
+      if (parent) {
+        parent.childIds = [...(parent.childIds ?? []), id];
+        await saveTask(parent);
+      }
+    }
+
+    state.currentId = id;
+    state.allTaskIds.push(id);
+    await saveState();
+    return t;
+  }
+
+  /**
+   * Append a message (assistant text, tool-call, or tool-result) to the
+   * current task.
+   */
+  async function appendMessage(msg) {
+    const id = state.currentId;
+    const t = await loadTask(id);
+    if (!t) throw new Error(`current task ${id} not found`);
+    const content = msg.content ?? '';
+    t.messages = t.messages ?? [];
+    t.messages.push({
+      kind: msg.kind,
+      role: msg.role,
+      content,
+      toolName: msg.toolName,
+      toolArgs: msg.toolArgs,
+      toolStatus: msg.toolStatus,
+      bytes: content.length,
+    });
+    await saveTask(t);
+    return t;
+  }
+
+  /**
+   * List tasks. If parentId is given, only its direct children. If tier is
+   * given, only tasks at that tier. By default archived tasks are excluded;
+   * pass includeArchived: true to include them (e.g., for search).
+   * Returns lightweight records (no messages).
+   */
+  async function listTasks({ parentId = undefined, tier = undefined, includeArchived = false } = {}) {
+    const out = [];
+    for (const id of state.allTaskIds) {
+      const t = await loadTask(id);
+      if (!t) continue;
+      if (!includeArchived && t.archived) continue;
+      if (parentId !== undefined && t.parentId !== parentId) continue;
+      if (tier !== undefined && t.tier !== tier) continue;
+      out.push({
+        id: t.id, title: t.title, goal: t.goal, parentId: t.parentId,
+        childIds: t.childIds, started: t.started, ended: t.ended,
+        tier: t.tier, summary: t.summary,
+        rolledUpInto: t.rolledUpInto ?? null,
+        archived: !!t.archived,
+      });
+    }
+    return out;
+  }
+
+  async function getDetail(id) {
+    const t = await loadTask(id);
+    if (!t) return null;
+    return {
+      id: t.id, title: t.title, goal: t.goal, parentId: t.parentId,
+      childIds: t.childIds, started: t.started, ended: t.ended,
+      tier: t.tier, summary: t.summary,
+      messageCount: (t.messages ?? []).length,
+    };
+  }
+
+  /** Case-insensitive substring search across title/goal/summary. */
+  async function searchTasks(query) {
+    if (!query) return listTasks();
+    const q = query.toLowerCase();
+    const hits = [];
+    for (const id of state.allTaskIds) {
+      const t = await loadTask(id);
+      if (!t) continue;
+      const hay = [t.title, t.goal, t.summary].filter(Boolean).join(' ').toLowerCase();
+      if (hay.includes(q)) {
+        hits.push({ id: t.id, title: t.title, goal: t.goal, parentId: t.parentId, started: t.started, ended: t.ended, tier: t.tier, summary: t.summary });
+      }
+    }
+    return hits;
+  }
+
+  /**
+   * Mechanical demotion: mark task as tier 2 and replace tool-result message
+   * bodies with one-line placeholders. NO LLM call.
+   */
+  async function demoteToTier2(id) {
+    const t = await loadTask(id);
+    if (!t) return null;
+    if (t.tier >= 2) return t;
+    for (const m of t.messages ?? []) {
+      if (m.kind === 'tool-result') {
+        const lines = (m.content ?? '').split('\n').length;
+        const argSummary = m.toolName ? `${m.toolName}` : 'tool';
+        m.content = `[${t.id} ${argSummary} -> ${lines} lines, masked]`;
+        m.bytes = m.content.length;
+      }
+    }
+    t.tier = 2;
+    await saveTask(t);
+    return t;
+  }
+
+  /**
+   * Summary demotion: replace messages with a one-paragraph summary. Caller
+   * provides the summary text (we don't run the LLM here; agent loop owns
+   * that concern).
+   */
+  async function demoteToTier3(id, summaryText) {
+    const t = await loadTask(id);
+    if (!t) return null;
+    if (t.tier >= 3) return t;
+    t.messages = [];
+    t.summary = summaryText || t.summary || '(no summary written)';
+    t.tier = 3;
+    await saveTask(t);
+    return t;
+  }
+
+  /**
+   * Find the oldest (by `ended` then `started`) task in a given tier that is
+   * eligible for demotion. Excludes: current task, archived tasks, and
+   * (for tier 3) tasks already rolled up into a tier-4 rollup. Returns id or null.
+   */
+  async function findOldestDemotionCandidate(tier) {
+    const tasks = await listTasks({ tier });
+    const eligible = tasks.filter((t) => {
+      if (t.id === state.currentId) return false;
+      if (t.archived) return false;
+      if (t.rolledUpInto) return false;
+      if ((tier === 1 || tier === 2) && t.ended == null) return false;
+      return true;
+    });
+    eligible.sort((a, b) => (a.ended ?? a.started ?? 0) - (b.ended ?? b.started ?? 0));
+    return eligible[0]?.id ?? null;
+  }
+
+  /**
+   * Roll up N tier-3 tasks into a single synthetic tier-4 task with a
+   * mechanically-concatenated summary. The children get `rolledUpInto` set
+   * so they're skipped in convo building (still searchable via the search tool).
+   */
+  async function rollupTier3Tasks(childIds) {
+    if (!Array.isArray(childIds) || childIds.length === 0) return null;
+    const children = [];
+    for (const cid of childIds) {
+      const c = await loadTask(cid);
+      if (c && c.tier === 3 && !c.rolledUpInto && !c.archived) children.push(c);
+    }
+    if (children.length === 0) return null;
+
+    const lines = [`Rollup of ${children.length} task(s):`];
+    for (const c of children) {
+      const firstLine = (c.summary ?? '').split('\n')[0].slice(0, 200);
+      lines.push(`- ${c.id} "${c.title}": ${firstLine}`);
+    }
+    const summary = lines.join('\n');
+
+    const id = newId();
+    const t = {
+      id,
+      title: `Rollup of ${children.length} tasks`,
+      goal: '',
+      parentId: children[0].parentId ?? null,
+      childIds: children.map((c) => c.id),
+      started: children[0].started,
+      ended: nowMs(),
+      tier: 4,
+      summary,
+      messages: [],
+    };
+    await saveTask(t);
+    state.allTaskIds.push(id);
+    await saveState();
+
+    for (const c of children) {
+      c.rolledUpInto = id;
+      await saveTask(c);
+    }
+    return t;
+  }
+
+  /** Mark a task (typically a tier-4 rollup) as archived. Stays searchable but
+   *  no longer included in convo construction. */
+  async function archiveTask(id) {
+    const t = await loadTask(id);
+    if (!t) return null;
+    t.archived = true;
+    await saveTask(t);
+    return t;
+  }
+
+  /** Compute token usage per tier from current task records. Excludes
+   *  archived and rolled-up tasks (they're not in context). */
+  async function tierTokens() {
+    const out = { 1: 0, 2: 0, 3: 0, 4: 0 };
+    for (const id of state.allTaskIds) {
+      const t = await loadTask(id);
+      if (!t) continue;
+      if (t.archived) continue;
+      if (t.rolledUpInto) continue;
+      if (t.tier === 3 || t.tier === 4) {
+        out[t.tier] += tokensOf(t.summary);
+      } else {
+        let sum = 0;
+        for (const m of t.messages ?? []) sum += tokensOf(m.content);
+        out[t.tier] += sum;
+      }
+    }
+    return out;
+  }
+
+  return {
+    init,
+    currentId, rootId,
+    getCurrent,
+    transitionTo,
+    appendMessage,
+    listTasks, getDetail, searchTasks,
+    demoteToTier2, demoteToTier3,
+    rollupTier3Tasks, archiveTask,
+    findOldestDemotionCandidate,
+    tierTokens,
+    _state: () => state,                     // for tests
+    _dir: () => dir,
+  };
+}
+
 // ====== agent/tools.mjs ======
 /**
  * Initial agent tools — read-only. Pure Node, no deps.
@@ -390,6 +886,11 @@ const TEXT_EXTS = new Set([
 const MAX_RESULT_BYTES = 2 * 1024 * 1024; // 2 MB
 const MAX_GREP_MATCHES = 2000;
 const MAX_GLOB_RESULTS = 5000;
+
+// Bash defaults — match Claude Code's tunables loosely.
+const BASH_DEFAULT_TIMEOUT_MS = 120000;     // 2 min
+const BASH_MAX_TIMEOUT_MS = 600000;         // 10 min
+const BASH_MAX_OUTPUT_CHARS = 30000;        // truncate stdout/stderr beyond this
 
 class TooLargeError extends Error {
   constructor(actualBytes) {
@@ -611,6 +1112,146 @@ const tools = {
     },
   },
 
+  write_file: {
+    schema: {
+      description: 'Write a UTF-8 text file. Creates parent directories as needed. Overwrites if the file already exists. Returns a unified diff vs. the prior content (or "(new file)" if none).',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Absolute or project-relative file path.' },
+          content: { type: 'string', description: 'Full file content (UTF-8).' },
+        },
+        required: ['path', 'content'],
+        additionalProperties: false,
+      },
+    },
+    impl: async ({ path: p, content }) => {
+      if (typeof p !== 'string' || !p) throw new Error('path is required');
+      if (typeof content !== 'string') throw new Error('content is required');
+      const abs = path.isAbsolute(p) ? p : path.join(process.cwd(), p);
+      let oldText = '';
+      let existed = false;
+      try { oldText = await readFile(abs, 'utf8'); existed = true; } catch {}
+      await mkdir(path.dirname(abs), { recursive: true });
+      await writeFile(abs, content, 'utf8');
+      const rel = relForDisplay(abs);
+      const summary = existed ? shortDiffSummary(oldText, content) : `(new file, ${content.split('\n').length} lines)`;
+      const diff = existed
+        ? renderUnifiedDiff(oldText, content, { pathLabel: rel, context: 2 })
+        : ['--- (new file)', `+++ ${rel}`, `@@ -0,0 +1,${content.split('\n').length} @@`, ...content.split('\n').map((l) => '+' + l)].join('\n');
+      return {
+        content: `wrote ${rel}  ${summary}`,
+        diff,
+        path: rel,
+      };
+    },
+  },
+
+  edit_file: {
+    schema: {
+      description: 'Surgical edit: replace one occurrence of an exact string in a file. Fails if the string is not found OR if it occurs more than once (ambiguous). Returns a unified diff.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Absolute or project-relative file path.' },
+          find: { type: 'string', description: 'Exact string to find. Must occur exactly once in the file.' },
+          replace: { type: 'string', description: 'Replacement string.' },
+        },
+        required: ['path', 'find', 'replace'],
+        additionalProperties: false,
+      },
+    },
+    impl: async ({ path: p, find, replace }) => {
+      if (typeof p !== 'string' || !p) throw new Error('path is required');
+      if (typeof find !== 'string') throw new Error('find is required');
+      if (typeof replace !== 'string') throw new Error('replace is required');
+      const abs = path.isAbsolute(p) ? p : path.join(process.cwd(), p);
+      const oldText = await readFile(abs, 'utf8');
+      const first = oldText.indexOf(find);
+      if (first === -1) throw new Error(`find string not found in ${relForDisplay(abs)}`);
+      const second = oldText.indexOf(find, first + 1);
+      if (second !== -1) throw new Error(`find string occurs more than once in ${relForDisplay(abs)} — make it more specific`);
+      const newText = oldText.slice(0, first) + replace + oldText.slice(first + find.length);
+      await writeFile(abs, newText, 'utf8');
+      const rel = relForDisplay(abs);
+      return {
+        content: `edited ${rel}  ${shortDiffSummary(oldText, newText)}`,
+        diff: renderUnifiedDiff(oldText, newText, { pathLabel: rel, context: 2 }),
+        path: rel,
+      };
+    },
+  },
+
+  bash: {
+    schema: {
+      description: 'Run a shell command in the project root. Stdout, stderr, and exit code are returned. Use this for builds (mvn compile, npm test), git (git status, git diff), and any other shell operation. The agent runs as the same user as the server.',
+      parameters: {
+        type: 'object',
+        properties: {
+          command: { type: 'string', description: 'Shell command to run. Pipes and redirects supported (executed via shell).' },
+          timeout_ms: { type: 'integer', description: `Timeout in milliseconds. Default ${BASH_DEFAULT_TIMEOUT_MS} (2 min), max ${BASH_MAX_TIMEOUT_MS} (10 min).` },
+        },
+        required: ['command'],
+        additionalProperties: false,
+      },
+    },
+    impl: async ({ command, timeout_ms }) => {
+      if (typeof command !== 'string' || !command.trim()) throw new Error('command is required');
+      const timeout = Math.min(Math.max(1000, Number(timeout_ms) || BASH_DEFAULT_TIMEOUT_MS), BASH_MAX_TIMEOUT_MS);
+
+      const t0 = Date.now();
+      return await new Promise((resolve) => {
+        let stdout = '', stderr = '', timedOut = false, settled = false;
+        // shell:true lets the system shell handle quoting natively. Without
+        // it, Node's argv-escaping (especially on Windows) mangles inner
+        // quotes — `node -e "process.exit(7)"` becomes unparseable.
+        const child = spawn(command, {
+          cwd: process.cwd(),
+          windowsHide: true,
+          env: process.env,
+          shell: true,
+        });
+        const timer = setTimeout(() => {
+          timedOut = true;
+          // On Windows, child.kill() only kills the shell wrapper, not the
+          // actual command (e.g. node.exe under cmd.exe). taskkill /T kills
+          // the whole process tree.
+          if (process.platform === 'win32' && child.pid) {
+            try { spawn('taskkill', ['/F', '/T', '/PID', String(child.pid)], { windowsHide: true }); } catch {}
+          } else {
+            try { child.kill('SIGKILL'); } catch {}
+          }
+        }, timeout);
+
+        child.stdout.on('data', (d) => { if (stdout.length < BASH_MAX_OUTPUT_CHARS * 2) stdout += d.toString('utf8'); });
+        child.stderr.on('data', (d) => { if (stderr.length < BASH_MAX_OUTPUT_CHARS * 2) stderr += d.toString('utf8'); });
+        child.on('error', (err) => {
+          if (settled) return; settled = true;
+          clearTimeout(timer);
+          resolve(`ERROR: failed to spawn shell: ${err.message}`);
+        });
+        child.on('close', (code, signal) => {
+          if (settled) return; settled = true;
+          clearTimeout(timer);
+          const elapsed = Date.now() - t0;
+          const outTrunc = stdout.length > BASH_MAX_OUTPUT_CHARS;
+          const errTrunc = stderr.length > BASH_MAX_OUTPUT_CHARS;
+          const outBody = outTrunc ? (stdout.slice(0, BASH_MAX_OUTPUT_CHARS) + `\n[...${stdout.length - BASH_MAX_OUTPUT_CHARS} more chars truncated]`) : stdout;
+          const errBody = errTrunc ? (stderr.slice(0, BASH_MAX_OUTPUT_CHARS) + `\n[...${stderr.length - BASH_MAX_OUTPUT_CHARS} more chars truncated]`) : stderr;
+          const header = timedOut
+            ? `command timed out after ${timeout}ms (killed)`
+            : `exit ${code ?? '?'}${signal ? ` (signal ${signal})` : ''} in ${elapsed}ms`;
+          const text = [
+            header,
+            outBody ? `--- stdout ---\n${outBody}` : '(no stdout)',
+            errBody ? `--- stderr ---\n${errBody}` : '',
+          ].filter(Boolean).join('\n').trim();
+          resolve(text);
+        });
+      });
+    },
+  },
+
   list_dir: {
     schema: {
       description: 'List entries in a directory. Returns each entry as "[D] name/" or "[F] name (<bytes> bytes)".',
@@ -651,92 +1292,168 @@ const toolDefs = Object.entries(tools).map(([name, t]) => ({
   function: { name, description: t.schema.description, parameters: t.schema.parameters },
 }));
 
+/**
+ * Execute a tool by name. Result shape:
+ *   - string                            -> the content string (legacy / read tools)
+ *   - { content, diff?, path?, ... }    -> structured result (write tools)
+ *   - "ERROR: ..." string               -> on failure
+ *
+ * Callers can normalize via `extractContent(result)` and `extractDiff(result)`.
+ */
 async function execute(name, args) {
   const t = tools[name];
   if (!t) return `ERROR: unknown tool "${name}". Available: ${Object.keys(tools).join(', ')}`;
   try {
     const result = await t.impl(args ?? {});
-    return typeof result === 'string' ? result : JSON.stringify(result);
+    return result;  // may be string or object; callers handle both
   } catch (e) {
     return `ERROR: ${e.message}`;
   }
 }
 
+function extractContent(r) {
+  if (typeof r === 'string') return r;
+  if (r && typeof r === 'object' && typeof r.content === 'string') return r.content;
+  return String(r ?? '');
+}
+function extractDiff(r) {
+  if (r && typeof r === 'object' && typeof r.diff === 'string') return r.diff;
+  return null;
+}
+
 // ====== agent/prompted.mjs ======
 /**
- * Prompted-format file access — the "local workspace bridge".
+ * Prompted-format agent loop with task-scoped memory.
  *
- * The production endpoint (api.genai.mil) is a managed-agent platform that
- * drops the OpenAI `tools` parameter AND injects its own cloud tools/agents
- * (e.g. "Generate Document", a cloud Python sandbox). Telling the model "you
- * have no tools, use only ours" made it conflict with those built-ins and
- * freeze. So we DON'T frame our mechanism as "tools" at all.
+ * The agent is ALWAYS inside exactly one task. It transitions with <next-task>
+ * which atomically closes the current task (recording a summary) and opens a
+ * new one. Tasks live in a per-project tasks store; messages are recorded as
+ * the agent does work, and they're demoted across four tiers as budgets fill:
  *
- * Instead we present a distinct concept: a LOCAL WORKSPACE BRIDGE — a text
- * channel to the user's real machine. The model's built-in tools run in a
- * cloud environment and genuinely cannot see the user's local project, so the
- * bridge is simply the way to reach those files. Positive framing only; no
- * "NOT this / NEVER that" instructions that cause paralysis.
+ *   1  full messages (current task always lives here; recent finished tasks
+ *      too, until budget pressure forces demotion)
+ *   2  finished tasks with tool RESULTS replaced by one-line placeholders
+ *   3  finished tasks reduced to one-paragraph summaries (the summary the
+ *      agent wrote at <next-task>)
+ *   4  parent rollup (not implemented yet)
  *
- * Wire format (model -> us): a <workspace> block of verb elements with
- * attributes (a separate visual concept from `<call name="tool">`):
+ * Wire format remains the <remote-workspace> protocol: the model emits a
+ * block of verb elements; we parse, dispatch, and feed structured results
+ * back as <remote-workspace-result> blocks.
  *
- *   <workspace>
- *     <list path="."/>
- *     <read path="pom.xml" limit="100"/>
- *     <search pattern="dependency" flags="i"/>
- *   </workspace>
+ * Verbs (model -> us):
  *
- * Feedback (us -> model), a normal user message:
- *   <workspace-result op="read" status="ok">
- *   ...real contents...
- *   </workspace-result>
+ *   Read tools (self-closing):
+ *     <list path="DIR"/>                                 list a directory
+ *     <read path="FILE" offset="N" limit="N"/>           read text file
+ *     <search pattern="REGEX" path="DIR" glob="GLOB"/>   regex search
+ *     <find pattern="GLOB"/>                             find by glob
+ *     <info path="FILE"/>                                metadata (size, lines)
+ *
+ *   Write tools (body text for content; raises diff in UI):
+ *     <write path="FILE">FILE CONTENTS</write>
+ *     <edit path="FILE"><find>X</find><replace>Y</replace></edit>
+ *
+ *   Task ops (self-closing; meta-operations the agent uses to manage memory):
+ *     <next-task summary="..." title="..." goal="..."/>  close + open new task
+ *     <list-tasks parent="ID"/>                          list tasks
+ *     <task-detail id="T-3"/>                            one task's summary
+ *     <search-tasks query="TEXT"/>                       search task summaries
  */
 
-// Friendly workspace verbs -> internal tool names.
+// ── Tier budgets and thresholds ─────────────────────────────────────────────
+// All four tiers live in context. When a tier exceeds budget, the oldest
+// eligible task in that tier is demoted to the next tier. Tier 4 overflow
+// archives to disk (still searchable, not in context).
+const TIER_1_BUDGET = 12000;     // full messages (current + recent tasks)
+const TIER_2_BUDGET = 8000;      // masked-results tasks
+const TIER_3_BUDGET = 4000;      // per-task summaries
+const TIER_4_BUDGET = 2000;      // group-rollup summaries
+const TIER_3_ROLLUP_BATCH = 5;   // how many tier-3 tasks group into one tier-4 rollup
+const HYST_HIGH = 1.10;          // demote when tier exceeds 110% of budget
+const HYST_LOW  = 0.50;          // demote DEEPLY to 50% so cache invalidations are rare (cost-of-miss amortized over many turns of cache hits)
+const TASK_NUDGE = 0.75;         // soft nudge at 75% of TIER 1 budget
+const TASK_FORCE = 1.00;         // firm push at 100%
+const TOKENS_PER_CHAR = 0.25;
+
+function estTokens(s) { return Math.ceil((s ?? '').length * TOKENS_PER_CHAR); }
+
+// ── Verb maps ───────────────────────────────────────────────────────────────
 const VERB_TO_TOOL = {
   list: 'list_dir',
   read: 'read_file',
   search: 'grep',
   find: 'glob',
   info: 'file_info',
+  write: 'write_file',
+  edit: 'edit_file',
+  bash: 'bash',
 };
-const VERBS = Object.keys(VERB_TO_TOOL).join('|');
-const OP_RE = new RegExp(`<(${VERBS})\\b([^>]*)>`, 'gi');
-const ATTR_RE = /([a-zA-Z_]+)\s*=\s*"([^"]*)"/g;
+const TASK_VERBS = new Set(['next-task', 'list-tasks', 'task-detail', 'search-tasks']);
+// Sort longer first so that e.g. "list-tasks" matches before "list".
+const ALL_VERBS = [...Object.keys(VERB_TO_TOOL), ...TASK_VERBS]
+  .sort((a, b) => b.length - a.length);
+const VERB_PATTERN = ALL_VERBS.map((v) => v.replace(/-/g, '\\-')).join('|');
 
-const DEFAULT_MAX_TURNS = 15;
+// Tags inside the body (for <edit>).
+const CHILD_TAG_RE = (tag) => new RegExp(`<${tag}\\s*>([\\s\\S]*?)</${tag}>`, 'i');
+const ATTR_RE = /([a-zA-Z_][a-zA-Z0-9_-]*)\s*=\s*"([^"]*)"/g;
+
+const DEFAULT_MAX_TURNS = 20;
 const REPEAT_LIMIT = 3;
 
-function buildSystemPrompt() {
-  return [
-    'You are a coding assistant connected to a REMOTE WORKSPACE — the user\'s own computer, where the project you are helping with actually lives. The remote workspace is separate from your native workspace (your built-in cloud environment); the project exists only in the remote workspace.',
+// ── System prompt ───────────────────────────────────────────────────────────
+function buildSystemPrompt({ taskId, taskTitle, taskGoal, tier1Tokens, tier1Pct }) {
+  const lines = [
+    'You are a coding assistant connected to a REMOTE WORKSPACE — the user\'s real machine, where the project lives. The remote workspace is separate from your native cloud workspace; the project files exist only on the remote side.',
     '',
-    'Your job is to operate in the remote workspace by issuing commands to it. Each command runs on the user\'s real filesystem and returns the actual results.',
+    'You always operate INSIDE a task. The current task scopes your work. When the task is naturally complete, signal <next-task summary="..." title="..." goal="..."/> to close it and open a fresh task — this keeps context sharp and lets you (and the user) navigate work later.',
     '',
-    'To issue commands, emit a <remote-workspace> block containing one or more commands, then stop and wait for the results:',
+    `Current task: ${taskId} "${taskTitle}"  · goal: ${taskGoal}`,
+    `Task budget: ${tier1Tokens} / ${TIER_1_BUDGET} tokens used (${tier1Pct}%)` + (tier1Pct >= 95
+      ? '  ← please finish soon: emit <next-task summary="..." title="..." goal="..."/>'
+      : tier1Pct >= 75
+        ? '  ← nearing budget; consider closing this task at a natural stopping point'
+        : ''),
     '',
-    '<remote-workspace>',
-    '  <list path="."/>',
-    '  <read path="pom.xml"/>',
-    '  <search pattern="dependency"/>',
-    '</remote-workspace>',
+    'Issue commands by emitting a <remote-workspace> block. Group independent commands in one block — they run in parallel, which is faster. Then stop and wait for the results.',
     '',
-    'The remote workspace replies with <remote-workspace-result> blocks containing the real contents from the user\'s machine. Read those, then issue more commands or answer the user. Group independent commands in one block — they run in parallel, which is faster.',
+    'Read commands (self-closing):',
+    '  <list path="DIR"/>                                  list a directory',
+    '  <read path="FILE" offset="N" limit="N"/>            read a UTF-8 text file',
+    '  <search pattern="REGEX" path="DIR" glob="GLOB" flags="i"/>   regex search',
+    '  <find pattern="GLOB"/>                              find files by glob',
+    '  <info path="FILE"/>                                 file size and line count',
     '',
-    'Commands available in the remote workspace:',
-    '  <list path="DIR"/>                                  list a directory (path optional; defaults to project root)',
-    '  <read path="FILE" offset="LINE" limit="N"/>          read a UTF-8 text file (offset/limit optional)',
-    '  <search pattern="REGEX" path="DIR" glob="GLOB" flags="i"/>   regex search across files (only pattern required)',
-    '  <find pattern="GLOB"/>                               find files by glob, e.g. src/**/*.mjs',
-    '  <info path="FILE"/>                                  file size and line count (cheap; use before reading big files)',
+    'Write commands (use the body, not attributes, for file content):',
+    '  <write path="FILE">',
+    '  full file content goes here',
+    '  </write>',
     '',
-    'Base every answer on results returned from the remote workspace. If you have not read a file through the remote workspace, issue a command to read it rather than guessing its contents.',
-  ].join('\n');
+    '  <edit path="FILE">',
+    '  <find>exact string to find (must occur exactly once)</find>',
+    '  <replace>replacement string</replace>',
+    '  </edit>',
+    '',
+    'Shell execution (for builds, tests, git, etc.):',
+    '  <bash>git status</bash>                              command in body',
+    '  <bash timeout_ms="300000">mvn -q clean install</bash>   override timeout (default 2 min, max 10 min)',
+    '  Returns stdout + stderr + exit code. Use this to run builds, tests, linters, git commands, and any other shell operation. Pipes and redirects are supported.',
+    '',
+    'Task management:',
+    '  <next-task summary="what just finished" title="next task" goal="what to do next"/>   atomically close current and open new',
+    '  <list-tasks parent="T-1"/>                          list tasks (omit parent for top-level)',
+    '  <task-detail id="T-3"/>                             one task\'s summary + metadata',
+    '  <search-tasks query="auth middleware"/>             keyword search across all task summaries',
+    '',
+    'The remote workspace replies with <remote-workspace-result> blocks. Read those, then issue more commands or answer the user. Base every answer on real results; never invent file or directory names you have not seen.',
+  ];
+  return lines.join('\n');
 }
 
+// ── Parser ──────────────────────────────────────────────────────────────────
 function coerce(toolName, key, raw) {
-  const ptype = tools[toolName]?.schema?.parameters?.properties?.[key]?.type;
+  const ptype = toolName ? tools[toolName]?.schema?.parameters?.properties?.[key]?.type : 'string';
   const val = String(raw).trim();
   if (ptype === 'integer' || ptype === 'number') {
     const n = Number(val);
@@ -745,44 +1462,85 @@ function coerce(toolName, key, raw) {
   if (ptype === 'boolean') return val === 'true';
   return val;
 }
+function mkId() { return 'call_' + randomUUID().replace(/-/g, '').slice(0, 16); }
 
-function mkId() {
-  return 'call_' + randomUUID().replace(/-/g, '').slice(0, 16);
+function parseAttrs(attrStr, toolName) {
+  const out = {};
+  ATTR_RE.lastIndex = 0;
+  let m;
+  while ((m = ATTR_RE.exec(attrStr ?? '')) !== null) {
+    out[m[1]] = coerce(toolName, m[1], m[2]);
+  }
+  return out;
 }
 
+/**
+ * Parse all <remote-workspace> verb calls from a model response text.
+ * Supports both self-closing and body forms.
+ */
 function parseToolCalls(text) {
   const calls = [];
   if (typeof text !== 'string' || !text) return calls;
-  OP_RE.lastIndex = 0;
-  let m;
-  while ((m = OP_RE.exec(text)) !== null) {
+
+  // Cut at the first close tag or hallucinated result tag — only the FIRST
+  // <remote-workspace> block counts.
+  let cut = text.length;
+  for (const re of [/<\/remote-workspace>/i, /<remote-workspace-result/i, /<workspace-result/i]) {
+    const i = text.search(re);
+    if (i >= 0 && i < cut) cut = i;
+  }
+  const scan = text.slice(0, cut);
+
+  const openRe = new RegExp(`<(${VERB_PATTERN})\\b([^>]*?)(/?)>`, 'gi');
+  let pos = 0;
+  while (pos < scan.length) {
+    openRe.lastIndex = pos;
+    const m = openRe.exec(scan);
+    if (!m) break;
     const verb = m[1].toLowerCase();
-    const toolName = VERB_TO_TOOL[verb];
-    if (!toolName) continue;
     const attrStr = m[2] ?? '';
-    const args = {};
-    ATTR_RE.lastIndex = 0;
-    let a;
-    while ((a = ATTR_RE.exec(attrStr)) !== null) {
-      args[a[1]] = coerce(toolName, a[1], a[2]);
+    const selfClosing = m[3] === '/';
+    const openEnd = m.index + m[0].length;
+
+    const isTaskOp = TASK_VERBS.has(verb);
+    const toolName = isTaskOp ? null : VERB_TO_TOOL[verb];
+    const args = parseAttrs(attrStr, toolName);
+
+    let nextPos = openEnd;
+    if (!selfClosing) {
+      const closeTag = `</${verb}>`;
+      const ci = scan.indexOf(closeTag, openEnd);
+      if (ci !== -1) {
+        const body = scan.slice(openEnd, ci);
+        nextPos = ci + closeTag.length;
+        if (verb === 'write') args.content = body;
+        if (verb === 'edit') {
+          const fM = CHILD_TAG_RE('find').exec(body);
+          const rM = CHILD_TAG_RE('replace').exec(body);
+          if (fM) args.find = fM[1];
+          if (rM) args.replace = rM[1];
+        }
+        if (verb === 'bash' && body.trim()) args.command = body.trim();
+      }
     }
-    calls.push({ id: mkId(), verb, name: toolName, args });
+    pos = nextPos;
+    calls.push({
+      id: mkId(),
+      verb,
+      kind: isTaskOp ? 'task-op' : 'tool',
+      name: toolName,
+      args,
+    });
   }
   return calls;
 }
 
 function formatToolResults(results) {
-  const blocks = results.map((r) =>
-    `<remote-workspace-result op="${r.verb}" status="${r.status}">\n${r.content}\n</remote-workspace-result>`,
-  ).join('\n');
+  const blocks = results.map((r) => {
+    const head = `<remote-workspace-result op="${r.verb}" status="${r.status}"${r.extras ? ' ' + r.extras : ''}>`;
+    return `${head}\n${r.content}\n</remote-workspace-result>`;
+  }).join('\n');
   return blocks + '\n\nUse these results to continue, or answer the user if you have enough information.';
-}
-
-/** Strip the <remote-workspace> block out of assistant text so we show only prose. */
-function proseBefore(text) {
-  if (typeof text !== 'string') return '';
-  const idx = text.search(/<remote-workspace>/i);
-  return (idx === -1 ? text : text.slice(0, idx)).trim();
 }
 
 function flattenContent(content) {
@@ -794,46 +1552,173 @@ function flattenContent(content) {
   return String(content);
 }
 
-/**
- * The production endpoint frequently ignores or overrides the `system`
- * message with its own platform prompt — the model reports it knows nothing
- * about the remote workspace. So we inject the instructions into the FIRST
- * user message (wrapped in <system-reminder>), which the platform cannot
- * strip because it's the actual query. No separate system message is sent.
- */
-function injectInstructions(messages) {
-  const instructions = buildSystemPrompt();
-  const nonSystem = (messages ?? []).filter((m) => m.role !== 'system');
+// ── Convo construction from task store ─────────────────────────────────────
+async function buildConvoFromStore(store) {
   const out = [];
-  let injected = false;
-  for (const m of nonSystem) {
-    if (!injected && m.role === 'user') {
-      out.push({ role: 'user', content: `<system-reminder>\n${instructions}\n</system-reminder>\n\n${flattenContent(m.content)}` });
-      injected = true;
+  const state = store._state();
+  for (const id of state.allTaskIds) {
+    const t = await loadTaskFull(store, id);
+    if (!t) continue;
+    if (t.archived) continue;            // archived tasks are search-only
+    if (t.rolledUpInto) continue;        // children of a tier-4 rollup are covered by the rollup
+    if (t.tier === 4) {
+      out.push({
+        role: 'user',
+        content: `<task-rollup id="${t.id}" children="${(t.childIds ?? []).join(',')}">\n${t.summary || '(no summary)'}\n</task-rollup>`,
+      });
+    } else if (t.tier === 3) {
+      out.push({
+        role: 'user',
+        content: `<task-history id="${t.id}" title="${t.title.replace(/"/g, '&quot;')}" parent="${t.parentId ?? 'root'}" status="${t.ended ? 'done' : 'open'}">\n${t.summary || '(no summary)'}\n</task-history>`,
+      });
     } else {
-      out.push(m);
+      // tier 1 and 2 both emit messages; tier 2 already has results masked in storage
+      for (const m of t.messages ?? []) {
+        out.push({ role: m.role, content: m.content });
+      }
     }
-  }
-  if (!injected) {
-    out.unshift({ role: 'user', content: `<system-reminder>\n${instructions}\n</system-reminder>` });
   }
   return out;
 }
 
-// Longest opening-tag prefix we must hold back so we never stream half of
-// "<remote-workspace>" to the user before we know it's a command block.
+// Helper: re-read a full task (with messages) from disk. listTasks omits the
+// messages array; the convo builder needs it.
+async function loadTaskFull(store, id) {
+  try {
+    const raw = await readFile(path.join(store._dir(), `${id}.json`), 'utf8');
+    return JSON.parse(raw);
+  } catch { return null; }
+}
+
+// ── Tier demotion ───────────────────────────────────────────────────────────
+// Strategy: when any tier exceeds budget × HYST_HIGH, demote the oldest
+// eligible task (or rollup batch) until the tier is below budget × HYST_LOW.
+// Demoting deeply (HYST_LOW = 0.50) means rare cache invalidations amortized
+// over many cache-hit turns.
+async function tier1TokensFor(store) {
+  const state = store._state();
+  let n = 0;
+  for (const t of await store.listTasks({ tier: 1 })) {
+    if (t.id === state.currentId) continue;       // current may exceed budget
+    if (t.rolledUpInto) continue;
+    const full = await loadTaskFull(store, t.id);
+    for (const m of full?.messages ?? []) n += estTokens(m.content);
+  }
+  return n;
+}
+async function tier2TokensFor(store) {
+  let n = 0;
+  for (const t of await store.listTasks({ tier: 2 })) {
+    if (t.rolledUpInto) continue;
+    const full = await loadTaskFull(store, t.id);
+    for (const m of full?.messages ?? []) n += estTokens(m.content);
+  }
+  return n;
+}
+async function tier3TokensFor(store) {
+  let n = 0;
+  for (const t of await store.listTasks({ tier: 3 })) {
+    if (t.rolledUpInto) continue;
+    n += estTokens(t.summary);
+  }
+  return n;
+}
+async function tier4TokensFor(store) {
+  let n = 0;
+  for (const t of await store.listTasks({ tier: 4 })) {
+    n += estTokens(t.summary);
+  }
+  return n;
+}
+
+async function maybeDemote(store) {
+  // Hysteresis: trigger demotion when current > HIGH × budget, then KEEP
+  // demoting until current < LOW × budget. With HYST_LOW = 0.50, we demote
+  // deeply on every trigger, so cache invalidations are rare.
+
+  // ── Tier 1 -> Tier 2 (mechanical: mask tool results) ──
+  {
+    let t = await tier1TokensFor(store);
+    const limit = TIER_1_BUDGET * HYST_HIGH;
+    const stop  = TIER_1_BUDGET * HYST_LOW;
+    if (t > limit) {
+      while (t > stop) {
+        const id = await store.findOldestDemotionCandidate(1);
+        if (!id) break;
+        const before = await loadTaskFull(store, id);
+        let removed = 0;
+        for (const m of before?.messages ?? []) if (m.kind === 'tool-result') removed += estTokens(m.content);
+        await store.demoteToTier2(id);
+        t -= removed;
+      }
+    }
+  }
+
+  // ── Tier 2 -> Tier 3 (mechanical: drop messages, keep agent-written summary) ──
+  {
+    let t = await tier2TokensFor(store);
+    const limit = TIER_2_BUDGET * HYST_HIGH;
+    const stop  = TIER_2_BUDGET * HYST_LOW;
+    if (t > limit) {
+      while (t > stop) {
+        const id = await store.findOldestDemotionCandidate(2);
+        if (!id) break;
+        const before = await loadTaskFull(store, id);
+        let removed = 0;
+        for (const m of before?.messages ?? []) removed += estTokens(m.content);
+        await store.demoteToTier3(id, before?.summary || '(no summary)');
+        t -= removed;
+      }
+    }
+  }
+
+  // ── Tier 3 -> Tier 4 (rollup: combine oldest N tier-3 tasks into one rollup) ──
+  {
+    let t = await tier3TokensFor(store);
+    const limit = TIER_3_BUDGET * HYST_HIGH;
+    const stop  = TIER_3_BUDGET * HYST_LOW;
+    if (t > limit) {
+      while (t > stop) {
+        const tier3 = (await store.listTasks({ tier: 3 }))
+          .filter((x) => !x.rolledUpInto && !x.archived)
+          .sort((a, b) => (a.ended ?? a.started ?? 0) - (b.ended ?? b.started ?? 0));
+        if (tier3.length < 2) break;
+        const batch = tier3.slice(0, Math.min(TIER_3_ROLLUP_BATCH, tier3.length));
+        const removed = batch.reduce((s, x) => s + estTokens(x.summary), 0);
+        const rollup = await store.rollupTier3Tasks(batch.map((x) => x.id));
+        if (!rollup) break;
+        t -= removed;
+      }
+    }
+  }
+
+  // ── Tier 4 -> archived (oldest tier-4 rollup leaves context entirely) ──
+  {
+    let t = await tier4TokensFor(store);
+    const limit = TIER_4_BUDGET * HYST_HIGH;
+    const stop  = TIER_4_BUDGET * HYST_LOW;
+    if (t > limit) {
+      while (t > stop) {
+        const tier4 = (await store.listTasks({ tier: 4 }))
+          .filter((x) => !x.archived)
+          .sort((a, b) => (a.ended ?? a.started ?? 0) - (b.ended ?? b.started ?? 0));
+        if (!tier4.length) break;
+        const oldest = tier4[0];
+        const removed = estTokens(oldest.summary);
+        await store.archiveTask(oldest.id);
+        t -= removed;
+      }
+    }
+  }
+}
+
+// ── Stream-aware turn (prose forwarding) ───────────────────────────────────
 const HOLDBACK = '<remote-workspace>'.length + 2;
 
-/**
- * Run one turn, streaming the model's PROSE (text before any <remote-workspace>
- * block) to onText as it arrives. Returns the full turn text. Falls back to a
- * non-streaming call if the adapter has no completeStream.
- */
 async function runTurnStreaming(adapter, opts, onText) {
   let text = '';
-  let sent = 0;       // chars of prose already forwarded
+  let sent = 0;
   let inCommands = false;
-
   const pump = () => {
     if (inCommands) return;
     const idx = text.search(/<remote-workspace/i);
@@ -841,12 +1726,11 @@ async function runTurnStreaming(adapter, opts, onText) {
       const flushTo = Math.max(sent, text.length - HOLDBACK);
       if (flushTo > sent) { onText?.(text.slice(sent, flushTo)); sent = flushTo; }
     } else {
-      if (idx > sent) { onText?.(text.slice(sent, idx)); }
+      if (idx > sent) onText?.(text.slice(sent, idx));
       sent = idx;
       inCommands = true;
     }
   };
-
   if (typeof adapter.completeStream === 'function') {
     for await (const chunk of adapter.completeStream(opts)) {
       const d = chunk?.choices?.[0]?.delta?.content;
@@ -857,56 +1741,207 @@ async function runTurnStreaming(adapter, opts, onText) {
     text = res?.choices?.[0]?.message?.content ?? '';
     pump();
   }
-
-  // If this turn never entered a command block, flush whatever prose remains.
-  if (!inCommands && sent < text.length) { onText?.(text.slice(sent)); sent = text.length; }
+  if (!inCommands && sent < text.length) { onText?.(text.slice(sent)); }
   return text;
 }
 
-async function runPromptedAgent({ adapter, messages, model, maxTurns = DEFAULT_MAX_TURNS, onText, onToolCalls }) {
-  const convo = injectInstructions(messages);
+// ── Task-op dispatcher ─────────────────────────────────────────────────────
+async function dispatchTaskOp(c, store) {
+  const a = c.args;
+  if (c.verb === 'next-task') {
+    const t = await store.transitionTo({
+      summary: a.summary ?? '',
+      title: a.title ?? 'untitled',
+      goal: a.goal ?? '',
+    });
+    return { ok: true, content: `opened new task ${t.id}: "${t.title}"  goal: ${t.goal || '(none)'}` };
+  }
+  if (c.verb === 'list-tasks') {
+    const list = await store.listTasks({ parentId: a.parent });
+    if (!list.length) return { ok: true, content: '(no tasks)' };
+    const lines = list.map((t) => {
+      const status = t.ended ? 'done' : 'open';
+      const tier = `tier${t.tier}`;
+      const summary = t.summary ? ` — ${t.summary.split('\n')[0].slice(0, 120)}` : '';
+      return `${t.id}  [${status}]  [${tier}]  ${t.title}${summary}`;
+    });
+    return { ok: true, content: lines.join('\n') };
+  }
+  if (c.verb === 'task-detail') {
+    const t = await store.getDetail(a.id);
+    if (!t) return { ok: false, content: `task ${a.id} not found` };
+    return { ok: true, content: JSON.stringify(t, null, 2) };
+  }
+  if (c.verb === 'search-tasks') {
+    const hits = await store.searchTasks(a.query ?? '');
+    if (!hits.length) return { ok: true, content: '(no matches)' };
+    const lines = hits.map((t) => `${t.id}  ${t.title}  — ${(t.summary ?? '').split('\n')[0].slice(0, 140)}`);
+    return { ok: true, content: lines.join('\n') };
+  }
+  return { ok: false, content: `unknown task op: ${c.verb}` };
+}
 
-  const stats = { turns: 0, toolCalls: 0, toolHistogram: {}, batches: [], loopBreaks: 0 };
+// ── Main agent loop ────────────────────────────────────────────────────────
+async function runPromptedAgent({
+  adapter,
+  messages,           // [{role, content}] from the browser; we only care about the last user message
+  model,
+  projectDir,         // required: where .agent/tasks/ lives
+  maxTurns = DEFAULT_MAX_TURNS,
+  onText, onToolCalls, onToolResult, onLog,
+}) {
+  if (!projectDir) throw new Error('projectDir required for task-scoped agent');
+
+  const log = (m) => { try { onLog?.(m); } catch {} };
+
+  // Initialize tasks store; this either loads existing state or creates a root task.
+  const store = createTasksStore(projectDir);
+  await store.init();
+
+  // Extract the user's new message (last user role in incoming).
+  const lastUserMsg = [...(messages ?? [])].reverse().find((m) => m.role === 'user');
+  const userText = flattenContent(lastUserMsg?.content);
+  if (userText) {
+    await store.appendMessage({
+      kind: 'user-message',
+      role: 'user',
+      content: userText,
+    });
+  }
+
+  const stats = { turns: 0, toolCalls: 0, toolHistogram: {}, batches: [], loopBreaks: 0, taskOps: 0 };
   let lastKey = '';
   let repeat = 0;
 
   for (let turn = 1; turn <= maxTurns; turn++) {
     stats.turns = turn;
+
+    // Compute current tier-1 tokens to inject into the system prompt.
+    const cur = await store.getCurrent();
+    let t1Tokens = 0;
+    for (const m of cur?.messages ?? []) t1Tokens += estTokens(m.content);
+    const tier1Pct = Math.round((t1Tokens / TIER_1_BUDGET) * 100);
+
+    const sys = buildSystemPrompt({
+      taskId: cur?.id ?? '?',
+      taskTitle: cur?.title ?? 'session',
+      taskGoal: cur?.goal ?? '',
+      tier1Tokens: t1Tokens,
+      tier1Pct,
+    });
+
+    // Build the convo from the store, then prepend the system reminder to the
+    // very first user message (the platform strips system messages).
+    const fromStore = await buildConvoFromStore(store);
+    let injected = false;
+    const convo = [];
+    for (const m of fromStore) {
+      if (!injected && m.role === 'user') {
+        convo.push({ role: 'user', content: `<system-reminder>\n${sys}\n</system-reminder>\n\n${m.content}` });
+        injected = true;
+      } else {
+        convo.push(m);
+      }
+    }
+    if (!injected) {
+      convo.unshift({ role: 'user', content: `<system-reminder>\n${sys}\n</system-reminder>` });
+    }
+
+    log(`turn ${turn}: ${convo.length} msgs · current=${cur?.id} · t1=${t1Tokens}/${TIER_1_BUDGET}`);
+
+    const t0 = Date.now();
     const text = await runTurnStreaming(
       adapter,
       { model, messages: convo, stop: ['</remote-workspace>'] },
       onText,
     );
     const calls = parseToolCalls(text);
+    log(`turn ${turn}: ${text.length} chars in ${Date.now() - t0}ms, ${calls.length} call(s)`);
 
     if (calls.length === 0) {
-      return { content: text, stats, terminated: 'stop', convo };
+      // Final answer reached. Record assistant prose to current task.
+      if (text.trim()) {
+        await store.appendMessage({ kind: 'assistant', role: 'assistant', content: text });
+      }
+      // Always check budgets before returning — even on the final turn — so
+      // long sessions stay within bounds.
+      await maybeDemote(store);
+      log(`done: ${stats.turns} turns, ${stats.toolCalls} tool calls, ${stats.taskOps} task ops`);
+      return { content: text, stats, terminated: 'stop', store };
     }
     stats.batches.push(calls.length);
-    if (onToolCalls) onToolCalls(calls);
 
+    // Record the assistant message exactly as the model emitted it (so the
+    // model sees its own prior reasoning when we reconstruct the convo).
     const assistantText = /<\/remote-workspace>/i.test(text) ? text : `${text}\n</remote-workspace>`;
-    convo.push({ role: 'assistant', content: assistantText });
+    await store.appendMessage({ kind: 'assistant', role: 'assistant', content: assistantText });
 
     const results = [];
     for (const c of calls) {
-      stats.toolCalls++;
-      stats.toolHistogram[c.name] = (stats.toolHistogram[c.name] ?? 0) + 1;
-      const key = c.name + '|' + JSON.stringify(c.args);
+      if (onToolCalls) onToolCalls([c]);
+
+      // Loop detection — useful for read tools that the model gets stuck on
+      const key = c.verb + '|' + JSON.stringify(c.args);
       if (key === lastKey) repeat++; else { lastKey = key; repeat = 1; }
-      let content;
+
+      let resultContent, resultStatus = 'ok', resultDiff = null;
       if (repeat >= REPEAT_LIMIT) {
         stats.loopBreaks++;
-        content = `LOOP DETECTED: this exact request has fired ${repeat} times. Stop requesting and answer with what you have.`;
+        resultContent = `LOOP DETECTED: this exact request has fired ${repeat} times. Stop requesting and answer with what you have.`;
+        resultStatus = 'error';
+      } else if (c.kind === 'task-op') {
+        stats.taskOps++;
+        const r = await dispatchTaskOp(c, store);
+        resultContent = r.content;
+        resultStatus = r.ok ? 'ok' : 'error';
+        log(`  ${c.verb}(${JSON.stringify(c.args)}) -> ${resultStatus}`);
       } else {
-        content = await execute(c.name, c.args);
+        stats.toolCalls++;
+        stats.toolHistogram[c.name] = (stats.toolHistogram[c.name] ?? 0) + 1;
+        const raw = await execute(c.name, c.args);
+        if (typeof raw === 'string' && raw.startsWith('ERROR:')) {
+          resultContent = raw;
+          resultStatus = 'error';
+        } else {
+          resultContent = extractContent(raw);
+          resultDiff = extractDiff(raw);
+        }
+        log(`  ${c.name}(${JSON.stringify(c.args)}) -> ${resultStatus === 'error' ? resultContent.slice(0, 80) : resultContent.length + 'b'}`);
       }
-      results.push({ verb: c.verb, status: content.startsWith('ERROR') ? 'error' : 'ok', content });
+
+      if (onToolResult) {
+        onToolResult({
+          verb: c.verb, name: c.name ?? c.verb, args: c.args,
+          status: resultStatus, content: resultContent,
+          diff: resultDiff,
+        });
+      }
+
+      // Persist as task messages.
+      await store.appendMessage({
+        kind: 'tool-call', role: 'assistant',
+        content: `<${c.verb} ...args/>`,    // marker; real content is in assistantText above
+        toolName: c.name ?? c.verb, toolArgs: c.args,
+      });
+      await store.appendMessage({
+        kind: 'tool-result', role: 'user',
+        content: `<remote-workspace-result op="${c.verb}" status="${resultStatus}">\n${resultContent}\n</remote-workspace-result>`,
+        toolName: c.name ?? c.verb, toolStatus: resultStatus,
+      });
+
+      results.push({ verb: c.verb, status: resultStatus, content: resultContent });
     }
-    convo.push({ role: 'user', content: formatToolResults(results) });
+
+    // Concat all results into one user message for the next LLM turn (matches
+    // what we stored, but the store already has them per-message; the LLM input
+    // is rebuilt fresh next turn from the store anyway).
+
+    // Demote if any tier is over budget.
+    await maybeDemote(store);
   }
 
-  return { content: '[MAX TURNS REACHED — agent did not converge]', stats, terminated: 'max-turns', convo };
+  log(`done: max turns (${maxTurns}) reached without converging`);
+  return { content: '[MAX TURNS REACHED — agent did not converge]', stats, terminated: 'max-turns', store };
 }
 
 // ====== server.mjs ======
@@ -998,6 +2033,21 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
     recent: await loadRecentProjects(),
   };
 
+  // Append-only project log at <project>/.agent/code-boss.log. Synchronous
+  // writes so a hang leaves a complete log up to the last operation.
+  let logDirEnsured = null;
+  // Defined in startServer scope where `path` is the node:path module (inside
+  // the request handler, `path` is shadowed by the URL pathname).
+  const logFilePath = () => (session.activeProject ? path.join(session.activeProject, '.agent', 'code-boss.log') : null);
+  function fileLog(msg) {
+    if (!session.activeProject) return;
+    try {
+      const dir = path.join(session.activeProject, '.agent');
+      if (logDirEnsured !== dir) { mkdirSync(dir, { recursive: true }); logDirEnsured = dir; }
+      appendFileSync(path.join(dir, 'code-boss.log'), `${new Date().toISOString()}  ${msg}\n`);
+    } catch { /* logging must never break the request */ }
+  }
+
   async function openProject(p) {
     if (typeof p !== 'string' || !p) throw new Error('invalid project path');
     try {
@@ -1007,7 +2057,9 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
     session.activeProject = p;
     session.recent = [p, ...session.recent.filter((x) => x !== p)].slice(0, MAX_RECENT);
     await saveRecentProjects(session.recent);
+    logDirEnsured = null;
     logEvent('project-opened', { path: p });
+    fileLog(`=== project opened: ${p} ===`);
   }
   function logEvent(type, data) {
     const summary = (SUMMARIZE[type] ?? ((d) => JSON.stringify(d).slice(0, 200)))(data);
@@ -1047,7 +2099,14 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
     res.end(s);
   }
   function sendText(res, status, text, type = 'text/plain') {
-    res.writeHead(status, { 'content-type': type, 'content-length': Buffer.byteLength(text) });
+    // no-store: the bundled HTML changes on every rebuild; Chrome caches
+    // localhost HTML aggressively, which makes "I deployed the new bundle but
+    // the page looks the same" the most common false-positive bug report.
+    res.writeHead(status, {
+      'content-type': type,
+      'content-length': Buffer.byteLength(text),
+      'cache-control': 'no-store, must-revalidate',
+    });
     res.end(text);
   }
 
@@ -1081,6 +2140,17 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
       if (req.method === 'POST' && path === '/api/close-project') {
         session.activeProject = null;
         return sendJson(res, 200, { activeProject: null, recent: session.recent });
+      }
+      if (req.method === 'GET' && path === '/api/log') {
+        if (!session.activeProject) return sendJson(res, 200, { log: '(no project open)', file: null });
+        const file = logFilePath();
+        try {
+          const content = await readFile(file, 'utf8');
+          const tail = content.length > 80000 ? content.slice(-80000) : content;
+          return sendJson(res, 200, { log: tail, file, bytes: content.length });
+        } catch (e) {
+          return sendJson(res, 200, { log: `(no log yet — ${e.code || e.message})`, file });
+        }
       }
       if (req.method === 'GET' && path === '/api/models') {
         // Dev mode passes a static modelsList; prod uses the adapter.
@@ -1134,6 +2204,8 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
           id: 'agent', object: 'chat.completion.chunk',
           choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
         });
+        // Custom UI events (Claude-Code-style dots / collapsible results).
+        const emitEvent = (cb) => send({ _cb: cb });
         const emitFinish = (reason, usage) => send({
           id: 'agent', object: 'chat.completion.chunk',
           choices: [{ index: 0, delta: {}, finish_reason: reason }],
@@ -1159,23 +2231,55 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
           return res.end();
         }
 
+        const lastUser = [...(body.messages ?? [])].reverse().find((m) => m.role === 'user');
+        fileLog(`chat: model=${body.model} q="${String(lastUser?.content ?? '').slice(0, 200).replace(/\s+/g, ' ')}"`);
         try {
           let emittedAnything = false;
           const result = await runPromptedAgent({
             adapter,
             messages: body.messages,
             model: body.model,
-            maxTurns: 15,
+            projectDir: session.activeProject,
+            maxTurns: 20,
             onText: (delta) => {
               if (delta) { emittedAnything = true; emitText(delta); }
             },
             onToolCalls: (calls) => {
               for (const c of calls) {
                 emittedAnything = true;
-                emitText(`\n🔧 \`${c.name}(${JSON.stringify(c.args)})\`\n`);
+                // For task ops, send a more readable label.
+                const label = c.verb;
+                const argStr = Object.entries(c.args)
+                  .filter(([k]) => k !== 'content')  // skip body for write
+                  .map(([k, v]) => `${k}=${String(v).slice(0, 60)}`)
+                  .join(', ');
+                emitEvent({ t: 'tool', name: c.name ?? label, verb: label, args: argStr });
               }
             },
+            onToolResult: ({ name, verb, status, content, diff }) => {
+              const nonEmptyLines = content.split('\n').filter((l) => l.trim()).length;
+              const v = verb ?? name;
+              let summary;
+              if (status === 'error') summary = content.split('\n')[0].slice(0, 140);
+              else if (name === 'list_dir' || v === 'list') summary = `${nonEmptyLines} entries`;
+              else if (name === 'read_file' || v === 'read') summary = `Read ${content.split('\n').length} lines`;
+              else if (name === 'grep' || v === 'search') summary = content.startsWith('(no matches') ? 'No matches' : `${nonEmptyLines} matching lines`;
+              else if (name === 'glob' || v === 'find') summary = content.startsWith('(no matches') ? 'No files' : `${nonEmptyLines} files`;
+              else if (name === 'write_file' || v === 'write') summary = content.replace(/^wrote\s+/, '');
+              else if (name === 'edit_file' || v === 'edit') summary = content.replace(/^edited\s+/, '');
+              else if (v === 'next-task') summary = content.replace(/^opened new task\s+/, '');
+              else if (v === 'list-tasks') summary = `${nonEmptyLines} tasks`;
+              else if (v === 'task-detail') summary = 'task detail';
+              else if (v === 'search-tasks') summary = `${nonEmptyLines} matches`;
+              else summary = `${content.length} bytes`;
+              emitEvent({ t: 'result', status, summary, full: content.slice(0, 8000) });
+              if (diff) {
+                emitEvent({ t: 'diff', diff, summary });
+              }
+            },
+            onLog: (msg) => fileLog(msg),
           });
+          fileLog(`chat done: terminated=${result.terminated} turns=${result.stats.turns} calls=${result.stats.toolCalls} batches=[${result.stats.batches.join(',')}]`);
           // Detect the "model returned nothing useful" case.
           if (!emittedAnything && (!result.content || result.content.trim().length === 0)) {
             emitText('\n⚠️ Model returned an empty response (terminated=' +
@@ -1191,6 +2295,7 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
           });
         } catch (e) {
           logEvent('error', { message: e.message });
+          fileLog(`chat ERROR: ${e.message}`);
           send({ error: { message: e.message, stack: e.stack } });
         } finally {
           if (cwdChanged) process.chdir(prevCwd);
@@ -1324,28 +2429,31 @@ const UI_HTML = `<!DOCTYPE html>
 <title>code_boss</title>
 <style>
   :root {
-    --bg: #f6f7f9;
-    --panel: #ffffff;
-    --border: #e3e6eb;
-    --fg: #1f2328;
-    --muted: #6b7280;
-    --accent: #2563eb;
-    --accent-fg: #ffffff;
-    --user-bubble: #2563eb;
-    --asst-bubble: #ffffff;
-    --error: #b91c1c;
-    --error-bg: #fef2f2;
-    --warn-bg: #fffbeb;
+    --bg: #1c1b18;          /* warm terminal near-black */
+    --panel: #211f1b;       /* slightly raised panels */
+    --panel-alt: #26241f;   /* input / boxes */
+    --border: #3a372f;      /* dim warm border */
+    --fg: #e6e2d6;          /* warm off-white text */
+    --muted: #8c887b;       /* dim gray for secondary */
+    --accent: #d97757;      /* Claude coral (bright for dark bg) */
+    --accent-hover: #e08968;
+    --accent-fg: #1c1b18;
+    --tool: #d97757;        /* tool-call bullet */
+    --error: #e5635a;
+    --error-bg: #2a1f1c;
+    --warn-bg: #2a261c;
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
   body {
-    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font: 13.5px/1.55 var(--mono);
     color: var(--fg);
     background: var(--bg);
     display: flex;
     flex-direction: column;
   }
+  ::selection { background: rgba(217,119,87,0.3); }
   #landing {
     flex: 1;
     display: flex;
@@ -1358,13 +2466,14 @@ const UI_HTML = `<!DOCTYPE html>
     width: 100%;
   }
   #landing.hidden, #chat.hidden { display: none; }
-  #landing h1 { font-size: 28px; margin: 0 0 6px; letter-spacing: -0.5px; }
-  #landing .tagline { color: var(--muted); margin: 0 0 32px; }
+  #landing h1 { font-size: 26px; font-weight: 700; margin: 0 0 6px; letter-spacing: -0.5px; color: var(--accent); }
+  #landing h1::before { content: "✻ "; }
+  #landing .tagline { color: var(--muted); margin: 0 0 32px; font-size: 15px; }
   #pickBtn {
-    font-size: 16px;
+    font-size: 15px;
     font-weight: 600;
-    padding: 14px 28px;
-    border-radius: 8px;
+    padding: 13px 26px;
+    border-radius: 12px;
   }
   #landing h2 {
     font-size: 13px;
@@ -1384,18 +2493,32 @@ const UI_HTML = `<!DOCTYPE html>
     cursor: pointer;
     transition: border-color 0.1s;
   }
+  .recent-item { background: var(--panel-alt); }
   .recent-item:hover { border-color: var(--accent); }
   .recent-item .name { font-weight: 600; }
+  .logbox {
+    background: #161512;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 12px;
+    font: 12px/1.5 var(--mono);
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 60vh;
+    overflow-y: auto;
+    color: #b9b5a8;
+  }
   .recent-item .path { color: var(--muted); font-size: 12px; font-family: ui-monospace, Menlo, Consolas, monospace; margin-top: 2px; word-break: break-all; }
   .recent-empty { color: var(--muted); font-size: 13px; text-align: center; padding: 12px; }
   .project-chip {
-    background: #f1f5f9;
-    padding: 4px 10px;
-    border-radius: 6px;
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--muted);
+    padding: 4px 8px;
+    border-radius: 4px;
     font-size: 12px;
-    font-family: ui-monospace, Menlo, Consolas, monospace;
-    color: #334155;
-    max-width: 360px;
+    font-family: var(--mono);
+    max-width: 340px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -1406,31 +2529,34 @@ const UI_HTML = `<!DOCTYPE html>
   header {
     background: var(--panel);
     border-bottom: 1px solid var(--border);
-    padding: 10px 16px;
+    padding: 10px 18px;
     display: flex;
     align-items: center;
-    gap: 12px;
+    gap: 10px;
     flex-shrink: 0;
   }
-  header h1 { margin: 0; font-size: 16px; font-weight: 600; letter-spacing: -0.2px; }
+  header h1 { margin: 0; font-size: 14px; font-weight: 700; color: var(--accent); }
+  header h1::before { content: "✻ "; }
   header .grow { flex: 1; }
   header select, header .btn {
     font: inherit;
-    padding: 6px 10px;
-    border: 1px solid var(--border);
-    background: #fff;
-    border-radius: 6px;
-    cursor: pointer;
-  }
-  header select { cursor: default; min-width: 200px; }
-  header .btn:hover { background: #f3f4f6; }
-  .chip {
-    background: #eef2ff;
-    color: #3730a3;
-    padding: 4px 10px;
-    border-radius: 999px;
     font-size: 12px;
-    font-weight: 500;
+    padding: 4px 10px;
+    border: 1px solid var(--border);
+    background: transparent;
+    border-radius: 4px;
+    cursor: pointer;
+    color: var(--muted);
+  }
+  header select { cursor: default; min-width: 180px; color: var(--fg); }
+  header .btn:hover { border-color: var(--accent); color: var(--fg); }
+  .chip {
+    background: transparent;
+    color: var(--muted);
+    padding: 4px 8px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font-size: 12px;
     font-variant-numeric: tabular-nums;
   }
 
@@ -1439,41 +2565,101 @@ const UI_HTML = `<!DOCTYPE html>
     overflow-y: auto;
     padding: 16px 16px 24px;
   }
-  .log { max-width: 820px; margin: 0 auto; }
-  .bubble {
-    max-width: 80%;
-    padding: 10px 14px;
-    border-radius: 14px;
-    margin: 8px 0;
+  .log { max-width: 860px; margin: 0 auto; }
+
+  /* User message: subtle gray block with a left accent bar. */
+  .bubble.user {
+    background: #2a2823;
+    border-left: 2px solid var(--muted);
+    border-radius: 0 6px 6px 0;
+    padding: 8px 12px;
+    margin: 16px 0;
     white-space: pre-wrap;
     word-wrap: break-word;
-    line-height: 1.45;
+    color: var(--fg);
   }
-  .bubble.user {
-    background: var(--user-bubble);
-    color: #fff;
-    margin-left: auto;
-    border-bottom-right-radius: 4px;
-  }
-  .bubble.assistant {
-    background: var(--asst-bubble);
-    border: 1px solid var(--border);
-    border-bottom-left-radius: 4px;
-  }
-  .bubble.system {
-    background: var(--warn-bg);
-    border: 1px solid #fde68a;
-    color: #78350f;
-    font-size: 12px;
-    text-align: center;
-    margin: 8px auto;
-    max-width: 70%;
-  }
-  .bubble .meta {
+  .bubble.system { color: var(--muted); font-size: 12.5px; margin: 12px 0; white-space: pre-wrap; }
+
+  /* Dotted message rows (Claude Code style). */
+  .row { display: flex; gap: 8px; margin: 10px 0; align-items: flex-start; }
+  .row.tool { margin: 10px 0 0 0; }                /* no bottom — result sits right below */
+  .row .dot { flex-shrink: 0; line-height: 1.55; }
+  .row.assistant .dot { color: var(--fg); }
+  .row.tool .dot { color: #6cc46c; }
+  .row .body { flex: 1; white-space: pre-wrap; word-wrap: break-word; min-width: 0; }
+  .row.tool .body { color: var(--fg); }
+  .body code { color: var(--accent); }
+
+  /* Result row — single inline line with hanging indent so the ⎿ sits under the ● and any wrap aligns under the summary text. */
+  .row-result {
     color: var(--muted);
-    font-size: 11px;
-    margin-top: 6px;
+    font-size: 12.5px;
+    margin: 1px 0 10px 0;
+    padding-left: 16px;
+    text-indent: -16px;
+    white-space: pre-wrap;
+    word-wrap: break-word;
   }
+  .row-result.err { color: var(--error); }
+  .row-result .expand { cursor: pointer; text-decoration: underline; font-size: 11px; margin-left: 6px; }
+  .row-result pre { margin: 6px 0 0; text-indent: 0; padding-left: 0; }
+
+  /* Diff block — appears after a write/edit tool result, showing the unified diff. */
+  .diff-block {
+    margin: 4px 0 12px 24px;
+    border: 1px solid #2f2d27;
+    border-radius: 4px;
+    background: #15140f;
+    overflow: hidden;
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.5;
+  }
+  .diff-block .diff-hdr {
+    background: #1f1d18;
+    color: var(--muted);
+    padding: 4px 10px;
+    font-size: 11px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .diff-block .diff-hdr .expand { cursor: pointer; text-decoration: underline; color: var(--accent); }
+  .diff-block .diff-body { padding: 6px 0; max-height: 320px; overflow-y: auto; }
+  .diff-block .diff-body.collapsed { display: none; }
+  .diff-block .dl { padding: 0 10px; white-space: pre; }
+  .diff-block .dl.add { background: rgba(70, 200, 70, 0.10); color: #a8e6a8; }
+  .diff-block .dl.del { background: rgba(220, 80, 80, 0.10); color: #f0a8a8; }
+  .diff-block .dl.hunk { color: var(--muted); }
+  .diff-block .dl.same { color: var(--muted); }
+
+  /* Welcome box (rounded terminal banner). */
+  .welcome {
+    border: 1px solid var(--accent);
+    border-radius: 8px;
+    padding: 12px 16px;
+    margin: 4px 0 20px;
+  }
+  .welcome .wt { color: var(--accent); font-weight: 700; }
+  .welcome .wl { color: var(--muted); font-size: 12.5px; margin-top: 3px; }
+
+  /* Inline status row inside the chat log — appears as the next "line" the
+     agent is producing. Fixed-width pieces keep the text from jittering. */
+  .status {
+    color: var(--accent);
+    margin: 10px 0;
+    font-variant-numeric: tabular-nums;
+  }
+  .status .spin {
+    display: inline-block;
+    width: 1ch;
+    text-align: center;
+  }
+  .status .arrow { display: inline-block; color: var(--accent); }
+  .status.thinking .arrow { animation: blinkArrow 1.2s ease-in-out infinite; }
+  @keyframes blinkArrow { 50% { opacity: 0.25; } }
+  .status .dim { color: var(--muted); }
+  .status.hidden { display: none; }
 
   footer {
     background: var(--panel);
@@ -1482,37 +2668,53 @@ const UI_HTML = `<!DOCTYPE html>
     flex-shrink: 0;
   }
   .input-row {
-    max-width: 820px;
+    max-width: 860px;
     margin: 0 auto;
     display: flex;
     gap: 8px;
-    align-items: flex-end;
+    align-items: stretch;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--panel-alt);
+    padding: 8px 10px;
+  }
+  .input-row:focus-within { border-color: var(--accent); }
+  .input-row::before {
+    content: ">";
+    color: var(--accent);
+    font-weight: 700;
+    padding: 4px 2px 0 4px;
   }
   textarea {
     flex: 1;
-    min-height: 44px;
-    max-height: 200px;
-    padding: 10px 12px;
-    border: 1px solid var(--border);
-    border-radius: 8px;
+    min-height: 24px;
+    max-height: 220px;
+    padding: 3px 4px;
+    border: none;
+    background: transparent;
     font: inherit;
-    resize: vertical;
+    color: var(--fg);
+    resize: none;
     outline: none;
   }
-  textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(37,99,235,0.15); }
+  textarea::placeholder { color: var(--muted); }
   .btn.primary {
-    background: var(--accent);
-    color: var(--accent-fg);
-    border-color: var(--accent);
-    padding: 10px 18px;
-    font-weight: 600;
+    background: transparent;
+    color: var(--accent);
+    border: 1px solid var(--accent);
+    border-radius: 4px;
+    padding: 4px 16px;
+    font-weight: 700;
+    font: inherit;
+    cursor: pointer;
+    align-self: flex-end;
   }
-  .btn.primary:disabled { opacity: 0.5; cursor: not-allowed; }
-  .btn.primary:not(:disabled):hover { background: #1d4ed8; }
+  .btn.primary:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn.primary:not(:disabled):hover { background: var(--accent); color: var(--accent-fg); }
 
   .modal-bg {
     position: fixed; inset: 0;
-    background: rgba(15,23,42,0.55);
+    background: rgba(0,0,0,0.6);
     display: none;
     align-items: flex-start;
     justify-content: center;
@@ -1522,22 +2724,22 @@ const UI_HTML = `<!DOCTYPE html>
   }
   .modal-bg.show { display: flex; }
   .modal {
-    background: var(--panel);
-    border-radius: 10px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 12px;
     max-width: 720px;
     width: 100%;
-    box-shadow: 0 20px 50px rgba(0,0,0,0.25);
     overflow: hidden;
   }
   .modal.error { border-top: 4px solid var(--error); }
   .modal-header {
-    padding: 16px 20px;
+    padding: 14px 18px;
     border-bottom: 1px solid var(--border);
     display: flex;
     align-items: center;
     justify-content: space-between;
   }
-  .modal-header h2 { margin: 0; font-size: 17px; }
+  .modal-header h2 { margin: 0; font-size: 14px; font-weight: 700; color: var(--accent); }
   .modal.error .modal-header h2 { color: var(--error); }
   .modal-body { padding: 18px 20px; max-height: 70vh; overflow-y: auto; }
   .modal-close {
@@ -1553,24 +2755,25 @@ const UI_HTML = `<!DOCTYPE html>
 
   .kv { display: grid; grid-template-columns: 160px 1fr; gap: 6px 16px; font-size: 13px; }
   .kv .k { color: var(--muted); font-weight: 500; }
-  .kv .v { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; word-break: break-all; }
+  .kv .v { font-family: var(--mono); word-break: break-all; }
 
   table { border-collapse: collapse; width: 100%; font-size: 12px; margin-top: 8px; }
   th, td { padding: 5px 8px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
-  th { background: #f3f4f6; font-weight: 600; }
+  th { background: var(--panel-alt); font-weight: 600; color: var(--muted); }
   td.t-ms { font-variant-numeric: tabular-nums; color: var(--muted); width: 60px; }
-  td.t-type { font-family: ui-monospace, monospace; font-size: 11px; color: var(--accent); width: 130px; }
+  td.t-type { font-family: var(--mono); font-size: 11px; color: var(--accent); width: 130px; }
 
   pre {
-    background: #f6f8fa;
+    background: #161512;
     border: 1px solid var(--border);
     padding: 10px 12px;
     border-radius: 6px;
     overflow-x: auto;
-    font: 11px/1.45 ui-monospace, Menlo, Consolas, monospace;
+    font: 11px/1.45 var(--mono);
     max-height: 320px;
+    color: #b9b5a8;
   }
-  h3 { margin: 18px 0 6px; font-size: 13px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+  h3 { margin: 18px 0 6px; font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
   .par-badge {
     display: inline-block;
     font-size: 10px;
@@ -1581,10 +2784,10 @@ const UI_HTML = `<!DOCTYPE html>
     margin-left: 8px;
     vertical-align: middle;
   }
-  .par-good { background: #d1fae5; color: #065f46; }
-  .par-warn { background: #fef3c7; color: #92400e; }
-  .par-bad  { background: #fee2e2; color: #991b1b; }
-  .par-na   { background: #e5e7eb; color: #4b5563; }
+  .par-good { background: #1e3a2e; color: #6ee7b7; }
+  .par-warn { background: #3a2f1a; color: #fcd34d; }
+  .par-bad  { background: #3a1f1c; color: #fca5a5; }
+  .par-na   { background: #2a2823; color: #a8a49a; }
   .par-caption { color: var(--muted); font-size: 12px; margin: 0 0 12px; }
   .batch-strip {
     display: flex;
@@ -1592,7 +2795,7 @@ const UI_HTML = `<!DOCTYPE html>
     gap: 4px;
     margin: 10px 0 4px;
     padding: 8px;
-    background: #f6f8fa;
+    background: #161512;
     border: 1px solid var(--border);
     border-radius: 6px;
   }
@@ -1608,8 +2811,8 @@ const UI_HTML = `<!DOCTYPE html>
     font-weight: 600;
     font-variant-numeric: tabular-nums;
   }
-  .dot-single { background: #e5e7eb; color: #6b7280; }
-  .dot-multi  { background: #2563eb; color: #fff; }
+  .dot-single { background: #2a2823; color: #8c887b; }
+  .dot-multi  { background: var(--accent); color: var(--accent-fg); }
   .error-banner {
     background: var(--error-bg);
     border-left: 4px solid var(--error);
@@ -1649,6 +2852,7 @@ const UI_HTML = `<!DOCTYPE html>
     <select id="model" title="Model"></select>
     <div class="grow"></div>
     <div class="chip" id="tokenChip" title="Total tokens this session">0 tokens</div>
+    <button class="btn" onclick="openLog()" title="View the project log (.agent/code-boss.log)">Log</button>
     <button class="btn" onclick="openSnapshot()">Snapshot</button>
     <button class="btn" onclick="resetSession()">Reset</button>
     <button class="btn" onclick="changeProject()" title="Pick a different project">Change project</button>
@@ -1700,6 +2904,126 @@ const UI_HTML = `<!DOCTYPE html>
   let totalTokens = 0;
   let activeProject = null;
 
+  // ---- Inline status row (spinner + verb + timer + tokens) ----
+  const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+  const VERB = 'Working';
+  const PHASE = { UPLOADING: 'uploading', THINKING: 'thinking', DOWNLOADING: 'downloading', DONE: 'done' };
+  let statusTimer = null, upAnimTimer = null;
+  let statusStart = 0, statusFrame = 0;
+  let doneElapsed = 0;
+  let statusRow = null;
+  let phase = 'idle';
+  let lastDir = 'up';      // direction of the most recent activity (for THINKING arrow)
+  let lastDeltaTime = 0;   // timestamp of last content delta — for stall detection
+  let upTokens = 0, downTokens = 0;
+  const STALL_MS = 1500;   // no traffic this long → switch to THINKING (blinking)
+
+  function ensureStatusRow() {
+    if (statusRow && statusRow.parentNode === $log) return statusRow;
+    statusRow = document.createElement('div');
+    statusRow.className = 'status';
+    $log.appendChild(statusRow);
+    scrollToBottom();
+    return statusRow;
+  }
+  function pinStatusToBottom() {
+    if (statusRow && statusRow.parentNode === $log && statusRow !== $log.lastChild) {
+      $log.appendChild(statusRow);
+    }
+  }
+  function startSpinner() {
+    statusStart = Date.now();
+    statusFrame = 0;
+    if (statusTimer) clearInterval(statusTimer);
+    statusTimer = setInterval(() => {
+      statusFrame++;
+      // Stall detection: if we've been "downloading" or "uploading" but no
+      // delta in a while, flip to THINKING (blinking arrow, same direction).
+      if ((phase === PHASE.DOWNLOADING || phase === PHASE.UPLOADING) && lastDeltaTime > 0
+          && Date.now() - lastDeltaTime > STALL_MS) {
+        phase = PHASE.THINKING;
+        if (statusRow) statusRow.classList.add('thinking');
+      }
+      renderStatus();
+    }, 120);
+  }
+  function stopSpinnerOnly() {
+    if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
+    if (upAnimTimer) { cancelAnimationFrame(upAnimTimer); upAnimTimer = null; }
+  }
+  function animateUpTo(target, ms) {
+    if (upAnimTimer) cancelAnimationFrame(upAnimTimer);
+    const from = upTokens;
+    const t0 = Date.now();
+    const tick = () => {
+      if (phase !== PHASE.UPLOADING) { upAnimTimer = null; return; }
+      const t = Math.min(1, (Date.now() - t0) / ms);
+      upTokens = Math.round(from + (target - from) * t);
+      renderStatus();
+      if (t < 1) upAnimTimer = requestAnimationFrame(tick);
+      else { upAnimTimer = null; setThinking(); }
+    };
+    upAnimTimer = requestAnimationFrame(tick);
+  }
+  function setUploading(target, ms) {
+    ensureStatusRow();
+    if (!statusTimer) startSpinner();
+    phase = PHASE.UPLOADING;
+    lastDir = 'up';
+    lastDeltaTime = Date.now();
+    statusRow.classList.remove('thinking');
+    if (target == null || target <= upTokens) {
+      if (target != null) upTokens = Math.max(upTokens, target);
+      renderStatus();
+      setTimeout(() => { if (phase === PHASE.UPLOADING) setThinking(); }, 80);
+    } else {
+      animateUpTo(target, ms ?? 700);
+    }
+  }
+  function setThinking() {
+    phase = PHASE.THINKING;
+    if (statusRow) statusRow.classList.add('thinking');
+    renderStatus();
+  }
+  function setDownloading() {
+    if (phase !== PHASE.DOWNLOADING) downTokens = 0;
+    phase = PHASE.DOWNLOADING;
+    lastDir = 'down';
+    lastDeltaTime = Date.now();
+    if (statusRow) statusRow.classList.remove('thinking');
+    renderStatus();
+  }
+  function setDone() {
+    doneElapsed = Math.floor((Date.now() - statusStart) / 1000);
+    phase = PHASE.DONE;
+    stopSpinnerOnly();
+    if (statusRow) statusRow.classList.remove('thinking');
+    renderStatus();
+    // status row persists; do NOT remove
+  }
+  function renderStatus() {
+    if (!statusRow) return;
+    const fmt = (n) => (n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n));
+    if (phase === PHASE.DONE) {
+      statusRow.innerHTML =
+        '<span class="arrow">↓</span> ' + fmt(downTokens) +
+        ' <span class="dim">tokens · ' + doneElapsed + 's</span>';
+      return;
+    }
+    const sp = SPINNER[statusFrame % SPINNER.length];
+    const secs = Math.floor((Date.now() - statusStart) / 1000);
+    // Arrow direction follows the most recent activity. During THINKING
+    // (stalled) it stays in that direction and blinks.
+    const isDown = (phase === PHASE.DOWNLOADING) || (phase === PHASE.THINKING && lastDir === 'down');
+    const arrow = isDown ? '↓' : '↑';
+    const count = isDown ? downTokens : upTokens;
+    statusRow.innerHTML =
+      '<span class="spin">' + sp + '</span> ' + VERB + '… ' +
+      '<span class="arrow">' + arrow + '</span> ' + fmt(count) +
+      ' <span class="dim">tokens · ' + secs + 's · esc to interrupt</span>';
+  }
+  function estimateTokens(s) { return Math.ceil((s || '').length / 4); }
+
   function basename(p) {
     if (!p) return '';
     return p.split(/[\\\\/]/).filter(Boolean).pop() || p;
@@ -1748,7 +3072,14 @@ const UI_HTML = `<!DOCTYPE html>
     conversation = [];
     totalTokens = 0;
     $tokenChip.textContent = '0 tokens';
-    $log.innerHTML = '<div class="bubble system">Working in ' + escapeHtml(projectPath) + '</div>';
+    const model = $model.value || SERVER.defaultModel || '(model)';
+    $log.innerHTML =
+      '<div class="welcome">' +
+        '<div class="wt">✻ Welcome to code_boss</div>' +
+        '<div class="wl">project: ' + escapeHtml(projectPath) + '</div>' +
+        '<div class="wl">model: ' + escapeHtml(model) + '</div>' +
+        '<div class="wl">Ask a question below. ⏎ to send, shift+⏎ for newline, esc to interrupt.</div>' +
+      '</div>';
     if ($model.options.length === 0 || $model.value === '') loadModels();
     $input.focus();
   }
@@ -1811,6 +3142,16 @@ const UI_HTML = `<!DOCTYPE html>
   function scrollToBottom() {
     $logScroll.scrollTop = $logScroll.scrollHeight;
   }
+  // Render assistant text with Claude Code line styling: ⏺ tool calls in
+  // coral, ⎿ results dimmed, prose plain.
+  function renderAssistant(el, text) {
+    el.innerHTML = text.split('\\n').map((line) => {
+      const t = line.trimStart();
+      if (t.startsWith('⏺')) return '<span class="tool-call">' + escapeHtml(line) + '</span>';
+      if (t.startsWith('⎿')) return '<span class="tool-result">' + escapeHtml(line) + '</span>';
+      return escapeHtml(line);
+    }).join('\\n');
+  }
 
   async function loadModels() {
     try {
@@ -1840,6 +3181,101 @@ const UI_HTML = `<!DOCTYPE html>
     }
   }
 
+  let currentAbort = null;
+
+  // Append a dotted row. kind: 'assistant' | 'tool'. Returns the .body element.
+  function addRow(kind, initial) {
+    const row = document.createElement('div');
+    row.className = 'row ' + kind;
+    const dot = document.createElement('span');
+    dot.className = 'dot';
+    dot.textContent = '●';
+    const body = document.createElement('span');
+    body.className = 'body';
+    if (initial != null) body.textContent = initial;
+    row.appendChild(dot);
+    row.appendChild(body);
+    $log.appendChild(row);
+    pinStatusToBottom();
+    scrollToBottom();
+    return body;
+  }
+  function addResultRow(ev) {
+    const row = document.createElement('div');
+    row.className = 'row-result' + (ev.status === 'error' ? ' err' : '');
+    // Inline single-line: "⎿ summary  (expand)". Hanging indent handles wraps.
+    row.innerHTML = '⎿ ' + escapeHtml(ev.summary);
+    if (ev.full && ev.full.length) {
+      const exp = document.createElement('span');
+      exp.className = 'expand';
+      exp.textContent = '(expand)';
+      let open = false;
+      exp.onclick = () => {
+        open = !open;
+        exp.textContent = open ? '(collapse)' : '(expand)';
+        let pre = row.querySelector('pre');
+        if (open) {
+          if (!pre) { pre = document.createElement('pre'); pre.textContent = ev.full; row.appendChild(pre); }
+          pre.style.display = '';
+        } else if (pre) { pre.style.display = 'none'; }
+      };
+      row.appendChild(exp);
+    }
+    $log.appendChild(row);
+    pinStatusToBottom();
+    scrollToBottom();
+  }
+
+  // Render a unified diff as a code block with + / - / hunk highlights.
+  function addDiffBlock(ev) {
+    const block = document.createElement('div');
+    block.className = 'diff-block';
+
+    const hdr = document.createElement('div');
+    hdr.className = 'diff-hdr';
+    const left = document.createElement('span');
+    left.textContent = 'diff ' + (ev.summary || '');
+    const exp = document.createElement('span');
+    exp.className = 'expand';
+    exp.textContent = 'collapse';
+    hdr.appendChild(left);
+    hdr.appendChild(exp);
+
+    const body = document.createElement('div');
+    body.className = 'diff-body';
+    const lines = String(ev.diff || '').split('\\n');
+    for (const line of lines) {
+      const ln = document.createElement('div');
+      ln.className = 'dl';
+      if (line.startsWith('+++') || line.startsWith('---')) {
+        ln.classList.add('hunk');
+      } else if (line.startsWith('@@')) {
+        ln.classList.add('hunk');
+      } else if (line.startsWith('+')) {
+        ln.classList.add('add');
+      } else if (line.startsWith('-')) {
+        ln.classList.add('del');
+      } else {
+        ln.classList.add('same');
+      }
+      ln.textContent = line || ' ';
+      body.appendChild(ln);
+    }
+
+    let collapsed = false;
+    exp.onclick = () => {
+      collapsed = !collapsed;
+      body.classList.toggle('collapsed', collapsed);
+      exp.textContent = collapsed ? 'expand' : 'collapse';
+    };
+
+    block.appendChild(hdr);
+    block.appendChild(body);
+    $log.appendChild(block);
+    pinStatusToBottom();
+    scrollToBottom();
+  }
+
   async function send() {
     const text = $input.value.trim();
     if (!text) return;
@@ -1849,14 +3285,23 @@ const UI_HTML = `<!DOCTYPE html>
 
     addBubble('user', text);
     conversation.push({ role: 'user', content: text });
-    const asst = addBubble('assistant', '…');
 
-    let accumulated = '';
+    let proseBody = null;        // current streaming prose row's body
+    let proseText = '';          // accumulated text for the current prose row
+    let anyOutput = false;
+
+    // Reset counters for a fresh send; animate ↑ from 0 to estimated total.
+    upTokens = 0; downTokens = 0;
+    const estUp = 1600 + conversation.reduce((s, m) => s + estimateTokens(m.content), 0);
+    setUploading(estUp, 700);
+
+    currentAbort = new AbortController();
     try {
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ model: $model.value, messages: conversation }),
+        signal: currentAbort.signal,
       });
       if (!res.ok) {
         const body = await res.text();
@@ -1865,6 +3310,7 @@ const UI_HTML = `<!DOCTYPE html>
       const reader = res.body.getReader();
       const dec = new TextDecoder();
       let buf = '';
+      let finalText = '';
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -1876,36 +3322,69 @@ const UI_HTML = `<!DOCTYPE html>
           if (!line.startsWith('data:')) continue;
           const data = line.slice(5).trim();
           if (data === '[DONE]') continue;
-          try {
-            const chunk = JSON.parse(data);
-            const d = chunk.choices?.[0]?.delta ?? {};
-            if (d.content) {
-              if (accumulated === '') asst.textContent = '';
-              accumulated += d.content;
-              asst.textContent = accumulated;
-              scrollToBottom();
+          let chunk;
+          try { chunk = JSON.parse(data); } catch { continue; }
+
+          if (chunk._cb) {
+            // Structured UI event: tool call or result.
+            proseBody = null; proseText = '';
+            if (chunk._cb.t === 'tool') {
+              anyOutput = true;
+              setThinking();   // model finished a turn; tool is executing locally
+              addRow('tool', chunk._cb.name + '(' + chunk._cb.args + ')');
+            } else if (chunk._cb.t === 'result') {
+              const grow = estimateTokens(chunk._cb.full || chunk._cb.summary);
+              setUploading(upTokens + grow, 300);  // animate ↑ growing by result size
+              addResultRow(chunk._cb);
+            } else if (chunk._cb.t === 'diff') {
+              addDiffBlock(chunk._cb);
             }
-            if (chunk.usage) {
-              totalTokens += chunk.usage.total_tokens ?? 0;
-              $tokenChip.textContent = totalTokens.toLocaleString() + ' tokens';
-            }
-            if (chunk.error) throw new Error(chunk.error.message ?? JSON.stringify(chunk.error));
-          } catch (parseErr) {
-            // ignore malformed line
+            continue;
           }
+          const d = chunk.choices?.[0]?.delta ?? {};
+          if (d.content) {
+            anyOutput = true;
+            // First byte or wake from stall — back to actively downloading.
+            if (phase !== PHASE.DOWNLOADING) setDownloading();
+            lastDeltaTime = Date.now();
+            if (statusRow) statusRow.classList.remove('thinking');
+            if (!proseBody) { proseBody = addRow('assistant', ''); proseText = ''; }
+            proseText += d.content;
+            finalText = proseText;
+            proseBody.innerHTML = renderInline(proseText);
+            downTokens += estimateTokens(d.content);
+            pinStatusToBottom();
+            scrollToBottom();
+          }
+          if (chunk.usage) {
+            totalTokens += chunk.usage.total_tokens ?? 0;
+            $tokenChip.textContent = totalTokens.toLocaleString() + ' tokens';
+            if (chunk.usage.total_tokens) downTokens = Math.max(downTokens, chunk.usage.completion_tokens ?? downTokens);
+          }
+          if (chunk.error) throw new Error(chunk.error.message ?? JSON.stringify(chunk.error));
         }
       }
-      if (!accumulated) asst.textContent = '(no content)';
-      conversation.push({ role: 'assistant', content: accumulated });
+      if (!anyOutput) addRow('assistant', '(no output)');
+      conversation.push({ role: 'assistant', content: finalText });
     } catch (e) {
-      asst.remove();
-      conversation.pop(); // remove the user message that wasn't completed
-      showError('Chat request failed', e);
+      if (e.name === 'AbortError') {
+        addBubble('system', 'Interrupted.');
+      } else {
+        conversation.pop();
+        showError('Chat request failed', e);
+      }
     } finally {
+      setDone();  // persist status with final ↓ count
+      currentAbort = null;
       $input.disabled = false;
       $send.disabled = false;
       $input.focus();
     }
+  }
+
+  // Minimal inline rendering: \`code\` spans only (keep it terminal-plain).
+  function renderInline(text) {
+    return escapeHtml(text).replace(/\`([^\`]+)\`/g, '<code>$1</code>');
   }
 
   async function openSnapshot() {
@@ -1996,6 +3475,30 @@ const UI_HTML = `<!DOCTYPE html>
     $modalBg.classList.add('show');
   }
 
+  async function openLog() {
+    $modal.classList.remove('error');
+    $modalTitle.textContent = 'Project log';
+    $modalBody.innerHTML = '<p class="par-caption">Loading…</p>';
+    $modalBg.classList.add('show');
+    await refreshLog();
+  }
+
+  async function refreshLog() {
+    try {
+      const r = await fetch('/api/log');
+      const d = await r.json();
+      const path = d.file ? escapeHtml(d.file) : '(no project)';
+      const bytes = d.bytes != null ? \` · \${d.bytes} bytes\` : '';
+      $modalBody.innerHTML =
+        '<div class="par-caption">' + path + bytes + ' &nbsp; <a href="#" onclick="refreshLog();return false;">refresh</a></div>' +
+        '<pre class="logbox" id="logBox">' + escapeHtml(d.log ?? '') + '</pre>';
+      const box = document.getElementById('logBox');
+      if (box) box.scrollTop = box.scrollHeight; // tail
+    } catch (e) {
+      $modalBody.innerHTML = '<div class="error-banner"><strong>Could not load log:</strong> ' + escapeHtml(e.message) + '</div>';
+    }
+  }
+
   function showError(title, err) {
     $modal.classList.add('error');
     $modalTitle.textContent = title;
@@ -2032,7 +3535,10 @@ const UI_HTML = `<!DOCTYPE html>
     }
   });
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') closeModal();
+    if (e.key === 'Escape') {
+      if ($modalBg.classList.contains('show')) { closeModal(); return; }
+      if (currentAbort) { currentAbort.abort(); }  // esc to interrupt
+    }
   });
 
   loadState();
