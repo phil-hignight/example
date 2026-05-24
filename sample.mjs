@@ -15,7 +15,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '2026-05-24T00:11:20.302Z';
+const BUILD_VERSION = '2026-05-24T02:09:24.888Z';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
@@ -29,7 +29,7 @@ import { createInterface } from 'node:readline';
 import { createServer } from 'node:http';
 import { homedir } from 'node:os';
 import { readFile as _readFile, writeFile as _writeFile, mkdir as _mkdir, stat as _stat, readdir as _readdir } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { existsSync, appendFileSync, mkdirSync } from 'node:fs';
 import { randomUUID as _randomUUID } from 'node:crypto';
 import path from 'node:path';
 const readFile = _readFile, writeFile = _writeFile, mkdir = _mkdir, stat = _stat, readdir = _readdir;
@@ -2063,21 +2063,36 @@ async function runPromptedAgent({
       tier1Pct,
     });
 
-    // Build the convo from the store, then prepend the system reminder to the
-    // very first user message (the platform strips system messages).
+    // Build the convo from the store. The system reminder is NOT stored —
+    // it lives only in the prompt we send each turn. We copy the convo and
+    // PREPEND the reminder into the LATEST user message (the one carrying
+    // the current question), so the model sees fresh instructions right
+    // before the question it's about to answer. The stored convo is untouched.
+    //
+    // Why latest, not oldest: in a long conversation the oldest user message
+    // is far in the past; a reminder there is easy for the model to overlook
+    // or treat as ancient context. The latest user message is the freshest
+    // and contains what the model is actively responding to.
+    //
+    // Why prepend (not append) within that latest message: convention —
+    // system instructions go before the user's question. Appending after
+    // the question can cause the model to respond to the reminder itself
+    // instead of the question.
     const fromStore = await buildConvoFromStore(store);
-    let injected = false;
-    const convo = [];
-    for (const m of fromStore) {
-      if (!injected && m.role === 'user') {
-        convo.push({ role: 'user', content: `<system-reminder>\n${sys}\n</system-reminder>\n\n${m.content}` });
-        injected = true;
-      } else {
-        convo.push(m);
-      }
+    let latestUserIdx = -1;
+    for (let i = fromStore.length - 1; i >= 0; i--) {
+      if (fromStore[i].role === 'user') { latestUserIdx = i; break; }
     }
-    if (!injected) {
-      convo.unshift({ role: 'user', content: `<system-reminder>\n${sys}\n</system-reminder>` });
+    const convo = fromStore.map((m, i) => {
+      if (i !== latestUserIdx) return m;
+      return {
+        role: 'user',
+        content: `<system-reminder>\n${sys}\n</system-reminder>\n\n${m.content}`,
+      };
+    });
+    if (latestUserIdx === -1) {
+      // No user messages at all — send the reminder as the only message.
+      convo.push({ role: 'user', content: `<system-reminder>\n${sys}\n</system-reminder>` });
     }
 
     log(`turn ${turn}: ${convo.length} msgs · current=${cur?.id} · t1=${t1Tokens}/${TIER_1_BUDGET}`);
@@ -2264,6 +2279,205 @@ async function saveRecentProjects(projects) {
     await mkdir(path.dirname(RECENT_FILE), { recursive: true });
     await writeFile(RECENT_FILE, JSON.stringify({ projects }, null, 2), 'utf8');
   } catch (e) { console.error('[recent] save failed:', e.message); }
+}
+
+/**
+ * Walk the assembled diagnostics object and return a list of findings —
+ * problems (or confirmations) detected by inspecting the raw data so the
+ * user doesn't have to spot them by eye. Each finding has:
+ *   - severity: 'ok' | 'info' | 'warn' | 'critical'
+ *   - category: 'prompt' | 'fileLog' | 'stderr' | 'gemini' | 'state' | 'config' | 'overall'
+ *   - title:    one-line headline
+ *   - detail:   longer explanation (optional)
+ *
+ * Pure function over the diag object — no I/O, no side effects — so it's
+ * unit-testable. Add new checks here as we learn new failure modes.
+ */
+function runDiagnosticChecks(diag) {
+  const findings = [];
+  const txs = (diag.transactions?.events ?? []).filter((e) => e.type === 'chat_completions');
+  const lastChat = txs[txs.length - 1];
+
+  // 1. System reminder injection. After our recent change, the reminder is
+  //    prepended INSIDE the latest user message. If it's missing, Gemini
+  //    will never see the code_boss instructions and may answer as the
+  //    Gemini Enterprise built-in agent. This is the single most useful
+  //    check when debugging "the model is ignoring instructions".
+  if (lastChat?.request?.messages) {
+    const msgs = lastChat.request.messages;
+    let lastUserIdx = -1;
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      if (msgs[i].role === 'user') { lastUserIdx = i; break; }
+    }
+    if (lastUserIdx >= 0) {
+      const content = String(msgs[lastUserIdx].content ?? '');
+      const hasReminder = content.includes('<system-reminder>');
+      const reminderAtStart = content.trimStart().startsWith('<system-reminder>');
+      if (hasReminder && reminderAtStart) {
+        findings.push({
+          severity: 'ok', category: 'prompt',
+          title: 'System reminder is at the start of the latest user message',
+          detail: `convo has ${msgs.length} message(s); reminder prepended to msg[${lastUserIdx}] (role=user)`,
+        });
+      } else if (hasReminder) {
+        findings.push({
+          severity: 'warn', category: 'prompt',
+          title: 'System reminder present but NOT at the start of the latest user message',
+          detail: 'Instructions buried mid-message are easier for the model to ignore than ones at the start.',
+        });
+      } else {
+        findings.push({
+          severity: 'critical', category: 'prompt',
+          title: 'System reminder MISSING from the latest user message',
+          detail: `Gemini will not see code_boss instructions. Latest user msg starts: "${content.slice(0, 140)}"`,
+        });
+      }
+    } else {
+      findings.push({
+        severity: 'warn', category: 'prompt',
+        title: 'Last request had no user message',
+        detail: `request had ${msgs.length} message(s), none with role=user`,
+      });
+    }
+  } else if (txs.length === 0) {
+    findings.push({
+      severity: 'info', category: 'state',
+      title: 'No chat transactions yet — send a message to enable more checks',
+    });
+  }
+
+  // 2. File logging actually working? We had a bug where fileLog silently
+  //    failed because mkdirSync wasn't in the bundle. Catch a regression
+  //    of that class by checking the log file on disk.
+  if (diag.project?.logFilePath) {
+    if (diag.project.logFileExists === false) {
+      findings.push({
+        severity: 'critical', category: 'fileLog',
+        title: 'Log file does NOT exist on disk',
+        detail: `Expected at ${diag.project.logFilePath}. fileLog may be silently failing — check the stderr section for ReferenceError / mkdirSync errors.`,
+      });
+    } else if (diag.project.logFileBytes === 0 && (diag.server?.uptimeMs ?? 0) > 30_000) {
+      findings.push({
+        severity: 'warn', category: 'fileLog',
+        title: 'Log file exists but is 0 bytes after 30s+ uptime',
+        detail: 'No fileLog writes have landed. Either the server is fully idle, or writes are failing somewhere.',
+      });
+    }
+  }
+
+  // 3. Errors / exceptions surfaced in the stderr ring buffer.
+  const stderr = diag.stderr ?? [];
+  const errorPatterns = [
+    /\bReferenceError\b/,
+    /\bTypeError\b/,
+    /\bSyntaxError\b/,
+    /is not defined/,
+    /\bENOENT\b/,
+    /\bEACCES\b/,
+    /\bEADDRINUSE\b/,
+    /FAILED TO START/,
+    /\bUncaught\b/,
+    /\[fileLog\] file write FAILED/,
+  ];
+  const stderrErrors = stderr.filter((e) => errorPatterns.some((re) => re.test(e.line ?? '')));
+  for (const e of stderrErrors.slice(-3)) {
+    findings.push({
+      severity: 'critical', category: 'stderr',
+      title: 'Error captured in stderr buffer',
+      detail: (e.line ?? '').slice(0, 300),
+    });
+  }
+
+  // 4. Gemini identity drift — assistant responding as Gemini Enterprise
+  //    built-in instead of code_boss. Strong signal that the system prompt
+  //    didn't land or got overridden.
+  const identityPatterns = [
+    /\bI am Gemini Enterprise\b/i,
+    /\bI(?:'| a)m Gemini(?:\b|,|\.)/i,
+    /\bMemory Bank agent\b/i,
+    /\bI can help you with (?:Jira|Drive|Calendar|Gmail|Confluence)/i,
+    /\bGenerate Memories\b/i,
+    /\bI am a large language model\b/i,
+  ];
+  const recentResponses = txs.slice(-5);
+  for (const tx of recentResponses) {
+    const content = tx?.response?.choices?.[0]?.message?.content ?? '';
+    const matched = identityPatterns.find((re) => re.test(content));
+    if (matched) {
+      findings.push({
+        severity: 'warn', category: 'gemini',
+        title: 'Assistant replied as a Gemini built-in persona, not as code_boss',
+        detail: `Matched "${matched.source}". Response starts: "${content.slice(0, 160)}"`,
+      });
+      break;
+    }
+  }
+
+  // 5. finish_reason — length truncation or content filter hits.
+  for (const tx of recentResponses) {
+    const fr = tx?.response?.choices?.[0]?.finish_reason;
+    if (fr === 'length') {
+      findings.push({
+        severity: 'warn', category: 'gemini',
+        title: 'A recent response was cut off (finish_reason=length)',
+        detail: 'The model hit max_tokens before finishing. Consider raising the cap.',
+      });
+      break;
+    }
+    if (fr === 'content_filter') {
+      findings.push({
+        severity: 'critical', category: 'gemini',
+        title: 'A recent response was blocked (finish_reason=content_filter)',
+      });
+      break;
+    }
+  }
+
+  // 6. Stale state hint — many messages on what might be a fresh session.
+  if (lastChat?.request?.messages?.length >= 20) {
+    findings.push({
+      severity: 'info', category: 'state',
+      title: `Conversation has ${lastChat.request.messages.length} messages`,
+      detail: 'If this is unexpected for the current session, you may have loaded a stale .agent/tasks/state.json from a previous run. Reset to start fresh.',
+    });
+  }
+
+  // 7. Chat is stuck in 'running' for a long time.
+  if (diag.chat?.status === 'running' && (diag.chat.chatStartedAgoMs ?? 0) > 120_000) {
+    findings.push({
+      severity: 'warn', category: 'state',
+      title: `Chat has been 'running' for ${Math.round(diag.chat.chatStartedAgoMs / 1000)}s`,
+      detail: 'May be stuck. Consider aborting and retrying.',
+    });
+  }
+
+  // 8. Basic config sanity.
+  if (!diag.project?.activeProject) {
+    findings.push({
+      severity: 'warn', category: 'config',
+      title: 'No active project — chat will fail until one is opened',
+    });
+  }
+  const keyPfx = diag.config?.apiKeyPrefix;
+  if (!keyPfx || keyPfx === '(none)' || keyPfx === '') {
+    findings.push({
+      severity: 'warn', category: 'config',
+      title: 'No API key configured',
+      detail: 'Edit API_KEY in the bundle CONFIG section.',
+    });
+  }
+
+  // If nothing notable came up, lead with a positive ok finding so the
+  // user can see at a glance "the analyzer ran and found nothing wrong"
+  // instead of wondering whether it ran at all.
+  if (!findings.some((f) => f.severity === 'critical' || f.severity === 'warn')) {
+    findings.unshift({
+      severity: 'ok', category: 'overall',
+      title: 'No problems detected by automated checks',
+    });
+  }
+
+  return findings;
 }
 
 /** Open a native folder-picker dialog; resolve to the selected absolute path
@@ -2655,9 +2869,9 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
         return sendJson(res, 200, chatState.chatStateSnapshot({ eventLimit: limit }));
       }
       if (req.method === 'GET' && path === '/api/diagnostics') {
-        // One-stop diagnostic dump. Rendered as a full-page view by the Snapshot
-        // UI. Designed to be useful when something is stuck and we don't even
-        // know if the server is alive.
+        // One-stop diagnostic dump + investigative findings. Rendered as a
+        // full-page view by the Snapshot UI. Findings are surfaced at the top
+        // of the view so the user doesn't have to spot problems by eye.
         const lf = logFilePath();
         let logExists = false, logBytes = 0, logTail = '';
         if (lf) {
@@ -2687,7 +2901,7 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
           multiCallTurns: allBatches.filter((n) => n > 1).length,
           batches: allBatches,
         };
-        return sendJson(res, 200, {
+        const diag = {
           build: {
             version: BUILD_VERSION_RUNTIME,
             startedAt: session.startedAt,
@@ -2735,7 +2949,9 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
           },
           stderr: stderrBuffer.slice(-200),  // last 200 lines
           logTail,
-        });
+        };
+        diag.findings = runDiagnosticChecks(diag);
+        return sendJson(res, 200, diag);
       }
       if (req.method === 'GET' && path === '/api/events') {
         const beforeId = url.searchParams.get('before');
@@ -3490,10 +3706,139 @@ const UI_HTML = `<!DOCTYPE html>
     width: 100%;
     overflow: hidden;
   }
-  /* Snapshot is a full-page dense diagnostic view, not a small modal. */
-  .modal-bg.fullpage { padding: 0; }
-  .modal-bg.fullpage .modal { max-width: none; border-radius: 0; min-height: 100vh; }
-  .modal-bg.fullpage .modal-body { max-height: none; }
+  /* Snapshot is a full-page dense diagnostic view, not a small modal.
+     Designed to fit ENTIRELY on one screen with NO scrolling, so a single
+     screenshot captures every section. Every cell uses overflow: hidden
+     so content that doesn't fit gets clipped rather than pushing the
+     layout off-screen. Fonts shrink to ~9-10px to pack in the data. */
+  .modal-bg.fullpage {
+    padding: 0;
+    align-items: stretch;
+    overflow: hidden;
+    height: 100vh;
+  }
+  .modal-bg.fullpage .modal {
+    max-width: none;
+    border-radius: 0;
+    min-height: 0;
+    height: 100vh;
+    width: 100vw;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .modal-bg.fullpage .modal-header { padding: 3px 8px; flex: 0 0 auto; }
+  .modal-bg.fullpage .modal-header h2 { font-size: 11px; }
+  .modal-bg.fullpage .modal-close { font-size: 14px; padding: 0 6px; }
+  .modal-bg.fullpage .modal-body {
+    padding: 3px 4px 4px;
+    max-height: none;
+    flex: 1 1 auto;
+    overflow: hidden;
+    min-height: 0;
+    display: grid;
+    gap: 3px;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-rows: auto auto auto minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-areas:
+      "findings findings"
+      "summary  summary"
+      "pills    pills"
+      "stderr   txreq"
+      "log      txresp"
+      "events   tx";
+  }
+  .modal-bg.fullpage .diag-findings {
+    grid-area: findings;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    padding: 3px 4px;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    background: #15140f;
+    font-family: var(--mono);
+    font-size: 10px;
+    line-height: 1.25;
+    overflow: hidden;
+  }
+  .modal-bg.fullpage .diag-finding {
+    display: flex;
+    gap: 6px;
+    align-items: baseline;
+    padding: 1px 2px;
+  }
+  .modal-bg.fullpage .diag-finding .sev {
+    font-weight: bold;
+    flex: 0 0 auto;
+    min-width: 56px;
+    padding: 0 4px;
+    border-radius: 2px;
+    text-align: center;
+    font-size: 9px;
+  }
+  .modal-bg.fullpage .diag-finding .sev.ok       { background: rgba(70,160,70,0.25);  color: #8fd28f; }
+  .modal-bg.fullpage .diag-finding .sev.info     { background: rgba(100,140,200,0.22); color: #9fc4e8; }
+  .modal-bg.fullpage .diag-finding .sev.warn     { background: rgba(227,196,106,0.22); color: #e3c46a; }
+  .modal-bg.fullpage .diag-finding .sev.critical { background: rgba(220,80,80,0.25);   color: #ff8f8f; }
+  .modal-bg.fullpage .diag-finding .cat   { color: var(--muted); flex: 0 0 auto; min-width: 56px; }
+  .modal-bg.fullpage .diag-finding .body  { color: var(--fg); flex: 1 1 auto; word-break: break-word; }
+  .modal-bg.fullpage .diag-finding .body .det { color: var(--muted); margin-left: 6px; }
+  .modal-bg.fullpage .diag-summary {
+    font-size: 10px;
+    line-height: 1.15;
+    padding: 4px 6px;
+    margin: 0;
+    grid-area: summary;
+    overflow: hidden;
+    border-width: 1px;
+  }
+  .modal-bg.fullpage .snap-pills {
+    grid-area: pills;
+    margin: 0 !important;
+    font-size: 10px !important;
+    padding: 0 2px;
+    gap: 6px !important;
+  }
+  .modal-bg.fullpage .snap-pills .pill { font-size: 9px; padding: 0 5px; }
+  .modal-bg.fullpage .diag-section {
+    margin: 0;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .modal-bg.fullpage .diag-section.area-stderr { grid-area: stderr; }
+  .modal-bg.fullpage .diag-section.area-log    { grid-area: log; }
+  .modal-bg.fullpage .diag-section.area-events { grid-area: events; }
+  .modal-bg.fullpage .diag-section.area-tx     { grid-area: tx; }
+  .modal-bg.fullpage .diag-section.area-txreq  { grid-area: txreq; }
+  .modal-bg.fullpage .diag-section.area-txresp { grid-area: txresp; }
+  .modal-bg.fullpage .diag-section h3 {
+    margin: 0;
+    font-size: 9px;
+    padding: 1px 4px 2px;
+    flex: 0 0 auto;
+    letter-spacing: 0.3px;
+  }
+  .modal-bg.fullpage .diag-block {
+    font-size: 9px;
+    line-height: 1.18;
+    padding: 2px 5px;
+    margin: 0;
+    max-height: none;
+    overflow: hidden;
+    flex: 1 1 auto;
+    min-height: 0;
+  }
+  .modal-bg.fullpage .diag-table-wrap {
+    flex: 1 1 auto;
+    overflow: hidden;
+    min-height: 0;
+  }
+  .modal-bg.fullpage .diag-table { font-size: 9px; }
+  .modal-bg.fullpage .diag-table th,
+  .modal-bg.fullpage .diag-table td { padding: 1px 4px; line-height: 1.18; }
 
   .modal.error { border-top: 4px solid var(--error); }
   .modal-header {
@@ -4261,45 +4606,76 @@ const UI_HTML = `<!DOCTYPE html>
         ? \`(log file does NOT exist on disk — fileLog may be silently failing to write)\`
         : '(no log content)');
 
+    // Per-section content. The fullpage CSS arranges these into a fixed
+    // grid that fills the viewport with overflow: hidden — sections that
+    // run long are clipped at their cell boundary rather than scrolling.
+    const txReqJson  = lastTx?.request  != null ? JSON.stringify(lastTx.request,  null, 2) : '';
+    const txRespJson = lastTx?.response != null ? JSON.stringify(lastTx.response, null, 2) : '';
+
+    // Findings: server-side investigative analysis. Color-coded by severity
+    // so the user can screenshot one frame and immediately see what's wrong.
+    const findings = Array.isArray(d.findings) ? d.findings : [];
+    const findingsHtml = findings.length
+      ? findings.map((f) => {
+          const sev  = String(f.severity ?? 'info').toLowerCase();
+          const cat  = String(f.category ?? '').toLowerCase();
+          const det  = f.detail ? \`<span class="det">— \${escapeHtml(String(f.detail))}</span>\` : '';
+          return \`<div class="diag-finding">
+            <span class="sev \${escapeHtml(sev)}">\${escapeHtml(sev.toUpperCase())}</span>
+            <span class="cat">\${escapeHtml(cat)}</span>
+            <span class="body">\${escapeHtml(String(f.title ?? ''))}\${det}</span>
+          </div>\`;
+        }).join('')
+      : \`<div class="diag-finding"><span class="sev info">INFO</span><span class="body">no findings — analyzer didn't run</span></div>\`;
+
     $modalBody.innerHTML = \`
+      <div class="diag-findings">\${findingsHtml}</div>
+
       <pre class="diag-summary">\${escapeHtml(dense)}</pre>
-      <div style="margin: 6px 0 12px; display:flex; gap:8px; align-items:center; font-size:12px;">
+
+      <div class="snap-pills" style="display:flex; gap:8px; align-items:center;">
         \${statusPill}
         <span class="pill idle">build \${escapeHtml(build.version ?? '?')}</span>
         <a href="#" onclick="openSnapshot(); return false" style="color: var(--accent); margin-left:auto;">↻ Refresh</a>
       </div>
 
-      <div class="diag-section">
-        <h3>STDERR buffer (last \${stderr.length} lines — captured even if file log fails)</h3>
+      <div class="diag-section area-stderr">
+        <h3>STDERR (\${stderr.length} lines)</h3>
         <div class="diag-block">\${escapeHtml(stderrBlock)}</div>
       </div>
 
-      <div class="diag-section">
-        <h3>Log file tail (\${project.logFilePath ?? 'no project'})</h3>
+      <div class="diag-section area-log">
+        <h3>Log file tail · \${escapeHtml(project.logFilePath ?? 'no project')}</h3>
         <div class="diag-block">\${logBlock}</div>
       </div>
 
-      <div class="diag-section">
-        <h3>Chat events (\${chatEvents.length} total · showing last \${Math.min(chatEvents.length, 200)})</h3>
-        \${chatEvents.length
-          ? \`<table class="diag-table"><thead><tr><th>id</th><th>type</th><th>task</th><th>content (truncated)</th></tr></thead><tbody>\${chatEventsRows}</tbody></table>\`
-          : '<p style="color:var(--muted)">No chat events yet.</p>'}
+      <div class="diag-section area-txreq">
+        <h3>Last TX request\${lastTx ? '' : ' (none yet)'}</h3>
+        <div class="diag-block">\${lastTx && txReqJson ? escapeHtml(txReqJson) : '(no request captured)'}</div>
       </div>
 
-      <div class="diag-section">
-        <h3>LLM transactions (\${tx.count} total · showing last \${Math.min(tx.count, 100)})</h3>
-        \${tx.count
-          ? \`<table class="diag-table"><thead><tr><th>at +ms</th><th>type</th><th>summary</th></tr></thead><tbody>\${txRows}</tbody></table>\`
-          : '<p style="color:var(--muted)">No transactions yet.</p>'}
+      <div class="diag-section area-txresp">
+        <h3>Last TX response\${lastTx ? ' · finish=' + escapeHtml(String(lastFinish)) : ''}</h3>
+        <div class="diag-block">\${lastTx && txRespJson ? escapeHtml(txRespJson) : '(no response captured)'}</div>
       </div>
 
-      \${lastTx ? \`
-      <div class="diag-section">
-        <h3>Most recent transaction — full payload</h3>
-        \${lastTx.request != null ? \`<h4 style="margin:6px 0 2px;font-size:12px;color:var(--muted)">request</h4><div class="diag-block">\${escapeHtml(JSON.stringify(lastTx.request, null, 2)).slice(0, 8000)}</div>\` : ''}
-        \${lastTx.response != null ? \`<h4 style="margin:6px 0 2px;font-size:12px;color:var(--muted)">response</h4><div class="diag-block">\${escapeHtml(JSON.stringify(lastTx.response, null, 2)).slice(0, 12000)}</div>\` : ''}
+      <div class="diag-section area-events">
+        <h3>Chat events (\${chatEvents.length})</h3>
+        <div class="diag-table-wrap">
+          \${chatEvents.length
+            ? \`<table class="diag-table"><thead><tr><th>id</th><th>type</th><th>task</th><th>content</th></tr></thead><tbody>\${chatEventsRows}</tbody></table>\`
+            : '<p style="color:var(--muted);font-size:9px;margin:2px 4px;">none</p>'}
+        </div>
       </div>
-      \` : ''}
+
+      <div class="diag-section area-tx">
+        <h3>LLM transactions (\${tx.count})</h3>
+        <div class="diag-table-wrap">
+          \${tx.count
+            ? \`<table class="diag-table"><thead><tr><th>+ms</th><th>type</th><th>summary</th></tr></thead><tbody>\${txRows}</tbody></table>\`
+            : '<p style="color:var(--muted);font-size:9px;margin:2px 4px;">none</p>'}
+        </div>
+      </div>
     \`;
     $modalBg.classList.add('show');
   }
