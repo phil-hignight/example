@@ -15,7 +15,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '3';
+const BUILD_VERSION = '12';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
@@ -552,7 +552,7 @@ function shortDiffSummary(oldText, newText) {
  * Demotion runs lazily when a tier exceeds budget (with hysteresis).
  *
  * Storage layout (per project):
- *   <project>/.agent/tasks/
+ *   <project>/.code_boss/tasks/
  *     state.json                  { nextId, currentId, rootId, allTaskIds: [...] }
  *     T-1.json                    full task record (see TaskRecord shape below)
  *     T-2.json
@@ -591,7 +591,7 @@ function tokensOf(s) { return Math.ceil((s || '').length / 4); }
 
 function createTasksStore(projectDir) {
   if (!projectDir) throw new Error('projectDir required');
-  const dir = path.join(projectDir, '.agent', 'tasks');
+  const dir = path.join(projectDir, '.code_boss', 'tasks');
 
   let state = null;            // { nextId, currentId, rootId, allTaskIds: [] }
   const cache = new Map();     // id -> TaskRecord (lazy)
@@ -972,7 +972,7 @@ function createTasksStore(projectDir) {
  * blowing up the context window. Truncation is explicitly marked.
  */
 
-const IGNORE_DIRS = new Set(['node_modules', '.git', 'dist', '.agent', 'coverage']);
+const IGNORE_DIRS = new Set(['node_modules', '.git', 'dist', '.code_boss', '.agent', 'coverage']);
 const TEXT_EXTS = new Set([
   '.mjs', '.js', '.ts', '.tsx', '.jsx', '.json', '.md', '.txt', '.yml', '.yaml',
   '.sh', '.ps1', '.bat', '.cmd', '.py', '.go', '.rs', '.java', '.xml', '.html',
@@ -1143,7 +1143,7 @@ const tools = {
 
   grep: {
     schema: {
-      description: 'Recursively search files in the project for a regular expression (Extended-regex / POSIX). Returns "file:line:text" entries. Up to ' + MAX_GREP_MATCHES + ' matches. Backed by real grep — bare globs like "*.java" work recursively.',
+      description: 'Recursively search files in the project for a JavaScript regular expression. Returns "file:line:text" entries (forward-slash paths). Up to ' + MAX_GREP_MATCHES + ' matches. Pure Node implementation — works on Windows without grep/Git for Windows. Binary files and common build dirs (node_modules, target, dist, .git, etc.) are skipped automatically.',
       parameters: {
         type: 'object',
         properties: {
@@ -1158,53 +1158,78 @@ const tools = {
     },
     impl: async ({ pattern, path: subPath, glob, flags }) => {
       if (typeof pattern !== 'string' || !pattern) throw new Error('pattern is required');
-      // Build a real grep invocation. -r recursive, -n line numbers, -E
-      // extended regex, -I skip binary files, --exclude-dir to skip noise.
-      const args = ['-rnEI'];
-      if ((flags ?? '').includes('i')) args.push('-i');
-      for (const d of ['.git', 'node_modules', 'dist', 'target', '.agent', '.idea', '.gradle', 'build']) {
-        args.push(`--exclude-dir=${d}`);
+      // Pure Node implementation — no external `grep` binary needed (DoD
+      // Windows machines often lack Git for Windows / WSL so spawn('grep')
+      // fails with ENOENT). Walks the tree, opens each text file, matches
+      // each line against the pattern, and emits "file:line:content".
+      //
+      // We use JS RegExp instead of POSIX ERE — slightly more permissive
+      // but in practice any ERE pattern parses fine here.
+      let re;
+      try {
+        re = new RegExp(pattern, (flags ?? '').includes('i') ? 'i' : '');
+      } catch (e) {
+        return `ERROR: invalid pattern: ${e.message}`;
       }
-      if (glob) args.push(`--include=${glob}`);
-      args.push('-m', String(MAX_GREP_MATCHES));   // grep's per-file cap; close enough
-      args.push('-e', pattern);
-      args.push(subPath || '.');
+      const globRe = glob ? globToRegex(glob) : null;
+      const exclude = new Set(['.git', 'node_modules', 'dist', 'target', '.code_boss', '.agent', '.idea', '.gradle', 'build', 'coverage']);
+      const rootAbs = subPath ? path.resolve(process.cwd(), subPath) : process.cwd();
 
-      const isWin = process.platform === 'win32';
-      // On Windows, grep typically comes from Git for Windows. Spawn it
-      // directly (works in PowerShell-or-cmd environments alike).
-      // On POSIX, /usr/bin/grep is in PATH.
-      const result = await new Promise((resolve) => {
-        let out = '', err = '', settled = false;
-        const child = spawn('grep', args, {
-          cwd: process.cwd(),
-          windowsHide: true,
-          env: process.env,
-        });
-        const timer = setTimeout(() => {
-          if (process.platform === 'win32' && child.pid) {
-            try { spawn('taskkill', ['/F', '/T', '/PID', String(child.pid)], { windowsHide: true }); } catch {}
-          } else {
-            try { child.kill('SIGKILL'); } catch {}
+      // Walk inline so we can short-circuit when MAX_GREP_MATCHES is hit.
+      const out = [];
+      let stopped = false;
+      async function walk(dir) {
+        if (stopped) return;
+        let entries;
+        try { entries = await readdir(dir, { withFileTypes: true }); }
+        catch { return; }
+        for (const e of entries) {
+          if (stopped) return;
+          if (e.isDirectory()) {
+            if (exclude.has(e.name)) continue;
+            await walk(path.join(dir, e.name));
+            continue;
           }
-        }, 30000); // 30s cap — grep is fast
-        child.stdout.on('data', (d) => { if (out.length < MAX_RESULT_BYTES) out += d.toString('utf8'); });
-        child.stderr.on('data', (d) => { if (err.length < 4096) err += d.toString('utf8'); });
-        child.on('error', (e) => { if (!settled) { settled = true; clearTimeout(timer); resolve({ code: -1, out: '', err: 'grep not found: ' + e.message }); } });
-        child.on('close', (code) => { if (!settled) { settled = true; clearTimeout(timer); resolve({ code, out, err }); } });
-      });
+          if (!e.isFile()) continue;
+          const full = path.join(dir, e.name);
+          // Glob filter applies to the path RELATIVE to cwd (forward slashes).
+          if (globRe) {
+            const rel = path.relative(process.cwd(), full).replace(/\\/g, '/');
+            if (!globRe.test(rel) && !globRe.test(e.name)) continue;
+          }
+          // Skip files that are obviously binary by extension. Cheap heuristic
+          // beats reading every PNG / JAR / class file in a Java project.
+          const lower = e.name.toLowerCase();
+          if (/\.(png|jpe?g|gif|ico|bmp|webp|pdf|zip|jar|war|ear|class|exe|dll|so|dylib|bin|lock|woff2?|ttf|otf|eot|mp[34]|wav|ogg|mov|mkv|avi|tar|gz|7z|rar)$/.test(lower)) continue;
+          // Read the file; skip if unreadable or if the first chunk contains
+          // null bytes (binary).
+          let text;
+          try {
+            const buf = await readFile(full);
+            if (buf.length === 0) continue;
+            const head = buf.subarray(0, Math.min(buf.length, 8192));
+            if (head.includes(0)) continue;  // binary
+            text = buf.toString('utf8');
+          } catch { continue; }
 
-      // grep exit codes: 0 = found, 1 = no match, 2 = error
-      if (result.code === 1 || (result.code === 0 && !result.out)) return '(no matches)';
-      if (result.code !== 0 && result.code !== 1) {
-        return `ERROR: grep exited ${result.code}: ${result.err.split('\n')[0].slice(0, 200)}`;
+          const lines = text.split(/\r?\n/);
+          for (let i = 0; i < lines.length; i++) {
+            if (re.test(lines[i])) {
+              const relPath = path.relative(process.cwd(), full).replace(/\\/g, '/') || full.replace(/\\/g, '/');
+              const line = lines[i].length > 500 ? lines[i].slice(0, 500) + '…' : lines[i];
+              out.push(`${relPath}:${i + 1}:${line}`);
+              if (out.length >= MAX_GREP_MATCHES) {
+                out.push(`[stopped at ${MAX_GREP_MATCHES} matches]`);
+                stopped = true;
+                return;
+              }
+            }
+          }
+        }
       }
-      // Normalize Windows path separators to forward slash for consistency.
-      const lines = result.out.split('\n').filter(Boolean).map((l) => l.replace(/\\/g, '/'));
-      const trimmed = lines.length > MAX_GREP_MATCHES
-        ? lines.slice(0, MAX_GREP_MATCHES).concat([`[stopped at ${MAX_GREP_MATCHES} matches]`])
-        : lines;
-      return ensureFits(trimmed.join('\n'));
+      await walk(rootAbs);
+      if (out.length === 0) return '(no matches)';
+      return ensureFits(out.join('\n'));
     },
   },
 
@@ -2305,7 +2330,7 @@ async function runPromptedAgent({
   adapter,
   messages,           // [{role, content}] from the browser; we only care about the last user message
   model,
-  projectDir,         // required: where .agent/tasks/ lives
+  projectDir,         // required: where .code_boss/tasks/ lives
   maxTurns = DEFAULT_MAX_TURNS,
   // Legacy callbacks (used by /api/chat SSE response):
   onText, onToolCalls, onToolResult, onLog,
@@ -2888,7 +2913,7 @@ const QUERY_CATALOG = [
   },
   {
     id: 32, name: 'Log file tail', category: 'server',
-    description: 'Tail of <project>/.agent/code-boss.log.',
+    description: 'Tail of <project>/.code_boss/code-boss.log.',
     sizeHint: { cols: 6, rows: 4 },
     compute: (d) => {
       const t = d.logTail;
@@ -3425,7 +3450,7 @@ function runDiagnosticChecks(diag) {
     findings.push({
       severity: 'info', category: 'state',
       title: `Conversation has ${msgCount} messages — may be stale state from disk`,
-      detail: 'If unexpected, you may have loaded a stale .agent/tasks/state.json. Reset to start fresh.',
+      detail: 'If unexpected, you may have loaded a stale .code_boss/tasks/state.json. Reset to start fresh.',
     });
   } else if (msgCount > 0) {
     findings.push({
@@ -3684,7 +3709,7 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
     resetChatState, chatStateSnapshot,
   };
 
-  // Append-only project log at <project>/.agent/code-boss.log. Synchronous
+  // Append-only project log at <project>/.code_boss/code-boss.log. Synchronous
   // writes so a hang leaves a complete log up to the last operation.
   //
   // Always mirrors to stderr too — so even if the project dir is unwritable
@@ -3693,15 +3718,15 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
   // the worst kind of bug; this guarantees something is always visible.
   let logDirEnsured = null;
   let loggedFileWriteWarning = false;       // suppress duplicate "file log unavailable" spam
-  const logFilePath = () => (session.activeProject ? path.join(session.activeProject, '.agent', 'code-boss.log') : null);
+  const logFilePath = () => (session.activeProject ? path.join(session.activeProject, '.code_boss', 'code-boss.log') : null);
   function fileLog(msg) {
     const line = `${new Date().toISOString()}  ${msg}`;
     // 1) Always print to stderr — guaranteed visible in the launcher window.
     try { process.stderr.write(line + '\n'); } catch {}
-    // 2) Append to <project>/.agent/code-boss.log if we can.
+    // 2) Append to <project>/.code_boss/code-boss.log if we can.
     if (!session.activeProject) return;
     try {
-      const dir = path.join(session.activeProject, '.agent');
+      const dir = path.join(session.activeProject, '.code_boss');
       if (logDirEnsured !== dir) {
         mkdirSync(dir, { recursive: true });
         logDirEnsured = dir;
@@ -3710,7 +3735,7 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
     } catch (e) {
       if (!loggedFileWriteWarning) {
         process.stderr.write(`[fileLog] file write FAILED (will continue with stderr only): ${e.message}\n`);
-        process.stderr.write(`[fileLog] attempted path: ${path.join(session.activeProject ?? '?', '.agent', 'code-boss.log')}\n`);
+        process.stderr.write(`[fileLog] attempted path: ${path.join(session.activeProject ?? '?', '.code_boss', 'code-boss.log')}\n`);
         loggedFileWriteWarning = true;
       }
     }
@@ -3722,6 +3747,20 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
       const s = await stat(p);
       if (!s.isDirectory()) throw new Error('not a directory');
     } catch (e) { throw new Error('cannot open: ' + e.message); }
+    // One-time migration: if a legacy .agent/ dir exists and the new
+    // .code_boss/ doesn't, rename it so prior logs + task state carry over.
+    // If both exist, leave them — user can clean up manually.
+    try {
+      const oldDir = path.join(p, '.agent');
+      const newDir = path.join(p, '.code_boss');
+      const oldStat = await stat(oldDir).catch(() => null);
+      if (oldStat?.isDirectory()) {
+        const newStat = await stat(newDir).catch(() => null);
+        if (!newStat) {
+          await rename(oldDir, newDir);
+        }
+      }
+    } catch { /* migration is best-effort */ }
     session.activeProject = p;
     session.recent = [p, ...session.recent.filter((x) => x !== p)].slice(0, MAX_RECENT);
     await saveRecentProjects(session.recent);
@@ -3891,7 +3930,7 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
           : raw.split(',').map((s) => parseInt(s, 10)).filter((n) => Number.isFinite(n));
         const tiles = runQueries(ids, diag);
         const pageCols = Number(url.searchParams.get('cols')) || 12;
-        const pageRows = Number(url.searchParams.get('rows')) || 8;
+        const pageRows = Number(url.searchParams.get('rows')) || 24;
         const layout = layoutMosaic(tiles, pageCols, pageRows, { maxMs: 250 });
         const catalog = QUERY_CATALOG.map((q) => ({
           id: q.id,
@@ -4289,6 +4328,12 @@ const C = process.stdout.isTTY
   : new Proxy({}, { get: () => '' });
 
 async function isInitialized(dir) {
+  // Accept the new .code_boss/ dir OR the legacy .agent/ (which gets
+  // migrated on first open by the server). Either signals this dir has
+  // previously been opened as a code_boss project.
+  try {
+    if ((await stat(path.join(dir, '.code_boss'))).isDirectory()) return true;
+  } catch {}
   try {
     return (await stat(path.join(dir, '.agent'))).isDirectory();
   } catch { return false; }
@@ -4392,6 +4437,22 @@ const UI_HTML = `<!DOCTYPE html>
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
+
+  /* Thin, theme-matched scrollbars everywhere. Firefox / modern Chrome use
+     \`scrollbar-*\` properties; WebKit uses the older pseudo-elements. The
+     \`*\` selector inherits to every scrollable element on the page. */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: #3a3830 transparent;
+  }
+  *::-webkit-scrollbar { width: 8px; height: 8px; }
+  *::-webkit-scrollbar-track { background: transparent; }
+  *::-webkit-scrollbar-thumb {
+    background: #3a3830;
+    border-radius: 4px;
+  }
+  *::-webkit-scrollbar-thumb:hover { background: #4d4a3f; }
+  *::-webkit-scrollbar-corner { background: transparent; }
   body {
     font: 13.5px/1.55 var(--mono);
     color: var(--fg);
@@ -4472,30 +4533,11 @@ const UI_HTML = `<!DOCTYPE html>
   }
   #chat { flex: 1; display: flex; flex-direction: column; min-height: 0; }
 
-  header {
-    background: var(--panel);
-    border-bottom: 1px solid var(--border);
-    padding: 10px 18px;
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    flex-shrink: 0;
-  }
-  header h1 { margin: 0; font-size: 14px; font-weight: 700; color: var(--accent); }
-  header h1::before { content: "✻ "; }
-  header .grow { flex: 1; }
-  header select, header .btn {
-    font: inherit;
-    font-size: 12px;
-    padding: 4px 10px;
-    border: 1px solid var(--border);
-    background: transparent;
-    border-radius: 4px;
-    cursor: pointer;
-    color: var(--muted);
-  }
-  header select { cursor: default; min-width: 180px; color: var(--fg); }
-  header .btn:hover { border-color: var(--accent); color: var(--fg); }
+  /* Header removed in build 7 — controls moved to the settings modal,
+     project path is shown below the input bar. */
+
+  /* Tokens / timeout chips kept as utility styles in case other code
+     references them (e.g., diagnostic / status displays). */
   .chip {
     background: transparent;
     color: var(--muted);
@@ -4513,16 +4555,28 @@ const UI_HTML = `<!DOCTYPE html>
   }
   .log { max-width: 860px; margin: 0 auto; }
 
-  /* User message: subtle gray block with a left accent bar. */
+  /* User message: visually mirrors the input bar — same panel background,
+     accent-colored border + ">" prompt — so the user can scan their own
+     messages at a glance. */
   .bubble.user {
-    background: #2a2823;
-    border-left: 2px solid var(--muted);
-    border-radius: 0 6px 6px 0;
-    padding: 8px 12px;
+    background: var(--panel-alt);
+    border: 1px solid var(--accent);
+    border-radius: 6px;
+    padding: 6px 10px;
     margin: 16px 0;
     white-space: pre-wrap;
     word-wrap: break-word;
     color: var(--fg);
+    display: flex;
+    gap: 8px;
+    align-items: flex-start;
+  }
+  .bubble.user::before {
+    content: ">";
+    color: var(--accent);
+    font-weight: 700;
+    flex-shrink: 0;
+    line-height: 1.55;
   }
   .bubble.system { color: var(--muted); font-size: 12.5px; margin: 12px 0; white-space: pre-wrap; }
 
@@ -4536,25 +4590,48 @@ const UI_HTML = `<!DOCTYPE html>
   .row.tool .body { color: var(--fg); }
   .body code { color: var(--accent); }
 
-  /* Result row — single inline line with hanging indent so the ⎿ sits under the ● and any wrap aligns under the summary text. */
+  /* Result row — "⎿ summary" sits under the body text of the tool row
+     above (one char + gap to the right of the bullet column). Hanging
+     indent pulls "⎿" back so wrapped lines align under the summary text
+     start. The whole row is clickable to expand. */
   .row-result {
     color: var(--muted);
     font-size: 12.5px;
     margin: 1px 0 10px 0;
-    padding-left: 16px;
-    text-indent: -16px;
+    padding-left: 32px;       /* dot col (~16px) + "⎿ " marker (~16px) */
+    text-indent: -16px;       /* pulls "⎿" leftward by its own width → sits at body-text start */
     white-space: pre-wrap;
     word-wrap: break-word;
+    cursor: pointer;
   }
   .row-result.err { color: var(--error); }
-  .row-result .expand { cursor: pointer; text-decoration: underline; font-size: 11px; margin-left: 6px; }
-  .row-result pre { margin: 6px 0 0; text-indent: 0; padding-left: 0; }
+  .row-result.expandable:hover { color: var(--fg); }
+  .row-result pre {
+    margin: 6px 0 0;
+    text-indent: 0;
+    padding: 6px 10px;
+    cursor: text;
+    background: #15140f;
+    border-left: 2px solid #2f2d27;
+    border-radius: 3px;
+    white-space: pre;
+    overflow-x: auto;
+    max-height: 480px;
+    overflow-y: auto;
+    font-size: 12px;
+    color: var(--fg);
+  }
 
-  /* Diff block — appears after a write/edit tool result, showing the unified diff. */
+  /* Diff block — appears after a write/edit tool result, showing the unified
+     diff. Visually distinguished from a .task-wrap (which is a rounded box
+     around closed tasks) by using a quote-bar style: no surrounding border,
+     just a thin accent strip on the left + a darker background. Reads more
+     like a code excerpt than a container. */
   .diff-block {
     margin: 4px 0 12px 24px;
-    border: 1px solid #2f2d27;
-    border-radius: 4px;
+    border: none;
+    border-left: 2px solid #4a463a;
+    border-radius: 0;
     background: #15140f;
     overflow: hidden;
     font-family: var(--mono);
@@ -4562,13 +4639,14 @@ const UI_HTML = `<!DOCTYPE html>
     line-height: 1.5;
   }
   .diff-block .diff-hdr {
-    background: #1f1d18;
+    background: transparent;
     color: var(--muted);
-    padding: 4px 10px;
+    padding: 2px 10px;
     font-size: 11px;
     display: flex;
     justify-content: space-between;
     align-items: center;
+    border-bottom: 1px solid #2a2823;
   }
   .diff-block .diff-hdr .expand { cursor: pointer; text-decoration: underline; color: var(--accent); }
   .diff-block .diff-body { padding: 6px 0; max-height: 320px; overflow-y: auto; }
@@ -4579,75 +4657,114 @@ const UI_HTML = `<!DOCTYPE html>
   .diff-block .dl.hunk { color: var(--muted); }
   .diff-block .dl.same { color: var(--muted); }
 
-  /* ── Task wraps (Phase 5) ───────────────────────────────────────────────
-     Reserve a fixed-width gutter on the left for ALL chat content. The
-     gutter is empty when an event is outside any wrap; when inside a closed
-     task or a project rollup, vertical line(s) fill the gutter.
-     Crucially: message content x-position is CONSTANT regardless of nesting. */
-  .log {
-    /* Constant left padding reserves gutter space for up to 2 lines (~12px). */
-    padding-left: 16px;
-  }
+  /* ── Task wraps ─────────────────────────────────────────────────────────
+     Previously drawn with ASCII chrome (┌, └─, ↳) and a fixed left gutter
+     so the box "borders" lined up with the terminal-y typography. Replaced
+     by real CSS borders: each closed task becomes a rounded-cornered box
+     with a header band (toggle + task id + user request) and a footer band
+     (summary). Project rollups get an accent-colored border so nested
+     hierarchies are visually distinct. */
   .task-wrap {
-    position: relative;
-    margin: 12px 0;
+    /* Negative horizontal margin cancels out the wrap's border + body
+       padding so messages INSIDE the wrap sit at the same x-position as
+       messages OUTSIDE — when a task closes, the box just appears around
+       its content, nothing shifts. -11px = -(1px border + 10px body padding). */
+    margin: 12px -11px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow: hidden;     /* clip the header/footer band corners */
+    background: transparent;
   }
   .task-wrap .task-head,
   .task-wrap .task-foot {
-    /* Headers/footers extend full width INCLUDING the gutter columns. */
-    color: var(--muted);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 10px;
     font-size: 12px;
-    margin-left: -12px;       /* span into the gutter */
-    padding: 2px 0;
-    white-space: nowrap;
+    color: var(--muted);
+    background: var(--panel-alt);
     overflow: hidden;
-    text-overflow: ellipsis;
   }
-  .task-wrap .task-head { color: var(--accent); }
-  .task-wrap .task-head .ur { color: var(--fg); font-weight: normal; margin-left: 6px; }
-  .task-wrap .task-foot::before { content: '└─ '; color: var(--muted); }
+  .task-wrap .task-head { border-bottom: 1px solid var(--border); }
+  .task-wrap .task-foot {
+    border-top: 1px solid var(--border);
+    white-space: normal;    /* let long summaries wrap inside the band */
+  }
   .task-wrap .task-head .toggle {
     cursor: pointer;
     user-select: none;
-    margin-right: 4px;
+    color: var(--muted);
+    font-size: 10px;
+    flex-shrink: 0;
   }
-  /* Gutter line — sits in the reserved gutter space, between header and footer. */
-  .task-wrap::before {
-    content: '';
-    position: absolute;
-    left: -8px;              /* into the .log padding-left area */
-    top: 22px;
-    bottom: 22px;
-    width: 1px;
-    background: var(--muted);
-    opacity: 0.5;
+  .task-wrap .task-head .task-id {
+    color: var(--accent);
+    font-weight: 600;
+    flex-shrink: 0;
   }
-  /* Project (tier-4) wrap: a second gutter line at a slightly different x. */
-  .task-wrap.project::before { left: -10px; }
-  .task-wrap.project::after {
-    content: '';
-    position: absolute;
-    left: -6px;
-    top: 22px;
-    bottom: 22px;
-    width: 1px;
-    background: var(--muted);
-    opacity: 0.5;
+  .task-wrap .task-head .tag {
+    flex-shrink: 0;
+    font-size: 10px;
+    padding: 0 6px;
+    border-radius: 8px;
+    background: rgba(217, 119, 87, 0.18);
+    color: var(--accent);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
   }
-  /* Collapsed: hide everything inside but the header (which carries the summary). */
+  .task-wrap .task-head .ur {
+    color: var(--fg);
+    flex: 1 1 auto;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+  }
+  .task-wrap .task-body {
+    padding: 6px 10px;
+  }
+  /* Project (tier-4) rollup: accent border + slightly tinted bands. */
+  .task-wrap.project {
+    border-color: var(--accent);
+  }
+  .task-wrap.project > .task-head,
+  .task-wrap.project > .task-foot {
+    background: rgba(217, 119, 87, 0.08);
+  }
+  /* Collapsed: hide body + footer, leave the header band visible. */
   .task-wrap.collapsed .task-body,
   .task-wrap.collapsed .task-foot { display: none; }
-  .task-wrap.collapsed::before,
-  .task-wrap.collapsed::after { display: none; }
+  .task-wrap.collapsed .task-head { border-bottom: none; }
+
+  /* Standalone task-end marker (rendered when task-end fires with no events
+     to wrap retroactively). Small inline pill rather than a full box. */
+  .task-end-marker {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin: 8px 0;
+    padding: 2px 10px;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    font-size: 11px;
+    color: var(--muted);
+    background: var(--panel-alt);
+  }
+  .task-end-marker .task-id { color: var(--accent); font-weight: 600; }
+  .task-end-marker .ur { color: var(--fg); }
 
   /* Mute: applied to content the LLM no longer sees (results masked at tier 2,
      whole task at tier 3, whole project's children at tier 4). */
   .muted, .muted * { opacity: 0.42; }
   .muted:hover, .muted:hover * { opacity: 0.85; }
 
-  /* Welcome box (rounded terminal banner). */
+  /* Welcome box (rounded terminal banner). Border is muted gray so only
+     user messages get the accent (orange) outline — the welcome is a
+     system-style banner, not a user message. */
   .welcome {
-    border: 1px solid var(--accent);
+    border: 1px solid var(--border);
     border-radius: 8px;
     padding: 12px 16px;
     margin: 4px 0 20px;
@@ -4676,7 +4793,7 @@ const UI_HTML = `<!DOCTYPE html>
   footer {
     background: var(--panel);
     border-top: 1px solid var(--border);
-    padding: 12px 16px;
+    padding: 10px 16px 8px;
     flex-shrink: 0;
   }
   .input-row {
@@ -4684,45 +4801,113 @@ const UI_HTML = `<!DOCTYPE html>
     margin: 0 auto;
     display: flex;
     gap: 8px;
-    align-items: stretch;
+    align-items: flex-start;
     border: 1px solid var(--border);
     border-radius: 8px;
     background: var(--panel-alt);
-    padding: 8px 10px;
+    padding: 4px 8px;
   }
   .input-row:focus-within { border-color: var(--accent); }
   .input-row::before {
     content: ">";
     color: var(--accent);
     font-weight: 700;
-    padding: 4px 2px 0 4px;
+    line-height: 1.55;
+    flex-shrink: 0;
   }
   textarea {
     flex: 1;
-    min-height: 24px;
+    /* min-height = one body line. Auto-grow JS adjusts up to max-height. */
+    min-height: calc(1em * 1.55);
     max-height: 220px;
-    padding: 3px 4px;
+    padding: 0 2px;
     border: none;
     background: transparent;
     font: inherit;
+    line-height: 1.55;
     color: var(--fg);
     resize: none;
     outline: none;
+    overflow-y: hidden;
   }
   textarea::placeholder { color: var(--muted); }
-  .btn.primary {
-    background: transparent;
-    color: var(--accent);
-    border: 1px solid var(--accent);
-    border-radius: 4px;
-    padding: 4px 16px;
-    font-weight: 700;
-    font: inherit;
-    cursor: pointer;
-    align-self: flex-end;
+
+  /* Sub-bar beneath the input: project path on the left, settings gear on
+     the right. 3/4 of the normal font size, muted color. */
+  .input-subbar {
+    max-width: 860px;
+    margin: 6px auto 0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 10px;
+    color: var(--muted);
+    font-family: var(--mono);
   }
-  .btn.primary:disabled { opacity: 0.4; cursor: not-allowed; }
-  .btn.primary:not(:disabled):hover { background: var(--accent); color: var(--accent-fg); }
+  .input-subbar .proj-path {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    cursor: help;
+  }
+  .input-subbar .settings-btn {
+    background: transparent;
+    border: none;
+    color: var(--muted);
+    cursor: pointer;
+    font-size: 14px;
+    padding: 0 4px;
+    line-height: 1;
+  }
+  .input-subbar .settings-btn:hover { color: var(--accent); }
+
+  /* Settings modal — vertical stack of labeled rows. Reuses .modal-bg. */
+  .settings-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 0;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+  }
+  .settings-row:last-child { border-bottom: none; }
+  .settings-row label {
+    flex: 0 0 110px;
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .settings-row .value { flex: 1; color: var(--fg); word-break: break-all; }
+  .settings-row select,
+  .settings-row input[type="text"] {
+    flex: 1;
+    font: inherit;
+    font-size: 12px;
+    background: var(--panel-alt);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 3px 6px;
+  }
+  .settings-row .btn,
+  .settings-actions .btn {
+    font: inherit;
+    font-size: 12px;
+    padding: 4px 12px;
+    border: 1px solid var(--border);
+    background: transparent;
+    border-radius: 4px;
+    cursor: pointer;
+    color: var(--muted);
+  }
+  .settings-row .btn:hover,
+  .settings-actions .btn:hover { border-color: var(--accent); color: var(--fg); }
+  .settings-actions {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-top: 12px;
+  }
 
   .modal-bg {
     position: fixed; inset: 0;
@@ -4828,13 +5013,17 @@ const UI_HTML = `<!DOCTYPE html>
     background: #15140f; color: var(--muted); border: 1px solid var(--border);
     padding: 0 4px; border-radius: 2px; font-size: 8px;
   }
-  /* Page = 12 cols × 8 rows grid filling the viewport beneath the header. */
+  /* Page = 12 cols × 24 rows grid filling the viewport beneath the header.
+     The vertical resolution is intentionally fine — each row is ~37px in a
+     typical 1080p viewport, just enough for one line of body content plus a
+     fraction of header chrome. This lets short tiles claim 1-2 rows without
+     huge empty space below their content. */
   .mosaic-page {
     position: absolute;
     inset: 0;
     display: grid;
     grid-template-columns: repeat(12, 1fr);
-    grid-template-rows: repeat(8, 1fr);
+    grid-template-rows: repeat(24, 1fr);
     gap: 2px;
     padding: 2px;
     box-sizing: border-box;
@@ -4934,7 +5123,7 @@ const UI_HTML = `<!DOCTYPE html>
   .mosaic-tile-body th, .mosaic-tile-body td { padding: 0 3px; border-bottom: 1px solid #2a2823; text-align: left; vertical-align: top; line-height: 1.05; }
   .mosaic-tile-body th { color: var(--muted); font-weight: normal; }
   /* Catalog index page tile */
-  .mosaic-catalog-tile { grid-column: 1 / span 12; grid-row: 1 / span 8; }
+  .mosaic-catalog-tile { grid-column: 1 / span 12; grid-row: 1 / span 24; }
   .mosaic-catalog-tile .mosaic-tile-body { font-size: 9px; padding: 1px 4px; }
   .mosaic-catalog-tile table { font-size: 9px; }
   .mosaic-catalog-tile th, .mosaic-catalog-tile td { padding: 0 4px; line-height: 1.25; }
@@ -5371,19 +5560,6 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
 </div>
 
 <div id="chat" class="hidden">
-  <header>
-    <h1>code_boss</h1>
-    <span class="project-chip" id="projectChip" title="" onclick="changeProject()">📁 (no project)</span>
-    <select id="model" title="Model"></select>
-    <div class="grow"></div>
-    <div class="chip" id="tokenChip" title="Total tokens this session">0 tokens</div>
-    <div class="chip" id="timeoutChip" title="Click to change agent timeout" onclick="changeTimeout()" style="cursor:pointer">⏱ 30m</div>
-    <button class="btn" onclick="openLog()" title="View the project log (.agent/code-boss.log)">Log</button>
-    <button class="btn" onclick="openSnapshot()">Snapshot</button>
-    <button class="btn" onclick="resetSession()">Reset</button>
-    <button class="btn" onclick="changeProject()" title="Pick a different project">Change project</button>
-  </header>
-
   <main id="logScroll">
     <div class="log" id="log">
       <div class="bubble system">Type a question and press Enter (Shift+Enter for newline).</div>
@@ -5392,13 +5568,52 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
 
   <footer>
     <div class="input-row">
-      <textarea id="input" placeholder="Ask…"></textarea>
-      <button class="btn primary" id="sendBtn" onclick="send()">Send</button>
+      <textarea id="input" placeholder="Ask…" rows="1"></textarea>
+    </div>
+    <div class="input-subbar">
+      <span class="proj-path" id="projectPath" title="">(no project)</span>
+      <button class="settings-btn" id="settingsBtn" onclick="openSettings()" title="Settings">⚙</button>
     </div>
   </footer>
 </div>
 
-<div class="modal-bg" id="modalBg" onclick="if (event.target === this) closeModal()">
+<!-- Settings modal: model, project, timeout, tokens display + action buttons. -->
+<div class="modal-bg" id="settingsModalBg" onclick="if (event.target === this) closeSettings()">
+  <div class="modal" id="settingsModal" style="max-width: 540px;">
+    <div class="modal-header">
+      <h2>Settings</h2>
+      <button class="modal-close" onclick="closeSettings()">&times;</button>
+    </div>
+    <div class="modal-body">
+      <div class="settings-row">
+        <label for="model">Model</label>
+        <select id="model" title="Model"></select>
+      </div>
+      <div class="settings-row">
+        <label>Project</label>
+        <span class="value" id="settingsProject">(none)</span>
+      </div>
+      <div class="settings-row">
+        <label>Timeout</label>
+        <span class="value" id="settingsTimeout">—</span>
+        <button class="btn" onclick="changeTimeout()">Change…</button>
+      </div>
+      <div class="settings-row">
+        <label>Tokens this session</label>
+        <span class="value" id="settingsTokens">0</span>
+      </div>
+      <div class="settings-actions">
+        <button class="btn" onclick="openSnapshot()">Snapshot</button>
+        <button class="btn" onclick="openLog()">Log</button>
+        <button class="btn" onclick="changeProject()">Change project…</button>
+        <button class="btn" onclick="resetSession()">Reset session</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Snapshot/diagnostic modal — stacks over the settings modal when both open. -->
+<div class="modal-bg" id="modalBg" onclick="if (event.target === this) closeModal()" style="z-index: 200;">
   <div class="modal" id="modal">
     <div class="modal-header">
       <h2 id="modalTitle">Snapshot</h2>
@@ -5413,13 +5628,15 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   const $chat = document.getElementById('chat');
   const $pickBtn = document.getElementById('pickBtn');
   const $recentList = document.getElementById('recentList');
-  const $projectChip = document.getElementById('projectChip');
+  const $projectPath = document.getElementById('projectPath');
   const $log = document.getElementById('log');
   const $logScroll = document.getElementById('logScroll');
   const $input = document.getElementById('input');
-  const $send = document.getElementById('sendBtn');
   const $model = document.getElementById('model');
-  const $tokenChip = document.getElementById('tokenChip');
+  const $settingsModalBg = document.getElementById('settingsModalBg');
+  const $settingsProject = document.getElementById('settingsProject');
+  const $settingsTimeout = document.getElementById('settingsTimeout');
+  const $settingsTokens = document.getElementById('settingsTokens');
   const $modalBg = document.getElementById('modalBg');
   const $modal = document.getElementById('modal');
   const $modalTitle = document.getElementById('modalTitle');
@@ -5596,12 +5813,13 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     activeProject = projectPath;
     $landing.classList.add('hidden');
     $chat.classList.remove('hidden');
-    $projectChip.textContent = '📁 ' + basename(projectPath);
-    $projectChip.title = projectPath;
+    $projectPath.textContent = projectPath;
+    $projectPath.title = projectPath;
+    if ($settingsProject) $settingsProject.textContent = projectPath;
     // Fresh chat on project switch
     conversation = [];
     totalTokens = 0;
-    $tokenChip.textContent = '0 tokens';
+    if ($settingsTokens) $settingsTokens.textContent = '0';
     const model = $model.value || SERVER.defaultModel || '(model)';
     $log.innerHTML =
       '<div class="welcome">' +
@@ -5733,27 +5951,31 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   function addResultRow(ev) {
     const row = document.createElement('div');
     row.className = 'row-result' + (ev.status === 'error' ? ' err' : '');
-    // Inline single-line: "⎿ summary  (expand)". Hanging indent handles wraps.
     row.innerHTML = '⎿ ' + escapeHtml(ev.summary);
     if (ev.full && ev.full.length) {
-      const exp = document.createElement('span');
-      exp.className = 'expand';
-      exp.textContent = '(expand)';
+      // No "(expand)" link — clicking anywhere on the row toggles the full
+      // output. Clicks inside the expanded <pre> are ignored so the user
+      // can select text without collapsing.
+      row.classList.add('expandable');
+      row.title = 'click to expand';
       let open = false;
-      exp.onclick = () => {
+      row.addEventListener('click', (e) => {
+        if (e.target.tagName === 'PRE') return;  // don't collapse when interacting with the body
         open = !open;
-        exp.textContent = open ? '(collapse)' : '(expand)';
+        row.title = open ? 'click to collapse' : 'click to expand';
         let pre = row.querySelector('pre');
         if (open) {
           if (!pre) { pre = document.createElement('pre'); pre.textContent = ev.full; row.appendChild(pre); }
           pre.style.display = '';
-        } else if (pre) { pre.style.display = 'none'; }
-      };
-      row.appendChild(exp);
+        } else if (pre) {
+          pre.style.display = 'none';
+        }
+      });
     }
     $log.appendChild(row);
     pinStatusToBottom();
     scrollToBottom();
+    return row;
   }
 
   // Render a unified diff as a code block with + / - / hunk highlights.
@@ -5804,6 +6026,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     $log.appendChild(block);
     pinStatusToBottom();
     scrollToBottom();
+    return block;
   }
 
   // Send a user message. Server pushes back the user-message event via SSE,
@@ -5812,6 +6035,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     const text = $input.value.trim();
     if (!text) return;
     $input.value = '';
+    autoGrowInput();  // shrink the textarea back to one line
     try {
       const r = await fetch('/api/message', {
         method: 'POST',
@@ -5914,37 +6138,48 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     document.body.removeChild(probe);
 
     // Available area for the mosaic = modal body minus its padding. The page
-    // grid splits that area into 12×8 cells. Each cell's INNER capacity =
-    // cell size minus border + tile header + body padding.
+    // grid splits that area into 12×24 cells. We pass charsPerCol and
+    // linesPerRow as FLOATS (not floored) — the layout uses ceil() so a
+    // tile that needs 1.1 rows worth doesn't get rounded down then forced
+    // up to 2 rows by the integer arithmetic.
     const bodyRect = $modalBody.getBoundingClientRect();
+    const pageRows = 24;
     const gap = 2;    // .mosaic-page gap
     const pad = 2;    // .mosaic-page padding
     const cellW = (bodyRect.width  - 2 * pad - 11 * gap) / 12;
-    const cellH = (bodyRect.height - 2 * pad -  7 * gap) /  8;
+    const cellH = (bodyRect.height - 2 * pad - (pageRows - 1) * gap) / pageRows;
     const tileBorderX = 2;       // 1px × 2
     const tileBorderY = 2;
     const tileBodyPadX = 8;      // 4px × 2
     const tileBodyPadY = 3;      // 1px top + 2px bottom
     const tileHeaderH = 14;      // measured from CSS: ~9px font × 1.1 LH + small padding
     const innerW = cellW - tileBorderX - tileBodyPadX;
-    const innerH = cellH - tileBorderY - tileBodyPadY - tileHeaderH;
-    const charsPerCol = Math.max(1, Math.floor(innerW / Math.max(1, charW)));
-    const linesPerRow = Math.max(1, Math.floor(innerH / Math.max(1, lineH)));
-    return { charsPerCol, linesPerRow, charW, lineH, cellW, cellH };
+    // charsPerCol = how many chars fit horizontally in one grid column.
+    // linesPerRow = how many lines of body content fit in one grid row's
+    // worth of vertical space, AFTER deducting the chrome that the tile
+    // header occupies in the topmost row. Pass through chromeLines so the
+    // layout knows the tile header eats some of the first row's capacity.
+    const charsPerCol = Math.max(1, innerW / Math.max(1, charW));
+    const linesPerRow = Math.max(1, cellH / Math.max(1, lineH));
+    const chromeLines = (tileBorderY + tileBodyPadY + tileHeaderH) / Math.max(1, lineH);
+    return { charsPerCol, linesPerRow, chromeLines, pageRows, charW, lineH, cellW, cellH };
   }
 
   function _relayoutAndRender() {
     const metrics = _measureCellMetrics();
     _mosaicState.metrics = metrics;
-    // Recompute size for every tile using the measured metrics.
+    // Recompute size for every tile using the measured metrics. maxRows
+    // matches the CSS grid (24 rows of fine vertical resolution).
     const sized = (_mosaicState.tiles ?? []).map((t) => ({
       ...t,
       sizeHint: computeTileSize(t, {
         charsPerCol: metrics.charsPerCol,
         linesPerRow: metrics.linesPerRow,
+        chromeLines: metrics.chromeLines,
+        maxRows: metrics.pageRows,
       }),
     }));
-    _mosaicState.layout = layoutMosaic(sized, 12, 8, { maxMs: 250 });
+    _mosaicState.layout = layoutMosaic(sized, 12, metrics.pageRows, { maxMs: 250 });
     renderMosaic();
   }
 
@@ -6320,7 +6555,16 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
         applyControlsForStatus();
         if (msg.status === 'running') {
           chatStartedAtLocal = Date.now();
+          // Create the status DOM row and kick off the spinner. Without this
+          // call, renderStatus bails out (statusRow is null) and the user
+          // never sees the spinner / arrow / token counts.
+          ensureStatusRow();
+          startSpinner();
+          setUploading();           // initial phase = uploading
           startSpinTick();
+        } else if (msg.status === 'done' || msg.status === 'error') {
+          setDone();
+          stopSpinTick();
         } else {
           stopSpinTick();
         }
@@ -6328,11 +6572,26 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
         break;
       case 'phase':
         session.phase = msg.phase;
+        // Map server phase strings to the UI's status row phase functions.
+        if (msg.phase === 'uploading')        setUploading();
+        else if (msg.phase === 'thinking')    setThinking();
+        else if (msg.phase === 'downloading') setDownloading();
         renderStatus();
         break;
       case 'tokens':
         session.tokens = msg.tokens;
-        $tokenChip.textContent = ((msg.tokens.up || 0) + (msg.tokens.down || 0)).toLocaleString() + ' tokens';
+        // Mirror server-side token counts into the locals renderStatus reads.
+        // Also infer phase from which side moved — useful when phase events
+        // are delayed or skipped.
+        const newUp = msg.tokens.up || 0;
+        const newDown = msg.tokens.down || 0;
+        if (newDown > downTokens && phase !== PHASE.DOWNLOADING && phase !== PHASE.DONE) {
+          setDownloading();
+        }
+        upTokens = newUp;
+        downTokens = newDown;
+        lastDeltaTime = Date.now();
+        if ($settingsTokens) $settingsTokens.textContent = (newUp + newDown).toLocaleString();
         renderStatus();
         break;
       case 'error':
@@ -6413,11 +6672,21 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       toggle.textContent = collapsed ? '▶' : '▼';
     };
     head.appendChild(toggle);
-    head.appendChild(document.createTextNode(\`┌ \${ev.parentTaskId} [project]\`));
+
+    const idSpan = document.createElement('span');
+    idSpan.className = 'task-id';
+    idSpan.textContent = ev.parentTaskId;
+    head.appendChild(idSpan);
+
+    const tag = document.createElement('span');
+    tag.className = 'tag';
+    tag.textContent = 'project';
+    head.appendChild(tag);
+
     if (ev.userRequest) {
       const ur = document.createElement('span');
       ur.className = 'ur';
-      ur.textContent = \`  ↳ \${ev.userRequest}\`;
+      ur.textContent = ev.userRequest;
       head.appendChild(ur);
     }
     project.appendChild(head);
@@ -6471,26 +6740,44 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
         break;
       }
       case 'tool-call': {
+        // Suppress next-task chrome from the chat — the just-closed task
+        // gets a wrap right after, which conveys the switch by itself.
+        // Showing "next-task(user-request=..., summary=...)" + a follow-up
+        // result row that names the new task ID would label a task that
+        // hasn't ended yet, which is confusing.
+        if ((ev.verb || ev.name) === 'next-task') break;
+        // Collapse multi-line arg values onto one display line. Replace
+        // newlines with a visible "↵ " marker so the user can see that the
+        // command had multiple lines, without the chat row breaking onto
+        // multiple lines with confusing indentation. Trim trailing newlines
+        // first so a single trailing \\n doesn't add a stray marker.
+        const fmtVal = (v) => String(v)
+          .replace(/\\s+$/, '')
+          .replace(/\\r?\\n/g, ' ↵ ')
+          .slice(0, 120);
         const argStr = Object.entries(ev.args || {})
           .filter(([k]) => k !== 'content')
-          .map(([k, v]) => \`\${k}=\${String(v).slice(0, 60)}\`)
+          .map(([k, v]) => \`\${k}=\${fmtVal(v)}\`)
           .join(', ');
         const body = addRow('tool', \`\${ev.verb || ev.name}(\${argStr})\`);
         node = body.parentElement;
         break;
       }
       case 'tool-result': {
-        addResultRow({
+        // Pair with the next-task tool-call suppression above.
+        if ((ev.verb || ev.name) === 'next-task') break;
+        // Use the row returned by addResultRow — $log.lastElementChild
+        // would be the status row (pinStatusToBottom runs inside addResultRow),
+        // so we'd otherwise tag the wrong element with data-task-id.
+        node = addResultRow({
           status: ev.status,
           summary: summarizeResult(ev),
           full: ev.content || '',
         });
-        node = $log.lastElementChild;
         break;
       }
       case 'diff':
-        addDiffBlock({ diff: ev.diff || '', summary: ev.summary || '' });
-        node = $log.lastElementChild;
+        node = addDiffBlock({ diff: ev.diff || '', summary: ev.summary || '' });
         break;
     }
 
@@ -6509,12 +6796,22 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       .filter((r) => !r.closest('.task-wrap'));
     if (rows.length === 0) {
       // No body rows (e.g., task with no user message and no tool calls). Still
-      // render a small footer-only marker so the user sees the boundary.
+      // render a small inline pill marker so the user sees the boundary.
       const marker = document.createElement('div');
-      marker.className = 'task-foot';
-      marker.style.color = 'var(--muted)';
-      marker.style.fontSize = '12px';
-      marker.textContent = \`└─ \${taskId}\` + (ev.userRequest ? \`  ↳ \${ev.userRequest}\` : '') + (ev.summary ? \`  — \${ev.summary}\` : '');
+      marker.className = 'task-end-marker';
+      const idSpan = document.createElement('span');
+      idSpan.className = 'task-id';
+      idSpan.textContent = taskId;
+      marker.appendChild(idSpan);
+      if (ev.userRequest) {
+        const ur = document.createElement('span');
+        ur.className = 'ur';
+        ur.textContent = ev.userRequest;
+        marker.appendChild(ur);
+      }
+      if (ev.summary) {
+        marker.appendChild(document.createTextNode(' — ' + ev.summary));
+      }
       $log.appendChild(marker);
       scrollToBottom();
       return;
@@ -6534,11 +6831,14 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       toggle.textContent = collapsed ? '▶' : '▼';
     };
     head.appendChild(toggle);
-    head.appendChild(document.createTextNode(\`┌ \${taskId}\`));
+    const idSpan = document.createElement('span');
+    idSpan.className = 'task-id';
+    idSpan.textContent = taskId;
+    head.appendChild(idSpan);
     if (ev.userRequest) {
       const ur = document.createElement('span');
       ur.className = 'ur';
-      ur.textContent = \`  ↳ \${ev.userRequest}\`;
+      ur.textContent = ev.userRequest;
       head.appendChild(ur);
     }
     wrap.appendChild(head);
@@ -6587,21 +6887,26 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
 
   function applyControlsForStatus() {
     const running = session?.status === 'running';
+    // No Send button anymore — input is disabled while running, and Esc
+    // cancels. Placeholder text doubles as a hint about what Enter will do.
     $input.disabled = running;
-    $send.disabled = running;
-    $send.textContent = running ? 'Cancel' : 'Send';
-    $send.onclick = running ? cancelChat : send;
+    $input.placeholder = running ? 'Running… press Esc to interrupt' : 'Ask…';
     if (!running) {
       try { $input.focus(); } catch {}
     }
   }
 
   function renderTimeoutChip() {
+    // Old chip removed from the chrome; timeout now lives in the settings
+    // modal. Update both the chip (if still in DOM) and the settings value.
     const $c = document.getElementById('timeoutChip');
-    if (!$c || !session) return;
-    const mins = Math.round((session.timeoutMs || 0) / 60000);
-    $c.textContent = \`⏱ \${mins}m\`;
-    $c.title = 'Click to change agent timeout (per chat)';
+    if (session && $c) {
+      const mins = Math.round((session.timeoutMs || 0) / 60000);
+      $c.textContent = \`⏱ \${mins}m\`;
+    }
+    if (session && $settingsTimeout) {
+      $settingsTimeout.textContent = fmtTimeoutMins(session.timeoutMs);
+    }
   }
 
   async function changeTimeout() {
@@ -6626,18 +6931,45 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   $input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
-      if (!$send.disabled || $send.textContent === 'Cancel') {
-        // do nothing while running — Enter shouldn't fire cancel by accident
-        if (!$input.disabled) send();
-      }
+      if (!$input.disabled) send();
     }
   });
+  // Auto-grow textarea: start at one line, grow with content up to its CSS
+  // max-height. The overflow-y: hidden on the textarea is flipped to auto
+  // only when content exceeds the cap.
+  function autoGrowInput() {
+    $input.style.height = 'auto';
+    const sh = $input.scrollHeight;
+    const max = 220;
+    $input.style.height = Math.min(sh, max) + 'px';
+    $input.style.overflowY = sh > max ? 'auto' : 'hidden';
+  }
+  $input.addEventListener('input', autoGrowInput);
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
+      // Layered modals: snapshot closes first, then settings, then we cancel
+      // the running chat as a last resort.
       if ($modalBg.classList.contains('show')) { closeModal(); return; }
+      if ($settingsModalBg.classList.contains('show')) { closeSettings(); return; }
       if (session?.status === 'running') cancelChat();
     }
   });
+
+  // ── Settings modal ─────────────────────────────────────────────────────
+  function openSettings() {
+    if ($settingsProject) $settingsProject.textContent = activeProject || '(none)';
+    if ($settingsTokens)  $settingsTokens.textContent = totalTokens.toLocaleString();
+    if ($settingsTimeout) $settingsTimeout.textContent = fmtTimeoutMins(session?.timeoutMs);
+    $settingsModalBg.classList.add('show');
+  }
+  function closeSettings() {
+    $settingsModalBg.classList.remove('show');
+  }
+  function fmtTimeoutMins(ms) {
+    if (!ms) return '—';
+    const m = ms / 60000;
+    return (m >= 1 ? m.toFixed(0) + ' min' : (ms / 1000).toFixed(0) + ' s');
+  }
 
   // ── Infinite scroll for older events ───────────────────────────────────
   // When the user scrolls near the top of the log, fetch the next batch of
