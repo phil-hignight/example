@@ -15,7 +15,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '2026-05-24T02:09:24.888Z';
+const BUILD_VERSION = '3';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
@@ -29,7 +29,7 @@ import { createInterface } from 'node:readline';
 import { createServer } from 'node:http';
 import { homedir } from 'node:os';
 import { readFile as _readFile, writeFile as _writeFile, mkdir as _mkdir, stat as _stat, readdir as _readdir } from 'node:fs/promises';
-import { existsSync, appendFileSync, mkdirSync } from 'node:fs';
+import { existsSync, appendFileSync, mkdirSync, statSync, readFileSync } from 'node:fs';
 import { randomUUID as _randomUUID } from 'node:crypto';
 import path from 'node:path';
 const readFile = _readFile, writeFile = _writeFile, mkdir = _mkdir, stat = _stat, readdir = _readdir;
@@ -294,66 +294,133 @@ function createHttpAdapter(opts = {}) {
     if (!request || !Array.isArray(request.messages)) {
       throw new TypeError('completeStream: request.messages is required');
     }
+    const t0 = Date.now();
     const body = { ...request, stream: true };
+    // Snapshot the request BEFORE we wire stream:true on, so the captured
+    // transaction shows what the agent actually passed in (without the
+    // streaming flag we added internally).
+    const requestSnapshot = JSON.parse(JSON.stringify(request));
     if (debug) {
       const flow = summarizeRequestToolFlow(body);
       console.error(`[http>] completeStream  tools=[${flow.toolDefs.join(',')}]`);
       if (flow.assistantToolCallIds.length) console.error(`[http>]   assistant.tool_calls ids: ${JSON.stringify(flow.assistantToolCallIds)}`);
       if (flow.toolMessageIds.length) console.error(`[http>]   tool message ids:           ${JSON.stringify(flow.toolMessageIds)}`);
     }
-    const res = await safeFetch('/chat/completions', { method: 'POST', body: JSON.stringify(body) });
 
-    // Graceful fallback: if the endpoint ignored stream:true and returned a
-    // normal JSON completion (some managed platforms do), yield it as a single
-    // chunk so the caller's streaming loop still works.
-    const ctype = res.headers.get('content-type') || '';
-    if (!ctype.includes('text/event-stream')) {
-      const json = await res.json();
-      if (json?.usage) onUsage(json.usage);
-      const msg = json?.choices?.[0]?.message ?? {};
-      yield {
-        id: json?.id ?? 'nostream',
-        object: 'chat.completion.chunk',
-        choices: [{ index: 0, delta: { role: 'assistant', content: msg.content ?? '' }, finish_reason: json?.choices?.[0]?.finish_reason ?? 'stop' }],
-        ...(json?.usage ? { usage: json.usage } : {}),
+    // Assembled state — populated as we stream, then handed to onTransaction
+    // when the stream ends (regardless of which exit path). Without this, the
+    // streaming path never emits a transaction event, so the Snapshot view
+    // shows "(no request captured)" and the analyzer can't detect issues
+    // like missing system reminders or Gemini identity drift.
+    let accumulatedContent = '';
+    let lastFinishReason = null;
+    let lastChunkId = null;
+    let lastUsage = null;
+    let txEmitted = false;
+    const emitTransaction = (extra = {}) => {
+      if (txEmitted) return;
+      txEmitted = true;
+      const synthesized = {
+        id: lastChunkId ?? 'stream',
+        object: 'chat.completion',
+        choices: [{
+          index: 0,
+          message: { role: 'assistant', content: accumulatedContent },
+          finish_reason: lastFinishReason ?? 'stop',
+        }],
+        ...(lastUsage ? { usage: lastUsage } : {}),
+        ...extra,
       };
-      return;
-    }
-
-    if (!res.body) throw new Error('completeStream: response has no body');
-
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = '';
-    let usageFired = false;
-    const fireUsageOnce = (u) => {
-      if (u && !usageFired) {
-        usageFired = true;
-        onUsage(u);
-      }
+      try {
+        onTransaction({
+          type: 'chat_completions',
+          request: requestSnapshot,
+          response: synthesized,
+          durationMs: Date.now() - t0,
+          streamed: true,
+        });
+      } catch { /* never let telemetry break the stream */ }
     };
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
+    try {
+      const res = await safeFetch('/chat/completions', { method: 'POST', body: JSON.stringify(body) });
 
-      let idx;
-      while ((idx = buf.indexOf('\n')) !== -1) {
-        const line = buf.slice(0, idx).replace(/\r$/, '');
-        buf = buf.slice(idx + 1);
-        if (!line || line.startsWith(':')) continue;
-        if (!line.startsWith('data:')) continue;
-        const data = line.slice(5).trim();
-        if (data === '[DONE]') return;
+      // Graceful fallback: if the endpoint ignored stream:true and returned a
+      // normal JSON completion (some managed platforms do), yield it as a single
+      // chunk so the caller's streaming loop still works.
+      const ctype = res.headers.get('content-type') || '';
+      if (!ctype.includes('text/event-stream')) {
+        const json = await res.json();
+        if (json?.usage) { lastUsage = json.usage; onUsage(json.usage); }
+        const msg = json?.choices?.[0]?.message ?? {};
+        accumulatedContent = msg.content ?? '';
+        lastFinishReason = json?.choices?.[0]?.finish_reason ?? 'stop';
+        lastChunkId = json?.id ?? null;
+        // Hand the FULL non-stream JSON to onTransaction since we have it.
+        txEmitted = true;
         try {
-          const chunk = JSON.parse(data);
-          fireUsageOnce(chunk.usage);
-          yield chunk;
-        } catch {
-          // ignore malformed line
+          onTransaction({
+            type: 'chat_completions',
+            request: requestSnapshot,
+            response: json,
+            durationMs: Date.now() - t0,
+            streamed: false,
+          });
+        } catch {}
+        yield {
+          id: json?.id ?? 'nostream',
+          object: 'chat.completion.chunk',
+          choices: [{ index: 0, delta: { role: 'assistant', content: msg.content ?? '' }, finish_reason: lastFinishReason }],
+          ...(json?.usage ? { usage: json.usage } : {}),
+        };
+        return;
+      }
+
+      if (!res.body) throw new Error('completeStream: response has no body');
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      let usageFired = false;
+      const fireUsageOnce = (u) => {
+        if (u && !usageFired) {
+          usageFired = true;
+          lastUsage = u;
+          onUsage(u);
+        }
+      };
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+
+        let idx;
+        while ((idx = buf.indexOf('\n')) !== -1) {
+          const line = buf.slice(0, idx).replace(/\r$/, '');
+          buf = buf.slice(idx + 1);
+          if (!line || line.startsWith(':')) continue;
+          if (!line.startsWith('data:')) continue;
+          const data = line.slice(5).trim();
+          if (data === '[DONE]') return;
+          try {
+            const chunk = JSON.parse(data);
+            fireUsageOnce(chunk.usage);
+            if (chunk?.id) lastChunkId = chunk.id;
+            const delta = chunk?.choices?.[0]?.delta;
+            if (delta?.content) accumulatedContent += delta.content;
+            const fr = chunk?.choices?.[0]?.finish_reason;
+            if (fr) lastFinishReason = fr;
+            yield chunk;
+          } catch {
+            // ignore malformed line
+          }
         }
       }
+    } finally {
+      // Fires on normal end, early consumer return(), or thrown error —
+      // ensures the transaction is captured no matter how the stream exits.
+      emitTransaction();
     }
   }
 
@@ -1376,6 +1443,245 @@ function extractDiff(r) {
   return null;
 }
 
+// ====== agent/mosaic-layout.mjs ======
+/**
+ * Mosaic layout — pure functions that size and pack tiles on a grid.
+ *
+ * Shared between the Node server (where layout-on-fetch is the fallback)
+ * and the browser script (where the same code runs with measured font
+ * metrics + actual viewport dimensions). The build script injects this
+ * file's contents into both contexts; keep it pure (no I/O, no Node-only
+ * APIs) so it can run unchanged in either.
+ *
+ * Three exports:
+ *   - computeTileSize(tile, opts) → {cols, rows}
+ *   - packPage(tiles, cols, rows, opts) → {placed, notPlaced, score, ...}
+ *   - layoutMosaic(tiles, pageCols, pageRows, opts) → {pages, ...}
+ */
+
+/**
+ * Compute the SMALLEST {cols, rows} rectangle that holds the tile's content
+ * without scrolling. Per-kind heuristic: for text/json we count chars and
+ * lines; for findings we account for the badge chrome; for tables we sum
+ * column widths.
+ *
+ * The conversion to grid cells depends on opts.charsPerCol and
+ * opts.linesPerRow, which the CALLER computes from the actual rendered
+ * font + viewport. The server passes its baseline (assumes 1400×800 at
+ * 9px monospace); the browser passes measured values.
+ */
+function computeTileSize(tile, opts = {}) {
+  const charsPerCol = opts.charsPerCol ?? 20;
+  const linesPerRow = opts.linesPerRow ?? 7;
+  const minCols     = opts.minCols ?? 2;
+  const minRows     = opts.minRows ?? 1;
+  const maxCols     = opts.maxCols ?? 12;
+  const maxRows     = opts.maxRows ?? 8;
+  // Chrome budget in lines (header bar + body padding amortized as text lines).
+  const chromeLines = opts.chromeLines ?? 2;
+
+  const kind = tile?.kind ?? 'text';
+  const body = tile?.body;
+  let maxLine = 0;
+  let lineCount = 1;
+
+  if (kind === 'json') {
+    let text;
+    try { text = JSON.stringify(body, null, 2); }
+    catch { text = String(body); }
+    const lines = text.split('\n');
+    lineCount = lines.length;
+    for (const line of lines) if (line.length > maxLine) maxLine = line.length;
+  } else if (kind === 'findings') {
+    const findings = Array.isArray(body) ? body : [];
+    lineCount = Math.max(1, findings.reduce((n, f) => n + (f?.detail ? 2 : 1), 0));
+    let widest = 50;
+    for (const f of findings) {
+      const t = (f?.title?.length ?? 0) + 14;
+      if (t > widest) widest = t;
+      if (f?.detail) {
+        const d = (String(f.detail).length ?? 0) + 4;
+        if (d > widest) widest = d;
+      }
+    }
+    maxLine = widest;
+  } else if (kind === 'table') {
+    const t = body ?? { columns: [], rows: [] };
+    lineCount = (t.rows?.length ?? 0) + 1;
+    const cols = t.columns ?? [];
+    let width = 0;
+    for (let i = 0; i < cols.length; i++) {
+      let colW = String(cols[i] ?? '').length;
+      for (const row of (t.rows ?? [])) {
+        const cellStr = String(row[i] ?? '');
+        if (cellStr.length > colW) colW = cellStr.length;
+      }
+      width += Math.min(colW, 40) + 2;
+    }
+    maxLine = Math.max(width, 30);
+  } else {
+    const text = String(body ?? '');
+    const lines = text.split('\n');
+    lineCount = lines.length;
+    for (const line of lines) if (line.length > maxLine) maxLine = line.length;
+  }
+
+  if (maxLine === 0) maxLine = 10;
+
+  let cols = Math.ceil(maxLine / charsPerCol);
+  let rows = Math.ceil((lineCount + chromeLines) / linesPerRow);
+
+  cols = Math.max(minCols, Math.min(maxCols, cols));
+  rows = Math.max(minRows, Math.min(maxRows, rows));
+  return { cols, rows };
+}
+
+/**
+ * Pack a list of tiles onto a single page via backtracking search.
+ * Score is the lexicographic pair (tileCount, cellsFilled) — placing
+ * more tiles always wins; within equal tile counts the denser packing
+ * wins. Time-capped via opts.maxMs (default 200ms).
+ */
+function packPage(tiles, cols, rows, opts = {}) {
+  const maxMs = opts.maxMs ?? 200;
+  const startMs = Date.now();
+  const sized = tiles.map((t) => {
+    const w = Math.max(1, Math.min(t.sizeHint?.cols ?? 3, cols));
+    const h = Math.max(1, Math.min(t.sizeHint?.rows ?? 2, rows));
+    return { tile: t, w, h, area: w * h };
+  });
+
+  const grid = Array.from({ length: rows }, () => new Array(cols).fill(-1));
+  const placed = [];
+  const usedIdx = new Set();
+  let best = { placedIdx: [], placements: [], tileCount: -1, cellsFilled: -1 };
+
+  const findEmpty = () => {
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        if (grid[r][c] === -1) return [r, c];
+      }
+    }
+    return null;
+  };
+  const fits = (r, c, w, h) => {
+    if (r + h > rows || c + w > cols) return false;
+    for (let i = 0; i < h; i++) for (let j = 0; j < w; j++) if (grid[r + i][c + j] !== -1) return false;
+    return true;
+  };
+  const fill = (r, c, w, h, v) => {
+    for (let i = 0; i < h; i++) for (let j = 0; j < w; j++) grid[r + i][c + j] = v;
+  };
+  const countFilled = () => {
+    let n = 0; for (const row of grid) for (const v of row) if (v >= 0) n++; return n;
+  };
+  const isBetter = (tileCount, cellsFilled) =>
+    tileCount > best.tileCount ||
+    (tileCount === best.tileCount && cellsFilled > best.cellsFilled);
+
+  function recurse() {
+    if (Date.now() - startMs > maxMs) return;
+    const empty = findEmpty();
+    const tileCount = placed.length;
+    if (!empty) {
+      const cellsFilled = countFilled();
+      if (isBetter(tileCount, cellsFilled)) {
+        best = { placedIdx: [...usedIdx], placements: placed.map((p) => ({ ...p })), tileCount, cellsFilled };
+      }
+      return;
+    }
+    const [r, c] = empty;
+
+    let emptyCount = 0;
+    for (const row of grid) for (const v of row) if (v === -1) emptyCount++;
+    let smallestArea = Infinity;
+    for (let i = 0; i < sized.length; i++) {
+      if (!usedIdx.has(i)) smallestArea = Math.min(smallestArea, sized[i].area);
+    }
+    const maxAdditionalTiles = smallestArea === Infinity ? 0 : Math.floor(emptyCount / smallestArea);
+    if (tileCount + maxAdditionalTiles < best.tileCount) return;
+    if (tileCount + maxAdditionalTiles === best.tileCount &&
+        countFilled() + emptyCount <= best.cellsFilled) return;
+
+    const candidates = sized
+      .map((s, i) => ({ s, i }))
+      .filter(({ i }) => !usedIdx.has(i))
+      .sort((a, b) => b.s.area - a.s.area);
+
+    let triedAny = false;
+    for (const { s, i } of candidates) {
+      if (fits(r, c, s.w, s.h)) {
+        triedAny = true;
+        fill(r, c, s.w, s.h, i);
+        usedIdx.add(i);
+        placed.push({ tileIdx: i, row: r, col: c, colSpan: s.w, rowSpan: s.h });
+        recurse();
+        placed.pop();
+        usedIdx.delete(i);
+        fill(r, c, s.w, s.h, -1);
+        if (Date.now() - startMs > maxMs) return;
+      }
+    }
+    if (!triedAny) {
+      grid[r][c] = -2;
+      recurse();
+      grid[r][c] = -1;
+    }
+  }
+
+  recurse();
+
+  const placedIdxSet = new Set(best.placedIdx);
+  const placedTiles = best.placements.map((p) => ({
+    ...tiles[p.tileIdx],
+    row: p.row,
+    col: p.col,
+    colSpan: p.colSpan,
+    rowSpan: p.rowSpan,
+  }));
+  const notPlaced = tiles.filter((_, i) => !placedIdxSet.has(i));
+  return {
+    placed: placedTiles,
+    notPlaced,
+    tileCount: best.tileCount,
+    cellsFilled: best.cellsFilled,
+    score: best.cellsFilled,
+  };
+}
+
+/**
+ * Lay out tiles across one or more pages, packing each page tightly via
+ * `packPage`. Tiles that don't fit overflow to the next page; an oversize
+ * tile is force-placed on its own page.
+ */
+function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
+  const pages = [];
+  let remaining = tiles.slice();
+  let safety = 30;
+  while (remaining.length > 0 && safety-- > 0) {
+    const r = packPage(remaining, pageCols, pageRows, opts);
+    if (r.placed.length === 0) {
+      const t = remaining.shift();
+      pages.push({
+        tiles: [{
+          ...t, row: 0, col: 0,
+          colSpan: Math.min(t.sizeHint?.cols ?? pageCols, pageCols),
+          rowSpan: Math.min(t.sizeHint?.rows ?? pageRows, pageRows),
+          oversize: true,
+        }],
+        fillRatio: 1.0,
+      });
+      continue;
+    }
+    pages.push({
+      tiles: r.placed,
+      fillRatio: r.score / (pageCols * pageRows),
+    });
+    remaining = r.notPlaced;
+  }
+  return { pages, totalTiles: tiles.length, totalPages: pages.length };
+}
+
 // ====== agent/prompted.mjs ======
 /**
  * Prompted-format agent loop with task-scoped memory.
@@ -2263,6 +2569,11 @@ async function runPromptedAgent({
  *
  * No npm deps. Node built-in http + the production HTTP adapter.
  */
+// Layout primitives live in mosaic-layout.mjs. Imported here so runQueries
+// can call computeTileSize directly. Re-exported so tests + tools can
+// import from server.mjs. In the production bundle, the build's
+// import-stripper merges all JS_SOURCES into a single module scope, so
+// the import is a no-op at runtime; this line exists for Node ESM resolution.
 
 const RECENT_FILE = path.join(homedir(), '.code-boss', 'recent.json');
 const MAX_RECENT = 12;
@@ -2281,6 +2592,641 @@ async function saveRecentProjects(projects) {
   } catch (e) { console.error('[recent] save failed:', e.message); }
 }
 
+// ── Query catalog (programmable mosaic backend) ─────────────────────────────
+//
+// Each query is a pure function from the diagnostics object to a tile result.
+// IDs are STABLE across builds so we can refer to them by number across
+// chat sessions ("activate 7, 12, 50"). Numbers are sparse-by-category so
+// new queries can be added without renumbering:
+//
+//   1-9    prompt (what we sent to the model)
+//   10-19  response (what came back)
+//   20-29  findings (synthesized analysis)
+//   30-39  server state (stderr, log file, uptime, memory)
+//   40-49  configuration (project, API, build)
+//   50-59  transactions (request/response bodies, table, latency)
+//   60-69  chat events (user/assistant turns)
+//   70-79  trends / comparisons (over multiple turns)
+//   90-99  meta / reserved
+//
+// Size hints map to a 12-col × 8-row page grid:
+//   small  = 3×2   wide   = 6×2   tall   = 3×6
+//   medium = 4×3   large  = 6×4   huge   = 12×4
+// Tiles can request any {cols, rows} though — these are just conventions.
+
+// ─── Catalog helpers (used by compute fns) ───────────────────────────────────
+function _lastChatTx(diag) {
+  const txs = (diag?.transactions?.events ?? []).filter((e) => e.type === 'chat_completions');
+  return txs[txs.length - 1] ?? null;
+}
+function _allChatTxs(diag) {
+  return (diag?.transactions?.events ?? []).filter((e) => e.type === 'chat_completions');
+}
+function _lastUserMessage(msgs) {
+  if (!Array.isArray(msgs)) return null;
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i]?.role === 'user') return msgs[i];
+  }
+  return null;
+}
+function _stripReminder(content) {
+  // Return the user's actual question with the <system-reminder>...</system-reminder>
+  // block removed, so we can show "the user's real ask" separately from the
+  // injected instructions. Falls back to original content if no reminder.
+  const s = String(content ?? '');
+  return s.replace(/<system-reminder>[\s\S]*?<\/system-reminder>\s*/i, '').trim();
+}
+function _reminderText(content) {
+  const m = String(content ?? '').match(/<system-reminder>([\s\S]*?)<\/system-reminder>/i);
+  return m ? m[1].trim() : null;
+}
+function _fmtBytes(n) {
+  if (n == null) return '?';
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  return (n / 1024 / 1024).toFixed(2) + ' MB';
+}
+function _fmtMs(ms) {
+  if (ms == null) return '—';
+  if (ms < 1000) return ms + ' ms';
+  if (ms < 60_000) return (ms / 1000).toFixed(1) + ' s';
+  if (ms < 3_600_000) return (ms / 60_000).toFixed(1) + ' min';
+  return (ms / 3_600_000).toFixed(2) + ' hr';
+}
+
+const QUERY_CATALOG = [
+  // ─── 1-9: PROMPT (what we sent to the model) ────────────────────────────
+  {
+    id: 1, name: 'System reminder check', category: 'prompt',
+    description: 'Whether <system-reminder> is at the start of the latest user message.',
+    sizeHint: { cols: 3, rows: 2 },
+    compute: (d) => {
+      const tx = _lastChatTx(d);
+      if (!tx) return { kind: 'text', severity: 'info', body: 'no chat request yet' };
+      const last = _lastUserMessage(tx.request?.messages);
+      if (!last) return { kind: 'text', severity: 'warn', body: 'no user message in last request' };
+      const c = String(last.content ?? '');
+      if (!c.includes('<system-reminder>')) return { kind: 'text', severity: 'critical', body: 'MISSING from latest user message' };
+      if (c.trimStart().startsWith('<system-reminder>')) return { kind: 'text', severity: 'ok', body: 'present at start of latest user message' };
+      return { kind: 'text', severity: 'warn', body: 'present but NOT at start' };
+    },
+  },
+  {
+    id: 2, name: 'System reminder text', category: 'prompt',
+    description: 'Full text of the <system-reminder> block we sent on the last request.',
+    sizeHint: { cols: 4, rows: 6 },
+    compute: (d) => {
+      const tx = _lastChatTx(d);
+      const last = _lastUserMessage(tx?.request?.messages);
+      const r = _reminderText(last?.content);
+      if (!r) return { kind: 'text', severity: 'warn', body: '(no <system-reminder> found in latest user message)' };
+      return { kind: 'text', body: r };
+    },
+  },
+  {
+    id: 3, name: 'System reminder size', category: 'prompt',
+    description: 'Character count of the <system-reminder> we sent.',
+    sizeHint: { cols: 3, rows: 2 },
+    compute: (d) => {
+      const tx = _lastChatTx(d);
+      const last = _lastUserMessage(tx?.request?.messages);
+      const r = _reminderText(last?.content);
+      if (r == null) return { kind: 'text', severity: 'warn', body: 'no reminder found' };
+      return { kind: 'text', body: `${r.length} chars  (~${Math.ceil(r.length / 4)} tokens)` };
+    },
+  },
+  {
+    id: 4, name: 'Latest user question (clean)', category: 'prompt',
+    description: 'The latest user message with the <system-reminder> stripped — just what the user actually asked.',
+    sizeHint: { cols: 6, rows: 3 },
+    compute: (d) => {
+      const tx = _lastChatTx(d);
+      const last = _lastUserMessage(tx?.request?.messages);
+      if (!last) return { kind: 'text', severity: 'info', body: '(no user message)' };
+      const clean = _stripReminder(last.content);
+      return { kind: 'text', body: clean || '(empty after stripping reminder)' };
+    },
+  },
+  {
+    id: 5, name: 'Latest user message (raw)', category: 'prompt',
+    description: 'Full raw content of the latest user message including any injected <system-reminder>.',
+    sizeHint: { cols: 4, rows: 6 },
+    compute: (d) => {
+      const tx = _lastChatTx(d);
+      const last = _lastUserMessage(tx?.request?.messages);
+      if (!last) return { kind: 'text', severity: 'info', body: '(no user message)' };
+      return { kind: 'text', body: String(last.content ?? '') };
+    },
+  },
+  {
+    id: 6, name: 'Message role sequence', category: 'prompt',
+    description: 'U/A/S sequence for the conversation we sent (checks for missing alternation, double-user, etc.).',
+    sizeHint: { cols: 6, rows: 2 },
+    compute: (d) => {
+      const tx = _lastChatTx(d);
+      const msgs = tx?.request?.messages ?? [];
+      if (msgs.length === 0) return { kind: 'text', severity: 'info', body: '(no messages)' };
+      const seq = msgs.map((m) => ({ user: 'U', assistant: 'A', system: 'S', tool: 'T' }[m.role] ?? '?')).join(' ');
+      return { kind: 'text', body: `${msgs.length} msgs:  ${seq}` };
+    },
+  },
+  {
+    id: 7, name: 'Conversation size', category: 'prompt',
+    description: 'Message count + estimated token budget for the prompt.',
+    sizeHint: { cols: 3, rows: 2 },
+    compute: (d) => {
+      const tx = _lastChatTx(d);
+      const msgs = tx?.request?.messages ?? [];
+      const totalChars = msgs.reduce((s, m) => s + String(m.content ?? '').length, 0);
+      return { kind: 'text', body: `${msgs.length} msgs · ${totalChars} chars · ~${Math.ceil(totalChars / 4)} tokens` };
+    },
+  },
+  {
+    id: 8, name: 'All user messages this session', category: 'prompt',
+    description: 'Every user-message chat event in the current session, in order.',
+    sizeHint: { cols: 4, rows: 6 },
+    compute: (d) => {
+      const ums = (d.chatEvents ?? []).filter((e) => e.type === 'user-message');
+      if (!ums.length) return { kind: 'text', severity: 'info', body: '(no user messages)' };
+      const body = ums.map((e, i) => `[${i + 1}] ${String(e.content ?? '').replace(/\s+/g, ' ').slice(0, 200)}`).join('\n\n');
+      return { kind: 'text', body };
+    },
+  },
+
+  // ─── 10-19: RESPONSE (what came back) ───────────────────────────────────
+  {
+    id: 10, name: 'Last response (full text)', category: 'response',
+    description: 'The complete assistant content from the most recent chat_completions response.',
+    sizeHint: { cols: 6, rows: 4 },
+    compute: (d) => {
+      const tx = _lastChatTx(d);
+      const c = tx?.response?.choices?.[0]?.message?.content;
+      if (c == null) return { kind: 'text', severity: 'info', body: '(no response yet)' };
+      return { kind: 'text', body: String(c) };
+    },
+  },
+  {
+    id: 11, name: 'Last response head', category: 'response',
+    description: 'First 500 characters of the last assistant response (where identity drift usually shows up).',
+    sizeHint: { cols: 4, rows: 3 },
+    compute: (d) => {
+      const tx = _lastChatTx(d);
+      const c = String(tx?.response?.choices?.[0]?.message?.content ?? '');
+      if (!c) return { kind: 'text', severity: 'info', body: '(no response)' };
+      return { kind: 'text', body: c.slice(0, 500) + (c.length > 500 ? '\n…[truncated]' : '') };
+    },
+  },
+  {
+    id: 12, name: 'finish_reason history', category: 'response',
+    description: 'finish_reason for the last N chat_completions responses.',
+    sizeHint: { cols: 6, rows: 2 },
+    compute: (d) => {
+      const txs = _allChatTxs(d);
+      if (!txs.length) return { kind: 'text', severity: 'info', body: '(no chat responses)' };
+      const rows = txs.slice(-10).map((t, i) => `#${txs.length - txs.slice(-10).length + i + 1}  ${t?.response?.choices?.[0]?.finish_reason ?? '?'}`);
+      return { kind: 'text', body: rows.join('\n') };
+    },
+  },
+  {
+    id: 13, name: 'Identity drift detection', category: 'response',
+    description: 'Whether the last response matches Gemini Enterprise built-in phrasing.',
+    sizeHint: { cols: 4, rows: 3 },
+    compute: (d) => {
+      const patterns = [
+        /\bI am Gemini Enterprise\b/i, /\bI(?:'| a)m Gemini(?:\b|,|\.)/i,
+        /\bMemory Bank agent\b/i, /\bI can help you with (?:Jira|Drive|Calendar|Gmail|Confluence)/i,
+        /\bGenerate Memories\b/i, /\bI am a large language model\b/i,
+        /\bI do not have direct access to your remote or local file system\b/i,
+      ];
+      const txs = _allChatTxs(d).slice(-5);
+      const hits = [];
+      for (const tx of txs) {
+        const c = String(tx?.response?.choices?.[0]?.message?.content ?? '');
+        for (const p of patterns) if (p.test(c)) { hits.push(p.source); break; }
+      }
+      if (!txs.length) return { kind: 'text', severity: 'info', body: '(no responses to scan)' };
+      if (!hits.length) return { kind: 'text', severity: 'ok', body: `clean across last ${txs.length} response(s)` };
+      return { kind: 'text', severity: 'warn', body: `DRIFT in ${hits.length}/${txs.length} responses:\n` + hits.join('\n') };
+    },
+  },
+  {
+    id: 14, name: 'Tool tags in last response', category: 'response',
+    description: 'Which code_boss tool tags (list/read/write/etc.) appeared in the last assistant response.',
+    sizeHint: { cols: 4, rows: 3 },
+    compute: (d) => {
+      const tx = _lastChatTx(d);
+      const c = String(tx?.response?.choices?.[0]?.message?.content ?? '');
+      if (!c) return { kind: 'text', severity: 'info', body: '(no response)' };
+      const tags = ['list', 'read', 'write', 'edit', 'glob', 'grep', 'powershell', 'bash', 'next-task', 'task-update', 'task-add', 'remote-workspace'];
+      const found = tags.filter((t) => new RegExp(`<${t}[\\s>/]`, 'i').test(c));
+      if (!found.length) return { kind: 'text', severity: 'warn', body: 'NO tool tags found — model just chatted' };
+      return { kind: 'text', severity: 'ok', body: 'found: ' + found.join(', ') };
+    },
+  },
+  {
+    id: 15, name: 'Token usage (last)', category: 'response',
+    description: 'Token counts from the last chat_completions response.',
+    sizeHint: { cols: 3, rows: 2 },
+    compute: (d) => {
+      const tx = _lastChatTx(d);
+      const u = tx?.response?.usage;
+      if (!u) return { kind: 'text', severity: 'info', body: '(no usage)' };
+      return { kind: 'text', body: `prompt: ${u.prompt_tokens ?? '?'}\nout:    ${u.completion_tokens ?? '?'}\ntotal:  ${u.total_tokens ?? '?'}` };
+    },
+  },
+  {
+    id: 16, name: 'Response length trend', category: 'response',
+    description: 'Character counts of the last 10 assistant responses.',
+    sizeHint: { cols: 6, rows: 2 },
+    compute: (d) => {
+      const txs = _allChatTxs(d).slice(-10);
+      if (!txs.length) return { kind: 'text', severity: 'info', body: '(no responses)' };
+      const lens = txs.map((t, i) => `#${i + 1}: ${String(t?.response?.choices?.[0]?.message?.content ?? '').length} chars`);
+      return { kind: 'text', body: lens.join('\n') };
+    },
+  },
+
+  // ─── 20-29: FINDINGS ────────────────────────────────────────────────────
+  {
+    id: 20, name: 'All findings', category: 'findings',
+    description: 'Full color-coded list of automated diagnostic findings.',
+    sizeHint: { cols: 4, rows: 6 },
+    compute: (d) => ({ kind: 'findings', body: d.findings ?? [] }),
+  },
+  {
+    id: 21, name: 'Critical findings only', category: 'findings',
+    description: 'Just the critical/warn findings, filtered.',
+    sizeHint: { cols: 4, rows: 3 },
+    compute: (d) => {
+      const f = (d.findings ?? []).filter((x) => x.severity === 'critical' || x.severity === 'warn');
+      if (!f.length) return { kind: 'text', severity: 'ok', body: 'no critical or warn findings' };
+      return { kind: 'findings', body: f };
+    },
+  },
+
+  // ─── 30-39: SERVER STATE ────────────────────────────────────────────────
+  {
+    id: 30, name: 'STDERR errors only', category: 'server',
+    description: 'Lines from the stderr ring buffer matching known error patterns.',
+    sizeHint: { cols: 6, rows: 3 },
+    compute: (d) => {
+      const pats = [/\bReferenceError\b/, /\bTypeError\b/, /\bSyntaxError\b/, /is not defined/, /\bENOENT\b/, /\bEACCES\b/, /\bUncaught\b/, /FAILED/];
+      const errs = (d.stderr ?? []).filter((e) => pats.some((p) => p.test(e.line ?? '')));
+      if (!errs.length) return { kind: 'text', severity: 'ok', body: '(no error patterns in stderr)' };
+      return { kind: 'text', severity: 'critical', body: errs.map((e) => `${e.at?.slice(11, 23) ?? ''}  ${e.line}`).join('\n') };
+    },
+  },
+  {
+    id: 31, name: 'STDERR tail (all)', category: 'server',
+    description: 'Last ~30 lines of the stderr ring buffer.',
+    sizeHint: { cols: 4, rows: 6 },
+    compute: (d) => {
+      const ls = (d.stderr ?? []).slice(-30);
+      if (!ls.length) return { kind: 'text', severity: 'info', body: '(empty)' };
+      return { kind: 'text', body: ls.map((e) => `${e.at?.slice(11, 23) ?? ''}  ${e.line}`).join('\n') };
+    },
+  },
+  {
+    id: 32, name: 'Log file tail', category: 'server',
+    description: 'Tail of <project>/.agent/code-boss.log.',
+    sizeHint: { cols: 6, rows: 4 },
+    compute: (d) => {
+      const t = d.logTail;
+      if (!t) return { kind: 'text', severity: 'info', body: '(no log content)' };
+      return { kind: 'text', body: t };
+    },
+  },
+  {
+    id: 33, name: 'Build + uptime + memory', category: 'server',
+    description: 'Build version, server uptime, memory usage.',
+    sizeHint: { cols: 4, rows: 3 },
+    compute: (d) => {
+      const s = d.server ?? {}, b = d.build ?? {}, m = s.memory ?? {};
+      return { kind: 'text', body: [
+        `build:   ${b.version ?? '?'}`,
+        `started: ${b.startedAt ?? '?'}`,
+        `uptime:  ${_fmtMs(s.uptimeMs)}`,
+        `mem rss: ${_fmtBytes(m.rss)}`,
+        `mem heap: ${_fmtBytes(m.heapUsed)} / ${_fmtBytes(m.heapTotal)}`,
+      ].join('\n') };
+    },
+  },
+  {
+    id: 34, name: 'PID / Node / platform', category: 'server',
+    description: 'Process identifiers — useful when diagnosing zombies or restarts.',
+    sizeHint: { cols: 3, rows: 2 },
+    compute: (d) => {
+      const s = d.server ?? {};
+      return { kind: 'text', body: `pid:      ${s.pid}\nnode:     ${s.nodeVersion}\nplatform: ${s.platform}` };
+    },
+  },
+  {
+    id: 35, name: 'Chat session state', category: 'server',
+    description: 'Current chat status, phase, version, subscribers, tokens.',
+    sizeHint: { cols: 4, rows: 3 },
+    compute: (d) => {
+      const c = d.chat ?? {};
+      return { kind: 'text', body: [
+        `status:   ${c.status}`,
+        `phase:    ${c.phase}`,
+        `version:  ${c.version}`,
+        `tokens:   up=${c.tokens?.up ?? 0}  down=${c.tokens?.down ?? 0}`,
+        `events:   ${c.eventCount}`,
+        `sse subs: ${c.streamSubscribers ?? 0}`,
+        `running:  ${c.chatStartedAt ? _fmtMs(c.chatStartedAgoMs) : 'no'}`,
+        `error:    ${c.error ?? '—'}`,
+      ].join('\n') };
+    },
+  },
+
+  // ─── 40-49: CONFIG ──────────────────────────────────────────────────────
+  {
+    id: 40, name: 'Active project', category: 'config',
+    description: 'The project directory code_boss is operating on.',
+    sizeHint: { cols: 6, rows: 2 },
+    compute: (d) => ({ kind: 'text', body: d.project?.activeProject ?? '(none)' }),
+  },
+  {
+    id: 41, name: 'API config', category: 'config',
+    description: 'Base URL, model, and key prefix.',
+    sizeHint: { cols: 4, rows: 3 },
+    compute: (d) => {
+      const c = d.config ?? {};
+      return { kind: 'text', body: [
+        `base:  ${c.baseURL ?? '?'}`,
+        `model: ${c.defaultModel ?? '?'}`,
+        `key:   ${c.apiKeyPrefix ?? '(none)'}`,
+      ].join('\n') };
+    },
+  },
+  {
+    id: 42, name: 'Recent projects', category: 'config',
+    description: 'Recently opened project paths.',
+    sizeHint: { cols: 4, rows: 3 },
+    compute: (d) => {
+      const r = d.project?.recent ?? [];
+      if (!r.length) return { kind: 'text', body: '(none)' };
+      return { kind: 'text', body: r.join('\n') };
+    },
+  },
+
+  // ─── 50-59: TRANSACTIONS ────────────────────────────────────────────────
+  {
+    id: 50, name: 'Last TX request (full)', category: 'transactions',
+    description: 'Full JSON of the most recent chat_completions request body.',
+    sizeHint: { cols: 6, rows: 4 },
+    compute: (d) => {
+      const tx = _lastChatTx(d);
+      if (!tx?.request) return { kind: 'text', severity: 'info', body: '(no request captured)' };
+      return { kind: 'json', body: tx.request };
+    },
+  },
+  {
+    id: 51, name: 'Last TX response (full)', category: 'transactions',
+    description: 'Full JSON of the most recent chat_completions response body.',
+    sizeHint: { cols: 6, rows: 4 },
+    compute: (d) => {
+      const tx = _lastChatTx(d);
+      if (!tx?.response) return { kind: 'text', severity: 'info', body: '(no response captured)' };
+      return { kind: 'json', body: tx.response };
+    },
+  },
+  {
+    id: 52, name: 'Last TX messages array only', category: 'transactions',
+    description: 'Just request.messages from the last call — easier to scan than the full body.',
+    sizeHint: { cols: 4, rows: 6 },
+    compute: (d) => {
+      const tx = _lastChatTx(d);
+      const ms = tx?.request?.messages;
+      if (!ms) return { kind: 'text', severity: 'info', body: '(no messages)' };
+      const body = ms.map((m, i) => {
+        const c = String(m.content ?? '').replace(/\s+/g, ' ');
+        return `[${i}] ${m.role}: ${c.slice(0, 280)}${c.length > 280 ? '…' : ''}`;
+      }).join('\n\n');
+      return { kind: 'text', body };
+    },
+  },
+  {
+    id: 53, name: 'Last TX response text only', category: 'transactions',
+    description: 'Just choices[0].message.content from the last response.',
+    sizeHint: { cols: 6, rows: 4 },
+    compute: (d) => {
+      const tx = _lastChatTx(d);
+      const c = tx?.response?.choices?.[0]?.message?.content;
+      if (c == null) return { kind: 'text', severity: 'info', body: '(no response text)' };
+      return { kind: 'text', body: String(c) };
+    },
+  },
+  {
+    id: 54, name: 'Transactions table', category: 'transactions',
+    description: 'Compact table of every transaction event with timing and summary.',
+    sizeHint: { cols: 6, rows: 4 },
+    compute: (d) => {
+      const evs = (d.transactions?.events ?? []).slice(-50);
+      if (!evs.length) return { kind: 'text', severity: 'info', body: '(no transactions)' };
+      const rows = evs.map((e) => [String(e.at ?? ''), String(e.type ?? ''), String(e.summary ?? '').slice(0, 200)]);
+      return { kind: 'table', body: { columns: ['+ms', 'type', 'summary'], rows } };
+    },
+  },
+  {
+    id: 55, name: 'Chat completions latency', category: 'transactions',
+    description: 'durationMs of the last 10 chat_completions calls.',
+    sizeHint: { cols: 4, rows: 3 },
+    compute: (d) => {
+      const txs = _allChatTxs(d).slice(-10);
+      if (!txs.length) return { kind: 'text', severity: 'info', body: '(no calls)' };
+      const rows = txs.map((t, i) => `#${i + 1}  ${_fmtMs(t.durationMs ?? null)}`);
+      return { kind: 'text', body: rows.join('\n') };
+    },
+  },
+  {
+    id: 56, name: 'Total chat call count', category: 'transactions',
+    description: 'Number of chat_completions calls + cumulative token spend.',
+    sizeHint: { cols: 3, rows: 2 },
+    compute: (d) => {
+      const n = _allChatTxs(d).length;
+      const tt = d.transactions?.totalTokens ?? 0;
+      return { kind: 'text', body: `${n} calls\n${tt} tokens total` };
+    },
+  },
+
+  // ─── 60-69: CHAT EVENTS ─────────────────────────────────────────────────
+  {
+    id: 60, name: 'Chat events table', category: 'events',
+    description: 'Compact table of every chat event (user/assistant/tool/etc.).',
+    sizeHint: { cols: 6, rows: 4 },
+    compute: (d) => {
+      const evs = (d.chatEvents ?? []).slice(-100);
+      if (!evs.length) return { kind: 'text', severity: 'info', body: '(no events)' };
+      const rows = evs.map((e) => {
+        const c = String(e.content ?? e.summary ?? e.diff ?? '').replace(/\s+/g, ' ').slice(0, 160);
+        return [String(e.id ?? ''), String(e.type ?? ''), String(e.taskId ?? ''), c];
+      });
+      return { kind: 'table', body: { columns: ['id', 'type', 'task', 'content'], rows } };
+    },
+  },
+  {
+    id: 61, name: 'Last assistant-text event', category: 'events',
+    description: 'Content of the most recent assistant-text chat event (what the user sees in the chat panel).',
+    sizeHint: { cols: 6, rows: 4 },
+    compute: (d) => {
+      const evs = (d.chatEvents ?? []).filter((e) => e.type === 'assistant-text');
+      const last = evs[evs.length - 1];
+      if (!last) return { kind: 'text', severity: 'info', body: '(no assistant-text events)' };
+      return { kind: 'text', body: String(last.content ?? '') };
+    },
+  },
+  {
+    id: 62, name: 'Last user-message event', category: 'events',
+    description: 'Content of the most recent user-message chat event.',
+    sizeHint: { cols: 4, rows: 3 },
+    compute: (d) => {
+      const evs = (d.chatEvents ?? []).filter((e) => e.type === 'user-message');
+      const last = evs[evs.length - 1];
+      if (!last) return { kind: 'text', severity: 'info', body: '(no user-message events)' };
+      return { kind: 'text', body: String(last.content ?? '') };
+    },
+  },
+
+  // ─── 70-79: TRENDS / COMPARISONS ────────────────────────────────────────
+  {
+    id: 70, name: 'Parallelism stats', category: 'trends',
+    description: 'Tool-call batching stats across this session.',
+    sizeHint: { cols: 4, rows: 3 },
+    compute: (d) => {
+      const p = d.parallelism ?? {};
+      return { kind: 'text', body: [
+        `runs:           ${p.runs ?? 0}`,
+        `turns w/ tools: ${p.turnsWithTools ?? 0}`,
+        `total calls:    ${p.totalToolCalls ?? 0}`,
+        `avg / turn:     ${p.avgPerTurn ?? 0}`,
+        `max parallel:   ${p.maxParallel ?? 0}`,
+      ].join('\n') };
+    },
+  },
+
+  // ─── 99: META ───────────────────────────────────────────────────────────
+  {
+    id: 99, name: 'Dense summary', category: 'meta',
+    description: 'The classic dense one-block diagnostic summary (build, chat, proj, api, trans, stderr).',
+    sizeHint: { cols: 6, rows: 6 },
+    compute: (d) => {
+      const b = d.build ?? {}, s = d.server ?? {}, c = d.chat ?? {}, p = d.project ?? {}, cfg = d.config ?? {}, t = d.transactions ?? {};
+      const lines = [
+        `build       ${b.version ?? '?'}`,
+        `started     ${b.startedAt ?? '?'}   uptime ${_fmtMs(s.uptimeMs)}`,
+        `pid ${s.pid ?? '?'}   node ${s.nodeVersion ?? '?'}   platform ${s.platform ?? '?'}`,
+        '',
+        `CHAT  status=${c.status} phase=${c.phase} version=${c.version}`,
+        `      events=${c.eventCount ?? 0}  tokens up=${c.tokens?.up ?? 0} down=${c.tokens?.down ?? 0}`,
+        `      sse-subs=${c.streamSubscribers ?? 0}  timeout=${_fmtMs(c.timeoutMs)}`,
+        `      error=${c.error ?? '—'}`,
+        '',
+        `PROJ  ${p.activeProject ?? '(none)'}`,
+        `      log file: ${p.logFilePath ?? '—'}  exists=${p.logFileExists ? 'YES' : 'NO'}  bytes=${p.logFileBytes ?? 0}`,
+        '',
+        `API   base=${cfg.baseURL ?? '?'}`,
+        `      model=${cfg.defaultModel ?? '?'}   key=${cfg.apiKeyPrefix ?? '?'}`,
+        '',
+        `TRANS count=${t.count ?? 0}   totalTokens=${t.totalTokens ?? 0}`,
+        `STDERR (${(d.stderr ?? []).length} lines captured)`,
+      ];
+      return { kind: 'text', body: lines.join('\n') };
+    },
+  },
+];
+
+// IDs that load when the user has no active set yet, or hits "defaults".
+// Sized so they pack cleanly onto a single 12×8 page (96 cells):
+//   1 (3×2=6) + 4 (6×3=18) + 10 (6×4=24) + 13 (4×3=12) + 30 (6×3=18) = 78 cells
+//
+// Covers the core debugging loop:
+//   1  was the system reminder injected
+//   4  what did the user actually ask (with reminder stripped)
+//   10 what did the model reply (full text)
+//   13 did the reply drift to a Gemini built-in persona
+//   30 any errors in stderr (silent-failure detector)
+//
+// Add 20 (all findings), 21 (critical only), 50/51 (full TX bodies), etc.
+// by typing them into the active-IDs input. The catalog page lists every
+// available query with its ID.
+const DEFAULT_QUERY_IDS = [1, 4, 10, 13, 30];
+
+/**
+ * Compute the SMALLEST {cols, rows} rectangle on the 12×8 page grid that
+ * holds the tile's content without scrolling. Per-kind heuristic — each
+ * mosaic cell at ~1400×800 viewport is roughly 18 monospace chars wide
+ * and 6 lines tall, after subtracting header + padding.
+ *
+ * The size is computed from the ACTUAL rendered body, not the catalog
+ * hint. A "Last response" tile gets small when the model said "ok", and
+ * grows large when the model wrote a paragraph. This lets the packer fit
+ * more tiles on each page because tiles only claim what they need.
+ *
+ * Returns { cols, rows } clamped to [minCols..maxCols] × [minRows..maxRows].
+ */
+// computeTileSize, packPage, and layoutMosaic now live in
+// src/agent/mosaic-layout.mjs. They're declared above in the bundle (same
+// module scope after the build's import-stripper concatenates all
+// JS_SOURCES), and re-exported at the bottom of this file for tests
+// importing directly from server.mjs.
+
+/**
+ * Execute a set of catalog queries against a diagnostics object and return
+ * an array of tile results, one per requested ID (preserving order). The
+ * sizeHint is computed from the actual rendered content (not the catalog
+ * default) so tiles only claim the space they need. Unknown IDs produce
+ * an error placeholder.
+ */
+function runQueries(ids, diag) {
+  const out = [];
+  for (const id of ids) {
+    const q = QUERY_CATALOG.find((x) => x.id === id);
+    if (!q) {
+      const tile = { kind: 'text', severity: 'warn', body: `no catalog entry for id=${id}` };
+      out.push({ id, name: `unknown query #${id}`, category: 'meta', sizeHint: computeTileSize(tile), ...tile });
+      continue;
+    }
+    let result;
+    try { result = q.compute(diag) ?? {}; }
+    catch (e) { result = { kind: 'text', severity: 'critical', body: `query #${id} threw: ${e.message}` }; }
+    const partial = {
+      kind: result.kind ?? 'text',
+      severity: result.severity ?? null,
+      body: result.body ?? '',
+    };
+    out.push({
+      id: q.id,
+      name: q.name,
+      category: q.category,
+      description: q.description,
+      sizeHint: computeTileSize(partial),
+      ...partial,
+    });
+  }
+  return out;
+}
+
+/**
+ * Pack a list of tiles onto a single page of given dimensions via
+ * backtracking search. Each tile contributes its `sizeHint.{cols,rows}`
+ * as a rectangle, capped at the page size. The algorithm:
+ *
+ *   1. Find the top-left empty cell.
+ *   2. Try placing each unplaced tile that fits there. For each placement,
+ *      recurse — this explores all permutations within the time budget.
+ *   3. If no tile fits the top-left empty cell, mark that cell "wasted"
+ *      and recurse with the next empty cell.
+ *   4. Score each leaf by total filled cells; keep the best seen.
+ *
+ * Time-capped via opts.maxMs (default 200ms). For the typical workload
+ * (≤15 tiles per page) the search completes in well under that.
+ *
+ * Returns { placed, notPlaced, score } — placed tiles carry their assigned
+ * row/col + spans; notPlaced overflow to the next page.
+ */
+// packPage and layoutMosaic moved to src/agent/mosaic-layout.mjs.
+
 /**
  * Walk the assembled diagnostics object and return a list of findings —
  * problems (or confirmations) detected by inspecting the raw data so the
@@ -2294,6 +3240,10 @@ async function saveRecentProjects(projects) {
  * unit-testable. Add new checks here as we learn new failure modes.
  */
 function runDiagnosticChecks(diag) {
+  // Every check below ALWAYS emits at least one finding so the panel acts
+  // as a system-health dashboard rather than a "errors only" log. Findings
+  // are sorted at the end by severity (critical → warn → info → ok) so
+  // problems float to the top of the view.
   const findings = [];
   const txs = (diag.transactions?.events ?? []).filter((e) => e.type === 'chat_completions');
   const lastChat = txs[txs.length - 1];
@@ -2301,29 +3251,45 @@ function runDiagnosticChecks(diag) {
   // 1. System reminder injection. After our recent change, the reminder is
   //    prepended INSIDE the latest user message. If it's missing, Gemini
   //    will never see the code_boss instructions and may answer as the
-  //    Gemini Enterprise built-in agent. This is the single most useful
-  //    check when debugging "the model is ignoring instructions".
-  if (lastChat?.request?.messages) {
+  //    Gemini Enterprise built-in agent.
+  if (!lastChat) {
+    findings.push({
+      severity: 'info', category: 'prompt',
+      title: 'System reminder — no chat request to inspect yet',
+      detail: 'Send a message to enable this check.',
+    });
+  } else if (!lastChat.request?.messages) {
+    findings.push({
+      severity: 'warn', category: 'prompt',
+      title: 'Last chat request had no messages array',
+      detail: 'request.messages is missing — adapter may not be capturing the request properly.',
+    });
+  } else {
     const msgs = lastChat.request.messages;
     let lastUserIdx = -1;
     for (let i = msgs.length - 1; i >= 0; i--) {
       if (msgs[i].role === 'user') { lastUserIdx = i; break; }
     }
-    if (lastUserIdx >= 0) {
+    if (lastUserIdx < 0) {
+      findings.push({
+        severity: 'warn', category: 'prompt',
+        title: 'Last request had no user message',
+        detail: `request had ${msgs.length} message(s), none with role=user`,
+      });
+    } else {
       const content = String(msgs[lastUserIdx].content ?? '');
       const hasReminder = content.includes('<system-reminder>');
       const reminderAtStart = content.trimStart().startsWith('<system-reminder>');
       if (hasReminder && reminderAtStart) {
         findings.push({
           severity: 'ok', category: 'prompt',
-          title: 'System reminder is at the start of the latest user message',
-          detail: `convo has ${msgs.length} message(s); reminder prepended to msg[${lastUserIdx}] (role=user)`,
+          title: `System reminder is at the start of the latest user message (${msgs.length} msgs)`,
         });
       } else if (hasReminder) {
         findings.push({
           severity: 'warn', category: 'prompt',
           title: 'System reminder present but NOT at the start of the latest user message',
-          detail: 'Instructions buried mid-message are easier for the model to ignore than ones at the start.',
+          detail: 'Instructions buried mid-message are easier for the model to ignore.',
         });
       } else {
         findings.push({
@@ -2332,65 +3298,60 @@ function runDiagnosticChecks(diag) {
           detail: `Gemini will not see code_boss instructions. Latest user msg starts: "${content.slice(0, 140)}"`,
         });
       }
-    } else {
-      findings.push({
-        severity: 'warn', category: 'prompt',
-        title: 'Last request had no user message',
-        detail: `request had ${msgs.length} message(s), none with role=user`,
-      });
     }
-  } else if (txs.length === 0) {
-    findings.push({
-      severity: 'info', category: 'state',
-      title: 'No chat transactions yet — send a message to enable more checks',
-    });
   }
 
-  // 2. File logging actually working? We had a bug where fileLog silently
-  //    failed because mkdirSync wasn't in the bundle. Catch a regression
-  //    of that class by checking the log file on disk.
-  if (diag.project?.logFilePath) {
-    if (diag.project.logFileExists === false) {
-      findings.push({
-        severity: 'critical', category: 'fileLog',
-        title: 'Log file does NOT exist on disk',
-        detail: `Expected at ${diag.project.logFilePath}. fileLog may be silently failing — check the stderr section for ReferenceError / mkdirSync errors.`,
-      });
-    } else if (diag.project.logFileBytes === 0 && (diag.server?.uptimeMs ?? 0) > 30_000) {
-      findings.push({
-        severity: 'warn', category: 'fileLog',
-        title: 'Log file exists but is 0 bytes after 30s+ uptime',
-        detail: 'No fileLog writes have landed. Either the server is fully idle, or writes are failing somewhere.',
-      });
-    }
+  // 2. File logging actually working? Catches regressions of the mkdirSync
+  //    silent-failure bug.
+  if (!diag.project?.logFilePath) {
+    findings.push({
+      severity: 'info', category: 'fileLog',
+      title: 'File logging — no project open, nothing to write',
+    });
+  } else if (diag.project.logFileExists === false) {
+    findings.push({
+      severity: 'critical', category: 'fileLog',
+      title: 'Log file does NOT exist on disk',
+      detail: `Expected at ${diag.project.logFilePath}. fileLog may be silently failing — check stderr for ReferenceError / mkdirSync errors.`,
+    });
+  } else if (diag.project.logFileBytes === 0 && (diag.server?.uptimeMs ?? 0) > 30_000) {
+    findings.push({
+      severity: 'warn', category: 'fileLog',
+      title: 'Log file is 0 bytes after 30s+ uptime',
+      detail: 'No fileLog writes have landed. Either fully idle or writes are failing.',
+    });
+  } else {
+    findings.push({
+      severity: 'ok', category: 'fileLog',
+      title: `Log file present (${diag.project.logFileBytes} bytes)`,
+    });
   }
 
   // 3. Errors / exceptions surfaced in the stderr ring buffer.
   const stderr = diag.stderr ?? [];
   const errorPatterns = [
-    /\bReferenceError\b/,
-    /\bTypeError\b/,
-    /\bSyntaxError\b/,
-    /is not defined/,
-    /\bENOENT\b/,
-    /\bEACCES\b/,
-    /\bEADDRINUSE\b/,
-    /FAILED TO START/,
-    /\bUncaught\b/,
-    /\[fileLog\] file write FAILED/,
+    /\bReferenceError\b/, /\bTypeError\b/, /\bSyntaxError\b/, /is not defined/,
+    /\bENOENT\b/, /\bEACCES\b/, /\bEADDRINUSE\b/, /FAILED TO START/,
+    /\bUncaught\b/, /\[fileLog\] file write FAILED/,
   ];
   const stderrErrors = stderr.filter((e) => errorPatterns.some((re) => re.test(e.line ?? '')));
-  for (const e of stderrErrors.slice(-3)) {
+  if (stderrErrors.length === 0) {
     findings.push({
-      severity: 'critical', category: 'stderr',
-      title: 'Error captured in stderr buffer',
-      detail: (e.line ?? '').slice(0, 300),
+      severity: 'ok', category: 'stderr',
+      title: `Stderr clean (${stderr.length} line(s), 0 error patterns)`,
     });
+  } else {
+    for (const e of stderrErrors.slice(-3)) {
+      findings.push({
+        severity: 'critical', category: 'stderr',
+        title: 'Error captured in stderr buffer',
+        detail: (e.line ?? '').slice(0, 300),
+      });
+    }
   }
 
   // 4. Gemini identity drift — assistant responding as Gemini Enterprise
-  //    built-in instead of code_boss. Strong signal that the system prompt
-  //    didn't land or got overridden.
+  //    built-in instead of code_boss.
   const identityPatterns = [
     /\bI am Gemini Enterprise\b/i,
     /\bI(?:'| a)m Gemini(?:\b|,|\.)/i,
@@ -2398,56 +3359,92 @@ function runDiagnosticChecks(diag) {
     /\bI can help you with (?:Jira|Drive|Calendar|Gmail|Confluence)/i,
     /\bGenerate Memories\b/i,
     /\bI am a large language model\b/i,
+    /\bI do not have direct access to your remote or local file system\b/i,
   ];
   const recentResponses = txs.slice(-5);
-  for (const tx of recentResponses) {
-    const content = tx?.response?.choices?.[0]?.message?.content ?? '';
-    const matched = identityPatterns.find((re) => re.test(content));
-    if (matched) {
+  if (recentResponses.length === 0) {
+    findings.push({
+      severity: 'info', category: 'gemini',
+      title: 'Identity-drift check — no responses to scan yet',
+    });
+  } else {
+    let driftHit = null;
+    for (const tx of recentResponses) {
+      const content = tx?.response?.choices?.[0]?.message?.content ?? '';
+      const matched = identityPatterns.find((re) => re.test(content));
+      if (matched) { driftHit = { matched, content }; break; }
+    }
+    if (driftHit) {
       findings.push({
         severity: 'warn', category: 'gemini',
-        title: 'Assistant replied as a Gemini built-in persona, not as code_boss',
-        detail: `Matched "${matched.source}". Response starts: "${content.slice(0, 160)}"`,
+        title: 'Assistant replied as a Gemini built-in persona, not code_boss',
+        detail: `Matched ${driftHit.matched.source}. Reply starts: "${driftHit.content.slice(0, 160)}"`,
       });
-      break;
+    } else {
+      findings.push({
+        severity: 'ok', category: 'gemini',
+        title: `Identity OK — no Gemini-built-in phrasing in last ${recentResponses.length} replies`,
+      });
     }
   }
 
   // 5. finish_reason — length truncation or content filter hits.
-  for (const tx of recentResponses) {
-    const fr = tx?.response?.choices?.[0]?.finish_reason;
-    if (fr === 'length') {
+  if (recentResponses.length === 0) {
+    findings.push({
+      severity: 'info', category: 'gemini',
+      title: 'finish_reason check — no responses yet',
+    });
+  } else {
+    let frHit = null;
+    for (const tx of recentResponses) {
+      const fr = tx?.response?.choices?.[0]?.finish_reason;
+      if (fr === 'length' || fr === 'content_filter') { frHit = fr; break; }
+    }
+    if (frHit === 'length') {
       findings.push({
         severity: 'warn', category: 'gemini',
         title: 'A recent response was cut off (finish_reason=length)',
-        detail: 'The model hit max_tokens before finishing. Consider raising the cap.',
+        detail: 'Model hit max_tokens before finishing.',
       });
-      break;
-    }
-    if (fr === 'content_filter') {
+    } else if (frHit === 'content_filter') {
       findings.push({
         severity: 'critical', category: 'gemini',
         title: 'A recent response was blocked (finish_reason=content_filter)',
       });
-      break;
+    } else {
+      findings.push({
+        severity: 'ok', category: 'gemini',
+        title: 'All recent responses finished cleanly (no length/filter hits)',
+      });
     }
   }
 
   // 6. Stale state hint — many messages on what might be a fresh session.
-  if (lastChat?.request?.messages?.length >= 20) {
+  const msgCount = lastChat?.request?.messages?.length ?? 0;
+  if (msgCount >= 20) {
     findings.push({
       severity: 'info', category: 'state',
-      title: `Conversation has ${lastChat.request.messages.length} messages`,
-      detail: 'If this is unexpected for the current session, you may have loaded a stale .agent/tasks/state.json from a previous run. Reset to start fresh.',
+      title: `Conversation has ${msgCount} messages — may be stale state from disk`,
+      detail: 'If unexpected, you may have loaded a stale .agent/tasks/state.json. Reset to start fresh.',
+    });
+  } else if (msgCount > 0) {
+    findings.push({
+      severity: 'ok', category: 'state',
+      title: `Conversation size OK (${msgCount} messages)`,
     });
   }
 
-  // 7. Chat is stuck in 'running' for a long time.
+  // 7. Chat stuck in 'running' for a long time.
   if (diag.chat?.status === 'running' && (diag.chat.chatStartedAgoMs ?? 0) > 120_000) {
     findings.push({
       severity: 'warn', category: 'state',
       title: `Chat has been 'running' for ${Math.round(diag.chat.chatStartedAgoMs / 1000)}s`,
       detail: 'May be stuck. Consider aborting and retrying.',
+    });
+  } else {
+    findings.push({
+      severity: 'ok', category: 'state',
+      title: `Chat status: ${diag.chat?.status ?? 'unknown'}`,
     });
   }
 
@@ -2457,6 +3454,11 @@ function runDiagnosticChecks(diag) {
       severity: 'warn', category: 'config',
       title: 'No active project — chat will fail until one is opened',
     });
+  } else {
+    findings.push({
+      severity: 'ok', category: 'config',
+      title: `Active project: ${diag.project.activeProject}`,
+    });
   }
   const keyPfx = diag.config?.apiKeyPrefix;
   if (!keyPfx || keyPfx === '(none)' || keyPfx === '') {
@@ -2465,17 +3467,17 @@ function runDiagnosticChecks(diag) {
       title: 'No API key configured',
       detail: 'Edit API_KEY in the bundle CONFIG section.',
     });
-  }
-
-  // If nothing notable came up, lead with a positive ok finding so the
-  // user can see at a glance "the analyzer ran and found nothing wrong"
-  // instead of wondering whether it ran at all.
-  if (!findings.some((f) => f.severity === 'critical' || f.severity === 'warn')) {
-    findings.unshift({
-      severity: 'ok', category: 'overall',
-      title: 'No problems detected by automated checks',
+  } else {
+    findings.push({
+      severity: 'ok', category: 'config',
+      title: `API key set (${keyPfx})`,
     });
   }
+
+  // Sort: critical first, then warn, then info, then ok — so problems
+  // float to the top of the panel where they're most visible in screenshots.
+  const order = { critical: 0, warn: 1, info: 2, ok: 3 };
+  findings.sort((a, b) => (order[a.severity] ?? 9) - (order[b.severity] ?? 9));
 
   return findings;
 }
@@ -2872,11 +3874,49 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
         // One-stop diagnostic dump + investigative findings. Rendered as a
         // full-page view by the Snapshot UI. Findings are surfaced at the top
         // of the view so the user doesn't have to spot problems by eye.
+        const diag = buildDiagnostics();
+        diag.findings = runDiagnosticChecks(diag);
+        return sendJson(res, 200, diag);
+      }
+      if (req.method === 'GET' && path === '/api/queries') {
+        // Programmable mosaic backend: takes ?ids=1,3,7 and runs those queries
+        // against the current diagnostic state, returning a list of tile data
+        // the UI can pack into a multi-page mosaic. The catalog is also
+        // returned so the UI can render the index page without a second call.
+        const diag = buildDiagnostics();
+        diag.findings = runDiagnosticChecks(diag);
+        const raw = (url.searchParams.get('ids') ?? '').trim();
+        const ids = raw === ''
+          ? DEFAULT_QUERY_IDS.slice()
+          : raw.split(',').map((s) => parseInt(s, 10)).filter((n) => Number.isFinite(n));
+        const tiles = runQueries(ids, diag);
+        const pageCols = Number(url.searchParams.get('cols')) || 12;
+        const pageRows = Number(url.searchParams.get('rows')) || 8;
+        const layout = layoutMosaic(tiles, pageCols, pageRows, { maxMs: 250 });
+        const catalog = QUERY_CATALOG.map((q) => ({
+          id: q.id,
+          name: q.name,
+          description: q.description,
+          category: q.category,
+          sizeHint: q.sizeHint,
+        }));
+        return sendJson(res, 200, {
+          tiles,                                    // unpositioned, ordered by requested ids
+          layout,                                   // { pages: [...], totalTiles, totalPages }
+          catalog,                                  // every available query
+          defaultIds: DEFAULT_QUERY_IDS,
+          pageCols, pageRows,
+          build: { version: BUILD_VERSION_RUNTIME, startedAt: session.startedAt },
+        });
+      }
+      // Kept as a labeled block so we can refactor the body later without
+      // re-finding the call sites — buildDiagnostics() is a closure over the
+      // session so it can stay inline with the rest of the handler scope.
+      function buildDiagnostics() {
         const lf = logFilePath();
         let logExists = false, logBytes = 0, logTail = '';
         if (lf) {
           try {
-            const { statSync, readFileSync } = await import('node:fs');
             const s = statSync(lf);
             logExists = true;
             logBytes = s.size;
@@ -2887,7 +3927,6 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
         const memUsage = (() => {
           try { const m = process.memoryUsage(); return { rss: m.rss, heapUsed: m.heapUsed, heapTotal: m.heapTotal }; } catch { return null; }
         })();
-        // Reuse the legacy snapshot's parallelism computation.
         const agentRuns = session.events.filter((e) => e.type === 'agent_run');
         const allBatches = agentRuns.flatMap((e) => Array.isArray(e.batches) ? e.batches : []);
         const sum = allBatches.reduce((s, n) => s + n, 0);
@@ -2901,7 +3940,7 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
           multiCallTurns: allBatches.filter((n) => n > 1).length,
           batches: allBatches,
         };
-        const diag = {
+        return {
           build: {
             version: BUILD_VERSION_RUNTIME,
             startedAt: session.startedAt,
@@ -2950,8 +3989,6 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
           stderr: stderrBuffer.slice(-200),  // last 200 lines
           logTail,
         };
-        diag.findings = runDiagnosticChecks(diag);
-        return sendJson(res, 200, diag);
       }
       if (req.method === 'GET' && path === '/api/events') {
         const beforeId = url.searchParams.get('before');
@@ -3706,11 +4743,11 @@ const UI_HTML = `<!DOCTYPE html>
     width: 100%;
     overflow: hidden;
   }
-  /* Snapshot is a full-page dense diagnostic view, not a small modal.
-     Designed to fit ENTIRELY on one screen with NO scrolling, so a single
-     screenshot captures every section. Every cell uses overflow: hidden
-     so content that doesn't fit gets clipped rather than pushing the
-     layout off-screen. Fonts shrink to ~9-10px to pack in the data. */
+  /* Snapshot is a full-screen programmable mosaic. The user activates a set
+     of numbered queries (catalog of ~38). Server runs them, packs the
+     resulting tiles onto one or more 12×8 grid pages, and returns positions.
+     The browser renders one page at a time with absolute grid placement —
+     every tile fits within the viewport, every page is screenshot-friendly. */
   .modal-bg.fullpage {
     padding: 0;
     align-items: stretch;
@@ -3727,118 +4764,183 @@ const UI_HTML = `<!DOCTYPE html>
     flex-direction: column;
     overflow: hidden;
   }
-  .modal-bg.fullpage .modal-header { padding: 3px 8px; flex: 0 0 auto; }
-  .modal-bg.fullpage .modal-header h2 { font-size: 11px; }
-  .modal-bg.fullpage .modal-close { font-size: 14px; padding: 0 6px; }
+  /* Compact mode: every pixel of chrome shrunk to the minimum that's still
+     readable in a screenshot. Headers are present (need them to identify
+     tiles) but use background distinction only, no border. Padding/gap
+     trimmed so tile content butts close to the edges. */
+  .modal-bg.fullpage .modal-header {
+    padding: 1px 4px;
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex-wrap: wrap;
+    border-bottom: 1px solid var(--border);
+    min-height: 0;
+  }
+  .modal-bg.fullpage .modal-header h2 { font-size: 9px; margin: 0; }
+  .modal-bg.fullpage .modal-close { font-size: 12px; padding: 0 4px; line-height: 1; }
   .modal-bg.fullpage .modal-body {
-    padding: 3px 4px 4px;
+    padding: 0;
     max-height: none;
     flex: 1 1 auto;
     overflow: hidden;
     min-height: 0;
-    display: grid;
-    gap: 3px;
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-    grid-template-rows: auto auto auto minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr);
-    grid-template-areas:
-      "findings findings"
-      "summary  summary"
-      "pills    pills"
-      "stderr   txreq"
-      "log      txresp"
-      "events   tx";
+    position: relative;
   }
-  .modal-bg.fullpage .diag-findings {
-    grid-area: findings;
+  /* Mosaic header controls — activation input, defaults button, page nav. */
+  .mosaic-controls {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-family: var(--mono);
+    font-size: 9px;
+    flex-wrap: wrap;
+    flex: 1 1 auto;
+  }
+  .mosaic-controls input {
+    background: #15140f;
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: 2px;
+    padding: 0 4px;
+    font-family: var(--mono);
+    font-size: 9px;
+    min-width: 160px;
+    flex: 1 1 160px;
+    height: 16px;
+  }
+  .mosaic-controls .btn-sm {
+    background: #2a2823;
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: 2px;
+    padding: 0 6px;
+    font-family: var(--mono);
+    font-size: 9px;
+    height: 16px;
+    cursor: pointer;
+    line-height: 1;
+  }
+  .mosaic-controls .btn-sm:hover { background: var(--accent); color: var(--accent-fg); }
+  .mosaic-controls .pageno { color: var(--muted); font-size: 9px; }
+  .mosaic-controls .build-pill {
+    background: #15140f; color: var(--muted); border: 1px solid var(--border);
+    padding: 0 4px; border-radius: 2px; font-size: 8px;
+  }
+  /* Page = 12 cols × 8 rows grid filling the viewport beneath the header. */
+  .mosaic-page {
+    position: absolute;
+    inset: 0;
+    display: grid;
+    grid-template-columns: repeat(12, 1fr);
+    grid-template-rows: repeat(8, 1fr);
+    gap: 2px;
+    padding: 2px;
+    box-sizing: border-box;
+  }
+  .mosaic-page[hidden] { display: none; }
+  /* Each tile occupies a rectangle of grid cells, positioned by inline CSS
+     variables set during render. 1-indexed to match CSS Grid line numbers. */
+  .mosaic-tile {
+    grid-column: var(--col) / span var(--cspan);
+    grid-row: var(--row) / span var(--rspan);
+    background: #15140f;
+    border: 1px solid var(--border);
+    border-radius: 2px;
     display: flex;
     flex-direction: column;
-    gap: 1px;
-    padding: 3px 4px;
-    border: 1px solid var(--border);
-    border-radius: 3px;
-    background: #15140f;
-    font-family: var(--mono);
-    font-size: 10px;
-    line-height: 1.25;
     overflow: hidden;
+    min-width: 0;
+    min-height: 0;
   }
-  .modal-bg.fullpage .diag-finding {
+  .mosaic-tile.sev-ok       { border-color: rgba(70,160,70,0.6); }
+  .mosaic-tile.sev-info     { border-color: rgba(100,140,200,0.6); }
+  .mosaic-tile.sev-warn     { border-color: rgba(227,196,106,0.7); }
+  .mosaic-tile.sev-critical { border-color: rgba(220,80,80,0.8); }
+  .mosaic-tile-head {
     display: flex;
-    gap: 6px;
-    align-items: baseline;
-    padding: 1px 2px;
-  }
-  .modal-bg.fullpage .diag-finding .sev {
-    font-weight: bold;
-    flex: 0 0 auto;
-    min-width: 56px;
+    align-items: center;
+    gap: 4px;
     padding: 0 4px;
+    flex: 0 0 auto;
+    background: #1a1814;
+    line-height: 1.1;
+  }
+  .mosaic-tile-head .id {
+    color: var(--accent);
+    font-family: var(--mono);
+    font-size: 8.5px;
+    font-weight: bold;
+  }
+  .mosaic-tile-head .name {
+    color: var(--fg);
+    font-size: 9px;
+    flex: 1 1 auto;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .mosaic-tile-head .sev-tag {
+    font-size: 7.5px;
+    padding: 0 3px;
+    border-radius: 2px;
+    text-transform: uppercase;
+    font-family: var(--mono);
+    line-height: 1.3;
+  }
+  .mosaic-tile-head .sev-tag.ok       { background: rgba(70,160,70,0.25);  color: #8fd28f; }
+  .mosaic-tile-head .sev-tag.info     { background: rgba(100,140,200,0.22); color: #9fc4e8; }
+  .mosaic-tile-head .sev-tag.warn     { background: rgba(227,196,106,0.22); color: #e3c46a; }
+  .mosaic-tile-head .sev-tag.critical { background: rgba(220,80,80,0.25);   color: #ff8f8f; }
+  .mosaic-tile-body {
+    flex: 1 1 auto;
+    overflow: hidden;
+    min-height: 0;
+    padding: 1px 4px 2px;
+    font-family: var(--mono);
+    font-size: 9px;
+    line-height: 1.0;
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: #cfc9b8;
+  }
+  /* Findings rendered inside a tile */
+  .mosaic-tile-body .finding {
+    display: flex;
+    gap: 4px;
+    align-items: baseline;
+    padding: 0;
+    font-size: 8.5px;
+    line-height: 1.05;
+  }
+  .mosaic-tile-body .finding .sev {
+    flex: 0 0 auto;
+    min-width: 44px;
+    padding: 0 3px;
     border-radius: 2px;
     text-align: center;
-    font-size: 9px;
+    font-weight: bold;
+    font-size: 8px;
   }
-  .modal-bg.fullpage .diag-finding .sev.ok       { background: rgba(70,160,70,0.25);  color: #8fd28f; }
-  .modal-bg.fullpage .diag-finding .sev.info     { background: rgba(100,140,200,0.22); color: #9fc4e8; }
-  .modal-bg.fullpage .diag-finding .sev.warn     { background: rgba(227,196,106,0.22); color: #e3c46a; }
-  .modal-bg.fullpage .diag-finding .sev.critical { background: rgba(220,80,80,0.25);   color: #ff8f8f; }
-  .modal-bg.fullpage .diag-finding .cat   { color: var(--muted); flex: 0 0 auto; min-width: 56px; }
-  .modal-bg.fullpage .diag-finding .body  { color: var(--fg); flex: 1 1 auto; word-break: break-word; }
-  .modal-bg.fullpage .diag-finding .body .det { color: var(--muted); margin-left: 6px; }
-  .modal-bg.fullpage .diag-summary {
-    font-size: 10px;
-    line-height: 1.15;
-    padding: 4px 6px;
-    margin: 0;
-    grid-area: summary;
-    overflow: hidden;
-    border-width: 1px;
-  }
-  .modal-bg.fullpage .snap-pills {
-    grid-area: pills;
-    margin: 0 !important;
-    font-size: 10px !important;
-    padding: 0 2px;
-    gap: 6px !important;
-  }
-  .modal-bg.fullpage .snap-pills .pill { font-size: 9px; padding: 0 5px; }
-  .modal-bg.fullpage .diag-section {
-    margin: 0;
-    min-height: 0;
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
-  }
-  .modal-bg.fullpage .diag-section.area-stderr { grid-area: stderr; }
-  .modal-bg.fullpage .diag-section.area-log    { grid-area: log; }
-  .modal-bg.fullpage .diag-section.area-events { grid-area: events; }
-  .modal-bg.fullpage .diag-section.area-tx     { grid-area: tx; }
-  .modal-bg.fullpage .diag-section.area-txreq  { grid-area: txreq; }
-  .modal-bg.fullpage .diag-section.area-txresp { grid-area: txresp; }
-  .modal-bg.fullpage .diag-section h3 {
-    margin: 0;
-    font-size: 9px;
-    padding: 1px 4px 2px;
-    flex: 0 0 auto;
-    letter-spacing: 0.3px;
-  }
-  .modal-bg.fullpage .diag-block {
-    font-size: 9px;
-    line-height: 1.18;
-    padding: 2px 5px;
-    margin: 0;
-    max-height: none;
-    overflow: hidden;
-    flex: 1 1 auto;
-    min-height: 0;
-  }
-  .modal-bg.fullpage .diag-table-wrap {
-    flex: 1 1 auto;
-    overflow: hidden;
-    min-height: 0;
-  }
-  .modal-bg.fullpage .diag-table { font-size: 9px; }
-  .modal-bg.fullpage .diag-table th,
-  .modal-bg.fullpage .diag-table td { padding: 1px 4px; line-height: 1.18; }
+  .mosaic-tile-body .finding .sev.ok       { background: rgba(70,160,70,0.25);  color: #8fd28f; }
+  .mosaic-tile-body .finding .sev.info     { background: rgba(100,140,200,0.22); color: #9fc4e8; }
+  .mosaic-tile-body .finding .sev.warn     { background: rgba(227,196,106,0.22); color: #e3c46a; }
+  .mosaic-tile-body .finding .sev.critical { background: rgba(220,80,80,0.25);   color: #ff8f8f; }
+  .mosaic-tile-body .finding .cat { color: var(--muted); flex: 0 0 auto; min-width: 44px; font-size: 8px; }
+  .mosaic-tile-body .finding .text { flex: 1 1 auto; word-break: break-word; }
+  /* Table tiles */
+  .mosaic-tile-body table { width: 100%; border-collapse: collapse; font-size: 8.5px; }
+  .mosaic-tile-body th, .mosaic-tile-body td { padding: 0 3px; border-bottom: 1px solid #2a2823; text-align: left; vertical-align: top; line-height: 1.05; }
+  .mosaic-tile-body th { color: var(--muted); font-weight: normal; }
+  /* Catalog index page tile */
+  .mosaic-catalog-tile { grid-column: 1 / span 12; grid-row: 1 / span 8; }
+  .mosaic-catalog-tile .mosaic-tile-body { font-size: 9px; padding: 1px 4px; }
+  .mosaic-catalog-tile table { font-size: 9px; }
+  .mosaic-catalog-tile th, .mosaic-catalog-tile td { padding: 0 4px; line-height: 1.25; }
+  .mosaic-catalog-tile td.id { color: var(--accent); font-weight: bold; min-width: 24px; }
+  .mosaic-catalog-tile td.cat { color: var(--muted); min-width: 60px; }
+  .mosaic-catalog-tile td.size { color: var(--muted); font-size: 8.5px; min-width: 40px; }
 
   .modal.error { border-top: 4px solid var(--error); }
   .modal-header {
@@ -4017,6 +5119,246 @@ const UI_HTML = `<!DOCTYPE html>
   }
   .modal.error pre.dense { border-color: var(--error); }
 </style>
+<script>
+// ====== injected from agent/mosaic-layout.mjs ======
+/**
+ * Mosaic layout — pure functions that size and pack tiles on a grid.
+ *
+ * Shared between the Node server (where layout-on-fetch is the fallback)
+ * and the browser script (where the same code runs with measured font
+ * metrics + actual viewport dimensions). The build script injects this
+ * file's contents into both contexts; keep it pure (no I/O, no Node-only
+ * APIs) so it can run unchanged in either.
+ *
+ * Three exports:
+ *   - computeTileSize(tile, opts) → {cols, rows}
+ *   - packPage(tiles, cols, rows, opts) → {placed, notPlaced, score, ...}
+ *   - layoutMosaic(tiles, pageCols, pageRows, opts) → {pages, ...}
+ */
+
+/**
+ * Compute the SMALLEST {cols, rows} rectangle that holds the tile's content
+ * without scrolling. Per-kind heuristic: for text/json we count chars and
+ * lines; for findings we account for the badge chrome; for tables we sum
+ * column widths.
+ *
+ * The conversion to grid cells depends on opts.charsPerCol and
+ * opts.linesPerRow, which the CALLER computes from the actual rendered
+ * font + viewport. The server passes its baseline (assumes 1400×800 at
+ * 9px monospace); the browser passes measured values.
+ */
+function computeTileSize(tile, opts = {}) {
+  const charsPerCol = opts.charsPerCol ?? 20;
+  const linesPerRow = opts.linesPerRow ?? 7;
+  const minCols     = opts.minCols ?? 2;
+  const minRows     = opts.minRows ?? 1;
+  const maxCols     = opts.maxCols ?? 12;
+  const maxRows     = opts.maxRows ?? 8;
+  // Chrome budget in lines (header bar + body padding amortized as text lines).
+  const chromeLines = opts.chromeLines ?? 2;
+
+  const kind = tile?.kind ?? 'text';
+  const body = tile?.body;
+  let maxLine = 0;
+  let lineCount = 1;
+
+  if (kind === 'json') {
+    let text;
+    try { text = JSON.stringify(body, null, 2); }
+    catch { text = String(body); }
+    const lines = text.split('\\n');
+    lineCount = lines.length;
+    for (const line of lines) if (line.length > maxLine) maxLine = line.length;
+  } else if (kind === 'findings') {
+    const findings = Array.isArray(body) ? body : [];
+    lineCount = Math.max(1, findings.reduce((n, f) => n + (f?.detail ? 2 : 1), 0));
+    let widest = 50;
+    for (const f of findings) {
+      const t = (f?.title?.length ?? 0) + 14;
+      if (t > widest) widest = t;
+      if (f?.detail) {
+        const d = (String(f.detail).length ?? 0) + 4;
+        if (d > widest) widest = d;
+      }
+    }
+    maxLine = widest;
+  } else if (kind === 'table') {
+    const t = body ?? { columns: [], rows: [] };
+    lineCount = (t.rows?.length ?? 0) + 1;
+    const cols = t.columns ?? [];
+    let width = 0;
+    for (let i = 0; i < cols.length; i++) {
+      let colW = String(cols[i] ?? '').length;
+      for (const row of (t.rows ?? [])) {
+        const cellStr = String(row[i] ?? '');
+        if (cellStr.length > colW) colW = cellStr.length;
+      }
+      width += Math.min(colW, 40) + 2;
+    }
+    maxLine = Math.max(width, 30);
+  } else {
+    const text = String(body ?? '');
+    const lines = text.split('\\n');
+    lineCount = lines.length;
+    for (const line of lines) if (line.length > maxLine) maxLine = line.length;
+  }
+
+  if (maxLine === 0) maxLine = 10;
+
+  let cols = Math.ceil(maxLine / charsPerCol);
+  let rows = Math.ceil((lineCount + chromeLines) / linesPerRow);
+
+  cols = Math.max(minCols, Math.min(maxCols, cols));
+  rows = Math.max(minRows, Math.min(maxRows, rows));
+  return { cols, rows };
+}
+
+/**
+ * Pack a list of tiles onto a single page via backtracking search.
+ * Score is the lexicographic pair (tileCount, cellsFilled) — placing
+ * more tiles always wins; within equal tile counts the denser packing
+ * wins. Time-capped via opts.maxMs (default 200ms).
+ */
+function packPage(tiles, cols, rows, opts = {}) {
+  const maxMs = opts.maxMs ?? 200;
+  const startMs = Date.now();
+  const sized = tiles.map((t) => {
+    const w = Math.max(1, Math.min(t.sizeHint?.cols ?? 3, cols));
+    const h = Math.max(1, Math.min(t.sizeHint?.rows ?? 2, rows));
+    return { tile: t, w, h, area: w * h };
+  });
+
+  const grid = Array.from({ length: rows }, () => new Array(cols).fill(-1));
+  const placed = [];
+  const usedIdx = new Set();
+  let best = { placedIdx: [], placements: [], tileCount: -1, cellsFilled: -1 };
+
+  const findEmpty = () => {
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        if (grid[r][c] === -1) return [r, c];
+      }
+    }
+    return null;
+  };
+  const fits = (r, c, w, h) => {
+    if (r + h > rows || c + w > cols) return false;
+    for (let i = 0; i < h; i++) for (let j = 0; j < w; j++) if (grid[r + i][c + j] !== -1) return false;
+    return true;
+  };
+  const fill = (r, c, w, h, v) => {
+    for (let i = 0; i < h; i++) for (let j = 0; j < w; j++) grid[r + i][c + j] = v;
+  };
+  const countFilled = () => {
+    let n = 0; for (const row of grid) for (const v of row) if (v >= 0) n++; return n;
+  };
+  const isBetter = (tileCount, cellsFilled) =>
+    tileCount > best.tileCount ||
+    (tileCount === best.tileCount && cellsFilled > best.cellsFilled);
+
+  function recurse() {
+    if (Date.now() - startMs > maxMs) return;
+    const empty = findEmpty();
+    const tileCount = placed.length;
+    if (!empty) {
+      const cellsFilled = countFilled();
+      if (isBetter(tileCount, cellsFilled)) {
+        best = { placedIdx: [...usedIdx], placements: placed.map((p) => ({ ...p })), tileCount, cellsFilled };
+      }
+      return;
+    }
+    const [r, c] = empty;
+
+    let emptyCount = 0;
+    for (const row of grid) for (const v of row) if (v === -1) emptyCount++;
+    let smallestArea = Infinity;
+    for (let i = 0; i < sized.length; i++) {
+      if (!usedIdx.has(i)) smallestArea = Math.min(smallestArea, sized[i].area);
+    }
+    const maxAdditionalTiles = smallestArea === Infinity ? 0 : Math.floor(emptyCount / smallestArea);
+    if (tileCount + maxAdditionalTiles < best.tileCount) return;
+    if (tileCount + maxAdditionalTiles === best.tileCount &&
+        countFilled() + emptyCount <= best.cellsFilled) return;
+
+    const candidates = sized
+      .map((s, i) => ({ s, i }))
+      .filter(({ i }) => !usedIdx.has(i))
+      .sort((a, b) => b.s.area - a.s.area);
+
+    let triedAny = false;
+    for (const { s, i } of candidates) {
+      if (fits(r, c, s.w, s.h)) {
+        triedAny = true;
+        fill(r, c, s.w, s.h, i);
+        usedIdx.add(i);
+        placed.push({ tileIdx: i, row: r, col: c, colSpan: s.w, rowSpan: s.h });
+        recurse();
+        placed.pop();
+        usedIdx.delete(i);
+        fill(r, c, s.w, s.h, -1);
+        if (Date.now() - startMs > maxMs) return;
+      }
+    }
+    if (!triedAny) {
+      grid[r][c] = -2;
+      recurse();
+      grid[r][c] = -1;
+    }
+  }
+
+  recurse();
+
+  const placedIdxSet = new Set(best.placedIdx);
+  const placedTiles = best.placements.map((p) => ({
+    ...tiles[p.tileIdx],
+    row: p.row,
+    col: p.col,
+    colSpan: p.colSpan,
+    rowSpan: p.rowSpan,
+  }));
+  const notPlaced = tiles.filter((_, i) => !placedIdxSet.has(i));
+  return {
+    placed: placedTiles,
+    notPlaced,
+    tileCount: best.tileCount,
+    cellsFilled: best.cellsFilled,
+    score: best.cellsFilled,
+  };
+}
+
+/**
+ * Lay out tiles across one or more pages, packing each page tightly via
+ * \`packPage\`. Tiles that don't fit overflow to the next page; an oversize
+ * tile is force-placed on its own page.
+ */
+function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
+  const pages = [];
+  let remaining = tiles.slice();
+  let safety = 30;
+  while (remaining.length > 0 && safety-- > 0) {
+    const r = packPage(remaining, pageCols, pageRows, opts);
+    if (r.placed.length === 0) {
+      const t = remaining.shift();
+      pages.push({
+        tiles: [{
+          ...t, row: 0, col: 0,
+          colSpan: Math.min(t.sizeHint?.cols ?? pageCols, pageCols),
+          rowSpan: Math.min(t.sizeHint?.rows ?? pageRows, pageRows),
+          oversize: true,
+        }],
+        fillRatio: 1.0,
+      });
+      continue;
+    }
+    pages.push({
+      tiles: r.placed,
+      fillRatio: r.score / (pageCols * pageRows),
+    });
+    remaining = r.notPlaced;
+  }
+  return { pages, totalTiles: tiles.length, totalPages: pages.length };
+}
+</script>
 </head>
 <body>
 
@@ -4496,15 +5838,295 @@ const UI_HTML = `<!DOCTYPE html>
     return escapeHtml(text).replace(/\`([^\`]+)\`/g, '<code>$1</code>');
   }
 
+  // ── Mosaic snapshot ─────────────────────────────────────────────────────
+  // Lives in localStorage so the active query set persists across page loads.
+  // Server-side default loads when no localStorage entry exists.
+  const MOSAIC_LS_KEY = 'cb.mosaic.activeIds';
+  let _mosaicState = {
+    currentPage: 0,
+    catalog: [],
+    tiles: [],           // raw tile data from server (kind + body etc.)
+    layout: null,        // {pages: [...]} computed locally with measured metrics
+    metrics: null,       // {charsPerCol, linesPerRow, ...} from _measureCellMetrics
+    build: null,
+    activeIdsRaw: '',
+  };
+  function _getActiveIds() {
+    try { return localStorage.getItem(MOSAIC_LS_KEY) ?? ''; }
+    catch { return ''; }
+  }
+  function _setActiveIds(raw) {
+    try { localStorage.setItem(MOSAIC_LS_KEY, raw); } catch {}
+  }
+
   async function openSnapshot() {
+    _mosaicState.currentPage = 0;
+    // Show the modal frame FIRST (with a loading placeholder) so we can
+    // measure the actual modal-body dimensions before sizing tiles.
+    $modal.classList.remove('error');
+    $modalBg.classList.add('fullpage');
+    $modalBg.classList.add('show');
+    if ($modalBody) $modalBody.innerHTML = '<div style="padding:20px;color:var(--muted);font-family:var(--mono);font-size:10px;">measuring…</div>';
+    if ($modalTitle) $modalTitle.textContent = 'Mosaic';
+    await _fetchAndRenderMosaic();
+  }
+
+  async function _fetchAndRenderMosaic() {
     try {
-      const r = await fetch('/api/diagnostics');
-      if (!r.ok) throw new Error('diagnostics fetch failed: ' + r.status);
+      const raw = _getActiveIds().trim();
+      const url = raw ? \`/api/queries?ids=\${encodeURIComponent(raw)}\` : '/api/queries';
+      const r = await fetch(url);
+      if (!r.ok) throw new Error('queries fetch failed: ' + r.status);
       const data = await r.json();
-      renderSnapshot(data);
+      _mosaicState.tiles = data.tiles ?? [];
+      _mosaicState.catalog = data.catalog ?? [];
+      _mosaicState.build = data.build;
+      _mosaicState.activeIdsRaw = raw || (data.defaultIds ?? []).join(',');
+      // Re-layout in the browser with measured metrics. The server's layout
+      // (in data.layout) is discarded — the browser knows the actual cell
+      // dimensions for the real viewport / font size / zoom level.
+      _relayoutAndRender();
     } catch (e) {
       showError('Snapshot fetch failed', e);
     }
+  }
+
+  // ── Browser-side measurement & layout ───────────────────────────────────
+  // The shared mosaic-layout.mjs is injected as a <script> in the HTML head
+  // by the build, so computeTileSize, packPage, and layoutMosaic are global
+  // functions in browser scope. We compute charsPerCol and linesPerRow from
+  // the actual rendered cell dimensions, then re-pack on every resize.
+  function _measureCellMetrics() {
+    // The mosaic-page grid splits the modal body into 12 cols × 8 rows.
+    // We need to know how much TEXT fits inside one cell after tile chrome.
+    // Strategy: render a hidden probe into the body with the real tile-body
+    // styles, measure a single character's width and a single line's height.
+    const probe = document.createElement('div');
+    probe.style.cssText = 'position:absolute;visibility:hidden;left:-9999px;top:-9999px;' +
+      'font-family:var(--mono);font-size:9px;line-height:1.0;white-space:pre;';
+    probe.textContent = 'X\\nX';
+    document.body.appendChild(probe);
+    const rect2 = probe.getBoundingClientRect();
+    probe.textContent = 'X';
+    const rect1 = probe.getBoundingClientRect();
+    const charW   = rect1.width;
+    const lineH   = rect2.height - rect1.height;  // delta between 1 and 2 lines
+    document.body.removeChild(probe);
+
+    // Available area for the mosaic = modal body minus its padding. The page
+    // grid splits that area into 12×8 cells. Each cell's INNER capacity =
+    // cell size minus border + tile header + body padding.
+    const bodyRect = $modalBody.getBoundingClientRect();
+    const gap = 2;    // .mosaic-page gap
+    const pad = 2;    // .mosaic-page padding
+    const cellW = (bodyRect.width  - 2 * pad - 11 * gap) / 12;
+    const cellH = (bodyRect.height - 2 * pad -  7 * gap) /  8;
+    const tileBorderX = 2;       // 1px × 2
+    const tileBorderY = 2;
+    const tileBodyPadX = 8;      // 4px × 2
+    const tileBodyPadY = 3;      // 1px top + 2px bottom
+    const tileHeaderH = 14;      // measured from CSS: ~9px font × 1.1 LH + small padding
+    const innerW = cellW - tileBorderX - tileBodyPadX;
+    const innerH = cellH - tileBorderY - tileBodyPadY - tileHeaderH;
+    const charsPerCol = Math.max(1, Math.floor(innerW / Math.max(1, charW)));
+    const linesPerRow = Math.max(1, Math.floor(innerH / Math.max(1, lineH)));
+    return { charsPerCol, linesPerRow, charW, lineH, cellW, cellH };
+  }
+
+  function _relayoutAndRender() {
+    const metrics = _measureCellMetrics();
+    _mosaicState.metrics = metrics;
+    // Recompute size for every tile using the measured metrics.
+    const sized = (_mosaicState.tiles ?? []).map((t) => ({
+      ...t,
+      sizeHint: computeTileSize(t, {
+        charsPerCol: metrics.charsPerCol,
+        linesPerRow: metrics.linesPerRow,
+      }),
+    }));
+    _mosaicState.layout = layoutMosaic(sized, 12, 8, { maxMs: 250 });
+    renderMosaic();
+  }
+
+  // Debounced window-resize handler. Reflow whenever the viewport changes
+  // size so tile dimensions scale with the browser without a manual reload.
+  let _resizeTimer = null;
+  window.addEventListener('resize', () => {
+    if (!$modalBg?.classList.contains('fullpage') || !$modalBg.classList.contains('show')) return;
+    clearTimeout(_resizeTimer);
+    _resizeTimer = setTimeout(() => {
+      if (_mosaicState.tiles?.length) _relayoutAndRender();
+    }, 150);
+  });
+
+  function _gotoPage(n) {
+    const total = _mosaicState.layout?.pages?.length ?? 0;
+    const catalogPageCount = 1;
+    const max = total + catalogPageCount - 1;  // last page = catalog index
+    _mosaicState.currentPage = Math.max(0, Math.min(max, n));
+    _renderCurrentPage();
+  }
+
+  function _onActiveIdsChange(e) {
+    const v = (e.target.value ?? '').trim();
+    _setActiveIds(v);
+    _mosaicState.currentPage = 0;
+    _fetchAndRenderMosaic();
+  }
+
+  function _resetMosaicDefaults() {
+    _setActiveIds('');  // empty = use server defaults
+    _mosaicState.currentPage = 0;
+    _fetchAndRenderMosaic();
+  }
+
+  function _gotoCatalog() {
+    const total = _mosaicState.layout?.pages?.length ?? 0;
+    _gotoPage(total);  // catalog page is one past the last data page
+  }
+
+  function renderMosaic() {
+    $modal.classList.remove('error');
+    $modalBg.classList.add('fullpage');
+    $modalBg.classList.add('show');
+
+    const { layout, catalog, build, activeIdsRaw } = _mosaicState;
+    const totalDataPages = layout?.pages?.length ?? 0;
+
+    // The modal-header gets rebuilt only on FIRST render (or when the modal
+    // was previously closed). Re-layouts triggered by window resize only
+    // refresh the body so the header's buttons aren't detached mid-click.
+    const headerExists = document.getElementById('mosaicActiveInput') != null;
+    if (!headerExists) {
+      const headerHtml = \`
+        <h2>Mosaic</h2>
+        <div class="mosaic-controls">
+          <label>active:</label>
+          <input type="text" id="mosaicActiveInput" placeholder="e.g. 1,13,20,50,51"
+                 title="Comma-separated query IDs from the catalog (last page).">
+          <button class="btn-sm" onclick="_resetMosaicDefaults()">defaults</button>
+          <button class="btn-sm" onclick="_gotoCatalog()">catalog</button>
+          <span class="pageno" id="mosaicPageNo"></span>
+          <button class="btn-sm" onclick="_gotoPage(_mosaicState.currentPage - 1)">‹</button>
+          <button class="btn-sm" onclick="_gotoPage(_mosaicState.currentPage + 1)">›</button>
+          <button class="btn-sm" onclick="_fetchAndRenderMosaic()">↻</button>
+          <span class="build-pill" id="mosaicBuildPill"></span>
+        </div>
+        <button class="modal-close" onclick="closeModal()">×</button>
+      \`;
+      document.querySelector('#modalBg .modal-header').innerHTML = headerHtml;
+      const input = document.getElementById('mosaicActiveInput');
+      if (input) {
+        input.addEventListener('change', _onActiveIdsChange);
+        input.addEventListener('keydown', (e) => { if (e.key === 'Enter') _onActiveIdsChange(e); });
+      }
+    }
+    // Update header dynamic bits — value of active input, build pill text —
+    // without recreating the elements (preserves listeners and click targets).
+    const inputEl = document.getElementById('mosaicActiveInput');
+    if (inputEl && inputEl.value !== activeIdsRaw) inputEl.value = activeIdsRaw;
+    const buildPill = document.getElementById('mosaicBuildPill');
+    if (buildPill) buildPill.textContent = build?.version ?? '?';
+
+    // Pre-render every page; only the current one is visible. This keeps
+    // the DOM stable so flipping pages is instant.
+    const dataPagesHtml = (layout?.pages ?? []).map((p, idx) => _renderPageHtml(p, idx)).join('');
+    const catalogHtml = \`<div class="mosaic-page" data-page-idx="\${totalDataPages}" hidden>\${_renderCatalogPageHtml(catalog)}</div>\`;
+    $modalBody.innerHTML = dataPagesHtml + catalogHtml;
+
+    _renderCurrentPage();
+  }
+
+  function _renderCurrentPage() {
+    const total = (_mosaicState.layout?.pages?.length ?? 0) + 1;
+    const cur = _mosaicState.currentPage;
+    $modalBody.querySelectorAll('.mosaic-page').forEach((el) => {
+      el.hidden = (Number(el.dataset.pageIdx) !== cur);
+    });
+    const pn = document.getElementById('mosaicPageNo');
+    if (pn) {
+      const isCatalog = cur === total - 1;
+      pn.textContent = isCatalog
+        ? \`page \${cur + 1}/\${total} (catalog)\`
+        : \`page \${cur + 1}/\${total}\`;
+    }
+  }
+
+  function _renderPageHtml(page, idx) {
+    const tiles = (page.tiles ?? []).map((t) => _renderTileHtml(t)).join('');
+    return \`<div class="mosaic-page" data-page-idx="\${idx}" hidden>\${tiles}</div>\`;
+  }
+
+  function _renderTileHtml(tile) {
+    const sev = tile.severity ? \`sev-\${tile.severity}\` : '';
+    const sevTag = tile.severity ? \`<span class="sev-tag \${tile.severity}">\${escapeHtml(tile.severity)}</span>\` : '';
+    // Server returns 0-indexed row/col; CSS Grid is 1-indexed.
+    const styleVars = \`--row: \${(tile.row ?? 0) + 1}; --col: \${(tile.col ?? 0) + 1}; --rspan: \${tile.rowSpan ?? 2}; --cspan: \${tile.colSpan ?? 3};\`;
+    const body = _renderTileBody(tile);
+    return \`<div class="mosaic-tile \${sev}" style="\${styleVars}">
+      <div class="mosaic-tile-head">
+        <span class="id">#\${tile.id}</span>
+        <span class="name">\${escapeHtml(tile.name ?? '')}</span>
+        \${sevTag}
+      </div>
+      <div class="mosaic-tile-body">\${body}</div>
+    </div>\`;
+  }
+
+  function _renderTileBody(tile) {
+    const kind = tile.kind ?? 'text';
+    if (kind === 'json') {
+      try { return escapeHtml(JSON.stringify(tile.body, null, 2)); }
+      catch { return escapeHtml(String(tile.body)); }
+    }
+    if (kind === 'table') {
+      const t = tile.body ?? { columns: [], rows: [] };
+      const head = (t.columns ?? []).map((c) => \`<th>\${escapeHtml(c)}</th>\`).join('');
+      const rows = (t.rows ?? []).map((r) =>
+        '<tr>' + r.map((cell) => \`<td>\${escapeHtml(String(cell ?? ''))}</td>\`).join('') + '</tr>'
+      ).join('');
+      return \`<table><thead><tr>\${head}</tr></thead><tbody>\${rows}</tbody></table>\`;
+    }
+    if (kind === 'findings') {
+      const findings = Array.isArray(tile.body) ? tile.body : [];
+      if (!findings.length) return '<span style="color:var(--muted)">(no findings)</span>';
+      return findings.map((f) => {
+        const sev = String(f.severity ?? 'info').toLowerCase();
+        const det = f.detail ? \`<br><span style="color:var(--muted);font-size:8.5px;">— \${escapeHtml(String(f.detail))}</span>\` : '';
+        return \`<div class="finding">
+          <span class="sev \${sev}">\${escapeHtml(sev.toUpperCase())}</span>
+          <span class="cat">\${escapeHtml(String(f.category ?? ''))}</span>
+          <span class="text">\${escapeHtml(String(f.title ?? ''))}\${det}</span>
+        </div>\`;
+      }).join('');
+    }
+    // Default: text
+    return escapeHtml(String(tile.body ?? ''));
+  }
+
+  function _renderCatalogPageHtml(catalog) {
+    // One full-page tile listing every available query with its ID + name +
+    // category + sizeHint + description. Sorted by ID so screenshots line up.
+    const sorted = [...catalog].sort((a, b) => a.id - b.id);
+    const rows = sorted.map((q) =>
+      \`<tr><td class="id">\${q.id}</td>
+        <td class="cat">\${escapeHtml(q.category ?? '')}</td>
+        <td class="size">\${q.sizeHint?.cols ?? '?'}×\${q.sizeHint?.rows ?? '?'}</td>
+        <td>\${escapeHtml(q.name ?? '')}</td>
+        <td style="color:var(--muted)">\${escapeHtml(q.description ?? '')}</td></tr>\`
+    ).join('');
+    return \`<div class="mosaic-tile mosaic-catalog-tile">
+      <div class="mosaic-tile-head">
+        <span class="id">CATALOG</span>
+        <span class="name">all \${sorted.length} available queries — type IDs above to activate</span>
+      </div>
+      <div class="mosaic-tile-body">
+        <table>
+          <thead><tr><th>id</th><th>category</th><th>size</th><th>name</th><th>description</th></tr></thead>
+          <tbody>\${rows}</tbody>
+        </table>
+      </div>
+    </div>\`;
   }
 
   function _fmtBytes(n) {
@@ -4524,160 +6146,6 @@ const UI_HTML = `<!DOCTYPE html>
     return '<div class="diag-kv">' + rows.map(([k, v, cls]) =>
       \`<div class="k">\${escapeHtml(k)}</div><div class="v\${cls ? ' ' + cls : ''}">\${v == null ? '<span style="color:var(--muted)">—</span>' : escapeHtml(String(v))}</div>\`
     ).join('') + '</div>';
-  }
-
-  function renderSnapshot(d) {
-    $modal.classList.remove('error');
-    $modalTitle.textContent = 'Snapshot · Diagnostics';
-    $modalBg.classList.add('fullpage');
-
-    // The new endpoint returns a structured diagnostics object. Keep backward
-    // compat: if it's the legacy shape, render that too.
-    const build = d.build ?? {};
-    const server = d.server ?? {};
-    const chat = d.chat ?? {};
-    const project = d.project ?? {};
-    const config = d.config ?? {};
-    const tx = d.transactions ?? { events: d.events ?? [], count: (d.events ?? []).length, totalTokens: d.totalTokens ?? 0 };
-    const events = tx.events;
-    const chatEvents = d.chatEvents ?? [];
-    const stderr = d.stderr ?? [];
-    const logTail = d.logTail ?? '';
-    const p = d.parallelism ?? {};
-    const batches = Array.isArray(p.batches) ? p.batches : [];
-
-    // Dense one-block summary at the top — designed to be screenshot-able in
-    // one frame and contain enough to diagnose most problems.
-    const lastTx = [...events].reverse().find((e) => e.type === 'chat_completions' || e.type === 'list_models');
-    const lastFinish = lastTx?.response?.choices?.[0]?.finish_reason ?? '?';
-    const lastEv = chatEvents[chatEvents.length - 1];
-    const dense = [
-      '== code_boss diagnostics  ' + new Date().toISOString().slice(0, 19) + 'Z ==',
-      'build       ' + (build.version ?? '?'),
-      'started     ' + (build.startedAt ?? server.startedAt ?? '?') + '   uptime ' + _fmtMs(server.uptimeMs),
-      'pid ' + (server.pid ?? '?') + '   node ' + (server.nodeVersion ?? '?') + '   platform ' + (server.platform ?? '?'),
-      'mem rss=' + _fmtBytes(server.memory?.rss) + '   heap=' + _fmtBytes(server.memory?.heapUsed) + '/' + _fmtBytes(server.memory?.heapTotal),
-      '',
-      'CHAT  status=' + (chat.status ?? '?') + '   phase=' + (chat.phase ?? '?') + '   version=' + (chat.version ?? '?'),
-      '      events=' + (chat.eventCount ?? 0) + '   tokens up=' + (chat.tokens?.up ?? 0) + ' down=' + (chat.tokens?.down ?? 0),
-      '      startedAt=' + (chat.chatStartedAt ?? '—') + '   running for ' + _fmtMs(chat.chatStartedAgoMs),
-      '      abortActive=' + (chat.abortControllerActive ? 'YES' : 'no') + '   sse-subs=' + (chat.streamSubscribers ?? 0) + '   timeout=' + _fmtMs(chat.timeoutMs),
-      '      error=' + (chat.error ? \`«\${String(chat.error).slice(0, 200)}»\` : '—'),
-      '      lastEvent=' + (lastEv ? \`\${lastEv.type}\${lastEv.taskId ? ' [' + lastEv.taskId + ']' : ''}\` : '—'),
-      '',
-      'PROJ  ' + (project.activeProject ?? '(none)'),
-      '      log file: ' + (project.logFilePath ?? '—'),
-      '              exists=' + (project.logFileExists ? 'YES' : 'NO') + '   bytes=' + (project.logFileBytes ?? 0),
-      '',
-      'API   base=' + (config.baseURL ?? '?'),
-      '      model=' + (config.defaultModel ?? '?') + '   key=' + (config.apiKeyPrefix ?? '?'),
-      '',
-      'TRANS count=' + tx.count + '   totalTokens=' + tx.totalTokens,
-      '      parallelism: runs=' + (p.runs ?? 0) + ' turns=' + (p.turnsWithTools ?? 0) +
-        ' calls=' + (p.totalToolCalls ?? 0) + ' max=' + (p.maxParallel ?? 0),
-      '      lastTx finish=' + lastFinish,
-      '',
-      'STDERR (' + stderr.length + ' lines captured)',
-    ].join('\\n');
-
-    const statusPill = \`<span class="pill \${chat.status ?? 'idle'}">\${escapeHtml(chat.status ?? 'idle')}</span>\`;
-
-    // Render chat events compactly
-    const chatEventsRows = chatEvents.slice(-200).map((ev) => {
-      const tag = ev.taskId ? \`[\${ev.taskId}]\` : '';
-      const c = (ev.content || ev.summary || ev.diff || JSON.stringify(ev).slice(0, 200) || '').toString().replace(/\\s+/g, ' ').slice(0, 160);
-      return \`<tr><td class="num">\${ev.id ?? ''}</td><td>\${escapeHtml(ev.type)}</td><td>\${escapeHtml(tag)}</td><td>\${escapeHtml(c)}</td></tr>\`;
-    }).join('');
-
-    // Legacy transactions table
-    const txRows = events.slice(-100).map((e) =>
-      \`<tr><td class="num">\${e.at}</td><td>\${escapeHtml(e.type)}</td><td>\${escapeHtml(e.summary || '')}</td></tr>\`
-    ).join('');
-
-    // Stderr buffer (most recent at the bottom)
-    const stderrBlock = stderr.length
-      ? stderr.map((e) => \`\${e.at?.slice(11, 23) ?? ''}  \${escapeHtml(e.line)}\`).join('\\n')
-      : '(empty — nothing has been printed to stderr since the server started)';
-
-    // Log file tail
-    const logBlock = logTail
-      ? escapeHtml(logTail)
-      : (project.logFileExists === false
-        ? \`(log file does NOT exist on disk — fileLog may be silently failing to write)\`
-        : '(no log content)');
-
-    // Per-section content. The fullpage CSS arranges these into a fixed
-    // grid that fills the viewport with overflow: hidden — sections that
-    // run long are clipped at their cell boundary rather than scrolling.
-    const txReqJson  = lastTx?.request  != null ? JSON.stringify(lastTx.request,  null, 2) : '';
-    const txRespJson = lastTx?.response != null ? JSON.stringify(lastTx.response, null, 2) : '';
-
-    // Findings: server-side investigative analysis. Color-coded by severity
-    // so the user can screenshot one frame and immediately see what's wrong.
-    const findings = Array.isArray(d.findings) ? d.findings : [];
-    const findingsHtml = findings.length
-      ? findings.map((f) => {
-          const sev  = String(f.severity ?? 'info').toLowerCase();
-          const cat  = String(f.category ?? '').toLowerCase();
-          const det  = f.detail ? \`<span class="det">— \${escapeHtml(String(f.detail))}</span>\` : '';
-          return \`<div class="diag-finding">
-            <span class="sev \${escapeHtml(sev)}">\${escapeHtml(sev.toUpperCase())}</span>
-            <span class="cat">\${escapeHtml(cat)}</span>
-            <span class="body">\${escapeHtml(String(f.title ?? ''))}\${det}</span>
-          </div>\`;
-        }).join('')
-      : \`<div class="diag-finding"><span class="sev info">INFO</span><span class="body">no findings — analyzer didn't run</span></div>\`;
-
-    $modalBody.innerHTML = \`
-      <div class="diag-findings">\${findingsHtml}</div>
-
-      <pre class="diag-summary">\${escapeHtml(dense)}</pre>
-
-      <div class="snap-pills" style="display:flex; gap:8px; align-items:center;">
-        \${statusPill}
-        <span class="pill idle">build \${escapeHtml(build.version ?? '?')}</span>
-        <a href="#" onclick="openSnapshot(); return false" style="color: var(--accent); margin-left:auto;">↻ Refresh</a>
-      </div>
-
-      <div class="diag-section area-stderr">
-        <h3>STDERR (\${stderr.length} lines)</h3>
-        <div class="diag-block">\${escapeHtml(stderrBlock)}</div>
-      </div>
-
-      <div class="diag-section area-log">
-        <h3>Log file tail · \${escapeHtml(project.logFilePath ?? 'no project')}</h3>
-        <div class="diag-block">\${logBlock}</div>
-      </div>
-
-      <div class="diag-section area-txreq">
-        <h3>Last TX request\${lastTx ? '' : ' (none yet)'}</h3>
-        <div class="diag-block">\${lastTx && txReqJson ? escapeHtml(txReqJson) : '(no request captured)'}</div>
-      </div>
-
-      <div class="diag-section area-txresp">
-        <h3>Last TX response\${lastTx ? ' · finish=' + escapeHtml(String(lastFinish)) : ''}</h3>
-        <div class="diag-block">\${lastTx && txRespJson ? escapeHtml(txRespJson) : '(no response captured)'}</div>
-      </div>
-
-      <div class="diag-section area-events">
-        <h3>Chat events (\${chatEvents.length})</h3>
-        <div class="diag-table-wrap">
-          \${chatEvents.length
-            ? \`<table class="diag-table"><thead><tr><th>id</th><th>type</th><th>task</th><th>content</th></tr></thead><tbody>\${chatEventsRows}</tbody></table>\`
-            : '<p style="color:var(--muted);font-size:9px;margin:2px 4px;">none</p>'}
-        </div>
-      </div>
-
-      <div class="diag-section area-tx">
-        <h3>LLM transactions (\${tx.count})</h3>
-        <div class="diag-table-wrap">
-          \${tx.count
-            ? \`<table class="diag-table"><thead><tr><th>+ms</th><th>type</th><th>summary</th></tr></thead><tbody>\${txRows}</tbody></table>\`
-            : '<p style="color:var(--muted);font-size:9px;margin:2px 4px;">none</p>'}
-        </div>
-      </div>
-    \`;
-    $modalBg.classList.add('show');
   }
 
   async function openLog() {
@@ -4725,6 +6193,13 @@ const UI_HTML = `<!DOCTYPE html>
   function closeModal() {
     $modalBg.classList.remove('show');
     $modalBg.classList.remove('fullpage');
+    // Clear mosaic state so the debounced resize handler doesn't re-render
+    // the modal after we just closed it.
+    if (typeof _mosaicState !== 'undefined') {
+      _mosaicState.tiles = [];
+      _mosaicState.layout = null;
+    }
+    if (typeof _resizeTimer !== 'undefined') clearTimeout(_resizeTimer);
   }
 
   async function resetSession() {
