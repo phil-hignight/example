@@ -12,6 +12,11 @@
  * Edit the CONFIG constants below for your environment.
  */
 
+// Build stamp — injected at build time so the running server can report it
+// (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
+// I just copied over" without guessing from file size.
+const BUILD_VERSION = '2026-05-24T00:11:20.302Z';
+
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
 const BASE_URL = 'https://api.genai.mil/v1';        // OpenAI-compatible endpoint
@@ -1462,9 +1467,11 @@ const REPEAT_LIMIT = 3;
 // ── System prompt ───────────────────────────────────────────────────────────
 function buildSystemPrompt({ taskId, taskUserRequest, tier1Tokens, tier1Pct }) {
   const lines = [
-    'You are a coding assistant. The project lives on the developer\'s remote Windows machine. You access it ONLY through <remote-workspace> commands.',
+    'You are code_boss, a coding agent. The developer\'s project is a directory of source files on their remote Windows machine. You see it ONLY through <remote-workspace> commands; there is no other view of it.',
     '',
-    'NEVER use built-in tools (Python, code interpreter, file browsers, document generators, memory tools, anything that runs in a cloud sandbox). They do not see the developer\'s project. Use <remote-workspace> exclusively.',
+    'CRITICAL: NEVER use built-in tools or suggest integrations. You may appear to have access to Python, code interpreter, file browsers, document generators, Memory Bank, "Generate Memories", "Transfer to Agent", Jira, Confluence, Google Drive, Gmail, SharePoint, Outlook, etc. NONE of those tools see the developer\'s project. NEVER suggest them in your responses. NEVER call them. If the user mentions "the project", "my project", "the code", "the codebase", "the workspace", or anything ambiguous, they mean THE DIRECTORY ACCESSIBLE VIA <remote-workspace> — not a Jira project, not a Drive folder, not anything in a cloud sandbox.',
+    '',
+    'When in doubt, run <list path="."/> immediately to see what is in the remote workspace, then proceed based on what you find. Never ask the user to clarify "which project" — there is exactly one project (the one in the remote workspace) and you can see it with one <list/> call.',
     '',
     `Current task: ${taskId}` + (taskUserRequest ? `  ↳ ${taskUserRequest}` : ''),
     `Task budget: ${tier1Tokens} / ${TIER_1_BUDGET} tokens (${tier1Pct}%)` + (tier1Pct >= 95
@@ -1744,7 +1751,7 @@ async function totalContextTokens(store) {
  *
  * Returns the number of rollup tasks created.
  */
-async function llmClusterTier3({ store, adapter, model, log }) {
+async function llmClusterTier3({ store, adapter, model, log, emitChat }) {
   const tier3 = (await store.listTasks({ tier: 3 }))
     .filter((x) => !x.rolledUpInto && !x.archived)
     .sort((a, b) => (a.ended ?? a.started ?? 0) - (b.ended ?? b.started ?? 0));
@@ -1752,7 +1759,8 @@ async function llmClusterTier3({ store, adapter, model, log }) {
     log?.(`tier3 cluster: only ${tier3.length} tasks (< ${MIN_T3_FOR_LLM_ROLLUP}); falling back to mechanical`);
     if (tier3.length >= 2) {
       // mechanical fallback: roll up everything into one batch
-      await store.rollupTier3Tasks(tier3.map((t) => t.id));
+      const r = await store.rollupTier3Tasks(tier3.map((t) => t.id));
+      if (r) emitChat?.({ type: 'task-rollup', parentTaskId: r.id, childTaskIds: r.childIds, userRequest: r.userRequest, summary: r.summary });
       return 1;
     }
     return 0;
@@ -1808,7 +1816,8 @@ async function llmClusterTier3({ store, adapter, model, log }) {
 
   if (!parsed || !Array.isArray(parsed.projects) || parsed.projects.length === 0) {
     log?.(`tier3 cluster: LLM response unparseable; falling back to one mechanical rollup`);
-    await store.rollupTier3Tasks(tier3.map((t) => t.id));
+    const r = await store.rollupTier3Tasks(tier3.map((t) => t.id));
+    if (r) emitChat?.({ type: 'task-rollup', parentTaskId: r.id, childTaskIds: r.childIds, userRequest: r.userRequest, summary: r.summary });
     return 1;
   }
 
@@ -1825,13 +1834,15 @@ async function llmClusterTier3({ store, adapter, model, log }) {
     if (rollup) {
       createdCount++;
       for (const id of ids) claimed.add(id);
+      emitChat?.({ type: 'task-rollup', parentTaskId: rollup.id, childTaskIds: rollup.childIds, userRequest: rollup.userRequest, summary: rollup.summary });
     }
   }
 
   // Sweep up any unclaimed task IDs into one final mechanical rollup so nothing is left orphaned.
   const orphans = [...validIds].filter((id) => !claimed.has(id));
   if (orphans.length >= 2) {
-    await store.rollupTier3Tasks(orphans);
+    const r = await store.rollupTier3Tasks(orphans);
+    if (r) emitChat?.({ type: 'task-rollup', parentTaskId: r.id, childTaskIds: r.childIds, userRequest: r.userRequest, summary: r.summary });
     createdCount++;
   }
   log?.(`tier3 cluster: created ${createdCount} rollups covering ${claimed.size + Math.max(0, orphans.length)} tasks`);
@@ -1847,7 +1858,7 @@ async function llmClusterTier3({ store, adapter, model, log }) {
  *      to cluster all tier-3 tasks into tier-4 rollups
  *   4. T4→archive (mechanical flag flip) for oldest if still over
  */
-async function maybeCompact({ store, adapter, model, log }) {
+async function maybeCompact({ store, adapter, model, log, emitChat }) {
   const HIGH = TOTAL_BUDGET * HYST_HIGH;
   const LOW  = TOTAL_BUDGET * HYST_LOW;
 
@@ -1856,7 +1867,7 @@ async function maybeCompact({ store, adapter, model, log }) {
 
   log?.(`compact: total=${total} > HIGH=${HIGH}; target LOW=${LOW}`);
 
-  // Step 1: T1 → T2 mask (cheap)
+  // Step 1: T1 → T2 mask (cheap). Emit task-tier-change so UI can mute results.
   while (total > LOW) {
     const id = await store.findOldestDemotionCandidate(1);
     if (!id) break;
@@ -1864,11 +1875,12 @@ async function maybeCompact({ store, adapter, model, log }) {
     let removed = 0;
     for (const m of before?.messages ?? []) if (m.kind === 'tool-result') removed += estTokens(m.content);
     await store.demoteToTier2(id);
+    emitChat?.({ type: 'task-tier-change', taskId: id, newTier: 2, muted: 'results' });
     total -= removed;
   }
   if (total <= LOW) { log?.(`compact: done after T1→T2 (total=${total})`); return; }
 
-  // Step 2: T2 → T3 drop (cheap)
+  // Step 2: T2 → T3 drop (cheap). Emit task-tier-change so UI can mute all rows.
   while (total > LOW) {
     const id = await store.findOldestDemotionCandidate(2);
     if (!id) break;
@@ -1877,6 +1889,7 @@ async function maybeCompact({ store, adapter, model, log }) {
     for (const m of before?.messages ?? []) removedMsgs += estTokens(m.content);
     const addedSummary = estTokens(before?.summary ?? '');
     await store.demoteToTier3(id, before?.summary || '(no summary)');
+    emitChat?.({ type: 'task-tier-change', taskId: id, newTier: 3, muted: 'all' });
     total -= (removedMsgs - addedSummary);
   }
   if (total <= LOW) { log?.(`compact: done after T2→T3 (total=${total})`); return; }
@@ -1885,13 +1898,13 @@ async function maybeCompact({ store, adapter, model, log }) {
   const t3 = await tier3TokensFor(store);
   if (t3 >= TIER_3_BUDGET) {
     log?.(`compact: tier3=${t3} >= ${TIER_3_BUDGET}; invoking LLM cluster`);
-    await llmClusterTier3({ store, adapter, model, log });
+    await llmClusterTier3({ store, adapter, model, log, emitChat });
     total = await totalContextTokens(store);
     log?.(`compact: after LLM cluster total=${total}`);
   }
   if (total <= LOW) { log?.(`compact: done after T3→T4 (total=${total})`); return; }
 
-  // Step 4: T4 → archive (mechanical)
+  // Step 4: T4 → archive (mechanical). Emit task-archived so UI can mark/hide it.
   while (total > LOW) {
     const tier4 = (await store.listTasks({ tier: 4 }))
       .filter((x) => !x.archived)
@@ -1900,6 +1913,7 @@ async function maybeCompact({ store, adapter, model, log }) {
     const oldest = tier4[0];
     const removed = estTokens(oldest.summary);
     await store.archiveTask(oldest.id);
+    emitChat?.({ type: 'task-archived', taskId: oldest.id });
     total -= removed;
   }
   log?.(`compact: done (total=${total}, target=${LOW})`);
@@ -2093,7 +2107,7 @@ async function runPromptedAgent({
       }
       // Always check budgets before returning — even on the final turn — so
       // long sessions stay within bounds.
-      await maybeCompact({ store, adapter, model, log });
+      await maybeCompact({ store, adapter, model, log, emitChat });
       log(`done: ${stats.turns} turns, ${stats.toolCalls} tool calls, ${stats.taskOps} task ops`);
       return { content: finalText, stats, terminated: 'stop', store };
     }
@@ -2210,7 +2224,7 @@ async function runPromptedAgent({
 
     // Compact if total context is over budget. Cheap mechanical demotions
     // first; LLM clustering only if tier 3 still over after that.
-    await maybeCompact({ store, adapter, model, log });
+    await maybeCompact({ store, adapter, model, log, emitChat });
   }
 
   log(`done: max turns (${maxTurns}) reached without converging`);
@@ -2292,6 +2306,33 @@ const SUMMARIZE = {
   usage: (d) => `usage  →  ${JSON.stringify(d)}`,
   error: (d) => `error: ${d.message}`,
 };
+
+// Ring buffer that captures everything written to process.stderr so the
+// Snapshot UI can show it. Lets the user see what fileLog *would* have
+// printed even if the launcher window output got lost/redirected.
+const STDERR_BUFFER_MAX = 500;
+const stderrBuffer = [];
+const _origStderrWrite = process.stderr.write.bind(process.stderr);
+process.stderr.write = function (chunk, ...rest) {
+  try {
+    const s = typeof chunk === 'string' ? chunk : (chunk && chunk.toString) ? chunk.toString() : '';
+    if (s) {
+      // Split into lines so the buffer entries are line-sized.
+      const lines = s.split('\n');
+      for (const ln of lines) {
+        if (ln === '' && lines.length === 1) continue;
+        if (ln === '' && lines.indexOf(ln) === lines.length - 1) continue; // trailing empty after \n
+        stderrBuffer.push({ at: new Date().toISOString(), line: ln });
+        if (stderrBuffer.length > STDERR_BUFFER_MAX) stderrBuffer.shift();
+      }
+    }
+  } catch {}
+  return _origStderrWrite(chunk, ...rest);
+};
+
+// BUILD_VERSION is injected by scripts/build.mjs into the bundled HEADER.
+// When running src/ directly (dev/tests), it's undefined — fall back to '(dev)'.
+const BUILD_VERSION_RUNTIME = (typeof BUILD_VERSION !== 'undefined') ? BUILD_VERSION : '(dev)';
 
 async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, adapter: providedAdapter, modelsList, initialProject = null }) {
   const session = {
@@ -2429,17 +2470,34 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
 
   // Append-only project log at <project>/.agent/code-boss.log. Synchronous
   // writes so a hang leaves a complete log up to the last operation.
+  //
+  // Always mirrors to stderr too — so even if the project dir is unwritable
+  // (permissions, disk full, etc.), the user can still see what happened in
+  // the PowerShell window where the bundle was launched. Logging silence is
+  // the worst kind of bug; this guarantees something is always visible.
   let logDirEnsured = null;
-  // Defined in startServer scope where `path` is the node:path module (inside
-  // the request handler, `path` is shadowed by the URL pathname).
+  let loggedFileWriteWarning = false;       // suppress duplicate "file log unavailable" spam
   const logFilePath = () => (session.activeProject ? path.join(session.activeProject, '.agent', 'code-boss.log') : null);
   function fileLog(msg) {
+    const line = `${new Date().toISOString()}  ${msg}`;
+    // 1) Always print to stderr — guaranteed visible in the launcher window.
+    try { process.stderr.write(line + '\n'); } catch {}
+    // 2) Append to <project>/.agent/code-boss.log if we can.
     if (!session.activeProject) return;
     try {
       const dir = path.join(session.activeProject, '.agent');
-      if (logDirEnsured !== dir) { mkdirSync(dir, { recursive: true }); logDirEnsured = dir; }
-      appendFileSync(path.join(dir, 'code-boss.log'), `${new Date().toISOString()}  ${msg}\n`);
-    } catch { /* logging must never break the request */ }
+      if (logDirEnsured !== dir) {
+        mkdirSync(dir, { recursive: true });
+        logDirEnsured = dir;
+      }
+      appendFileSync(path.join(dir, 'code-boss.log'), line + '\n');
+    } catch (e) {
+      if (!loggedFileWriteWarning) {
+        process.stderr.write(`[fileLog] file write FAILED (will continue with stderr only): ${e.message}\n`);
+        process.stderr.write(`[fileLog] attempted path: ${path.join(session.activeProject ?? '?', '.agent', 'code-boss.log')}\n`);
+        loggedFileWriteWarning = true;
+      }
+    }
   }
 
   async function openProject(p) {
@@ -2596,6 +2654,89 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
         const limit = Number(url.searchParams.get('limit')) || 100;
         return sendJson(res, 200, chatState.chatStateSnapshot({ eventLimit: limit }));
       }
+      if (req.method === 'GET' && path === '/api/diagnostics') {
+        // One-stop diagnostic dump. Rendered as a full-page view by the Snapshot
+        // UI. Designed to be useful when something is stuck and we don't even
+        // know if the server is alive.
+        const lf = logFilePath();
+        let logExists = false, logBytes = 0, logTail = '';
+        if (lf) {
+          try {
+            const { statSync, readFileSync } = await import('node:fs');
+            const s = statSync(lf);
+            logExists = true;
+            logBytes = s.size;
+            const buf = readFileSync(lf, 'utf8');
+            logTail = buf.length > 16000 ? '...' + buf.slice(-16000) : buf;
+          } catch (e) { logTail = `(log read failed: ${e.message})`; }
+        }
+        const memUsage = (() => {
+          try { const m = process.memoryUsage(); return { rss: m.rss, heapUsed: m.heapUsed, heapTotal: m.heapTotal }; } catch { return null; }
+        })();
+        // Reuse the legacy snapshot's parallelism computation.
+        const agentRuns = session.events.filter((e) => e.type === 'agent_run');
+        const allBatches = agentRuns.flatMap((e) => Array.isArray(e.batches) ? e.batches : []);
+        const sum = allBatches.reduce((s, n) => s + n, 0);
+        const parallelism = {
+          runs: agentRuns.length,
+          turnsWithTools: allBatches.length,
+          totalToolCalls: sum,
+          avgPerTurn: allBatches.length ? +(sum / allBatches.length).toFixed(2) : 0,
+          maxParallel: allBatches.length ? Math.max(...allBatches) : 0,
+          singleCallTurns: allBatches.filter((n) => n === 1).length,
+          multiCallTurns: allBatches.filter((n) => n > 1).length,
+          batches: allBatches,
+        };
+        return sendJson(res, 200, {
+          build: {
+            version: BUILD_VERSION_RUNTIME,
+            startedAt: session.startedAt,
+          },
+          server: {
+            uptimeMs: Date.now() - session.startMs,
+            pid: process.pid,
+            cwd: process.cwd(),
+            platform: process.platform,
+            nodeVersion: process.version,
+            memory: memUsage,
+          },
+          chat: {
+            status: session.status,
+            phase: session.phase,
+            version: session.version,
+            chatStartedAt: session.chatStartedAt,
+            chatStartedAgoMs: session.chatStartedAt ? Date.now() - session.chatStartedAt : null,
+            timeoutMs: session.chatTimeoutMs,
+            error: session.error,
+            tokens: { ...session.chatTokens },
+            eventCount: session.chatEvents.length,
+            abortControllerActive: !!session.abortController,
+            streamSubscribers: session.streamSubscribers.size,
+          },
+          chatEvents: session.chatEvents,
+          project: {
+            activeProject: session.activeProject,
+            logFilePath: lf,
+            logFileExists: logExists,
+            logFileBytes: logBytes,
+            recent: session.recent,
+          },
+          config: {
+            baseURL: session.baseURL,
+            defaultModel: session.defaultModel,
+            apiKeyPrefix: session.apiKeyPrefix,
+            modelInUseDefault: session.defaultModel,
+          },
+          parallelism,
+          transactions: {
+            count: session.events.length,
+            totalTokens: session.totalTokens,
+            events: session.events,
+          },
+          stderr: stderrBuffer.slice(-200),  // last 200 lines
+          logTail,
+        });
+      }
       if (req.method === 'GET' && path === '/api/events') {
         const beforeId = url.searchParams.get('before');
         const limit = Math.min(Number(url.searchParams.get('limit')) || 50, 500);
@@ -2644,6 +2785,7 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
         if (!text.trim()) return sendJson(res, 400, { error: 'text is required' });
         if (!session.activeProject) return sendJson(res, 400, { error: 'no project open' });
         if (session.status === 'running') return sendJson(res, 409, { error: 'chat is already running' });
+        fileLog(`/api/message received: model=${body?.model ?? session.defaultModel} text="${text.slice(0, 100).replace(/\s+/g, ' ')}"`);
 
         // Lock in running state BEFORE we return, so a fast second call sees the lock.
         session.chatStartedAt = Date.now();
@@ -2670,10 +2812,11 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
         (async () => {
           const prevCwd = process.cwd();
           let cwdChanged = false;
+          const chatStart = Date.now();
           try {
             try { process.chdir(session.activeProject); cwdChanged = true; }
             catch (e) { throw new Error('cannot enter project directory: ' + e.message); }
-            fileLog(`chat: model=${model} q="${text.slice(0, 200).replace(/\s+/g, ' ')}"`);
+            fileLog(`chat START: model=${model} q="${text.slice(0, 200).replace(/\s+/g, ' ')}"`);
             const result = await runPromptedAgent({
               adapter,
               messages: [{ role: 'user', content: text }],
@@ -2685,7 +2828,8 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
               onPhase: (p) => chatState.setPhase(p),
               onLog: (msg) => fileLog(msg),
             });
-            fileLog(`chat done: terminated=${result.terminated} turns=${result.stats.turns} calls=${result.stats.toolCalls}`);
+            const dur = Date.now() - chatStart;
+            fileLog(`chat DONE: terminated=${result.terminated} turns=${result.stats.turns} calls=${result.stats.toolCalls} duration=${dur}ms`);
             logEvent('agent_run', {
               turns: result.stats.turns,
               toolCalls: result.stats.toolCalls,
@@ -2694,10 +2838,14 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
             });
             chatState.setStatus('done');
           } catch (e) {
+            const dur = Date.now() - chatStart;
             const aborted = e?.name === 'AbortError' || /aborted/i.test(e?.message ?? '');
             chatState.setError(aborted ? (session.error || 'aborted') : e.message);
             chatState.setStatus('error');
-            fileLog(`chat ${aborted ? 'aborted' : 'ERROR'}: ${e.message}`);
+            fileLog(`chat ${aborted ? 'ABORTED' : 'ERROR'} after ${dur}ms: ${e.message}`);
+            if (!aborted && e?.stack) {
+              fileLog(`stack: ${e.stack.split('\n').slice(0, 4).join(' | ')}`);
+            }
             logEvent('error', { message: e.message });
           } finally {
             clearTimeout(timeoutId);
@@ -2706,7 +2854,11 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
             chatState.setPhase('idle');
             if (cwdChanged) try { process.chdir(prevCwd); } catch {}
           }
-        })().catch(() => { /* errors handled inside */ });
+        })().catch((e) => {
+          // Shouldn't reach here — errors are handled inside. But if it does,
+          // make sure we know.
+          fileLog(`/api/message background promise leaked an error: ${e?.message ?? e}`);
+        });
 
         return sendJson(res, 200, { ok: true, version: session.version });
       }
@@ -3325,7 +3477,7 @@ const UI_HTML = `<!DOCTYPE html>
     display: none;
     align-items: flex-start;
     justify-content: center;
-    padding: 40px 16px 16px;
+    padding: 12px;
     overflow-y: auto;
     z-index: 100;
   }
@@ -3338,6 +3490,11 @@ const UI_HTML = `<!DOCTYPE html>
     width: 100%;
     overflow: hidden;
   }
+  /* Snapshot is a full-page dense diagnostic view, not a small modal. */
+  .modal-bg.fullpage { padding: 0; }
+  .modal-bg.fullpage .modal { max-width: none; border-radius: 0; min-height: 100vh; }
+  .modal-bg.fullpage .modal-body { max-height: none; }
+
   .modal.error { border-top: 4px solid var(--error); }
   .modal-header {
     padding: 14px 18px;
@@ -3349,6 +3506,80 @@ const UI_HTML = `<!DOCTYPE html>
   .modal-header h2 { margin: 0; font-size: 14px; font-weight: 700; color: var(--accent); }
   .modal.error .modal-header h2 { color: var(--error); }
   .modal-body { padding: 18px 20px; max-height: 70vh; overflow-y: auto; }
+
+  /* Dense diagnostic layout. */
+  .diag-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 8px 24px;
+    margin: 8px 0 18px;
+  }
+  .diag-section h3 {
+    margin: 14px 0 4px;
+    color: var(--accent);
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 2px;
+  }
+  .diag-kv {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 2px 12px;
+    font-size: 12px;
+    font-family: var(--mono);
+  }
+  .diag-kv .k { color: var(--muted); white-space: nowrap; }
+  .diag-kv .v { color: var(--fg); word-break: break-all; }
+  .diag-kv .v.ok { color: #8fd28f; }
+  .diag-kv .v.warn { color: #e3c46a; }
+  .diag-kv .v.err { color: var(--error); }
+  .diag-block {
+    background: #15140f;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 6px 10px;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 320px;
+    overflow-y: auto;
+    color: #cfc9b8;
+  }
+  .diag-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 11.5px;
+    font-family: var(--mono);
+  }
+  .diag-table th, .diag-table td {
+    text-align: left;
+    padding: 3px 8px;
+    border-bottom: 1px solid #2a2823;
+    vertical-align: top;
+  }
+  .diag-table th { color: var(--muted); font-weight: normal; background: #1a1814; }
+  .diag-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .diag-summary {
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.4;
+    background: #15140f;
+    border: 1px solid var(--accent);
+    border-radius: 4px;
+    padding: 10px 14px;
+    margin: 0 0 8px;
+    color: var(--fg);
+    white-space: pre;
+  }
+  .pill { display: inline-block; padding: 1px 7px; border-radius: 99px; font-size: 11px; }
+  .pill.idle { background: #2a2823; color: var(--muted); }
+  .pill.running { background: rgba(217,119,87,0.2); color: var(--accent); }
+  .pill.done { background: rgba(70,160,70,0.2); color: #8fd28f; }
+  .pill.error { background: rgba(220,80,80,0.2); color: var(--error); }
   .modal-close {
     background: none;
     border: none;
@@ -3922,8 +4153,8 @@ const UI_HTML = `<!DOCTYPE html>
 
   async function openSnapshot() {
     try {
-      const r = await fetch('/api/snapshot');
-      if (!r.ok) throw new Error('snapshot fetch failed: ' + r.status);
+      const r = await fetch('/api/diagnostics');
+      if (!r.ok) throw new Error('diagnostics fetch failed: ' + r.status);
       const data = await r.json();
       renderSnapshot(data);
     } catch (e) {
@@ -3931,80 +4162,145 @@ const UI_HTML = `<!DOCTYPE html>
     }
   }
 
+  function _fmtBytes(n) {
+    if (n == null) return '?';
+    if (n < 1024) return n + ' B';
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+    return (n / 1024 / 1024).toFixed(2) + ' MB';
+  }
+  function _fmtMs(ms) {
+    if (ms == null) return '—';
+    if (ms < 1000) return ms + ' ms';
+    if (ms < 60_000) return (ms / 1000).toFixed(1) + ' s';
+    if (ms < 3_600_000) return (ms / 60_000).toFixed(1) + ' min';
+    return (ms / 3_600_000).toFixed(2) + ' hr';
+  }
+  function _kv(rows) {
+    return '<div class="diag-kv">' + rows.map(([k, v, cls]) =>
+      \`<div class="k">\${escapeHtml(k)}</div><div class="v\${cls ? ' ' + cls : ''}">\${v == null ? '<span style="color:var(--muted)">—</span>' : escapeHtml(String(v))}</div>\`
+    ).join('') + '</div>';
+  }
+
   function renderSnapshot(d) {
     $modal.classList.remove('error');
-    $modalTitle.textContent = 'Snapshot';
-    const events = d.events ?? [];
-    const lastTx = [...events].reverse().find((e) => e.type === 'chat_completions' || e.type === 'list_models');
-    const rows = events.map((e) =>
-      '<tr><td class="t-ms">' + e.at + '</td><td class="t-type">' + escapeHtml(e.type) + '</td><td>' + escapeHtml(e.summary) + '</td></tr>'
-    ).join('');
+    $modalTitle.textContent = 'Snapshot · Diagnostics';
+    $modalBg.classList.add('fullpage');
+
+    // The new endpoint returns a structured diagnostics object. Keep backward
+    // compat: if it's the legacy shape, render that too.
+    const build = d.build ?? {};
+    const server = d.server ?? {};
+    const chat = d.chat ?? {};
+    const project = d.project ?? {};
+    const config = d.config ?? {};
+    const tx = d.transactions ?? { events: d.events ?? [], count: (d.events ?? []).length, totalTokens: d.totalTokens ?? 0 };
+    const events = tx.events;
+    const chatEvents = d.chatEvents ?? [];
+    const stderr = d.stderr ?? [];
+    const logTail = d.logTail ?? '';
     const p = d.parallelism ?? {};
     const batches = Array.isArray(p.batches) ? p.batches : [];
-    let parallelismBadge = '';
-    let parallelismCaption = '';
-    if (p.turnsWithTools === 0) {
-      parallelismBadge = '<span class="par-badge par-na">no tool turns yet</span>';
-      parallelismCaption = 'Ask a question that needs the agent to use tools to populate this.';
-    } else if (p.maxParallel <= 1) {
-      parallelismBadge = '<span class="par-badge par-bad">SEQUENTIAL ONLY</span>';
-      parallelismCaption = 'Every turn issued exactly one tool call. The model is not batching parallel calls.';
-    } else if ((p.multiCallTurns / p.turnsWithTools) < 0.25) {
-      parallelismBadge = '<span class="par-badge par-warn">RARE</span>';
-      parallelismCaption = 'Most turns still issue one call at a time.';
-    } else {
-      parallelismBadge = '<span class="par-badge par-good">BATCHING</span>';
-      parallelismCaption = 'Model is emitting parallel tool calls in some turns.';
-    }
-    const batchDots = batches.map((n) => {
-      const cls = n > 1 ? 'dot dot-multi' : 'dot dot-single';
-      return '<span class="' + cls + '" title="turn with ' + n + ' tool call(s)">' + n + '</span>';
-    }).join('');
-    // Dense one-screenshot summary at the very top.
+
+    // Dense one-block summary at the top — designed to be screenshot-able in
+    // one frame and contain enough to diagnose most problems.
+    const lastTx = [...events].reverse().find((e) => e.type === 'chat_completions' || e.type === 'list_models');
     const lastFinish = lastTx?.response?.choices?.[0]?.finish_reason ?? '?';
-    const lastTools = lastTx?.response?.choices?.[0]?.message?.tool_calls ? 'yes' : 'no';
+    const lastEv = chatEvents[chatEvents.length - 1];
     const dense = [
-      '== snapshot ' + new Date().toISOString().slice(0, 19) + 'Z ==',
-      'proj   ' + (d.activeProject ?? '(none)'),
-      'base   ' + (d.baseURL ?? '?'),
-      'model  ' + (d.defaultModel ?? '?') + '   key ' + (d.apiKeyPrefix ?? '?'),
-      'tokens ' + (d.totalTokens ?? 0) + '   events ' + events.length,
-      'parallel runs=' + (p.runs ?? 0) + ' turns=' + (p.turnsWithTools ?? 0) +
-        ' calls=' + (p.totalToolCalls ?? 0) + ' max=' + (p.maxParallel ?? 0) +
-        ' batches=[' + batches.join(',') + ']',
-      'lastTx ' + (lastTx ? (lastTx.type + ' finish=' + lastFinish + ' tool_calls=' + lastTools) : '(none)'),
+      '== code_boss diagnostics  ' + new Date().toISOString().slice(0, 19) + 'Z ==',
+      'build       ' + (build.version ?? '?'),
+      'started     ' + (build.startedAt ?? server.startedAt ?? '?') + '   uptime ' + _fmtMs(server.uptimeMs),
+      'pid ' + (server.pid ?? '?') + '   node ' + (server.nodeVersion ?? '?') + '   platform ' + (server.platform ?? '?'),
+      'mem rss=' + _fmtBytes(server.memory?.rss) + '   heap=' + _fmtBytes(server.memory?.heapUsed) + '/' + _fmtBytes(server.memory?.heapTotal),
+      '',
+      'CHAT  status=' + (chat.status ?? '?') + '   phase=' + (chat.phase ?? '?') + '   version=' + (chat.version ?? '?'),
+      '      events=' + (chat.eventCount ?? 0) + '   tokens up=' + (chat.tokens?.up ?? 0) + ' down=' + (chat.tokens?.down ?? 0),
+      '      startedAt=' + (chat.chatStartedAt ?? '—') + '   running for ' + _fmtMs(chat.chatStartedAgoMs),
+      '      abortActive=' + (chat.abortControllerActive ? 'YES' : 'no') + '   sse-subs=' + (chat.streamSubscribers ?? 0) + '   timeout=' + _fmtMs(chat.timeoutMs),
+      '      error=' + (chat.error ? \`«\${String(chat.error).slice(0, 200)}»\` : '—'),
+      '      lastEvent=' + (lastEv ? \`\${lastEv.type}\${lastEv.taskId ? ' [' + lastEv.taskId + ']' : ''}\` : '—'),
+      '',
+      'PROJ  ' + (project.activeProject ?? '(none)'),
+      '      log file: ' + (project.logFilePath ?? '—'),
+      '              exists=' + (project.logFileExists ? 'YES' : 'NO') + '   bytes=' + (project.logFileBytes ?? 0),
+      '',
+      'API   base=' + (config.baseURL ?? '?'),
+      '      model=' + (config.defaultModel ?? '?') + '   key=' + (config.apiKeyPrefix ?? '?'),
+      '',
+      'TRANS count=' + tx.count + '   totalTokens=' + tx.totalTokens,
+      '      parallelism: runs=' + (p.runs ?? 0) + ' turns=' + (p.turnsWithTools ?? 0) +
+        ' calls=' + (p.totalToolCalls ?? 0) + ' max=' + (p.maxParallel ?? 0),
+      '      lastTx finish=' + lastFinish,
+      '',
+      'STDERR (' + stderr.length + ' lines captured)',
     ].join('\\n');
-    $modalBody.innerHTML = [
-      '<pre class="dense">' + escapeHtml(dense) + '</pre>',
-      '<div class="kv">',
-      '<div class="k">Started</div><div class="v">' + escapeHtml(d.startedAt) + '</div>',
-      '<div class="k">Active project</div><div class="v">' + escapeHtml(d.activeProject ?? '(none)') + '</div>',
-      '<div class="k">Base URL</div><div class="v">' + escapeHtml(d.baseURL) + '</div>',
-      '<div class="k">Default model</div><div class="v">' + escapeHtml(d.defaultModel) + '</div>',
-      '<div class="k">API key prefix</div><div class="v">' + escapeHtml(d.apiKeyPrefix) + '</div>',
-      '<div class="k">Events</div><div class="v">' + events.length + '</div>',
-      '<div class="k">Total tokens</div><div class="v">' + (d.totalTokens ?? 0) + '</div>',
-      '</div>',
-      '<h3>Parallel tool batching ' + parallelismBadge + '</h3>',
-      '<p class="par-caption">' + escapeHtml(parallelismCaption) + '</p>',
-      '<div class="kv">',
-      '<div class="k">Agent runs</div><div class="v">' + (p.runs ?? 0) + '</div>',
-      '<div class="k">Turns with tools</div><div class="v">' + (p.turnsWithTools ?? 0) + '</div>',
-      '<div class="k">Total tool calls</div><div class="v">' + (p.totalToolCalls ?? 0) + '</div>',
-      '<div class="k">Avg per turn</div><div class="v">' + (p.avgPerTurn ?? 0) + '</div>',
-      '<div class="k">Max parallel</div><div class="v">' + (p.maxParallel ?? 0) + ' call(s) in one turn</div>',
-      '<div class="k">Single-call turns</div><div class="v">' + (p.singleCallTurns ?? 0) + '</div>',
-      '<div class="k">Multi-call turns</div><div class="v">' + (p.multiCallTurns ?? 0) + '</div>',
-      '</div>',
-      batches.length ? '<div class="batch-strip">' + batchDots + '</div>' : '',
-      '<h3>Events</h3>',
-      events.length
-        ? '<table><thead><tr><th>+ms</th><th>type</th><th>summary</th></tr></thead><tbody>' + rows + '</tbody></table>'
-        : '<p style="color:var(--muted)">No events yet.</p>',
-      lastTx ? '<h3>Last transaction</h3>' : '',
-      lastTx && lastTx.request != null ? '<h4 style="margin:8px 0 4px;font-size:12px">Request</h4><pre>' + escapeHtml(JSON.stringify(lastTx.request, null, 2)).slice(0, 8000) + '</pre>' : '',
-      lastTx && lastTx.response != null ? '<h4 style="margin:8px 0 4px;font-size:12px">Response</h4><pre>' + escapeHtml(JSON.stringify(lastTx.response, null, 2)).slice(0, 12000) + '</pre>' : '',
-    ].join('');
+
+    const statusPill = \`<span class="pill \${chat.status ?? 'idle'}">\${escapeHtml(chat.status ?? 'idle')}</span>\`;
+
+    // Render chat events compactly
+    const chatEventsRows = chatEvents.slice(-200).map((ev) => {
+      const tag = ev.taskId ? \`[\${ev.taskId}]\` : '';
+      const c = (ev.content || ev.summary || ev.diff || JSON.stringify(ev).slice(0, 200) || '').toString().replace(/\\s+/g, ' ').slice(0, 160);
+      return \`<tr><td class="num">\${ev.id ?? ''}</td><td>\${escapeHtml(ev.type)}</td><td>\${escapeHtml(tag)}</td><td>\${escapeHtml(c)}</td></tr>\`;
+    }).join('');
+
+    // Legacy transactions table
+    const txRows = events.slice(-100).map((e) =>
+      \`<tr><td class="num">\${e.at}</td><td>\${escapeHtml(e.type)}</td><td>\${escapeHtml(e.summary || '')}</td></tr>\`
+    ).join('');
+
+    // Stderr buffer (most recent at the bottom)
+    const stderrBlock = stderr.length
+      ? stderr.map((e) => \`\${e.at?.slice(11, 23) ?? ''}  \${escapeHtml(e.line)}\`).join('\\n')
+      : '(empty — nothing has been printed to stderr since the server started)';
+
+    // Log file tail
+    const logBlock = logTail
+      ? escapeHtml(logTail)
+      : (project.logFileExists === false
+        ? \`(log file does NOT exist on disk — fileLog may be silently failing to write)\`
+        : '(no log content)');
+
+    $modalBody.innerHTML = \`
+      <pre class="diag-summary">\${escapeHtml(dense)}</pre>
+      <div style="margin: 6px 0 12px; display:flex; gap:8px; align-items:center; font-size:12px;">
+        \${statusPill}
+        <span class="pill idle">build \${escapeHtml(build.version ?? '?')}</span>
+        <a href="#" onclick="openSnapshot(); return false" style="color: var(--accent); margin-left:auto;">↻ Refresh</a>
+      </div>
+
+      <div class="diag-section">
+        <h3>STDERR buffer (last \${stderr.length} lines — captured even if file log fails)</h3>
+        <div class="diag-block">\${escapeHtml(stderrBlock)}</div>
+      </div>
+
+      <div class="diag-section">
+        <h3>Log file tail (\${project.logFilePath ?? 'no project'})</h3>
+        <div class="diag-block">\${logBlock}</div>
+      </div>
+
+      <div class="diag-section">
+        <h3>Chat events (\${chatEvents.length} total · showing last \${Math.min(chatEvents.length, 200)})</h3>
+        \${chatEvents.length
+          ? \`<table class="diag-table"><thead><tr><th>id</th><th>type</th><th>task</th><th>content (truncated)</th></tr></thead><tbody>\${chatEventsRows}</tbody></table>\`
+          : '<p style="color:var(--muted)">No chat events yet.</p>'}
+      </div>
+
+      <div class="diag-section">
+        <h3>LLM transactions (\${tx.count} total · showing last \${Math.min(tx.count, 100)})</h3>
+        \${tx.count
+          ? \`<table class="diag-table"><thead><tr><th>at +ms</th><th>type</th><th>summary</th></tr></thead><tbody>\${txRows}</tbody></table>\`
+          : '<p style="color:var(--muted)">No transactions yet.</p>'}
+      </div>
+
+      \${lastTx ? \`
+      <div class="diag-section">
+        <h3>Most recent transaction — full payload</h3>
+        \${lastTx.request != null ? \`<h4 style="margin:6px 0 2px;font-size:12px;color:var(--muted)">request</h4><div class="diag-block">\${escapeHtml(JSON.stringify(lastTx.request, null, 2)).slice(0, 8000)}</div>\` : ''}
+        \${lastTx.response != null ? \`<h4 style="margin:6px 0 2px;font-size:12px;color:var(--muted)">response</h4><div class="diag-block">\${escapeHtml(JSON.stringify(lastTx.response, null, 2)).slice(0, 12000)}</div>\` : ''}
+      </div>
+      \` : ''}
+    \`;
     $modalBg.classList.add('show');
   }
 
@@ -4050,7 +4346,10 @@ const UI_HTML = `<!DOCTYPE html>
     $modalBg.classList.add('show');
   }
 
-  function closeModal() { $modalBg.classList.remove('show'); }
+  function closeModal() {
+    $modalBg.classList.remove('show');
+    $modalBg.classList.remove('fullpage');
+  }
 
   async function resetSession() {
     if (!confirm('Clear the chat and reset the snapshot log?')) return;
@@ -4198,6 +4497,97 @@ const UI_HTML = `<!DOCTYPE html>
         clearLog();
         break;
     }
+    // Some compaction events the server emits as regular chat events via
+    // appendChatEvent — they show up as msg.type === 'event' with the inner
+    // event carrying a different type. Handle those here too.
+  }
+
+  // When the server's compaction demotes a task or rolls it up, the agent loop
+  // emits special events through onChatEvent. These come through as normal
+  // 'event' deltas, but their inner type triggers UI-only effects (mute, wrap).
+  function handleCompactionEvent(ev) {
+    if (!ev || !ev.type) return;
+    if (ev.type === 'task-tier-change') {
+      muteTaskRows(ev.taskId, ev.muted);
+      return true;
+    }
+    if (ev.type === 'task-rollup') {
+      wrapRollup(ev);
+      return true;
+    }
+    if (ev.type === 'task-archived') {
+      // Mute the whole wrap heavily as an "archived" indicator
+      const wrap = $log.querySelector(\`.task-wrap[data-task-id="\${ev.taskId}"]\`);
+      if (wrap) wrap.classList.add('muted');
+      return true;
+    }
+    return false;
+  }
+
+  function muteTaskRows(taskId, mode) {
+    const rows = $log.querySelectorAll(\`[data-task-id="\${taskId}"]\`);
+    rows.forEach((r) => {
+      if (mode === 'results') {
+        if (r.classList.contains('row-result') || r.classList.contains('diff-block')) {
+          r.classList.add('muted');
+        }
+      } else if (mode === 'all') {
+        r.classList.add('muted');
+      }
+    });
+  }
+
+  function wrapRollup(ev) {
+    // Find the existing task-wraps for the child task IDs.
+    const children = (ev.childTaskIds || [])
+      .map((id) => $log.querySelector(\`.task-wrap[data-task-id="\${id}"]\`))
+      .filter(Boolean);
+    if (children.length === 0) return;
+
+    // Mute all child wraps — agent now only sees the project summary.
+    children.forEach((c) => c.classList.add('muted'));
+
+    // Build a project wrap that contains all the existing child wraps.
+    const project = document.createElement('div');
+    project.className = 'task-wrap project';
+    project.dataset.taskId = ev.parentTaskId;
+
+    const head = document.createElement('div');
+    head.className = 'task-head';
+    const toggle = document.createElement('span');
+    toggle.className = 'toggle';
+    toggle.textContent = '▼';
+    toggle.onclick = () => {
+      const collapsed = project.classList.toggle('collapsed');
+      toggle.textContent = collapsed ? '▶' : '▼';
+    };
+    head.appendChild(toggle);
+    head.appendChild(document.createTextNode(\`┌ \${ev.parentTaskId} [project]\`));
+    if (ev.userRequest) {
+      const ur = document.createElement('span');
+      ur.className = 'ur';
+      ur.textContent = \`  ↳ \${ev.userRequest}\`;
+      head.appendChild(ur);
+    }
+    project.appendChild(head);
+
+    const body = document.createElement('div');
+    body.className = 'task-body';
+    project.appendChild(body);
+
+    // Insert the project wrap at the position of the FIRST child wrap.
+    const firstChild = children[0];
+    $log.insertBefore(project, firstChild);
+    // Move all child wraps into the project body.
+    for (const c of children) body.appendChild(c);
+
+    // Footer carries the project summary (NOT muted — this is what the LLM sees).
+    const foot = document.createElement('div');
+    foot.className = 'task-foot';
+    foot.textContent = ev.summary || '(no summary)';
+    project.appendChild(foot);
+
+    scrollToBottom();
   }
 
   function clearLog() {
@@ -4207,6 +4597,12 @@ const UI_HTML = `<!DOCTYPE html>
 
   function renderEvent(ev) {
     if (!ev || !ev.type) return;
+
+    // Compaction events drive UI-only effects (mute classes, project wrap).
+    if (ev.type === 'task-tier-change' || ev.type === 'task-rollup' || ev.type === 'task-archived') {
+      handleCompactionEvent(ev);
+      return;
+    }
 
     // task-end is special: it wraps prior events instead of appending a row.
     if (ev.type === 'task-end') {
@@ -4390,6 +4786,52 @@ const UI_HTML = `<!DOCTYPE html>
       if ($modalBg.classList.contains('show')) { closeModal(); return; }
       if (session?.status === 'running') cancelChat();
     }
+  });
+
+  // ── Infinite scroll for older events ───────────────────────────────────
+  // When the user scrolls near the top of the log, fetch the next batch of
+  // older events from /api/events?before=<id>&limit=50 and prepend them.
+  let _loadingOlder = false;
+  let _noMoreOlder = false;
+  async function maybeLoadOlder() {
+    if (_loadingOlder || _noMoreOlder) return;
+    if (!session || !session.events || session.events.length === 0) return;
+    // Trigger when scrolled within 120px of the top
+    if ($logScroll.scrollTop > 120) return;
+    _loadingOlder = true;
+    const oldestId = session.events[0].id;
+    // Save scroll metrics so we can preserve position after prepending
+    const prevScrollHeight = $logScroll.scrollHeight;
+    const prevScrollTop = $logScroll.scrollTop;
+    try {
+      const r = await fetch(\`/api/events?before=\${encodeURIComponent(oldestId)}&limit=50\`);
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const data = await r.json();
+      const older = Array.isArray(data.events) ? data.events : [];
+      if (older.length === 0) {
+        _noMoreOlder = true;
+        return;
+      }
+      // Prepend to session.events
+      session.events = older.concat(session.events);
+      // Re-render from scratch (small N; expanded state lives on DOM so it's lost on rerender)
+      clearLog();
+      for (const ev of session.events) renderEvent(ev);
+      // Restore scroll position so the user's current view doesn't jump
+      const newScrollHeight = $logScroll.scrollHeight;
+      $logScroll.scrollTop = prevScrollTop + (newScrollHeight - prevScrollHeight);
+      if (!data.hasMoreOlder) _noMoreOlder = true;
+    } catch (e) {
+      console.error('load older failed:', e);
+    } finally {
+      _loadingOlder = false;
+    }
+  }
+  // Throttled scroll handler
+  let _scrollT = null;
+  $logScroll.addEventListener('scroll', () => {
+    if (_scrollT) return;
+    _scrollT = setTimeout(() => { _scrollT = null; maybeLoadOlder(); }, 150);
   });
 
   // Initial load
