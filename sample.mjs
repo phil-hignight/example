@@ -15,7 +15,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '12';
+const BUILD_VERSION = '14';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
@@ -2410,11 +2410,41 @@ async function runPromptedAgent({
     // the question can cause the model to respond to the reminder itself
     // instead of the question.
     const fromStore = await buildConvoFromStore(store);
+    // Prepend a hidden user/assistant priming pair so the model has already
+    // "agreed" to use the <remote-workspace> XML tooling by the time the
+    // real user message arrives. Without this, Gemini Enterprise's first
+    // turn often drifts into "I do not have access to your files" before
+    // it remembers it does have the workspace tools. The priming messages
+    // are NOT persisted to the task store and never appear in the UI;
+    // they exist only in the prompt sent to the API.
+    const PRIMING = [
+      {
+        role: 'user',
+        content:
+          "Hi! I'm working with you in a remote workspace where you interact " +
+          "with my project by returning XML commands inside <remote-workspace> " +
+          "tags — for example <remote-workspace><list path=\".\"/></remote-workspace> " +
+          "to see what's there, <read path=\"...\"/> to view a file, " +
+          "<write path=\"...\">contents</write> to create one, " +
+          "<powershell>...</powershell> to run a shell command. Anything you put " +
+          "inside <remote-workspace> runs on my machine and the results come back " +
+          "to you on the next turn. Sound good?",
+      },
+      {
+        role: 'assistant',
+        content:
+          "Got it — I'll use <remote-workspace> XML commands to interact with your " +
+          "project files and run shell commands. I won't apologize for being " +
+          "unable to access files; the workspace IS the project. What would you " +
+          "like to work on?",
+      },
+    ];
+    const baseConvo = [...PRIMING, ...fromStore];
     let latestUserIdx = -1;
-    for (let i = fromStore.length - 1; i >= 0; i--) {
-      if (fromStore[i].role === 'user') { latestUserIdx = i; break; }
+    for (let i = baseConvo.length - 1; i >= 0; i--) {
+      if (baseConvo[i].role === 'user') { latestUserIdx = i; break; }
     }
-    const convo = fromStore.map((m, i) => {
+    const convo = baseConvo.map((m, i) => {
       if (i !== latestUserIdx) return m;
       return {
         role: 'user',
@@ -3791,7 +3821,18 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
     baseURL, apiKey,
     onUnlock: (url) => logEvent('unlock', { url }),
     onRateLimit: (ms) => logEvent('rate-limit', { ms }),
-    onUsage: (u) => { session.totalTokens += u.total_tokens ?? 0; logEvent('usage', u); },
+    onUsage: (u) => {
+      session.totalTokens += u.total_tokens ?? 0;
+      // Feed the response-side token count into chatTokens so the browser's
+      // status row can show ↓ <N> tokens instead of stuck at 0. Each agent
+      // turn adds its own completion_tokens; resetTokens() at chat start
+      // clears the counter so the cumulative count is per-message-not-session.
+      // (We don't add prompt_tokens to .up because each agent turn re-sends
+      // growing context, which would falsely inflate "↑" across turns. The
+      // estimateTokens at message send is good enough for the up-side hint.)
+      if (u.completion_tokens) chatState.updateTokens({ down: u.completion_tokens });
+      logEvent('usage', u);
+    },
     onTransaction: (t) => logEvent(t.type, t),
   });
 
@@ -4420,19 +4461,19 @@ const UI_HTML = `<!DOCTYPE html>
 <title>code_boss</title>
 <style>
   :root {
-    --bg: #1c1b18;          /* warm terminal near-black */
-    --panel: #211f1b;       /* slightly raised panels */
-    --panel-alt: #26241f;   /* input / boxes */
+    --bg: #141310;          /* warm terminal near-black (a touch darker for more text contrast) */
+    --panel: #1a1814;       /* slightly raised panels */
+    --panel-alt: #1f1d18;   /* input / boxes */
     --border: #3a372f;      /* dim warm border */
     --fg: #e6e2d6;          /* warm off-white text */
     --muted: #8c887b;       /* dim gray for secondary */
     --accent: #d97757;      /* Claude coral (bright for dark bg) */
     --accent-hover: #e08968;
-    --accent-fg: #1c1b18;
+    --accent-fg: #141310;
     --tool: #d97757;        /* tool-call bullet */
     --error: #e5635a;
-    --error-bg: #2a1f1c;
-    --warn-bg: #2a261c;
+    --error-bg: #251a17;
+    --warn-bg: #251f15;
     --mono: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
   }
   * { box-sizing: border-box; }
@@ -5884,6 +5925,10 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     div.className = 'bubble ' + role;
     div.textContent = text;
     $log.appendChild(div);
+    // If the status row already exists (SSE 'status: running' often arrives
+    // BEFORE the user-message event), keep it pinned to the bottom — without
+    // this the spinner can end up above the first user bubble.
+    pinStatusToBottom();
     scrollToBottom();
     return div;
   }
