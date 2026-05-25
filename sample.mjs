@@ -15,7 +15,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '14';
+const BUILD_VERSION = '16';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
@@ -201,7 +201,11 @@ async function readJson(res) {
  */
 function createHttpAdapter(opts = {}) {
   const baseURL = (opts.baseURL ?? process.env.AGENT_BASE_URL ?? DEFAULT_BASE_URL).replace(/\/+$/, '');
-  const apiKey = opts.apiKey ?? process.env.AGENT_API_KEY ?? '';
+  // apiKey can be a string OR a function returning the current key. The
+  // function form lets the server hot-update the key (e.g., user enters it
+  // in the UI on first run) without re-creating the adapter.
+  const apiKeyOpt = opts.apiKey ?? process.env.AGENT_API_KEY ?? '';
+  const getApiKey = typeof apiKeyOpt === 'function' ? apiKeyOpt : () => apiKeyOpt;
   const fetchImpl = opts.fetchImpl ?? globalThis.fetch;
   const maxRetries = opts.maxRetries ?? 3;
   const onUnlock = opts.onUnlock ?? (() => {});
@@ -214,6 +218,7 @@ function createHttpAdapter(opts = {}) {
 
   async function doFetchOnce(path, init) {
     const url = `${baseURL}${path}`;
+    const apiKey = getApiKey() || '';
     const headers = {
       'content-type': 'application/json',
       accept: init?.body && JSON.parse(init.body).stream ? 'text/event-stream' : 'application/json',
@@ -2630,7 +2635,34 @@ async function runPromptedAgent({
 // import-stripper merges all JS_SOURCES into a single module scope, so
 // the import is a no-op at runtime; this line exists for Node ESM resolution.
 
-const RECENT_FILE = path.join(homedir(), '.code-boss', 'recent.json');
+// User-home config dir. Normalized to .code_boss (underscore) to match the
+// per-project state dir name. Legacy ~/.code-boss/ (hyphen) is migrated on
+// first read so prior recent-projects history isn't lost.
+const USER_CONFIG_DIR  = path.join(homedir(), '.code_boss');
+const RECENT_FILE      = path.join(USER_CONFIG_DIR, 'recent.json');
+const API_KEY_FILE     = path.join(USER_CONFIG_DIR, 'api-key.txt');
+const LEGACY_USER_DIR  = path.join(homedir(), '.code-boss');
+
+async function migrateLegacyUserDir() {
+  try {
+    const newStat = await stat(USER_CONFIG_DIR).catch(() => null);
+    if (newStat) return;                 // already on new path
+    const oldStat = await stat(LEGACY_USER_DIR).catch(() => null);
+    if (!oldStat?.isDirectory()) return; // no legacy dir to migrate
+    await rename(LEGACY_USER_DIR, USER_CONFIG_DIR);
+  } catch { /* best-effort */ }
+}
+
+async function loadApiKeyFromFile() {
+  try {
+    const text = await readFile(API_KEY_FILE, 'utf8');
+    return text.trim();
+  } catch { return null; }
+}
+async function saveApiKeyToFile(key) {
+  await mkdir(USER_CONFIG_DIR, { recursive: true });
+  await writeFile(API_KEY_FILE, String(key).trim() + '\n', 'utf8');
+}
 const MAX_RECENT = 12;
 
 async function loadRecentProjects() {
@@ -3606,12 +3638,26 @@ process.stderr.write = function (chunk, ...rest) {
 const BUILD_VERSION_RUNTIME = (typeof BUILD_VERSION !== 'undefined') ? BUILD_VERSION : '(dev)';
 
 async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, adapter: providedAdapter, modelsList, initialProject = null }) {
+  // Migrate legacy ~/.code-boss/ → ~/.code_boss/ (hyphen → underscore) if a
+  // user is upgrading from an older bundle. Best-effort; falls through if
+  // the legacy dir is absent or permissions block the rename.
+  await migrateLegacyUserDir();
+  // If a key was passed in (build-time CONFIG.API_KEY), use it as the default.
+  // Otherwise check ~/.code_boss/api-key.txt — populated when the user enters
+  // the key via the UI on first run.
+  let resolvedKey = apiKey || '';
+  if (!resolvedKey) {
+    const fromFile = await loadApiKeyFromFile();
+    if (fromFile) resolvedKey = fromFile;
+  }
+
   const session = {
     // Static config
     startedAt: new Date().toISOString(),
     baseURL: baseURL ?? '(dev)',
     defaultModel,
-    apiKeyPrefix: (apiKey || '').slice(0, 8) + (apiKey ? '…' : '(empty)'),
+    apiKey: resolvedKey,               // mutable so /api/api-key can update at runtime
+    apiKeyPrefix: (resolvedKey || '').slice(0, 8) + (resolvedKey ? '…' : '(empty)'),
     startMs: Date.now(),
     activeProject: null,
     recent: await loadRecentProjects(),
@@ -3818,7 +3864,10 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
   // Use a caller-provided adapter (e.g. the dev claude-code-headless adapter)
   // if given; otherwise default to a fresh production HTTP adapter.
   const adapter = providedAdapter ?? createHttpAdapter({
-    baseURL, apiKey,
+    baseURL,
+    // Pass a getter so hot-updates to session.apiKey (via POST /api/api-key)
+    // take effect on the next request without re-creating the adapter.
+    apiKey: () => session.apiKey,
     onUnlock: (url) => logEvent('unlock', { url }),
     onRateLimit: (ms) => logEvent('rate-limit', { ms }),
     onUsage: (u) => {
@@ -3868,6 +3917,27 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
       }
       if (req.method === 'GET' && path === '/api/health') {
         return sendJson(res, 200, { ok: true });
+      }
+      // API key: status (does the server have a key?) + set (POST a new one).
+      // First-run UI calls /api/api-key with status=GET; if hasKey=false, it
+      // prompts the user and POSTs the value, which gets persisted to
+      // ~/.code_boss/api-key.txt and applied to the running session.
+      if (req.method === 'GET' && path === '/api/api-key') {
+        return sendJson(res, 200, {
+          hasKey: !!session.apiKey,
+          prefix: session.apiKeyPrefix,
+        });
+      }
+      if (req.method === 'POST' && path === '/api/api-key') {
+        const raw = await readBody(req);
+        let body; try { body = JSON.parse(raw); } catch { return sendJson(res, 400, { error: 'invalid JSON' }); }
+        const key = (body?.key ?? '').toString().trim();
+        if (!key) return sendJson(res, 400, { error: 'key is required' });
+        try { await saveApiKeyToFile(key); }
+        catch (e) { return sendJson(res, 500, { error: 'could not save key: ' + e.message }); }
+        session.apiKey = key;
+        session.apiKeyPrefix = key.slice(0, 8) + '…';
+        return sendJson(res, 200, { ok: true, prefix: session.apiKeyPrefix });
       }
       if (req.method === 'GET' && path === '/api/project-state') {
         // Legacy endpoint kept for the existing browser project picker.
@@ -5635,6 +5705,11 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
         <span class="value" id="settingsProject">(none)</span>
       </div>
       <div class="settings-row">
+        <label>API key</label>
+        <span class="value" id="settingsApiKey">(not set)</span>
+        <button class="btn" onclick="changeApiKey()">Change…</button>
+      </div>
+      <div class="settings-row">
         <label>Timeout</label>
         <span class="value" id="settingsTimeout">—</span>
         <button class="btn" onclick="changeTimeout()">Change…</button>
@@ -5819,6 +5894,14 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
 
   async function loadState() {
     try {
+      // First-run gate: if there's no API key on file, prompt for it before
+      // doing anything else. The prompt is modal — user can't skip it. They
+      // can still change the key later via the settings modal.
+      const ak = await fetch('/api/api-key').then((r) => r.json()).catch(() => ({ hasKey: true }));
+      if (!ak.hasKey) {
+        const ok = await promptForApiKey({ initial: true });
+        if (!ok) return;   // user closed without entering — nothing to load
+      }
       const r = await fetch('/api/project-state');
       const s = await r.json();
       if (s.activeProject) {
@@ -5829,6 +5912,71 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     } catch (e) {
       showError('Failed to load state', e);
     }
+  }
+
+  // ── API key prompt / change ─────────────────────────────────────────────
+  // Shown automatically on first run when ~/.code_boss/api-key.txt is absent,
+  // or on demand from the settings modal. Resolves true on save, false on
+  // cancel.
+  function promptForApiKey({ initial } = {}) {
+    return new Promise((resolve) => {
+      const title = initial ? 'Set API key' : 'Change API key';
+      const subtitle = initial
+        ? 'code_boss needs an API key for the LLM endpoint. It will be saved at <code>~/.code_boss/api-key.txt</code> so this prompt only appears once.'
+        : 'Replace the API key. It overwrites <code>~/.code_boss/api-key.txt</code>.';
+      $modal.classList.remove('error');
+      $modalBg.classList.remove('fullpage');
+      $modalTitle.textContent = title;
+      $modalBody.innerHTML = \`
+        <p style="margin: 0 0 12px; color: var(--muted); font-size: 12.5px;">\${subtitle}</p>
+        <input id="apiKeyInput" type="password" autocomplete="off" spellcheck="false"
+               placeholder="paste key" style="width: 100%; padding: 8px 10px; font: inherit;
+               font-size: 13px; background: var(--panel-alt); color: var(--fg);
+               border: 1px solid var(--border); border-radius: 4px;" />
+        <div style="margin-top: 12px; display: flex; gap: 8px; justify-content: flex-end;">
+          <button id="apiKeyCancel" class="btn">Cancel</button>
+          <button id="apiKeySave" class="btn primary">Save</button>
+        </div>
+        <p id="apiKeyMsg" style="margin: 8px 0 0; color: var(--error); font-size: 12px; min-height: 14px;"></p>
+      \`;
+      $modalBg.classList.add('show');
+      const inp = document.getElementById('apiKeyInput');
+      const msg = document.getElementById('apiKeyMsg');
+      const cancel = document.getElementById('apiKeyCancel');
+      const save = document.getElementById('apiKeySave');
+      setTimeout(() => inp?.focus(), 50);
+
+      const done = (ok) => { closeModal(); resolve(ok); };
+      cancel.onclick = () => done(false);
+      const submit = async () => {
+        const key = (inp.value || '').trim();
+        if (!key) { msg.textContent = 'Key cannot be empty.'; return; }
+        save.disabled = true;
+        try {
+          const r = await fetch('/api/api-key', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ key }),
+          });
+          if (!r.ok) {
+            const body = await r.text();
+            msg.textContent = 'Save failed: ' + body.slice(0, 200);
+            save.disabled = false;
+            return;
+          }
+          done(true);
+        } catch (e) {
+          msg.textContent = 'Save failed: ' + e.message;
+          save.disabled = false;
+        }
+      };
+      save.onclick = submit;
+      inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); });
+    });
+  }
+  async function changeApiKey() {
+    const ok = await promptForApiKey({ initial: false });
+    if (ok && typeof openSettings === 'function') openSettings();   // re-open settings with the new prefix
   }
 
   function showLanding(recent) {
@@ -7001,10 +7149,17 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   });
 
   // ── Settings modal ─────────────────────────────────────────────────────
-  function openSettings() {
+  async function openSettings() {
     if ($settingsProject) $settingsProject.textContent = activeProject || '(none)';
     if ($settingsTokens)  $settingsTokens.textContent = totalTokens.toLocaleString();
     if ($settingsTimeout) $settingsTimeout.textContent = fmtTimeoutMins(session?.timeoutMs);
+    // Pull the current key prefix so the settings row reflects whatever
+    // was loaded from ~/.code_boss/api-key.txt (or set just now).
+    try {
+      const ak = await fetch('/api/api-key').then((r) => r.json());
+      const el = document.getElementById('settingsApiKey');
+      if (el) el.textContent = ak.hasKey ? (ak.prefix || '(set)') : '(not set)';
+    } catch {}
     $settingsModalBg.classList.add('show');
   }
   function closeSettings() {
