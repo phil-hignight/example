@@ -15,7 +15,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '26';
+const BUILD_VERSION = '30';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
@@ -2638,6 +2638,9 @@ async function runPromptedAgent({
  *
  * No npm deps. Node built-in http + the production HTTP adapter.
  */
+// Inside the request handler `path` gets shadowed by `const path = url.pathname`,
+// so callers in that scope use `nodePath` for the actual path module.
+const nodePath = path;
 // Layout primitives live in mosaic-layout.mjs. Imported here so runQueries
 // can call computeTileSize directly. Re-exported so tests + tools can
 // import from server.mjs. In the production bundle, the build's
@@ -4066,6 +4069,73 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
         const chosen = await pickFolderNative();
         return sendJson(res, 200, { path: chosen });
       }
+      if (req.method === 'GET' && path === '/api/list-dir') {
+        // In-browser folder picker. Returns subdirs of `path` (or the home
+        // dir if path is empty or '~'), plus parent + breadcrumb so the UI
+        // can render navigation without re-parsing paths. Hidden dirs
+        // (leading '.') are filtered out — they're noise for picking a
+        // project root and would let the user dig into things like
+        // .git/objects/ by accident.
+        let target = url.searchParams.get('path') || '';
+        if (!target || target === '~') target = homedir();
+        // On Windows, an empty path or '/' means "list drives".
+        if (process.platform === 'win32' && (target === '/' || target === '\\')) {
+          const drives = [];
+          for (const letter of 'ABCDEFGHIJKLMNOPQRSTUVWXYZ') {
+            const root = letter + ':\\';
+            try {
+              statSync(root);
+              drives.push({ name: letter + ':', path: root });
+            } catch {}
+          }
+          return sendJson(res, 200, {
+            path: '',
+            parent: null,
+            breadcrumb: [{ name: '(drives)', path: '' }],
+            entries: drives,
+            isDriveList: true,
+          });
+        }
+        const abs = nodePath.resolve(target);
+        let entries = [];
+        try {
+          const names = await readdir(abs);
+          for (const name of names) {
+            if (name.startsWith('.')) continue;
+            try {
+              const s = await stat(nodePath.join(abs, name));
+              if (s.isDirectory()) entries.push({ name, path: nodePath.join(abs, name) });
+            } catch {}
+          }
+        } catch (e) {
+          return sendJson(res, 400, { error: 'cannot read dir: ' + e.message });
+        }
+        entries.sort((a, b) => a.name.localeCompare(b.name));
+        // Build breadcrumb: each path segment is one hop you can click.
+        // On Windows, drive root (C:\) has no parent — leads to drive list.
+        const segments = [];
+        let cur = abs;
+        while (true) {
+          const parent = nodePath.dirname(cur);
+          const name = nodePath.basename(cur) || cur;
+          segments.unshift({ name, path: cur });
+          if (parent === cur) break;
+          cur = parent;
+        }
+        // Parent for "Up" button. On Windows root drive, parent points to
+        // the drive list (empty string).
+        let parent = nodePath.dirname(abs);
+        if (parent === abs) {
+          parent = process.platform === 'win32' ? '' : null;
+        }
+        return sendJson(res, 200, {
+          path: abs,
+          parent,
+          breadcrumb: segments,
+          entries,
+          isDriveList: false,
+        });
+      }
       if (req.method === 'POST' && path === '/api/open-project') {
         const raw = await readBody(req);
         let body;
@@ -4547,107 +4617,6 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
   });
 }
 
-// ====== cli-picker.mjs ======
-/**
- * Interactive CLI prompt: choose a project to open before the web UI starts.
- *
- * Menu shape:
- *   [1] <current working directory>   (★ initialized | new project)
- *   [2] Open a different folder...    (spawns native dialog)
- *   Recent:
- *   [3..6] up to four recent projects (★ initialized | new project)
- *
- * Returns the absolute path of the chosen folder. Falls back to cwd in a
- * non-TTY environment.
- */
-
-const C = process.stdout.isTTY
-  ? { reset:'\x1b[0m', bold:'\x1b[1m', dim:'\x1b[2m', green:'\x1b[32m', cyan:'\x1b[36m', yellow:'\x1b[33m' }
-  : new Proxy({}, { get: () => '' });
-
-async function isInitialized(dir) {
-  // Accept the new .code_boss/ dir OR the legacy .agent/ (which gets
-  // migrated on first open by the server). Either signals this dir has
-  // previously been opened as a code_boss project.
-  try {
-    if ((await stat(path.join(dir, '.code_boss'))).isDirectory()) return true;
-  } catch {}
-  try {
-    return (await stat(path.join(dir, '.agent'))).isDirectory();
-  } catch { return false; }
-}
-
-function prompt(question) {
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
-  return new Promise((r) => rl.question(question, (a) => { rl.close(); r(a); }));
-}
-
-function markerFor(init) {
-  return init
-    ? `${C.green}★ initialized${C.reset}`
-    : `${C.dim}new project${C.reset}`;
-}
-
-async function selectProject({ recent = [], cwd = process.cwd() } = {}) {
-  // Non-interactive fallback: just use cwd.
-  if (!process.stdin.isTTY) {
-    console.error(`[cli-picker] non-TTY, defaulting to cwd: ${cwd}`);
-    return cwd;
-  }
-
-  const cwdInit = await isInitialized(cwd);
-  const recentFiltered = recent.filter((p) => p !== cwd).slice(0, 4);
-  const recentInfo = await Promise.all(
-    recentFiltered.map(async (p) => ({ path: p, init: await isInitialized(p) })),
-  );
-
-  console.log('');
-  console.log(`  ${C.bold}code_boss${C.reset}`);
-  console.log(`  ${C.dim}─────────${C.reset}`);
-  console.log('');
-  console.log('  Open a project:');
-  console.log('');
-
-  const choices = [];
-  console.log(`  ${C.cyan}[1]${C.reset} ${cwd}    ${markerFor(cwdInit)}`);
-  choices.push({ kind: 'path', value: cwd });
-
-  console.log(`  ${C.cyan}[2]${C.reset} ${C.dim}Open a different folder…${C.reset}`);
-  choices.push({ kind: 'pick' });
-
-  if (recentInfo.length > 0) {
-    console.log('');
-    console.log(`  ${C.dim}Recent:${C.reset}`);
-    for (let i = 0; i < recentInfo.length; i++) {
-      const idx = i + 3;
-      const r = recentInfo[i];
-      console.log(`  ${C.cyan}[${idx}]${C.reset} ${r.path}    ${markerFor(r.init)}`);
-      choices.push({ kind: 'path', value: r.path });
-    }
-  }
-
-  console.log('');
-  const raw = (await prompt(`  Enter choice [1]: `)).trim();
-  const idx = raw === '' ? 0 : parseInt(raw, 10) - 1;
-
-  if (Number.isNaN(idx) || idx < 0 || idx >= choices.length) {
-    console.log(`  ${C.yellow}Invalid choice. Exiting.${C.reset}`);
-    process.exit(1);
-  }
-
-  const chosen = choices[idx];
-  if (chosen.kind === 'pick') {
-    console.log(`  ${C.dim}Opening folder dialog…${C.reset}`);
-    const picked = await pickFolderNative();
-    if (!picked) {
-      console.log(`  ${C.yellow}No folder selected. Exiting.${C.reset}`);
-      process.exit(0);
-    }
-    return picked;
-  }
-  return chosen.value;
-}
-
 
 
 // ====== embedded UI HTML ======
@@ -4724,12 +4693,14 @@ const UI_HTML = `<!DOCTYPE html>
     flex: 1;
     display: flex;
     flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    padding: 32px 24px;
+    align-items: stretch;
+    justify-content: flex-start;
+    padding: 48px 24px 32px;
     max-width: 640px;
     margin: 0 auto;
     width: 100%;
+    overflow-y: auto;
+    min-height: 0;
   }
   #landing.hidden, #chat.hidden, #initView.hidden { display: none; }
   #initView {
@@ -4751,12 +4722,6 @@ const UI_HTML = `<!DOCTYPE html>
   #landing h1 { font-size: 26px; font-weight: 700; margin: 0 0 6px; letter-spacing: -0.5px; color: var(--accent); }
   #landing h1::before { content: "✻ "; }
   #landing .tagline { color: var(--muted); margin: 0 0 32px; font-size: 15px; }
-  #pickBtn {
-    font-size: 15px;
-    font-weight: 600;
-    padding: 13px 26px;
-    border-radius: 12px;
-  }
   #landing h2 {
     font-size: 13px;
     text-transform: uppercase;
@@ -4792,6 +4757,69 @@ const UI_HTML = `<!DOCTYPE html>
   }
   .recent-item .path { color: var(--muted); font-size: 12px; font-family: ui-monospace, Menlo, Consolas, monospace; margin-top: 2px; word-break: break-all; }
   .recent-empty { color: var(--muted); font-size: 13px; text-align: center; padding: 12px; }
+
+  /* In-UI file browser (replaces the native PowerShell folder dialog).
+     Used on the landing to pick a project. Looks like a Finder-ish list. */
+  .browser-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+  }
+  .breadcrumb {
+    flex: 1 1 auto;
+    min-width: 0;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    padding: 0 4px;
+  }
+  .breadcrumb .crumb { cursor: pointer; }
+  .breadcrumb .crumb:hover { color: var(--accent); text-decoration: underline; }
+  .breadcrumb .sep { color: var(--border); margin: 0 4px; }
+  .dir-list {
+    list-style: none;
+    padding: 0;
+    margin: 0 0 12px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--panel);
+    max-height: 360px;
+    overflow-y: auto;
+  }
+  .dir-item {
+    padding: 7px 12px;
+    cursor: pointer;
+    font-family: var(--mono);
+    font-size: 12px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .dir-item:last-child { border-bottom: none; }
+  .dir-item:hover { background: var(--panel-alt); color: var(--accent); }
+  .dir-item .icon { color: var(--muted); flex-shrink: 0; }
+  .dir-empty { color: var(--muted); font-size: 12px; text-align: center; padding: 16px; font-style: italic; }
+  .browser-actions {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    justify-content: space-between;
+  }
+  .browser-actions .muted {
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 11px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1 1 auto;
+    min-width: 0;
+  }
   .project-chip {
     background: transparent;
     border: 1px solid var(--border);
@@ -4973,10 +5001,14 @@ const UI_HTML = `<!DOCTYPE html>
     font-size: 10px;
     flex-shrink: 0;
   }
-  .task-wrap .task-head .task-id {
+  .task-wrap .task-head .ur {
     color: var(--accent);
     font-weight: 600;
-    flex-shrink: 0;
+    flex: 1 1 auto;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
   }
   .task-wrap .task-head .tag {
     flex-shrink: 0;
@@ -4988,14 +5020,6 @@ const UI_HTML = `<!DOCTYPE html>
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.4px;
-  }
-  .task-wrap .task-head .ur {
-    color: var(--fg);
-    flex: 1 1 auto;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    min-width: 0;
   }
   .task-wrap .task-body {
     padding: 6px 10px;
@@ -5027,8 +5051,7 @@ const UI_HTML = `<!DOCTYPE html>
     color: var(--muted);
     background: var(--panel-alt);
   }
-  .task-end-marker .task-id { color: var(--accent); font-weight: 600; }
-  .task-end-marker .ur { color: var(--fg); }
+  .task-end-marker .ur { color: var(--accent); font-weight: 600; }
 
   /* Mute: applied to content the LLM no longer sees (results masked at tier 2,
      whole task at tier 3, whole project's children at tier 4). */
@@ -5834,9 +5857,20 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
 <div id="landing">
   <h1>code_boss</h1>
   <p class="tagline">Pick a project folder to work on.</p>
-  <button class="btn primary" id="pickBtn" onclick="pickFolder()">Pick a folder…</button>
+
   <h2>Recent projects</h2>
   <ul class="recent-list" id="recentList"></ul>
+
+  <h2>Browse</h2>
+  <div class="browser-toolbar">
+    <button class="btn" id="upBtn" onclick="browserUp()" title="Go to parent folder">↑ Up</button>
+    <div class="breadcrumb" id="breadcrumb"></div>
+  </div>
+  <ul class="dir-list" id="dirList"></ul>
+  <div class="browser-actions">
+    <span class="muted" id="browserStatus"></span>
+    <button class="btn primary" id="openHereBtn" onclick="openCurrentBrowserDir()" disabled>Open this folder</button>
+  </div>
 </div>
 
 <!-- Init view: shown while we collect the API key, load the models list,
@@ -5938,8 +5972,12 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
 <script>
   const $landing = document.getElementById('landing');
   const $chat = document.getElementById('chat');
-  const $pickBtn = document.getElementById('pickBtn');
   const $recentList = document.getElementById('recentList');
+  const $upBtn = document.getElementById('upBtn');
+  const $breadcrumb = document.getElementById('breadcrumb');
+  const $dirList = document.getElementById('dirList');
+  const $browserStatus = document.getElementById('browserStatus');
+  const $openHereBtn = document.getElementById('openHereBtn');
   const $projectPath = document.getElementById('projectPath');
   const $log = document.getElementById('log');
   const $logScroll = document.getElementById('logScroll');
@@ -6315,16 +6353,22 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     $recentList.innerHTML = '';
     if (!recent || recent.length === 0) {
       $recentList.innerHTML = '<li class="recent-empty">No recent projects yet.</li>';
-      return;
+    } else {
+      for (const p of recent) {
+        const li = document.createElement('li');
+        li.className = 'recent-item';
+        li.innerHTML = '<div class="name">' + escapeHtml(basename(p)) + '</div>'
+          + '<div class="path">' + escapeHtml(p) + '</div>';
+        li.addEventListener('click', () => openProject(p));
+        $recentList.appendChild(li);
+      }
     }
-    for (const p of recent) {
-      const li = document.createElement('li');
-      li.className = 'recent-item';
-      li.innerHTML = '<div class="name">' + escapeHtml(basename(p)) + '</div>'
-        + '<div class="path">' + escapeHtml(p) + '</div>';
-      li.addEventListener('click', () => openProject(p));
-      $recentList.appendChild(li);
-    }
+    // Kick off the file browser. Start at the parent of the most recent
+    // project (so re-picking siblings is one click), else home dir.
+    const start = (recent && recent.length > 0)
+      ? recent[0].replace(/[\\\\\\/][^\\\\\\/]+[\\\\\\/]?$/, '')   // parent of most recent
+      : '';
+    loadBrowser(start);
   }
 
   function showChat(projectPath) {
@@ -6350,21 +6394,99 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     $input.focus();
   }
 
-  async function pickFolder() {
-    $pickBtn.disabled = true;
-    $pickBtn.textContent = 'Choose folder in dialog…';
+  // ── In-UI file browser (landing) ────────────────────────────────────────
+  // Replaces the native PowerShell folder-dialog flow. Server returns subdirs
+  // + breadcrumb for any path; we render rows the user can click to navigate
+  // into, and a primary button to open the currently-displayed folder as a
+  // project. No fs access in the browser — every navigation hop is a single
+  // /api/list-dir GET.
+  let _browserPath = '';
+  // Monotonic token. loadState + SSE init can both fire showLanding on page
+  // load, kicking off two concurrent loadBrowser('') calls; a user click
+  // mid-flight adds a third. We only apply the result of the LATEST call so
+  // older responses can't overwrite newer state.
+  let _browserLoadToken = 0;
+  async function loadBrowser(target) {
+    const myToken = ++_browserLoadToken;
+    $dirList.innerHTML = '<li class="dir-empty">Loading…</li>';
+    $openHereBtn.disabled = true;
     try {
-      const r = await fetch('/api/pick-folder', { method: 'POST' });
-      const data = await r.json();
-      if (data.path) {
-        await openProject(data.path);
+      const url = '/api/list-dir' + (target ? '?path=' + encodeURIComponent(target) : '');
+      const r = await fetch(url);
+      if (myToken !== _browserLoadToken) return;
+      if (!r.ok) {
+        const data = await r.json().catch(() => ({}));
+        throw new Error(data.error ?? ('HTTP ' + r.status));
       }
+      const data = await r.json();
+      if (myToken !== _browserLoadToken) return;
+      _browserPath = data.path || '';
+      renderBreadcrumb(data.breadcrumb || [], data.isDriveList);
+      renderDirList(data.entries || [], data.isDriveList);
+      $browserStatus.textContent = _browserPath || '(drives)';
+      $browserStatus.title = _browserPath || '';
+      // "Open this folder" only enabled when we're inside a real directory
+      // (not the drive list).
+      $openHereBtn.disabled = !_browserPath;
+      $upBtn.disabled = (data.parent === null || data.parent === undefined);
+      $upBtn.dataset.parent = data.parent || '';
     } catch (e) {
-      showError('Folder picker failed', e);
-    } finally {
-      $pickBtn.disabled = false;
-      $pickBtn.textContent = 'Pick a folder…';
+      if (myToken !== _browserLoadToken) return;
+      $dirList.innerHTML = '<li class="dir-empty">Failed to load: ' + escapeHtml(e.message) + '</li>';
+      $browserStatus.textContent = target || '(home)';
     }
+  }
+  function renderBreadcrumb(segments, isDriveList) {
+    $breadcrumb.innerHTML = '';
+    if (isDriveList) {
+      const span = document.createElement('span');
+      span.textContent = '(pick a drive)';
+      $breadcrumb.appendChild(span);
+      return;
+    }
+    segments.forEach((seg, i) => {
+      if (i > 0) {
+        const sep = document.createElement('span');
+        sep.className = 'sep';
+        sep.textContent = '›';
+        $breadcrumb.appendChild(sep);
+      }
+      const crumb = document.createElement('span');
+      crumb.className = 'crumb';
+      crumb.textContent = seg.name;
+      crumb.title = seg.path;
+      crumb.onclick = () => loadBrowser(seg.path);
+      $breadcrumb.appendChild(crumb);
+    });
+  }
+  function renderDirList(entries, isDriveList) {
+    $dirList.innerHTML = '';
+    if (entries.length === 0) {
+      $dirList.innerHTML = '<li class="dir-empty">(no subfolders)</li>';
+      return;
+    }
+    for (const e of entries) {
+      const li = document.createElement('li');
+      li.className = 'dir-item';
+      const icon = document.createElement('span');
+      icon.className = 'icon';
+      icon.textContent = isDriveList ? '◉' : '▸';
+      li.appendChild(icon);
+      const label = document.createElement('span');
+      label.textContent = e.name;
+      li.appendChild(label);
+      li.onclick = () => loadBrowser(e.path);
+      $dirList.appendChild(li);
+    }
+  }
+  function browserUp() {
+    const parent = $upBtn.dataset.parent;
+    if (parent === undefined) return;
+    loadBrowser(parent);
+  }
+  function openCurrentBrowserDir() {
+    if (!_browserPath) return;
+    openProject(_browserPath);
   }
 
   async function openProject(p) {
@@ -7277,11 +7399,6 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     };
     head.appendChild(toggle);
 
-    const idSpan = document.createElement('span');
-    idSpan.className = 'task-id';
-    idSpan.textContent = ev.parentTaskId;
-    head.appendChild(idSpan);
-
     const tag = document.createElement('span');
     tag.className = 'tag';
     tag.textContent = 'project';
@@ -7403,10 +7520,6 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       // render a small inline pill marker so the user sees the boundary.
       const marker = document.createElement('div');
       marker.className = 'task-end-marker';
-      const idSpan = document.createElement('span');
-      idSpan.className = 'task-id';
-      idSpan.textContent = taskId;
-      marker.appendChild(idSpan);
       if (ev.userRequest) {
         const ur = document.createElement('span');
         ur.className = 'ur';
@@ -7435,10 +7548,6 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       toggle.textContent = collapsed ? '▶' : '▼';
     };
     head.appendChild(toggle);
-    const idSpan = document.createElement('span');
-    idSpan.className = 'task-id';
-    idSpan.textContent = taskId;
-    head.appendChild(idSpan);
     if (ev.userRequest) {
       const ur = document.createElement('span');
       ur.className = 'ur';
@@ -7668,19 +7777,18 @@ const htmlWithConfig = UI_HTML.replace(
   '<script>window.SERVER_CONFIG=' + JSON.stringify({ defaultModel: MODEL, baseURL: BASE_URL, buildVersion: BUILD_VERSION }) + ';</script></head>'
 );
 
+// Boot: no CLI picker — the browser shows an in-UI file browser on the
+// landing view and the user picks a project there. Server starts with
+// no active project; /api/open-project drives the transition.
 (async () => {
   try {
-    const recent = await loadRecentProjects();
-    const initialProject = await selectProject({ recent });
-    console.error('[code_boss] active project: ' + initialProject);
-
     const { port } = await startServer({
       html: htmlWithConfig,
       baseURL: BASE_URL,
       apiKey: API_KEY,
       defaultModel: MODEL,
       port: PORT,
-      initialProject,
+      initialProject: null,
     });
     const url = 'http://127.0.0.1:' + port + '/';
     console.error('[code_boss] listening on ' + url);
