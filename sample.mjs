@@ -15,7 +15,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '25';
+const BUILD_VERSION = '26';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
@@ -6631,10 +6631,16 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   }
 
   async function _fetchAndRenderMosaic() {
+    // Hard timeout so a hung server doesn't leave the modal stuck on
+    // "measuring…" forever — if the user opened the snapshot because
+    // something else froze, /api/queries may not come back.
+    const ctrl = new AbortController();
+    const timeoutId = setTimeout(() => ctrl.abort(), 10000);
     try {
       const raw = _getActiveIds().trim();
       const url = raw ? \`/api/queries?ids=\${encodeURIComponent(raw)}\` : '/api/queries';
-      const r = await fetch(url);
+      const r = await fetch(url, { signal: ctrl.signal });
+      clearTimeout(timeoutId);
       if (!r.ok) throw new Error('queries fetch failed: ' + r.status);
       const data = await r.json();
       _mosaicState.tiles = data.tiles ?? [];
@@ -6646,7 +6652,11 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       // dimensions for the real viewport / font size / zoom level.
       _relayoutAndRender();
     } catch (e) {
-      showError('Snapshot fetch failed', e);
+      clearTimeout(timeoutId);
+      const msg = e?.name === 'AbortError'
+        ? new Error('snapshot fetch timed out after 10s — server may be unresponsive')
+        : e;
+      showError('Snapshot fetch failed', msg);
     }
   }
 
@@ -6987,19 +6997,25 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   // ── SSE stream — pushes every server-side state change here ──
   // Browser is a view: we mirror session, render from session.events.
   let _es = null;
+  let _lastSseAt = 0;            // wallclock ms of most recent SSE message
   function connectStream() {
     if (_es) { try { _es.close(); } catch {} _es = null; }
     _es = new EventSource('/api/stream');
+    console.log('[sse] connecting');
+    _es.onopen = () => { _lastSseAt = Date.now(); console.log('[sse] open'); };
     _es.onmessage = (e) => {
+      _lastSseAt = Date.now();
       let msg;
       try { msg = JSON.parse(e.data); } catch { return; }
       if (msg.type === 'init') {
+        console.log('[sse] init v=' + msg.session.version + ' status=' + msg.session.status);
         onInit(msg.session);
         expectedNextVersion = msg.session.version + 1;
         return;
       }
       // Gap detection
       if (typeof msg.version !== 'number') return;
+      console.log('[sse] msg type=' + msg.type + ' v=' + msg.version + (msg.status ? ' status=' + msg.status : ''));
       if (msg.version === expectedNextVersion) {
         applyDelta(msg);
         expectedNextVersion = msg.version + 1;
@@ -7013,7 +7029,9 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       // else: stale, ignore
     };
     _es.onerror = () => {
-      // EventSource auto-reconnects on its own; we don't need to do anything.
+      // EventSource auto-reconnects on its own; the watchdog below will
+      // refetch state if reconnect doesn't deliver messages in time.
+      console.warn('[sse] error (readyState=' + _es?.readyState + ')');
     };
   }
   async function refetchAndReconnect() {
@@ -7029,6 +7047,26 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       setTimeout(refetchAndReconnect, 2000);
     }
   }
+
+  // SSE watchdog. EventSource auto-reconnect is supposed to handle drops,
+  // but we've seen the chat get stuck in 'running' (input disabled, no final
+  // assistant message, no 'status: done' delta) — meaning the server-side
+  // state moved on but the client never heard about it. Every 5s, if the
+  // session is 'running' and no SSE message has arrived in 30s, refetch
+  // /api/state directly and reconnect. Cheap insurance against silent SSE
+  // drops; doesn't run when idle.
+  setInterval(() => {
+    if (!session) return;
+    if (session.status !== 'running') return;
+    if (!_lastSseAt) return;     // never connected yet — connectStream will handle it
+    const silence = Date.now() - _lastSseAt;
+    if (silence > 30000) {
+      console.warn('[sse] watchdog: ' + silence + 'ms since last message while running — refetching');
+      try { _es?.close(); } catch {}
+      _es = null;
+      refetchAndReconnect();
+    }
+  }, 5000);
 
   // Spinner tick — runs only while a chat is in progress so the spinner glyph
   // animates and the elapsed timer counts up.
