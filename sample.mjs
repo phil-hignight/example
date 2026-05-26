@@ -15,7 +15,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '32';
+const BUILD_VERSION = '33';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
@@ -4091,7 +4091,7 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
           return sendJson(res, 200, {
             path: '',
             parent: null,
-            breadcrumb: [{ name: '(drives)', path: '' }],
+            breadcrumb: [{ name: '(drives)', path: '/' }],
             entries: drives,
             isDriveList: true,
           });
@@ -4112,7 +4112,8 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
         }
         entries.sort((a, b) => a.name.localeCompare(b.name));
         // Build breadcrumb: each path segment is one hop you can click.
-        // On Windows, drive root (C:\) has no parent — leads to drive list.
+        // On Windows we prepend a "(drives)" hop with path='/' so the user
+        // can climb past the drive root back to the drive list.
         const segments = [];
         let cur = abs;
         while (true) {
@@ -4122,11 +4123,15 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
           if (parent === cur) break;
           cur = parent;
         }
-        // Parent for "Up" button. On Windows root drive, parent points to
-        // the drive list (empty string).
+        if (process.platform === 'win32') {
+          segments.unshift({ name: '(drives)', path: '/' });
+        }
+        // Parent for "Up" button. On Windows root drive (C:\), parent
+        // points to the drive list ('/'); on POSIX it's null (no further
+        // hop possible).
         let parent = nodePath.dirname(abs);
         if (parent === abs) {
-          parent = process.platform === 'win32' ? '' : null;
+          parent = process.platform === 'win32' ? '/' : null;
         }
         return sendJson(res, 200, {
           path: abs,
@@ -4645,6 +4650,51 @@ const UI_HTML = `<!DOCTYPE html>
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
 
+  /* Global button reset + .btn styles. Without these, anything using
+     \`class="btn"\` falls through to the OS-native button rendering — wrong
+     font, light gradient background, faint inset shadow from the top-left.
+     The contextual \`.settings-row .btn\` / \`.settings-actions .btn\` rules
+     below override these where finer tuning is needed; specificity wins. */
+  button { font: inherit; }
+  .btn {
+    -webkit-appearance: none;
+    appearance: none;
+    font-family: var(--mono);
+    font-size: 12.5px;
+    font-weight: 500;
+    line-height: 1.4;
+    padding: 8px 18px;
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--fg);
+    border-radius: 5px;
+    cursor: pointer;
+    letter-spacing: 0.2px;
+    transition: border-color 0.12s, background 0.12s, color 0.12s;
+  }
+  .btn:hover:not(:disabled) {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .btn:active:not(:disabled) { transform: translateY(1px); }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn.primary {
+    background: var(--accent);
+    color: var(--accent-fg);
+    border-color: var(--accent);
+    font-weight: 600;
+  }
+  .btn.primary:hover:not(:disabled) {
+    background: var(--accent-hover);
+    border-color: var(--accent-hover);
+    color: var(--accent-fg);
+  }
+  .btn.primary:disabled {
+    background: transparent;
+    color: var(--muted);
+    border-color: var(--border);
+  }
+
   /* Floating build-version badge — top-right, translucent, never blocks
      interaction. Always visible so a screenshot of the page also captures
      which bundle is running. */
@@ -4760,10 +4810,9 @@ const UI_HTML = `<!DOCTYPE html>
 
   /* Folder-picker modal — replaces the native PowerShell folder dialog. */
   #selectFolderBtn {
-    font-size: 14px;
-    font-weight: 600;
-    padding: 11px 22px;
-    border-radius: 10px;
+    font-size: 13.5px;
+    padding: 11px 24px;
+    border-radius: 8px;
     align-self: flex-start;
   }
   .browser-toolbar {
@@ -4835,10 +4884,10 @@ const UI_HTML = `<!DOCTYPE html>
   .modal-footer {
     display: flex;
     justify-content: flex-end;
-    gap: 8px;
-    padding: 10px 16px;
+    gap: 10px;
+    padding: 14px 18px;
     border-top: 1px solid var(--border);
-    background: var(--panel-alt);
+    background: var(--bg);          /* match page bg — darker than panel-alt */
   }
   .project-chip {
     background: transparent;
