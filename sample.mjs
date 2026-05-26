@@ -15,7 +15,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '21';
+const BUILD_VERSION = '23';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
@@ -4658,19 +4658,19 @@ const UI_HTML = `<!DOCTYPE html>
 <title>code_boss</title>
 <style>
   :root {
-    --bg: #141310;          /* warm terminal near-black (a touch darker for more text contrast) */
-    --panel: #1a1814;       /* slightly raised panels */
-    --panel-alt: #1f1d18;   /* input / boxes */
+    --bg: #100e0b;          /* warm terminal near-black */
+    --panel: #161410;       /* slightly raised panels */
+    --panel-alt: #1b1914;   /* input / boxes */
     --border: #3a372f;      /* dim warm border */
     --fg: #e6e2d6;          /* warm off-white text */
     --muted: #8c887b;       /* dim gray for secondary */
     --accent: #d97757;      /* Claude coral (bright for dark bg) */
     --accent-hover: #e08968;
-    --accent-fg: #141310;
+    --accent-fg: #100e0b;
     --tool: #d97757;        /* tool-call bullet */
     --error: #e5635a;
-    --error-bg: #251a17;
-    --warn-bg: #251f15;
+    --error-bg: #211613;
+    --warn-bg: #211b11;
     --mono: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
   }
   * { box-sizing: border-box; }
@@ -5819,7 +5819,10 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
 <div id="initView" class="hidden">
   <h1>code_boss</h1>
   <p class="tagline" id="initStatus">Initializing…</p>
-  <button id="initRetryBtn" class="btn primary hidden" onclick="initialize()">Retry</button>
+  <div style="display: flex; gap: 8px; margin-top: 12px;">
+    <button id="initRetryBtn" class="btn primary hidden" onclick="initialize()">Retry</button>
+    <button class="btn" onclick="openSnapshot()" title="Open snapshot (diagnostics)">⚙ Snapshot</button>
+  </div>
 </div>
 
 <div id="chat" class="hidden">
@@ -5880,7 +5883,22 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   </div>
 </div>
 
-<!-- Snapshot/diagnostic modal — stacks over the settings modal when both open. -->
+<!-- Init modal: shown for set-api-key and unlock flows. Cannot be dismissed
+     (no × close button, no backdrop-click handler) because there's nowhere
+     to go from these states — the user must complete the action or close
+     the tab. A ⚙ in the header opens the snapshot OVER this modal so the
+     user can still capture diagnostics if init freezes. -->
+<div class="modal-bg" id="initModalBg" style="z-index: 150;">
+  <div class="modal" id="initModal">
+    <div class="modal-header">
+      <h2 id="initModalTitle">Setup</h2>
+      <button class="settings-btn" onclick="openSnapshot()" title="Open snapshot (diagnostics)">⚙</button>
+    </div>
+    <div class="modal-body" id="initModalBody"></div>
+  </div>
+</div>
+
+<!-- Snapshot/diagnostic modal — stacks over EVERYTHING when open. -->
 <div class="modal-bg" id="modalBg" onclick="if (event.target === this) closeModal()" style="z-index: 200;">
   <div class="modal" id="modal">
     <div class="modal-header">
@@ -5905,6 +5923,12 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   const $settingsProject = document.getElementById('settingsProject');
   const $settingsTimeout = document.getElementById('settingsTimeout');
   const $settingsTokens = document.getElementById('settingsTokens');
+  // Init modal — set-api-key + unlock. Separate from snapshot $modalBg so
+  // snapshot can stack OVER an open init modal (z-index 200 vs 150) and
+  // both stay alive across opens.
+  const $initModalBg    = document.getElementById('initModalBg');
+  const $initModalTitle = document.getElementById('initModalTitle');
+  const $initModalBody  = document.getElementById('initModalBody');
   const $modalBg = document.getElementById('modalBg');
   const $modal = document.getElementById('modal');
   const $modalTitle = document.getElementById('modalTitle');
@@ -6126,30 +6150,32 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       const subtitle = initial
         ? 'code_boss needs an API key for the LLM endpoint. It will be saved at <code>~/.code_boss/api-key.txt</code> so this prompt only appears once.'
         : 'Replace the API key. It overwrites <code>~/.code_boss/api-key.txt</code>.';
-      $modal.classList.remove('error');
-      $modalBg.classList.remove('fullpage');
-      $modalTitle.textContent = title;
-      $modalBody.innerHTML = \`
+      $initModalTitle.textContent = title;
+      // Change-key (from settings) gets a Cancel; first-run does NOT —
+      // there's no usable app behind the modal if a key isn't set yet.
+      const cancelHtml = initial ? '' :
+        '<button id="apiKeyCancel" class="btn">Cancel</button>';
+      $initModalBody.innerHTML = \`
         <p style="margin: 0 0 12px; color: var(--muted); font-size: 12.5px;">\${subtitle}</p>
         <input id="apiKeyInput" type="password" autocomplete="off" spellcheck="false"
                placeholder="paste key" style="width: 100%; padding: 8px 10px; font: inherit;
                font-size: 13px; background: var(--panel-alt); color: var(--fg);
                border: 1px solid var(--border); border-radius: 4px;" />
         <div style="margin-top: 12px; display: flex; gap: 8px; justify-content: flex-end;">
-          <button id="apiKeyCancel" class="btn">Cancel</button>
+          \${cancelHtml}
           <button id="apiKeySave" class="btn primary">Save</button>
         </div>
         <p id="apiKeyMsg" style="margin: 8px 0 0; color: var(--error); font-size: 12px; min-height: 14px;"></p>
       \`;
-      $modalBg.classList.add('show');
+      $initModalBg.classList.add('show');
       const inp = document.getElementById('apiKeyInput');
       const msg = document.getElementById('apiKeyMsg');
-      const cancel = document.getElementById('apiKeyCancel');
       const save = document.getElementById('apiKeySave');
+      const cancel = document.getElementById('apiKeyCancel');
       setTimeout(() => inp?.focus(), 50);
 
-      const done = (ok) => { closeModal(); resolve(ok); };
-      cancel.onclick = () => done(false);
+      const done = (ok) => { $initModalBg.classList.remove('show'); resolve(ok); };
+      if (cancel) cancel.onclick = () => done(false);
       const submit = async () => {
         const key = (inp.value || '').trim();
         if (!key) { msg.textContent = 'Key cannot be empty.'; return; }
@@ -6181,10 +6207,8 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   // the user in control), unlocks the key in their browser, then clicks
   // "I've unlocked" to retry whatever request was in flight.
   function showUnlockModal(url) {
-    $modal.classList.remove('error');
-    $modalBg.classList.remove('fullpage');
-    $modalTitle.textContent = 'API key locked';
-    $modalBody.innerHTML = \`
+    $initModalTitle.textContent = 'API key locked';
+    $initModalBody.innerHTML = \`
       <p style="margin: 0 0 8px; color: var(--fg); font-size: 13px;">
         The endpoint is asking us to unlock the API key in your browser before
         we can talk to the model. The request in flight is paused — we'll
@@ -6204,7 +6228,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       </div>
       <p id="unlockMsg" style="margin: 8px 0 0; color: var(--muted); font-size: 11px; min-height: 14px;"></p>
     \`;
-    $modalBg.classList.add('show');
+    $initModalBg.classList.add('show');
     document.getElementById('unlockOpen').onclick = () => {
       window.open(url, '_blank', 'noopener');
       document.getElementById('unlockMsg').textContent = 'Opened in a new tab. Come back here and click "I\\'ve unlocked" when done.';
@@ -6218,7 +6242,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       try {
         await fetch('/api/unlock-done', { method: 'POST' });
         console.log('[unlock] /api/unlock-done returned');
-        closeModal();
+        $initModalBg.classList.remove('show');
       } catch (e) {
         msg.textContent = 'Could not signal server: ' + e.message;
         btn.disabled = false;
@@ -7088,10 +7112,11 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
         break;
       case 'unlock-done':
         console.log('[sse] unlock-done');
-        // Server signals the unlock dance is complete. Close the modal if
-        // it's still open (the user may have closed it manually).
-        if ($modalBg.classList.contains('show') && $modalTitle.textContent === 'API key locked') {
-          closeModal();
+        // Server signals the unlock dance is complete. Close the init
+        // modal if it's still on the unlock screen (could have been
+        // closed already by the local click handler).
+        if ($initModalBg.classList.contains('show') && $initModalTitle.textContent === 'API key locked') {
+          $initModalBg.classList.remove('show');
         }
         break;
     }
