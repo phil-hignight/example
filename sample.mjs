@@ -15,7 +15,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '19';
+const BUILD_VERSION = '21';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
@@ -1766,11 +1766,16 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
 // Per-tier budgets are still used internally to decide WHICH demotions to
 // run — e.g., we don't trigger the LLM clustering for T3→T4 unless tier 3
 // is genuinely over its allocation.
-const TIER_1_BUDGET = 12000;     // full messages (current + recent tasks)
-const TIER_2_BUDGET = 8000;      // masked-results tasks
-const TIER_3_BUDGET = 4000;      // per-task summaries
-const TIER_4_BUDGET = 2000;      // group-rollup summaries
-const TOTAL_BUDGET  = TIER_1_BUDGET + TIER_2_BUDGET + TIER_3_BUDGET + TIER_4_BUDGET; // 26000
+// Budgets are env-overridable so the overnight compaction-validation run
+// can run with tiny budgets (TIER_1_BUDGET=2000 etc.) to actually exercise
+// the demotion paths without needing massive conversations. Production
+// uses the defaults below.
+const _envNum = (name, def) => { const n = Number(process.env[name]); return Number.isFinite(n) && n > 0 ? n : def; };
+const TIER_1_BUDGET = _envNum('TIER_1_BUDGET', 12000);  // full messages (current + recent tasks)
+const TIER_2_BUDGET = _envNum('TIER_2_BUDGET',  8000);  // masked-results tasks
+const TIER_3_BUDGET = _envNum('TIER_3_BUDGET',  4000);  // per-task summaries
+const TIER_4_BUDGET = _envNum('TIER_4_BUDGET',  2000);  // group-rollup summaries
+const TOTAL_BUDGET  = TIER_1_BUDGET + TIER_2_BUDGET + TIER_3_BUDGET + TIER_4_BUDGET;
 const HYST_HIGH = 1.10;          // trigger compaction when total > 110% of TOTAL_BUDGET
 const HYST_LOW  = 0.50;          // compact down to 50% of TOTAL_BUDGET in one pass
 const TASK_NUDGE = 0.75;         // soft nudge at 75% of TIER 1 budget (per-task signal to agent)
@@ -3061,6 +3066,54 @@ const QUERY_CATALOG = [
     },
   },
 
+  // ─── 43-49: AUTH (API key + 401 unlock state) ─────────────────────────
+  {
+    id: 44, name: 'API key state', category: 'config',
+    description: 'Whether the server has a key loaded, and its prefix.',
+    sizeHint: { cols: 3, rows: 2 },
+    compute: (d) => {
+      const a = d.auth ?? {};
+      if (!a.hasKey) return { kind: 'text', severity: 'critical', body: 'NO KEY — first-run modal should be open' };
+      return { kind: 'text', severity: 'ok', body: 'hasKey=YES  prefix=' + (a.keyPrefix ?? '?') };
+    },
+  },
+  {
+    id: 45, name: 'Pending unlock', category: 'config',
+    description: 'If non-empty, an LLM call returned 401 with an unlock_url and the adapter is waiting for the browser modal\'s "I\'ve unlocked" POST. Every queued resolver counts a hung LLM call.',
+    sizeHint: { cols: 6, rows: 3 },
+    compute: (d) => {
+      const a = d.auth ?? {};
+      if (!a.pendingUnlockUrl) return { kind: 'text', severity: 'ok', body: '(none — no unlock in flight)' };
+      return {
+        kind: 'text', severity: 'critical',
+        body: 'BLOCKED on unlock — ' + a.pendingUnlockResolverCount + ' LLM call(s) waiting\nurl: ' + a.pendingUnlockUrl,
+      };
+    },
+  },
+  {
+    id: 46, name: 'SSE subscribers', category: 'config',
+    description: 'How many EventSource clients are currently connected. If 0 while an unlock-needed broadcast fires, the modal won\'t appear in any tab.',
+    sizeHint: { cols: 3, rows: 2 },
+    compute: (d) => {
+      const n = d.chat?.streamSubscribers ?? 0;
+      if (n === 0) return { kind: 'text', severity: 'warn', body: '0 subscribers — page not connected to SSE' };
+      return { kind: 'text', severity: 'ok', body: n + ' subscriber(s)' };
+    },
+  },
+  {
+    id: 47, name: 'Auth events (recent)', category: 'config',
+    description: 'unlock + api-key + project-opened entries from session.events (most recent at the bottom).',
+    sizeHint: { cols: 6, rows: 4 },
+    compute: (d) => {
+      const evs = (d.transactions?.events ?? []).filter((e) =>
+        e.type === 'unlock' || e.type === 'api-key' || e.type === 'project-opened'
+      );
+      if (!evs.length) return { kind: 'text', severity: 'info', body: '(none)' };
+      const body = evs.map((e) => `+${e.at}ms  ${e.type}  ${e.summary ?? ''}`).join('\n');
+      return { kind: 'text', body };
+    },
+  },
+
   // ─── 50-59: TRANSACTIONS ────────────────────────────────────────────────
   {
     id: 50, name: 'Last TX request (full)', category: 'transactions',
@@ -3539,6 +3592,27 @@ function runDiagnosticChecks(diag) {
     });
   }
 
+  // 8a. Pending unlock — if any LLM call is blocked waiting for the user
+  //     to click "I've unlocked", surface it loudly. Without this finding
+  //     the page can appear frozen while the user wonders what to do.
+  if (diag.auth?.pendingUnlockUrl) {
+    findings.push({
+      severity: 'critical', category: 'auth',
+      title: `BLOCKED: ${diag.auth.pendingUnlockResolverCount} LLM call(s) waiting on API-key unlock`,
+      detail: `unlock URL: ${diag.auth.pendingUnlockUrl}`,
+    });
+  }
+  // 8b. SSE subscriber sanity. If the page disconnects (and 0 tabs are
+  //     listening), an unlock-needed broadcast will land on no one and
+  //     the modal will never appear in any browser.
+  if (diag.auth?.pendingUnlockUrl && (diag.chat?.streamSubscribers ?? 0) === 0) {
+    findings.push({
+      severity: 'critical', category: 'auth',
+      title: 'Unlock pending but 0 SSE subscribers — modal cannot reach any browser tab',
+      detail: 'Reload the page; the snapshot init will re-show the unlock modal from pendingUnlockUrl.',
+    });
+  }
+
   // 8. Basic config sanity.
   if (!diag.project?.activeProject) {
     findings.push({
@@ -3806,21 +3880,20 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
   // (permissions, disk full, etc.), the user can still see what happened in
   // the PowerShell window where the bundle was launched. Logging silence is
   // the worst kind of bug; this guarantees something is always visible.
-  let logDirEnsured = null;
   let loggedFileWriteWarning = false;       // suppress duplicate "file log unavailable" spam
   const logFilePath = () => (session.activeProject ? path.join(session.activeProject, '.code_boss', 'code-boss.log') : null);
   function fileLog(msg) {
     const line = `${new Date().toISOString()}  ${msg}`;
     // 1) Always print to stderr — guaranteed visible in the launcher window.
     try { process.stderr.write(line + '\n'); } catch {}
-    // 2) Append to <project>/.code_boss/code-boss.log if we can.
+    // 2) Append to <project>/.code_boss/code-boss.log if we can. Always
+    //    mkdirSync (no caching) so an external `git clean -fdx` that wipes
+    //    the dir between writes doesn't leave subsequent writes stranded —
+    //    mkdir with recursive:true is a no-op when the dir already exists.
     if (!session.activeProject) return;
     try {
       const dir = path.join(session.activeProject, '.code_boss');
-      if (logDirEnsured !== dir) {
-        mkdirSync(dir, { recursive: true });
-        logDirEnsured = dir;
-      }
+      mkdirSync(dir, { recursive: true });
       appendFileSync(path.join(dir, 'code-boss.log'), line + '\n');
     } catch (e) {
       if (!loggedFileWriteWarning) {
@@ -3854,7 +3927,6 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
     session.activeProject = p;
     session.recent = [p, ...session.recent.filter((x) => x !== p)].slice(0, MAX_RECENT);
     await saveRecentProjects(session.recent);
-    logDirEnsured = null;
     logEvent('project-opened', { path: p });
     fileLog(`=== project opened: ${p} ===`);
   }
@@ -3888,11 +3960,11 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
     onUnlock: (url) => new Promise((resolve) => {
       logEvent('unlock', { url });
       if (session.pendingUnlock) {
-        // Reuse the modal already on screen; multiple concurrent requests
-        // all wait on the single user acknowledgment.
+        fileLog(`unlock-needed (coalesce): adding resolver to existing pending unlock`);
         session.pendingUnlock.resolvers.push(resolve);
         return;
       }
+      fileLog(`unlock-needed: broadcasting SSE; url=${url}; subscribers=${session.streamSubscribers.size}`);
       session.pendingUnlock = { url, resolvers: [resolve] };
       chatState.broadcast({
         type: 'unlock-needed',
@@ -3964,9 +4036,12 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
         // pending adapter call so they all retry their requests.
         if (session.pendingUnlock) {
           const { resolvers } = session.pendingUnlock;
+          fileLog(`unlock-done: resolving ${resolvers.length} pending adapter call(s)`);
           session.pendingUnlock = null;
           chatState.broadcast({ type: 'unlock-done', version: chatState.bumpVersion() });
           for (const r of resolvers) { try { r(); } catch {} }
+        } else {
+          fileLog('unlock-done: no pending unlock (already resolved or stale click)');
         }
         return sendJson(res, 200, { ok: true });
       }
@@ -3979,6 +4054,7 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
         catch (e) { return sendJson(res, 500, { error: 'could not save key: ' + e.message }); }
         session.apiKey = key;
         session.apiKeyPrefix = key.slice(0, 8) + '…';
+        fileLog(`api-key set via UI: prefix=${session.apiKeyPrefix}`);
         return sendJson(res, 200, { ok: true, prefix: session.apiKeyPrefix });
       }
       if (req.method === 'GET' && path === '/api/project-state') {
@@ -4157,6 +4233,15 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
             eventCount: session.chatEvents.length,
             abortControllerActive: !!session.abortController,
             streamSubscribers: session.streamSubscribers.size,
+          },
+          // Auth state — surfaced so the snapshot can show api-key + unlock
+          // status as numbered queries (catalog 44–47). When pendingUnlock
+          // is non-null, every LLM call is blocked waiting on the user.
+          auth: {
+            hasKey: !!session.apiKey,
+            keyPrefix: session.apiKeyPrefix,
+            pendingUnlockUrl: session.pendingUnlock?.url ?? null,
+            pendingUnlockResolverCount: session.pendingUnlock?.resolvers?.length ?? 0,
           },
           chatEvents: session.chatEvents,
           project: {
@@ -5993,20 +6078,26 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     $chat.classList.add('hidden');
     $init.classList.remove('hidden');
     $retry.classList.add('hidden');
+    const t0 = Date.now();
+    const tick = () => \`\${Math.round((Date.now() - t0) / 1000)}s\`;
     try {
+      console.log('[init] start, project=', projectPath);
       $status.textContent = 'Checking API key…';
       const ak = await fetch('/api/api-key').then((r) => r.json()).catch(() => ({ hasKey: true }));
+      console.log('[init] api-key', JSON.stringify(ak));
       if (!ak.hasKey) {
-        $status.textContent = 'API key required…';
+        $status.textContent = 'API key required — see modal…';
         const ok = await promptForApiKey({ initial: true });
+        console.log('[init] key prompt resolved', ok);
         if (!ok) {
           $status.textContent = 'API key was not set. Click Retry to try again.';
           $retry.classList.remove('hidden');
           return;
         }
       }
-      $status.textContent = 'Loading models…';
+      $status.textContent = 'Loading models (this may pause for unlock)…';
       await loadModels();  // blocks here if a 401 unlock is needed
+      console.log('[init] loadModels done after', tick());
       $status.textContent = 'Ready.';
       $init.classList.add('hidden');
       _initialized = true;
@@ -6120,12 +6211,16 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     };
     document.getElementById('unlockDone').onclick = async () => {
       const btn = document.getElementById('unlockDone');
+      const msg = document.getElementById('unlockMsg');
       btn.disabled = true;
+      msg.textContent = 'Telling server you unlocked, retrying request…';
+      console.log('[unlock] user clicked done, posting /api/unlock-done');
       try {
         await fetch('/api/unlock-done', { method: 'POST' });
+        console.log('[unlock] /api/unlock-done returned');
         closeModal();
       } catch (e) {
-        document.getElementById('unlockMsg').textContent = 'Could not signal server: ' + e.message;
+        msg.textContent = 'Could not signal server: ' + e.message;
         btn.disabled = false;
       }
     };
@@ -6256,8 +6351,17 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   }
 
   async function loadModels() {
+    // 90s upper bound. If the server-side adapter is hung (waiting on a
+    // pending unlock the user never acknowledged, or some hung connection)
+    // we surface a clear error instead of appearing frozen on the init
+    // view forever.
+    console.log('[loadModels] fetching /api/models');
+    const _ac = new AbortController();
+    const _to = setTimeout(() => _ac.abort(), 90_000);
     try {
-      const r = await fetch('/api/models');
+      const r = await fetch('/api/models', { signal: _ac.signal });
+      clearTimeout(_to);
+      console.log('[loadModels] response', r.status);
       if (!r.ok) {
         const body = await r.text();
         throw new Error('GET /api/models failed: ' + r.status + ' ' + body.slice(0, 300));
@@ -6979,9 +7083,11 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
         clearLog();
         break;
       case 'unlock-needed':
+        console.log('[sse] unlock-needed', msg.url);
         showUnlockModal(msg.url);
         break;
       case 'unlock-done':
+        console.log('[sse] unlock-done');
         // Server signals the unlock dance is complete. Close the modal if
         // it's still open (the user may have closed it manually).
         if ($modalBg.classList.contains('show') && $modalTitle.textContent === 'API key locked') {
