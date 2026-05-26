@@ -15,7 +15,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '23';
+const BUILD_VERSION = '25';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
@@ -4676,6 +4676,27 @@ const UI_HTML = `<!DOCTYPE html>
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
 
+  /* Floating build-version badge — top-right, translucent, never blocks
+     interaction. Always visible so a screenshot of the page also captures
+     which bundle is running. */
+  #versionBadge {
+    position: fixed;
+    top: 6px;
+    right: 8px;
+    z-index: 500;
+    pointer-events: none;
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--muted);
+    opacity: 0.45;
+    padding: 1px 6px;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    background: rgba(0, 0, 0, 0.25);
+    user-select: none;
+  }
+  #versionBadge:empty { display: none; }
+
   /* Thin, theme-matched scrollbars everywhere. Firefox / modern Chrome use
      \`scrollbar-*\` properties; WebKit uses the older pseudo-elements. The
      \`*\` selector inherits to every scrollable element on the page. */
@@ -5805,6 +5826,11 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
 </head>
 <body>
 
+<!-- Floating build-version badge, top-right. Translucent so it doesn't
+     compete with content but stays visible enough to read in a screenshot.
+     pointer-events: none so it can never block a click. -->
+<div id="versionBadge"></div>
+
 <div id="landing">
   <h1>code_boss</h1>
   <p class="tagline">Pick a project folder to work on.</p>
@@ -5935,6 +5961,14 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   const $modalBody = document.getElementById('modalBody');
 
   const SERVER = window.SERVER_CONFIG || {};
+  // Populate the floating version badge once the DOM is ready. SERVER.
+  // buildVersion is injected at bundle-build time; if absent (dev/test
+  // server didn't pass it), the badge stays empty (CSS hides it).
+  {
+    const v = SERVER.buildVersion;
+    const $vb = document.getElementById('versionBadge');
+    if ($vb && v) $vb.textContent = 'v' + v;
+  }
   // Server-as-source-of-truth state mirror. Local UI state is kept minimal.
   let session = null;             // { version, status, phase, tokens, timeoutMs, events, ... }
   let expectedNextVersion = 0;
@@ -6134,6 +6168,25 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       } else {
         showChat(activeProject);
       }
+      // Post-init diagnostic: log the state of every modal + whether the
+      // gear is the topmost element at its coordinates. If the user later
+      // reports a "frozen chat", this line should expose what's covering
+      // the page (or confirm nothing is, and the freeze is elsewhere).
+      setTimeout(() => {
+        const btn = document.getElementById('settingsBtn');
+        const rect = btn?.getBoundingClientRect();
+        const topEl = rect ? document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2) : null;
+        console.log('[init] post-state', JSON.stringify({
+          initModalShown: $initModalBg?.classList.contains('show'),
+          mainModalShown: $modalBg?.classList.contains('show'),
+          settingsModalShown: $settingsModalBg?.classList.contains('show'),
+          initViewHidden: $init?.classList.contains('hidden'),
+          chatHidden: $chat?.classList.contains('hidden'),
+          settingsBtnTopEl: topEl?.id || topEl?.className || topEl?.tagName || '(none)',
+          settingsBtnIsTop: topEl === btn || (btn && btn.contains(topEl)),
+          bodyClasses: document.body.className,
+        }));
+      }, 100);
     } catch (e) {
       $status.textContent = 'Initialization failed: ' + (e?.message || e);
       $retry.classList.remove('hidden');
@@ -7459,6 +7512,10 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   }
   $input.addEventListener('input', autoGrowInput);
   document.addEventListener('keydown', (e) => {
+    // F1 → open snapshot. Works even if every UI click is being eaten by
+    // an invisible overlay — handy when the page seems "frozen" and the
+    // user needs to capture diagnostics anyway.
+    if (e.key === 'F1') { e.preventDefault(); openSnapshot(); return; }
     if (e.key === 'Escape') {
       // Layered modals: snapshot closes first, then settings, then we cancel
       // the running chat as a last resort.
@@ -7566,9 +7623,11 @@ function openInDefaultBrowser(url) {
 }
 
 // startServer was inlined above (from server.mjs). Wire defaults from CONFIG.
+// buildVersion goes into SERVER_CONFIG too so the UI can render a floating
+// version badge in the corner without an extra fetch round-trip.
 const htmlWithConfig = UI_HTML.replace(
   '</head>',
-  '<script>window.SERVER_CONFIG=' + JSON.stringify({ defaultModel: MODEL, baseURL: BASE_URL }) + ';</script></head>'
+  '<script>window.SERVER_CONFIG=' + JSON.stringify({ defaultModel: MODEL, baseURL: BASE_URL, buildVersion: BUILD_VERSION }) + ';</script></head>'
 );
 
 (async () => {
