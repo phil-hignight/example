@@ -15,7 +15,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '16';
+const BUILD_VERSION = '19';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
@@ -239,9 +239,13 @@ function createHttpAdapter(opts = {}) {
         const body = await readJson(res);
         const unlockUrl = body?.unlock_url ?? body?.error?.unlock_url;
         if (unlockUrl) {
-          onUnlock(unlockUrl);
-          if (opts.openBrowser !== false) openInBrowser(unlockUrl);
-          await promptEnter(`\n[unlock] API key is locked. A browser tab should have opened:\n  ${unlockUrl}\nUnlock the key in your browser, then press Enter to retry... `);
+          // onUnlock returns a Promise that resolves when the user has
+          // unlocked. The caller (server.mjs) drives the browser-side flow:
+          // broadcasts an SSE 'unlock-needed' message with the URL and waits
+          // for a POST /api/unlock-done from the UI. No CLI prompts; no
+          // automatic browser-spawning from this layer — the user is already
+          // in a browser tab, the UI handles it.
+          await Promise.resolve(onUnlock(unlockUrl));
           unlocked = true;
           continue;
         }
@@ -3685,6 +3689,13 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
     abortController: null,
     // SSE subscribers (Phase 2 will populate; Set of res objects)
     streamSubscribers: new Set(),
+    // Pending API-key unlock. When the LLM endpoint returns 401 with an
+    // unlock_url, the adapter calls onUnlock(url) and awaits its Promise.
+    // We surface the URL via SSE so the browser shows a modal; the user
+    // clicks "I've unlocked" → POST /api/unlock-done → resolvers are called.
+    // Concurrent 401s reuse the same pending entry (one modal, many
+    // resolvers).
+    pendingUnlock: null,  // { url, resolvers: [...] }
   };
 
   // Bumps version, returns the new value. Used by all chat-state setters.
@@ -3776,6 +3787,9 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
       recent: session.recent,
       events,
       hasMoreOlder: !!(eventLimit && eventLimit < session.chatEvents.length),
+      // If an unlock is in flight, include the URL so a freshly-connecting
+      // browser can re-show the modal rather than miss the broadcast.
+      pendingUnlockUrl: session.pendingUnlock?.url ?? null,
     };
   }
   // Expose helpers so we can use them from /api/chat and from new endpoints later.
@@ -3868,7 +3882,24 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
     // Pass a getter so hot-updates to session.apiKey (via POST /api/api-key)
     // take effect on the next request without re-creating the adapter.
     apiKey: () => session.apiKey,
-    onUnlock: (url) => logEvent('unlock', { url }),
+    // The adapter awaits this promise when it hits a 401+unlock_url. We
+    // broadcast the URL to the browser, queue a resolver, and the user
+    // clicking "I've unlocked" (POST /api/unlock-done) resolves us.
+    onUnlock: (url) => new Promise((resolve) => {
+      logEvent('unlock', { url });
+      if (session.pendingUnlock) {
+        // Reuse the modal already on screen; multiple concurrent requests
+        // all wait on the single user acknowledgment.
+        session.pendingUnlock.resolvers.push(resolve);
+        return;
+      }
+      session.pendingUnlock = { url, resolvers: [resolve] };
+      chatState.broadcast({
+        type: 'unlock-needed',
+        version: chatState.bumpVersion(),
+        url,
+      });
+    }),
     onRateLimit: (ms) => logEvent('rate-limit', { ms }),
     onUsage: (u) => {
       session.totalTokens += u.total_tokens ?? 0;
@@ -3927,6 +3958,17 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
           hasKey: !!session.apiKey,
           prefix: session.apiKeyPrefix,
         });
+      }
+      if (req.method === 'POST' && path === '/api/unlock-done') {
+        // User clicked "I've unlocked" in the browser modal. Resolve every
+        // pending adapter call so they all retry their requests.
+        if (session.pendingUnlock) {
+          const { resolvers } = session.pendingUnlock;
+          session.pendingUnlock = null;
+          chatState.broadcast({ type: 'unlock-done', version: chatState.bumpVersion() });
+          for (const r of resolvers) { try { r(); } catch {} }
+        }
+        return sendJson(res, 200, { ok: true });
       }
       if (req.method === 'POST' && path === '/api/api-key') {
         const raw = await readBody(req);
@@ -4583,7 +4625,23 @@ const UI_HTML = `<!DOCTYPE html>
     margin: 0 auto;
     width: 100%;
   }
-  #landing.hidden, #chat.hidden { display: none; }
+  #landing.hidden, #chat.hidden, #initView.hidden { display: none; }
+  #initView {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 32px 24px;
+    max-width: 640px;
+    margin: 0 auto;
+    width: 100%;
+    gap: 8px;
+  }
+  #initView h1 { font-size: 26px; font-weight: 700; margin: 0 0 6px; letter-spacing: -0.5px; color: var(--accent); }
+  #initView h1::before { content: "✻ "; }
+  #initView .tagline { color: var(--muted); margin: 0; font-size: 14px; }
+  #initRetryBtn.hidden { display: none; }
   #landing h1 { font-size: 26px; font-weight: 700; margin: 0 0 6px; letter-spacing: -0.5px; color: var(--accent); }
   #landing h1::before { content: "✻ "; }
   #landing .tagline { color: var(--muted); margin: 0 0 32px; font-size: 15px; }
@@ -5670,6 +5728,15 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   <ul class="recent-list" id="recentList"></ul>
 </div>
 
+<!-- Init view: shown while we collect the API key, load the models list,
+     and handle any 401 unlock so the user doesn't see a chat they can't
+     actually use yet. Hidden after init completes. -->
+<div id="initView" class="hidden">
+  <h1>code_boss</h1>
+  <p class="tagline" id="initStatus">Initializing…</p>
+  <button id="initRetryBtn" class="btn primary hidden" onclick="initialize()">Retry</button>
+</div>
+
 <div id="chat" class="hidden">
   <main id="logScroll">
     <div class="log" id="log">
@@ -5892,25 +5959,69 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     return p.split(/[\\\\/]/).filter(Boolean).pop() || p;
   }
 
+  // Loaded by the inline script at the bottom on page load. Decides which
+  // view to show. If no project is open yet, go straight to the landing
+  // picker. Otherwise hand off to initialize() which gates the chat behind
+  // API-key + models-loaded readiness.
   async function loadState() {
     try {
-      // First-run gate: if there's no API key on file, prompt for it before
-      // doing anything else. The prompt is modal — user can't skip it. They
-      // can still change the key later via the settings modal.
-      const ak = await fetch('/api/api-key').then((r) => r.json()).catch(() => ({ hasKey: true }));
-      if (!ak.hasKey) {
-        const ok = await promptForApiKey({ initial: true });
-        if (!ok) return;   // user closed without entering — nothing to load
-      }
       const r = await fetch('/api/project-state');
       const s = await r.json();
-      if (s.activeProject) {
-        showChat(s.activeProject);
-      } else {
+      if (!s.activeProject) {
         showLanding(s.recent ?? []);
+        return;
       }
+      await initialize(s.activeProject);
     } catch (e) {
       showError('Failed to load state', e);
+    }
+  }
+
+  // Initialization view. Shown as soon as a project is selected and stays
+  // visible until we can guarantee the chat is actually usable:
+  //   1. API key present (or just entered via the first-run modal).
+  //   2. /api/models returns successfully (any 401 unlock_url is handled
+  //      via the SSE unlock-needed modal, which blocks here on the
+  //      models fetch until the user clicks "I've unlocked").
+  // If any step fails, the init view shows the error + a Retry button.
+  async function initialize(projectPath) {
+    const $init = document.getElementById('initView');
+    const $status = document.getElementById('initStatus');
+    const $retry = document.getElementById('initRetryBtn');
+    activeProject = projectPath ?? activeProject;
+    $landing.classList.add('hidden');
+    $chat.classList.add('hidden');
+    $init.classList.remove('hidden');
+    $retry.classList.add('hidden');
+    try {
+      $status.textContent = 'Checking API key…';
+      const ak = await fetch('/api/api-key').then((r) => r.json()).catch(() => ({ hasKey: true }));
+      if (!ak.hasKey) {
+        $status.textContent = 'API key required…';
+        const ok = await promptForApiKey({ initial: true });
+        if (!ok) {
+          $status.textContent = 'API key was not set. Click Retry to try again.';
+          $retry.classList.remove('hidden');
+          return;
+        }
+      }
+      $status.textContent = 'Loading models…';
+      await loadModels();  // blocks here if a 401 unlock is needed
+      $status.textContent = 'Ready.';
+      $init.classList.add('hidden');
+      _initialized = true;
+      // If SSE init arrived during initialization, render its captured
+      // session now. Otherwise just open the chat with a fresh log; any
+      // subsequent SSE 'event' deltas append normally.
+      if (_pendingSession) {
+        renderSessionInChat(_pendingSession);
+        _pendingSession = null;
+      } else {
+        showChat(activeProject);
+      }
+    } catch (e) {
+      $status.textContent = 'Initialization failed: ' + (e?.message || e);
+      $retry.classList.remove('hidden');
     }
   }
 
@@ -5974,6 +6085,52 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); });
     });
   }
+  // Browser-side unlock flow. Shown when the LLM endpoint returns 401 with
+  // an unlock_url. The user opens the URL (we don't auto-open it — keeps
+  // the user in control), unlocks the key in their browser, then clicks
+  // "I've unlocked" to retry whatever request was in flight.
+  function showUnlockModal(url) {
+    $modal.classList.remove('error');
+    $modalBg.classList.remove('fullpage');
+    $modalTitle.textContent = 'API key locked';
+    $modalBody.innerHTML = \`
+      <p style="margin: 0 0 8px; color: var(--fg); font-size: 13px;">
+        The endpoint is asking us to unlock the API key in your browser before
+        we can talk to the model. The request in flight is paused — we'll
+        resume it the moment you tell us you're done.
+      </p>
+      <p style="margin: 0 0 12px; color: var(--muted); font-size: 12px;">
+        Click <strong>Open unlock page</strong>, sign in / approve, then come
+        back to this tab and click <strong>I've unlocked</strong>.
+      </p>
+      <div style="margin: 0 0 12px; padding: 6px 8px; background: var(--panel-alt);
+                  border: 1px solid var(--border); border-radius: 4px;
+                  font-family: var(--mono); font-size: 11px; color: var(--muted);
+                  word-break: break-all;">\${escapeHtml(url)}</div>
+      <div style="display: flex; gap: 8px; justify-content: flex-end;">
+        <button id="unlockOpen" class="btn">Open unlock page</button>
+        <button id="unlockDone" class="btn primary">I've unlocked</button>
+      </div>
+      <p id="unlockMsg" style="margin: 8px 0 0; color: var(--muted); font-size: 11px; min-height: 14px;"></p>
+    \`;
+    $modalBg.classList.add('show');
+    document.getElementById('unlockOpen').onclick = () => {
+      window.open(url, '_blank', 'noopener');
+      document.getElementById('unlockMsg').textContent = 'Opened in a new tab. Come back here and click "I\\'ve unlocked" when done.';
+    };
+    document.getElementById('unlockDone').onclick = async () => {
+      const btn = document.getElementById('unlockDone');
+      btn.disabled = true;
+      try {
+        await fetch('/api/unlock-done', { method: 'POST' });
+        closeModal();
+      } catch (e) {
+        document.getElementById('unlockMsg').textContent = 'Could not signal server: ' + e.message;
+        btn.disabled = false;
+      }
+    };
+  }
+
   async function changeApiKey() {
     const ok = await promptForApiKey({ initial: false });
     if (ok && typeof openSettings === 'function') openSettings();   // re-open settings with the new prefix
@@ -6049,7 +6206,11 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
         const data = await r.json();
         throw new Error(data.error ?? ('HTTP ' + r.status));
       }
-      showChat(p);
+      // Reset the init gate so a new project re-runs models load (the key
+      // and model dropdown may differ per environment).
+      _initialized = false;
+      _pendingSession = null;
+      await initialize(p);
     } catch (e) {
       showError('Could not open project', e);
     }
@@ -6701,19 +6862,18 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     renderStatus();
   }
 
-  function onInit(s) {
-    session = s;
-    window.__sessionRef = s;     // for tests; mirror the live session object
-    activeProject = s.activeProject;
-    if (!activeProject) {
-      showLanding(s.recent || []);
-      stopSpinTick();
-      return;
-    }
+  let _initialized = false;       // initialize() flips this once chat is allowed
+  let _pendingSession = null;     // SSE init arriving during init is parked here
+
+  function renderSessionInChat(s) {
     showChat(activeProject);
-    // Replace the welcome content with the actual events
-    clearLog();
-    for (const ev of (s.events || [])) renderEvent(ev);
+    // Only wipe the welcome banner if there are real events to render in
+    // its place. Empty-session initialization should leave the welcome
+    // visible so the user has something to read while typing.
+    if (s.events && s.events.length > 0) {
+      clearLog();
+      for (const ev of s.events) renderEvent(ev);
+    }
     applyControlsForStatus();
     renderTimeoutChip();
     if (s.status === 'running') {
@@ -6723,6 +6883,25 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       stopSpinTick();
     }
     renderStatus();
+  }
+
+  function onInit(s) {
+    session = s;
+    window.__sessionRef = s;     // for tests; mirror the live session object
+    activeProject = s.activeProject;
+    // If a 401 unlock is in flight when we connect, re-show the modal so
+    // a reload or late-arriving tab doesn't leave the user stranded.
+    if (s.pendingUnlockUrl) showUnlockModal(s.pendingUnlockUrl);
+    if (!activeProject) {
+      showLanding(s.recent || []);
+      stopSpinTick();
+      return;
+    }
+    // Chat shouldn't be visible until initialize() has confirmed the system
+    // is usable (API key + models). If init isn't done, just remember the
+    // session — initialize() will render it on completion.
+    if (_initialized) renderSessionInChat(s);
+    else _pendingSession = s;
   }
 
   function applyDelta(msg) {
@@ -6798,6 +6977,16 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       case 'reset':
         session.events = [];
         clearLog();
+        break;
+      case 'unlock-needed':
+        showUnlockModal(msg.url);
+        break;
+      case 'unlock-done':
+        // Server signals the unlock dance is complete. Close the modal if
+        // it's still open (the user may have closed it manually).
+        if ($modalBg.classList.contains('show') && $modalTitle.textContent === 'API key locked') {
+          closeModal();
+        }
         break;
     }
     // Some compaction events the server emits as regular chat events via
