@@ -15,7 +15,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '30';
+const BUILD_VERSION = '32';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
@@ -4758,8 +4758,14 @@ const UI_HTML = `<!DOCTYPE html>
   .recent-item .path { color: var(--muted); font-size: 12px; font-family: ui-monospace, Menlo, Consolas, monospace; margin-top: 2px; word-break: break-all; }
   .recent-empty { color: var(--muted); font-size: 13px; text-align: center; padding: 12px; }
 
-  /* In-UI file browser (replaces the native PowerShell folder dialog).
-     Used on the landing to pick a project. Looks like a Finder-ish list. */
+  /* Folder-picker modal — replaces the native PowerShell folder dialog. */
+  #selectFolderBtn {
+    font-size: 14px;
+    font-weight: 600;
+    padding: 11px 22px;
+    border-radius: 10px;
+    align-self: flex-start;
+  }
   .browser-toolbar {
     display: flex;
     align-items: center;
@@ -4783,42 +4789,56 @@ const UI_HTML = `<!DOCTYPE html>
   .dir-list {
     list-style: none;
     padding: 0;
-    margin: 0 0 12px;
+    margin: 0 0 8px;
     border: 1px solid var(--border);
     border-radius: 6px;
     background: var(--panel);
-    max-height: 360px;
+    height: 380px;
     overflow-y: auto;
   }
   .dir-item {
-    padding: 7px 12px;
+    padding: 8px 12px;
     cursor: pointer;
-    font-family: var(--mono);
-    font-size: 12px;
+    font-size: 13px;
     border-bottom: 1px solid var(--border);
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 10px;
   }
   .dir-item:last-child { border-bottom: none; }
-  .dir-item:hover { background: var(--panel-alt); color: var(--accent); }
-  .dir-item .icon { color: var(--muted); flex-shrink: 0; }
-  .dir-empty { color: var(--muted); font-size: 12px; text-align: center; padding: 16px; font-style: italic; }
-  .browser-actions {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    justify-content: space-between;
+  .dir-item:hover { background: var(--panel-alt); }
+  .dir-item:hover .name { color: var(--accent); }
+  .dir-item .icon {
+    flex-shrink: 0;
+    font-size: 15px;
+    line-height: 1;
+    filter: saturate(0.85);
   }
-  .browser-actions .muted {
+  .dir-item .name {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: var(--mono);
+  }
+  .dir-empty { color: var(--muted); font-size: 12px; text-align: center; padding: 16px; font-style: italic; }
+  .browser-status {
     color: var(--muted);
     font-family: var(--mono);
     font-size: 11px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    flex: 1 1 auto;
-    min-width: 0;
+    padding: 2px 4px;
+  }
+  .modal-footer {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    padding: 10px 16px;
+    border-top: 1px solid var(--border);
+    background: var(--panel-alt);
   }
   .project-chip {
     background: transparent;
@@ -4961,38 +4981,43 @@ const UI_HTML = `<!DOCTYPE html>
   .diff-block .dl.same { color: var(--muted); }
 
   /* ── Task wraps ─────────────────────────────────────────────────────────
-     Previously drawn with ASCII chrome (┌, └─, ↳) and a fixed left gutter
-     so the box "borders" lined up with the terminal-y typography. Replaced
-     by real CSS borders: each closed task becomes a rounded-cornered box
-     with a header band (toggle + task id + user request) and a footer band
-     (summary). Project rollups get an accent-colored border so nested
-     hierarchies are visually distinct. */
+     Minimalist: no full box. The request sits at the top (orange + bold),
+     the summary at the bottom (italic + muted, prefixed with a "summary"
+     label), and a single thin accent-colored bracket on the left curves
+     from the vertical middle of the request line, down past all the
+     events, and into the vertical middle of the summary line. Visually
+     it's a sideways \`(\` connecting the two text rows. */
   .task-wrap {
-    /* Negative horizontal margin cancels out the wrap's border + body
-       padding so messages INSIDE the wrap sit at the same x-position as
-       messages OUTSIDE — when a task closes, the box just appears around
-       its content, nothing shifts. -11px = -(1px border + 10px body padding). */
-    margin: 12px -11px;
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    overflow: hidden;     /* clip the header/footer band corners */
+    position: relative;
+    margin: 14px 0;
+    padding: 0 0 0 22px;     /* room on the left for the bracket */
+    border: none;
     background: transparent;
+    overflow: visible;
+  }
+  .task-wrap::before {
+    content: '';
+    position: absolute;
+    left: 4px;
+    top: 0.72em;             /* ~ vertical middle of the request line */
+    bottom: 0.65em;          /* ~ vertical middle of the summary line  */
+    width: 12px;
+    border-left: 1.5px solid var(--accent);
+    border-top: 1.5px solid var(--accent);
+    border-bottom: 1.5px solid var(--accent);
+    border-radius: 10px 0 0 10px;
+    pointer-events: none;
+    opacity: 0.55;
   }
   .task-wrap .task-head,
   .task-wrap .task-foot {
     display: flex;
-    align-items: center;
+    align-items: baseline;
     gap: 8px;
-    padding: 4px 10px;
-    font-size: 12px;
-    color: var(--muted);
-    background: var(--panel-alt);
+    padding: 0;
+    background: transparent;
+    border: none;
     overflow: hidden;
-  }
-  .task-wrap .task-head { border-bottom: 1px solid var(--border); }
-  .task-wrap .task-foot {
-    border-top: 1px solid var(--border);
-    white-space: normal;    /* let long summaries wrap inside the band */
   }
   .task-wrap .task-head .toggle {
     cursor: pointer;
@@ -5000,10 +5025,13 @@ const UI_HTML = `<!DOCTYPE html>
     color: var(--muted);
     font-size: 10px;
     flex-shrink: 0;
+    opacity: 0.5;
   }
+  .task-wrap .task-head .toggle:hover { opacity: 1; }
   .task-wrap .task-head .ur {
     color: var(--accent);
-    font-weight: 600;
+    font-weight: 700;
+    font-size: 13.5px;
     flex: 1 1 auto;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -5012,30 +5040,48 @@ const UI_HTML = `<!DOCTYPE html>
   }
   .task-wrap .task-head .tag {
     flex-shrink: 0;
-    font-size: 10px;
-    padding: 0 6px;
+    font-size: 9.5px;
+    padding: 1px 6px;
     border-radius: 8px;
-    background: rgba(217, 119, 87, 0.18);
+    background: rgba(217, 119, 87, 0.15);
     color: var(--accent);
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.4px;
   }
   .task-wrap .task-body {
-    padding: 6px 10px;
+    padding: 4px 0 6px 0;
   }
-  /* Project (tier-4) rollup: accent border + slightly tinted bands. */
-  .task-wrap.project {
-    border-color: var(--accent);
+  .task-wrap .task-foot {
+    font-size: 11.5px;
+    color: var(--muted);
+    font-style: italic;
+    white-space: normal;
+    line-height: 1.45;
   }
-  .task-wrap.project > .task-head,
-  .task-wrap.project > .task-foot {
-    background: rgba(217, 119, 87, 0.08);
+  .task-wrap .task-foot::before {
+    content: 'summary';
+    font-style: normal;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    font-size: 9.5px;
+    color: var(--accent);
+    opacity: 0.7;
+    font-weight: 600;
+    margin-right: 8px;
+    flex-shrink: 0;
+    align-self: baseline;
   }
-  /* Collapsed: hide body + footer, leave the header band visible. */
-  .task-wrap.collapsed .task-body,
-  .task-wrap.collapsed .task-foot { display: none; }
-  .task-wrap.collapsed .task-head { border-bottom: none; }
+  /* Project (tier-4) rollup: same shape, brighter bracket. */
+  .task-wrap.project::before {
+    opacity: 0.85;
+    border-left-width: 2px;
+    border-top-width: 2px;
+    border-bottom-width: 2px;
+  }
+  /* Collapsed: hide body only — keep the summary so the bracket still
+     has both endpoints to span. */
+  .task-wrap.collapsed .task-body { display: none; }
 
   /* Standalone task-end marker (rendered when task-end fires with no events
      to wrap retroactively). Small inline pill rather than a full box. */
@@ -5858,18 +5904,35 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   <h1>code_boss</h1>
   <p class="tagline">Pick a project folder to work on.</p>
 
+  <button class="btn primary" id="selectFolderBtn" onclick="openFolderPicker()">Select folder…</button>
+
   <h2>Recent projects</h2>
   <ul class="recent-list" id="recentList"></ul>
+</div>
 
-  <h2>Browse</h2>
-  <div class="browser-toolbar">
-    <button class="btn" id="upBtn" onclick="browserUp()" title="Go to parent folder">↑ Up</button>
-    <div class="breadcrumb" id="breadcrumb"></div>
-  </div>
-  <ul class="dir-list" id="dirList"></ul>
-  <div class="browser-actions">
-    <span class="muted" id="browserStatus"></span>
-    <button class="btn primary" id="openHereBtn" onclick="openCurrentBrowserDir()" disabled>Open this folder</button>
+<!-- Folder-picker modal. Triggered by Select folder on landing or by Change
+     project in settings. Looks like an OS folder picker: title, breadcrumb
+     toolbar, scrollable list with folder icons, footer with Select / Cancel. -->
+<div class="modal-bg" id="folderModalBg" onclick="if (event.target === this) closeFolderPicker()" style="z-index: 180;">
+  <div class="modal" id="folderModal" style="max-width: 640px; width: 92%;">
+    <div class="modal-header">
+      <h2>Select folder</h2>
+      <button class="modal-close" onclick="closeFolderPicker()">&times;</button>
+    </div>
+    <div class="modal-body" style="padding: 12px 16px;">
+      <div class="browser-toolbar">
+        <button class="btn" id="upBtn" onclick="browserUp()" title="Go to parent folder">↑ Up</button>
+        <div class="breadcrumb" id="breadcrumb"></div>
+      </div>
+      <ul class="dir-list" id="dirList"></ul>
+      <div class="browser-status">
+        <span class="muted" id="browserStatus"></span>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn" onclick="closeFolderPicker()">Cancel</button>
+      <button class="btn primary" id="openHereBtn" onclick="openCurrentBrowserDir()" disabled>Select</button>
+    </div>
   </div>
 </div>
 
@@ -6346,6 +6409,9 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     if (ok && typeof openSettings === 'function') openSettings();   // re-open settings with the new prefix
   }
 
+  // Tracks the most-recent project so the folder picker starts at its
+  // parent (siblings = one click). Falls back to home dir.
+  let _lastRecentProject = null;
   function showLanding(recent) {
     activeProject = null;
     $chat.classList.add('hidden');
@@ -6353,6 +6419,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     $recentList.innerHTML = '';
     if (!recent || recent.length === 0) {
       $recentList.innerHTML = '<li class="recent-empty">No recent projects yet.</li>';
+      _lastRecentProject = null;
     } else {
       for (const p of recent) {
         const li = document.createElement('li');
@@ -6362,13 +6429,8 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
         li.addEventListener('click', () => openProject(p));
         $recentList.appendChild(li);
       }
+      _lastRecentProject = recent[0];
     }
-    // Kick off the file browser. Start at the parent of the most recent
-    // project (so re-picking siblings is one click), else home dir.
-    const start = (recent && recent.length > 0)
-      ? recent[0].replace(/[\\\\\\/][^\\\\\\/]+[\\\\\\/]?$/, '')   // parent of most recent
-      : '';
-    loadBrowser(start);
   }
 
   function showChat(projectPath) {
@@ -6470,12 +6532,20 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       li.className = 'dir-item';
       const icon = document.createElement('span');
       icon.className = 'icon';
-      icon.textContent = isDriveList ? '◉' : '▸';
+      // Folder icon for normal entries; drive disc for the Windows drive
+      // list. Emoji renders consistently across Windows/macOS/Linux without
+      // bundling an icon font.
+      icon.textContent = isDriveList ? '💽' : '📁';
       li.appendChild(icon);
       const label = document.createElement('span');
+      label.className = 'name';
       label.textContent = e.name;
       li.appendChild(label);
       li.onclick = () => loadBrowser(e.path);
+      // Double-click on a dir selects it as the project (OS-picker behavior).
+      li.ondblclick = () => {
+        loadBrowser(e.path).then(() => openCurrentBrowserDir());
+      };
       $dirList.appendChild(li);
     }
   }
@@ -6486,7 +6556,21 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   }
   function openCurrentBrowserDir() {
     if (!_browserPath) return;
+    closeFolderPicker();
     openProject(_browserPath);
+  }
+  function openFolderPicker() {
+    const $bg = document.getElementById('folderModalBg');
+    $bg.classList.add('show');
+    // Start at the parent of the most recent project, else home dir.
+    const start = _lastRecentProject
+      ? _lastRecentProject.replace(/[\\\\\\/][^\\\\\\/]+[\\\\\\/]?$/, '')
+      : '';
+    loadBrowser(start);
+  }
+  function closeFolderPicker() {
+    const $bg = document.getElementById('folderModalBg');
+    $bg.classList.remove('show');
   }
 
   async function openProject(p) {
