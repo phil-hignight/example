@@ -15,7 +15,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '48';
+const BUILD_VERSION = '52';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
@@ -1427,10 +1427,23 @@ const tools = {
           const header = timedOut
             ? `command timed out after ${timeout}ms (killed)`
             : `exit ${code ?? '?'}${signal ? ` (signal ${signal})` : ''} in ${elapsed}ms`;
+          // On timeout, nudge the model toward a faster variant rather
+          // than re-running the same expensive command. Many tools have
+          // a quick mode (mvn -DskipTests, wl quickbuild, find with a
+          // narrower path/glob, etc.). The hint is generic — the model
+          // applies it based on what the command actually was.
+          const hint = timedOut
+            ? '\n\nHINT: this command was too slow to finish. Before retrying, consider a faster variant:\n' +
+              '  - narrower scope (smaller path, more specific glob/pattern, lower depth)\n' +
+              '  - skip-tests / quick / dry-run flag if the tool offers one\n' +
+              '  - higher timeout_ms (max 600000) if the operation is inherently slow but useful\n' +
+              'Re-running the exact same command will time out again.'
+            : '';
           const text = [
             header,
             outBody ? `--- stdout ---\n${outBody}` : '(no stdout)',
             errBody ? `--- stderr ---\n${errBody}` : '',
+            hint,
           ].filter(Boolean).join('\n').trim();
           resolve(text);
         });
@@ -1956,6 +1969,32 @@ function truncateAtFirstBlock(text) {
     return before + '\n</remote-workspace>';
   }
   return before;
+}
+
+// Strip multi-agent framing artifacts the model sometimes emits in its
+// prose between tool calls. Gemini (esp. on the GenAI.mil endpoint) has
+// been observed prefixing turns with "for context: [some_agent] said:"
+// — empty meta-prose that's noise in our single-agent chat. We strip
+// the line entirely; any actual content on subsequent lines is kept.
+//
+// Pattern variants we've seen:
+//   for context: [file_and_coding_agent] said:
+//   For Context [planner_agent] said
+//   for context:[name] said:
+//
+// All match: optional "for context" prefix, a bracketed name, "said",
+// with flexible whitespace + punctuation. Conservative — only strips
+// lines that are JUST the marker (anchored ^...$).
+function sanitizeAssistantProse(text) {
+  if (typeof text !== 'string' || !text) return text;
+  const lines = text.split('\n');
+  const out = [];
+  for (const line of lines) {
+    if (/^\s*for\s+context\s*:?\s*\[[^\]]*\]\s*said\s*:?\s*$/i.test(line)) continue;
+    out.push(line);
+  }
+  // Collapse runs of blank lines that the stripping leaves behind.
+  return out.join('\n').replace(/\n{3,}/g, '\n\n').trim();
 }
 
 function parseAttrs(attrStr, toolName) {
@@ -2544,7 +2583,7 @@ async function runPromptedAgent({
     emitPhase('thinking');
     const text = await runTurnStreaming(
       adapter,
-      { model, messages: convo, stop: ['</remote-workspace>'] },
+      { model, messages: convo, stop: ['</remote-workspace>'], signal },
       (delta) => { onText?.(delta); emitPhase('downloading'); },
     );
     emitPhase('thinking');
@@ -2559,7 +2598,8 @@ async function runPromptedAgent({
       const finalText = truncateAtFirstBlock(text);
       if (finalText.trim()) {
         await store.appendMessage({ kind: 'assistant', role: 'assistant', content: finalText });
-        emitChat({ type: 'assistant-text', taskId: cur?.id, content: finalText });
+        const cleaned = sanitizeAssistantProse(finalText);
+        if (cleaned) emitChat({ type: 'assistant-text', taskId: cur?.id, content: cleaned });
       }
       // Always check budgets before returning — even on the final turn — so
       // long sessions stay within bounds.
@@ -2578,7 +2618,8 @@ async function runPromptedAgent({
     const blockIdx = assistantText.search(/<remote-workspace>/i);
     const proseOnly = (blockIdx === -1 ? assistantText : assistantText.slice(0, blockIdx)).trim();
     if (proseOnly) {
-      emitChat({ type: 'assistant-text', taskId: cur?.id, content: proseOnly });
+      const cleaned = sanitizeAssistantProse(proseOnly);
+      if (cleaned) emitChat({ type: 'assistant-text', taskId: cur?.id, content: cleaned });
     }
 
     const results = [];
@@ -2909,8 +2950,9 @@ const WL_USER_GUIDE_HINT = 'X:\\Java\\scriptsWLS.12c\\WeblogicDesktopScriptsUser
 const WL_PROMPT = `
 The "wl" command is available in this environment. It is a developer wrapper
 around git + maven for WebLogic-deployable projects. wl MUST be run from the
-WORKSPACE directory — the parent of the active project. The wl tool below
-cd's there automatically; you do not need to cd manually.
+WORKSPACE directory — i.e. the active project (apps and shared libraries are
+subdirectories of the workspace). The wl tool below runs in the current
+project's directory automatically; you do not need to cd manually.
 
 Use the wl tool. Pass everything that would come after "wl " on the
 command line as the args string.
@@ -2968,7 +3010,7 @@ const wlPlugin = {
     verb: 'wl',
     name: 'wl',
     schema: {
-      description: 'Run a wl (WebLogic developer) command from the workspace directory. The tool automatically cd\'s to the parent of the active project so wl finds the workspace. Returns stdout, stderr, and exit code.',
+      description: 'Run a wl (WebLogic developer) command from the workspace directory. The tool runs in the active project\'s directory (which IS the workspace — apps and sharedlibs live as subdirs of it). Returns stdout, stderr, and exit code.',
       parameters: {
         type: 'object',
         properties: {
@@ -2988,7 +3030,10 @@ const wlPlugin = {
       // Empty args is allowed — running `wl` with nothing prints its
       // usage screen, which the agent may legitimately want.
       const safeArgs = (typeof args === 'string') ? args.trim() : '';
-      const workspaceDir = path.dirname(process.cwd());
+      // wl runs from the active project directory. The project IS the
+      // workspace (apps + shared libs are subdirs under it). Do NOT cd
+      // up — earlier versions did and that ran wl from the wrong place.
+      const workspaceDir = process.cwd();
       const timeout = Math.min(Math.max(1000, Number(timeout_ms) || 300000), 600000);
       const t0 = Date.now();
       return await new Promise((resolve) => {
@@ -6213,7 +6258,8 @@ const UI_HTML = `<!DOCTYPE html>
     width: 1ch;
     text-align: center;
   }
-  .status .arrow { display: inline-block; color: var(--accent); }
+  .status .arrow { display: inline-block; color: var(--muted); }
+  .status .count { color: var(--muted); }
   .status.thinking .arrow { animation: blinkArrow 1.2s ease-in-out infinite; }
   @keyframes blinkArrow { 50% { opacity: 0.25; } }
   .status .dim { color: var(--muted); }
@@ -7252,7 +7298,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   // ---- Inline status row (spinner + verb + timer + tokens) ----
   const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
   const VERB = 'Working';
-  const PHASE = { UPLOADING: 'uploading', THINKING: 'thinking', DOWNLOADING: 'downloading', DONE: 'done' };
+  const PHASE = { UPLOADING: 'uploading', THINKING: 'thinking', DOWNLOADING: 'downloading', DONE: 'done', CANCELED: 'canceled' };
   let statusTimer = null, upAnimTimer = null;
   let statusStart = 0, statusFrame = 0;
   let doneElapsed = 0;
@@ -7346,13 +7392,28 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     renderStatus();
     // status row persists; do NOT remove
   }
+  function setCanceled() {
+    doneElapsed = Math.floor((Date.now() - statusStart) / 1000);
+    phase = PHASE.CANCELED;
+    stopSpinnerOnly();
+    if (statusRow) statusRow.classList.remove('thinking');
+    renderStatus();
+    // Row persists until the user submits a new message; the next chat
+    // start reuses this same statusRow DOM element and replaces the
+    // canceled content with the fresh spinner via setUploading().
+  }
   function renderStatus() {
     if (!statusRow) return;
     const fmt = (n) => (n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n));
     if (phase === PHASE.DONE) {
       statusRow.innerHTML =
-        '<span class="arrow">↓</span> ' + fmt(downTokens) +
+        '<span class="arrow">↓</span> <span class="count">' + fmt(downTokens) + '</span>' +
         ' <span class="dim">tokens · ' + doneElapsed + 's</span>';
+      return;
+    }
+    if (phase === PHASE.CANCELED) {
+      statusRow.innerHTML =
+        '<span class="arrow">⊘</span> <span class="dim">canceled by user · ' + doneElapsed + 's</span>';
       return;
     }
     const sp = SPINNER[statusFrame % SPINNER.length];
@@ -7364,7 +7425,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     const count = isDown ? downTokens : upTokens;
     statusRow.innerHTML =
       '<span class="spin">' + sp + '</span> ' + VERB + '… ' +
-      '<span class="arrow">' + arrow + '</span> ' + fmt(count) +
+      '<span class="arrow">' + arrow + '</span> <span class="count">' + fmt(count) + '</span>' +
       ' <span class="dim">tokens · ' + secs + 's · esc to interrupt</span>';
   }
   function estimateTokens(s) { return Math.ceil((s || '').length / 4); }
@@ -8633,12 +8694,23 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
           // Create the status DOM row and kick off the spinner. Without this
           // call, renderStatus bails out (statusRow is null) and the user
           // never sees the spinner / arrow / token counts.
+          // (ensureStatusRow reuses the prior row, so any canceled/done
+          // content from the last turn gets replaced by setUploading.)
           ensureStatusRow();
           startSpinner();
           setUploading();           // initial phase = uploading
           startSpinTick();
         } else if (msg.status === 'done' || msg.status === 'error') {
-          setDone();
+          // User-initiated cancel surfaces as status=error with
+          // session.error === 'aborted' (server-side flag set in
+          // /api/message catch when the AbortController fires from
+          // /api/cancel). Show a dedicated "canceled by user" line
+          // instead of the regular down-arrow done-state.
+          if (msg.status === 'error' && session.error === 'aborted') {
+            setCanceled();
+          } else {
+            setDone();
+          }
           stopSpinTick();
           // Defensive: any tool row still marked running (e.g., agent
           // aborted mid-tool) should stop blinking now.
@@ -8674,7 +8746,11 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
         break;
       case 'error':
         session.error = msg.error;
-        if (msg.error) showError('Agent error', new Error(msg.error));
+        // User-initiated cancel surfaces as error='aborted'; suppress
+        // the modal since the canceled status line already conveys it.
+        if (msg.error && msg.error !== 'aborted') {
+          showError('Agent error', new Error(msg.error));
+        }
         break;
       case 'timeout':
         session.timeoutMs = msg.timeoutMs;
