@@ -15,7 +15,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '45';
+const BUILD_VERSION = '47';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
@@ -32,6 +32,7 @@ import { readFile as _readFile, writeFile as _writeFile, mkdir as _mkdir, stat a
 import { existsSync, appendFileSync, mkdirSync, statSync, readFileSync, writeFileSync } from 'node:fs';
 import { randomUUID as _randomUUID } from 'node:crypto';
 import path from 'node:path';
+import zlib from 'node:zlib';
 const readFile = _readFile, writeFile = _writeFile, mkdir = _mkdir, stat = _stat, readdir = _readdir, unlink = _unlink;
 const randomUUID = _randomUUID;
 
@@ -2894,16 +2895,24 @@ function clip(s, n) {
  * libraries live as subdirs of the workspace).
  *
  * Trigger detects `wl` on PATH via `Get-Command`. When active, the plugin
- * registers the wl_run tool and prepends a usage block to the system prompt.
+ * registers the wl tool and prepends a usage block to the system prompt.
  */
+
+// Per-user wl config script. wl reads this on every invocation.
+const WL_CONFIG_PATH = path.join(homedir(), 'myWlSetup.bat');
+// User guide ships under X:\Java\scriptsWLS.<ver>\. We name the current
+// known version but the latest may differ — the agent can <list/> the
+// X:\Java directory to find it, then use the docx plugin's read_docx tool
+// to extract the text.
+const WL_USER_GUIDE_HINT = 'X:\\Java\\scriptsWLS.12c\\WeblogicDesktopScriptsUserGuide.docx';
 
 const WL_PROMPT = `
 The "wl" command is available in this environment. It is a developer wrapper
 around git + maven for WebLogic-deployable projects. wl MUST be run from the
-WORKSPACE directory — the parent of the active project. The wl_run tool below
+WORKSPACE directory — the parent of the active project. The wl tool below
 cd's there automatically; you do not need to cd manually.
 
-Use the wl_run tool. Pass everything that would come after "wl " on the
+Use the wl tool. Pass everything that would come after "wl " on the
 command line as the args string.
 
 Actions (with their abbreviations):
@@ -2920,13 +2929,23 @@ Chain different action/deployable groups with " . " — e.g.:
   wl all teb . start milconnect
 
 Examples:
-  <wl_run args="all milconnect"/>           full build + projprops + deploy + run
-  <wl_run args="quickbuild milconnect"/>    build skipping tests
-  <wl_run args="pull allportlets"/>         git pull
-  <wl_run args="all teb . start milconnect"/>  chain: build teb, then start milconnect
+  <wl args="all milconnect"/>           full build + projprops + deploy + run
+  <wl args="quickbuild milconnect"/>    build skipping tests
+  <wl args="pull allportlets"/>         git pull
+  <wl args="all teb . start milconnect"/>  chain: build teb, then start milconnect
 
 The tool can take many minutes — full builds especially. Prefer quickbuild
 over build when iterating, and pass a higher timeout_ms for slow operations.
+
+For help, run wl with no args:
+  <wl args=""/>           shows the wl usage screen
+
+Further reference, if you need it:
+  - User config (env, sync region, aliases): ${WL_CONFIG_PATH}
+    (use <read path="${WL_CONFIG_PATH}"/> to inspect)
+  - User guide (this version, may shift — list X:\\Java to find latest):
+    ${WL_USER_GUIDE_HINT}
+    (the read_docx tool from the docx plugin can read it)
 `.trim();
 
 const wlPlugin = {
@@ -2946,8 +2965,8 @@ const wlPlugin = {
   },
   promptAddition: WL_PROMPT,
   tools: [{
-    verb: 'wl_run',
-    name: 'wl_run',
+    verb: 'wl',
+    name: 'wl',
     schema: {
       description: 'Run a wl (WebLogic developer) command from the workspace directory. The tool automatically cd\'s to the parent of the active project so wl finds the workspace. Returns stdout, stderr, and exit code.',
       parameters: {
@@ -2966,7 +2985,9 @@ const wlPlugin = {
       },
     },
     async impl({ args, timeout_ms }) {
-      if (typeof args !== 'string' || !args.trim()) throw new Error('args is required');
+      // Empty args is allowed — running `wl` with nothing prints its
+      // usage screen, which the agent may legitimately want.
+      const safeArgs = (typeof args === 'string') ? args.trim() : '';
       const workspaceDir = path.dirname(process.cwd());
       const timeout = Math.min(Math.max(1000, Number(timeout_ms) || 300000), 600000);
       const t0 = Date.now();
@@ -2974,7 +2995,7 @@ const wlPlugin = {
         let stdout = '', stderr = '', timedOut = false, settled = false;
         const child = spawn(
           'powershell.exe',
-          ['-NoProfile', '-NonInteractive', '-Command', `wl ${args}`],
+          ['-NoProfile', '-NonInteractive', '-Command', safeArgs ? `wl ${safeArgs}` : 'wl'],
           { cwd: workspaceDir, windowsHide: true },
         );
         const tid = setTimeout(() => {
@@ -2989,7 +3010,7 @@ const wlPlugin = {
           clearTimeout(tid);
           const dur = Date.now() - t0;
           if (timedOut) {
-            resolve(`ERROR: wl ${args} timed out after ${timeout}ms (workspace=${workspaceDir})`);
+            resolve(`ERROR: wl ${safeArgs} timed out after ${timeout}ms (workspace=${workspaceDir})`);
             return;
           }
           const head = `exit ${code} in ${dur}ms  (workspace=${workspaceDir})`;
@@ -3008,6 +3029,168 @@ const wlPlugin = {
 };
 
 wlPlugin;
+
+// ====== plugins/docx.mjs ======
+/**
+ * `docx` plugin — reads text out of a .docx file (Word document).
+ *
+ * A .docx is a ZIP archive containing XML; the main content lives at
+ * word/document.xml. We need this because the user guide for the wl
+ * tool is distributed as a .docx and the LLM otherwise can't read it.
+ *
+ * Constraints: bundle is zero-dep, so we write a minimal ZIP reader by
+ * hand and use Node's built-in `zlib.inflateRawSync` for DEFLATE. Not
+ * ZIP64-capable — fine for documents up to ~4GB compressed, which any
+ * real-world docx is well under.
+ *
+ * Text extraction approach:
+ *   - Find every <w:p>...</w:p> (or self-closing <w:p/>) → paragraph.
+ *   - Inside each, concatenate every <w:t>...</w:t>'s inner text.
+ *   - Join paragraphs with newlines.
+ *   - Decode the five XML entities (&amp; &lt; &gt; &quot; &apos;).
+ * This is intentionally crude — no tables/lists/styles awareness — but
+ * it gets the readable prose out, which is what the agent needs.
+ */
+
+const MAX_DOCX_BYTES = 50 * 1024 * 1024;   // 50MB sanity cap
+
+const docxPlugin = {
+  name: 'docx',
+  description: 'Reads text out of .docx files (Word documents). Pure-JS; always available.',
+  // No detection needed — this works wherever Node runs.
+  async trigger() { return true; },
+  promptAddition: `
+The read_docx tool reads the plain text out of a Microsoft Word .docx file.
+Use it when you need to consult a .docx document — typical examples:
+   - the wl plugin's user guide at X:\\Java\\scriptsWLS.12c\\WeblogicDesktopScriptsUserGuide.docx
+   - any spec or design doc the user points you to that ends in .docx
+
+  <read_docx path="X:\\Java\\scriptsWLS.12c\\WeblogicDesktopScriptsUserGuide.docx"/>
+
+Output is the document's text content, paragraphs separated by newlines.
+Tables/styles/images are dropped; you get readable prose only.
+`.trim(),
+  tools: [{
+    verb: 'read_docx',
+    name: 'read_docx',
+    schema: {
+      description: 'Read the plain-text content of a Word .docx file. Returns paragraphs joined by newlines. Best-effort: tables, lists, and styling are dropped; prose comes through.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Absolute or project-relative path to a .docx file.' },
+          offset: { type: 'integer', description: 'Optional 1-based starting paragraph (for paging huge docs).' },
+          limit: { type: 'integer', description: 'Optional max paragraphs to return (default 1000).' },
+        },
+        required: ['path'],
+      },
+    },
+    async impl({ path: p, offset, limit }) {
+      if (typeof p !== 'string' || !p) throw new Error('path is required');
+      const s = await stat(p);
+      if (!s.isFile()) throw new Error('not a file: ' + p);
+      if (s.size > MAX_DOCX_BYTES) throw new Error(`file too large: ${s.size} bytes (max ${MAX_DOCX_BYTES})`);
+      const buf = await readFile(p);
+      const paragraphs = docxToParagraphs(buf);
+      const start = Math.max(0, (Number(offset) || 1) - 1);
+      const max = Math.min(5000, Math.max(1, Number(limit) || 1000));
+      const slice = paragraphs.slice(start, start + max);
+      const head = `${p}  (${paragraphs.length} paragraphs, showing ${start + 1}..${start + slice.length})`;
+      return { content: `${head}\n\n${slice.join('\n')}` };
+    },
+  }],
+};
+
+// ── ZIP reader (minimal, non-ZIP64) ─────────────────────────────────────────
+const EOCD_SIG = 0x06054b50;
+const CD_SIG   = 0x02014b50;
+const LFH_SIG  = 0x04034b50;
+
+function readZipEntries(buffer) {
+  // EOCD is at the END of the file. Without a comment it sits at length-22.
+  // With a comment it can be up to 65535+22 bytes back. Scan backward.
+  let eocd = -1;
+  const minStart = Math.max(0, buffer.length - 0xFFFF - 22);
+  for (let i = buffer.length - 22; i >= minStart; i--) {
+    if (buffer.readUInt32LE(i) === EOCD_SIG) { eocd = i; break; }
+  }
+  if (eocd < 0) throw new Error('not a ZIP file (EOCD record not found)');
+  const totalEntries = buffer.readUInt16LE(eocd + 10);
+  const cdOffset = buffer.readUInt32LE(eocd + 16);
+
+  const entries = {};
+  let off = cdOffset;
+  for (let i = 0; i < totalEntries; i++) {
+    if (buffer.readUInt32LE(off) !== CD_SIG) {
+      throw new Error(`central directory entry ${i} has bad signature`);
+    }
+    const method     = buffer.readUInt16LE(off + 10);
+    const compSize   = buffer.readUInt32LE(off + 20);
+    const uncompSize = buffer.readUInt32LE(off + 24);
+    const fnLen      = buffer.readUInt16LE(off + 28);
+    const extLen     = buffer.readUInt16LE(off + 30);
+    const cmtLen     = buffer.readUInt16LE(off + 32);
+    const localOff   = buffer.readUInt32LE(off + 42);
+    const name       = buffer.slice(off + 46, off + 46 + fnLen).toString('utf8');
+    entries[name] = { method, compSize, uncompSize, localOff };
+    off += 46 + fnLen + extLen + cmtLen;
+  }
+  return entries;
+}
+
+function readZipFile(buffer, entry) {
+  // The Local File Header has its OWN name + extra fields whose lengths
+  // can differ from the central directory's — must read them to find the
+  // actual data offset.
+  const off = entry.localOff;
+  if (buffer.readUInt32LE(off) !== LFH_SIG) throw new Error('local file header bad signature');
+  const fnLen  = buffer.readUInt16LE(off + 26);
+  const extLen = buffer.readUInt16LE(off + 28);
+  const dataOff = off + 30 + fnLen + extLen;
+  const compData = buffer.slice(dataOff, dataOff + entry.compSize);
+  if (entry.method === 0) return compData;            // stored, no compression
+  if (entry.method === 8) return zlib.inflateRawSync(compData);   // DEFLATE
+  throw new Error(`unsupported ZIP compression method ${entry.method}`);
+}
+
+// ── docx XML → paragraphs ───────────────────────────────────────────────────
+function docxToParagraphs(buffer) {
+  const entries = readZipEntries(buffer);
+  if (!entries['word/document.xml']) {
+    throw new Error('not a .docx file (word/document.xml missing)');
+  }
+  const xml = readZipFile(buffer, entries['word/document.xml']).toString('utf8');
+
+  const paragraphs = [];
+  // Two flavors: self-closing <w:p/> (empty paragraph) and the normal
+  // <w:p ...> ... </w:p> form. Capture both, but only the latter has text.
+  const pRe = /<w:p\b[^>]*\/>|<w:p\b[^>]*>([\s\S]*?)<\/w:p>/g;
+  const tRe = /<w:t\b[^>]*>([\s\S]*?)<\/w:t>/g;
+  let m;
+  while ((m = pRe.exec(xml))) {
+    const inner = m[1] ?? '';
+    if (!inner) { paragraphs.push(''); continue; }
+    let para = '';
+    let tm;
+    tRe.lastIndex = 0;
+    while ((tm = tRe.exec(inner))) para += tm[1];
+    paragraphs.push(decodeEntities(para));
+  }
+  return paragraphs;
+}
+
+function decodeEntities(s) {
+  return s
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n, 10)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCharCode(parseInt(n, 16)))
+    .replace(/&amp;/g, '&');   // last so we don't double-decode
+}
+
+docxPlugin;
 
 // ====== plugins/index.mjs ======
 /**
@@ -3035,7 +3218,7 @@ wlPlugin;
  */
 
 // All built-in plugins. New plugins get added here.
-const PLUGINS = [wlPlugin];
+const PLUGINS = [wlPlugin, docxPlugin];
 
 const PLUGIN_REDETECT_MS = 5 * 60 * 1000;
 
@@ -6874,7 +7057,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   <h1>code_boss</h1>
   <p class="tagline">Pick a project folder to work on.</p>
 
-  <button class="btn primary" id="selectFolderBtn" onclick="openFolderPicker()">Select folder…</button>
+  <button class="btn primary" id="selectFolderBtn" onclick="openFolderPicker()">Select folder</button>
 
   <h2>Recent projects</h2>
   <ul class="recent-list" id="recentList"></ul>
