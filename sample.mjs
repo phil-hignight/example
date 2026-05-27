@@ -15,7 +15,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '47';
+const BUILD_VERSION = '48';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
@@ -7432,11 +7432,17 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       $init.classList.add('hidden');
       _initialized = true;
       // If SSE init arrived during initialization, render its captured
-      // session now. Otherwise just open the chat with a fresh log; any
-      // subsequent SSE 'event' deltas append normally.
+      // session now. Otherwise, if SSE delivered the restored
+      // conversation while we were loading models (project-switch path:
+      // server's openProject broadcasts a reset + each restored event,
+      // those land in session.events while initialize is awaiting the
+      // models fetch), render the live session. Only if neither path
+      // populated the session do we show an empty chat.
       if (_pendingSession) {
         renderSessionInChat(_pendingSession);
         _pendingSession = null;
+      } else if (session && Array.isArray(session.events) && session.events.length > 0) {
+        renderSessionInChat(session);
       } else {
         showChat(activeProject);
       }
