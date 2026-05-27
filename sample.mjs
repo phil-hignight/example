@@ -15,7 +15,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '33';
+const BUILD_VERSION = '45';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
@@ -28,11 +28,11 @@ import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { createServer } from 'node:http';
 import { homedir } from 'node:os';
-import { readFile as _readFile, writeFile as _writeFile, mkdir as _mkdir, stat as _stat, readdir as _readdir } from 'node:fs/promises';
-import { existsSync, appendFileSync, mkdirSync, statSync, readFileSync } from 'node:fs';
+import { readFile as _readFile, writeFile as _writeFile, mkdir as _mkdir, stat as _stat, readdir as _readdir, unlink as _unlink } from 'node:fs/promises';
+import { existsSync, appendFileSync, mkdirSync, statSync, readFileSync, writeFileSync } from 'node:fs';
 import { randomUUID as _randomUUID } from 'node:crypto';
 import path from 'node:path';
-const readFile = _readFile, writeFile = _writeFile, mkdir = _mkdir, stat = _stat, readdir = _readdir;
+const readFile = _readFile, writeFile = _writeFile, mkdir = _mkdir, stat = _stat, readdir = _readdir, unlink = _unlink;
 const randomUUID = _randomUUID;
 
 
@@ -1328,15 +1328,44 @@ const tools = {
       if (typeof replace !== 'string') throw new Error('replace is required');
       const abs = path.isAbsolute(p) ? p : path.join(process.cwd(), p);
       const oldText = await readFile(abs, 'utf8');
-      const first = oldText.indexOf(find);
+
+      // Find the string. Try exact match first; if that fails, try
+      // common normalizations before giving up. The model frequently
+      // copies bytes from a read result that's been normalized to LF
+      // and then asks us to edit a Windows file with CRLF — the bytes
+      // don't match exactly but the intent is clear.
+      let findToUse = find;
+      let replaceToUse = replace;
+      let first = oldText.indexOf(findToUse);
+      let fallback = null;
+
+      if (first === -1) {
+        const fileHasCRLF = oldText.includes('\r\n');
+        const findHasCRLF = find.includes('\r\n');
+        if (fileHasCRLF && !findHasCRLF) {
+          // File uses CRLF, model gave LF. Promote both find + replace.
+          findToUse = find.replace(/\n/g, '\r\n');
+          replaceToUse = replace.replace(/\n/g, '\r\n');
+          first = oldText.indexOf(findToUse);
+          if (first !== -1) fallback = 'CRLF';
+        } else if (!fileHasCRLF && findHasCRLF) {
+          // File uses LF, model gave CRLF. Strip the \r from both.
+          findToUse = find.replace(/\r\n/g, '\n');
+          replaceToUse = replace.replace(/\r\n/g, '\n');
+          first = oldText.indexOf(findToUse);
+          if (first !== -1) fallback = 'LF';
+        }
+      }
+
       if (first === -1) throw new Error(`find string not found in ${relForDisplay(abs)}`);
-      const second = oldText.indexOf(find, first + 1);
+      const second = oldText.indexOf(findToUse, first + 1);
       if (second !== -1) throw new Error(`find string occurs more than once in ${relForDisplay(abs)} — make it more specific`);
-      const newText = oldText.slice(0, first) + replace + oldText.slice(first + find.length);
+      const newText = oldText.slice(0, first) + replaceToUse + oldText.slice(first + findToUse.length);
       await writeFile(abs, newText, 'utf8');
       const rel = relForDisplay(abs);
+      const note = fallback ? `  (matched after normalizing line endings to ${fallback})` : '';
       return {
-        content: `edited ${rel}  ${shortDiffSummary(oldText, newText)}`,
+        content: `edited ${rel}  ${shortDiffSummary(oldText, newText)}${note}`,
         diff: renderUnifiedDiff(oldText, newText, { pathLabel: rel, context: 2 }),
         path: rel,
       };
@@ -1456,9 +1485,15 @@ const toolDefs = Object.entries(tools).map(([name, t]) => ({
  *
  * Callers can normalize via `extractContent(result)` and `extractDiff(result)`.
  */
-async function execute(name, args) {
-  const t = tools[name];
-  if (!t) return `ERROR: unknown tool "${name}". Available: ${Object.keys(tools).join(', ')}`;
+async function execute(name, args, extraTools = {}) {
+  // Built-ins win over plugin tools — name collisions are caught earlier in
+  // src/plugins/index.mjs (checkCollisions), but if a plugin tool somehow
+  // sneaks through with a built-in name it still won't shadow.
+  const t = tools[name] || extraTools[name];
+  if (!t) {
+    const all = [...Object.keys(tools), ...Object.keys(extraTools)];
+    return `ERROR: unknown tool "${name}". Available: ${all.join(', ')}`;
+  }
   try {
     const result = await t.impl(args ?? {});
     return result;  // may be string or object; callers handle both
@@ -1810,7 +1845,7 @@ const DEFAULT_MAX_TURNS = 20;
 const REPEAT_LIMIT = 3;
 
 // ── System prompt ───────────────────────────────────────────────────────────
-function buildSystemPrompt({ taskId, taskUserRequest, tier1Tokens, tier1Pct }) {
+function buildSystemPrompt({ taskId, taskUserRequest, tier1Tokens, tier1Pct, promptAdditions = [] }) {
   const lines = [
     'You are code_boss, a coding agent. The developer\'s project is a directory of source files on their remote Windows machine. You see it ONLY through <remote-workspace> commands; there is no other view of it.',
     '',
@@ -1859,6 +1894,14 @@ function buildSystemPrompt({ taskId, taskUserRequest, tier1Tokens, tier1Pct }) {
     '',
     'The remote workspace replies with <remote-workspace-result> blocks. Read real results before answering. Never invent file or directory names you have not seen.',
   ];
+  // Append plugin-provided prompt additions (each one is appended only
+  // while its plugin's trigger is currently active). They show up as
+  // extra "tool/context" blocks at the end of the system prompt.
+  for (const add of (promptAdditions || [])) {
+    lines.push('');
+    lines.push('────────  plugin  ────────');
+    lines.push(String(add).trim());
+  }
   return lines.join('\n');
 }
 
@@ -1928,9 +1971,18 @@ function parseAttrs(attrStr, toolName) {
  * Parse all <remote-workspace> verb calls from a model response text.
  * Supports both self-closing and body forms.
  */
-function parseToolCalls(text) {
+function parseToolCalls(text, opts = {}) {
   const calls = [];
   if (typeof text !== 'string' || !text) return calls;
+
+  // Plugin-provided verbs map their own verb names to tool names. Merge
+  // with the built-in VERB_TO_TOOL at parse time so the regex picks them
+  // up and so dispatch resolves to the right tool registry entry.
+  const extraVerbs = opts.extraVerbs || {};   // { verb: tool_name }
+  const allVerbToTool = { ...VERB_TO_TOOL, ...extraVerbs };
+  const allVerbs = [...Object.keys(allVerbToTool), ...TASK_VERBS]
+    .sort((a, b) => b.length - a.length);
+  const verbPattern = allVerbs.map((v) => v.replace(/-/g, '\\-').replace(/_/g, '\\_')).join('|');
 
   // Cut at the first close tag or hallucinated result tag — only the FIRST
   // <remote-workspace> block counts.
@@ -1941,7 +1993,7 @@ function parseToolCalls(text) {
   }
   const scan = text.slice(0, cut);
 
-  const openRe = new RegExp(`<(${VERB_PATTERN})\\b([^>]*?)(/?)>`, 'gi');
+  const openRe = new RegExp(`<(${verbPattern})\\b([^>]*?)(/?)>`, 'gi');
   let pos = 0;
   while (pos < scan.length) {
     openRe.lastIndex = pos;
@@ -1953,7 +2005,7 @@ function parseToolCalls(text) {
     const openEnd = m.index + m[0].length;
 
     const isTaskOp = TASK_VERBS.has(verb);
-    const toolName = isTaskOp ? null : VERB_TO_TOOL[verb];
+    const toolName = isTaskOp ? null : allVerbToTool[verb];
     const args = parseAttrs(attrStr, toolName);
 
     let nextPos = openEnd;
@@ -2354,10 +2406,20 @@ async function runPromptedAgent({
   //              'diff', 'task-end'.
   onChatEvent,
   // New phase callback:
-  //   onPhase('idle' | 'uploading' | 'thinking' | 'downloading')
+  //   onPhase('idle' | 'uploading' | 'thinking' | 'downloading' | 'reviewing')
   onPhase,
   // Abort signal — checked between turns and when waiting on the model.
   signal,
+  // When the reviewer feeds back to the agent, the user-facing review
+  // event already shows the feedback — set this to false to skip the
+  // duplicate 'user-message' event. The store still gets the message so
+  // the LLM sees it as input.
+  emitInitialUserMessage = true,
+  // Plugin integration. Manager passes these so the agent's prompt + tool
+  // dispatch + parser pick up enabled plugins' contributions.
+  extraTools = {},          // { tool_name: { verb, name, schema, impl } }
+  extraVerbs = {},          // { verb: tool_name } — fed to parseToolCalls
+  promptAdditions = [],     // strings appended to system prompt
 }) {
   if (!projectDir) throw new Error('projectDir required for task-scoped agent');
 
@@ -2385,7 +2447,9 @@ async function runPromptedAgent({
       role: 'user',
       content: userText,
     });
-    emitChat({ type: 'user-message', taskId: store.currentId(), content: userText });
+    if (emitInitialUserMessage) {
+      emitChat({ type: 'user-message', taskId: store.currentId(), content: userText });
+    }
   }
 
   const stats = { turns: 0, toolCalls: 0, toolHistogram: {}, batches: [], loopBreaks: 0, taskOps: 0 };
@@ -2406,6 +2470,7 @@ async function runPromptedAgent({
       taskUserRequest: cur?.userRequest ?? '',
       tier1Tokens: t1Tokens,
       tier1Pct,
+      promptAdditions,
     });
 
     // Build the convo from the store. The system reminder is NOT stored —
@@ -2483,7 +2548,7 @@ async function runPromptedAgent({
     );
     emitPhase('thinking');
     checkAbort();
-    const calls = parseToolCalls(text);
+    const calls = parseToolCalls(text, { extraVerbs });
     log(`turn ${turn}: ${text.length} chars in ${Date.now() - t0}ms, ${calls.length} call(s)`);
 
     if (calls.length === 0) {
@@ -2556,7 +2621,7 @@ async function runPromptedAgent({
       } else {
         stats.toolCalls++;
         stats.toolHistogram[c.name] = (stats.toolHistogram[c.name] ?? 0) + 1;
-        const raw = await execute(c.name, c.args);
+        const raw = await execute(c.name, c.args, extraTools);
         if (typeof raw === 'string' && raw.startsWith('ERROR:')) {
           resultContent = raw;
           resultStatus = 'error';
@@ -2619,6 +2684,492 @@ async function runPromptedAgent({
 
   log(`done: max turns (${maxTurns}) reached without converging`);
   return { content: '[MAX TURNS REACHED — agent did not converge]', stats, terminated: 'max-turns', store };
+}
+
+// ─── Reviewer agent ────────────────────────────────────────────────────────
+// Runs a separate LLM call to review what the dev agent just did, against
+// three categories: structural validity, bugs, intent match. Returns either
+// pass or a concrete list of concerns the dev agent should address.
+//
+// Inputs:
+//   userRequest  — original text the developer sent that started this work
+//   trajectory   — compact representation of what the agent did (tool calls,
+//                  diffs, results) — built by buildReviewTrajectory()
+//   finalText    — agent's last assistant message
+//
+// Output: { pass: true } or { pass: false, concerns: '...' }
+
+// Reviewer's tool allowlist. Read-only: it can inspect any file or
+// directory in the project but cannot write, edit, or run shell commands.
+// Same parser as the dev agent (parseToolCalls) — we just filter the
+// dispatch so writes are silently dropped.
+const REVIEWER_TOOL_VERBS = new Set(['list', 'read', 'search', 'find', 'info']);
+const REVIEWER_MAX_TURNS = 6;
+
+const REVIEWER_SYSTEM_PROMPT = `You are a code review agent. Another agent has just completed work on behalf of a developer. Review that work for three categories of issues. Be specific and concise — the dev agent will act on your feedback verbatim.
+
+1. STRUCTURAL VALIDITY (most likely failure mode — focus here first)
+   Look at every removed, commented-out, or modified element. For each, ask: "is the surrounding container still valid for this file type?"
+   • XML/HTML: elements with required children. A <library-ref> without a <library-name> is well-formed XML but invalid for the weblogic schema. Commenting out a required child WITHOUT also handling the parent is a bug.
+   • JSON/YAML: required fields per the consuming application (package.json must have name+version, k8s manifest must have apiVersion+kind+metadata, etc.)
+   • Source files: syntax parses, imports resolve, types match (best-effort), function signatures match call sites you can see.
+   • Properties / .env: required keys still present.
+   After commenting out anything, mentally re-read the file and ask: "would the framework that consumes this file reject it now?"
+
+2. BUGS — Logic errors introduced by THIS change (NOT pre-existing):
+   • Off-by-one, null dereference, uncaught exception path, wrong operator.
+   • Behavior change in code paths the user didn't ask about (scope creep).
+   • Side effects in pure-looking functions.
+   • Race conditions if concurrency is in play.
+   • Resource leaks (unclosed file handles, listeners, connections).
+   • For config/build files: did a dependency version go down, a required field get dropped, a script break?
+
+3. INTENT MATCH
+   • Was the right thing changed, or did the agent change something adjacent?
+   • Was the scope correct — did it do too little (left work undone) or too much (touched unrelated code)?
+   • Does the agent's summary describe what was actually changed (not what was intended)?
+   • If the user asked a question rather than for a change, was the question actually answered?
+
+READ-ONLY TOOLS
+You can inspect the project to verify what the agent did. Emit tool calls inside a <remote-workspace> block, exactly like the dev agent does. Available tools:
+  <read path="FILE"/>                         read full file contents
+  <read path="FILE" offset="N" limit="N"/>    read a slice
+  <list path="DIR"/>                          list directory entries
+  <search pattern="REGEX" path="DIR" glob="GLOB"/>   grep across files
+  <find pattern="GLOB"/>                      glob (recursive by default)
+  <info path="FILE"/>                         file/dir stat
+
+You have NO write access — only the dev agent can change files. Issue at most a few tool calls per turn; you have a ${REVIEWER_MAX_TURNS}-turn budget total. Prefer reading the specific file the agent just changed (which you can see in the trajectory's diffs) over broad searches.
+
+The remote workspace will reply with <remote-workspace-result> blocks containing real data. Read those before deciding.
+
+OUTPUT FORMAT
+When you have enough information, respond with EXACTLY ONE of these in a turn that has no tool calls:
+  <review-pass/>
+  <review-fail>specific, actionable concerns here</review-fail>
+
+Use <review-pass/> when the work is correct and complete enough to ship.
+Use <review-fail>...</review-fail> only when there's something the dev agent should fix. Be specific: name the file, the element, what's wrong, and what would fix it. Do not include items the dev agent already noticed and fixed in this same trajectory.`;
+
+async function runReviewer({ adapter, model, userRequest, trajectory, finalText, signal, onLog }) {
+  const log = (m) => { try { onLog?.(m); } catch {} };
+  const userBlock = [
+    '<review-target>',
+    '<user-request>',
+    String(userRequest ?? '').trim(),
+    '</user-request>',
+    '<trajectory>',
+    trajectory,
+    '</trajectory>',
+    '<final-answer>',
+    String(finalText ?? '').trim(),
+    '</final-answer>',
+    '</review-target>',
+  ].join('\n');
+
+  const messages = [
+    { role: 'system', content: REVIEWER_SYSTEM_PROMPT },
+    { role: 'user', content: userBlock },
+  ];
+
+  for (let turn = 1; turn <= REVIEWER_MAX_TURNS; turn++) {
+    if (signal?.aborted) {
+      const e = new Error('aborted');
+      e.name = 'AbortError';
+      throw e;
+    }
+    const t0 = Date.now();
+    const response = await adapter.complete({ model, messages, signal });
+    const text = response?.choices?.[0]?.message?.content ?? '';
+    log(`reviewer turn ${turn}: ${text.length} chars in ${Date.now() - t0}ms`);
+
+    // Verdict check first — if the model produced a verdict, take it
+    // regardless of any tool calls mixed in.
+    if (/<review-pass\s*\/?>/i.test(text)) {
+      return { pass: true };
+    }
+    const failMatch = text.match(/<review-fail>([\s\S]*?)<\/review-fail>/i);
+    if (failMatch) {
+      return { pass: false, concerns: failMatch[1].trim() };
+    }
+
+    // No verdict yet — look for tool calls and execute the allowed ones.
+    const calls = parseToolCalls(text);
+    const allowed = calls.filter((c) => REVIEWER_TOOL_VERBS.has(c.verb));
+    const blocked = calls.filter((c) => !REVIEWER_TOOL_VERBS.has(c.verb));
+
+    if (allowed.length === 0) {
+      // No verdict, no usable tool calls. Default to pass — matches the
+      // older "unparseable response = pass" semantics so a confused
+      // reviewer doesn't block the user. Log so we can investigate.
+      if (blocked.length > 0) {
+        log(`reviewer turn ${turn}: blocked ${blocked.length} write call(s) (${blocked.map((c) => c.verb).join(', ')}); no verdict — defaulting to pass`);
+      } else {
+        log(`reviewer turn ${turn}: no verdict, no tool calls — defaulting to pass. raw: ${text.slice(0, 200)}`);
+      }
+      return { pass: true, unparseable: true };
+    }
+
+    // Execute the allowed tools.
+    const results = [];
+    for (const c of allowed) {
+      try {
+        const raw = await execute(c.name, c.args);
+        const content = (typeof raw === 'string' && raw.startsWith('ERROR:'))
+          ? raw
+          : extractContent(raw);
+        const status = (typeof raw === 'string' && raw.startsWith('ERROR:')) ? 'error' : 'ok';
+        results.push({ verb: c.verb, status, content });
+        log(`reviewer turn ${turn}: ${c.verb}(${JSON.stringify(c.args).slice(0, 80)}) -> ${status} ${content.length}b`);
+      } catch (e) {
+        results.push({ verb: c.verb, status: 'error', content: 'ERROR: ' + (e?.message ?? String(e)) });
+      }
+    }
+    if (blocked.length > 0) {
+      results.push({
+        verb: 'system',
+        status: 'error',
+        content: `Reviewer is read-only — dropped ${blocked.length} call(s): ${blocked.map((c) => c.verb).join(', ')}.`,
+      });
+    }
+
+    messages.push({ role: 'assistant', content: text });
+    messages.push({ role: 'user', content: formatToolResults(results) });
+  }
+
+  // Out of turns without a verdict. Be permissive (pass) so the user isn't
+  // blocked behind an indecisive reviewer.
+  log(`reviewer: hit max turns (${REVIEWER_MAX_TURNS}) without a verdict, treating as pass.`);
+  return { pass: true, indecisive: true };
+}
+
+// Build a compact representation of the work the agent did, for the
+// reviewer to consume. Skips noisy chat events (review-* itself, status
+// rows) and truncates very long tool results. Returns a single string.
+function buildReviewTrajectory(events) {
+  const lines = [];
+  for (const ev of events) {
+    switch (ev.type) {
+      case 'user-message':
+        // The user-request is passed separately; skip dups here.
+        break;
+      case 'assistant-text':
+        lines.push('AGENT: ' + clip(ev.content, 800));
+        break;
+      case 'tool-call': {
+        const args = Object.entries(ev.args || {})
+          .map(([k, v]) => `${k}=${clip(String(v), 200)}`).join(', ');
+        lines.push(`TOOL: ${ev.verb || ev.name}(${args})`);
+        break;
+      }
+      case 'tool-result':
+        lines.push(`  -> [${ev.status || 'ok'}] ${clip(ev.content, 600)}`);
+        break;
+      case 'diff':
+        lines.push('DIFF:');
+        lines.push(clip(ev.diff || '', 2000));
+        break;
+      case 'task-end':
+        lines.push(`TASK END: ${clip(ev.summary || '', 400)}`);
+        break;
+      default:
+        // skip other event types (review, task-rollup, task-tier-change, etc)
+    }
+  }
+  return lines.join('\n');
+}
+
+function clip(s, n) {
+  if (typeof s !== 'string') return String(s ?? '');
+  return s.length > n ? s.slice(0, n) + ' … [truncated]' : s;
+}
+
+// ====== plugins/wl.mjs ======
+/**
+ * `wl` plugin — wraps the WebLogic developer command-line tool.
+ *
+ * The `wl` command is a workspace-level wrapper around git + maven actions
+ * for WebLogic-deployable projects. It MUST be invoked from the workspace
+ * directory, which is the PARENT of the active project (apps and shared
+ * libraries live as subdirs of the workspace).
+ *
+ * Trigger detects `wl` on PATH via `Get-Command`. When active, the plugin
+ * registers the wl_run tool and prepends a usage block to the system prompt.
+ */
+
+const WL_PROMPT = `
+The "wl" command is available in this environment. It is a developer wrapper
+around git + maven for WebLogic-deployable projects. wl MUST be run from the
+WORKSPACE directory — the parent of the active project. The wl_run tool below
+cd's there automatically; you do not need to cd manually.
+
+Use the wl_run tool. Pass everything that would come after "wl " on the
+command line as the args string.
+
+Actions (with their abbreviations):
+  clone, pull, clonepull, status, diff   git operations
+  clean, build (b), projprops (pp), deploy (d), run (r), all (a)
+  quickbuild (qb), quickall (qa)         skip tests
+  datasources (ds)
+  stop, start, undeploy
+  mvninstall (mi)                        mvn clean install (rarely needed)
+
+Deployables: any app or sharedlib name (sharedlib ones start with "sharedlib-").
+
+Chain different action/deployable groups with " . " — e.g.:
+  wl all teb . start milconnect
+
+Examples:
+  <wl_run args="all milconnect"/>           full build + projprops + deploy + run
+  <wl_run args="quickbuild milconnect"/>    build skipping tests
+  <wl_run args="pull allportlets"/>         git pull
+  <wl_run args="all teb . start milconnect"/>  chain: build teb, then start milconnect
+
+The tool can take many minutes — full builds especially. Prefer quickbuild
+over build when iterating, and pass a higher timeout_ms for slow operations.
+`.trim();
+
+const wlPlugin = {
+  name: 'wl',
+  description: 'WebLogic developer tool — wraps git/maven actions across project apps and shared libs',
+  async trigger(executor) {
+    // Get-Command returns the command object when present, nothing when not.
+    // Pipe to Out-Null + check $? for a clean boolean.
+    try {
+      const r = await executor.run(
+        'if (Get-Command wl -ErrorAction SilentlyContinue) { "yes" } else { "no" }'
+      );
+      return r.exitCode === 0 && /^yes/i.test(r.stdout.trim());
+    } catch {
+      return false;
+    }
+  },
+  promptAddition: WL_PROMPT,
+  tools: [{
+    verb: 'wl_run',
+    name: 'wl_run',
+    schema: {
+      description: 'Run a wl (WebLogic developer) command from the workspace directory. The tool automatically cd\'s to the parent of the active project so wl finds the workspace. Returns stdout, stderr, and exit code.',
+      parameters: {
+        type: 'object',
+        properties: {
+          args: {
+            type: 'string',
+            description: 'Everything that should follow `wl ` on the command line. E.g. "all milconnect" or "quickbuild teb" or "all teb . start milconnect".',
+          },
+          timeout_ms: {
+            type: 'integer',
+            description: 'Timeout in ms. Default 5 minutes, max 10. Full builds may need 10+.',
+          },
+        },
+        required: ['args'],
+      },
+    },
+    async impl({ args, timeout_ms }) {
+      if (typeof args !== 'string' || !args.trim()) throw new Error('args is required');
+      const workspaceDir = path.dirname(process.cwd());
+      const timeout = Math.min(Math.max(1000, Number(timeout_ms) || 300000), 600000);
+      const t0 = Date.now();
+      return await new Promise((resolve) => {
+        let stdout = '', stderr = '', timedOut = false, settled = false;
+        const child = spawn(
+          'powershell.exe',
+          ['-NoProfile', '-NonInteractive', '-Command', `wl ${args}`],
+          { cwd: workspaceDir, windowsHide: true },
+        );
+        const tid = setTimeout(() => {
+          timedOut = true;
+          try { child.kill(); } catch {}
+        }, timeout);
+        child.stdout.on('data', (d) => { stdout += d.toString(); });
+        child.stderr.on('data', (d) => { stderr += d.toString(); });
+        const settle = (code) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(tid);
+          const dur = Date.now() - t0;
+          if (timedOut) {
+            resolve(`ERROR: wl ${args} timed out after ${timeout}ms (workspace=${workspaceDir})`);
+            return;
+          }
+          const head = `exit ${code} in ${dur}ms  (workspace=${workspaceDir})`;
+          const body = stdout + (stderr ? '\nSTDERR:\n' + stderr : '');
+          if (code !== 0 && code != null) {
+            resolve(`ERROR: ${head}\n${body}`);
+          } else {
+            resolve({ content: `${head}\n${body}` });
+          }
+        };
+        child.on('close', settle);
+        child.on('error', (e) => { stderr += '\n' + e.message; settle(-1); });
+      });
+    },
+  }],
+};
+
+wlPlugin;
+
+// ====== plugins/index.mjs ======
+/**
+ * Plugin registry + manager.
+ *
+ * Each plugin is a JS module exporting an object with:
+ *   name           unique string id
+ *   description    short summary for diagnostics
+ *   trigger(exec)  async (executor) => bool  — pure detection, no side effects
+ *   promptAddition string (or fn returning string) — appended to system prompt
+ *                  while enabled
+ *   tools          [{ verb, name, schema, impl }]  — same shape as built-in
+ *                  tools in src/agent/tools.mjs; verb is what the model writes
+ *                  in <verb .../> blocks, name is the registry key
+ *
+ * The manager re-runs every trigger at startup and every 5 minutes. State
+ * changes (false→true / true→false) get logged. When the agent loop builds
+ * a turn's prompt + tool dispatch, it asks the manager for the currently
+ * enabled plugins' promptAdditions, tools, and verbs.
+ *
+ * Collisions (two plugins claiming the same tool name, or a plugin claiming
+ * a built-in name) cause BOTH conflicting plugins to be disabled and a
+ * prominent error logged to fileLog — the user resolves by editing or
+ * removing the source file under src/plugins/ and rebuilding.
+ */
+
+// All built-in plugins. New plugins get added here.
+const PLUGINS = [wlPlugin];
+
+const PLUGIN_REDETECT_MS = 5 * 60 * 1000;
+
+function createPluginManager({ onLog } = {}) {
+  const log = (m) => { try { onLog?.(m); } catch {} };
+  // name → { enabled: bool, plugin: <object>, error: string|null }
+  const state = new Map();
+
+  // Executor passed to trigger fns. Runs a PowerShell command, returns
+  // { stdout, stderr, exitCode, timedOut, durationMs }. Wraps spawn so
+  // plugins never have to deal with child_process directly.
+  const executor = {
+    async run(command, { cwd, timeoutMs } = {}) {
+      const t0 = Date.now();
+      const timeout = Math.max(1000, Number(timeoutMs) || 30000);
+      return new Promise((resolve) => {
+        let stdout = '', stderr = '', timedOut = false, settled = false;
+        const child = spawn(
+          'powershell.exe',
+          ['-NoProfile', '-NonInteractive', '-Command', command],
+          { cwd: cwd ?? process.cwd(), windowsHide: true },
+        );
+        const tid = setTimeout(() => {
+          timedOut = true;
+          try { child.kill(); } catch {}
+        }, timeout);
+        child.stdout.on('data', (d) => { stdout += d.toString(); });
+        child.stderr.on('data', (d) => { stderr += d.toString(); });
+        const settle = (code) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(tid);
+          resolve({ stdout, stderr, exitCode: code ?? -1, timedOut, durationMs: Date.now() - t0 });
+        };
+        child.on('close', settle);
+        child.on('error', (e) => { stderr += '\n' + e.message; settle(-1); });
+      });
+    },
+  };
+
+  async function detectAll() {
+    for (const p of PLUGINS) {
+      try {
+        const enabled = await p.trigger(executor);
+        const prev = state.get(p.name)?.enabled;
+        state.set(p.name, { enabled, plugin: p, error: null });
+        if (prev !== enabled) {
+          log(`plugin ${p.name}: ${enabled ? 'enabled' : 'disabled'}`);
+        }
+      } catch (e) {
+        const prev = state.get(p.name)?.enabled;
+        state.set(p.name, { enabled: false, plugin: p, error: e.message });
+        if (prev !== false) {
+          log(`plugin ${p.name}: trigger error — ${e.message}`);
+        }
+      }
+    }
+    checkCollisions();
+  }
+
+  // Hard-error on tool-name collisions. Both conflicting plugins are disabled
+  // until the user resolves by editing or removing source files under
+  // src/plugins/. Built-in tool names always win — a plugin can never
+  // shadow a built-in.
+  function checkCollisions() {
+    const builtinNames = new Set(Object.keys(tools));
+    const owners = new Map();   // tool name → plugin name that owns it
+    const conflicts = [];
+    for (const s of state.values()) {
+      if (!s.enabled) continue;
+      for (const t of (s.plugin.tools || [])) {
+        if (builtinNames.has(t.name)) {
+          conflicts.push({ tool: t.name, owners: ['(built-in)', s.plugin.name] });
+          continue;
+        }
+        if (owners.has(t.name)) {
+          conflicts.push({ tool: t.name, owners: [owners.get(t.name), s.plugin.name] });
+          continue;
+        }
+        owners.set(t.name, s.plugin.name);
+      }
+    }
+    if (conflicts.length === 0) return;
+    for (const c of conflicts) {
+      for (const pluginName of c.owners) {
+        if (pluginName === '(built-in)') continue;
+        const s = state.get(pluginName);
+        if (s) {
+          s.enabled = false;
+          s.error = `tool-name collision on "${c.tool}" with ${c.owners.filter((x) => x !== pluginName).join(', ')}`;
+        }
+      }
+    }
+    log('!!! PLUGIN TOOL NAME COLLISION — affected plugins are now disabled.');
+    log('!!! Resolve by editing or removing the source file(s) under src/plugins/ and rebuilding:');
+    for (const c of conflicts) {
+      log(`!!!   "${c.tool}" claimed by: ${c.owners.join(' and ')}`);
+    }
+  }
+
+  function enabledPlugins() {
+    return [...state.values()].filter((s) => s.enabled).map((s) => s.plugin);
+  }
+  function enabledTools() {
+    const out = {};
+    for (const p of enabledPlugins()) {
+      for (const t of (p.tools || [])) out[t.name] = t;
+    }
+    return out;
+  }
+  function enabledVerbs() {
+    const out = {};   // verb → tool name
+    for (const p of enabledPlugins()) {
+      for (const t of (p.tools || [])) out[t.verb] = t.name;
+    }
+    return out;
+  }
+  function promptAdditions() {
+    return enabledPlugins().map((p) => {
+      const v = typeof p.promptAddition === 'function' ? p.promptAddition() : p.promptAddition;
+      return v ? String(v).trim() : '';
+    }).filter(Boolean);
+  }
+  function snapshot() {
+    return [...state.values()].map(({ plugin, enabled, error }) => ({
+      name: plugin.name,
+      description: plugin.description,
+      enabled,
+      error: error || null,
+      tools: (plugin.tools || []).map((t) => t.name),
+    }));
+  }
+
+  return { detectAll, executor, enabledPlugins, enabledTools, enabledVerbs, promptAdditions, snapshot };
 }
 
 // ====== server.mjs ======
@@ -3824,6 +4375,7 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
     const ev = { id, appendedAtVersion: session.version + 1, ...event };
     session.chatEvents.push(ev);
     broadcast({ type: 'event', version: bumpVersion(), event: ev });
+    scheduleConversationSave();
     return ev;
   }
   // Patch an existing event in place (e.g., to mute tool result on tier 1→2 demotion).
@@ -3832,6 +4384,7 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
     if (!ev) return null;
     Object.assign(ev, patch);
     broadcast({ type: 'event-patch', version: bumpVersion(), eventId, patch });
+    scheduleConversationSave();
     return ev;
   }
   // Replace entire chat state (used by /api/reset).
@@ -3845,6 +4398,66 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
     session.chatStartedAt = null;
     session.abortController = null;
     broadcast({ type: 'reset', version: bumpVersion() });
+    // Don't write an empty conversation back to disk — the caller (clearConversation
+    // or project switch) is responsible for cleaning up the file.
+  }
+  // Per-project conversation persistence. Writes session.chatEvents +
+  // nextEventId to <project>/.code_boss/conversation.json so a chat
+  // survives restarts. Debounced so a burst of events (tool call, result,
+  // assistant text in quick succession) writes once.
+  const CONVERSATION_FILE = 'conversation.json';
+  let _saveTimer = null;
+  function conversationFilePath() {
+    return session.activeProject ? path.join(session.activeProject, '.code_boss', CONVERSATION_FILE) : null;
+  }
+  function scheduleConversationSave() {
+    if (!session.activeProject) return;
+    if (_saveTimer) return;
+    _saveTimer = setTimeout(() => {
+      _saveTimer = null;
+      flushConversationSave();
+    }, 300);
+  }
+  function flushConversationSave() {
+    const file = conversationFilePath();
+    if (!file) return;
+    try {
+      mkdirSync(path.dirname(file), { recursive: true });
+      const data = {
+        version: 1,
+        savedAt: new Date().toISOString(),
+        nextEventId: session.nextEventId,
+        chatEvents: session.chatEvents,
+      };
+      writeFileSync(file, JSON.stringify(data), 'utf8');
+    } catch (e) {
+      fileLog(`conversation save failed: ${e.message}`);
+    }
+  }
+  async function loadConversation() {
+    if (_saveTimer) { clearTimeout(_saveTimer); _saveTimer = null; }
+    const file = conversationFilePath();
+    if (!file) return;
+    try {
+      const raw = await readFile(file, 'utf8');
+      const data = JSON.parse(raw);
+      if (data && Array.isArray(data.chatEvents)) {
+        session.chatEvents = data.chatEvents;
+        session.nextEventId = data.nextEventId || (data.chatEvents.length + 1);
+        fileLog(`loaded conversation: ${data.chatEvents.length} event(s) from ${file}`);
+      }
+    } catch (e) {
+      if (e.code !== 'ENOENT') fileLog(`conversation load failed: ${e.message}`);
+    }
+  }
+  async function clearConversation() {
+    if (_saveTimer) { clearTimeout(_saveTimer); _saveTimer = null; }
+    resetChatState();
+    const file = conversationFilePath();
+    if (file) {
+      try { await unlink(file); fileLog(`conversation cleared: ${file}`); }
+      catch (e) { if (e.code !== 'ENOENT') fileLog(`conversation delete failed: ${e.message}`); }
+    }
   }
   // Snapshot of chat state for /api/state.
   function chatStateSnapshot({ eventLimit } = {}) {
@@ -3867,13 +4480,14 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
       // If an unlock is in flight, include the URL so a freshly-connecting
       // browser can re-show the modal rather than miss the broadcast.
       pendingUnlockUrl: session.pendingUnlock?.url ?? null,
+      plugins: pluginManager ? pluginManager.snapshot() : [],
     };
   }
   // Expose helpers so we can use them from /api/chat and from new endpoints later.
   const chatState = {
     bumpVersion, broadcast, setStatus, setPhase, setError, setTimeout: setTimeout_,
     updateTokens, resetTokens, appendChatEvent, patchChatEvent,
-    resetChatState, chatStateSnapshot,
+    resetChatState, chatStateSnapshot, clearConversation,
   };
 
   // Append-only project log at <project>/.code_boss/code-boss.log. Synchronous
@@ -3927,11 +4541,25 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
         }
       }
     } catch { /* migration is best-effort */ }
+    // Flush any pending save for the project we're leaving; otherwise the
+    // debounced write would land in the wrong directory.
+    if (_saveTimer) { clearTimeout(_saveTimer); _saveTimer = null; flushConversationSave(); }
+    // Reset in-memory chat state before loading the new project's so
+    // events from the previous project don't leak.
+    resetChatState();
     session.activeProject = p;
     session.recent = [p, ...session.recent.filter((x) => x !== p)].slice(0, MAX_RECENT);
     await saveRecentProjects(session.recent);
     logEvent('project-opened', { path: p });
     fileLog(`=== project opened: ${p} ===`);
+    // Restore the conversation from disk (if one was saved previously).
+    // Broadcast a snapshot so any connected browser swaps to the restored
+    // events instead of the empty post-reset state.
+    await loadConversation();
+    broadcast({ type: 'reset', version: bumpVersion() });
+    for (const ev of session.chatEvents) {
+      broadcast({ type: 'event', version: bumpVersion(), event: ev });
+    }
   }
   function logEvent(type, data) {
     const summary = (SUMMARIZE[type] ?? ((d) => JSON.stringify(d).slice(0, 200)))(data);
@@ -3949,6 +4577,19 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
     }
     return out;
   }
+
+  // Plugin manager. Detects which plugins should be active by running each
+  // plugin's trigger() against a PowerShell executor. Runs once immediately
+  // at startup (no delay per user spec) and re-runs every 5 minutes so
+  // newly-installed tools light up without a restart.
+  const pluginManager = createPluginManager({ onLog: (m) => fileLog(`[plugin] ${m}`) });
+  await pluginManager.detectAll();
+  const _pluginInterval = setInterval(() => {
+    pluginManager.detectAll().catch((e) => fileLog(`[plugin] detect error: ${e.message}`));
+  }, PLUGIN_REDETECT_MS);
+  // Don't keep the event loop alive just for the redetect timer — tests
+  // call server.close() and expect the process to exit.
+  if (typeof _pluginInterval.unref === 'function') _pluginInterval.unref();
 
   // Use a caller-provided adapter (e.g. the dev claude-code-headless adapter)
   // if given; otherwise default to a fresh production HTTP adapter.
@@ -4207,6 +4848,17 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
         chatState.resetChatState();
         return sendJson(res, 200, { ok: true, version: session.version });
       }
+      if (req.method === 'POST' && path === '/api/clear-conversation') {
+        // Wipes the persisted chat (in-memory + disk) for the active
+        // project. Different from /api/reset, which only resets in-memory
+        // state — clear also deletes the on-disk conversation file so it
+        // won't reload on next project open.
+        if (session.status === 'running') {
+          return sendJson(res, 409, { error: 'chat is running; cancel first' });
+        }
+        await chatState.clearConversation();
+        return sendJson(res, 200, { ok: true, version: session.version });
+      }
 
       // ── New chat-state endpoints ───────────────────────────────────────
       if (req.method === 'GET' && path === '/api/state') {
@@ -4422,24 +5074,80 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
             try { process.chdir(session.activeProject); cwdChanged = true; }
             catch (e) { throw new Error('cannot enter project directory: ' + e.message); }
             fileLog(`chat START: model=${model} q="${text.slice(0, 200).replace(/\s+/g, ' ')}"`);
-            const result = await runPromptedAgent({
-              adapter,
-              messages: [{ role: 'user', content: text }],
-              model,
-              projectDir: session.activeProject,
-              maxTurns: 20,
-              signal,
-              onChatEvent: (ev) => chatState.appendChatEvent(ev),
-              onPhase: (p) => chatState.setPhase(p),
-              onLog: (msg) => fileLog(msg),
-            });
+            // Review loop: run agent → review → if fail, feed back as a
+            // synthetic user message and re-run; max 2 rounds. If still
+            // failing after round 2, surface the issue to the user.
+            const REVIEW_MAX_ROUNDS = 2;
+            let round = 0;
+            let userMessage = text;
+            let emitInitialUserMessage = true;
+            let lastAgentResult = null;
+            while (true) {
+              const turnStartIdx = session.chatEvents.length;
+              const result = await runPromptedAgent({
+                adapter,
+                messages: [{ role: 'user', content: userMessage }],
+                model,
+                projectDir: session.activeProject,
+                maxTurns: 20,
+                signal,
+                onChatEvent: (ev) => chatState.appendChatEvent(ev),
+                onPhase: (p) => chatState.setPhase(p),
+                onLog: (msg) => fileLog(msg),
+                emitInitialUserMessage,
+                extraTools: pluginManager.enabledTools(),
+                extraVerbs: pluginManager.enabledVerbs(),
+                promptAdditions: pluginManager.promptAdditions(),
+              });
+              lastAgentResult = result;
+              const turnDur = Date.now() - chatStart;
+              fileLog(`chat round ${round + 1} done: terminated=${result.terminated} turns=${result.stats.turns} calls=${result.stats.toolCalls} duration=${turnDur}ms`);
+
+              // Fire the reviewer on what just happened. The review event
+              // is patched in place from 'pending' → 'pass'/'fail'/'escalate'.
+              chatState.setPhase('reviewing');
+              const reviewEv = chatState.appendChatEvent({
+                type: 'review',
+                state: 'pending',
+                round: round + 1,
+              });
+              const trajectory = buildReviewTrajectory(session.chatEvents.slice(turnStartIdx));
+              const review = await runReviewer({
+                adapter, model,
+                userRequest: text,            // always the ORIGINAL user request
+                trajectory,
+                finalText: result.content,
+                signal,
+                onLog: (msg) => fileLog(msg),
+              });
+
+              if (review.pass) {
+                chatState.patchChatEvent(reviewEv.id, { state: 'pass' });
+                break;
+              }
+              round++;
+              if (round >= REVIEW_MAX_ROUNDS) {
+                chatState.patchChatEvent(reviewEv.id, { state: 'escalate', concerns: review.concerns });
+                fileLog(`reviewer escalated after ${round} rounds: ${review.concerns.slice(0, 200)}`);
+                break;
+              }
+              chatState.patchChatEvent(reviewEv.id, { state: 'fail', concerns: review.concerns });
+              fileLog(`reviewer found issues round ${round}, feeding back: ${review.concerns.slice(0, 200)}`);
+              // Re-invoke with the reviewer's concerns as the next agent input.
+              // Suppress the user-message event since the review event itself
+              // already shows the feedback to the user.
+              userMessage = `The reviewer found issues with your last work:\n\n${review.concerns}\n\nPlease address these concerns.`;
+              emitInitialUserMessage = false;
+              chatState.setPhase('uploading');
+            }
             const dur = Date.now() - chatStart;
-            fileLog(`chat DONE: terminated=${result.terminated} turns=${result.stats.turns} calls=${result.stats.toolCalls} duration=${dur}ms`);
+            fileLog(`chat DONE (with review): rounds=${round + 1} duration=${dur}ms`);
             logEvent('agent_run', {
-              turns: result.stats.turns,
-              toolCalls: result.stats.toolCalls,
-              batches: result.stats.batches,
-              terminated: result.terminated,
+              turns: lastAgentResult.stats.turns,
+              toolCalls: lastAgentResult.stats.toolCalls,
+              batches: lastAgentResult.stats.batches,
+              terminated: lastAgentResult.terminated,
+              reviewRounds: round + 1,
             });
             chatState.setStatus('done');
           } catch (e) {
@@ -4655,7 +5363,17 @@ const UI_HTML = `<!DOCTYPE html>
      font, light gradient background, faint inset shadow from the top-left.
      The contextual \`.settings-row .btn\` / \`.settings-actions .btn\` rules
      below override these where finer tuning is needed; specificity wins. */
-  button { font: inherit; }
+  /* Strip OS button chrome from EVERY button — the faint inset shadow
+     from \`appearance: button\` was leaking through even on buttons that
+     set border/background, since those properties don't override the
+     UA's native rendering by themselves. Specific classes (.btn,
+     .modal-close, .settings-btn, .btn-sm) layer their look on top of
+     this clean slate. */
+  button {
+    font: inherit;
+    -webkit-appearance: none;
+    appearance: none;
+  }
   .btn {
     -webkit-appearance: none;
     appearance: none;
@@ -4950,6 +5668,16 @@ const UI_HTML = `<!DOCTYPE html>
     flex-shrink: 0;
     line-height: 1.55;
   }
+  .bubble.user .bubble-content {
+    flex: 1 1 auto;
+    min-width: 0;
+    word-wrap: break-word;
+  }
+  /* Trim default top/bottom margins on the FIRST/LAST markdown block so
+     the bubble stays compact when the user starts with a header or ends
+     with a list. */
+  .bubble.user .bubble-content > *:first-child { margin-top: 0; }
+  .bubble.user .bubble-content > *:last-child { margin-bottom: 0; }
   .bubble.system { color: var(--muted); font-size: 12.5px; margin: 12px 0; white-space: pre-wrap; }
 
   /* Dotted message rows (Claude Code style). */
@@ -4958,9 +5686,52 @@ const UI_HTML = `<!DOCTYPE html>
   .row .dot { flex-shrink: 0; line-height: 1.55; }
   .row.assistant .dot { color: var(--fg); }
   .row.tool .dot { color: #6cc46c; }
+  /* Blink the green dot while a tool call is in flight (no matching
+     tool-result yet). Added when the tool-call row renders, removed
+     when its tool-result event arrives. */
+  @keyframes tool-blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+  .row.tool.tool-running .dot { animation: tool-blink 0.7s ease-in-out infinite; }
   .row .body { flex: 1; white-space: pre-wrap; word-wrap: break-word; min-width: 0; }
   .row.tool .body { color: var(--fg); }
+  /* Expandable tool-call: click anywhere on the row to toggle the full
+     args (including filtered fields like find/replace/content). Mirrors
+     the result-row expansion pattern. */
+  .row.tool.expandable { cursor: pointer; }
+  .row.tool.expandable:hover > .body > :not(pre),
+  .row.tool.expandable:hover > .body { color: var(--accent); }
+  .row.tool .tool-call-full {
+    margin: 6px 0 0;
+    padding: 8px 12px;
+    background: #15140f;
+    border-left: 2px solid #2f2d27;
+    border-radius: 3px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 480px;
+    overflow-y: auto;
+    font-size: 12px;
+    color: var(--fg);
+    cursor: text;
+  }
   .body code { color: var(--accent); }
+  /* Inline markdown rendered by renderInline(). All rules are scoped to
+     .md so they don't leak into accidental h/ul/li elsewhere. */
+  .body strong { color: var(--fg); font-weight: 700; }
+  .body h3.md, .body h4.md, .body h5.md {
+    margin: 8px 0 2px;
+    font-weight: 700;
+    line-height: 1.3;
+    color: var(--fg);
+  }
+  .body h3.md { font-size: 15px; color: var(--accent); }
+  .body h4.md { font-size: 13.5px; }
+  .body h5.md { font-size: 12.5px; color: var(--muted); letter-spacing: 0.3px; text-transform: uppercase; }
+  .body ul.md {
+    margin: 4px 0 6px;
+    padding-left: 20px;
+  }
+  .body ul.md li { margin: 0 0 2px; }
+  .body ul.md li::marker { color: var(--accent); }
 
   /* Result row — "⎿ summary" sits under the body text of the tool row
      above (one char + gap to the right of the bullet column). Hanging
@@ -5039,22 +5810,26 @@ const UI_HTML = `<!DOCTYPE html>
   .task-wrap {
     position: relative;
     margin: 14px 0;
-    padding: 0 0 0 22px;     /* room on the left for the bracket */
+    padding: 0;                /* no inner indent — events stay aligned */
     border: none;
     background: transparent;
     overflow: visible;
   }
+  /* Bracket overhangs to the LEFT of the wrap so wrapping a task doesn't
+     shift its content — events sit at the same x whether inside a task
+     or outside. The 16px overhang lives in the gutter to the left of the
+     chat column (between the main padding and the .log content). */
   .task-wrap::before {
     content: '';
     position: absolute;
-    left: 4px;
-    top: 0.72em;             /* ~ vertical middle of the request line */
-    bottom: 0.65em;          /* ~ vertical middle of the summary line  */
-    width: 12px;
+    left: -16px;
+    top: 0.72em;               /* ~ vertical middle of the request line */
+    bottom: 0.65em;            /* ~ vertical middle of the summary line  */
+    width: 10px;
     border-left: 1.5px solid var(--accent);
     border-top: 1.5px solid var(--accent);
     border-bottom: 1.5px solid var(--accent);
-    border-radius: 10px 0 0 10px;
+    border-radius: 8px 0 0 8px;
     pointer-events: none;
     opacity: 0.55;
   }
@@ -5148,6 +5923,84 @@ const UI_HTML = `<!DOCTYPE html>
   }
   .task-end-marker .ur { color: var(--accent); font-weight: 600; }
 
+  /* Reviewer feedback row. Inline below the just-completed work.
+     States: pending (gray + animated ring), pass (green), fail (warn),
+     escalate (red). Layout: ring + label on one line, concerns prose
+     wraps into a child block beneath when present. */
+  .review-row {
+    display: grid;
+    grid-template-columns: 18px 1fr;
+    gap: 6px 8px;
+    margin: 10px 0;
+    padding: 6px 0;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .review-ring {
+    grid-row: 1;
+    grid-column: 1;
+    width: 18px;
+    height: 18px;
+    line-height: 18px;
+    text-align: center;
+    border-radius: 50%;
+    font-size: 12px;
+    font-weight: 700;
+    flex-shrink: 0;
+  }
+  .review-label {
+    grid-row: 1;
+    grid-column: 2;
+    align-self: center;
+    line-height: 1.4;
+  }
+  .review-concerns {
+    grid-row: 2;
+    grid-column: 2;
+    color: var(--fg);
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    background: var(--panel);
+    border-left: 2px solid currentColor;
+    border-radius: 3px;
+    padding: 6px 10px;
+    margin-top: 2px;
+    font-size: 12.5px;
+    line-height: 1.5;
+  }
+  /* pending — gray, dotted spinner ring */
+  .review-pending .review-ring {
+    color: var(--muted);
+    border: 1.5px dotted var(--muted);
+    animation: review-spin 1.8s linear infinite;
+  }
+  @keyframes review-spin { to { transform: rotate(360deg); } }
+  /* pass — green */
+  .review-pass {
+    color: #7bb070;
+  }
+  .review-pass .review-ring {
+    color: #7bb070;
+    border: 1.5px solid #7bb070;
+  }
+  /* fail — warn orange (we're fixing it) */
+  .review-fail {
+    color: var(--accent);
+  }
+  .review-fail .review-ring {
+    color: var(--accent);
+    border: 1.5px solid var(--accent);
+  }
+  /* escalate — red */
+  .review-escalate {
+    color: var(--error);
+  }
+  .review-escalate .review-ring {
+    color: var(--error);
+    border: 1.5px solid var(--error);
+  }
+
   /* Mute: applied to content the LLM no longer sees (results masked at tier 2,
      whole task at tier 3, whole project's children at tier 4). */
   .muted, .muted * { opacity: 0.42; }
@@ -5201,6 +6054,74 @@ const UI_HTML = `<!DOCTYPE html>
     padding: 4px 8px;
   }
   .input-row:focus-within { border-color: var(--accent); }
+  /* Queue button in the right gutter of the input. Visible only while the
+     agent is busy — clicking it (or pressing Enter) moves the textarea
+     contents into the pending-message queue above. */
+  .input-row .queue-btn {
+    flex-shrink: 0;
+    align-self: center;
+    background: transparent;
+    border: none;
+    color: var(--muted);
+    cursor: pointer;
+    padding: 4px;
+    margin-left: 2px;
+    line-height: 0;
+    border-radius: 3px;
+  }
+  .input-row .queue-btn:hover { color: var(--accent); background: var(--bg); }
+  .input-row .queue-btn svg { display: block; }
+  .input-row .queue-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  /* Pending-message queue above the input. Each row is one item; clicking
+     anywhere outside the play/delete buttons swaps the row's text with the
+     current input contents. */
+  .queue-stack {
+    max-width: 860px;
+    margin: 0 auto 6px;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+  .queue-stack:empty { display: none; }
+  .queue-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: var(--panel-alt);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 3px 4px 3px 10px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--muted);
+    cursor: pointer;
+    transition: border-color 0.1s, color 0.1s;
+  }
+  .queue-item:hover { border-color: var(--accent); color: var(--fg); }
+  .queue-item .queue-preview {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    line-height: 1.4;
+  }
+  .queue-item .queue-play,
+  .queue-item .queue-del {
+    flex-shrink: 0;
+    background: transparent;
+    border: none;
+    color: var(--muted);
+    cursor: pointer;
+    font-size: 12px;
+    line-height: 1;
+    padding: 3px 7px;
+    border-radius: 3px;
+  }
+  .queue-item .queue-play:hover:not(:disabled),
+  .queue-item .queue-del:hover { color: var(--accent); background: var(--bg); }
+  .queue-item .queue-play:disabled { opacity: 0.35; cursor: not-allowed; }
   .input-row::before {
     content: ">";
     color: var(--accent);
@@ -6005,8 +6926,26 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   </main>
 
   <footer>
+    <!-- Pending messages. Items only appear when the user pressed Enter
+         or clicked the queue button while the agent was busy. Each row
+         is a one-line preview + play (▶) + delete (×). Click the row to
+         swap with the input box. -->
+    <div class="queue-stack" id="queueStack"></div>
     <div class="input-row">
       <textarea id="input" placeholder="Ask…" rows="1"></textarea>
+      <button id="queueBtn"
+              class="queue-btn"
+              title="Add to queue — same as Enter while the agent is busy"
+              onclick="enqueueCurrentInput()"
+              style="display: none;">
+        <svg width="14" height="14" viewBox="0 0 14 14" fill="none"
+             stroke="currentColor" stroke-width="1.3"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M7 1.5 L7 6 M4.5 3.8 L7 6.3 L9.5 3.8"/>
+          <rect x="2" y="8.4" width="10" height="1.5" rx="0.4"/>
+          <rect x="2" y="11.1" width="10" height="1.5" rx="0.4"/>
+        </svg>
+      </button>
     </div>
     <div class="input-subbar">
       <span class="proj-path" id="projectPath" title="">(no project)</span>
@@ -6049,7 +6988,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
         <button class="btn" onclick="openSnapshot()">Snapshot</button>
         <button class="btn" onclick="openLog()">Log</button>
         <button class="btn" onclick="changeProject()">Change project…</button>
-        <button class="btn" onclick="resetSession()">Reset session</button>
+        <button class="btn" onclick="clearConversation()">Clear conversation</button>
       </div>
     </div>
   </div>
@@ -6659,7 +7598,19 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   function addBubble(role, text) {
     const div = document.createElement('div');
     div.className = 'bubble ' + role;
-    div.textContent = text;
+    // User bubbles use flex layout (\`>\` prefix via ::before, content
+    // beside it). Render markdown into a single child so any block
+    // elements (h3, ul, …) become one flex item, not many.
+    if (role === 'user') {
+      const content = document.createElement('div');
+      content.className = 'bubble-content';
+      content.innerHTML = renderInline(text);
+      div.appendChild(content);
+    } else if (role === 'assistant') {
+      div.innerHTML = renderInline(text);
+    } else {
+      div.textContent = text;
+    }
     $log.appendChild(div);
     // If the status row already exists (SSE 'status: running' often arrives
     // BEFORE the user-message event), keep it pinned to the bottom — without
@@ -6787,11 +7738,13 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     body.className = 'diff-body';
     const lines = String(ev.diff || '').split('\\n');
     for (const line of lines) {
+      // Skip the file-header lines (--- / +++) — the row above already
+      // names the file, repeating it here is just noise. Hunk markers
+      // (@@) and content lines stay.
+      if (line.startsWith('+++') || line.startsWith('---')) continue;
       const ln = document.createElement('div');
       ln.className = 'dl';
-      if (line.startsWith('+++') || line.startsWith('---')) {
-        ln.classList.add('hunk');
-      } else if (line.startsWith('@@')) {
+      if (line.startsWith('@@')) {
         ln.classList.add('hunk');
       } else if (line.startsWith('+')) {
         ln.classList.add('add');
@@ -6817,6 +7770,51 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     pinStatusToBottom();
     scrollToBottom();
     return block;
+  }
+
+  // Review event row. State transitions: 'pending' → 'pass' / 'fail' /
+  // 'escalate'. The whole .log re-renders on event-patch (see applyDelta
+  // case 'event-patch') so this function just builds the current state.
+  function addReviewRow(ev) {
+    const row = document.createElement('div');
+    row.className = 'review-row review-' + (ev.state || 'pending');
+    if (ev.round) row.dataset.round = ev.round;
+
+    const ring = document.createElement('span');
+    ring.className = 'review-ring';
+    // States — chosen so a screenshot still tells you what happened
+    // without the animation playing:
+    //   pending  → ◌ gray, dotted animated ring
+    //   pass     → ✓ green
+    //   fail     → ✗ orange/warn (we're going to fix it)
+    //   escalate → ⚠ red (we're giving up and surfacing to user)
+    if (ev.state === 'pass') ring.textContent = '✓';
+    else if (ev.state === 'fail') ring.textContent = '✗';
+    else if (ev.state === 'escalate') ring.textContent = '⚠';
+    else ring.textContent = '◌';
+    row.appendChild(ring);
+
+    const label = document.createElement('span');
+    label.className = 'review-label';
+    if (ev.state === 'pass') label.textContent = \`Review passed (round \${ev.round || 1})\`;
+    else if (ev.state === 'fail') label.textContent = \`Review found issues — handing back for fix (round \${ev.round || 1}):\`;
+    else if (ev.state === 'escalate') label.textContent = \`Reviewer still has concerns after \${ev.round || 2} attempts — your call:\`;
+    else label.textContent = \`Reviewing (round \${ev.round || 1})…\`;
+    row.appendChild(label);
+
+    if (ev.concerns && (ev.state === 'fail' || ev.state === 'escalate')) {
+      const concerns = document.createElement('div');
+      concerns.className = 'review-concerns';
+      // Render through renderInline so backtick/bold/etc. work in the
+      // reviewer's prose.
+      concerns.innerHTML = renderInline(String(ev.concerns));
+      row.appendChild(concerns);
+    }
+
+    $log.appendChild(row);
+    pinStatusToBottom();
+    scrollToBottom();
+    return row;
   }
 
   // Send a user message. Server pushes back the user-message event via SSE,
@@ -6847,9 +7845,51 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     catch (e) { showError('Cancel failed', e); }
   }
 
-  // Minimal inline rendering: \`code\` spans only (keep it terminal-plain).
+  // Minimal markdown rendering for assistant text. Supports:
+  //   - \`inline code\`
+  //   - **bold**
+  //   - # header   (## and ### map to smaller headers)
+  //   - - bullet / * bullet
+  // Anything else passes through with newlines preserved by the body's
+  // white-space: pre-wrap. Block elements (h, ul, li) carry their own
+  // line breaks so we omit \\n around them when reassembling.
   function renderInline(text) {
-    return escapeHtml(text).replace(/\`([^\`]+)\`/g, '<code>$1</code>');
+    const escaped = escapeHtml(text);
+    const lines = escaped.split('\\n');
+    const tokens = [];   // { kind: 'text' | 'block', value: string }
+    let inList = false;
+    const closeList = () => {
+      if (inList) { tokens.push({ kind: 'block', value: '</ul>' }); inList = false; }
+    };
+    for (const line of lines) {
+      const bullet = line.match(/^\\s*[-*]\\s+(.+)$/);
+      if (bullet) {
+        if (!inList) { tokens.push({ kind: 'block', value: '<ul class="md">' }); inList = true; }
+        tokens.push({ kind: 'block', value: '<li>' + bullet[1] + '</li>' });
+        continue;
+      }
+      closeList();
+      const h = line.match(/^(#{1,3})\\s+(.+)$/);
+      if (h) {
+        const lvl = h[1].length + 2;     // #=h3, ##=h4, ###=h5
+        tokens.push({ kind: 'block', value: \`<h\${lvl} class="md">\${h[2]}</h\${lvl}>\` });
+        continue;
+      }
+      tokens.push({ kind: 'text', value: line });
+    }
+    closeList();
+    // Join: keep \\n between adjacent text tokens (so pre-wrap renders the
+    // line break); blocks need no separator since they're already block.
+    let out = '';
+    for (let i = 0; i < tokens.length; i++) {
+      if (i > 0 && tokens[i].kind === 'text' && tokens[i - 1].kind === 'text') out += '\\n';
+      out += tokens[i].value;
+    }
+    // Inline passes — applied AFTER block extraction so they work inside
+    // both plain text and block-element bodies (e.g., bold in a header).
+    out = out.replace(/\\*\\*([^*]+)\\*\\*/g, '<strong>$1</strong>');
+    out = out.replace(/\`([^\`]+)\`/g, '<code>$1</code>');
+    return out;
   }
 
   // ── Mosaic snapshot ─────────────────────────────────────────────────────
@@ -7237,16 +8277,16 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     if (typeof _resizeTimer !== 'undefined') clearTimeout(_resizeTimer);
   }
 
-  async function resetSession() {
-    if (!confirm('Clear the chat and reset the snapshot log?')) return;
+  async function clearConversation() {
+    if (!confirm('Clear the conversation? This deletes the saved chat for this project — the agent won\\'t remember anything from before.')) return;
     try {
-      const r = await fetch('/api/reset', { method: 'POST' });
+      const r = await fetch('/api/clear-conversation', { method: 'POST' });
       if (!r.ok && r.status === 409) {
-        alert('Cannot reset while agent is running. Cancel first.');
+        alert('Cannot clear while agent is running. Cancel first.');
         return;
       }
-    } catch (e) { showError('Reset failed', e); }
-    // The server will broadcast a 'reset' delta that clears our render.
+    } catch (e) { showError('Clear failed', e); }
+    // The server broadcasts a 'reset' delta that wipes our render.
   }
 
   // ── SSE stream — pushes every server-side state change here ──
@@ -7411,6 +8451,9 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
         } else if (msg.status === 'done' || msg.status === 'error') {
           setDone();
           stopSpinTick();
+          // Defensive: any tool row still marked running (e.g., agent
+          // aborted mid-tool) should stop blinking now.
+          $log.querySelectorAll('.row.tool.tool-running').forEach((r) => r.classList.remove('tool-running'));
         } else {
           stopSpinTick();
         }
@@ -7596,33 +8639,73 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       case 'tool-call': {
         // Suppress next-task chrome from the chat — the just-closed task
         // gets a wrap right after, which conveys the switch by itself.
-        // Showing "next-task(user-request=..., summary=...)" + a follow-up
-        // result row that names the new task ID would label a task that
-        // hasn't ended yet, which is confusing.
         if ((ev.verb || ev.name) === 'next-task') break;
-        // Collapse multi-line arg values onto one display line. Replace
-        // newlines with a visible "↵ " marker so the user can see that the
-        // command had multiple lines, without the chat row breaking onto
-        // multiple lines with confusing indentation. Trim trailing newlines
-        // first so a single trailing \\n doesn't add a stray marker.
-        const fmtVal = (v) => String(v)
-          .replace(/\\s+$/, '')
-          .replace(/\\r?\\n/g, ' ↵ ')
-          .slice(0, 120);
-        const argStr = Object.entries(ev.args || {})
-          .filter(([k]) => k !== 'content')
-          .map(([k, v]) => \`\${k}=\${fmtVal(v)}\`)
-          .join(', ');
-        const body = addRow('tool', \`\${ev.verb || ev.name}(\${argStr})\`);
-        node = body.parentElement;
+        // Newlines → "↵ " marker so a multi-line command stays on one
+        // chat row instead of breaking with confusing indentation.
+        const fmtVal = (v) => String(v).replace(/\\s+$/, '').replace(/\\r?\\n/g, ' ↵ ');
+        // Args that are usually huge (file contents, find/replace bodies).
+        // The diff row right after an edit already shows what changed; the
+        // full text is available via the expand-on-click below.
+        const NOISY_ARG_KEYS = new Set(['content', 'find', 'replace']);
+        const args = ev.args || {};
+        const visibleArgs = Object.entries(args).filter(([k]) => !NOISY_ARG_KEYS.has(k));
+        let argStr;
+        if (visibleArgs.length === 1 && visibleArgs[0][0] === 'path') {
+          // Single-path tools (read, write, edit, list_dir): drop the
+          // \`path=\` prefix — \`edit(hello.txt)\` reads cleaner.
+          argStr = fmtVal(visibleArgs[0][1]);
+        } else {
+          argStr = visibleArgs.map(([k, v]) => \`\${k}=\${fmtVal(v)}\`).join(', ');
+        }
+        const verb = ev.verb || ev.name;
+        const fullLine = \`\${verb}(\${argStr})\`;
+        // Same cap for EVERY tool — was 120 per-arg, which gave
+        // edit(path=…, find=long, replace=long) ~360 chars but
+        // powershell(command=long) only 120 + the wrapper. Now both top
+        // out at the same width with a trailing "…" so the user knows
+        // there's more to see.
+        const TOOL_DISPLAY_MAX = 200;
+        const truncated = fullLine.length > TOOL_DISPLAY_MAX;
+        const display = truncated ? fullLine.slice(0, TOOL_DISPLAY_MAX - 1) + '…' : fullLine;
+        const body = addRow('tool', display);
+        const row = body.parentElement;
+        // Tag the row with its callId so the matching tool-result event
+        // can find it (to stop the blinking dot). Mark as running for
+        // now; the tool-result render below will clear the class once
+        // it arrives.
+        if (ev.callId) row.dataset.callId = ev.callId;
+        row.classList.add('tool-running');
+        // Filtered noisy args still exist on ev.args; surface them on
+        // click so the user can audit what a long powershell command or
+        // a multi-line edit actually contained.
+        const hasHidden = visibleArgs.length < Object.keys(args).length;
+        if (truncated || hasHidden) {
+          row.classList.add('expandable');
+          const pre = document.createElement('pre');
+          pre.className = 'tool-call-full';
+          pre.style.display = 'none';
+          // Pretty-print all args with their REAL multi-line content.
+          const fullArgs = Object.entries(args)
+            .map(([k, v]) => \`  \${k}: \${String(v)}\`)
+            .join('\\n\\n');
+          pre.textContent = \`\${verb}(\\n\${fullArgs}\\n)\`;
+          body.appendChild(pre);
+          row.addEventListener('click', (e) => {
+            if (e.target.tagName === 'PRE') return;   // text selection inside
+            pre.style.display = pre.style.display === 'none' ? 'block' : 'none';
+          });
+        }
+        node = row;
         break;
       }
       case 'tool-result': {
         // Pair with the next-task tool-call suppression above.
         if ((ev.verb || ev.name) === 'next-task') break;
-        // Use the row returned by addResultRow — $log.lastElementChild
-        // would be the status row (pinStatusToBottom runs inside addResultRow),
-        // so we'd otherwise tag the wrong element with data-task-id.
+        // The matching tool-call row's blinking dot should stop now.
+        if (ev.callId) {
+          const callRow = $log.querySelector(\`.row.tool[data-call-id="\${ev.callId}"]\`);
+          if (callRow) callRow.classList.remove('tool-running');
+        }
         node = addResultRow({
           status: ev.status,
           summary: summarizeResult(ev),
@@ -7632,6 +8715,9 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       }
       case 'diff':
         node = addDiffBlock({ diff: ev.diff || '', summary: ev.summary || '' });
+        break;
+      case 'review':
+        node = addReviewRow(ev);
         break;
     }
 
@@ -7733,12 +8819,105 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
 
   function applyControlsForStatus() {
     const running = session?.status === 'running';
-    // No Send button anymore — input is disabled while running, and Esc
-    // cancels. Placeholder text doubles as a hint about what Enter will do.
-    $input.disabled = running;
-    $input.placeholder = running ? 'Running… press Esc to interrupt' : 'Ask…';
+    // Input is NEVER disabled now — the user can compose at any time.
+    // While the agent is busy: Enter (or the queue button on the right)
+    // adds to the queue above. While idle: Enter submits as before.
+    $input.disabled = false;
+    $input.placeholder = running
+      ? 'Agent running — Enter to queue, Esc to stop'
+      : 'Ask…';
     if (!running) {
       try { $input.focus(); } catch {}
+    }
+    if ($queueBtn) $queueBtn.style.display = running ? '' : 'none';
+    renderQueue();        // play buttons enable/disable when status flips
+  }
+
+  // ── Pending-message queue ───────────────────────────────────────────────
+  // Holds text the user prepared while the agent was busy. Items don't
+  // auto-fire — the user explicitly clicks ▶ to send each one, or clicks
+  // a row to swap it back into the input box for editing. Memory only;
+  // dropped on page reload by design.
+  const $queueStack = document.getElementById('queueStack');
+  const $queueBtn   = document.getElementById('queueBtn');
+  let _inputQueue = [];     // [{ id, text }]
+  let _queueIdCounter = 0;
+
+  function enqueueText(text) {
+    text = (text ?? '').trim();
+    if (!text) return;
+    _inputQueue.push({ id: ++_queueIdCounter, text });
+    renderQueue();
+  }
+  function enqueueCurrentInput() {
+    const text = $input.value;
+    if (!text.trim()) return;
+    enqueueText(text);
+    $input.value = '';
+    autoGrowInput();
+    $input.focus();
+  }
+  function removeFromQueue(id) {
+    _inputQueue = _inputQueue.filter((q) => q.id !== id);
+    renderQueue();
+  }
+  function dispatchQueueItem(id) {
+    if (session?.status === 'running') return;     // button should be disabled anyway
+    const item = _inputQueue.find((q) => q.id === id);
+    if (!item) return;
+    removeFromQueue(id);
+    $input.value = item.text;
+    autoGrowInput();
+    send();
+  }
+  // Click a queue row → swap it with the current input contents. Lets the
+  // user resume an earlier draft without losing what they're typing now.
+  function swapQueueWithInput(id) {
+    const idx = _inputQueue.findIndex((q) => q.id === id);
+    if (idx === -1) return;
+    const item = _inputQueue[idx];
+    const currentText = $input.value;
+    if (currentText.trim()) {
+      _inputQueue[idx] = { id: ++_queueIdCounter, text: currentText };
+    } else {
+      _inputQueue.splice(idx, 1);
+    }
+    $input.value = item.text;
+    autoGrowInput();
+    renderQueue();
+    $input.focus();
+  }
+  function renderQueue() {
+    if (!$queueStack) return;
+    $queueStack.innerHTML = '';
+    const running = session?.status === 'running';
+    for (const item of _inputQueue) {
+      const row = document.createElement('div');
+      row.className = 'queue-item';
+      row.title = item.text;
+      row.onclick = () => swapQueueWithInput(item.id);
+
+      const preview = document.createElement('span');
+      preview.className = 'queue-preview';
+      preview.textContent = item.text.replace(/\\s+/g, ' ').slice(0, 200);
+      row.appendChild(preview);
+
+      const play = document.createElement('button');
+      play.className = 'queue-play';
+      play.textContent = '▶';
+      play.title = running ? 'Agent busy — wait or stop' : 'Send this message';
+      play.disabled = running;
+      play.onclick = (e) => { e.stopPropagation(); dispatchQueueItem(item.id); };
+      row.appendChild(play);
+
+      const del = document.createElement('button');
+      del.className = 'queue-del';
+      del.textContent = '×';
+      del.title = 'Remove';
+      del.onclick = (e) => { e.stopPropagation(); removeFromQueue(item.id); };
+      row.appendChild(del);
+
+      $queueStack.appendChild(row);
     }
   }
 
@@ -7777,7 +8956,13 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   $input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
-      if (!$input.disabled) send();
+      if (!$input.value.trim()) return;        // empty Enter = no-op
+      if (session?.status === 'running') {
+        // Agent busy → queue instead of submit. Stays composable.
+        enqueueCurrentInput();
+      } else {
+        send();
+      }
     }
   });
   // Auto-grow textarea: start at one line, grow with content up to its CSS
