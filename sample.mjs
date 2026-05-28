@@ -15,7 +15,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '65';
+const BUILD_VERSION = '73';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
@@ -1305,10 +1305,18 @@ const tools = {
         additionalProperties: false,
       },
     },
-    impl: async ({ path: p, content }) => {
+    impl: async ({ path: p, content }, ctx) => {
       if (typeof p !== 'string' || !p) throw new Error('path is required');
       if (typeof content !== 'string') throw new Error('content is required');
       const abs = path.isAbsolute(p) ? p : path.join(process.cwd(), p);
+      // Pre-write hook: server may insist the containing git repo be on
+      // a CODE_BOSS_* branch before we modify any file under it. If the
+      // hook throws or returns 'aborted', the user declined and the
+      // write should not happen.
+      if (typeof ctx?.requireBranch === 'function') {
+        const status = await ctx.requireBranch(abs);
+        if (status === 'aborted') throw new Error('write aborted: user declined to create a CODE_BOSS branch for this repo');
+      }
       let oldText = '';
       let existed = false;
       try { oldText = await readFile(abs, 'utf8'); existed = true; } catch {}
@@ -1341,11 +1349,16 @@ const tools = {
         additionalProperties: false,
       },
     },
-    impl: async ({ path: p, find, replace }) => {
+    impl: async ({ path: p, find, replace }, ctx) => {
       if (typeof p !== 'string' || !p) throw new Error('path is required');
       if (typeof find !== 'string') throw new Error('find is required');
       if (typeof replace !== 'string') throw new Error('replace is required');
       const abs = path.isAbsolute(p) ? p : path.join(process.cwd(), p);
+      // Same pre-write hook as write_file — see comment there.
+      if (typeof ctx?.requireBranch === 'function') {
+        const status = await ctx.requireBranch(abs);
+        if (status === 'aborted') throw new Error('edit aborted: user declined to create a CODE_BOSS branch for this repo');
+      }
       const oldText = await readFile(abs, 'utf8');
 
       // Find the string. Try exact match first; if that fails, try
@@ -2024,6 +2037,69 @@ async function isGitRepo(dir) {
   } catch { return false; }
 }
 
+// Directories we never recurse into when looking for nested git repos.
+// Same list the CODE-BOSS.md scanner uses, plus the obvious build outputs
+// where a vendored dependency might keep its own .git as a footgun.
+const GIT_SCAN_SKIP_DIRS = new Set([
+  '.git', '.hg', '.svn', '.code_boss', '.agent',
+  '.vs', '.idea', '.vscode',
+  'node_modules', 'bower_components',
+  'target', 'dist', 'build', 'out', 'bin', 'obj',
+  '__pycache__', '.gradle', '.mvn',
+]);
+
+/**
+ * Walk `rootDir` looking for git repositories. Returns an array of
+ * absolute repo paths. The root itself counts if it has a `.git`.
+ * Otherwise we descend until we hit one (recurses no deeper into a
+ * directory tree that contains its own `.git`).
+ *
+ * Bounded so a generated tree can't stall project open:
+ *   - max depth 5 below rootDir
+ *   - max 30 repos returned
+ */
+async function discoverGitRepos(rootDir, { maxDepth = 5, maxRepos = 30 } = {}) {
+  if (!rootDir) return [];
+  const { readdir } = await import('node:fs/promises');
+  const found = [];
+  async function walk(dir, depth) {
+    if (depth > maxDepth) return;
+    if (found.length >= maxRepos) return;
+    if (await isGitRepo(dir)) {
+      found.push(dir);
+      return;             // don't descend into a repo's subdirs for more repos
+    }
+    let entries;
+    try { entries = await readdir(dir, { withFileTypes: true }); }
+    catch { return; }
+    for (const e of entries) {
+      if (!e.isDirectory()) continue;
+      if (e.name.startsWith('.')) continue;
+      if (GIT_SCAN_SKIP_DIRS.has(e.name)) continue;
+      await walk(path.join(dir, e.name), depth + 1);
+      if (found.length >= maxRepos) return;
+    }
+  }
+  await walk(rootDir, 0);
+  return found;
+}
+
+/**
+ * Walk up from `filepath` looking for the containing git repo's root.
+ * Returns the repo's absolute path or null if no .git was found before
+ * reaching the filesystem root.
+ */
+async function findContainingRepo(filepath) {
+  if (!filepath) return null;
+  let dir = path.dirname(path.resolve(filepath));
+  while (true) {
+    if (await isGitRepo(dir)) return dir;
+    const parent = path.dirname(dir);
+    if (parent === dir) return null;   // hit fs root
+    dir = parent;
+  }
+}
+
 /**
  * Append a pattern to .git/info/exclude (git's local-only ignore file —
  * unlike .gitignore, this never gets committed). Used to make code_boss
@@ -2363,8 +2439,31 @@ function truncateAtFirstBlock(text) {
 // All match: optional "for context" prefix, a bracketed name, "said",
 // with flexible whitespace + punctuation. Conservative — only strips
 // lines that are JUST the marker (anchored ^...$).
-function sanitizeAssistantProse(text) {
+function sanitizeAssistantProse(text, opts = {}) {
   if (typeof text !== 'string' || !text) return text;
+  // Also strip tool-call-looking XML tags from the prose. The model
+  // sometimes "previews" what it's about to do by writing the tag in
+  // its narration before the actual <remote-workspace> block — so the
+  // chat shows the same call twice. We strip ONLY tags whose name is
+  // a known tool/task verb, so legitimate XML-content discussions
+  // (e.g. talking about a <library-ref> the user has in their pom)
+  // pass through untouched.
+  const extraVerbs = opts.extraVerbs || {};
+  const knownVerbs = new Set([
+    ...Object.keys(VERB_TO_TOOL),
+    ...Object.keys(extraVerbs),
+    ...TASK_VERBS,
+  ]);
+  if (knownVerbs.size > 0) {
+    const verbPattern = [...knownVerbs].sort((a, b) => b.length - a.length)
+      .map((v) => v.replace(/[-_]/g, (c) => '\\' + c)).join('|');
+    // Self-closing form: <verb ... />
+    text = text.replace(new RegExp(`<(?:${verbPattern})\\b[^>]*\\/>`, 'gi'), '');
+    // Body form: <verb ...>...</verb> — closer must match the opener
+    // (backref) so we don't stop at an inner closing tag like </find>
+    // inside an <edit>...</edit> block.
+    text = text.replace(new RegExp(`<(${verbPattern})\\b[^>]*>[\\s\\S]*?</\\1>`, 'gi'), '');
+  }
   const lines = text.split('\n');
   const out = [];
   for (const line of lines) {
@@ -2850,6 +2949,12 @@ async function runPromptedAgent({
   // return a commit hash string (or null). The hash is attached to the
   // closed task's record and included in the task-end chat event.
   onTaskClose,
+  // Pre-write hook handed to tools that mutate files (write_file,
+  // edit_file). Called as requireBranch(absPath) before the write,
+  // resolves to 'ok' to proceed or 'aborted' to cancel. The server's
+  // implementation pauses until the user resolves a CODE_BOSS-branch
+  // prompt for the file's containing repo.
+  requireBranch,
 }) {
   if (!projectDir) throw new Error('projectDir required for task-scoped agent');
 
@@ -2989,7 +3094,7 @@ async function runPromptedAgent({
       const finalText = truncateAtFirstBlock(text);
       if (finalText.trim()) {
         await store.appendMessage({ kind: 'assistant', role: 'assistant', content: finalText });
-        const cleaned = sanitizeAssistantProse(finalText);
+        const cleaned = sanitizeAssistantProse(finalText, { extraVerbs });
         if (cleaned) emitChat({ type: 'assistant-text', taskId: cur?.id, content: cleaned });
       }
       // Always check budgets before returning — even on the final turn — so
@@ -3009,7 +3114,7 @@ async function runPromptedAgent({
     const blockIdx = assistantText.search(/<remote-workspace>/i);
     const proseOnly = (blockIdx === -1 ? assistantText : assistantText.slice(0, blockIdx)).trim();
     if (proseOnly) {
-      const cleaned = sanitizeAssistantProse(proseOnly);
+      const cleaned = sanitizeAssistantProse(proseOnly, { extraVerbs });
       if (cleaned) emitChat({ type: 'assistant-text', taskId: cur?.id, content: cleaned });
     }
 
@@ -3084,6 +3189,9 @@ async function runPromptedAgent({
           // live-output view. tool-progress events are ephemeral (not
           // persisted — see appendChatEvent in src/server.mjs).
           onProgress: (chunk) => emitChat({ type: 'tool-progress', callId: c.id, chunk }),
+          // Pre-write hook for write_file / edit_file. Server pauses
+          // the tool here when the file's repo isn't yet on CODE_BOSS_*.
+          requireBranch,
         });
         if (typeof raw === 'string' && raw.startsWith('ERROR:')) {
           resultContent = raw;
@@ -5167,6 +5275,12 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
       plugins: pluginManager ? pluginManager.snapshot() : [],
       projectContextFiles: session.projectContextFiles || [],
       git: session.git || { isRepo: false },
+      // Surface pause-and-resolve state so the client can show the
+      // git-needs-branch modal (and tests can wait for it). Internal
+      // resolver Promises aren't serializable — strip to bare metadata.
+      gitPending: session.gitPending
+        ? Object.fromEntries(Object.entries(session.gitPending).map(([k, v]) => [k, { repoDir: k, currentBranch: v.currentBranch }]))
+        : null,
     };
   }
   // Expose helpers so we can use them from /api/chat and from new endpoints later.
@@ -5258,49 +5372,36 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
     await initGitWorkflow();
   }
   async function initGitWorkflow() {
-    session.git = { isRepo: false };
+    // Phase B: discover EVERY git repo under the active project (the
+    // project itself if it has .git, otherwise sub-repos one or more
+    // levels down). Each gets its own entry in session.git.repos with
+    // current branch + head cached. We don't create branches here —
+    // that happens lazily when a tool first writes to a file inside a
+    // given repo (see resolveBranchForRepo in /api/message), with a
+    // user-resolving modal for the non-CODE_BOSS case.
+    session.git = { isRepo: false, repos: {}, repoList: [] };
     if (!session.activeProject) return;
-    const dir = session.activeProject;
-    if (!(await isGitRepo(dir))) {
-      fileLog('git: project is not a git repo — branch workflow disabled');
+    const repoDirs = await discoverGitRepos(session.activeProject);
+    if (repoDirs.length === 0) {
+      fileLog('git: no git repos found under active project — workflow disabled');
       return;
     }
-    session.git = { isRepo: true, dir };
-    // code_boss's own state (.code_boss/, conversation.json) should not
-    // pollute the user's working tree from git's POV. Append to
-    // .git/info/exclude (local-only; never committed).
-    try {
-      const added = await ensureExcluded(dir, '.code_boss/', '.code_boss');
-      if (added) fileLog('git: added .code_boss/ to .git/info/exclude');
-    } catch (e) { fileLog(`git: could not update .git/info/exclude: ${e.message}`); }
-    const branch = await getCurrentBranch(dir);
-    const head = await getHeadHash(dir);
-    session.git.branch = branch;
-    session.git.head = head;
-    if (isCodeBossBranch(branch)) {
-      fileLog(`git: already on ${branch} (head=${head}) — reusing`);
-      return;
+    session.git.isRepo = true;
+    for (const dir of repoDirs) {
+      try {
+        const added = await ensureExcluded(dir, '.code_boss/', '.code_boss');
+        if (added) fileLog(`git: added .code_boss/ to ${dir}/.git/info/exclude`);
+      } catch (e) { fileLog(`git: could not update ${dir}/.git/info/exclude: ${e.message}`); }
+      const branch = await getCurrentBranch(dir);
+      const head = await getHeadHash(dir);
+      session.git.repos[dir] = { dir, branch, head };
+      session.git.repoList.push(dir);
     }
-    const status = await getStatus(dir);
-    if (status.dirty) {
-      // Dirty tree — branch creation deferred to the wizard. Until the
-      // wizard ships, we just flag it and continue. The agent can still
-      // work on the user's current branch; auto-commit will write there.
-      session.git.pendingWizard = {
-        currentBranch: branch,
-        changeCount: status.lines.length,
-      };
-      fileLog(`git: ${status.lines.length} uncommitted change(s) on '${branch}'; CODE_BOSS branch not created (wizard pending)`);
-      return;
-    }
-    const r = await createBranch(dir);
-    if (r.exitCode !== 0) {
-      fileLog(`git: failed to create branch '${r.branch}': ${r.stderr.trim() || 'exit ' + r.exitCode}`);
-      return;
-    }
-    session.git.branch = r.branch;
-    session.git.parentBranch = branch;  // remember where we forked from for later merge
-    fileLog(`git: created and checked out ${r.branch} (forked from ${branch} @ ${head})`);
+    const rel = (d) => path.relative(session.activeProject, d) || '.';
+    const summary = session.git.repoList
+      .map((d) => `${rel(d)}=${session.git.repos[d].branch}`)
+      .join(', ');
+    fileLog(`git: found ${repoDirs.length} repo(s): ${summary}`);
   }
   async function refreshProjectContext({ openLog = false } = {}) {
     if (!session.activeProject) {
@@ -5568,70 +5669,79 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
           git: session.git || { isRepo: false },
         });
       }
-      if (req.method === 'POST' && path === '/api/git-wizard-resolve') {
-        // Resolve the open-project git wizard. Body shape:
-        //   { action: 'manual' }
-        //     → close the wizard, leave the project on the user's branch
-        //       (no CODE_BOSS branch created; the user will commit by
-        //       hand and reopen). Returns 200 with the updated git state.
-        //   { action: 'commit', message: '...' }
-        //     → stage + commit with the provided message, then create
-        //       the CODE_BOSS_<ts> branch. Message required.
-        //   { action: 'commit', useAI: true }
-        //     → ask the LLM for a one-line commit subject based on
-        //       `git diff HEAD`, commit with that, then branch.
-        if (!session.git?.isRepo) return sendJson(res, 400, { error: 'no git repo' });
-        if (!session.git.pendingWizard) return sendJson(res, 400, { error: 'no pending wizard' });
+      if (req.method === 'POST' && path === '/api/git-pending-resolve') {
+        // Resolve a pre-write pause. Body:
+        //   { repoDir, action: 'manual' | 'codeboss', message?, useAI? }
+        //
+        // 'manual' → user took care of it externally (created the
+        //   CODE_BOSS branch by hand, or chose not to). We re-check the
+        //   branch state; if it's now CODE_BOSS_* we resolve with 'ok',
+        //   otherwise 'aborted' (the tool will throw and the agent
+        //   reacts to the error like any other tool failure).
+        // 'codeboss' → server stages whatever was uncommitted on the
+        //   user's current branch (if anything), commits it with the
+        //   given message (AI-generated if useAI=true), and forks a
+        //   CODE_BOSS_<timestamp> off the new HEAD. Resolves 'ok'.
         const raw = await readBody(req);
         let body; try { body = JSON.parse(raw); }
         catch { return sendJson(res, 400, { error: 'invalid JSON' }); }
-        const dir = session.git.dir;
+        const repoDir = body?.repoDir;
+        const pending = repoDir && session.gitPending?.[repoDir];
+        if (!pending) return sendJson(res, 400, { error: 'no pending wizard for that repo' });
+        const repo = session.git.repos[repoDir];
+
         if (body.action === 'manual') {
-          delete session.git.pendingWizard;
-          fileLog('git wizard: user chose manual commit; CODE_BOSS branch not created');
-          return sendJson(res, 200, { git: session.git });
+          const now = await getCurrentBranch(repoDir);
+          repo.branch = now;
+          repo.head = await getHeadHash(repoDir);
+          const result = isCodeBossBranch(now) ? 'ok' : 'aborted';
+          fileLog(`git pending: manual resolution; branch now ${now} → ${result}`);
+          pending.resolve(result);
+          delete session.gitPending[repoDir];
+          return sendJson(res, 200, { repoDir, branch: now, result });
         }
-        if (body.action !== 'commit') return sendJson(res, 400, { error: 'unknown action' });
-        // Stage everything FIRST. This way the AI sees untracked files
-        // too (git diff HEAD only shows tracked changes), and the
-        // commit path below is unconditional.
-        const add = await runGit(dir, ['add', '-A']);
-        if (add.exitCode !== 0) return sendJson(res, 500, { error: 'git add failed: ' + add.stderr });
+        if (body.action !== 'codeboss') return sendJson(res, 400, { error: 'unknown action' });
+
+        // codeboss: handle any uncommitted work first (commit it on the
+        // user's current branch), then fork a CODE_BOSS_ branch.
         let message = String(body.message || '').trim();
-        if (body.useAI) {
-          // --cached compares the index to HEAD; now that we've staged
-          // everything, it includes the new files the user hadn't tracked.
-          const diff = await runGit(dir, ['diff', '--cached', 'HEAD']);
-          const sample = (diff.stdout || '').slice(0, 12000);
-          if (!sample.trim()) return sendJson(res, 400, { error: 'no changes to summarize' });
-          try {
-            const r = await adapter.complete({
-              model: session.defaultModel,
-              messages: [
-                { role: 'system', content: 'You summarize git diffs into a single short imperative commit subject (max 70 chars). Respond with ONLY the subject line, no quotes, no prefix.' },
-                { role: 'user', content: `Diff:\n\n${sample}` },
-              ],
-            });
-            const text = (r?.choices?.[0]?.message?.content || '').trim();
-            message = text.split('\n')[0].slice(0, 72) || 'pre-existing changes';
-            fileLog(`git wizard: AI summary → "${message}"`);
-          } catch (e) {
-            return sendJson(res, 500, { error: 'AI summary failed: ' + e.message });
+        const initialStatus = await getStatus(repoDir);
+        if (initialStatus.dirty) {
+          const add = await runGit(repoDir, ['add', '-A']);
+          if (add.exitCode !== 0) return sendJson(res, 500, { error: 'git add failed: ' + add.stderr });
+          if (body.useAI) {
+            const diff = await runGit(repoDir, ['diff', '--cached', 'HEAD']);
+            const sample = (diff.stdout || '').slice(0, 12000);
+            if (!sample.trim()) return sendJson(res, 400, { error: 'no changes to summarize' });
+            try {
+              const r = await adapter.complete({
+                model: session.defaultModel,
+                messages: [
+                  { role: 'system', content: 'You summarize git diffs into a single short imperative commit subject (max 70 chars). Respond with ONLY the subject line, no quotes, no prefix.' },
+                  { role: 'user', content: `Diff:\n\n${sample}` },
+                ],
+              });
+              const text = (r?.choices?.[0]?.message?.content || '').trim();
+              message = text.split('\n')[0].slice(0, 72) || 'pre-existing changes';
+              fileLog(`git pending: AI summary → "${message}"`);
+            } catch (e) {
+              return sendJson(res, 500, { error: 'AI summary failed: ' + e.message });
+            }
           }
+          if (!message) return sendJson(res, 400, { error: 'message required when useAI is false and tree is dirty' });
+          const commit = await runGit(repoDir, ['commit', '-F', '-'], { input: message + '\n' });
+          if (commit.exitCode !== 0) return sendJson(res, 500, { error: 'git commit failed: ' + commit.stderr });
         }
-        if (!message) return sendJson(res, 400, { error: 'message required when useAI is false' });
-        const commit = await runGit(dir, ['commit', '-F', '-'], { input: message + '\n' });
-        if (commit.exitCode !== 0) return sendJson(res, 500, { error: 'git commit failed: ' + commit.stderr });
-        const preBranchHash = await getHeadHash(dir);
-        const parentBranch = session.git.branch;
-        const r = await createBranch(dir);
-        if (r.exitCode !== 0) return sendJson(res, 500, { error: 'branch creation failed: ' + r.stderr });
-        session.git.branch = r.branch;
-        session.git.parentBranch = parentBranch;
-        session.git.head = preBranchHash;
-        delete session.git.pendingWizard;
-        fileLog(`git wizard: committed (${preBranchHash}) + created ${r.branch} from ${parentBranch}`);
-        return sendJson(res, 200, { git: session.git, committedAs: preBranchHash, message });
+        const parentBranch = await getCurrentBranch(repoDir);
+        const newBranchRes = await createBranch(repoDir);
+        if (newBranchRes.exitCode !== 0) return sendJson(res, 500, { error: 'branch creation failed: ' + newBranchRes.stderr });
+        repo.parentBranch = parentBranch;
+        repo.branch = newBranchRes.branch;
+        repo.head = await getHeadHash(repoDir);
+        fileLog(`git pending: code_boss resolution; created ${newBranchRes.branch} from ${parentBranch}`);
+        pending.resolve('ok');
+        delete session.gitPending[repoDir];
+        return sendJson(res, 200, { repoDir, branch: newBranchRes.branch, result: 'ok' });
       }
       if (req.method === 'POST' && path === '/api/close-project') {
         session.activeProject = null;
@@ -5861,7 +5971,11 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
           'cache-control': 'no-cache, no-store',
           'connection': 'keep-alive',
         });
-        // Send full state once on connect so the browser has a starting point.
+        // Send the most recent 100 events on connect. Older events
+        // backfill via /api/events?before=<oldestId>&limit=50 when the
+        // client scrolls to the top (see maybeLoadOlder in ui.html).
+        // hasMoreOlder in the snapshot tells the client to keep the
+        // scroll-to-load hook armed.
         const initial = chatState.chatStateSnapshot({ eventLimit: 100 });
         res.write(`data: ${JSON.stringify({ type: 'init', version: session.version, session: initial })}\n\n`);
         // Subscribe to broadcasts.
@@ -5924,37 +6038,109 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
             // tagged with the just-closed task's id. Returns the new
             // commit's short hash, which the agent attaches to the
             // closed task in the store.
+            // Phase B: walk EVERY repo session.git.repos knows about.
+            // For each one currently on a CODE_BOSS_* branch with dirty
+            // changes, commit. Skip repos not on CODE_BOSS_* (the
+            // pre-write hook will have prompted the user already; if
+            // they declined we won't have any uncommitted CODE_BOSS
+            // work to commit on those).
+            const emitGitOp = async (repoDir, cmdLabel, taskId, run) => {
+              const callId = randomUUID();
+              const rel = nodePath.relative(session.activeProject, repoDir) || '.';
+              chatState.appendChatEvent({
+                type: 'tool-call', callId, verb: 'git', name: 'git',
+                args: { command: `[${rel}] ${cmdLabel}` }, taskId,
+              });
+              const r = await run();
+              const status = r.exitCode === 0 ? 'ok' : 'error';
+              const content = r.exitCode === 0
+                ? (r.stdout.trim() || '(ok)')
+                : (r.stderr.trim() || `exit ${r.exitCode}`);
+              chatState.appendChatEvent({
+                type: 'tool-result', callId, verb: 'git', name: 'git',
+                status, content, taskId,
+              });
+              return r;
+            };
             const gitAutoCommitHook = async ({ closedTaskId, userRequest, summary }) => {
-              if (!session.git?.isRepo || !isCodeBossBranch(session.git.branch)) return null;
-              const dir = session.git.dir;
+              if (!session.git?.isRepo) return null;
               const msg = buildCommitMessage({ summary, userRequest });
-              const emitOp = async (cmdLabel, run) => {
-                const callId = randomUUID();
-                chatState.appendChatEvent({
-                  type: 'tool-call', callId, verb: 'git', name: 'git',
-                  args: { command: cmdLabel }, taskId: closedTaskId,
-                });
-                const r = await run();
-                const status = r.exitCode === 0 ? 'ok' : 'error';
-                const content = r.exitCode === 0
-                  ? (r.stdout.trim() || '(ok)')
-                  : (r.stderr.trim() || `exit ${r.exitCode}`);
-                chatState.appendChatEvent({
-                  type: 'tool-result', callId, verb: 'git', name: 'git',
-                  status, content, taskId: closedTaskId,
-                });
-                return r;
-              };
-              const add = await emitOp('git add -A', () => runGit(dir, ['add', '-A']));
-              if (add.exitCode !== 0) return null;
-              // Pre-check: nothing to commit → silent no-op (don't even
-              // emit a git-commit row for the empty case — the chat
-              // stays clean for Q&A turns that don't touch files).
-              const status = await getStatus(dir);
-              if (!status.dirty) return null;
-              const commit = await emitOp('git commit -F -', () => runGit(dir, ['commit', '-F', '-'], { input: msg }));
-              if (commit.exitCode !== 0) return null;
-              return await getHeadHash(dir);
+              // Walk all repos. Commit each one on a CODE_BOSS_* branch
+              // with changes. Return the FIRST hash for the task store
+              // (we attach one commit hash per closed task — multi-repo
+              // commits will all be visible in the chat as separate
+              // tool-result rows).
+              let firstHash = null;
+              for (const repoDir of session.git.repoList) {
+                const repo = session.git.repos[repoDir];
+                // Refresh branch in case the user resolved a wizard mid-task.
+                repo.branch = await getCurrentBranch(repoDir);
+                if (!isCodeBossBranch(repo.branch)) {
+                  // Phase B gap: powershell + other tools that touch
+                  // files without going through the requireBranch hook
+                  // may have left changes in a repo we never paused on.
+                  // Surface those so the user notices and can commit
+                  // them manually.
+                  const status = await getStatus(repoDir);
+                  if (status.dirty) {
+                    const rel = nodePath.relative(session.activeProject, repoDir) || '.';
+                    chatState.appendChatEvent({
+                      type: 'git-uncommitted-warning',
+                      taskId: closedTaskId,
+                      repoDir, relDir: rel,
+                      branch: repo.branch,
+                      changeCount: status.lines.length,
+                      changes: status.lines.slice(0, 20),
+                    });
+                    fileLog(`autocommit warning: ${rel} on '${repo.branch}' has ${status.lines.length} uncommitted change(s) — not on CODE_BOSS_, skipping`);
+                  }
+                  continue;
+                }
+                const add = await emitGitOp(repoDir, 'git add -A', closedTaskId, () => runGit(repoDir, ['add', '-A']));
+                if (add.exitCode !== 0) continue;
+                const status = await getStatus(repoDir);
+                if (!status.dirty) continue;
+                const commit = await emitGitOp(repoDir, 'git commit -F -', closedTaskId, () => runGit(repoDir, ['commit', '-F', '-'], { input: msg }));
+                if (commit.exitCode !== 0) continue;
+                const hash = await getHeadHash(repoDir);
+                repo.head = hash;
+                if (!firstHash) firstHash = hash;
+              }
+              return firstHash;
+            };
+            // Pre-write hook: tools (write_file, edit_file) call this
+            // before modifying any file. If the file's containing repo
+            // is on a CODE_BOSS_* branch, proceed silently. Otherwise
+            // pause: emit a 'git-needs-branch' SSE delta with the repo
+            // info, register a Promise resolver on session.gitPending,
+            // and await /api/git-pending-resolve from the client.
+            const requireBranch = async (absPath) => {
+              if (!session.git?.isRepo) return 'ok';   // not a git workspace at all
+              const repoDir = await findContainingRepo(absPath);
+              if (!repoDir || !session.git.repos[repoDir]) return 'ok';   // outside any tracked repo
+              const repo = session.git.repos[repoDir];
+              // Always re-check the branch; the user might have
+              // resolved a prior wizard and put us on CODE_BOSS_*.
+              repo.branch = await getCurrentBranch(repoDir);
+              if (isCodeBossBranch(repo.branch)) return 'ok';
+              // Already pending for THIS repo? Wait on the same Promise.
+              const existing = session.gitPending?.[repoDir];
+              if (existing) return await existing.promise;
+              const rel = nodePath.relative(session.activeProject, repoDir) || '.';
+              fileLog(`git: pausing on ${rel} (currentBranch=${repo.branch}) — emitting git-needs-branch`);
+              session.gitPending = session.gitPending || {};
+              const pending = { currentBranch: repo.branch };
+              pending.promise = new Promise((resolve) => { pending.resolve = resolve; });
+              session.gitPending[repoDir] = pending;
+              chatState.broadcast({
+                type: 'git-needs-branch',
+                version: chatState.bumpVersion(),
+                repoDir, relDir: rel, currentBranch: repo.branch,
+              });
+              chatState.setPhase('paused');
+              const result = await pending.promise;
+              chatState.setPhase('thinking');
+              return result;
             };
             // Review loop: run agent → review → if fail, feed back as a
             // synthetic user message and re-run; max 2 rounds. If still
@@ -5982,19 +6168,24 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
                 promptAdditions: pluginManager.promptAdditions(),
                 projectContext: session.projectContext || '',
                 onTaskClose: gitAutoCommitHook,
+                requireBranch,
               });
               lastAgentResult = result;
               const turnDur = Date.now() - chatStart;
               fileLog(`chat round ${round + 1} done: terminated=${result.terminated} turns=${result.stats.turns} calls=${result.stats.toolCalls} duration=${turnDur}ms`);
 
-              // Skip the reviewer when the working tree is clean — Q&A
-              // turns, pure-read flows, and turns where the auto-commit
-              // already swept everything into a commit don't need
-              // review. Saves the LLM call.
+              // Skip the reviewer when ALL tracked repos are clean.
+              // Q&A turns, pure-read flows, and turns where the auto-
+              // commit already swept everything into commits don't
+              // need review. Saves the LLM call.
               if (session.git?.isRepo) {
-                const status = await getStatus(session.git.dir);
-                if (!status.dirty) {
-                  fileLog(`reviewer skipped: working tree clean`);
+                let anyDirty = false;
+                for (const repoDir of session.git.repoList) {
+                  const status = await getStatus(repoDir);
+                  if (status.dirty) { anyDirty = true; break; }
+                }
+                if (!anyDirty) {
+                  fileLog(`reviewer skipped: all repos clean`);
                   break;
                 }
               }
@@ -6939,10 +7130,28 @@ const UI_HTML = `<!DOCTYPE html>
   .status.hidden { display: none; }
 
   footer {
-    background: var(--panel);
-    border-top: 1px solid var(--border);
+    /* Continue the page bg straight into the footer — no panel tint,
+       no top border. The gradient strip below acts as the visual
+       separator and gives a fade as chat content scrolls toward the
+       input. */
+    background: var(--bg);
     padding: 10px 16px 8px;
     flex-shrink: 0;
+    position: relative;
+  }
+  /* Gradient fade sitting just above the input row. Anything in the
+     scrolling chat that approaches the bottom of \`main\` passes behind
+     this overlay and softens out before reaching the input. */
+  footer::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: -36px;
+    height: 36px;
+    background: linear-gradient(to bottom, transparent, var(--bg));
+    pointer-events: none;
+    z-index: 1;
   }
   .input-row {
     max-width: 860px;
@@ -8333,108 +8542,103 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     if (ok && typeof openSettings === 'function') openSettings();   // re-open settings with the new prefix
   }
 
-  // Git wizard for the "uncommitted changes on a non-CODE_BOSS branch"
-  // case. Returns true if the wizard was resolved (manual OR commit), or
-  // false if the user closed the modal without choosing — in which case
-  // the caller should abort the open flow.
-  function showGitWizard(gitState) {
+  // Mid-task git-branch prompt. Fired from the SSE 'git-needs-branch'
+  // handler when the agent is paused at a write_file/edit_file that
+  // wants to touch a file inside a repo that isn't on a CODE_BOSS_*
+  // branch. The user picks: let Code Boss branch (with optional AI
+  // commit message for any pre-existing uncommitted work) OR do it
+  // themselves and click "I've handled it" to retry.
+  function showGitBranchPrompt({ repoDir, relDir, currentBranch }) {
     const $bg = document.getElementById('gitWizardBg');
     const $body = document.getElementById('gitWizardBody');
-    const w = gitState.pendingWizard || {};
-    return new Promise((resolve) => {
-      $body.innerHTML = \`
-        <p style="margin: 0 0 12px; color: var(--fg); font-size: 13px;">
-          Your project has <strong>\${w.changeCount}</strong> uncommitted change\${w.changeCount === 1 ? '' : 's'} on
-          <code>\${escapeHtml(w.currentBranch || '?')}</code>. Code Boss works on a
-          dedicated <code>CODE_BOSS_*</code> branch — we'll create one after
-          these changes are resolved.
+    $body.innerHTML = \`
+      <p style="margin: 0 0 12px; color: var(--fg); font-size: 13px;">
+        Code Boss is paused on a write to <code>\${escapeHtml(relDir || '.')}</code>.
+        That repo is on <code>\${escapeHtml(currentBranch || '?')}</code> — Code Boss
+        only writes on a <code>CODE_BOSS_*</code> branch.
+      </p>
+      <div class="settings-row" style="align-items: flex-start;">
+        <label style="display:flex; gap:6px; align-items:center; cursor:pointer;">
+          <input type="radio" name="gw-action" value="codeboss" checked>
+          <span>Let Code Boss create the branch</span>
+        </label>
+      </div>
+      <div id="gw-commit-opts" style="margin: 4px 0 8px 24px;">
+        <p style="margin: 0 0 6px; color: var(--muted); font-size: 12px;">
+          If the working tree is dirty, Code Boss will commit any uncommitted
+          changes on <code>\${escapeHtml(currentBranch || '?')}</code> before branching.
         </p>
-        <div class="settings-row" style="align-items: flex-start;">
-          <label style="display:flex; gap:6px; align-items:center; cursor:pointer;">
-            <input type="radio" name="gw-action" value="commit" checked>
-            <span>Let Code Boss commit them</span>
-          </label>
-        </div>
-        <div id="gw-commit-opts" style="margin: 4px 0 8px 24px;">
-          <label style="display:flex; gap:6px; align-items:center; cursor:pointer; margin-bottom: 4px;">
-            <input type="checkbox" id="gw-use-ai" checked>
-            <span>Generate description with AI</span>
-          </label>
-          <textarea id="gw-msg" rows="3" placeholder="Commit message…"
-                    style="display:none; width:100%; box-sizing:border-box; padding:6px 8px; border:1px solid var(--border); background:var(--panel-alt); color:var(--fg); border-radius:4px; font:inherit; resize:vertical;"></textarea>
-        </div>
-        <div class="settings-row" style="align-items: flex-start;">
-          <label style="display:flex; gap:6px; align-items:center; cursor:pointer;">
-            <input type="radio" name="gw-action" value="manual">
-            <span>I'll commit them manually first</span>
-          </label>
-        </div>
-        <p id="gw-msg-err" style="margin: 8px 0 0; color: var(--error); font-size: 12px; min-height: 14px;"></p>
-        <div style="display:flex; gap:8px; justify-content:flex-end; margin-top: 14px;">
-          <button id="gw-cancel" class="btn">Cancel</button>
-          <button id="gw-submit" class="btn primary">Continue</button>
-        </div>
-      \`;
-      $bg.classList.add('show');
+        <label style="display:flex; gap:6px; align-items:center; cursor:pointer; margin-bottom: 4px;">
+          <input type="checkbox" id="gw-use-ai" checked>
+          <span>Generate commit message with AI</span>
+        </label>
+        <textarea id="gw-msg" rows="3" placeholder="Commit message (only used if there are uncommitted changes)…"
+                  style="display:none; width:100%; box-sizing:border-box; padding:6px 8px; border:1px solid var(--border); background:var(--panel-alt); color:var(--fg); border-radius:4px; font:inherit; resize:vertical;"></textarea>
+      </div>
+      <div class="settings-row" style="align-items: flex-start;">
+        <label style="display:flex; gap:6px; align-items:center; cursor:pointer;">
+          <input type="radio" name="gw-action" value="manual">
+          <span>I'll handle the branch myself, then click Continue</span>
+        </label>
+      </div>
+      <p id="gw-msg-err" style="margin: 8px 0 0; color: var(--error); font-size: 12px; min-height: 14px;"></p>
+      <div style="display:flex; gap:8px; justify-content:flex-end; margin-top: 14px;">
+        <button id="gw-submit" class="btn primary">Continue</button>
+      </div>
+    \`;
+    $bg.classList.add('show');
 
-      const $useAI = document.getElementById('gw-use-ai');
-      const $msg = document.getElementById('gw-msg');
-      const $err = document.getElementById('gw-msg-err');
-      const $commitOpts = document.getElementById('gw-commit-opts');
-      const $submit = document.getElementById('gw-submit');
-      const $cancel = document.getElementById('gw-cancel');
+    const $useAI = document.getElementById('gw-use-ai');
+    const $msg = document.getElementById('gw-msg');
+    const $err = document.getElementById('gw-msg-err');
+    const $commitOpts = document.getElementById('gw-commit-opts');
+    const $submit = document.getElementById('gw-submit');
 
-      function syncCommitOptsVisibility() {
-        const action = document.querySelector('input[name="gw-action"]:checked')?.value;
-        $commitOpts.style.display = action === 'commit' ? '' : 'none';
-      }
-      function syncMsgVisibility() {
-        $msg.style.display = $useAI.checked ? 'none' : 'block';
-      }
-      document.querySelectorAll('input[name="gw-action"]').forEach((r) => r.addEventListener('change', syncCommitOptsVisibility));
-      $useAI.addEventListener('change', syncMsgVisibility);
-      syncCommitOptsVisibility();
-      syncMsgVisibility();
+    function syncCommitOptsVisibility() {
+      const action = document.querySelector('input[name="gw-action"]:checked')?.value;
+      $commitOpts.style.display = action === 'codeboss' ? '' : 'none';
+    }
+    function syncMsgVisibility() { $msg.style.display = $useAI.checked ? 'none' : 'block'; }
+    document.querySelectorAll('input[name="gw-action"]').forEach((r) => r.addEventListener('change', syncCommitOptsVisibility));
+    $useAI.addEventListener('change', syncMsgVisibility);
+    syncCommitOptsVisibility(); syncMsgVisibility();
 
-      function done(result) {
-        $bg.classList.remove('show');
-        $body.innerHTML = '';
-        resolve(result);
-      }
-      $cancel.onclick = () => done(false);
-      $submit.onclick = async () => {
-        $err.textContent = '';
-        const action = document.querySelector('input[name="gw-action"]:checked')?.value;
-        let body;
-        if (action === 'manual') {
-          body = { action: 'manual' };
-        } else {
-          if ($useAI.checked) {
-            body = { action: 'commit', useAI: true };
-          } else {
-            const msg = $msg.value.trim();
-            if (!msg) { $err.textContent = 'Please enter a commit message or check "Generate description with AI".'; return; }
-            body = { action: 'commit', message: msg };
-          }
+    function close() {
+      $bg.classList.remove('show');
+      $body.innerHTML = '';
+    }
+    $submit.onclick = async () => {
+      $err.textContent = '';
+      const action = document.querySelector('input[name="gw-action"]:checked')?.value;
+      let body = { repoDir };
+      if (action === 'manual') {
+        body.action = 'manual';
+      } else {
+        body.action = 'codeboss';
+        if ($useAI.checked) body.useAI = true;
+        else {
+          const msg = $msg.value.trim();
+          if (msg) body.message = msg;
+          // message-required-when-dirty enforcement happens server-side
         }
-        $submit.disabled = true; $cancel.disabled = true;
-        $submit.textContent = body.useAI ? 'Generating + committing…' : (action === 'manual' ? 'Continuing…' : 'Committing…');
-        try {
-          const r = await fetch('/api/git-wizard-resolve', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify(body),
-          });
-          const data = await r.json();
-          if (!r.ok) throw new Error(data.error ?? ('HTTP ' + r.status));
-          done(true);
-        } catch (e) {
-          $submit.disabled = false; $cancel.disabled = false;
-          $submit.textContent = 'Continue';
-          $err.textContent = 'Failed: ' + e.message;
-        }
-      };
-    });
+      }
+      $submit.disabled = true;
+      $submit.textContent = body.useAI ? 'Generating + committing…' : 'Continuing…';
+      try {
+        const r = await fetch('/api/git-pending-resolve', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error ?? ('HTTP ' + r.status));
+        close();
+      } catch (e) {
+        $submit.disabled = false;
+        $submit.textContent = 'Continue';
+        $err.textContent = 'Failed: ' + e.message;
+      }
+    };
   }
 
   // Tracks the most-recent project so the folder picker starts at its
@@ -8617,14 +8821,10 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       // and model dropdown may differ per environment).
       _initialized = false;
       _pendingSession = null;
-      // Git wizard: if opening surfaced uncommitted changes on a non-
-      // CODE_BOSS branch, server set pendingWizard. Resolve it BEFORE
-      // initialize() so the agent never starts work on top of dirty
-      // bytes the user didn't ask us to touch.
-      if (data.git?.pendingWizard) {
-        const resolved = await showGitWizard(data.git);
-        if (!resolved) return;     // user closed the wizard outright
-      }
+      // Phase B: no open-time git wizard. The "needs a CODE_BOSS
+      // branch" prompt fires mid-task, when a write/edit tool needs
+      // to touch a file inside a non-CODE_BOSS repo. See the
+      // git-needs-branch SSE handler.
       await initialize(p);
     } catch (e) {
       showError('Could not open project', e);
@@ -8932,6 +9132,35 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       row.appendChild(concerns);
     }
 
+    $log.appendChild(row);
+    pinStatusToBottom();
+    scrollToBottom();
+    return row;
+  }
+
+  // Inline warning when the task-close auto-commit found a repo that
+  // had changes but wasn't on a CODE_BOSS_* branch (so we couldn't
+  // commit it). Typically means a tool like powershell touched files
+  // outside the pre-write hook's reach.
+  function addUncommittedWarningRow(ev) {
+    const row = document.createElement('div');
+    row.className = 'review-row review-fail';   // reuse the warn-orange styling
+    const ring = document.createElement('span');
+    ring.className = 'review-ring';
+    ring.textContent = '⚠';
+    row.appendChild(ring);
+    const label = document.createElement('span');
+    label.className = 'review-label';
+    label.textContent = \`Uncommitted changes in \${ev.relDir || '?'} on \${ev.branch || '?'} — not on a CODE_BOSS branch, so they weren't auto-committed.\`;
+    row.appendChild(label);
+    if (Array.isArray(ev.changes) && ev.changes.length > 0) {
+      const list = document.createElement('div');
+      list.className = 'review-concerns';
+      const lines = ev.changes.map((c) => \`\${c.status}  \${c.path}\`);
+      if (ev.changeCount > ev.changes.length) lines.push(\`… +\${ev.changeCount - ev.changes.length} more\`);
+      list.textContent = lines.join('\\n');
+      row.appendChild(list);
+    }
     $log.appendChild(row);
     pinStatusToBottom();
     scrollToBottom();
@@ -9651,6 +9880,13 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
           $initModalBg.classList.remove('show');
         }
         break;
+      case 'git-needs-branch':
+        // Mid-task pause: the agent's about to write to a file inside
+        // a repo that isn't on a CODE_BOSS_ branch. The agent's tool
+        // is awaiting our /api/git-pending-resolve POST.
+        console.log('[sse] git-needs-branch', msg.repoDir);
+        showGitBranchPrompt({ repoDir: msg.repoDir, relDir: msg.relDir, currentBranch: msg.currentBranch });
+        break;
     }
     // Some compaction events the server emits as regular chat events via
     // appendChatEvent — they show up as msg.type === 'event' with the inner
@@ -9801,7 +10037,10 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
           argStr = visibleArgs.map(([k, v]) => \`\${k}=\${fmtVal(v)}\`).join(', ');
         }
         const verb = ev.verb || ev.name;
-        const fullLine = \`\${verb}(\${argStr})\`;
+        // Drop the parens entirely when there are no meaningful args
+        // (visibleArgs is empty, or the single arg's value is blank).
+        // \`wl(args=)\` reads worse than just \`wl\`.
+        const fullLine = argStr.trim() === '' ? verb : \`\${verb}(\${argStr})\`;
         // Same cap for EVERY tool — was 120 per-arg, which gave
         // edit(path=…, find=long, replace=long) ~360 chars but
         // powershell(command=long) only 120 + the wrapper. Now both top
@@ -9878,6 +10117,9 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
         break;
       case 'review':
         node = addReviewRow(ev);
+        break;
+      case 'git-uncommitted-warning':
+        node = addUncommittedWarningRow(ev);
         break;
     }
 
