@@ -15,7 +15,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '73';
+const BUILD_VERSION = '74';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
@@ -272,7 +272,12 @@ function createHttpAdapter(opts = {}) {
     if (!request || !Array.isArray(request.messages)) {
       throw new TypeError('complete: request.messages is required');
     }
-    const body = { ...request, stream: false };
+    // signal is an AbortSignal — pull it off the request before
+    // stringifying the body (signal can't survive JSON), then thread it
+    // through to fetch so /api/cancel aborts the in-flight HTTP call
+    // instead of waiting for the model to finish.
+    const { signal, ...rest } = request;
+    const body = { ...rest, stream: false };
     if (debug) {
       const flow = summarizeRequestToolFlow(body);
       console.error(`[http>] complete  tools=[${flow.toolDefs.join(',')}]`);
@@ -284,7 +289,7 @@ function createHttpAdapter(opts = {}) {
     // shares its messages array by reference and will mutate it after the
     // call returns. Without this clone, snapshots show a misleading body.
     const requestSnapshot = JSON.parse(JSON.stringify(body));
-    const res = await safeFetch('/chat/completions', { method: 'POST', body: JSON.stringify(body) });
+    const res = await safeFetch('/chat/completions', { method: 'POST', body: JSON.stringify(body), signal });
     const json = await res.json();
     onTransaction({ type: 'chat_completions', request: requestSnapshot, response: json, durationMs: Date.now() - t0 });
     if (debug) {
@@ -305,7 +310,8 @@ function createHttpAdapter(opts = {}) {
       throw new TypeError('completeStream: request.messages is required');
     }
     const t0 = Date.now();
-    const body = { ...request, stream: true };
+    const { signal: streamSignal, ...streamRest } = request;
+    const body = { ...streamRest, stream: true };
     // Snapshot the request BEFORE we wire stream:true on, so the captured
     // transaction shows what the agent actually passed in (without the
     // streaming flag we added internally).
@@ -353,7 +359,7 @@ function createHttpAdapter(opts = {}) {
     };
 
     try {
-      const res = await safeFetch('/chat/completions', { method: 'POST', body: JSON.stringify(body) });
+      const res = await safeFetch('/chat/completions', { method: 'POST', body: JSON.stringify(body), signal: streamSignal });
 
       // Graceful fallback: if the endpoint ignored stream:true and returned a
       // normal JSON completion (some managed platforms do), yield it as a single
@@ -1456,6 +1462,22 @@ const tools = {
           }
         }, timeout);
 
+        // User-initiated cancel (esc / /api/cancel) — kill the child
+        // tree immediately so the agent doesn't sit waiting for a long-
+        // running mvn / git clone / etc. to finish before noticing the
+        // abort. Same taskkill /T trick as the timeout path.
+        let cancelled = false;
+        const onAbort = () => {
+          cancelled = true;
+          if (child.pid) {
+            try { spawn('taskkill', ['/F', '/T', '/PID', String(child.pid)], { windowsHide: true }); } catch {}
+          }
+        };
+        if (ctx?.signal) {
+          if (ctx.signal.aborted) onAbort();
+          else ctx.signal.addEventListener('abort', onAbort, { once: true });
+        }
+
         child.stdout.on('data', (d) => {
           const s = d.toString('utf8');
           if (stdout.length < BASH_MAX_OUTPUT_CHARS * 2) stdout += s;
@@ -1475,13 +1497,16 @@ const tools = {
         child.on('close', (code, signal) => {
           if (settled) return; settled = true;
           clearTimeout(timer);
+          if (ctx?.signal) ctx.signal.removeEventListener('abort', onAbort);
           if (progressTimer) { clearTimeout(progressTimer); flushProgress(); }
           const elapsed = Date.now() - t0;
           const outTrunc = stdout.length > BASH_MAX_OUTPUT_CHARS;
           const errTrunc = stderr.length > BASH_MAX_OUTPUT_CHARS;
           const outBody = outTrunc ? (stdout.slice(0, BASH_MAX_OUTPUT_CHARS) + `\n[...${stdout.length - BASH_MAX_OUTPUT_CHARS} more chars truncated]`) : stdout;
           const errBody = errTrunc ? (stderr.slice(0, BASH_MAX_OUTPUT_CHARS) + `\n[...${stderr.length - BASH_MAX_OUTPUT_CHARS} more chars truncated]`) : stderr;
-          const header = timedOut
+          const header = cancelled
+            ? `command canceled by user after ${elapsed}ms`
+            : timedOut
             ? `command timed out after ${timeout}ms (killed)`
             : `exit ${code ?? '?'}${signal ? ` (signal ${signal})` : ''} in ${elapsed}ms`;
           // On timeout, nudge the model toward a faster variant rather
@@ -2955,6 +2980,12 @@ async function runPromptedAgent({
   // implementation pauses until the user resolves a CODE_BOSS-branch
   // prompt for the file's containing repo.
   requireBranch,
+  // Returns { user, token } for plugins that need to hit the configured
+  // GitLab API (e.g. wl's documentation fetchers). Token never reaches
+  // the model — the plugin's impl calls the GitLab client and only the
+  // result content goes into the chat. Optional; plugins handle the
+  // missing case themselves.
+  getGitLabCredentials,
 }) {
   if (!projectDir) throw new Error('projectDir required for task-scoped agent');
 
@@ -3192,6 +3223,12 @@ async function runPromptedAgent({
           // Pre-write hook for write_file / edit_file. Server pauses
           // the tool here when the file's repo isn't yet on CODE_BOSS_*.
           requireBranch,
+          // User-initiated cancel. Tools that block on long-running
+          // children (powershell) listen for this to kill the process
+          // tree instead of running to natural completion.
+          signal,
+          // GitLab credentials accessor (used by wl docs tools, etc).
+          getGitLabCredentials,
         });
         if (typeof raw === 'string' && raw.startsWith('ERROR:')) {
           resultContent = raw;
@@ -3470,10 +3507,12 @@ function clip(s, n) {
 
 // Per-user wl config script. wl reads this on every invocation.
 const WL_CONFIG_PATH = path.join(homedir(), 'myWlSetup.bat');
-// The wl tool's source + user guide live in a git repo. Clone it into a
-// scratch directory and read files normally; git credentials are already
-// configured on the dev machine.
-const WL_REPO_URL = 'https://git-oci.int.dmdc.osd.mil/incubator/sandbox/weblogicdesktopscripts';
+// The wl tool's source + user guide live in a self-hosted GitLab repo.
+// We fetch files/trees over the GitLab v4 API rather than cloning —
+// cloning prompts for credentials in non-interactive shells, and pulls
+// down megabytes for files the agent reads once.
+const WL_GIT_SERVER = 'https://git-oci.int.dmdc.osd.mil';
+const WL_DOCS_REPO  = 'incubator/sandbox/weblogicdesktopscripts';
 
 const WL_PROMPT = `
 The "wl" command is available in this environment. It is a developer wrapper
@@ -3513,24 +3552,37 @@ For help, run wl with no args:
 Further reference, if you need it:
   - User config (env, sync region, aliases): ${WL_CONFIG_PATH}
     (use <read path="${WL_CONFIG_PATH}"/> to inspect)
-  - Source + user guide live in a git repo (developer creds already
-    set up on PATH; no auth dance needed):
-      ${WL_REPO_URL}
-    To browse without cluttering the project, clone into a scratch
-    dir and read normally. Example:
-      <powershell>git clone --depth 1 ${WL_REPO_URL} $env:TEMP\\wlscripts</powershell>
-      <list path="$env:TEMP\\wlscripts"/>
-      <read path="$env:TEMP\\wlscripts\\README.md"/>
-    The user guide is a .docx in the repo — use read_docx (from the
-    docx plugin) for that.
+  - wl source + user guide live in a remote GitLab repo. Do NOT git clone
+    — use the dedicated docs tools below. They hit the GitLab API and
+    return only what you ask for:
+      <wl_list_docs path=""/>          list repo root
+      <wl_list_docs path="docs"/>      list a subdir
+      <wl_read_doc  path="README.md"/> read a single file
+    Binary docs (.docx user guide) come back as a saved temp file path
+    — pass that path to read_docx to extract text.
 `.trim();
+
+function buildGitLabClient(ctx) {
+  const getCreds = ctx?.getGitLabCredentials;
+  if (typeof getCreds !== 'function') {
+    throw new Error('GitLab credentials accessor not available in this run');
+  }
+  return createGitLabClient({
+    serverUrl: WL_GIT_SERVER,
+    getCredentials: () => {
+      const c = getCreds();
+      if (!c?.token) {
+        throw new Error('GitLab credentials not set. Open settings (gear icon) and add a GitLab username + token.');
+      }
+      return c;
+    },
+  });
+}
 
 const wlPlugin = {
   name: 'wl',
   description: 'WebLogic developer tool — wraps git/maven actions across project apps and shared libs',
   async trigger(executor) {
-    // Get-Command returns the command object when present, nothing when not.
-    // Pipe to Out-Null + check $? for a clean boolean.
     try {
       const r = await executor.run(
         'if (Get-Command wl -ErrorAction SilentlyContinue) { "yes" } else { "no" }'
@@ -3541,96 +3593,165 @@ const wlPlugin = {
     }
   },
   promptAddition: WL_PROMPT,
-  tools: [{
-    verb: 'wl',
-    name: 'wl',
-    schema: {
-      description: 'Run a wl (WebLogic developer) command from the workspace directory. The tool runs in the active project\'s directory (which IS the workspace — apps and sharedlibs live as subdirs of it). Returns stdout, stderr, and exit code.',
-      parameters: {
-        type: 'object',
-        properties: {
-          args: {
-            type: 'string',
-            description: 'Everything that should follow `wl ` on the command line. E.g. "all milconnect" or "quickbuild teb" or "all teb . start milconnect".',
+  tools: [
+    {
+      verb: 'wl',
+      name: 'wl',
+      schema: {
+        description: 'Run a wl (WebLogic developer) command from the workspace directory. The tool runs in the active project\'s directory (which IS the workspace — apps and sharedlibs live as subdirs of it). Returns stdout, stderr, and exit code.',
+        parameters: {
+          type: 'object',
+          properties: {
+            args: {
+              type: 'string',
+              description: 'Everything that should follow `wl ` on the command line. E.g. "all milconnect" or "quickbuild teb" or "all teb . start milconnect".',
+            },
+            timeout_ms: {
+              type: 'integer',
+              description: 'Timeout in ms. Default 5 minutes, max 10. Full builds may need 10+.',
+            },
           },
-          timeout_ms: {
-            type: 'integer',
-            description: 'Timeout in ms. Default 5 minutes, max 10. Full builds may need 10+.',
-          },
+          required: ['args'],
         },
-        required: ['args'],
+      },
+      async impl({ args, timeout_ms }, ctx) {
+        const safeArgs = (typeof args === 'string') ? args.trim() : '';
+        const workspaceDir = process.cwd();
+        const timeout = Math.min(Math.max(1000, Number(timeout_ms) || 300000), 600000);
+        const t0 = Date.now();
+        return await new Promise((resolve) => {
+          let stdout = '', stderr = '', timedOut = false, settled = false;
+          let pendingProgress = '';
+          let progressTimer = null;
+          const flushProgress = () => {
+            progressTimer = null;
+            if (!pendingProgress) return;
+            try { ctx?.onProgress?.(pendingProgress); } catch {}
+            pendingProgress = '';
+          };
+          const queueProgress = (s) => {
+            if (!ctx?.onProgress) return;
+            pendingProgress += s;
+            if (!progressTimer) progressTimer = setTimeout(flushProgress, 150);
+          };
+          const child = spawn(
+            'powershell.exe',
+            ['-NoProfile', '-NonInteractive', '-Command', safeArgs ? `wl ${safeArgs}` : 'wl'],
+            { cwd: workspaceDir, windowsHide: true },
+          );
+          const tid = setTimeout(() => {
+            timedOut = true;
+            try { child.kill(); } catch {}
+          }, timeout);
+          child.stdout.on('data', (d) => {
+            const s = d.toString();
+            stdout += s;
+            queueProgress(s);
+          });
+          child.stderr.on('data', (d) => {
+            const s = d.toString();
+            stderr += s;
+            queueProgress(s);
+          });
+          const settle = (code) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(tid);
+            if (progressTimer) { clearTimeout(progressTimer); flushProgress(); }
+            const dur = Date.now() - t0;
+            if (timedOut) {
+              resolve(`ERROR: wl ${safeArgs} timed out after ${timeout}ms (workspace=${workspaceDir})`);
+              return;
+            }
+            const head = `exit ${code} in ${dur}ms  (workspace=${workspaceDir})`;
+            const body = stdout + (stderr ? '\nSTDERR:\n' + stderr : '');
+            if (code !== 0 && code != null) {
+              resolve(`ERROR: ${head}\n${body}`);
+            } else {
+              resolve({ content: `${head}\n${body}` });
+            }
+          };
+          child.on('close', settle);
+          child.on('error', (e) => { stderr += '\n' + e.message; settle(-1); });
+        });
       },
     },
-    async impl({ args, timeout_ms }, ctx) {
-      // Empty args is allowed — running `wl` with nothing prints its
-      // usage screen, which the agent may legitimately want.
-      const safeArgs = (typeof args === 'string') ? args.trim() : '';
-      // wl runs from the active project directory. The project IS the
-      // workspace (apps + shared libs are subdirs under it). Do NOT cd
-      // up — earlier versions did and that ran wl from the wrong place.
-      const workspaceDir = process.cwd();
-      const timeout = Math.min(Math.max(1000, Number(timeout_ms) || 300000), 600000);
-      const t0 = Date.now();
-      return await new Promise((resolve) => {
-        let stdout = '', stderr = '', timedOut = false, settled = false;
-        // Forward stdout/stderr chunks to the live-progress channel so the
-        // user can click the "running…" row in the chat and watch a build
-        // / deploy stream in real time. Batched ~150ms to avoid SSE flood.
-        let pendingProgress = '';
-        let progressTimer = null;
-        const flushProgress = () => {
-          progressTimer = null;
-          if (!pendingProgress) return;
-          try { ctx?.onProgress?.(pendingProgress); } catch {}
-          pendingProgress = '';
-        };
-        const queueProgress = (s) => {
-          if (!ctx?.onProgress) return;
-          pendingProgress += s;
-          if (!progressTimer) progressTimer = setTimeout(flushProgress, 150);
-        };
-        const child = spawn(
-          'powershell.exe',
-          ['-NoProfile', '-NonInteractive', '-Command', safeArgs ? `wl ${safeArgs}` : 'wl'],
-          { cwd: workspaceDir, windowsHide: true },
-        );
-        const tid = setTimeout(() => {
-          timedOut = true;
-          try { child.kill(); } catch {}
-        }, timeout);
-        child.stdout.on('data', (d) => {
-          const s = d.toString();
-          stdout += s;
-          queueProgress(s);
+    {
+      verb: 'wl_list_docs',
+      name: 'wl_list_docs',
+      schema: {
+        description: 'List files and subdirectories in the wl source/docs repo at the given path. Backed by the GitLab v4 API — no clone, no checkout. Use this to walk the repo and find the docs you want.',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: {
+              type: 'string',
+              description: 'Path within the repo. Empty string lists the root. Examples: "", "docs", "src/cmd".',
+            },
+            ref: {
+              type: 'string',
+              description: 'Branch, tag, or commit SHA. Defaults to the repo default branch.',
+            },
+          },
+          required: [],
+        },
+      },
+      async impl({ path: dirPath, ref }, ctx) {
+        const client = buildGitLabClient(ctx);
+        const entries = await client.listTree({
+          projectPath: WL_DOCS_REPO,
+          path: typeof dirPath === 'string' ? dirPath : '',
+          ref: ref || undefined,
         });
-        child.stderr.on('data', (d) => {
-          const s = d.toString();
-          stderr += s;
-          queueProgress(s);
-        });
-        const settle = (code) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(tid);
-          if (progressTimer) { clearTimeout(progressTimer); flushProgress(); }
-          const dur = Date.now() - t0;
-          if (timedOut) {
-            resolve(`ERROR: wl ${safeArgs} timed out after ${timeout}ms (workspace=${workspaceDir})`);
-            return;
-          }
-          const head = `exit ${code} in ${dur}ms  (workspace=${workspaceDir})`;
-          const body = stdout + (stderr ? '\nSTDERR:\n' + stderr : '');
-          if (code !== 0 && code != null) {
-            resolve(`ERROR: ${head}\n${body}`);
-          } else {
-            resolve({ content: `${head}\n${body}` });
-          }
-        };
-        child.on('close', settle);
-        child.on('error', (e) => { stderr += '\n' + e.message; settle(-1); });
-      });
+        if (!Array.isArray(entries) || entries.length === 0) {
+          return { content: `(empty) ${WL_DOCS_REPO} @ ${ref || 'default'} : ${dirPath || '/'}` };
+        }
+        const lines = entries.map((e) => `${e.type === 'tree' ? 'd' : '-'}  ${e.path}`);
+        return { content: `${WL_DOCS_REPO} @ ${ref || 'default'} : ${dirPath || '/'}  (${entries.length} entries)\n${lines.join('\n')}` };
+      },
     },
-  }],
+    {
+      verb: 'wl_read_doc',
+      name: 'wl_read_doc',
+      schema: {
+        description: 'Read a single file from the wl source/docs repo via the GitLab API. Text files come back as content. Binary files (e.g. the .docx user guide) are saved to a temp path the agent can then pass to read_docx.',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: {
+              type: 'string',
+              description: 'Path of the file within the repo. E.g. "README.md", "docs/user-guide.docx".',
+            },
+            ref: {
+              type: 'string',
+              description: 'Branch, tag, or commit SHA. Defaults to the repo default branch.',
+            },
+          },
+          required: ['path'],
+        },
+      },
+      async impl({ path: filepath, ref }, ctx) {
+        if (typeof filepath !== 'string' || !filepath.trim()) {
+          return 'ERROR: path is required';
+        }
+        const client = buildGitLabClient(ctx);
+        const result = await client.readFile({
+          projectPath: WL_DOCS_REPO,
+          filepath: filepath.trim(),
+          ref: ref || undefined,
+        });
+        if (result.encoding === 'utf8') {
+          return { content: `${WL_DOCS_REPO}:${filepath}  (${result.size} bytes, ${result.contentType || 'text'})\n${result.content}` };
+        }
+        // Binary: write to a temp file and report the path so the agent
+        // can hand it to read_docx or another binary-aware tool.
+        const safeName = path.basename(filepath).replace(/[^a-zA-Z0-9._-]/g, '_');
+        const tmp = path.join(tmpdir(), `wl-doc-${Date.now()}-${safeName}`);
+        await writeFile(tmp, result.content);
+        return { content: `${WL_DOCS_REPO}:${filepath}  (${result.size} bytes, binary ${result.contentType})\nSaved to: ${tmp}\nUse read_docx (or appropriate reader) on that path.` };
+      },
+    },
+  ],
 };
 
 wlPlugin;
@@ -3991,6 +4112,7 @@ const nodePath = path;
 const USER_CONFIG_DIR  = path.join(homedir(), '.code_boss');
 const RECENT_FILE      = path.join(USER_CONFIG_DIR, 'recent.json');
 const API_KEY_FILE     = path.join(USER_CONFIG_DIR, 'api-key.txt');
+const GITLAB_CREDS_FILE = path.join(USER_CONFIG_DIR, 'gitlab-creds.json');
 const LEGACY_USER_DIR  = path.join(homedir(), '.code-boss');
 
 async function migrateLegacyUserDir() {
@@ -4012,6 +4134,21 @@ async function loadApiKeyFromFile() {
 async function saveApiKeyToFile(key) {
   await mkdir(USER_CONFIG_DIR, { recursive: true });
   await writeFile(API_KEY_FILE, String(key).trim() + '\n', 'utf8');
+}
+
+async function loadGitLabCredsFromFile() {
+  try {
+    const text = await readFile(GITLAB_CREDS_FILE, 'utf8');
+    const data = JSON.parse(text);
+    if (typeof data?.user === 'string' && typeof data?.token === 'string' && data.token) {
+      return { user: data.user, token: data.token };
+    }
+    return null;
+  } catch { return null; }
+}
+async function saveGitLabCredsToFile({ user, token }) {
+  await mkdir(USER_CONFIG_DIR, { recursive: true });
+  await writeFile(GITLAB_CREDS_FILE, JSON.stringify({ user, token }, null, 2) + '\n', 'utf8');
 }
 const MAX_RECENT = 12;
 
@@ -5056,7 +5193,7 @@ process.stderr.write = function (chunk, ...rest) {
 // When running src/ directly (dev/tests), it's undefined — fall back to '(dev)'.
 const BUILD_VERSION_RUNTIME = (typeof BUILD_VERSION !== 'undefined') ? BUILD_VERSION : '(dev)';
 
-async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, adapter: providedAdapter, modelsList, initialProject = null }) {
+async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, port = 18888, adapter: providedAdapter, modelsList, initialProject = null }) {
   // Migrate legacy ~/.code-boss/ → ~/.code_boss/ (hyphen → underscore) if a
   // user is upgrading from an older bundle. Best-effort; falls through if
   // the legacy dir is absent or permissions block the rename.
@@ -5069,6 +5206,12 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
     const fromFile = await loadApiKeyFromFile();
     if (fromFile) resolvedKey = fromFile;
   }
+  // Same pattern for GitLab credentials: caller (tests / build-time
+  // config) wins, otherwise fall back to the on-disk file.
+  let resolvedGitlab = gitlabCreds || null;
+  if (!resolvedGitlab) {
+    resolvedGitlab = await loadGitLabCredsFromFile();
+  }
 
   const session = {
     // Static config
@@ -5077,6 +5220,11 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
     defaultModel,
     apiKey: resolvedKey,               // mutable so /api/api-key can update at runtime
     apiKeyPrefix: (resolvedKey || '').slice(0, 8) + (resolvedKey ? '…' : '(empty)'),
+    // Optional GitLab credentials for plugins that pull files/trees from
+    // a self-hosted GitLab via the v4 API. Loaded from disk if present;
+    // user can set/replace via the UI. Mutable so /api/gitlab-creds
+    // updates the running session.
+    gitlabCreds: resolvedGitlab,
     startMs: Date.now(),
     activeProject: null,
     recent: await loadRecentProjects(),
@@ -5575,6 +5723,27 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
         fileLog(`api-key set via UI: prefix=${session.apiKeyPrefix}`);
         return sendJson(res, 200, { ok: true, prefix: session.apiKeyPrefix });
       }
+      if (req.method === 'GET' && path === '/api/gitlab-creds') {
+        // Same shape as /api/api-key: report presence + a non-secret
+        // hint (the username), never the token. Used by the UI's
+        // startup-prompt flow.
+        return sendJson(res, 200, {
+          hasCreds: !!(session.gitlabCreds && session.gitlabCreds.token),
+          user: session.gitlabCreds?.user || '',
+        });
+      }
+      if (req.method === 'POST' && path === '/api/gitlab-creds') {
+        const raw = await readBody(req);
+        let body; try { body = JSON.parse(raw); } catch { return sendJson(res, 400, { error: 'invalid JSON' }); }
+        const user = (body?.user ?? '').toString().trim();
+        const token = (body?.token ?? '').toString().trim();
+        if (!user || !token) return sendJson(res, 400, { error: 'user and token are required' });
+        try { await saveGitLabCredsToFile({ user, token }); }
+        catch (e) { return sendJson(res, 500, { error: 'could not save credentials: ' + e.message }); }
+        session.gitlabCreds = { user, token };
+        fileLog(`gitlab-creds set via UI: user=${user} token_prefix=${token.slice(0, 4)}…`);
+        return sendJson(res, 200, { ok: true, user });
+      }
       if (req.method === 'GET' && path === '/api/project-state') {
         // Legacy endpoint kept for the existing browser project picker.
         // New code should use /api/state.
@@ -5743,8 +5912,107 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
         delete session.gitPending[repoDir];
         return sendJson(res, 200, { repoDir, branch: newBranchRes.branch, result: 'ok' });
       }
+      if (req.method === 'POST' && path === '/api/git-resolve-batch') {
+        // End-of-chat resolution: process one decision per repo listed
+        // in a git-pending-resolution event. Body:
+        //   { eventId, resolutions: [{ repoDir, action: 'codeboss'|'skip',
+        //                              useAI?, message? }] }
+        // 'codeboss' commits whatever's dirty (AI subject or typed),
+        // forks CODE_BOSS_<ts>. 'skip' leaves the repo alone.
+        const raw = await readBody(req);
+        let body; try { body = JSON.parse(raw); }
+        catch { return sendJson(res, 400, { error: 'invalid JSON' }); }
+        const evId = body?.eventId;
+        const ev = session.chatEvents.find((e) => e.id === evId && e.type === 'git-pending-resolution');
+        if (!ev) return sendJson(res, 400, { error: 'no such pending-resolution event' });
+        if (ev.resolved) return sendJson(res, 400, { error: 'already resolved' });
+        const resolutions = Array.isArray(body.resolutions) ? body.resolutions : [];
+        const outcomes = [];
+        const emitGit = async (repoDir, cmdLabel, run) => {
+          const callId = randomUUID();
+          const rel = nodePath.relative(session.activeProject, repoDir) || '.';
+          chatState.appendChatEvent({ type: 'tool-call', callId, verb: 'git', name: 'git', args: { command: `[${rel}] ${cmdLabel}` } });
+          const r = await run();
+          const status = r.exitCode === 0 ? 'ok' : 'error';
+          const content = r.exitCode === 0 ? (r.stdout.trim() || '(ok)') : (r.stderr.trim() || `exit ${r.exitCode}`);
+          chatState.appendChatEvent({ type: 'tool-result', callId, verb: 'git', name: 'git', status, content });
+          return r;
+        };
+        for (const r of resolutions) {
+          const repoDir = r?.repoDir;
+          if (!repoDir || !session.git?.repos?.[repoDir]) {
+            outcomes.push({ repoDir, status: 'error', error: 'unknown repo' });
+            continue;
+          }
+          const repo = session.git.repos[repoDir];
+          if (r.action === 'skip') { outcomes.push({ repoDir, status: 'skipped' }); continue; }
+          if (r.action !== 'codeboss') {
+            outcomes.push({ repoDir, status: 'error', error: 'unknown action' });
+            continue;
+          }
+          let message = String(r.message || '').trim();
+          const status = await getStatus(repoDir);
+          if (!status.dirty) {
+            outcomes.push({ repoDir, status: 'noop', note: 'tree clean' });
+            continue;
+          }
+          const add = await emitGit(repoDir, 'git add -A', () => runGit(repoDir, ['add', '-A']));
+          if (add.exitCode !== 0) { outcomes.push({ repoDir, status: 'error', error: 'git add failed' }); continue; }
+          if (r.useAI) {
+            const diff = await runGit(repoDir, ['diff', '--cached', 'HEAD']);
+            const sample = (diff.stdout || '').slice(0, 12000);
+            if (!sample.trim()) { outcomes.push({ repoDir, status: 'error', error: 'no diff' }); continue; }
+            try {
+              const aiR = await adapter.complete({
+                model: session.defaultModel,
+                messages: [
+                  { role: 'system', content: 'You summarize git diffs into a single short imperative commit subject (max 70 chars). Respond with ONLY the subject line, no quotes, no prefix.' },
+                  { role: 'user', content: `Diff:\n\n${sample}` },
+                ],
+              });
+              message = ((aiR?.choices?.[0]?.message?.content) || '').trim().split('\n')[0].slice(0, 72) || 'pre-existing changes';
+            } catch (e) {
+              outcomes.push({ repoDir, status: 'error', error: 'AI summary failed: ' + e.message });
+              continue;
+            }
+          }
+          if (!message) { outcomes.push({ repoDir, status: 'error', error: 'message required' }); continue; }
+          const commit = await emitGit(repoDir, `git commit -m "${message.replace(/"/g, '\\"')}"`, () => runGit(repoDir, ['commit', '-F', '-'], { input: message + '\n' }));
+          if (commit.exitCode !== 0) { outcomes.push({ repoDir, status: 'error', error: 'git commit failed' }); continue; }
+          const parentBranch = await getCurrentBranch(repoDir);
+          // If the repo got moved onto a CODE_BOSS branch between
+          // event-emit and resolve (e.g., user did it manually), skip
+          // forking another one — commit-only is enough.
+          if (isCodeBossBranch(parentBranch)) {
+            repo.head = await getHeadHash(repoDir);
+            outcomes.push({ repoDir, status: 'ok', commit: message, branch: parentBranch });
+            continue;
+          }
+          const newBranchRes = await createBranch(repoDir);
+          if (newBranchRes.exitCode !== 0) { outcomes.push({ repoDir, status: 'error', error: 'branch creation failed' }); continue; }
+          const relB = nodePath.relative(session.activeProject, repoDir) || '.';
+          const cidB = randomUUID();
+          chatState.appendChatEvent({ type: 'tool-call', callId: cidB, verb: 'git', name: 'git', args: { command: `[${relB}] git checkout -b ${newBranchRes.branch}` } });
+          chatState.appendChatEvent({ type: 'tool-result', callId: cidB, verb: 'git', name: 'git', status: 'ok', content: `forked from ${parentBranch}` });
+          repo.parentBranch = parentBranch;
+          repo.branch = newBranchRes.branch;
+          repo.head = await getHeadHash(repoDir);
+          fileLog(`git-resolve-batch: ${repoDir} → commit "${message}" on ${parentBranch}, forked ${newBranchRes.branch}`);
+          outcomes.push({ repoDir, status: 'ok', commit: message, branch: newBranchRes.branch });
+        }
+        chatState.patchChatEvent(ev.id, { resolved: true, outcomes });
+        return sendJson(res, 200, { eventId: ev.id, outcomes });
+      }
       if (req.method === 'POST' && path === '/api/close-project') {
+        // Reject while a chat is running — mirrors /api/reset's stance.
+        // Otherwise the chat's still-running async loop would keep
+        // touching session.git, session.activeProject, etc. after
+        // they're cleared.
+        if (session.status === 'running') {
+          return sendJson(res, 409, { error: 'chat is running; cancel first' });
+        }
         session.activeProject = null;
+        session.git = { isRepo: false };
         return sendJson(res, 200, { activeProject: null, recent: session.recent });
       }
       if (req.method === 'GET' && path === '/api/log') {
@@ -5946,6 +6214,35 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
           logTail,
         };
       }
+      if (req.method === 'GET' && path === '/api/git-dirty') {
+        // Lightweight poll: returns the list of tracked repos that
+        // currently have uncommitted changes. Drives the red ⚠
+        // indicator in the footer next to the project path.
+        // Guard: if a project just closed, session.activeProject is null
+        // but session.git may still carry stale repoList — bail early
+        // rather than passing null to path.relative.
+        if (!session.activeProject || !session.git?.repoList?.length) {
+          return sendJson(res, 200, { repos: [] });
+        }
+        const repos = [];
+        for (const dir of session.git.repoList) {
+          try {
+            const branch = await getCurrentBranch(dir);
+            const status = await getStatus(dir);
+            if (status.dirty) {
+              repos.push({
+                relDir: nodePath.relative(session.activeProject, dir) || '.',
+                branch: branch || '(detached HEAD)',
+                codeBoss: isCodeBossBranch(branch),
+                changeCount: status.lines.length,
+              });
+            }
+          } catch {
+            // Repo got removed under us, .git deleted, etc — skip it.
+          }
+        }
+        return sendJson(res, 200, { repos });
+      }
       if (req.method === 'GET' && path === '/api/events') {
         const beforeId = url.searchParams.get('before');
         const limit = Math.min(Number(url.searchParams.get('limit')) || 50, 500);
@@ -6076,24 +6373,11 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
                 // Refresh branch in case the user resolved a wizard mid-task.
                 repo.branch = await getCurrentBranch(repoDir);
                 if (!isCodeBossBranch(repo.branch)) {
-                  // Phase B gap: powershell + other tools that touch
-                  // files without going through the requireBranch hook
-                  // may have left changes in a repo we never paused on.
-                  // Surface those so the user notices and can commit
-                  // them manually.
-                  const status = await getStatus(repoDir);
-                  if (status.dirty) {
-                    const rel = nodePath.relative(session.activeProject, repoDir) || '.';
-                    chatState.appendChatEvent({
-                      type: 'git-uncommitted-warning',
-                      taskId: closedTaskId,
-                      repoDir, relDir: rel,
-                      branch: repo.branch,
-                      changeCount: status.lines.length,
-                      changes: status.lines.slice(0, 20),
-                    });
-                    fileLog(`autocommit warning: ${rel} on '${repo.branch}' has ${status.lines.length} uncommitted change(s) — not on CODE_BOSS_, skipping`);
-                  }
+                  // Per-repo per-task warning suppressed: a single
+                  // end-of-chat resolution event surfaces ALL dirty
+                  // non-CODE_BOSS repos in one go (see the block below
+                  // the review loop). Cleaner UX than spamming a row
+                  // per task close.
                   continue;
                 }
                 const add = await emitGitOp(repoDir, 'git add -A', closedTaskId, () => runGit(repoDir, ['add', '-A']));
@@ -6169,6 +6453,7 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
                 projectContext: session.projectContext || '',
                 onTaskClose: gitAutoCommitHook,
                 requireBranch,
+                getGitLabCredentials: () => session.gitlabCreds,
               });
               lastAgentResult = result;
               const turnDur = Date.now() - chatStart;
@@ -6235,6 +6520,35 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
               terminated: lastAgentResult.terminated,
               reviewRounds: round + 1,
             });
+            // Survey every tracked repo. Anything dirty AND not on a
+            // CODE_BOSS_ branch surfaces in one consolidated chat row
+            // the user can click to trigger a per-repo branch+commit.
+            // Guard against the user closing the project mid-chat —
+            // session.activeProject can be null here.
+            if (session.activeProject && session.git?.repoList?.length) {
+              const dirtyRepos = [];
+              for (const repoDir of session.git.repoList) {
+                const branch = await getCurrentBranch(repoDir);
+                if (isCodeBossBranch(branch)) continue;
+                const status = await getStatus(repoDir);
+                if (!status.dirty) continue;
+                dirtyRepos.push({
+                  repoDir,
+                  relDir: nodePath.relative(session.activeProject, repoDir) || '.',
+                  branch,
+                  changeCount: status.lines.length,
+                  changes: status.lines.slice(0, 20),
+                });
+              }
+              if (dirtyRepos.length) {
+                chatState.appendChatEvent({
+                  type: 'git-pending-resolution',
+                  resolved: false,
+                  repos: dirtyRepos,
+                });
+                fileLog(`git-pending-resolution: ${dirtyRepos.length} repo(s) need branch+commit (${dirtyRepos.map((r) => r.relDir).join(', ')})`);
+              }
+            }
             chatState.setStatus('done');
           } catch (e) {
             const dur = Date.now() - chatStart;
@@ -7286,6 +7600,13 @@ const UI_HTML = `<!DOCTYPE html>
     line-height: 1;
   }
   .input-subbar .settings-btn:hover { color: var(--accent); }
+  .input-subbar .dirty-indicator {
+    color: var(--error);
+    font-size: 12px;
+    line-height: 1;
+    cursor: help;
+    flex-shrink: 0;
+  }
 
   /* Settings modal — vertical stack of labeled rows. Reuses .modal-bg. */
   .settings-row {
@@ -8059,6 +8380,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       </button>
     </div>
     <div class="input-subbar">
+      <span class="dirty-indicator" id="gitDirtyIndicator" title="" style="display:none;">⚠</span>
       <span class="proj-path" id="projectPath" title="">(no project)</span>
       <button class="settings-btn" id="settingsBtn" onclick="openSettings()" title="Settings">⚙</button>
     </div>
@@ -8085,6 +8407,11 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
         <label>API key</label>
         <span class="value" id="settingsApiKey">(not set)</span>
         <button class="btn" onclick="changeApiKey()">Change…</button>
+      </div>
+      <div class="settings-row">
+        <label>GitLab</label>
+        <span class="value" id="settingsGitLab">(not set)</span>
+        <button class="btn" onclick="changeGitLabCreds()">Change…</button>
       </div>
       <div class="settings-row">
         <label>Timeout</label>
@@ -8381,6 +8708,17 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
           return;
         }
       }
+      $status.textContent = 'Checking GitLab credentials…';
+      const gc = await fetch('/api/gitlab-creds').then((r) => r.json()).catch(() => ({ hasCreds: true }));
+      if (!gc.hasCreds) {
+        $status.textContent = 'GitLab credentials required — see modal…';
+        const ok = await promptForGitLabCreds({ initial: true });
+        if (!ok) {
+          $status.textContent = 'GitLab credentials were not set. Click Retry to try again.';
+          $retry.classList.remove('hidden');
+          return;
+        }
+      }
       $status.textContent = 'Loading models (this may pause for unlock)…';
       await loadModels();  // blocks here if a 401 unlock is needed
       console.log('[init] loadModels done after', tick());
@@ -8489,6 +8827,68 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); });
     });
   }
+  function promptForGitLabCreds({ initial } = {}) {
+    return new Promise((resolve) => {
+      const title = initial ? 'Set GitLab credentials' : 'Change GitLab credentials';
+      const subtitle = initial
+        ? 'code_boss can fetch files from your internal GitLab without cloning. Enter the username + personal access token (classic). Saved to <code>~/.code_boss/gitlab-creds.json</code>.'
+        : 'Replace the GitLab username and personal access token. Overwrites <code>~/.code_boss/gitlab-creds.json</code>.';
+      $initModalTitle.textContent = title;
+      const cancelHtml = initial ? '' :
+        '<button id="glCredsCancel" class="btn">Cancel</button>';
+      $initModalBody.innerHTML = \`
+        <p style="margin: 0 0 12px; color: var(--muted); font-size: 12.5px;">\${subtitle}</p>
+        <input id="glCredsUser" type="text" autocomplete="off" spellcheck="false"
+               placeholder="username" style="width: 100%; padding: 8px 10px; font: inherit;
+               font-size: 13px; background: var(--panel-alt); color: var(--fg);
+               border: 1px solid var(--border); border-radius: 4px; margin-bottom: 8px;" />
+        <input id="glCredsToken" type="password" autocomplete="off" spellcheck="false"
+               placeholder="personal access token (classic)" style="width: 100%; padding: 8px 10px; font: inherit;
+               font-size: 13px; background: var(--panel-alt); color: var(--fg);
+               border: 1px solid var(--border); border-radius: 4px;" />
+        <div style="margin-top: 12px; display: flex; gap: 8px; justify-content: flex-end;">
+          \${cancelHtml}
+          <button id="glCredsSave" class="btn primary">Save</button>
+        </div>
+        <p id="glCredsMsg" style="margin: 8px 0 0; color: var(--error); font-size: 12px; min-height: 14px;"></p>
+      \`;
+      $initModalBg.classList.add('show');
+      const u = document.getElementById('glCredsUser');
+      const t = document.getElementById('glCredsToken');
+      const msg = document.getElementById('glCredsMsg');
+      const save = document.getElementById('glCredsSave');
+      const cancel = document.getElementById('glCredsCancel');
+      setTimeout(() => u?.focus(), 50);
+
+      const done = (ok) => { $initModalBg.classList.remove('show'); resolve(ok); };
+      if (cancel) cancel.onclick = () => done(false);
+      const submit = async () => {
+        const user = (u.value || '').trim();
+        const token = (t.value || '').trim();
+        if (!user || !token) { msg.textContent = 'Username and token are required.'; return; }
+        save.disabled = true;
+        try {
+          const r = await fetch('/api/gitlab-creds', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ user, token }),
+          });
+          if (!r.ok) {
+            const body = await r.text();
+            msg.textContent = 'Save failed: ' + body.slice(0, 200);
+            save.disabled = false;
+            return;
+          }
+          done(true);
+        } catch (e) {
+          msg.textContent = 'Save failed: ' + e.message;
+          save.disabled = false;
+        }
+      };
+      save.onclick = submit;
+      [u, t].forEach((el) => el.addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); }));
+    });
+  }
   // Browser-side unlock flow. Shown when the LLM endpoint returns 401 with
   // an unlock_url. The user opens the URL (we don't auto-open it — keeps
   // the user in control), unlocks the key in their browser, then clicks
@@ -8540,6 +8940,11 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   async function changeApiKey() {
     const ok = await promptForApiKey({ initial: false });
     if (ok && typeof openSettings === 'function') openSettings();   // re-open settings with the new prefix
+  }
+
+  async function changeGitLabCreds() {
+    const ok = await promptForGitLabCreds({ initial: false });
+    if (ok && typeof openSettings === 'function') openSettings();
   }
 
   // Mid-task git-branch prompt. Fired from the SSE 'git-needs-branch'
@@ -8648,6 +9053,15 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     activeProject = null;
     $chat.classList.add('hidden');
     $landing.classList.remove('hidden');
+    // Modals live at body root, so they'd otherwise float above the
+    // landing view. Close the git resolution wizard if it's open —
+    // its repos belong to the project we just closed.
+    const $gwBg = document.getElementById('gitWizardBg');
+    if ($gwBg) {
+      $gwBg.classList.remove('show');
+      const $gwBody = document.getElementById('gitWizardBody');
+      if ($gwBody) $gwBody.innerHTML = '';
+    }
     $recentList.innerHTML = '';
     if (!recent || recent.length === 0) {
       $recentList.innerHTML = '<li class="recent-empty">No recent projects yet.</li>';
@@ -8686,6 +9100,12 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       '</div>';
     if ($model.options.length === 0 || $model.value === '') loadModels();
     $input.focus();
+    // Drop the previous project's dirty-indicator state synchronously
+    // so the tooltip doesn't flash with stale repo names while the
+    // first /api/git-dirty call is in flight.
+    const $gd = document.getElementById('gitDirtyIndicator');
+    if ($gd) { $gd.style.display = 'none'; $gd.title = ''; }
+    refreshGitDirty();
   }
 
   // ── In-UI file browser (landing) ────────────────────────────────────────
@@ -9142,29 +9562,134 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   // had changes but wasn't on a CODE_BOSS_* branch (so we couldn't
   // commit it). Typically means a tool like powershell touched files
   // outside the pre-write hook's reach.
-  function addUncommittedWarningRow(ev) {
+  function addPendingResolutionRow(ev) {
     const row = document.createElement('div');
-    row.className = 'review-row review-fail';   // reuse the warn-orange styling
+    row.className = 'review-row review-fail';
     const ring = document.createElement('span');
     ring.className = 'review-ring';
-    ring.textContent = '⚠';
+    ring.textContent = ev.resolved ? '✓' : '⚠';
     row.appendChild(ring);
     const label = document.createElement('span');
     label.className = 'review-label';
-    label.textContent = \`Uncommitted changes in \${ev.relDir || '?'} on \${ev.branch || '?'} — not on a CODE_BOSS branch, so they weren't auto-committed.\`;
+    if (ev.resolved) {
+      const okCount = (ev.outcomes || []).filter((o) => o.status === 'ok').length;
+      const skipCount = (ev.outcomes || []).filter((o) => o.status === 'skipped').length;
+      label.textContent = \`Resolved: \${okCount} repo(s) branched + committed, \${skipCount} skipped.\`;
+    } else {
+      const n = (ev.repos || []).length;
+      label.textContent = \`Uncommitted changes in \${n} repo(s) without a CODE_BOSS branch. Click to resolve.\`;
+      row.style.cursor = 'pointer';
+      row.addEventListener('click', () => showGitPendingResolutionModal(ev));
+    }
     row.appendChild(label);
-    if (Array.isArray(ev.changes) && ev.changes.length > 0) {
+    if (Array.isArray(ev.repos) && ev.repos.length) {
       const list = document.createElement('div');
       list.className = 'review-concerns';
-      const lines = ev.changes.map((c) => \`\${c.status}  \${c.path}\`);
-      if (ev.changeCount > ev.changes.length) lines.push(\`… +\${ev.changeCount - ev.changes.length} more\`);
-      list.textContent = lines.join('\\n');
+      list.textContent = ev.repos.map((r) => \`\${r.relDir} (\${r.branch}) — \${r.changeCount} change(s)\`).join('\\n');
       row.appendChild(list);
     }
     $log.appendChild(row);
     pinStatusToBottom();
     scrollToBottom();
     return row;
+  }
+
+  function showGitPendingResolutionModal(ev) {
+    if (ev.resolved) return;
+    const $bg = document.getElementById('gitWizardBg');
+    const $body = document.getElementById('gitWizardBody');
+    const repoCards = (ev.repos || []).map((r, i) => \`
+      <div class="settings-row" style="display:block; padding: 10px; border: 1px solid var(--border); border-radius: 4px; margin-bottom: 8px;">
+        <div style="font-weight: 600; margin-bottom: 4px;">\${escapeHtml(r.relDir)}
+          <span style="color: var(--muted); font-weight: normal; font-size: 12px;">on \${escapeHtml(r.branch)} — \${r.changeCount} change(s)</span>
+        </div>
+        <pre style="margin: 4px 0; padding: 6px 8px; background: var(--panel-alt); border-radius: 3px; max-height: 120px; overflow: auto; font-size: 12px;">\${escapeHtml((r.changes || []).map((c) => \`\${c.status}  \${c.path}\`).join('\\n'))}</pre>
+        <label style="display:flex; gap:6px; align-items:center; cursor:pointer; margin-top: 4px;">
+          <input type="radio" name="gpr-\${i}" value="codeboss" checked>
+          <span>Commit on <code>\${escapeHtml(r.branch)}</code> &amp; fork CODE_BOSS branch</span>
+        </label>
+        <label style="display:flex; gap:6px; align-items:center; cursor:pointer; margin-left: 18px;">
+          <input type="checkbox" name="gpr-ai-\${i}" checked>
+          <span>Generate commit message with AI</span>
+        </label>
+        <textarea name="gpr-msg-\${i}" rows="2" placeholder="Commit message…"
+                  style="display:none; width:100%; box-sizing:border-box; margin-top: 4px; padding:6px 8px; border:1px solid var(--border); background:var(--panel-alt); color:var(--fg); border-radius:4px; font:inherit; resize:vertical;"></textarea>
+        <label style="display:flex; gap:6px; align-items:center; cursor:pointer; margin-top: 4px;">
+          <input type="radio" name="gpr-\${i}" value="skip">
+          <span>Skip — leave this repo alone</span>
+        </label>
+      </div>
+    \`).join('');
+    $body.innerHTML = \`
+      <p style="margin: 0 0 12px; color: var(--fg); font-size: 13px;">
+        These repos have uncommitted changes but aren't on a <code>CODE_BOSS_*</code> branch.
+        Pick how to handle each one:
+      </p>
+      \${repoCards}
+      <p id="gpr-err" style="margin: 8px 0 0; color: var(--error); font-size: 12px; min-height: 14px;"></p>
+      <div style="display:flex; gap:8px; justify-content:flex-end; margin-top: 14px;">
+        <button id="gpr-cancel" class="btn">Close</button>
+        <button id="gpr-submit" class="btn primary">Apply</button>
+      </div>
+    \`;
+    $bg.classList.add('show');
+
+    // Per-repo AI checkbox toggles its textarea visibility.
+    (ev.repos || []).forEach((_r, i) => {
+      const $ai = $body.querySelector(\`input[name="gpr-ai-\${i}"]\`);
+      const $msg = $body.querySelector(\`textarea[name="gpr-msg-\${i}"]\`);
+      const $action = $body.querySelectorAll(\`input[name="gpr-\${i}"]\`);
+      function sync() {
+        const action = $body.querySelector(\`input[name="gpr-\${i}"]:checked\`)?.value;
+        const enabled = action === 'codeboss';
+        $ai.disabled = !enabled;
+        $msg.style.display = (enabled && !$ai.checked) ? 'block' : 'none';
+      }
+      $ai.addEventListener('change', sync);
+      $action.forEach((r) => r.addEventListener('change', sync));
+      sync();
+    });
+
+    const $err = document.getElementById('gpr-err');
+    const $cancel = document.getElementById('gpr-cancel');
+    const $submit = document.getElementById('gpr-submit');
+    function close() { $bg.classList.remove('show'); $body.innerHTML = ''; }
+    $cancel.onclick = close;
+    $submit.onclick = async () => {
+      $err.textContent = '';
+      const resolutions = (ev.repos || []).map((r, i) => {
+        const action = $body.querySelector(\`input[name="gpr-\${i}"]:checked\`)?.value || 'skip';
+        const out = { repoDir: r.repoDir, action };
+        if (action === 'codeboss') {
+          const useAI = $body.querySelector(\`input[name="gpr-ai-\${i}"]\`)?.checked;
+          if (useAI) out.useAI = true;
+          else {
+            const msg = ($body.querySelector(\`textarea[name="gpr-msg-\${i}"]\`)?.value || '').trim();
+            if (msg) out.message = msg;
+          }
+        }
+        return out;
+      });
+      $submit.disabled = true;
+      $submit.textContent = 'Applying…';
+      try {
+        const r = await fetch('/api/git-resolve-batch', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ eventId: ev.id, resolutions }),
+        });
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
+        const errs = (data.outcomes || []).filter((o) => o.status === 'error');
+        if (errs.length) throw new Error(errs.map((e) => \`\${e.repoDir}: \${e.error}\`).join('\\n'));
+        close();
+        refreshGitDirty();
+      } catch (e) {
+        $submit.disabled = false;
+        $submit.textContent = 'Apply';
+        $err.textContent = 'Failed: ' + e.message;
+      }
+    };
   }
 
   // Send a user message. Server pushes back the user-message event via SSE,
@@ -9713,6 +10238,32 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     }
   }, 5000);
 
+  // Poll /api/git-dirty so the footer ⚠ icon reflects the current
+  // uncommitted-changes state across all tracked repos. Cheap (a few
+  // \`git status\` calls server-side) and refreshes every 8s, plus on
+  // demand after we know state likely changed (chat-end, project-open).
+  const $gitDirty = document.getElementById('gitDirtyIndicator');
+  async function refreshGitDirty() {
+    if (!activeProject) { $gitDirty.style.display = 'none'; return; }
+    try {
+      const r = await fetch('/api/git-dirty');
+      if (!r.ok) return;
+      const data = await r.json();
+      const repos = Array.isArray(data.repos) ? data.repos : [];
+      if (repos.length === 0) {
+        $gitDirty.style.display = 'none';
+        $gitDirty.title = '';
+        return;
+      }
+      $gitDirty.style.display = '';
+      const lines = repos.map((r) =>
+        \`\${r.relDir} (\${r.branch}\${r.codeBoss ? '' : ' — not CODE_BOSS'}) — \${r.changeCount} change(s)\`,
+      );
+      $gitDirty.title = 'Uncommitted changes:\\n' + lines.join('\\n');
+    } catch {}
+  }
+  setInterval(refreshGitDirty, 8000);
+
   // Spinner tick — runs only while a chat is in progress so the spinner glyph
   // animates and the elapsed timer counts up.
   let _spinTick = null;
@@ -9822,6 +10373,9 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
           // Defensive: any tool row still marked running (e.g., agent
           // aborted mid-tool) should stop blinking now.
           $log.querySelectorAll('.row.tool.tool-running').forEach((r) => r.classList.remove('tool-running'));
+          // Repos most likely changed during the chat — refresh the
+          // footer indicator now rather than waiting for the next poll.
+          refreshGitDirty();
         } else {
           stopSpinTick();
         }
@@ -10118,8 +10672,8 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       case 'review':
         node = addReviewRow(ev);
         break;
-      case 'git-uncommitted-warning':
-        node = addUncommittedWarningRow(ev);
+      case 'git-pending-resolution':
+        node = addPendingResolutionRow(ev);
         break;
     }
 
@@ -10403,6 +10957,11 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       const ak = await fetch('/api/api-key').then((r) => r.json());
       const el = document.getElementById('settingsApiKey');
       if (el) el.textContent = ak.hasKey ? (ak.prefix || '(set)') : '(not set)';
+    } catch {}
+    try {
+      const gc = await fetch('/api/gitlab-creds').then((r) => r.json());
+      const el = document.getElementById('settingsGitLab');
+      if (el) el.textContent = gc.hasCreds ? (gc.user || '(set)') : '(not set)';
     } catch {}
     $settingsModalBg.classList.add('show');
   }
