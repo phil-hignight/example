@@ -15,7 +15,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '54';
+const BUILD_VERSION = '65';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
@@ -694,6 +694,10 @@ function createTasksStore(projectDir) {
     cur.userRequest = userRequest ?? cur.userRequest ?? null;
     cur.ended = nowMs();
     await saveTask(cur);
+    // Return the closed task id alongside the new one so the caller can
+    // attach metadata to it after the fact (e.g. the commit hash from
+    // the post-transition auto-commit).
+    const closedId = cur.id;
 
     // If `cur` IS the root, the new task becomes a child of root.
     // Otherwise the new task is a sibling of `cur` (same parent).
@@ -725,6 +729,19 @@ function createTasksStore(projectDir) {
     state.currentId = id;
     state.allTaskIds.push(id);
     await saveState();
+    return { newTask: t, closedId };
+  }
+
+  /**
+   * Attach arbitrary metadata fields to a previously-saved task.
+   * Used post-transition to record the auto-commit hash on the just-
+   * closed task without forcing every caller to round-trip load+save.
+   */
+  async function attachToTask(taskId, fields) {
+    const t = await loadTask(taskId);
+    if (!t) return null;
+    Object.assign(t, fields);
+    await saveTask(t);
     return t;
   }
 
@@ -958,6 +975,7 @@ function createTasksStore(projectDir) {
     currentId, rootId,
     getCurrent,
     transitionTo,
+    attachToTask,
     appendMessage,
     listTasks, getDetail, searchTasks,
     demoteToTier2, demoteToTier3,
@@ -1803,6 +1821,321 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   return { pages, totalTiles: tiles.length, totalPages: pages.length };
 }
 
+// ====== agent/project-context.mjs ======
+/**
+ * Discover and format per-project context from CODE-BOSS.md files.
+ *
+ * On project open, walk the project directory recursively looking for
+ * files named CODE-BOSS.md. Each directory that contains one is treated
+ * as a project; its contents get injected into the agent's system
+ * prompt every turn so the model has the project-specific instructions
+ * the developer has captured there.
+ *
+ * Two render modes:
+ *   - Exactly one file, AT the project root → include its text directly
+ *     under a "project context" heading.
+ *   - Anything else (one in a subdir, or multiple) → list each found
+ *     file with its relative directory path. Useful when the open
+ *     directory is a workspace that contains several project subdirs
+ *     and the agent needs to know which one is which.
+ *
+ * The whole thing is bounded so a runaway tree (deep node_modules, etc.)
+ * can't stall project open or blow up the prompt.
+ */
+
+// Directories we will not recurse into. Build outputs, version-control
+// internals, dependency caches — none of these legitimately contain
+// CODE-BOSS.md, and walking them is expensive.
+const SKIP_DIRS = new Set([
+  '.git', '.hg', '.svn',
+  '.code_boss', '.agent',
+  '.vs', '.idea', '.vscode',
+  'node_modules', 'bower_components',
+  'target', 'dist', 'build', 'out', 'bin', 'obj',
+  '__pycache__', '.gradle', '.mvn',
+]);
+
+const CODE_BOSS_FILE = 'CODE-BOSS.md';
+const MAX_DEPTH = 6;             // root + 6 levels — deeper is almost always inside a dependency
+const MAX_FILES = 25;            // hard stop so a generated tree can't pile up forever
+const MAX_FILE_BYTES = 16 * 1024;  // 16KB per file is plenty for project instructions
+const MAX_TOTAL_BYTES = 200 * 1024; // hard cap on the combined output
+
+/**
+ * Walk `rootDir` looking for CODE-BOSS.md files. Returns
+ *   [{ relDir, absPath, content, truncated, originalBytes }, ...]
+ * with relDir relative to rootDir ('.' for the root itself).
+ */
+async function discoverCodeBossFiles(rootDir) {
+  const found = [];
+  let totalBytes = 0;
+
+  async function walk(dir, depth) {
+    if (depth > MAX_DEPTH) return;
+    if (found.length >= MAX_FILES) return;
+    if (totalBytes >= MAX_TOTAL_BYTES) return;
+    let entries;
+    try { entries = await readdir(dir, { withFileTypes: true }); }
+    catch { return; }   // permission denied, broken symlink, etc.
+    // Read files in this dir first, then descend — gives a stable
+    // top-down order in the result.
+    for (const e of entries) {
+      if (!e.isFile()) continue;
+      if (e.name !== CODE_BOSS_FILE) continue;
+      const abs = path.join(dir, e.name);
+      try {
+        const buf = await readFile(abs, 'utf8');
+        const truncated = buf.length > MAX_FILE_BYTES;
+        const content = truncated
+          ? buf.slice(0, MAX_FILE_BYTES) + '\n[... truncated]'
+          : buf;
+        totalBytes += content.length;
+        const rel = path.relative(rootDir, dir) || '.';
+        found.push({ relDir: rel, absPath: abs, content, truncated, originalBytes: buf.length });
+        if (found.length >= MAX_FILES) return;
+        if (totalBytes >= MAX_TOTAL_BYTES) return;
+      } catch { /* unreadable; skip */ }
+    }
+    for (const e of entries) {
+      if (!e.isDirectory()) continue;
+      if (e.name.startsWith('.')) continue;
+      if (SKIP_DIRS.has(e.name)) continue;
+      await walk(path.join(dir, e.name), depth + 1);
+      if (found.length >= MAX_FILES) return;
+      if (totalBytes >= MAX_TOTAL_BYTES) return;
+    }
+  }
+
+  try {
+    const s = await stat(rootDir);
+    if (!s.isDirectory()) return [];
+  } catch { return []; }
+
+  await walk(rootDir, 0);
+  return found;
+}
+
+/**
+ * Format a discovered-file list as a system-prompt-ready string.
+ * Empty input → ''.  Single file in the root → its text directly under
+ * a heading.  Anything else → a list of sections keyed by relative dir.
+ */
+function formatProjectContext(found) {
+  if (!Array.isArray(found) || found.length === 0) return '';
+
+  if (found.length === 1 && found[0].relDir === '.') {
+    return [
+      'The developer has placed a CODE-BOSS.md file in the project root with',
+      'instructions specific to this project. Follow these:',
+      '',
+      String(found[0].content).trim(),
+    ].join('\n');
+  }
+
+  const sections = found.map((f) => {
+    const heading = f.relDir === '.' ? '(project root)' : f.relDir.split(path.sep).join('/');
+    return `### ${heading}/CODE-BOSS.md\n\n${String(f.content).trim()}`;
+  });
+  return [
+    `The active directory contains ${found.length} CODE-BOSS.md file(s), one per`,
+    'sub-project. Each section below names the directory and gives the',
+    'developer\'s instructions for that part of the codebase. Use the relevant',
+    'one(s) when working inside a given subdirectory:',
+    '',
+    sections.join('\n\n────────\n\n'),
+  ].join('\n');
+}
+
+/**
+ * One-shot helper: discover + format.
+ * Returns the prompt-ready string (possibly empty).
+ */
+async function loadProjectContext(rootDir) {
+  if (!rootDir) return { context: '', files: [] };
+  const files = await discoverCodeBossFiles(rootDir);
+  return { context: formatProjectContext(files), files };
+}
+
+// ====== agent/git-workflow.mjs ======
+/**
+ * Git workflow helpers — used by server.mjs to:
+ *   - Detect whether the active project is a git repo.
+ *   - Branch automatically onto CODE_BOSS_<timestamp> when first opening
+ *     so the agent's changes never land directly on the user's working
+ *     branch.
+ *   - Auto-commit at the end of each task (next-task) with the task's
+ *     summary as the commit message.
+ *   - Check `git status --porcelain` before running the reviewer so we
+ *     skip the LLM call when nothing actually changed (Q&A turns, pure
+ *     read flows).
+ *
+ * The shape: each call returns a result object you can pass directly to
+ * a tool-call/tool-result chat event pair, so the git operations are
+ * visible in the chat history just like any other tool the agent runs.
+ *
+ *   { command: 'git ...', exitCode, stdout, stderr, durationMs }
+ *
+ * The caller decides whether to emit a chat event; this module just
+ * runs commands.
+ */
+
+const GIT_DEFAULT_TIMEOUT_MS = 30000;
+
+/** Run a single `git <args>` invocation. Resolves with the result object. */
+function runGit(cwd, args, { timeoutMs = GIT_DEFAULT_TIMEOUT_MS, input } = {}) {
+  return new Promise((resolve) => {
+    const t0 = Date.now();
+    let stdout = '', stderr = '', timedOut = false, settled = false;
+    const child = spawn('git', args, { cwd, windowsHide: true, env: process.env });
+    const tid = setTimeout(() => {
+      timedOut = true;
+      try { child.kill(); } catch {}
+    }, timeoutMs);
+    child.stdout.on('data', (d) => { stdout += d.toString('utf8'); });
+    child.stderr.on('data', (d) => { stderr += d.toString('utf8'); });
+    if (input != null) {
+      try { child.stdin.write(input); child.stdin.end(); } catch {}
+    }
+    const settle = (code, signal) => {
+      if (settled) return; settled = true;
+      clearTimeout(tid);
+      resolve({
+        command: 'git ' + args.join(' '),
+        cwd,
+        exitCode: timedOut ? null : (code ?? null),
+        signal: signal ?? null,
+        timedOut,
+        stdout,
+        stderr,
+        durationMs: Date.now() - t0,
+      });
+    };
+    child.on('close', settle);
+    child.on('error', (e) => { stderr += '\n' + e.message; settle(-1, null); });
+  });
+}
+
+/** True if `dir/.git` exists (file or directory — git worktrees use a file). */
+async function isGitRepo(dir) {
+  if (!dir) return false;
+  try {
+    await stat(path.join(dir, '.git'));
+    return true;
+  } catch { return false; }
+}
+
+/**
+ * Append a pattern to .git/info/exclude (git's local-only ignore file —
+ * unlike .gitignore, this never gets committed). Used to make code_boss
+ * internal state (.code_boss/, conversation.json, etc.) invisible to git
+ * status without modifying the user's project files.
+ *
+ * No-op if the pattern is already there.
+ */
+async function ensureExcluded(dir, ...patterns) {
+  const file = path.join(dir, '.git', 'info', 'exclude');
+  let { readFile, writeFile, mkdir } = await import('node:fs/promises');
+  let existing = '';
+  try { existing = await readFile(file, 'utf8'); }
+  catch { /* file doesn't exist yet; will create */ }
+  const have = new Set(existing.split('\n').map((s) => s.trim()).filter(Boolean));
+  const toAdd = patterns.filter((p) => !have.has(p));
+  if (toAdd.length === 0) return false;
+  try { await mkdir(path.dirname(file), { recursive: true }); } catch {}
+  const next = (existing.endsWith('\n') || existing === '') ? existing : existing + '\n';
+  await writeFile(file, next + toAdd.join('\n') + '\n', 'utf8');
+  return true;
+}
+
+/** Get current branch name (or null if detached HEAD / non-git / error). */
+async function getCurrentBranch(dir) {
+  const r = await runGit(dir, ['rev-parse', '--abbrev-ref', 'HEAD']);
+  if (r.exitCode !== 0) return null;
+  const name = r.stdout.trim();
+  if (!name || name === 'HEAD') return null;
+  return name;
+}
+
+/** Return short HEAD hash, or null if anything goes wrong. */
+async function getHeadHash(dir) {
+  const r = await runGit(dir, ['rev-parse', '--short', 'HEAD']);
+  if (r.exitCode !== 0) return null;
+  const h = r.stdout.trim();
+  return h || null;
+}
+
+/**
+ * Read the porcelain status. Returns:
+ *   { dirty: bool, lines: [{ status, path }] }
+ * Empty `lines` ⇒ working tree clean. We use this both for the
+ * project-open dirty-check AND for the reviewer-skip check.
+ */
+async function getStatus(dir) {
+  const r = await runGit(dir, ['status', '--porcelain']);
+  if (r.exitCode !== 0) return { dirty: false, lines: [], error: r.stderr.trim() };
+  const lines = r.stdout.split('\n').filter(Boolean).map((line) => ({
+    status: line.slice(0, 2),
+    path: line.slice(3),
+  }));
+  return { dirty: lines.length > 0, lines };
+}
+
+/**
+ * Create + checkout a new branch from HEAD. Fails (exitCode !== 0) if
+ * the branch already exists. Branch name is generated when not provided.
+ */
+async function createBranch(dir, name) {
+  const branch = name || generateBranchName();
+  const r = await runGit(dir, ['checkout', '-b', branch]);
+  return { ...r, branch };
+}
+
+/** YYYYMMDD-HHMMSS local time. Sortable, human-readable, no collisions. */
+function generateBranchName() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  const ts = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+  return `CODE_BOSS_${ts}`;
+}
+
+/** True if a name matches the CODE_BOSS_<timestamp> pattern. */
+function isCodeBossBranch(name) {
+  return typeof name === 'string' && /^CODE_BOSS_/.test(name);
+}
+
+/**
+ * Stage everything then commit with the given message. If there's
+ * nothing to commit (working tree clean), returns `{ skipped: true }`
+ * instead of a failed commit. Otherwise resolves with the commit's
+ * short hash on success.
+ */
+async function commitAll(dir, message) {
+  const status = await getStatus(dir);
+  if (!status.dirty) return { skipped: true, reason: 'working tree clean' };
+  const add = await runGit(dir, ['add', '-A']);
+  if (add.exitCode !== 0) {
+    return { committed: false, error: 'git add failed: ' + (add.stderr.trim() || `exit ${add.exitCode}`), add };
+  }
+  // -F - reads message from stdin so multi-line + special chars round-trip cleanly.
+  const commit = await runGit(dir, ['commit', '-F', '-'], { input: message });
+  if (commit.exitCode !== 0) {
+    return { committed: false, error: 'git commit failed: ' + (commit.stderr.trim() || `exit ${commit.exitCode}`), add, commit };
+  }
+  const hash = await getHeadHash(dir);
+  return { committed: true, hash, add, commit };
+}
+
+/**
+ * Build a commit message from the next-task attributes. Subject is the
+ * summary (truncated to fit a normal git log column); body has the
+ * user-request that prompted the work.
+ */
+function buildCommitMessage({ summary, userRequest }) {
+  const subject = String(summary || 'task').replace(/\s+/g, ' ').trim().slice(0, 72) || 'task';
+  const body = userRequest ? `\n\nUser request: ${String(userRequest).trim()}` : '';
+  return subject + body + '\n\n[code_boss auto-commit]\n';
+}
+
 // ====== agent/prompted.mjs ======
 /**
  * Prompted-format agent loop with task-scoped memory.
@@ -1897,7 +2230,7 @@ const DEFAULT_MAX_TURNS = 20;
 const REPEAT_LIMIT = 3;
 
 // ── System prompt ───────────────────────────────────────────────────────────
-function buildSystemPrompt({ taskId, taskUserRequest, tier1Tokens, tier1Pct, promptAdditions = [] }) {
+function buildSystemPrompt({ taskId, taskUserRequest, tier1Tokens, tier1Pct, promptAdditions = [], projectContext = '' }) {
   const lines = [
     'You are code_boss, a coding agent. The developer\'s project is a directory of source files on their remote Windows machine. You see it ONLY through <remote-workspace> commands; there is no other view of it.',
     '',
@@ -1953,6 +2286,13 @@ function buildSystemPrompt({ taskId, taskUserRequest, tier1Tokens, tier1Pct, pro
     lines.push('');
     lines.push('────────  plugin  ────────');
     lines.push(String(add).trim());
+  }
+  // Project context from CODE-BOSS.md files discovered at project open.
+  // Last so it sits closest to the user's question — recency bias.
+  if (projectContext) {
+    lines.push('');
+    lines.push('────────  project context  ────────');
+    lines.push(String(projectContext).trim());
   }
   return lines.join('\n');
 }
@@ -2433,11 +2773,16 @@ async function dispatchTaskOp(c, store) {
   if (c.verb === 'next-task') {
     // user-request and summary describe the task being CLOSED (the current one),
     // not the new one being opened. See system prompt.
-    const t = await store.transitionTo({
+    const r = await store.transitionTo({
       summary: a.summary ?? '',
       userRequest: a['user-request'] ?? '',
     });
-    return { ok: true, content: `closed previous task with summary "${a.summary ?? ''}"; opened new task ${t.id}` };
+    return {
+      ok: true,
+      content: `closed previous task with summary "${a.summary ?? ''}"; opened new task ${r.newTask.id}`,
+      closedId: r.closedId,
+      newTaskId: r.newTask.id,
+    };
   }
   if (c.verb === 'list-tasks') {
     const list = await store.listTasks({ parentId: a.parent });
@@ -2447,7 +2792,8 @@ async function dispatchTaskOp(c, store) {
       const tier = `tier${t.tier}`;
       const ur = t.userRequest ? ` ↳ ${t.userRequest.split('\n')[0].slice(0, 100)}` : '';
       const summary = t.summary ? ` — ${t.summary.split('\n')[0].slice(0, 120)}` : '';
-      return `${t.id}  [${status}]  [${tier}]${ur}${summary}`;
+      const hash = t.commitHash ? `  (commit ${t.commitHash})` : '';
+      return `${t.id}  [${status}]  [${tier}]${hash}${ur}${summary}`;
     });
     return { ok: true, content: lines.join('\n') };
   }
@@ -2498,6 +2844,12 @@ async function runPromptedAgent({
   extraTools = {},          // { tool_name: { verb, name, schema, impl } }
   extraVerbs = {},          // { verb: tool_name } — fed to parseToolCalls
   promptAdditions = [],     // strings appended to system prompt
+  projectContext = '',      // formatted CODE-BOSS.md context for this project
+  // Hook fired right after a <next-task> task-op transitions the store.
+  // Receives { closedTaskId, newTaskId, userRequest, summary } and may
+  // return a commit hash string (or null). The hash is attached to the
+  // closed task's record and included in the task-end chat event.
+  onTaskClose,
 }) {
   if (!projectDir) throw new Error('projectDir required for task-scoped agent');
 
@@ -2549,6 +2901,7 @@ async function runPromptedAgent({
       tier1Tokens: t1Tokens,
       tier1Pct,
       promptAdditions,
+      projectContext,
     });
 
     // Build the convo from the store. The system reminder is NOT stored —
@@ -2689,13 +3042,35 @@ async function runPromptedAgent({
         resultContent = r.content;
         resultStatus = r.ok ? 'ok' : 'error';
         log(`  ${c.verb}(${JSON.stringify(c.args)}) -> ${resultStatus}`);
-        // If this was a <next-task>, emit a task-end event for the (just-closed) prior task.
+        // If this was a <next-task>, give the server a chance to commit
+        // (the auto-commit hook runs here, after the store transition).
+        // The hook returns a commit hash; we record it on the just-
+        // closed task so future task-detail / list-tasks responses see
+        // it, then emit task-end carrying the hash too.
         if (c.verb === 'next-task' && r.ok) {
+          let commitHash = null;
+          if (typeof onTaskClose === 'function') {
+            try {
+              commitHash = await onTaskClose({
+                closedTaskId: r.closedId,
+                newTaskId: r.newTaskId,
+                userRequest: c.args['user-request'] ?? '',
+                summary: c.args.summary ?? '',
+              });
+            } catch (e) {
+              log(`onTaskClose error: ${e.message}`);
+            }
+          }
+          if (commitHash && r.closedId) {
+            try { await store.attachToTask(r.closedId, { commitHash }); }
+            catch (e) { log(`attachToTask error: ${e.message}`); }
+          }
           emitChat({
             type: 'task-end',
             taskId: cur?.id,                      // the task that just closed
             userRequest: c.args['user-request'] ?? '',
             summary: c.args.summary ?? '',
+            commitHash,                           // null if no auto-commit happened
           });
         }
       } else {
@@ -4790,6 +5165,8 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
       // browser can re-show the modal rather than miss the broadcast.
       pendingUnlockUrl: session.pendingUnlock?.url ?? null,
       plugins: pluginManager ? pluginManager.snapshot() : [],
+      projectContextFiles: session.projectContextFiles || [],
+      git: session.git || { isRepo: false },
     };
   }
   // Expose helpers so we can use them from /api/chat and from new endpoints later.
@@ -4869,6 +5246,88 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
     for (const ev of session.chatEvents) {
       broadcast({ type: 'event', version: bumpVersion(), event: ev });
     }
+    // Scan for CODE-BOSS.md files and cache the prompt-ready string.
+    // Also re-runs every PLUGIN_REDETECT_MS (see the interval below)
+    // so edits to CODE-BOSS.md files take effect within ~5 min without
+    // a project reopen.
+    await refreshProjectContext({ openLog: true });
+    // Git workflow: branch automatically onto CODE_BOSS_<timestamp>
+    // if we're opening a non-CODE_BOSS branch with a clean tree. If
+    // the tree is dirty, set a pending-wizard flag and skip the
+    // branch creation — the user resolves via the wizard modal.
+    await initGitWorkflow();
+  }
+  async function initGitWorkflow() {
+    session.git = { isRepo: false };
+    if (!session.activeProject) return;
+    const dir = session.activeProject;
+    if (!(await isGitRepo(dir))) {
+      fileLog('git: project is not a git repo — branch workflow disabled');
+      return;
+    }
+    session.git = { isRepo: true, dir };
+    // code_boss's own state (.code_boss/, conversation.json) should not
+    // pollute the user's working tree from git's POV. Append to
+    // .git/info/exclude (local-only; never committed).
+    try {
+      const added = await ensureExcluded(dir, '.code_boss/', '.code_boss');
+      if (added) fileLog('git: added .code_boss/ to .git/info/exclude');
+    } catch (e) { fileLog(`git: could not update .git/info/exclude: ${e.message}`); }
+    const branch = await getCurrentBranch(dir);
+    const head = await getHeadHash(dir);
+    session.git.branch = branch;
+    session.git.head = head;
+    if (isCodeBossBranch(branch)) {
+      fileLog(`git: already on ${branch} (head=${head}) — reusing`);
+      return;
+    }
+    const status = await getStatus(dir);
+    if (status.dirty) {
+      // Dirty tree — branch creation deferred to the wizard. Until the
+      // wizard ships, we just flag it and continue. The agent can still
+      // work on the user's current branch; auto-commit will write there.
+      session.git.pendingWizard = {
+        currentBranch: branch,
+        changeCount: status.lines.length,
+      };
+      fileLog(`git: ${status.lines.length} uncommitted change(s) on '${branch}'; CODE_BOSS branch not created (wizard pending)`);
+      return;
+    }
+    const r = await createBranch(dir);
+    if (r.exitCode !== 0) {
+      fileLog(`git: failed to create branch '${r.branch}': ${r.stderr.trim() || 'exit ' + r.exitCode}`);
+      return;
+    }
+    session.git.branch = r.branch;
+    session.git.parentBranch = branch;  // remember where we forked from for later merge
+    fileLog(`git: created and checked out ${r.branch} (forked from ${branch} @ ${head})`);
+  }
+  async function refreshProjectContext({ openLog = false } = {}) {
+    if (!session.activeProject) {
+      session.projectContext = '';
+      session.projectContextFiles = [];
+      return;
+    }
+    try {
+      const { context, files } = await loadProjectContext(session.activeProject);
+      const prev = session.projectContext || '';
+      session.projectContext = context;
+      session.projectContextFiles = files.map((f) => ({
+        relDir: f.relDir, bytes: f.originalBytes, truncated: f.truncated,
+      }));
+      // Log on every project open, plus on any change after that.
+      // No log when a periodic scan finds nothing new.
+      const changed = context !== prev;
+      if (files.length > 0 && (openLog || changed)) {
+        fileLog(`project context: ${files.length} CODE-BOSS.md file(s), ${context.length} chars${changed && !openLog ? ' (changed since last scan)' : ''}`);
+      } else if (changed && !openLog) {
+        fileLog(`project context: cleared (no CODE-BOSS.md files found)`);
+      }
+    } catch (e) {
+      session.projectContext = '';
+      session.projectContextFiles = [];
+      fileLog(`project context load failed: ${e.message}`);
+    }
   }
   function logEvent(type, data) {
     const summary = (SUMMARIZE[type] ?? ((d) => JSON.stringify(d).slice(0, 200)))(data);
@@ -4893,8 +5352,13 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
   // newly-installed tools light up without a restart.
   const pluginManager = createPluginManager({ onLog: (m) => fileLog(`[plugin] ${m}`) });
   await pluginManager.detectAll();
+  // The 5-min loop refreshes BOTH plugin enablement (in case a tool got
+  // installed mid-session) AND project context (in case a CODE-BOSS.md
+  // file was edited). Same cadence on purpose — one timer, one source
+  // of "stuff that might have changed on disk".
   const _pluginInterval = setInterval(() => {
     pluginManager.detectAll().catch((e) => fileLog(`[plugin] detect error: ${e.message}`));
+    refreshProjectContext().catch((e) => fileLog(`[context] refresh error: ${e.message}`));
   }, PLUGIN_REDETECT_MS);
   // Don't keep the event loop alive just for the redetect timer — tests
   // call server.close() and expect the process to exit.
@@ -5098,7 +5562,76 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
         catch { return sendJson(res, 400, { error: 'invalid JSON' }); }
         try { await openProject(body.path); }
         catch (e) { return sendJson(res, 400, { error: e.message }); }
-        return sendJson(res, 200, { activeProject: session.activeProject, recent: session.recent });
+        return sendJson(res, 200, {
+          activeProject: session.activeProject,
+          recent: session.recent,
+          git: session.git || { isRepo: false },
+        });
+      }
+      if (req.method === 'POST' && path === '/api/git-wizard-resolve') {
+        // Resolve the open-project git wizard. Body shape:
+        //   { action: 'manual' }
+        //     → close the wizard, leave the project on the user's branch
+        //       (no CODE_BOSS branch created; the user will commit by
+        //       hand and reopen). Returns 200 with the updated git state.
+        //   { action: 'commit', message: '...' }
+        //     → stage + commit with the provided message, then create
+        //       the CODE_BOSS_<ts> branch. Message required.
+        //   { action: 'commit', useAI: true }
+        //     → ask the LLM for a one-line commit subject based on
+        //       `git diff HEAD`, commit with that, then branch.
+        if (!session.git?.isRepo) return sendJson(res, 400, { error: 'no git repo' });
+        if (!session.git.pendingWizard) return sendJson(res, 400, { error: 'no pending wizard' });
+        const raw = await readBody(req);
+        let body; try { body = JSON.parse(raw); }
+        catch { return sendJson(res, 400, { error: 'invalid JSON' }); }
+        const dir = session.git.dir;
+        if (body.action === 'manual') {
+          delete session.git.pendingWizard;
+          fileLog('git wizard: user chose manual commit; CODE_BOSS branch not created');
+          return sendJson(res, 200, { git: session.git });
+        }
+        if (body.action !== 'commit') return sendJson(res, 400, { error: 'unknown action' });
+        // Stage everything FIRST. This way the AI sees untracked files
+        // too (git diff HEAD only shows tracked changes), and the
+        // commit path below is unconditional.
+        const add = await runGit(dir, ['add', '-A']);
+        if (add.exitCode !== 0) return sendJson(res, 500, { error: 'git add failed: ' + add.stderr });
+        let message = String(body.message || '').trim();
+        if (body.useAI) {
+          // --cached compares the index to HEAD; now that we've staged
+          // everything, it includes the new files the user hadn't tracked.
+          const diff = await runGit(dir, ['diff', '--cached', 'HEAD']);
+          const sample = (diff.stdout || '').slice(0, 12000);
+          if (!sample.trim()) return sendJson(res, 400, { error: 'no changes to summarize' });
+          try {
+            const r = await adapter.complete({
+              model: session.defaultModel,
+              messages: [
+                { role: 'system', content: 'You summarize git diffs into a single short imperative commit subject (max 70 chars). Respond with ONLY the subject line, no quotes, no prefix.' },
+                { role: 'user', content: `Diff:\n\n${sample}` },
+              ],
+            });
+            const text = (r?.choices?.[0]?.message?.content || '').trim();
+            message = text.split('\n')[0].slice(0, 72) || 'pre-existing changes';
+            fileLog(`git wizard: AI summary → "${message}"`);
+          } catch (e) {
+            return sendJson(res, 500, { error: 'AI summary failed: ' + e.message });
+          }
+        }
+        if (!message) return sendJson(res, 400, { error: 'message required when useAI is false' });
+        const commit = await runGit(dir, ['commit', '-F', '-'], { input: message + '\n' });
+        if (commit.exitCode !== 0) return sendJson(res, 500, { error: 'git commit failed: ' + commit.stderr });
+        const preBranchHash = await getHeadHash(dir);
+        const parentBranch = session.git.branch;
+        const r = await createBranch(dir);
+        if (r.exitCode !== 0) return sendJson(res, 500, { error: 'branch creation failed: ' + r.stderr });
+        session.git.branch = r.branch;
+        session.git.parentBranch = parentBranch;
+        session.git.head = preBranchHash;
+        delete session.git.pendingWizard;
+        fileLog(`git wizard: committed (${preBranchHash}) + created ${r.branch} from ${parentBranch}`);
+        return sendJson(res, 200, { git: session.git, committedAs: preBranchHash, message });
       }
       if (req.method === 'POST' && path === '/api/close-project') {
         session.activeProject = null;
@@ -5383,6 +5916,46 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
             try { process.chdir(session.activeProject); cwdChanged = true; }
             catch (e) { throw new Error('cannot enter project directory: ' + e.message); }
             fileLog(`chat START: model=${model} q="${text.slice(0, 200).replace(/\s+/g, ' ')}"`);
+            // Auto-commit hook: fires from runPromptedAgent after every
+            // <next-task> task-op. Only does anything when the project
+            // is a git repo AND we're on a CODE_BOSS_* branch (set up
+            // at project open). Emits the git operations as tool-call /
+            // tool-result chat events so the user sees them inline,
+            // tagged with the just-closed task's id. Returns the new
+            // commit's short hash, which the agent attaches to the
+            // closed task in the store.
+            const gitAutoCommitHook = async ({ closedTaskId, userRequest, summary }) => {
+              if (!session.git?.isRepo || !isCodeBossBranch(session.git.branch)) return null;
+              const dir = session.git.dir;
+              const msg = buildCommitMessage({ summary, userRequest });
+              const emitOp = async (cmdLabel, run) => {
+                const callId = randomUUID();
+                chatState.appendChatEvent({
+                  type: 'tool-call', callId, verb: 'git', name: 'git',
+                  args: { command: cmdLabel }, taskId: closedTaskId,
+                });
+                const r = await run();
+                const status = r.exitCode === 0 ? 'ok' : 'error';
+                const content = r.exitCode === 0
+                  ? (r.stdout.trim() || '(ok)')
+                  : (r.stderr.trim() || `exit ${r.exitCode}`);
+                chatState.appendChatEvent({
+                  type: 'tool-result', callId, verb: 'git', name: 'git',
+                  status, content, taskId: closedTaskId,
+                });
+                return r;
+              };
+              const add = await emitOp('git add -A', () => runGit(dir, ['add', '-A']));
+              if (add.exitCode !== 0) return null;
+              // Pre-check: nothing to commit → silent no-op (don't even
+              // emit a git-commit row for the empty case — the chat
+              // stays clean for Q&A turns that don't touch files).
+              const status = await getStatus(dir);
+              if (!status.dirty) return null;
+              const commit = await emitOp('git commit -F -', () => runGit(dir, ['commit', '-F', '-'], { input: msg }));
+              if (commit.exitCode !== 0) return null;
+              return await getHeadHash(dir);
+            };
             // Review loop: run agent → review → if fail, feed back as a
             // synthetic user message and re-run; max 2 rounds. If still
             // failing after round 2, surface the issue to the user.
@@ -5407,11 +5980,24 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
                 extraTools: pluginManager.enabledTools(),
                 extraVerbs: pluginManager.enabledVerbs(),
                 promptAdditions: pluginManager.promptAdditions(),
+                projectContext: session.projectContext || '',
+                onTaskClose: gitAutoCommitHook,
               });
               lastAgentResult = result;
               const turnDur = Date.now() - chatStart;
               fileLog(`chat round ${round + 1} done: terminated=${result.terminated} turns=${result.stats.turns} calls=${result.stats.toolCalls} duration=${turnDur}ms`);
 
+              // Skip the reviewer when the working tree is clean — Q&A
+              // turns, pure-read flows, and turns where the auto-commit
+              // already swept everything into a commit don't need
+              // review. Saves the LLM call.
+              if (session.git?.isRepo) {
+                const status = await getStatus(session.git.dir);
+                if (!status.dirty) {
+                  fileLog(`reviewer skipped: working tree clean`);
+                  break;
+                }
+              }
               // Fire the reviewer on what just happened. The review event
               // is patched in place from 'pending' → 'pass'/'fail'/'escalate'.
               chatState.setPhase('reviewing');
@@ -7325,6 +7911,19 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   </div>
 </div>
 
+<!-- Git workflow wizard. Shown on project open when the active project
+     has uncommitted changes on a non-CODE_BOSS branch — gives the user
+     the choice of committing manually or letting code_boss commit (with
+     either an AI-generated subject or one they typed). -->
+<div class="modal-bg" id="gitWizardBg" style="z-index: 170;">
+  <div class="modal" id="gitWizard" style="max-width: 560px;">
+    <div class="modal-header">
+      <h2>Uncommitted changes</h2>
+    </div>
+    <div class="modal-body" id="gitWizardBody"></div>
+  </div>
+</div>
+
 <!-- Snapshot/diagnostic modal — stacks over EVERYTHING when open. -->
 <div class="modal-bg" id="modalBg" onclick="if (event.target === this) closeModal()" style="z-index: 200;">
   <div class="modal" id="modal">
@@ -7734,6 +8333,110 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     if (ok && typeof openSettings === 'function') openSettings();   // re-open settings with the new prefix
   }
 
+  // Git wizard for the "uncommitted changes on a non-CODE_BOSS branch"
+  // case. Returns true if the wizard was resolved (manual OR commit), or
+  // false if the user closed the modal without choosing — in which case
+  // the caller should abort the open flow.
+  function showGitWizard(gitState) {
+    const $bg = document.getElementById('gitWizardBg');
+    const $body = document.getElementById('gitWizardBody');
+    const w = gitState.pendingWizard || {};
+    return new Promise((resolve) => {
+      $body.innerHTML = \`
+        <p style="margin: 0 0 12px; color: var(--fg); font-size: 13px;">
+          Your project has <strong>\${w.changeCount}</strong> uncommitted change\${w.changeCount === 1 ? '' : 's'} on
+          <code>\${escapeHtml(w.currentBranch || '?')}</code>. Code Boss works on a
+          dedicated <code>CODE_BOSS_*</code> branch — we'll create one after
+          these changes are resolved.
+        </p>
+        <div class="settings-row" style="align-items: flex-start;">
+          <label style="display:flex; gap:6px; align-items:center; cursor:pointer;">
+            <input type="radio" name="gw-action" value="commit" checked>
+            <span>Let Code Boss commit them</span>
+          </label>
+        </div>
+        <div id="gw-commit-opts" style="margin: 4px 0 8px 24px;">
+          <label style="display:flex; gap:6px; align-items:center; cursor:pointer; margin-bottom: 4px;">
+            <input type="checkbox" id="gw-use-ai" checked>
+            <span>Generate description with AI</span>
+          </label>
+          <textarea id="gw-msg" rows="3" placeholder="Commit message…"
+                    style="display:none; width:100%; box-sizing:border-box; padding:6px 8px; border:1px solid var(--border); background:var(--panel-alt); color:var(--fg); border-radius:4px; font:inherit; resize:vertical;"></textarea>
+        </div>
+        <div class="settings-row" style="align-items: flex-start;">
+          <label style="display:flex; gap:6px; align-items:center; cursor:pointer;">
+            <input type="radio" name="gw-action" value="manual">
+            <span>I'll commit them manually first</span>
+          </label>
+        </div>
+        <p id="gw-msg-err" style="margin: 8px 0 0; color: var(--error); font-size: 12px; min-height: 14px;"></p>
+        <div style="display:flex; gap:8px; justify-content:flex-end; margin-top: 14px;">
+          <button id="gw-cancel" class="btn">Cancel</button>
+          <button id="gw-submit" class="btn primary">Continue</button>
+        </div>
+      \`;
+      $bg.classList.add('show');
+
+      const $useAI = document.getElementById('gw-use-ai');
+      const $msg = document.getElementById('gw-msg');
+      const $err = document.getElementById('gw-msg-err');
+      const $commitOpts = document.getElementById('gw-commit-opts');
+      const $submit = document.getElementById('gw-submit');
+      const $cancel = document.getElementById('gw-cancel');
+
+      function syncCommitOptsVisibility() {
+        const action = document.querySelector('input[name="gw-action"]:checked')?.value;
+        $commitOpts.style.display = action === 'commit' ? '' : 'none';
+      }
+      function syncMsgVisibility() {
+        $msg.style.display = $useAI.checked ? 'none' : 'block';
+      }
+      document.querySelectorAll('input[name="gw-action"]').forEach((r) => r.addEventListener('change', syncCommitOptsVisibility));
+      $useAI.addEventListener('change', syncMsgVisibility);
+      syncCommitOptsVisibility();
+      syncMsgVisibility();
+
+      function done(result) {
+        $bg.classList.remove('show');
+        $body.innerHTML = '';
+        resolve(result);
+      }
+      $cancel.onclick = () => done(false);
+      $submit.onclick = async () => {
+        $err.textContent = '';
+        const action = document.querySelector('input[name="gw-action"]:checked')?.value;
+        let body;
+        if (action === 'manual') {
+          body = { action: 'manual' };
+        } else {
+          if ($useAI.checked) {
+            body = { action: 'commit', useAI: true };
+          } else {
+            const msg = $msg.value.trim();
+            if (!msg) { $err.textContent = 'Please enter a commit message or check "Generate description with AI".'; return; }
+            body = { action: 'commit', message: msg };
+          }
+        }
+        $submit.disabled = true; $cancel.disabled = true;
+        $submit.textContent = body.useAI ? 'Generating + committing…' : (action === 'manual' ? 'Continuing…' : 'Committing…');
+        try {
+          const r = await fetch('/api/git-wizard-resolve', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(body),
+          });
+          const data = await r.json();
+          if (!r.ok) throw new Error(data.error ?? ('HTTP ' + r.status));
+          done(true);
+        } catch (e) {
+          $submit.disabled = false; $cancel.disabled = false;
+          $submit.textContent = 'Continue';
+          $err.textContent = 'Failed: ' + e.message;
+        }
+      };
+    });
+  }
+
   // Tracks the most-recent project so the folder picker starts at its
   // parent (siblings = one click). Falls back to home dir.
   let _lastRecentProject = null;
@@ -7909,10 +8612,19 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
         const data = await r.json();
         throw new Error(data.error ?? ('HTTP ' + r.status));
       }
+      const data = await r.json();
       // Reset the init gate so a new project re-runs models load (the key
       // and model dropdown may differ per environment).
       _initialized = false;
       _pendingSession = null;
+      // Git wizard: if opening surfaced uncommitted changes on a non-
+      // CODE_BOSS branch, server set pendingWizard. Resolve it BEFORE
+      // initialize() so the agent never starts work on top of dirty
+      // bytes the user didn't ask us to touch.
+      if (data.git?.pendingWizard) {
+        const resolved = await showGitWizard(data.git);
+        if (!resolved) return;     // user closed the wizard outright
+      }
       await initialize(p);
     } catch (e) {
       showError('Could not open project', e);
@@ -9081,7 +9793,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
         const args = ev.args || {};
         const visibleArgs = Object.entries(args).filter(([k]) => !NOISY_ARG_KEYS.has(k));
         let argStr;
-        if (visibleArgs.length === 1 && visibleArgs[0][0] === 'path') {
+        if (visibleArgs.length === 1 && (visibleArgs[0][0] === 'path' || visibleArgs[0][0] === 'command')) {
           // Single-path tools (read, write, edit, list_dir): drop the
           // \`path=\` prefix — \`edit(hello.txt)\` reads cleaner.
           argStr = fmtVal(visibleArgs[0][1]);
