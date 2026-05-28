@@ -15,7 +15,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '52';
+const BUILD_VERSION = '54';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
@@ -1386,13 +1386,29 @@ const tools = {
         additionalProperties: false,
       },
     },
-    impl: async ({ command, timeout_ms }) => {
+    impl: async ({ command, timeout_ms }, ctx) => {
       if (typeof command !== 'string' || !command.trim()) throw new Error('command is required');
       const timeout = Math.min(Math.max(1000, Number(timeout_ms) || BASH_DEFAULT_TIMEOUT_MS), BASH_MAX_TIMEOUT_MS);
 
       const t0 = Date.now();
       return await new Promise((resolve) => {
         let stdout = '', stderr = '', timedOut = false, settled = false;
+        // Coalesce stdout/stderr chunks into ~150ms batches when forwarding
+        // to the live-progress channel. Otherwise a noisy build can fire
+        // hundreds of SSE deltas per second.
+        let pendingProgress = '';
+        let progressTimer = null;
+        const flushProgress = () => {
+          progressTimer = null;
+          if (!pendingProgress) return;
+          try { ctx?.onProgress?.(pendingProgress); } catch {}
+          pendingProgress = '';
+        };
+        const queueProgress = (s) => {
+          if (!ctx?.onProgress) return;
+          pendingProgress += s;
+          if (!progressTimer) progressTimer = setTimeout(flushProgress, 150);
+        };
         // PowerShell-only deployment. cmd.exe is often blocked by enterprise
         // policy and lacks the unix aliases the agent expects (ls, cat, etc.).
         const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', command], {
@@ -1409,16 +1425,26 @@ const tools = {
           }
         }, timeout);
 
-        child.stdout.on('data', (d) => { if (stdout.length < BASH_MAX_OUTPUT_CHARS * 2) stdout += d.toString('utf8'); });
-        child.stderr.on('data', (d) => { if (stderr.length < BASH_MAX_OUTPUT_CHARS * 2) stderr += d.toString('utf8'); });
+        child.stdout.on('data', (d) => {
+          const s = d.toString('utf8');
+          if (stdout.length < BASH_MAX_OUTPUT_CHARS * 2) stdout += s;
+          queueProgress(s);
+        });
+        child.stderr.on('data', (d) => {
+          const s = d.toString('utf8');
+          if (stderr.length < BASH_MAX_OUTPUT_CHARS * 2) stderr += s;
+          queueProgress(s);
+        });
         child.on('error', (err) => {
           if (settled) return; settled = true;
           clearTimeout(timer);
+          if (progressTimer) { clearTimeout(progressTimer); flushProgress(); }
           resolve(`ERROR: failed to spawn shell: ${err.message}`);
         });
         child.on('close', (code, signal) => {
           if (settled) return; settled = true;
           clearTimeout(timer);
+          if (progressTimer) { clearTimeout(progressTimer); flushProgress(); }
           const elapsed = Date.now() - t0;
           const outTrunc = stdout.length > BASH_MAX_OUTPUT_CHARS;
           const errTrunc = stderr.length > BASH_MAX_OUTPUT_CHARS;
@@ -1445,7 +1471,14 @@ const tools = {
             errBody ? `--- stderr ---\n${errBody}` : '',
             hint,
           ].filter(Boolean).join('\n').trim();
-          resolve(text);
+          // Timeout is a failure mode the agent should see as an error
+          // (status=error, red row in chat) — without the ERROR prefix
+          // it falls through to status=ok with the timeout text buried
+          // in the body, which is too easy to miss on the collapsed
+          // result row. Non-zero exit codes are left as-is: many
+          // commands (git diff --exit-code, grep, etc.) intentionally
+          // return non-zero for normal outcomes.
+          resolve(timedOut ? 'ERROR: ' + text : text);
         });
       });
     },
@@ -1499,7 +1532,7 @@ const toolDefs = Object.entries(tools).map(([name, t]) => ({
  *
  * Callers can normalize via `extractContent(result)` and `extractDiff(result)`.
  */
-async function execute(name, args, extraTools = {}) {
+async function execute(name, args, extraTools = {}, ctx = {}) {
   // Built-ins win over plugin tools — name collisions are caught earlier in
   // src/plugins/index.mjs (checkCollisions), but if a plugin tool somehow
   // sneaks through with a built-in name it still won't shadow.
@@ -1509,7 +1542,12 @@ async function execute(name, args, extraTools = {}) {
     return `ERROR: unknown tool "${name}". Available: ${all.join(', ')}`;
   }
   try {
-    const result = await t.impl(args ?? {});
+    // ctx may carry { callId, onProgress(chunk) } so tools that produce
+    // streaming output (powershell, wl, anything else with a child
+    // process) can forward stdout/stderr chunks to the chat for a
+    // click-to-expand "running…" indicator while they execute. Tools
+    // that don't care simply ignore the second arg.
+    const result = await t.impl(args ?? {}, ctx);
     return result;  // may be string or object; callers handle both
   } catch (e) {
     return `ERROR: ${e.message}`;
@@ -2663,7 +2701,15 @@ async function runPromptedAgent({
       } else {
         stats.toolCalls++;
         stats.toolHistogram[c.name] = (stats.toolHistogram[c.name] ?? 0) + 1;
-        const raw = await execute(c.name, c.args, extraTools);
+        const raw = await execute(c.name, c.args, extraTools, {
+          callId: c.id,
+          // Tool emits stdout/stderr chunks → broadcast as tool-progress
+          // chat events. The client renders a "running…" placeholder row
+          // for each tool call and accumulates chunks into a clickable
+          // live-output view. tool-progress events are ephemeral (not
+          // persisted — see appendChatEvent in src/server.mjs).
+          onProgress: (chunk) => emitChat({ type: 'tool-progress', callId: c.id, chunk }),
+        });
         if (typeof raw === 'string' && raw.startsWith('ERROR:')) {
           resultContent = raw;
           resultStatus = 'error';
@@ -2941,11 +2987,10 @@ function clip(s, n) {
 
 // Per-user wl config script. wl reads this on every invocation.
 const WL_CONFIG_PATH = path.join(homedir(), 'myWlSetup.bat');
-// User guide ships under X:\Java\scriptsWLS.<ver>\. We name the current
-// known version but the latest may differ — the agent can <list/> the
-// X:\Java directory to find it, then use the docx plugin's read_docx tool
-// to extract the text.
-const WL_USER_GUIDE_HINT = 'X:\\Java\\scriptsWLS.12c\\WeblogicDesktopScriptsUserGuide.docx';
+// The wl tool's source + user guide live in a git repo. Clone it into a
+// scratch directory and read files normally; git credentials are already
+// configured on the dev machine.
+const WL_REPO_URL = 'https://git-oci.int.dmdc.osd.mil/incubator/sandbox/weblogicdesktopscripts';
 
 const WL_PROMPT = `
 The "wl" command is available in this environment. It is a developer wrapper
@@ -2985,9 +3030,16 @@ For help, run wl with no args:
 Further reference, if you need it:
   - User config (env, sync region, aliases): ${WL_CONFIG_PATH}
     (use <read path="${WL_CONFIG_PATH}"/> to inspect)
-  - User guide (this version, may shift — list X:\\Java to find latest):
-    ${WL_USER_GUIDE_HINT}
-    (the read_docx tool from the docx plugin can read it)
+  - Source + user guide live in a git repo (developer creds already
+    set up on PATH; no auth dance needed):
+      ${WL_REPO_URL}
+    To browse without cluttering the project, clone into a scratch
+    dir and read normally. Example:
+      <powershell>git clone --depth 1 ${WL_REPO_URL} $env:TEMP\\wlscripts</powershell>
+      <list path="$env:TEMP\\wlscripts"/>
+      <read path="$env:TEMP\\wlscripts\\README.md"/>
+    The user guide is a .docx in the repo — use read_docx (from the
+    docx plugin) for that.
 `.trim();
 
 const wlPlugin = {
@@ -3026,7 +3078,7 @@ const wlPlugin = {
         required: ['args'],
       },
     },
-    async impl({ args, timeout_ms }) {
+    async impl({ args, timeout_ms }, ctx) {
       // Empty args is allowed — running `wl` with nothing prints its
       // usage screen, which the agent may legitimately want.
       const safeArgs = (typeof args === 'string') ? args.trim() : '';
@@ -3038,6 +3090,22 @@ const wlPlugin = {
       const t0 = Date.now();
       return await new Promise((resolve) => {
         let stdout = '', stderr = '', timedOut = false, settled = false;
+        // Forward stdout/stderr chunks to the live-progress channel so the
+        // user can click the "running…" row in the chat and watch a build
+        // / deploy stream in real time. Batched ~150ms to avoid SSE flood.
+        let pendingProgress = '';
+        let progressTimer = null;
+        const flushProgress = () => {
+          progressTimer = null;
+          if (!pendingProgress) return;
+          try { ctx?.onProgress?.(pendingProgress); } catch {}
+          pendingProgress = '';
+        };
+        const queueProgress = (s) => {
+          if (!ctx?.onProgress) return;
+          pendingProgress += s;
+          if (!progressTimer) progressTimer = setTimeout(flushProgress, 150);
+        };
         const child = spawn(
           'powershell.exe',
           ['-NoProfile', '-NonInteractive', '-Command', safeArgs ? `wl ${safeArgs}` : 'wl'],
@@ -3047,12 +3115,21 @@ const wlPlugin = {
           timedOut = true;
           try { child.kill(); } catch {}
         }, timeout);
-        child.stdout.on('data', (d) => { stdout += d.toString(); });
-        child.stderr.on('data', (d) => { stderr += d.toString(); });
+        child.stdout.on('data', (d) => {
+          const s = d.toString();
+          stdout += s;
+          queueProgress(s);
+        });
+        child.stderr.on('data', (d) => {
+          const s = d.toString();
+          stderr += s;
+          queueProgress(s);
+        });
         const settle = (code) => {
           if (settled) return;
           settled = true;
           clearTimeout(tid);
+          if (progressTimer) { clearTimeout(progressTimer); flushProgress(); }
           const dur = Date.now() - t0;
           if (timedOut) {
             resolve(`ERROR: wl ${safeArgs} timed out after ${timeout}ms (workspace=${workspaceDir})`);
@@ -3106,11 +3183,10 @@ const docxPlugin = {
   async trigger() { return true; },
   promptAddition: `
 The read_docx tool reads the plain text out of a Microsoft Word .docx file.
-Use it when you need to consult a .docx document — typical examples:
-   - the wl plugin's user guide at X:\\Java\\scriptsWLS.12c\\WeblogicDesktopScriptsUserGuide.docx
-   - any spec or design doc the user points you to that ends in .docx
+Use it when you need to consult a .docx document — design docs, user
+guides, specs the user points you to that end in .docx.
 
-  <read_docx path="X:\\Java\\scriptsWLS.12c\\WeblogicDesktopScriptsUserGuide.docx"/>
+  <read_docx path="path/to/document.docx"/>
 
 Output is the document's text content, paragraphs separated by newlines.
 Tables/styles/images are dropped; you get readable prose only.
@@ -4601,9 +4677,14 @@ async function startServer({ html, baseURL, apiKey, defaultModel, port = 18888, 
   function appendChatEvent(event) {
     const id = `e${session.nextEventId++}`;
     const ev = { id, appendedAtVersion: session.version + 1, ...event };
-    session.chatEvents.push(ev);
+    // tool-progress events stream live stdout/stderr chunks from a running
+    // tool — broadcast them so the chat UI can render a live-output view,
+    // but DON'T push to chatEvents or save: they'd bloat the conversation
+    // file by megabytes during a build, and they're ephemeral by intent.
+    const ephemeral = event.type === 'tool-progress';
+    if (!ephemeral) session.chatEvents.push(ev);
     broadcast({ type: 'event', version: bumpVersion(), event: ev });
-    scheduleConversationSave();
+    if (!ephemeral) scheduleConversationSave();
     return ev;
   }
   // Patch an existing event in place (e.g., to mute tool result on tier 1→2 demotion).
@@ -5977,6 +6058,12 @@ const UI_HTML = `<!DOCTYPE html>
   }
   .row-result.err { color: var(--error); }
   .row-result.expandable:hover { color: var(--fg); }
+  /* "Running…" placeholder shown while a tool is still executing. Plain
+     muted text — no pulse here because the green dot on the tool-call
+     row above already blinks; two pulsing things compete. Click to
+     expand the live-output buffer below. */
+  .row-result.running { color: var(--muted); }
+  .row-result.running:hover { color: var(--fg); }
   .row-result pre {
     margin: 6px 0 0;
     text-indent: 0;
@@ -7939,6 +8026,78 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     scrollToBottom();
     return body;
   }
+  // Per-call live-output buffers. Keyed by tool-call ev.callId. tool-progress
+  // events append; tool-result removes the entry. Survives only in memory —
+  // a page reload won't restore mid-flight output (the server doesn't persist
+  // tool-progress events on purpose; they'd flood the conversation file).
+  const _progressBuffers = new Map();
+  const PROGRESS_MAX_BYTES = 1024 * 1024;   // 1 MB cap per call
+
+  function addRunningResultRow(callId) {
+    const row = document.createElement('div');
+    row.className = 'row-result running expandable';
+    if (callId) row.dataset.callId = callId;
+    row.title = 'click to view live output';
+    const sum = document.createElement('span');
+    sum.className = 'run-sum';
+    sum.textContent = '⎿ Running…';
+    row.appendChild(sum);
+    let open = false;
+    row.addEventListener('click', (e) => {
+      if (e.target.tagName === 'PRE') return;   // selecting text in the pre shouldn't collapse
+      open = !open;
+      row.dataset.open = open ? '1' : '';
+      row.title = open ? 'click to collapse' : 'click to view live output';
+      let pre = row.querySelector('pre');
+      if (open) {
+        if (!pre) {
+          pre = document.createElement('pre');
+          row.appendChild(pre);
+        }
+        pre.textContent = _progressBuffers.get(callId) || '(no output yet)';
+        pre.style.display = '';
+        // Scroll the pre to the bottom so the freshest output is visible
+        // (matches tail -f intuition for a running command).
+        requestAnimationFrame(() => { pre.scrollTop = pre.scrollHeight; });
+      } else if (pre) {
+        pre.style.display = 'none';
+      }
+    });
+    $log.appendChild(row);
+    pinStatusToBottom();
+    scrollToBottom();
+    return row;
+  }
+
+  function appendProgress(callId, chunk) {
+    if (!callId) return;
+    const prev = _progressBuffers.get(callId) || '';
+    let next = prev + (chunk || '');
+    // Cap the per-call buffer so a runaway build doesn't eat the page's
+    // memory. Keeps the LAST PROGRESS_MAX_BYTES — tail is more useful
+    // than head for a running build's "what's happening RIGHT NOW".
+    if (next.length > PROGRESS_MAX_BYTES) {
+      next = '… [earlier output trimmed] …\\n' + next.slice(-PROGRESS_MAX_BYTES);
+    }
+    _progressBuffers.set(callId, next);
+    const placeholder = $log.querySelector(\`.row-result.running[data-call-id="\${callId}"]\`);
+    if (!placeholder) return;
+    const sum = placeholder.querySelector('.run-sum');
+    if (sum) sum.textContent = \`⎿ Running… \${fmtBytes(next.length)}\`;
+    if (placeholder.dataset.open) {
+      const pre = placeholder.querySelector('pre');
+      if (pre) {
+        pre.textContent = next;
+        requestAnimationFrame(() => { pre.scrollTop = pre.scrollHeight; });
+      }
+    }
+  }
+  function fmtBytes(n) {
+    if (n < 1024) return n + ' B';
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+    return (n / 1024 / 1024).toFixed(2) + ' MB';
+  }
+
   function addResultRow(ev) {
     const row = document.createElement('div');
     row.className = 'row-result' + (ev.status === 'error' ? ' err' : '');
@@ -8673,7 +8832,14 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     session.version = msg.version;
     switch (msg.type) {
       case 'event':
-        session.events.push(msg.event);
+        // tool-progress streams live stdout from a running tool — render
+        // it but do NOT keep it in session.events. The server doesn't
+        // persist it either (see appendChatEvent in server.mjs). Pushing
+        // here would replay every chunk on full re-renders (event-patch
+        // case below) — visually fine but wasteful, and worse: when the
+        // conversation is reloaded from disk after a restart we'd be
+        // replaying chunks for a tool that has long since finished.
+        if (msg.event.type !== 'tool-progress') session.events.push(msg.event);
         renderEvent(msg.event);
         break;
       case 'event-patch': {
@@ -8961,8 +9127,20 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
           });
         }
         node = row;
+        // Append a "running…" placeholder result row right after the
+        // tool call. tool-progress events will update its summary +
+        // live-output pre; tool-result will remove it and a final
+        // result row will appear in its place. If we're re-rendering
+        // an old log where the matching tool-result already exists in
+        // session.events, the result event will fire next in this same
+        // loop and remove the placeholder — net effect: no placeholder
+        // for completed tools.
+        if (ev.callId) addRunningResultRow(ev.callId);
         break;
       }
+      case 'tool-progress':
+        appendProgress(ev.callId, ev.chunk);
+        break;
       case 'tool-result': {
         // Pair with the next-task tool-call suppression above.
         if ((ev.verb || ev.name) === 'next-task') break;
@@ -8970,6 +9148,11 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
         if (ev.callId) {
           const callRow = $log.querySelector(\`.row.tool[data-call-id="\${ev.callId}"]\`);
           if (callRow) callRow.classList.remove('tool-running');
+          // Drop the running placeholder and its live-output buffer —
+          // the proper result row below carries the full final content.
+          const placeholder = $log.querySelector(\`.row-result.running[data-call-id="\${ev.callId}"]\`);
+          if (placeholder) placeholder.remove();
+          _progressBuffers.delete(ev.callId);
         }
         node = addResultRow({
           status: ev.status,
