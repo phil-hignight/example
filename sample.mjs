@@ -15,7 +15,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '74';
+const BUILD_VERSION = '75';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
@@ -27,7 +27,7 @@ const PORT     = Number(process.env.PORT ?? 18888); // local UI port
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { createServer } from 'node:http';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { readFile as _readFile, writeFile as _writeFile, mkdir as _mkdir, stat as _stat, readdir as _readdir, unlink as _unlink } from 'node:fs/promises';
 import { existsSync, appendFileSync, mkdirSync, statSync, readFileSync, writeFileSync } from 'node:fs';
 import { randomUUID as _randomUUID } from 'node:crypto';
@@ -3490,6 +3490,105 @@ function buildReviewTrajectory(events) {
 function clip(s, n) {
   if (typeof s !== 'string') return String(s ?? '');
   return s.length > n ? s.slice(0, n) + ' … [truncated]' : s;
+}
+
+// ====== git-api/gitlab.mjs ======
+/**
+ * Common GitLab REST v4 client. Used by any plugin or core code that
+ * needs to read files/trees from a self-hosted GitLab without cloning.
+ *
+ * Auth: PRIVATE-TOKEN header. Username is captured for the UI / API-key
+ * parity but only the token is sent.
+ *
+ *   const client = createGitLabClient({
+ *     serverUrl: 'https://git-oci.int.dmdc.osd.mil',
+ *     getCredentials: () => session.gitlabCreds,   // hot-reloads
+ *   });
+ *   await client.listTree({ projectPath: 'incubator/sandbox/foo', path: 'docs', ref: 'main' });
+ *   await client.readFile({ projectPath: 'incubator/sandbox/foo', filepath: 'docs/guide.md' });
+ */
+
+class GitLabApiError extends Error {
+  constructor(status, body) {
+    super(`GitLab API ${status}: ${typeof body === 'string' ? body.slice(0, 200) : (body?.message ?? JSON.stringify(body).slice(0, 200))}`);
+    this.status = status;
+    this.body = body;
+  }
+}
+
+function createGitLabClient({ serverUrl, getCredentials, fetchImpl } = {}) {
+  if (!serverUrl) throw new Error('createGitLabClient: serverUrl is required');
+  if (typeof getCredentials !== 'function') throw new Error('createGitLabClient: getCredentials must be a function');
+  const fetcher = fetchImpl ?? globalThis.fetch;
+  if (!fetcher) throw new Error('createGitLabClient: no fetch available');
+  const base = serverUrl.replace(/\/+$/, '');
+
+  function authHeaders() {
+    const creds = getCredentials() || {};
+    if (!creds.token) throw new Error('GitLab credentials not configured');
+    return { 'PRIVATE-TOKEN': String(creds.token) };
+  }
+
+  async function apiGet(path, { accept = 'application/json' } = {}) {
+    const url = `${base}/api/v4${path}`;
+    const res = await fetcher(url, { headers: { accept, ...authHeaders() } });
+    if (!res.ok) {
+      let body; try { body = await res.json(); } catch { body = await res.text().catch(() => ''); }
+      throw new GitLabApiError(res.status, body);
+    }
+    return res;
+  }
+
+  function encId(projectPath) {
+    return encodeURIComponent(String(projectPath).replace(/^\/+|\/+$/g, ''));
+  }
+
+  /**
+   * List entries at a given path. Returns array of:
+   *   { id, name, type: 'tree'|'blob', path, mode }
+   * `path` empty / undefined → repo root. `ref` defaults to the project's default branch.
+   */
+  async function listTree({ projectPath, path = '', ref, perPage = 100 } = {}) {
+    if (!projectPath) throw new Error('listTree: projectPath is required');
+    const params = new URLSearchParams();
+    if (path) params.set('path', path);
+    if (ref) params.set('ref', ref);
+    params.set('per_page', String(perPage));
+    const res = await apiGet(`/projects/${encId(projectPath)}/repository/tree?${params}`);
+    return res.json();
+  }
+
+  /**
+   * Read a single file. Returns { content: string, encoding: 'utf8'|'binary',
+   * size, ref, contentType }. Text files come back as UTF-8 strings; binary
+   * comes back as a Buffer (caller can write to a temp file).
+   */
+  async function readFile({ projectPath, filepath, ref } = {}) {
+    if (!projectPath) throw new Error('readFile: projectPath is required');
+    if (!filepath) throw new Error('readFile: filepath is required');
+    const params = new URLSearchParams();
+    if (ref) params.set('ref', ref);
+    const url = `/projects/${encId(projectPath)}/repository/files/${encodeURIComponent(filepath)}/raw?${params}`;
+    const res = await apiGet(url, { accept: '*/*' });
+    const contentType = res.headers.get('content-type') || '';
+    const buf = Buffer.from(await res.arrayBuffer());
+    // Heuristic: if the bytes round-trip cleanly through UTF-8 decode and
+    // we don't see a high concentration of NUL bytes, treat as text.
+    const looksText = isLikelyText(buf);
+    if (looksText) {
+      return { content: buf.toString('utf8'), encoding: 'utf8', size: buf.length, ref: res.headers.get('x-gitlab-ref') || ref || null, contentType };
+    }
+    return { content: buf, encoding: 'binary', size: buf.length, ref: res.headers.get('x-gitlab-ref') || ref || null, contentType };
+  }
+
+  return { listTree, readFile, _apiGet: apiGet };
+}
+
+function isLikelyText(buf) {
+  const sample = buf.subarray(0, Math.min(buf.length, 4096));
+  let nul = 0;
+  for (let i = 0; i < sample.length; i++) if (sample[i] === 0) nul++;
+  return nul / Math.max(sample.length, 1) < 0.005;
 }
 
 // ====== plugins/wl.mjs ======
@@ -7082,7 +7181,10 @@ const UI_HTML = `<!DOCTYPE html>
 
   /* Dotted message rows (Claude Code style). */
   .row { display: flex; gap: 8px; margin: 10px 0; align-items: flex-start; }
-  .row.tool { margin: 10px 0 0 0; }                /* no bottom — result sits right below */
+  /* Tool rows hug each other tighter than chat rows: no bottom margin
+     (result sits flush below), and a small top margin so consecutive
+     tool calls cluster as one visual unit. */
+  .row.tool { margin: 6px 0 0 0; }
   .row .dot { flex-shrink: 0; line-height: 1.55; }
   .row.assistant .dot { color: var(--fg); }
   .row.tool .dot { color: #6cc46c; }
@@ -7140,7 +7242,10 @@ const UI_HTML = `<!DOCTYPE html>
   .row-result {
     color: var(--muted);
     font-size: 12.5px;
-    margin: 1px 0 10px 0;
+    /* No top margin — the result sits flush against the tool-call row
+       above it. Small bottom margin so the next tool-call clusters
+       close while still being visually distinct. */
+    margin: 0 0 4px 0;
     padding-left: 32px;       /* dot col (~16px) + "⎿ " marker (~16px) */
     text-indent: -16px;       /* pulls "⎿" leftward by its own width → sits at body-text start */
     white-space: pre-wrap;
