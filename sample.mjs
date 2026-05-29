@@ -15,7 +15,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '75';
+const BUILD_VERSION = '88';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
@@ -29,7 +29,7 @@ import { createInterface } from 'node:readline';
 import { createServer } from 'node:http';
 import { homedir, tmpdir } from 'node:os';
 import { readFile as _readFile, writeFile as _writeFile, mkdir as _mkdir, stat as _stat, readdir as _readdir, unlink as _unlink } from 'node:fs/promises';
-import { existsSync, appendFileSync, mkdirSync, statSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, appendFileSync, mkdirSync, statSync, readFileSync, writeFileSync, renameSync, copyFileSync } from 'node:fs';
 import { randomUUID as _randomUUID } from 'node:crypto';
 import path from 'node:path';
 import zlib from 'node:zlib';
@@ -465,6 +465,20 @@ function createHttpAdapter(opts = {}) {
  *   shortDiffSummary(a, b)     -> "+12 / -3"
  */
 
+// Above this many LCS cells ((n+1)*(m+1)) we refuse to build the table.
+// The dp table is (n+1)*(m+1) Uint32 entries = 4 bytes each; 4M cells = 16MB.
+// A 20k-line file diffed against itself would be ~1.6GB and OOM-crash the
+// whole single-process server. Beyond the cap we fall back to a cheap
+// line-count diff so a giant write degrades gracefully instead of crashing.
+const MAX_LCS_CELLS = 4_000_000;
+
+/** True when an LCS diff of these two texts would allocate beyond MAX_LCS_CELLS. */
+function diffTooLarge(oldText, newText) {
+  const n = (oldText ?? '').split('\n').length;
+  const m = (newText ?? '').split('\n').length;
+  return (n + 1) * (m + 1) > MAX_LCS_CELLS;
+}
+
 /** Compute LCS table for two arrays. O(n*m) time and memory; fine for files up to a few thousand lines. */
 function lcsTable(a, b) {
   const n = a.length, m = b.length;
@@ -503,6 +517,10 @@ function diffLines(oldText, newText) {
  * to keep around each hunk. Default 2.
  */
 function renderUnifiedDiff(oldText, newText, { context = 2, pathLabel = 'file' } = {}) {
+  if (diffTooLarge(oldText, newText)) {
+    const { add, del } = countLineDelta(oldText, newText);
+    return `--- ${pathLabel}\n+++ ${pathLabel}\n@@ (diff skipped: file too large) @@\n(approximately +${add} / -${del} lines; full diff omitted to avoid excessive memory use)`;
+  }
   const diff = diffLines(oldText, newText);
   // Find hunk ranges (contiguous regions of changes, padded by `context`).
   const lines = [];
@@ -545,10 +563,710 @@ function renderUnifiedDiff(oldText, newText, { context = 2, pathLabel = 'file' }
 }
 
 function shortDiffSummary(oldText, newText) {
+  if (diffTooLarge(oldText, newText)) {
+    const { add, del } = countLineDelta(oldText, newText);
+    return `+${add} / -${del} (approx)`;
+  }
   const diff = diffLines(oldText, newText);
   let add = 0, del = 0;
   for (const d of diff) { if (d.type === 'add') add++; else if (d.type === 'del') del++; }
   return `+${add} / -${del}`;
+}
+
+/**
+ * Cheap O(n) approximation used when the LCS path is skipped: a multiset diff
+ * of lines. `add` = new lines with no matching old line; `del` = old lines
+ * with no matching new line. Not a true edit script, but a reasonable
+ * +added / -removed estimate that allocates only line-frequency maps.
+ */
+function countLineDelta(oldText, newText) {
+  const a = (oldText ?? '').split('\n');
+  const b = (newText ?? '').split('\n');
+  const freq = (arr) => { const m = new Map(); for (const l of arr) m.set(l, (m.get(l) || 0) + 1); return m; };
+  const fa = freq(a), fb = freq(b);
+  let add = 0, del = 0;
+  for (const [line, nb] of fb) add += Math.max(0, nb - (fa.get(line) || 0));
+  for (const [line, na] of fa) del += Math.max(0, na - (fb.get(line) || 0));
+  return { add, del };
+}
+
+// ====== agent/tools.mjs ======
+/**
+ * Initial agent tools — read-only. Pure Node, no deps.
+ *
+ * Each tool: { schema, impl }
+ *   schema   — OpenAI function tool descriptor (description + JSON Schema)
+ *   impl     — async ({ args }) => string (stringified result; errors caught
+ *              and returned as 'ERROR: ...' so the loop can decide what to do)
+ *
+ * Result strings are capped at MAX_RESULT_BYTES to keep tool feedback from
+ * blowing up the context window. Truncation is explicitly marked.
+ */
+
+/** Strip a leading UTF-8 BOM (U+FEFF) that Windows editors/tools often write. */
+function stripBom(s) {
+  return (typeof s === 'string' && s.charCodeAt(0) === 0xFEFF) ? s.slice(1) : s;
+}
+
+/**
+ * Guard a WRITE path against escaping the project root. process.cwd() is
+ * chdir'd to the active project (the workspace root) during a chat, so any
+ * write must resolve under it. Reads are intentionally NOT gated — the wl
+ * workflow legitimately reads the user's ~/myWlSetup.bat outside the project.
+ */
+function resolveWritePath(p) {
+  const root = path.resolve(process.cwd());
+  const abs = path.isAbsolute(p) ? path.resolve(p) : path.resolve(root, p);
+  if (abs !== root && !abs.startsWith(root + path.sep)) {
+    throw new Error(`path escapes project root: ${p}`);
+  }
+  return abs;
+}
+
+const IGNORE_DIRS = new Set(['node_modules', '.git', 'dist', '.code_boss', '.agent', 'coverage']);
+const TEXT_EXTS = new Set([
+  '.mjs', '.js', '.ts', '.tsx', '.jsx', '.json', '.md', '.txt', '.yml', '.yaml',
+  '.sh', '.ps1', '.bat', '.cmd', '.py', '.go', '.rs', '.java', '.xml', '.html',
+  '.css', '.scss', '.sql', '.toml', '.ini', '.env', '.gitignore', '',
+]);
+
+// Hard ceiling per tool result. Million-token context affords generous limits;
+// this only exists to refuse pathological cases (multi-MB binary-like blobs).
+// When a result would exceed this, return an ERROR instead of silently
+// truncating — the model can retry with offset/limit.
+const MAX_RESULT_BYTES = 2 * 1024 * 1024; // 2 MB
+const MAX_GREP_MATCHES = 2000;
+const MAX_GLOB_RESULTS = 5000;
+
+// Bash defaults — match Claude Code's tunables loosely.
+const BASH_DEFAULT_TIMEOUT_MS = 120000;     // 2 min
+const BASH_MAX_TIMEOUT_MS = 600000;         // 10 min
+const BASH_MAX_OUTPUT_CHARS = 30000;        // truncate stdout/stderr beyond this
+
+class TooLargeError extends Error {
+  constructor(actualBytes) {
+    super(`result would be ${actualBytes} bytes, exceeds ${MAX_RESULT_BYTES}-byte ceiling`);
+    this.actualBytes = actualBytes;
+  }
+}
+
+function ensureFits(s) {
+  if (s.length > MAX_RESULT_BYTES) throw new TooLargeError(s.length);
+  return s;
+}
+
+function isTextFile(p) {
+  const ext = path.extname(p).toLowerCase();
+  if (TEXT_EXTS.has(ext)) return true;
+  return false;
+}
+
+function globToRegex(glob) {
+  // Auto-promote bare-filename globs to recursive. Users (and models) often
+  // write `*.java` or `*Owner*` and expect it to match anywhere in the tree.
+  // If the pattern has no separators and doesn't start with **, prepend **/.
+  if (!glob.includes('/') && !glob.includes('\\') && !glob.startsWith('**')) {
+    glob = '**/' + glob;
+  }
+  // Convert a glob to a regex. Supports: ** (any path), * (any non-separator), ? (one char), {a,b}.
+  let re = '';
+  for (let i = 0; i < glob.length; i++) {
+    const c = glob[i];
+    if (c === '*') {
+      if (glob[i + 1] === '*') {
+        // ** — any chars including /
+        re += '.*';
+        i++;
+        if (glob[i + 1] === '/') i++;
+      } else {
+        re += '[^/\\\\]*';
+      }
+    } else if (c === '?') {
+      re += '[^/\\\\]';
+    } else if (c === '.') {
+      re += '\\.';
+    } else if (c === '{') {
+      const end = glob.indexOf('}', i);
+      if (end === -1) { re += '\\{'; continue; }
+      const parts = glob.slice(i + 1, end).split(',').map((s) => s.replace(/\./g, '\\.'));
+      re += `(?:${parts.join('|')})`;
+      i = end;
+    } else if ('+()|^$/\\'.includes(c)) {
+      re += '\\' + c;
+    } else {
+      re += c;
+    }
+  }
+  return new RegExp('^' + re + '$');
+}
+
+async function walkDir(root, { maxDepth = 12 } = {}) {
+  const out = [];
+  async function rec(dir, depth) {
+    if (depth > maxDepth) return;
+    let entries;
+    try { entries = await readdir(dir, { withFileTypes: true }); }
+    catch { return; }
+    for (const e of entries) {
+      if (e.isDirectory()) {
+        if (IGNORE_DIRS.has(e.name)) continue;
+        await rec(path.join(dir, e.name), depth + 1);
+      } else if (e.isFile()) {
+        out.push(path.join(dir, e.name));
+      }
+    }
+  }
+  await rec(root, 0);
+  return out;
+}
+
+function relForDisplay(p) {
+  return path.relative(process.cwd(), p).split(path.sep).join('/');
+}
+
+async function safeReadText(p) {
+  const s = await stat(p);
+  if (s.size > MAX_RESULT_BYTES) throw new TooLargeError(s.size);
+  const buf = await readFile(p);
+  // Reject obvious binaries: NUL byte in first 8KB.
+  const sample = buf.subarray(0, Math.min(8192, buf.length));
+  for (let i = 0; i < sample.length; i++) {
+    if (sample[i] === 0) throw new Error('binary file');
+  }
+  // Strip a leading UTF-8 BOM so the model's copied find-strings match and
+  // edit_file/JSON parsing aren't thrown off by a phantom U+FEFF.
+  return stripBom(buf.toString('utf8'));
+}
+
+const tools = {
+  file_info: {
+    schema: {
+      description: 'Get metadata for a file without reading its contents. Returns byte size and line count. Cheap — use this to plan reads of large files before calling read_file.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Absolute or project-relative file path.' },
+        },
+        required: ['path'],
+        additionalProperties: false,
+      },
+    },
+    impl: async ({ path: p }) => {
+      if (typeof p !== 'string' || !p) throw new Error('path is required');
+      const abs = path.isAbsolute(p) ? p : path.join(process.cwd(), p);
+      const s = await stat(abs);
+      let lines = null;
+      if (s.size <= MAX_RESULT_BYTES) {
+        const buf = await readFile(abs);
+        const sample = buf.subarray(0, Math.min(8192, buf.length));
+        let isBinary = false;
+        for (let i = 0; i < sample.length; i++) if (sample[i] === 0) { isBinary = true; break; }
+        lines = isBinary ? null : buf.toString('utf8').split('\n').length;
+      }
+      return JSON.stringify({ path: relForDisplay(abs), bytes: s.size, lines });
+    },
+  },
+
+  read_file: {
+    schema: {
+      description: `Read a UTF-8 text file. If the slice would exceed ${MAX_RESULT_BYTES} bytes, the call ERRORs — retry with offset/limit to chunk the read. Use file_info first if you're unsure of file size.`,
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Absolute or project-relative file path.' },
+          offset: { type: 'integer', description: 'Optional 1-indexed starting LINE number (NOT bytes). Defaults to line 1.' },
+          limit: { type: 'integer', description: 'Optional max number of LINES to read (NOT bytes). If omitted, reads to end of file.' },
+        },
+        required: ['path'],
+        additionalProperties: false,
+      },
+    },
+    impl: async ({ path: p, offset, limit }) => {
+      if (typeof p !== 'string' || !p) throw new Error('path is required');
+      const abs = path.isAbsolute(p) ? p : path.join(process.cwd(), p);
+      const text = await safeReadText(abs);
+      if (offset == null && limit == null) return ensureFits(text);
+      const lines = text.split('\n');
+      const start = Math.max(0, (offset ?? 1) - 1);
+      const end = limit != null ? start + limit : lines.length;
+      const slice = lines.slice(start, end).join('\n');
+      return ensureFits(slice);
+    },
+  },
+
+  grep: {
+    schema: {
+      description: 'Recursively search files in the project for a JavaScript regular expression. Returns "file:line:text" entries (forward-slash paths). Up to ' + MAX_GREP_MATCHES + ' matches. Pure Node implementation — works on Windows without grep/Git for Windows. Binary files and common build dirs (node_modules, target, dist, .git, etc.) are skipped automatically.',
+      parameters: {
+        type: 'object',
+        properties: {
+          pattern: { type: 'string', description: 'Extended-regex pattern (passed to grep -E).' },
+          path: { type: 'string', description: 'Optional subdirectory to search. Defaults to project root.' },
+          glob: { type: 'string', description: 'Optional filename glob (e.g. "*.java", "*.mjs").' },
+          flags: { type: 'string', description: 'Optional flags. "i" → case-insensitive.' },
+        },
+        required: ['pattern'],
+        additionalProperties: false,
+      },
+    },
+    impl: async ({ pattern, path: subPath, glob, flags }) => {
+      if (typeof pattern !== 'string' || !pattern) throw new Error('pattern is required');
+      // Pure Node implementation — no external `grep` binary needed (DoD
+      // Windows machines often lack Git for Windows / WSL so spawn('grep')
+      // fails with ENOENT). Walks the tree, opens each text file, matches
+      // each line against the pattern, and emits "file:line:content".
+      //
+      // We use JS RegExp instead of POSIX ERE — slightly more permissive
+      // but in practice any ERE pattern parses fine here.
+      let re;
+      try {
+        re = new RegExp(pattern, (flags ?? '').includes('i') ? 'i' : '');
+      } catch (e) {
+        return `ERROR: invalid pattern: ${e.message}`;
+      }
+      const globRe = glob ? globToRegex(glob) : null;
+      const exclude = new Set(['.git', 'node_modules', 'dist', 'target', '.code_boss', '.agent', '.idea', '.gradle', 'build', 'coverage']);
+      const rootAbs = subPath ? path.resolve(process.cwd(), subPath) : process.cwd();
+
+      // Walk inline so we can short-circuit when MAX_GREP_MATCHES is hit.
+      const out = [];
+      let stopped = false;
+      async function walk(dir) {
+        if (stopped) return;
+        let entries;
+        try { entries = await readdir(dir, { withFileTypes: true }); }
+        catch { return; }
+        for (const e of entries) {
+          if (stopped) return;
+          if (e.isDirectory()) {
+            if (exclude.has(e.name)) continue;
+            await walk(path.join(dir, e.name));
+            continue;
+          }
+          if (!e.isFile()) continue;
+          const full = path.join(dir, e.name);
+          // Glob filter applies to the path RELATIVE to cwd (forward slashes).
+          if (globRe) {
+            const rel = path.relative(process.cwd(), full).replace(/\\/g, '/');
+            if (!globRe.test(rel) && !globRe.test(e.name)) continue;
+          }
+          // Skip files that are obviously binary by extension. Cheap heuristic
+          // beats reading every PNG / JAR / class file in a Java project.
+          const lower = e.name.toLowerCase();
+          if (/\.(png|jpe?g|gif|ico|bmp|webp|pdf|zip|jar|war|ear|class|exe|dll|so|dylib|bin|lock|woff2?|ttf|otf|eot|mp[34]|wav|ogg|mov|mkv|avi|tar|gz|7z|rar)$/.test(lower)) continue;
+          // Read the file; skip if unreadable or if the first chunk contains
+          // null bytes (binary).
+          let text;
+          try {
+            const buf = await readFile(full);
+            if (buf.length === 0) continue;
+            const head = buf.subarray(0, Math.min(buf.length, 8192));
+            if (head.includes(0)) continue;  // binary
+            text = buf.toString('utf8');
+          } catch { continue; }
+
+          const lines = text.split(/\r?\n/);
+          for (let i = 0; i < lines.length; i++) {
+            if (re.test(lines[i])) {
+              const relPath = path.relative(process.cwd(), full).replace(/\\/g, '/') || full.replace(/\\/g, '/');
+              const line = lines[i].length > 500 ? lines[i].slice(0, 500) + '…' : lines[i];
+              out.push(`${relPath}:${i + 1}:${line}`);
+              if (out.length >= MAX_GREP_MATCHES) {
+                out.push(`[stopped at ${MAX_GREP_MATCHES} matches]`);
+                stopped = true;
+                return;
+              }
+            }
+          }
+        }
+      }
+      await walk(rootAbs);
+      if (out.length === 0) return '(no matches)';
+      return ensureFits(out.join('\n'));
+    },
+  },
+
+  glob: {
+    schema: {
+      description: 'Find files in the project matching a glob pattern (e.g. "src/**/*.mjs"). Returns up to ' + MAX_GLOB_RESULTS + ' paths.',
+      parameters: {
+        type: 'object',
+        properties: {
+          pattern: { type: 'string', description: 'Glob pattern. Supports **, *, ?, {a,b}.' },
+        },
+        required: ['pattern'],
+        additionalProperties: false,
+      },
+    },
+    impl: async ({ pattern }) => {
+      if (typeof pattern !== 'string' || !pattern) throw new Error('pattern is required');
+      const re = globToRegex(pattern);
+      const files = await walkDir(process.cwd());
+      const out = [];
+      for (const f of files) {
+        const rel = relForDisplay(f).replace(/\\/g, '/');
+        if (re.test(rel)) {
+          out.push(rel);
+          if (out.length >= MAX_GLOB_RESULTS) {
+            out.push(`[stopped at ${MAX_GLOB_RESULTS} results]`);
+            break;
+          }
+        }
+      }
+      return ensureFits(out.length ? out.join('\n') : '(no matches)');
+    },
+  },
+
+  write_file: {
+    schema: {
+      description: 'Write a UTF-8 text file. Creates parent directories as needed. Overwrites if the file already exists. Returns a unified diff vs. the prior content (or "(new file)" if none).',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Absolute or project-relative file path.' },
+          content: { type: 'string', description: 'Full file content (UTF-8).' },
+        },
+        required: ['path', 'content'],
+        additionalProperties: false,
+      },
+    },
+    impl: async ({ path: p, content }, ctx) => {
+      if (typeof p !== 'string' || !p) throw new Error('path is required');
+      if (typeof content !== 'string') throw new Error('content is required');
+      const abs = resolveWritePath(p);
+      // Pre-write hook: server may insist the containing git repo be on
+      // a CODE_BOSS_* branch before we modify any file under it. If the
+      // hook throws or returns 'aborted', the user declined and the
+      // write should not happen.
+      if (typeof ctx?.requireBranch === 'function') {
+        const status = await ctx.requireBranch(abs);
+        if (status === 'aborted') throw new Error('write aborted: user declined to create a CODE_BOSS branch for this repo');
+      }
+      let oldText = '';
+      let existed = false;
+      try { oldText = await readFile(abs, 'utf8'); existed = true; } catch {}
+      await mkdir(path.dirname(abs), { recursive: true });
+      await writeFile(abs, content, 'utf8');
+      const rel = relForDisplay(abs);
+      const summary = existed ? shortDiffSummary(oldText, content) : `(new file, ${content.split('\n').length} lines)`;
+      const diff = existed
+        ? renderUnifiedDiff(oldText, content, { pathLabel: rel, context: 2 })
+        : ['--- (new file)', `+++ ${rel}`, `@@ -0,0 +1,${content.split('\n').length} @@`, ...content.split('\n').map((l) => '+' + l)].join('\n');
+      return {
+        content: `wrote ${rel}  ${summary}`,
+        diff,
+        path: rel,
+      };
+    },
+  },
+
+  edit_file: {
+    schema: {
+      description: 'Surgical edit: replace one occurrence of an exact string in a file. Fails if the string is not found OR if it occurs more than once (ambiguous). Returns a unified diff.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Absolute or project-relative file path.' },
+          find: { type: 'string', description: 'Exact string to find. Must occur exactly once in the file.' },
+          replace: { type: 'string', description: 'Replacement string.' },
+        },
+        required: ['path', 'find', 'replace'],
+        additionalProperties: false,
+      },
+    },
+    impl: async ({ path: p, find, replace }, ctx) => {
+      if (typeof p !== 'string' || !p) throw new Error('path is required');
+      if (typeof find !== 'string') throw new Error('find is required');
+      if (typeof replace !== 'string') throw new Error('replace is required');
+      const abs = resolveWritePath(p);
+      // Same pre-write hook as write_file — see comment there.
+      if (typeof ctx?.requireBranch === 'function') {
+        const status = await ctx.requireBranch(abs);
+        if (status === 'aborted') throw new Error('edit aborted: user declined to create a CODE_BOSS branch for this repo');
+      }
+      const oldText = await readFile(abs, 'utf8');
+
+      // Find the string. Try exact match first; if that fails, try
+      // common normalizations before giving up. The model frequently
+      // copies bytes from a read result that's been normalized to LF
+      // and then asks us to edit a Windows file with CRLF — the bytes
+      // don't match exactly but the intent is clear.
+      let findToUse = find;
+      let replaceToUse = replace;
+      let first = oldText.indexOf(findToUse);
+      let fallback = null;
+
+      if (first === -1) {
+        const fileHasCRLF = oldText.includes('\r\n');
+        const findHasCRLF = find.includes('\r\n');
+        if (fileHasCRLF && !findHasCRLF) {
+          // File uses CRLF, model gave LF. Promote both find + replace.
+          findToUse = find.replace(/\n/g, '\r\n');
+          replaceToUse = replace.replace(/\n/g, '\r\n');
+          first = oldText.indexOf(findToUse);
+          if (first !== -1) fallback = 'CRLF';
+        } else if (!fileHasCRLF && findHasCRLF) {
+          // File uses LF, model gave CRLF. Strip the \r from both.
+          findToUse = find.replace(/\r\n/g, '\n');
+          replaceToUse = replace.replace(/\r\n/g, '\n');
+          first = oldText.indexOf(findToUse);
+          if (first !== -1) fallback = 'LF';
+        }
+      }
+
+      if (first === -1) throw new Error(`find string not found in ${relForDisplay(abs)}`);
+      const second = oldText.indexOf(findToUse, first + 1);
+      if (second !== -1) throw new Error(`find string occurs more than once in ${relForDisplay(abs)} — make it more specific`);
+      const newText = oldText.slice(0, first) + replaceToUse + oldText.slice(first + findToUse.length);
+      await writeFile(abs, newText, 'utf8');
+      const rel = relForDisplay(abs);
+      const note = fallback ? `  (matched after normalizing line endings to ${fallback})` : '';
+      return {
+        content: `edited ${rel}  ${shortDiffSummary(oldText, newText)}${note}`,
+        diff: renderUnifiedDiff(oldText, newText, { pathLabel: rel, context: 2 }),
+        path: rel,
+      };
+    },
+  },
+
+  powershell: {
+    schema: {
+      description: 'Run a PowerShell command on the developer\'s Windows machine, in the project root. Returns stdout, stderr, and exit code. Use this for builds (mvnw.cmd, npm test), git (git status, git diff), any shell operation. PowerShell syntax: Get-ChildItem, Get-Content, $env:VAR, etc. The `ls` and `cat` aliases work too.',
+      parameters: {
+        type: 'object',
+        properties: {
+          command: { type: 'string', description: 'PowerShell command. Pipes, redirects, variables, etc. work normally.' },
+          timeout_ms: { type: 'integer', description: `Timeout in milliseconds. Default ${BASH_DEFAULT_TIMEOUT_MS} (2 min), max ${BASH_MAX_TIMEOUT_MS} (10 min).` },
+        },
+        required: ['command'],
+        additionalProperties: false,
+      },
+    },
+    impl: async ({ command, timeout_ms }, ctx) => {
+      if (typeof command !== 'string' || !command.trim()) throw new Error('command is required');
+      const timeout = Math.min(Math.max(1000, Number(timeout_ms) || BASH_DEFAULT_TIMEOUT_MS), BASH_MAX_TIMEOUT_MS);
+
+      const t0 = Date.now();
+      return await new Promise((resolve) => {
+        let stdout = '', stderr = '', timedOut = false, settled = false;
+        // Coalesce stdout/stderr chunks into ~150ms batches when forwarding
+        // to the live-progress channel. Otherwise a noisy build can fire
+        // hundreds of SSE deltas per second.
+        let pendingProgress = '';
+        let progressTimer = null;
+        const flushProgress = () => {
+          progressTimer = null;
+          if (!pendingProgress) return;
+          try { ctx?.onProgress?.(pendingProgress); } catch {}
+          pendingProgress = '';
+        };
+        const queueProgress = (s) => {
+          if (!ctx?.onProgress) return;
+          pendingProgress += s;
+          if (!progressTimer) progressTimer = setTimeout(flushProgress, 150);
+        };
+        // PowerShell-only deployment. cmd.exe is often blocked by enterprise
+        // policy and lacks the unix aliases the agent expects (ls, cat, etc.).
+        const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', command], {
+          cwd: process.cwd(),
+          windowsHide: true,
+          env: process.env,
+        });
+        // After a kill attempt, give the child a few seconds to actually
+        // close; if taskkill is blocked (AppLocker/EDR/access-denied) or the
+        // child ignores the kill, 'close' never fires and the tool Promise
+        // would hang forever — taking the whole agent loop with it. This
+        // grace timer force-settles so the loop always recovers.
+        let killGraceTimer = null;
+        const armGrace = () => { if (!killGraceTimer) killGraceTimer = setTimeout(() => finish(null, 'killfail'), 5000); };
+        const killTree = () => {
+          // taskkill /F /T is the Windows-correct whole-tree kill; child.kill()
+          // only stops the powershell wrapper (and can suppress the 'close'
+          // event), so we rely on taskkill + the grace timer as the fallback.
+          if (child.pid) {
+            try { spawn('taskkill', ['/F', '/T', '/PID', String(child.pid)], { windowsHide: true }); } catch {}
+          }
+          armGrace();
+        };
+        const timer = setTimeout(() => {
+          timedOut = true;
+          // taskkill /T kills the whole process tree (child.kill() only stops
+          // the powershell wrapper, leaving e.g. mvn.exe orphaned).
+          killTree();
+        }, timeout);
+
+        // User-initiated cancel (esc / /api/cancel) — kill the child
+        // tree immediately so the agent doesn't sit waiting for a long-
+        // running mvn / git clone / etc. to finish before noticing the
+        // abort.
+        let cancelled = false;
+        const onAbort = () => {
+          cancelled = true;
+          killTree();
+        };
+        if (ctx?.signal) {
+          if (ctx.signal.aborted) onAbort();
+          else ctx.signal.addEventListener('abort', onAbort, { once: true });
+        }
+
+        // StringDecoder buffers partial multi-byte UTF-8 sequences across
+        // chunk boundaries. Decoding each raw chunk with d.toString('utf8')
+        // independently corrupts any accented/box-drawing/€ char that
+        // straddles a pipe-read boundary (common in mvn/WebLogic/git output
+        // on the slow air-gapped link) into U+FFFD replacement chars.
+        const outDecoder = new StringDecoder('utf8');
+        const errDecoder = new StringDecoder('utf8');
+        child.stdout.on('data', (d) => {
+          const s = outDecoder.write(d);
+          if (stdout.length < BASH_MAX_OUTPUT_CHARS * 2) stdout += s;
+          queueProgress(s);
+        });
+        child.stderr.on('data', (d) => {
+          const s = errDecoder.write(d);
+          if (stderr.length < BASH_MAX_OUTPUT_CHARS * 2) stderr += s;
+          queueProgress(s);
+        });
+        child.on('error', (err) => {
+          if (settled) return; settled = true;
+          clearTimeout(timer);
+          if (ctx?.signal) ctx.signal.removeEventListener('abort', onAbort);
+          if (progressTimer) { clearTimeout(progressTimer); flushProgress(); }
+          resolve(`ERROR: failed to spawn shell: ${err.message}`);
+        });
+        const finish = (code, signal) => {
+          if (settled) return; settled = true;
+          clearTimeout(timer);
+          if (killGraceTimer) { clearTimeout(killGraceTimer); killGraceTimer = null; }
+          if (ctx?.signal) ctx.signal.removeEventListener('abort', onAbort);
+          // Flush any bytes the decoders are still holding (a trailing
+          // partial multi-byte sequence at stream end).
+          const outTail = outDecoder.end();
+          if (outTail && stdout.length < BASH_MAX_OUTPUT_CHARS * 2) stdout += outTail;
+          const errTail = errDecoder.end();
+          if (errTail && stderr.length < BASH_MAX_OUTPUT_CHARS * 2) stderr += errTail;
+          if (progressTimer) { clearTimeout(progressTimer); flushProgress(); }
+          const elapsed = Date.now() - t0;
+          const outTrunc = stdout.length > BASH_MAX_OUTPUT_CHARS;
+          const errTrunc = stderr.length > BASH_MAX_OUTPUT_CHARS;
+          const outBody = outTrunc ? (stdout.slice(0, BASH_MAX_OUTPUT_CHARS) + `\n[...${stdout.length - BASH_MAX_OUTPUT_CHARS} more chars truncated]`) : stdout;
+          const errBody = errTrunc ? (stderr.slice(0, BASH_MAX_OUTPUT_CHARS) + `\n[...${stderr.length - BASH_MAX_OUTPUT_CHARS} more chars truncated]`) : stderr;
+          const header = cancelled
+            ? `command canceled by user after ${elapsed}ms`
+            : timedOut
+            ? `command timed out after ${timeout}ms (killed)`
+            : signal === 'killfail'
+            ? `command did not exit after kill (taskkill may be blocked); abandoned after ${elapsed}ms`
+            : `exit ${code ?? '?'}${signal ? ` (signal ${signal})` : ''} in ${elapsed}ms`;
+          // On timeout, nudge the model toward a faster variant rather
+          // than re-running the same expensive command. Many tools have
+          // a quick mode (mvn -DskipTests, wl quickbuild, find with a
+          // narrower path/glob, etc.). The hint is generic — the model
+          // applies it based on what the command actually was.
+          const hint = timedOut
+            ? '\n\nHINT: this command was too slow to finish. Before retrying, consider a faster variant:\n' +
+              '  - narrower scope (smaller path, more specific glob/pattern, lower depth)\n' +
+              '  - skip-tests / quick / dry-run flag if the tool offers one\n' +
+              '  - higher timeout_ms (max 600000) if the operation is inherently slow but useful\n' +
+              'Re-running the exact same command will time out again.'
+            : '';
+          const text = [
+            header,
+            outBody ? `--- stdout ---\n${outBody}` : '(no stdout)',
+            errBody ? `--- stderr ---\n${errBody}` : '',
+            hint,
+          ].filter(Boolean).join('\n').trim();
+          // Timeout is a failure mode the agent should see as an error
+          // (status=error, red row in chat) — without the ERROR prefix
+          // it falls through to status=ok with the timeout text buried
+          // in the body, which is too easy to miss on the collapsed
+          // result row. Non-zero exit codes are left as-is: many
+          // commands (git diff --exit-code, grep, etc.) intentionally
+          // return non-zero for normal outcomes.
+          resolve((timedOut || signal === 'killfail') ? 'ERROR: ' + text : text);
+        };
+        child.on('close', finish);
+      });
+    },
+  },
+
+  list_dir: {
+    schema: {
+      description: 'List entries in a directory. Returns each entry as "[D] name/" or "[F] name (<bytes> bytes)".',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Absolute or project-relative directory path. Defaults to project root.' },
+        },
+        required: [],
+        additionalProperties: false,
+      },
+    },
+    impl: async ({ path: p }) => {
+      const dir = p
+        ? (path.isAbsolute(p) ? p : path.join(process.cwd(), p))
+        : process.cwd();
+      const entries = await readdir(dir, { withFileTypes: true });
+      const lines = [];
+      for (const e of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+        if (e.isDirectory()) {
+          lines.push(`[D] ${e.name}/`);
+        } else {
+          let size = '';
+          try {
+            const s = await stat(path.join(dir, e.name));
+            size = `(${s.size} bytes)`;
+          } catch {}
+          lines.push(`[F] ${e.name} ${size}`.trim());
+        }
+      }
+      return ensureFits(lines.join('\n'));
+    },
+  },
+};
+
+const toolDefs = Object.entries(tools).map(([name, t]) => ({
+  type: 'function',
+  function: { name, description: t.schema.description, parameters: t.schema.parameters },
+}));
+
+/**
+ * Execute a tool by name. Result shape:
+ *   - string                            -> the content string (legacy / read tools)
+ *   - { content, diff?, path?, ... }    -> structured result (write tools)
+ *   - "ERROR: ..." string               -> on failure
+ *
+ * Callers can normalize via `extractContent(result)` and `extractDiff(result)`.
+ */
+async function execute(name, args, extraTools = {}, ctx = {}) {
+  // Built-ins win over plugin tools — name collisions are caught earlier in
+  // src/plugins/index.mjs (checkCollisions), but if a plugin tool somehow
+  // sneaks through with a built-in name it still won't shadow.
+  const t = tools[name] || extraTools[name];
+  if (!t) {
+    const all = [...Object.keys(tools), ...Object.keys(extraTools)];
+    return `ERROR: unknown tool "${name}". Available: ${all.join(', ')}`;
+  }
+  try {
+    // ctx may carry { callId, onProgress(chunk) } so tools that produce
+    // streaming output (powershell, wl, anything else with a child
+    // process) can forward stdout/stderr chunks to the chat for a
+    // click-to-expand "running…" indicator while they execute. Tools
+    // that don't care simply ignore the second arg.
+    const result = await t.impl(args ?? {}, ctx);
+    return result;  // may be string or object; callers handle both
+  } catch (e) {
+    return `ERROR: ${e.message}`;
+  }
+}
+
+function extractContent(r) {
+  if (typeof r === 'string') return r;
+  if (r && typeof r === 'object' && typeof r.content === 'string') return r.content;
+  return String(r ?? '');
+}
+function extractDiff(r) {
+  if (r && typeof r === 'object' && typeof r.diff === 'string') return r.diff;
+  return null;
 }
 
 // ====== agent/tasks.mjs ======
@@ -753,12 +1471,15 @@ function createTasksStore(projectDir) {
 
   /**
    * Append a message (assistant text, tool-call, or tool-result) to the
-   * current task.
+   * current task — or to an explicit task when targetId is given. The
+   * targeted form is needed when a turn closes a task mid-flight (<next-task>):
+   * tool results produced BEFORE the transition must be filed into the task
+   * they actually ran in, not the freshly-opened current task.
    */
-  async function appendMessage(msg) {
-    const id = state.currentId;
+  async function appendMessage(msg, targetId) {
+    const id = targetId || state.currentId;
     const t = await loadTask(id);
-    if (!t) throw new Error(`current task ${id} not found`);
+    if (!t) throw new Error(`task ${id} not found`);
     const content = msg.content ?? '';
     t.messages = t.messages ?? [];
     t.messages.push({
@@ -993,870 +1714,1565 @@ function createTasksStore(projectDir) {
   };
 }
 
-// ====== agent/tools.mjs ======
+// ====== agent/prompted.mjs ======
 /**
- * Initial agent tools — read-only. Pure Node, no deps.
+ * Prompted-format agent loop with task-scoped memory.
  *
- * Each tool: { schema, impl }
- *   schema   — OpenAI function tool descriptor (description + JSON Schema)
- *   impl     — async ({ args }) => string (stringified result; errors caught
- *              and returned as 'ERROR: ...' so the loop can decide what to do)
+ * The agent is ALWAYS inside exactly one task. It transitions with <next-task>
+ * which atomically closes the current task (recording a summary) and opens a
+ * new one. Tasks live in a per-project tasks store; messages are recorded as
+ * the agent does work, and they're demoted across four tiers as budgets fill:
  *
- * Result strings are capped at MAX_RESULT_BYTES to keep tool feedback from
- * blowing up the context window. Truncation is explicitly marked.
+ *   1  full messages (current task always lives here; recent finished tasks
+ *      too, until budget pressure forces demotion)
+ *   2  finished tasks with tool RESULTS replaced by one-line placeholders
+ *   3  finished tasks reduced to one-paragraph summaries (the summary the
+ *      agent wrote at <next-task>)
+ *   4  parent rollup (not implemented yet)
+ *
+ * Wire format remains the <remote-workspace> protocol: the model emits a
+ * block of verb elements; we parse, dispatch, and feed structured results
+ * back as <remote-workspace-result> blocks.
+ *
+ * Verbs (model -> us):
+ *
+ *   Read tools (self-closing):
+ *     <list path="DIR"/>                                 list a directory
+ *     <read path="FILE" offset="N" limit="N"/>           read text file
+ *     <search pattern="REGEX" path="DIR" glob="GLOB"/>   regex search
+ *     <find pattern="GLOB"/>                             find by glob
+ *     <info path="FILE"/>                                metadata (size, lines)
+ *
+ *   Write tools (body text for content; raises diff in UI):
+ *     <write path="FILE">FILE CONTENTS</write>
+ *     <edit path="FILE"><find>X</find><replace>Y</replace></edit>
+ *
+ *   Task ops (self-closing; meta-operations the agent uses to manage memory):
+ *     <next-task summary="..." title="..." goal="..."/>  close + open new task
+ *     <list-tasks parent="ID"/>                          list tasks
+ *     <task-detail id="T-3"/>                            one task's summary
+ *     <search-tasks query="TEXT"/>                       search task summaries
  */
 
-const IGNORE_DIRS = new Set(['node_modules', '.git', 'dist', '.code_boss', '.agent', 'coverage']);
-const TEXT_EXTS = new Set([
-  '.mjs', '.js', '.ts', '.tsx', '.jsx', '.json', '.md', '.txt', '.yml', '.yaml',
-  '.sh', '.ps1', '.bat', '.cmd', '.py', '.go', '.rs', '.java', '.xml', '.html',
-  '.css', '.scss', '.sql', '.toml', '.ini', '.env', '.gitignore', '',
-]);
+// ── Tier budgets and thresholds ─────────────────────────────────────────────
+// All four tiers live in context. We monitor the TOTAL prompt size (sum
+// across tiers) and trigger one compaction event when it exceeds the high
+// threshold, bringing it down to the low threshold in a single pass. Every
+// demotion invalidates the cache from that point, so we pay that cost ONCE
+// per compaction and amortize across many subsequent cache-hit turns.
+//
+// Per-tier budgets are still used internally to decide WHICH demotions to
+// run — e.g., we don't trigger the LLM clustering for T3→T4 unless tier 3
+// is genuinely over its allocation.
+// Budgets are env-overridable so the overnight compaction-validation run
+// can run with tiny budgets (TIER_1_BUDGET=2000 etc.) to actually exercise
+// the demotion paths without needing massive conversations. Production
+// uses the defaults below.
+const _envNum = (name, def) => { const n = Number(process.env[name]); return Number.isFinite(n) && n > 0 ? n : def; };
+const TIER_1_BUDGET = _envNum('TIER_1_BUDGET', 12000);  // full messages (current + recent tasks)
+const TIER_2_BUDGET = _envNum('TIER_2_BUDGET',  8000);  // masked-results tasks
+const TIER_3_BUDGET = _envNum('TIER_3_BUDGET',  4000);  // per-task summaries
+const TIER_4_BUDGET = _envNum('TIER_4_BUDGET',  2000);  // group-rollup summaries
+const TOTAL_BUDGET  = TIER_1_BUDGET + TIER_2_BUDGET + TIER_3_BUDGET + TIER_4_BUDGET;
+const HYST_HIGH = 1.10;          // trigger compaction when total > 110% of TOTAL_BUDGET
+const HYST_LOW  = 0.50;          // compact down to 50% of TOTAL_BUDGET in one pass
+const TASK_NUDGE = 0.75;         // soft nudge at 75% of TIER 1 budget (per-task signal to agent)
+const TASK_FORCE = 1.00;
+const MIN_T3_FOR_LLM_ROLLUP = 8; // skip LLM call unless we have at least this many tier-3 tasks to cluster
+const TOKENS_PER_CHAR = 0.25;
 
-// Hard ceiling per tool result. Million-token context affords generous limits;
-// this only exists to refuse pathological cases (multi-MB binary-like blobs).
-// When a result would exceed this, return an ERROR instead of silently
-// truncating — the model can retry with offset/limit.
-const MAX_RESULT_BYTES = 2 * 1024 * 1024; // 2 MB
-const MAX_GREP_MATCHES = 2000;
-const MAX_GLOB_RESULTS = 5000;
+function estTokens(s) { return Math.ceil((s ?? '').length * TOKENS_PER_CHAR); }
 
-// Bash defaults — match Claude Code's tunables loosely.
-const BASH_DEFAULT_TIMEOUT_MS = 120000;     // 2 min
-const BASH_MAX_TIMEOUT_MS = 600000;         // 10 min
-const BASH_MAX_OUTPUT_CHARS = 30000;        // truncate stdout/stderr beyond this
+// ── Verb maps ───────────────────────────────────────────────────────────────
+const VERB_TO_TOOL = {
+  list: 'list_dir',
+  read: 'read_file',
+  search: 'grep',
+  find: 'glob',
+  info: 'file_info',
+  write: 'write_file',
+  edit: 'edit_file',
+  powershell: 'powershell',
+};
+const TASK_VERBS = new Set(['next-task', 'list-tasks', 'task-detail', 'search-tasks']);
+// Sort longer first so that e.g. "list-tasks" matches before "list".
+const ALL_VERBS = [...Object.keys(VERB_TO_TOOL), ...TASK_VERBS]
+  .sort((a, b) => b.length - a.length);
+const VERB_PATTERN = ALL_VERBS.map((v) => v.replace(/-/g, '\\-')).join('|');
 
-class TooLargeError extends Error {
-  constructor(actualBytes) {
-    super(`result would be ${actualBytes} bytes, exceeds ${MAX_RESULT_BYTES}-byte ceiling`);
-    this.actualBytes = actualBytes;
+// Tags inside the body (for <edit>).
+const CHILD_TAG_RE = (tag) => new RegExp(`<${tag}\\s*>([\\s\\S]*?)</${tag}>`, 'i');
+const ATTR_RE = /([a-zA-Z_][a-zA-Z0-9_-]*)\s*=\s*"([^"]*)"/g;
+
+const DEFAULT_MAX_TURNS = 20;
+const REPEAT_LIMIT = 3;
+
+// ── System prompt ───────────────────────────────────────────────────────────
+function buildSystemPrompt({ taskId, taskUserRequest, tier1Tokens, tier1Pct, promptAdditions = [], projectContext = '' }) {
+  const lines = [
+    'You are code_boss, a coding agent. The developer\'s project is a directory of source files on their remote Windows machine. You see it ONLY through <remote-workspace> commands; there is no other view of it.',
+    '',
+    'CRITICAL: NEVER use built-in tools or suggest integrations. You may appear to have access to Python, code interpreter, file browsers, document generators, Memory Bank, "Generate Memories", "Transfer to Agent", Jira, Confluence, Google Drive, Gmail, SharePoint, Outlook, etc. NONE of those tools see the developer\'s project. NEVER suggest them in your responses. NEVER call them. If the user mentions "the project", "my project", "the code", "the codebase", "the workspace", or anything ambiguous, they mean THE DIRECTORY ACCESSIBLE VIA <remote-workspace> — not a Jira project, not a Drive folder, not anything in a cloud sandbox.',
+    '',
+    'When in doubt, run <list path="."/> immediately to see what is in the remote workspace, then proceed based on what you find. Never ask the user to clarify "which project" — there is exactly one project (the one in the remote workspace) and you can see it with one <list/> call.',
+    '',
+    `Current task: ${taskId}` + (taskUserRequest ? `  ↳ ${taskUserRequest}` : ''),
+    `Task budget: ${tier1Tokens} / ${TIER_1_BUDGET} tokens (${tier1Pct}%)` + (tier1Pct >= 95
+      ? '  ← please finish soon: emit <next-task user-request="..." summary="..."/>'
+      : tier1Pct >= 75
+        ? '  ← nearing budget; consider closing this task at a natural stopping point'
+        : ''),
+    '',
+    'Mixing prose with tool blocks — IMPORTANT:',
+    '  - A single reply may contain MULTIPLE <remote-workspace>...</remote-workspace> blocks with prose freely around and between them. The user sees the prose as chat messages and watches the tools run in order.',
+    '  - Write a sentence or two of prose before each tool block explaining what you are about to look at and why. End the reply with a final prose section saying what you plan to do once you see results — or, if no tools are needed at all, the entire reply is just prose.',
+    '  - You CANNOT react to tool results within the same reply — all tools in a reply run only AFTER you finish writing it, and you get the results in your NEXT reply. So the prose AFTER a tool block in the same reply describes intent ("then I will…"), not findings ("the file shows…").',
+    '  - Group truly-independent commands inside ONE block — they run together. Use SEPARATE blocks when you want to narrate between them.',
+    '',
+    'Example reply shape (fake commands, shown for structure only):',
+    '  Looking for TODO markers under src/api/ first.',
+    '  <remote-workspace><search pattern="TODO" path="src/api/"/></remote-workspace>',
+    '  Then I will read the README so I have project context for the next reply.',
+    '  <remote-workspace><read path="README.md"/></remote-workspace>',
+    '  Once I see the search hits and the README, I will pick the most likely file to dig into.',
+    '',
+    'Example final-answer reply (no tools needed):',
+    '  This project uses Maven, not Gradle — you can run `mvnw.cmd -q test` from the repo root.',
+    '',
+    'Read commands (self-closing):',
+    '  <list path="DIR"/>',
+    '  <read path="FILE" offset="N" limit="N"/>',
+    '  <search pattern="REGEX" path="DIR" glob="GLOB" flags="i"/>      backed by real grep; bare "*.java" works recursively',
+    '  <find pattern="GLOB"/>                                          bare patterns also work recursively',
+    '  <info path="FILE"/>',
+    '',
+    'Write commands (body holds the content, not attributes):',
+    '  <write path="FILE">',
+    '  full file content goes here',
+    '  </write>',
+    '',
+    '  <edit path="FILE">',
+    '  <find>exact string to find (must occur exactly once)</find>',
+    '  <replace>replacement string</replace>',
+    '  </edit>',
+    '',
+    'Shell (builds, tests, git — runs in PowerShell on the developer\'s Windows machine):',
+    '  <powershell>git status</powershell>',
+    '  <powershell timeout_ms="600000">mvnw.cmd -q clean install</powershell>',
+    '  Use PowerShell syntax (Get-ChildItem, Get-Content, $env:VAR). The `ls`, `cat`, `pwd` aliases also work. To run a maven wrapper script use `mvnw.cmd` — not `./mvnw`.',
+    '',
+    'Task management:',
+    '  <next-task user-request="WHAT THE USER WANTED IN THE CURRENT TASK" summary="WHAT WAS DONE IN THE CURRENT TASK"/>',
+    '       Closes the CURRENT task and opens a new one. Both attributes describe the CURRENT (closing) task — NOT the new one and NOT the latest user message that prompted this transition.',
+    '       The user-request is a single sentence that captures what the user wanted across the work just finished. It is a synthesized statement, not a quote of any single user message.',
+    '  <list-tasks parent="T-1"/>',
+    '  <task-detail id="T-3"/>',
+    '  <search-tasks query="auth middleware"/>',
+    '',
+    'The remote workspace replies with <remote-workspace-result> blocks. Read real results before answering. Never invent file or directory names you have not seen.',
+  ];
+  // Append plugin-provided prompt additions (each one is appended only
+  // while its plugin's trigger is currently active). They show up as
+  // extra "tool/context" blocks at the end of the system prompt.
+  for (const add of (promptAdditions || [])) {
+    lines.push('');
+    lines.push('────────  plugin  ────────');
+    lines.push(String(add).trim());
   }
-}
-
-function ensureFits(s) {
-  if (s.length > MAX_RESULT_BYTES) throw new TooLargeError(s.length);
-  return s;
-}
-
-function isTextFile(p) {
-  const ext = path.extname(p).toLowerCase();
-  if (TEXT_EXTS.has(ext)) return true;
-  return false;
-}
-
-function globToRegex(glob) {
-  // Auto-promote bare-filename globs to recursive. Users (and models) often
-  // write `*.java` or `*Owner*` and expect it to match anywhere in the tree.
-  // If the pattern has no separators and doesn't start with **, prepend **/.
-  if (!glob.includes('/') && !glob.includes('\\') && !glob.startsWith('**')) {
-    glob = '**/' + glob;
+  // Project context from CODE-BOSS.md files discovered at project open.
+  // Last so it sits closest to the user's question — recency bias.
+  if (projectContext) {
+    lines.push('');
+    lines.push('────────  project context  ────────');
+    lines.push(String(projectContext).trim());
   }
-  // Convert a glob to a regex. Supports: ** (any path), * (any non-separator), ? (one char), {a,b}.
-  let re = '';
-  for (let i = 0; i < glob.length; i++) {
-    const c = glob[i];
-    if (c === '*') {
-      if (glob[i + 1] === '*') {
-        // ** — any chars including /
-        re += '.*';
-        i++;
-        if (glob[i + 1] === '/') i++;
-      } else {
-        re += '[^/\\\\]*';
-      }
-    } else if (c === '?') {
-      re += '[^/\\\\]';
-    } else if (c === '.') {
-      re += '\\.';
-    } else if (c === '{') {
-      const end = glob.indexOf('}', i);
-      if (end === -1) { re += '\\{'; continue; }
-      const parts = glob.slice(i + 1, end).split(',').map((s) => s.replace(/\./g, '\\.'));
-      re += `(?:${parts.join('|')})`;
-      i = end;
-    } else if ('+()|^$/\\'.includes(c)) {
-      re += '\\' + c;
-    } else {
-      re += c;
-    }
-  }
-  return new RegExp('^' + re + '$');
+  return lines.join('\n');
 }
 
-async function walkDir(root, { maxDepth = 12 } = {}) {
+// ── Parser ──────────────────────────────────────────────────────────────────
+function coerce(toolName, key, raw) {
+  const ptype = toolName ? tools[toolName]?.schema?.parameters?.properties?.[key]?.type : 'string';
+  const val = String(raw).trim();
+  if (ptype === 'integer' || ptype === 'number') {
+    const n = Number(val);
+    return Number.isNaN(n) ? val : n;
+  }
+  if (ptype === 'boolean') return val === 'true';
+  return val;
+}
+function mkId() { return 'call_' + randomUUID().replace(/-/g, '').slice(0, 16); }
+
+/**
+ * Truncate an assistant response to just the first real <remote-workspace>
+ * block — everything after the close tag (or before a hallucinated result
+ * tag) is dropped.
+ *
+ * Why this exists: backends that ignore our `stop` parameter (e.g., the
+ * Claude Agent SDK in dev mode) let the model "imagine" multi-turn
+ * conversations within a single response — writing fake
+ * <remote-workspace-result> blocks and follow-up turns. Our parser already
+ * ignores the imagined content when extracting calls, but if we store the
+ * full text in the task history, the model on the NEXT loop iteration sees
+ * its own imagined turns and concludes the work is already done.
+ *
+ * By truncating at storage time, the task store contains only what actually
+ * happened — same view the model would have if `stop` had been honored
+ * at the token level.
+ */
+function truncateAtFirstBlock(text) {
+  if (typeof text !== 'string' || !text) return text;
+  const closeMatch = text.match(/<\/remote-workspace>/i);
+  const resultMatch = text.match(/<remote-workspace-result|<workspace-result/i);
+
+  // Case A: no markers → leave as-is (final answers / pure prose).
+  if (!closeMatch && !resultMatch) return text;
+
+  // Case B: close tag comes first (or is the only marker) → keep through close.
+  if (closeMatch && (!resultMatch || closeMatch.index < resultMatch.index)) {
+    return text.slice(0, closeMatch.index + closeMatch[0].length);
+  }
+
+  // Case C: a hallucinated result tag appears before any close. Cut there
+  // and append a synthetic close so the block is well-formed in storage.
+  const before = text.slice(0, resultMatch.index).trimEnd();
+  if (/<remote-workspace>/i.test(before) && !/<\/remote-workspace>/i.test(before)) {
+    return before + '\n</remote-workspace>';
+  }
+  return before;
+}
+
+// Strip multi-agent framing artifacts the model sometimes emits in its
+// prose between tool calls. Gemini (esp. on the GenAI.mil endpoint) has
+// been observed prefixing turns with "for context: [some_agent] said:"
+// — empty meta-prose that's noise in our single-agent chat. We strip
+// the line entirely; any actual content on subsequent lines is kept.
+//
+// Pattern variants we've seen:
+//   for context: [file_and_coding_agent] said:
+//   For Context [planner_agent] said
+//   for context:[name] said:
+//
+// All match: optional "for context" prefix, a bracketed name, "said",
+// with flexible whitespace + punctuation. Conservative — only strips
+// lines that are JUST the marker (anchored ^...$).
+function sanitizeAssistantProse(text, opts = {}) {
+  if (typeof text !== 'string' || !text) return text;
+  // Also strip tool-call-looking XML tags from the prose. The model
+  // sometimes "previews" what it's about to do by writing the tag in
+  // its narration before the actual <remote-workspace> block — so the
+  // chat shows the same call twice. We strip ONLY tags whose name is
+  // a known tool/task verb, so legitimate XML-content discussions
+  // (e.g. talking about a <library-ref> the user has in their pom)
+  // pass through untouched.
+  const extraVerbs = opts.extraVerbs || {};
+  const knownVerbs = new Set([
+    ...Object.keys(VERB_TO_TOOL),
+    ...Object.keys(extraVerbs),
+    ...TASK_VERBS,
+  ]);
+  if (knownVerbs.size > 0) {
+    const verbPattern = [...knownVerbs].sort((a, b) => b.length - a.length)
+      .map((v) => v.replace(/[-_]/g, (c) => '\\' + c)).join('|');
+    // Self-closing form: <verb ... />
+    text = text.replace(new RegExp(`<(?:${verbPattern})\\b[^>]*\\/>`, 'gi'), '');
+    // Body form: <verb ...>...</verb> — closer must match the opener
+    // (backref) so we don't stop at an inner closing tag like </find>
+    // inside an <edit>...</edit> block.
+    text = text.replace(new RegExp(`<(${verbPattern})\\b[^>]*>[\\s\\S]*?</\\1>`, 'gi'), '');
+  }
+  const lines = text.split('\n');
   const out = [];
-  async function rec(dir, depth) {
-    if (depth > maxDepth) return;
-    let entries;
-    try { entries = await readdir(dir, { withFileTypes: true }); }
-    catch { return; }
-    for (const e of entries) {
-      if (e.isDirectory()) {
-        if (IGNORE_DIRS.has(e.name)) continue;
-        await rec(path.join(dir, e.name), depth + 1);
-      } else if (e.isFile()) {
-        out.push(path.join(dir, e.name));
-      }
-    }
+  for (const line of lines) {
+    if (/^\s*for\s+context\s*:?\s*\[[^\]]*\]\s*said\s*:?\s*$/i.test(line)) continue;
+    out.push(line);
   }
-  await rec(root, 0);
+  // Collapse runs of blank lines that the stripping leaves behind.
+  return out.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+function parseAttrs(attrStr, toolName) {
+  const out = {};
+  ATTR_RE.lastIndex = 0;
+  let m;
+  while ((m = ATTR_RE.exec(attrStr ?? '')) !== null) {
+    out[m[1]] = coerce(toolName, m[1], m[2]);
+  }
   return out;
 }
 
-function relForDisplay(p) {
-  return path.relative(process.cwd(), p).split(path.sep).join('/');
-}
+/**
+ * Parse all <remote-workspace> verb calls from a model response text.
+ * Supports both self-closing and body forms.
+ */
+function parseToolCalls(text, opts = {}) {
+  const calls = [];
+  if (typeof text !== 'string' || !text) return calls;
 
-async function safeReadText(p) {
-  const s = await stat(p);
-  if (s.size > MAX_RESULT_BYTES) throw new TooLargeError(s.size);
-  const buf = await readFile(p);
-  // Reject obvious binaries: NUL byte in first 8KB.
-  const sample = buf.subarray(0, Math.min(8192, buf.length));
-  for (let i = 0; i < sample.length; i++) {
-    if (sample[i] === 0) throw new Error('binary file');
+  // Plugin-provided verbs map their own verb names to tool names. Merge
+  // with the built-in VERB_TO_TOOL at parse time so the regex picks them
+  // up and so dispatch resolves to the right tool registry entry.
+  const extraVerbs = opts.extraVerbs || {};   // { verb: tool_name }
+  const allVerbToTool = { ...VERB_TO_TOOL, ...extraVerbs };
+  const allVerbs = [...Object.keys(allVerbToTool), ...TASK_VERBS]
+    .sort((a, b) => b.length - a.length);
+  const verbPattern = allVerbs.map((v) => v.replace(/-/g, '\\-').replace(/_/g, '\\_')).join('|');
+
+  // Cut at the first close tag or hallucinated result tag — only the FIRST
+  // <remote-workspace> block counts.
+  let cut = text.length;
+  for (const re of [/<\/remote-workspace>/i, /<remote-workspace-result/i, /<workspace-result/i]) {
+    const i = text.search(re);
+    if (i >= 0 && i < cut) cut = i;
   }
-  return buf.toString('utf8');
+  const scan = text.slice(0, cut);
+
+  const openRe = new RegExp(`<(${verbPattern})\\b([^>]*?)(/?)>`, 'gi');
+  let pos = 0;
+  while (pos < scan.length) {
+    openRe.lastIndex = pos;
+    const m = openRe.exec(scan);
+    if (!m) break;
+    const verb = m[1].toLowerCase();
+    const attrStr = m[2] ?? '';
+    const selfClosing = m[3] === '/';
+    const openEnd = m.index + m[0].length;
+
+    const isTaskOp = TASK_VERBS.has(verb);
+    const toolName = isTaskOp ? null : allVerbToTool[verb];
+    const args = parseAttrs(attrStr, toolName);
+
+    let nextPos = openEnd;
+    if (!selfClosing) {
+      // Case-INSENSITIVE close-tag search: the opener was matched with /i and
+      // `verb` was lowercased, but a model (Gemini) may emit </Powershell> or
+      // </WRITE>. A case-sensitive indexOf of the lowercased tag would miss
+      // those, leaving args.content/args.command undefined (empty file write,
+      // no-op shell command) while the model is told it ran.
+      const closeRe = new RegExp(`</${verb}\\s*>`, 'i');
+      closeRe.lastIndex = openEnd;
+      const cm = closeRe.exec(scan.slice(openEnd));
+      const ci = cm ? openEnd + cm.index : -1;
+      if (ci !== -1) {
+        const body = scan.slice(openEnd, ci);
+        nextPos = ci + cm[0].length;
+        if (verb === 'write') args.content = body;
+        if (verb === 'edit') {
+          const fM = CHILD_TAG_RE('find').exec(body);
+          const rM = CHILD_TAG_RE('replace').exec(body);
+          if (fM) args.find = fM[1];
+          if (rM) args.replace = rM[1];
+        }
+        if (verb === 'powershell' && body.trim()) args.command = body.trim();
+      }
+    }
+    pos = nextPos;
+    calls.push({
+      id: mkId(),
+      verb,
+      kind: isTaskOp ? 'task-op' : 'tool',
+      name: toolName,
+      args,
+    });
+  }
+  return calls;
 }
 
-const tools = {
-  file_info: {
-    schema: {
-      description: 'Get metadata for a file without reading its contents. Returns byte size and line count. Cheap — use this to plan reads of large files before calling read_file.',
-      parameters: {
-        type: 'object',
-        properties: {
-          path: { type: 'string', description: 'Absolute or project-relative file path.' },
-        },
-        required: ['path'],
-        additionalProperties: false,
-      },
-    },
-    impl: async ({ path: p }) => {
-      if (typeof p !== 'string' || !p) throw new Error('path is required');
-      const abs = path.isAbsolute(p) ? p : path.join(process.cwd(), p);
-      const s = await stat(abs);
-      let lines = null;
-      if (s.size <= MAX_RESULT_BYTES) {
-        const buf = await readFile(abs);
-        const sample = buf.subarray(0, Math.min(8192, buf.length));
-        let isBinary = false;
-        for (let i = 0; i < sample.length; i++) if (sample[i] === 0) { isBinary = true; break; }
-        lines = isBinary ? null : buf.toString('utf8').split('\n').length;
+/**
+ * Walk a model response left-to-right and split it into ordered segments.
+ * Each segment is either:
+ *   { type: 'prose', content: string }
+ *   { type: 'tool-block', body: string, calls: [...] }
+ *
+ * Multiple <remote-workspace>...</remote-workspace> blocks are supported
+ * with prose freely around and between them. Anything from a hallucinated
+ * <remote-workspace-result> or <workspace-result> tag onward is dropped —
+ * the model sometimes invents its own tool results in continuation, and
+ * those would lie about what really happened.
+ *
+ * An unclosed final block (model truncated mid-stream) becomes prose so
+ * we don't run partial commands.
+ */
+function parseResponseSegments(text, opts = {}) {
+  const segments = [];
+  if (typeof text !== 'string' || !text) return segments;
+
+  // Drop hallucinated result tags up front.
+  let cut = text.length;
+  for (const re of [/<remote-workspace-result/i, /<workspace-result/i]) {
+    const i = text.search(re);
+    if (i >= 0 && i < cut) cut = i;
+  }
+  const scan = text.slice(0, cut);
+
+  const openRe = /<remote-workspace\b[^>]*>/i;
+  const closeRe = /<\/remote-workspace>/i;
+  let pos = 0;
+  while (pos < scan.length) {
+    const rest = scan.slice(pos);
+    const openM = openRe.exec(rest);
+    if (!openM) {
+      // No more blocks — rest is all prose.
+      segments.push({ type: 'prose', content: rest });
+      break;
+    }
+    // Always emit a prose segment before the block — even if empty — so the
+    // segment indices line up with the stream-time parser, which also
+    // increments on every prose→block transition. Empty segments are
+    // filtered out at emit time.
+    segments.push({ type: 'prose', content: rest.slice(0, openM.index) });
+    const blockOpenEnd = pos + openM.index + openM[0].length;
+    const afterOpen = scan.slice(blockOpenEnd);
+    const closeM = closeRe.exec(afterOpen);
+    if (!closeM) {
+      // Unclosed block — model truncated. Treat as prose so we don't run
+      // partial commands.
+      segments.push({ type: 'prose', content: scan.slice(pos + openM.index) });
+      break;
+    }
+    const blockBody = afterOpen.slice(0, closeM.index);
+    const blockCloseEnd = blockOpenEnd + closeM.index + closeM[0].length;
+    // Reuse parseToolCalls on the wrapped block — it already knows how to
+    // parse every verb, attribute, and body shape.
+    const calls = parseToolCalls(`<remote-workspace>${blockBody}</remote-workspace>`, opts);
+    segments.push({ type: 'tool-block', body: blockBody, calls });
+    pos = blockCloseEnd;
+  }
+  return segments;
+}
+
+function formatToolResults(results) {
+  const blocks = results.map((r) => {
+    const head = `<remote-workspace-result op="${r.verb}" status="${r.status}"${r.extras ? ' ' + r.extras : ''}>`;
+    return `${head}\n${r.content}\n</remote-workspace-result>`;
+  }).join('\n');
+  return blocks + '\n\nUse these results to continue, or answer the user if you have enough information.';
+}
+
+function flattenContent(content) {
+  if (content == null) return '';
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content.map((p) => (typeof p === 'string' ? p : p?.type === 'text' ? p.text ?? '' : '')).join('');
+  }
+  return String(content);
+}
+
+// ── Convo construction from task store ─────────────────────────────────────
+async function buildConvoFromStore(store) {
+  const out = [];
+  const state = store._state();
+  for (const id of state.allTaskIds) {
+    const t = await loadTaskFull(store, id);
+    if (!t) continue;
+    if (t.archived) continue;            // archived tasks are search-only
+    if (t.rolledUpInto) continue;        // children of a tier-4 rollup are covered by the rollup
+    if (t.tier === 4) {
+      out.push({
+        role: 'user',
+        content: `<task-rollup id="${t.id}" children="${(t.childIds ?? []).join(',')}">\n  ↳ ${t.userRequest || '(no user request synthesized)'}\n${t.summary || '(no summary)'}\n</task-rollup>`,
+      });
+    } else if (t.tier === 3) {
+      out.push({
+        role: 'user',
+        content: `<task-history id="${t.id}" parent="${t.parentId ?? 'root'}" status="${t.ended ? 'done' : 'open'}">\n  ↳ ${t.userRequest || '(no user request synthesized)'}\n${t.summary || '(no summary)'}\n</task-history>`,
+      });
+    } else {
+      // tier 1 and 2 both emit messages; tier 2 already has results masked in storage
+      for (const m of t.messages ?? []) {
+        out.push({ role: m.role, content: m.content });
       }
-      return JSON.stringify({ path: relForDisplay(abs), bytes: s.size, lines });
-    },
-  },
+    }
+  }
+  return out;
+}
 
-  read_file: {
-    schema: {
-      description: `Read a UTF-8 text file. If the slice would exceed ${MAX_RESULT_BYTES} bytes, the call ERRORs — retry with offset/limit to chunk the read. Use file_info first if you're unsure of file size.`,
-      parameters: {
-        type: 'object',
-        properties: {
-          path: { type: 'string', description: 'Absolute or project-relative file path.' },
-          offset: { type: 'integer', description: 'Optional 1-indexed starting LINE number (NOT bytes). Defaults to line 1.' },
-          limit: { type: 'integer', description: 'Optional max number of LINES to read (NOT bytes). If omitted, reads to end of file.' },
-        },
-        required: ['path'],
-        additionalProperties: false,
-      },
-    },
-    impl: async ({ path: p, offset, limit }) => {
-      if (typeof p !== 'string' || !p) throw new Error('path is required');
-      const abs = path.isAbsolute(p) ? p : path.join(process.cwd(), p);
-      const text = await safeReadText(abs);
-      if (offset == null && limit == null) return ensureFits(text);
-      const lines = text.split('\n');
-      const start = Math.max(0, (offset ?? 1) - 1);
-      const end = limit != null ? start + limit : lines.length;
-      const slice = lines.slice(start, end).join('\n');
-      return ensureFits(slice);
-    },
-  },
+// Helper: re-read a full task (with messages) from disk. listTasks omits the
+// messages array; the convo builder needs it.
+async function loadTaskFull(store, id) {
+  try {
+    const raw = await readFile(path.join(store._dir(), `${id}.json`), 'utf8');
+    return JSON.parse(raw);
+  } catch { return null; }
+}
 
-  grep: {
-    schema: {
-      description: 'Recursively search files in the project for a JavaScript regular expression. Returns "file:line:text" entries (forward-slash paths). Up to ' + MAX_GREP_MATCHES + ' matches. Pure Node implementation — works on Windows without grep/Git for Windows. Binary files and common build dirs (node_modules, target, dist, .git, etc.) are skipped automatically.',
-      parameters: {
-        type: 'object',
-        properties: {
-          pattern: { type: 'string', description: 'Extended-regex pattern (passed to grep -E).' },
-          path: { type: 'string', description: 'Optional subdirectory to search. Defaults to project root.' },
-          glob: { type: 'string', description: 'Optional filename glob (e.g. "*.java", "*.mjs").' },
-          flags: { type: 'string', description: 'Optional flags. "i" → case-insensitive.' },
-        },
-        required: ['pattern'],
-        additionalProperties: false,
-      },
-    },
-    impl: async ({ pattern, path: subPath, glob, flags }) => {
-      if (typeof pattern !== 'string' || !pattern) throw new Error('pattern is required');
-      // Pure Node implementation — no external `grep` binary needed (DoD
-      // Windows machines often lack Git for Windows / WSL so spawn('grep')
-      // fails with ENOENT). Walks the tree, opens each text file, matches
-      // each line against the pattern, and emits "file:line:content".
-      //
-      // We use JS RegExp instead of POSIX ERE — slightly more permissive
-      // but in practice any ERE pattern parses fine here.
-      let re;
-      try {
-        re = new RegExp(pattern, (flags ?? '').includes('i') ? 'i' : '');
-      } catch (e) {
-        return `ERROR: invalid pattern: ${e.message}`;
+// ── Tier demotion ───────────────────────────────────────────────────────────
+// Strategy: when any tier exceeds budget × HYST_HIGH, demote the oldest
+// eligible task (or rollup batch) until the tier is below budget × HYST_LOW.
+// Demoting deeply (HYST_LOW = 0.50) means rare cache invalidations amortized
+// over many cache-hit turns.
+async function tier1TokensFor(store) {
+  const state = store._state();
+  let n = 0;
+  for (const t of await store.listTasks({ tier: 1 })) {
+    if (t.id === state.currentId) continue;       // current may exceed budget
+    if (t.rolledUpInto) continue;
+    const full = await loadTaskFull(store, t.id);
+    for (const m of full?.messages ?? []) n += estTokens(m.content);
+  }
+  return n;
+}
+async function tier2TokensFor(store) {
+  let n = 0;
+  for (const t of await store.listTasks({ tier: 2 })) {
+    if (t.rolledUpInto) continue;
+    const full = await loadTaskFull(store, t.id);
+    for (const m of full?.messages ?? []) n += estTokens(m.content);
+  }
+  return n;
+}
+async function tier3TokensFor(store) {
+  let n = 0;
+  for (const t of await store.listTasks({ tier: 3 })) {
+    if (t.rolledUpInto) continue;
+    n += estTokens(t.summary);
+  }
+  return n;
+}
+async function tier4TokensFor(store) {
+  let n = 0;
+  for (const t of await store.listTasks({ tier: 4 })) {
+    n += estTokens(t.summary);
+  }
+  return n;
+}
+
+async function totalContextTokens(store) {
+  return (await tier1TokensFor(store))
+    + (await tier2TokensFor(store))
+    + (await tier3TokensFor(store))
+    + (await tier4TokensFor(store));
+}
+
+// Tokens in the CURRENT task's messages. tier1TokensFor intentionally
+// EXCLUDES the current task (it can't be demoted), but the current task IS
+// sent to the model in full — so the compaction TRIGGER must count it, or a
+// single long task (big build log, several large file reads) grows the real
+// prompt past the model's context window while totalContextTokens reports it
+// as comfortably under budget and compaction never fires.
+async function currentTaskTokens(store) {
+  const state = store._state();
+  if (!state?.currentId) return 0;
+  const full = await loadTaskFull(store, state.currentId);
+  let n = 0;
+  for (const m of full?.messages ?? []) n += estTokens(m.content);
+  return n;
+}
+
+/**
+ * LLM-driven clustering of tier-3 tasks into tier-4 rollups. ONE LLM call
+ * groups N tier-3 summaries into 4-8 "project" rollups, each with a custom
+ * title + summary. Falls back to mechanical concatenation if the call fails
+ * or the response can't be parsed.
+ *
+ * Returns the number of rollup tasks created.
+ */
+async function llmClusterTier3({ store, adapter, model, log, emitChat }) {
+  const tier3 = (await store.listTasks({ tier: 3 }))
+    .filter((x) => !x.rolledUpInto && !x.archived)
+    .sort((a, b) => (a.ended ?? a.started ?? 0) - (b.ended ?? b.started ?? 0));
+  if (tier3.length < MIN_T3_FOR_LLM_ROLLUP) {
+    log?.(`tier3 cluster: only ${tier3.length} tasks (< ${MIN_T3_FOR_LLM_ROLLUP}); falling back to mechanical`);
+    if (tier3.length >= 2) {
+      // mechanical fallback: roll up everything into one batch
+      const r = await store.rollupTier3Tasks(tier3.map((t) => t.id));
+      if (r) emitChat?.({ type: 'task-rollup', parentTaskId: r.id, childTaskIds: r.childIds, userRequest: r.userRequest, summary: r.summary });
+      return 1;
+    }
+    return 0;
+  }
+
+  const taskLines = tier3
+    .map((t) => {
+      const ur = (t.userRequest || '').replace(/\s+/g, ' ').trim().slice(0, 200);
+      const sm = (t.summary || '').replace(/\s+/g, ' ').trim().slice(0, 200);
+      return `${t.id}  ↳ ${ur || '(no request)'} — ${sm}`;
+    })
+    .join('\n');
+
+  const prompt = [
+    `You will compact a coding session's history. There are ${tier3.length} completed task summaries below.`,
+    '',
+    'Group them into 4-8 logical "projects" — sets of tasks that form coherent units of work (e.g., "auth refactor", "build system upgrade"). For each project, produce:',
+    '  user-request: a single synthesized sentence representing what the user wanted ACROSS this project (NOT a copy of any single message).',
+    '  summary: one dense 1-2 sentence recap of what was actually accomplished across the project.',
+    '',
+    'Tasks (id, user-request, summary):',
+    taskLines,
+    '',
+    'Output ONLY a single JSON object in this exact shape, no other text, no markdown fences:',
+    '{"projects":[{"userRequest":"...","summary":"...","taskIds":["T-3","T-8"]}]}',
+    '',
+    'Constraints:',
+    '- Every task ID from the list above must appear in exactly one project.',
+    '- Use the task IDs verbatim.',
+    '- Keep each user-request and summary under 200 characters.',
+  ].join('\n');
+
+  let raw;
+  try {
+    // Best-effort with a hard timeout. This is BACKGROUND compaction, not the
+    // user's turn — it must never block the agent loop. Without a bound, a
+    // 401-with-unlock makes safeFetch await the user clicking an unlock modal
+    // (which they don't expect mid-compaction), and a 429 retries for tens of
+    // seconds — either way the loop hangs and the mechanical fallback below
+    // (only reached on throw) is bypassed. A timeout signal converts those
+    // into a throw → graceful mechanical rollup.
+    const COMPACT_LLM_TIMEOUT_MS = 25000;
+    let signal;
+    try { signal = AbortSignal.timeout(COMPACT_LLM_TIMEOUT_MS); } catch { signal = undefined; }
+    const res = await adapter.complete({
+      model,
+      messages: [{ role: 'user', content: prompt }],
+      max_tokens: 2000,
+      signal,
+    });
+    raw = res?.choices?.[0]?.message?.content ?? '';
+  } catch (e) {
+    log?.(`tier3 cluster: LLM call failed/timed out (${e.message}); falling back to mechanical`);
+  }
+
+  // Try to parse JSON out of the response. Tolerant of prose around the object.
+  let parsed = null;
+  if (raw) {
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      try { parsed = JSON.parse(jsonMatch[0]); } catch {}
+    }
+  }
+
+  if (!parsed || !Array.isArray(parsed.projects) || parsed.projects.length === 0) {
+    log?.(`tier3 cluster: LLM response unparseable; falling back to one mechanical rollup`);
+    const r = await store.rollupTier3Tasks(tier3.map((t) => t.id));
+    if (r) emitChat?.({ type: 'task-rollup', parentTaskId: r.id, childTaskIds: r.childIds, userRequest: r.userRequest, summary: r.summary });
+    return 1;
+  }
+
+  // Build set of valid IDs (the ones we asked about); ignore any hallucinated IDs.
+  const validIds = new Set(tier3.map((t) => t.id));
+  let createdCount = 0;
+  const claimed = new Set();
+  for (const p of parsed.projects) {
+    if (typeof p?.userRequest !== 'string' || typeof p?.summary !== 'string') continue;
+    if (!Array.isArray(p?.taskIds)) continue;
+    const ids = p.taskIds.filter((id) => validIds.has(id) && !claimed.has(id));
+    if (ids.length === 0) continue;
+    const rollup = await store.rollupTier3Tasks(ids, { userRequest: p.userRequest, summary: p.summary });
+    if (rollup) {
+      createdCount++;
+      for (const id of ids) claimed.add(id);
+      emitChat?.({ type: 'task-rollup', parentTaskId: rollup.id, childTaskIds: rollup.childIds, userRequest: rollup.userRequest, summary: rollup.summary });
+    }
+  }
+
+  // Sweep up any unclaimed task IDs into one final mechanical rollup so nothing is left orphaned.
+  const orphans = [...validIds].filter((id) => !claimed.has(id));
+  if (orphans.length >= 2) {
+    const r = await store.rollupTier3Tasks(orphans);
+    if (r) emitChat?.({ type: 'task-rollup', parentTaskId: r.id, childTaskIds: r.childIds, userRequest: r.userRequest, summary: r.summary });
+    createdCount++;
+  }
+  log?.(`tier3 cluster: created ${createdCount} rollups covering ${claimed.size + Math.max(0, orphans.length)} tasks`);
+  return createdCount;
+}
+
+/**
+ * Compact when total context exceeds the high threshold. Bring it down to
+ * the low threshold in one pass:
+ *   1. T1→T2 (mechanical mask) until under LOW or no more candidates
+ *   2. T2→T3 (mechanical drop messages) until under LOW or no candidates
+ *   3. If still over and tier-3 is at or above its allocation: ONE LLM call
+ *      to cluster all tier-3 tasks into tier-4 rollups
+ *   4. T4→archive (mechanical flag flip) for oldest if still over
+ */
+async function maybeCompact({ store, adapter, model, log, emitChat }) {
+  const HIGH = TOTAL_BUDGET * HYST_HIGH;
+  const LOW  = TOTAL_BUDGET * HYST_LOW;
+
+  // Trigger on the TRUE prompt size (incl. the current task), but drive the
+  // demotion loop on the demotable total (excl. current — it can't be masked
+  // while in progress). This makes compaction fire on a long single task and
+  // reclaim every finished task, instead of never firing at all.
+  const demotableTotal = await totalContextTokens(store);
+  const triggerTotal = demotableTotal + (await currentTaskTokens(store));
+  if (triggerTotal <= HIGH) return;
+  let total = demotableTotal;
+
+  log?.(`compact: trigger=${triggerTotal} (demotable=${demotableTotal}, current=${triggerTotal - demotableTotal}) > HIGH=${HIGH}; target LOW=${LOW}`);
+  if (total <= LOW) {
+    log?.(`compact: current task alone exceeds budget; demotable context already minimal (no finished tasks to reclaim)`);
+  }
+
+  // Step 1: T1 → T2 mask (cheap). Emit task-tier-change so UI can mute results.
+  while (total > LOW) {
+    const id = await store.findOldestDemotionCandidate(1);
+    if (!id) break;
+    const before = await loadTaskFull(store, id);
+    let removed = 0;
+    for (const m of before?.messages ?? []) if (m.kind === 'tool-result') removed += estTokens(m.content);
+    await store.demoteToTier2(id);
+    emitChat?.({ type: 'task-tier-change', taskId: id, newTier: 2, muted: 'results' });
+    total -= removed;
+  }
+  if (total <= LOW) { log?.(`compact: done after T1→T2 (total=${total})`); return; }
+
+  // Step 2: T2 → T3 drop (cheap). Emit task-tier-change so UI can mute all rows.
+  while (total > LOW) {
+    const id = await store.findOldestDemotionCandidate(2);
+    if (!id) break;
+    const before = await loadTaskFull(store, id);
+    let removedMsgs = 0;
+    for (const m of before?.messages ?? []) removedMsgs += estTokens(m.content);
+    const addedSummary = estTokens(before?.summary ?? '');
+    await store.demoteToTier3(id, before?.summary || '(no summary)');
+    emitChat?.({ type: 'task-tier-change', taskId: id, newTier: 3, muted: 'all' });
+    total -= (removedMsgs - addedSummary);
+  }
+  if (total <= LOW) { log?.(`compact: done after T2→T3 (total=${total})`); return; }
+
+  // Step 3: T3 → T4 via LLM clustering (expensive — only if mechanical didn't suffice)
+  const t3 = await tier3TokensFor(store);
+  if (t3 >= TIER_3_BUDGET) {
+    log?.(`compact: tier3=${t3} >= ${TIER_3_BUDGET}; invoking LLM cluster`);
+    await llmClusterTier3({ store, adapter, model, log, emitChat });
+    total = await totalContextTokens(store);
+    log?.(`compact: after LLM cluster total=${total}`);
+  }
+  if (total <= LOW) { log?.(`compact: done after T3→T4 (total=${total})`); return; }
+
+  // Step 4: T4 → archive (mechanical). Emit task-archived so UI can mark/hide it.
+  while (total > LOW) {
+    const tier4 = (await store.listTasks({ tier: 4 }))
+      .filter((x) => !x.archived)
+      .sort((a, b) => (a.ended ?? a.started ?? 0) - (b.ended ?? b.started ?? 0));
+    if (!tier4.length) break;
+    const oldest = tier4[0];
+    const removed = estTokens(oldest.summary);
+    await store.archiveTask(oldest.id);
+    emitChat?.({ type: 'task-archived', taskId: oldest.id });
+    total -= removed;
+  }
+  log?.(`compact: done (total=${total}, target=${LOW})`);
+}
+
+// ── Stream-aware turn (prose forwarding) ───────────────────────────────────
+const HOLDBACK = '<remote-workspace>'.length + 2;
+
+/**
+ * Stream the model's response while live-tracking prose/block boundaries.
+ *
+ * The state machine has two modes:
+ *   PROSE  — accumulating text until we see <remote-workspace
+ *   BLOCK  — inside a <remote-workspace>…</remote-workspace>; suppress chunks
+ *
+ * Callbacks (any can be omitted):
+ *   onProseChunk({ segmentIndex, content })  — fresh prose bytes for live UI
+ *   onBlockReady ({ segmentIndex, body })    — a closed tool block; fire its
+ *                                              tools NOW, in parallel with
+ *                                              later blocks if you like
+ *
+ * The HOLDBACK at the tail of the buffer means we wait for the next chunk
+ * before emitting the last few bytes, so a partial "<remote-w" never leaks
+ * to the UI as visible text and then has to be retracted.
+ *
+ * Returns the full text on completion. The agent loop re-parses with
+ * parseResponseSegments to assemble the canonical segment list for storage
+ * and any post-stream work — that pass owns the hallucinated-result-tag
+ * defense, so this streamer can stay simple.
+ */
+async function runTurnStreaming(adapter, opts, { onProseChunk, onProseSegmentEnd, onBlockReady } = {}) {
+  let text = '';
+  let state = 'prose';
+  let segmentIndex = 0;
+  let proseStart = 0;       // start of the current prose segment (for content slicing on end)
+  let proseSent = 0;        // chars already streamed via onProseChunk
+  let blockBodyStart = -1;
+
+  // Case-insensitive search on the ORIGINAL text. Do NOT use
+  // text.toLowerCase().indexOf(...): some characters (U+0130 'İ', 'ß', ligatures)
+  // change LENGTH under toLowerCase, so an index found in the lowercased copy
+  // is offset from the same position in the original — slicing the original at
+  // that shifted index leaks tag fragments into the prose and corrupts the
+  // stored message. Regex .index is computed against the original string.
+  const findFrom = (re, from) => { re.lastIndex = from; const m = re.exec(text); return m ? m.index : -1; };
+  const OPEN_RE = /<remote-workspace/gi;
+  const CLOSE_RE = /<\/remote-workspace>/gi;
+  const pump = () => {
+    while (true) {
+      if (state === 'prose') {
+        const openIdx = findFrom(OPEN_RE, proseSent);
+        if (openIdx === -1) {
+          // No open tag yet — emit prose up to HOLDBACK before the tail so
+          // a partial tag mid-stream never appears in the UI.
+          const flushTo = Math.max(proseSent, text.length - HOLDBACK);
+          if (flushTo > proseSent) {
+            onProseChunk?.({ segmentIndex, content: text.slice(proseSent, flushTo) });
+            proseSent = flushTo;
+          }
+          return;
+        }
+        if (openIdx > proseSent) {
+          onProseChunk?.({ segmentIndex, content: text.slice(proseSent, openIdx) });
+          proseSent = openIdx;
+        }
+        // We have a <remote-workspace — make sure the full opening tag has arrived
+        const tagCloseIdx = text.indexOf('>', openIdx);
+        if (tagCloseIdx === -1) return;
+        const opener = text.slice(openIdx, tagCloseIdx + 1);
+        // Skip hallucinated result tags — the post-stream parser drops them.
+        if (/<remote-workspace-result|<workspace-result/i.test(opener)) {
+          // Flush the current prose segment (whatever the model said before
+          // its hallucinated result) then suppress further chunks.
+          const proseContent = text.slice(proseStart, openIdx);
+          if (proseContent.length) onProseSegmentEnd?.({ segmentIndex, content: proseContent });
+          state = 'block';
+          blockBodyStart = Number.MAX_SAFE_INTEGER;
+          proseSent = tagCloseIdx + 1;
+          return;
+        }
+        // Real <remote-workspace …> — close out the current prose segment
+        // (so the UI gets its sanitized final-version event in order),
+        // then transition into block state.
+        const proseContent = text.slice(proseStart, openIdx);
+        onProseSegmentEnd?.({ segmentIndex, content: proseContent });
+        segmentIndex++;
+        state = 'block';
+        blockBodyStart = tagCloseIdx + 1;
+        proseSent = tagCloseIdx + 1;
+        continue;
       }
-      const globRe = glob ? globToRegex(glob) : null;
-      const exclude = new Set(['.git', 'node_modules', 'dist', 'target', '.code_boss', '.agent', '.idea', '.gradle', 'build', 'coverage']);
-      const rootAbs = subPath ? path.resolve(process.cwd(), subPath) : process.cwd();
+      // state === 'block'
+      const closeIdx = findFrom(CLOSE_RE, blockBodyStart);
+      if (closeIdx === -1) return;
+      const body = text.slice(blockBodyStart, closeIdx);
+      onBlockReady?.({ segmentIndex, body });
+      segmentIndex++;
+      const endTag = '</remote-workspace>';
+      state = 'prose';
+      proseSent = closeIdx + endTag.length;
+      proseStart = proseSent;
+      blockBodyStart = -1;
+    }
+  };
 
-      // Walk inline so we can short-circuit when MAX_GREP_MATCHES is hit.
-      const out = [];
-      let stopped = false;
-      async function walk(dir) {
-        if (stopped) return;
-        let entries;
-        try { entries = await readdir(dir, { withFileTypes: true }); }
-        catch { return; }
-        for (const e of entries) {
-          if (stopped) return;
-          if (e.isDirectory()) {
-            if (exclude.has(e.name)) continue;
-            await walk(path.join(dir, e.name));
-            continue;
-          }
-          if (!e.isFile()) continue;
-          const full = path.join(dir, e.name);
-          // Glob filter applies to the path RELATIVE to cwd (forward slashes).
-          if (globRe) {
-            const rel = path.relative(process.cwd(), full).replace(/\\/g, '/');
-            if (!globRe.test(rel) && !globRe.test(e.name)) continue;
-          }
-          // Skip files that are obviously binary by extension. Cheap heuristic
-          // beats reading every PNG / JAR / class file in a Java project.
-          const lower = e.name.toLowerCase();
-          if (/\.(png|jpe?g|gif|ico|bmp|webp|pdf|zip|jar|war|ear|class|exe|dll|so|dylib|bin|lock|woff2?|ttf|otf|eot|mp[34]|wav|ogg|mov|mkv|avi|tar|gz|7z|rar)$/.test(lower)) continue;
-          // Read the file; skip if unreadable or if the first chunk contains
-          // null bytes (binary).
-          let text;
-          try {
-            const buf = await readFile(full);
-            if (buf.length === 0) continue;
-            const head = buf.subarray(0, Math.min(buf.length, 8192));
-            if (head.includes(0)) continue;  // binary
-            text = buf.toString('utf8');
-          } catch { continue; }
+  if (typeof adapter.completeStream === 'function') {
+    for await (const chunk of adapter.completeStream(opts)) {
+      const d = chunk?.choices?.[0]?.delta?.content;
+      if (d) { text += d; pump(); }
+    }
+  } else {
+    const res = await adapter.complete(opts);
+    text = res?.choices?.[0]?.message?.content ?? '';
+    pump();
+  }
+  // Final flush: any trailing prose still inside HOLDBACK gets emitted,
+  // and the final prose segment is closed out so the UI can finalize it.
+  if (state === 'prose') {
+    if (proseSent < text.length) {
+      onProseChunk?.({ segmentIndex, content: text.slice(proseSent) });
+      proseSent = text.length;
+    }
+    const finalProse = text.slice(proseStart);
+    if (finalProse.length) onProseSegmentEnd?.({ segmentIndex, content: finalProse });
+  }
+  return text;
+}
 
-          const lines = text.split(/\r?\n/);
-          for (let i = 0; i < lines.length; i++) {
-            if (re.test(lines[i])) {
-              const relPath = path.relative(process.cwd(), full).replace(/\\/g, '/') || full.replace(/\\/g, '/');
-              const line = lines[i].length > 500 ? lines[i].slice(0, 500) + '…' : lines[i];
-              out.push(`${relPath}:${i + 1}:${line}`);
-              if (out.length >= MAX_GREP_MATCHES) {
-                out.push(`[stopped at ${MAX_GREP_MATCHES} matches]`);
-                stopped = true;
-                return;
-              }
+// ── Task-op dispatcher ─────────────────────────────────────────────────────
+async function dispatchTaskOp(c, store) {
+  const a = c.args;
+  if (c.verb === 'next-task') {
+    // user-request and summary describe the task being CLOSED (the current one),
+    // not the new one being opened. See system prompt.
+    const r = await store.transitionTo({
+      summary: a.summary ?? '',
+      userRequest: a['user-request'] ?? '',
+    });
+    return {
+      ok: true,
+      content: `closed previous task with summary "${a.summary ?? ''}"; opened new task ${r.newTask.id}`,
+      closedId: r.closedId,
+      newTaskId: r.newTask.id,
+    };
+  }
+  if (c.verb === 'list-tasks') {
+    const list = await store.listTasks({ parentId: a.parent });
+    if (!list.length) return { ok: true, content: '(no tasks)' };
+    const lines = list.map((t) => {
+      const status = t.ended ? 'done' : 'open';
+      const tier = `tier${t.tier}`;
+      const ur = t.userRequest ? ` ↳ ${t.userRequest.split('\n')[0].slice(0, 100)}` : '';
+      const summary = t.summary ? ` — ${t.summary.split('\n')[0].slice(0, 120)}` : '';
+      const hash = t.commitHash ? `  (commit ${t.commitHash})` : '';
+      return `${t.id}  [${status}]  [${tier}]${hash}${ur}${summary}`;
+    });
+    return { ok: true, content: lines.join('\n') };
+  }
+  if (c.verb === 'task-detail') {
+    const t = await store.getDetail(a.id);
+    if (!t) return { ok: false, content: `task ${a.id} not found` };
+    return { ok: true, content: JSON.stringify(t, null, 2) };
+  }
+  if (c.verb === 'search-tasks') {
+    const hits = await store.searchTasks(a.query ?? '');
+    if (!hits.length) return { ok: true, content: '(no matches)' };
+    const lines = hits.map((t) => {
+      const ur = t.userRequest ? ` ↳ ${t.userRequest.split('\n')[0].slice(0, 100)}` : '';
+      const sm = (t.summary ?? '').split('\n')[0].slice(0, 140);
+      return `${t.id}${ur} — ${sm}`;
+    });
+    return { ok: true, content: lines.join('\n') };
+  }
+  return { ok: false, content: `unknown task op: ${c.verb}` };
+}
+
+// ── Main agent loop ────────────────────────────────────────────────────────
+async function runPromptedAgent({
+  adapter,
+  messages,           // [{role, content}] from the browser; we only care about the last user message
+  model,
+  projectDir,         // required: where .code_boss/tasks/ lives
+  maxTurns = DEFAULT_MAX_TURNS,
+  // Legacy callbacks (used by /api/chat SSE response):
+  onText, onToolCalls, onToolResult, onLog,
+  // New chat-event callback (used by /api/message + chat state on server):
+  //   onChatEvent({ type, taskId, ...payload })
+  // emitted for: 'user-message', 'assistant-text', 'tool-call', 'tool-result',
+  //              'diff', 'task-end'.
+  onChatEvent,
+  // New phase callback:
+  //   onPhase('idle' | 'uploading' | 'thinking' | 'downloading' | 'reviewing')
+  onPhase,
+  // Abort signal — checked between turns and when waiting on the model.
+  signal,
+  // When the reviewer feeds back to the agent, the user-facing review
+  // event already shows the feedback — set this to false to skip the
+  // duplicate 'user-message' event. The store still gets the message so
+  // the LLM sees it as input.
+  emitInitialUserMessage = true,
+  // Plugin integration. Manager passes these so the agent's prompt + tool
+  // dispatch + parser pick up enabled plugins' contributions.
+  extraTools = {},          // { tool_name: { verb, name, schema, impl } }
+  extraVerbs = {},          // { verb: tool_name } — fed to parseToolCalls
+  promptAdditions = [],     // strings appended to system prompt
+  projectContext = '',      // formatted CODE-BOSS.md context for this project
+  // Hook fired right after a <next-task> task-op transitions the store.
+  // Receives { closedTaskId, newTaskId, userRequest, summary } and may
+  // return a commit hash string (or null). The hash is attached to the
+  // closed task's record and included in the task-end chat event.
+  onTaskClose,
+  // Pre-write hook handed to tools that mutate files (write_file,
+  // edit_file). Called as requireBranch(absPath) before the write,
+  // resolves to 'ok' to proceed or 'aborted' to cancel. The server's
+  // implementation pauses until the user resolves a CODE_BOSS-branch
+  // prompt for the file's containing repo.
+  requireBranch,
+  // Returns { user, token } for plugins that need to hit the configured
+  // GitLab API (e.g. wl's documentation fetchers). Token never reaches
+  // the model — the plugin's impl calls the GitLab client and only the
+  // result content goes into the chat. Optional; plugins handle the
+  // missing case themselves.
+  getGitLabCredentials,
+}) {
+  if (!projectDir) throw new Error('projectDir required for task-scoped agent');
+
+  const log = (m) => { try { onLog?.(m); } catch {} };
+  const emitChat = (ev) => { try { onChatEvent?.(ev); } catch (e) { log(`onChatEvent error: ${e.message}`); } };
+  const emitPhase = (p) => { try { onPhase?.(p); } catch {} };
+  const checkAbort = () => {
+    if (signal?.aborted) {
+      const e = new Error('aborted');
+      e.name = 'AbortError';
+      throw e;
+    }
+  };
+
+  // Initialize tasks store; this either loads existing state or creates a root task.
+  const store = createTasksStore(projectDir);
+  await store.init();
+
+  // Extract the user's new message (last user role in incoming).
+  const lastUserMsg = [...(messages ?? [])].reverse().find((m) => m.role === 'user');
+  const userText = flattenContent(lastUserMsg?.content);
+  if (userText) {
+    await store.appendMessage({
+      kind: 'user-message',
+      role: 'user',
+      content: userText,
+    });
+    if (emitInitialUserMessage) {
+      emitChat({ type: 'user-message', taskId: store.currentId(), content: userText });
+    }
+  }
+
+  const stats = { turns: 0, toolCalls: 0, toolHistogram: {}, batches: [], loopBreaks: 0, taskOps: 0 };
+
+  for (let turn = 1; turn <= maxTurns; turn++) {
+    stats.turns = turn;
+
+    // Compute current tier-1 tokens to inject into the system prompt.
+    const cur = await store.getCurrent();
+    let t1Tokens = 0;
+    for (const m of cur?.messages ?? []) t1Tokens += estTokens(m.content);
+    const tier1Pct = Math.round((t1Tokens / TIER_1_BUDGET) * 100);
+
+    const sys = buildSystemPrompt({
+      taskId: cur?.id ?? '?',
+      taskUserRequest: cur?.userRequest ?? '',
+      tier1Tokens: t1Tokens,
+      tier1Pct,
+      promptAdditions,
+      projectContext,
+    });
+
+    // Build the convo from the store. The system reminder is NOT stored —
+    // it lives only in the prompt we send each turn. We copy the convo and
+    // PREPEND the reminder into the LATEST user message (the one carrying
+    // the current question), so the model sees fresh instructions right
+    // before the question it's about to answer. The stored convo is untouched.
+    //
+    // Why latest, not oldest: in a long conversation the oldest user message
+    // is far in the past; a reminder there is easy for the model to overlook
+    // or treat as ancient context. The latest user message is the freshest
+    // and contains what the model is actively responding to.
+    //
+    // Why prepend (not append) within that latest message: convention —
+    // system instructions go before the user's question. Appending after
+    // the question can cause the model to respond to the reminder itself
+    // instead of the question.
+    const fromStore = await buildConvoFromStore(store);
+    // Prepend a hidden user/assistant priming pair so the model has already
+    // "agreed" to use the <remote-workspace> XML tooling by the time the
+    // real user message arrives. Without this, Gemini Enterprise's first
+    // turn often drifts into "I do not have access to your files" before
+    // it remembers it does have the workspace tools. The priming messages
+    // are NOT persisted to the task store and never appear in the UI;
+    // they exist only in the prompt sent to the API.
+    const PRIMING = [
+      {
+        role: 'user',
+        content:
+          "Hi! I'm working with you in a remote workspace where you interact " +
+          "with my project by returning XML commands inside <remote-workspace> " +
+          "tags — for example <remote-workspace><list path=\".\"/></remote-workspace> " +
+          "to see what's there, <read path=\"...\"/> to view a file, " +
+          "<write path=\"...\">contents</write> to create one, " +
+          "<powershell>...</powershell> to run a shell command. Anything you put " +
+          "inside <remote-workspace> runs on my machine and the results come back " +
+          "to you on the next turn. Sound good?",
+      },
+      {
+        role: 'assistant',
+        content:
+          "Got it — I'll use <remote-workspace> XML commands to interact with your " +
+          "project files and run shell commands. I won't apologize for being " +
+          "unable to access files; the workspace IS the project. What would you " +
+          "like to work on?",
+      },
+    ];
+    const baseConvo = [...PRIMING, ...fromStore];
+    let latestUserIdx = -1;
+    for (let i = baseConvo.length - 1; i >= 0; i--) {
+      if (baseConvo[i].role === 'user') { latestUserIdx = i; break; }
+    }
+    const convo = baseConvo.map((m, i) => {
+      if (i !== latestUserIdx) return m;
+      return {
+        role: 'user',
+        content: `<system-reminder>\n${sys}\n</system-reminder>\n\n${m.content}`,
+      };
+    });
+    if (latestUserIdx === -1) {
+      // No user messages at all — send the reminder as the only message.
+      convo.push({ role: 'user', content: `<system-reminder>\n${sys}\n</system-reminder>` });
+    }
+
+    log(`turn ${turn}: ${convo.length} msgs · current=${cur?.id} · t1=${t1Tokens}/${TIER_1_BUDGET}`);
+
+    checkAbort();
+    emitPhase('uploading');
+    const t0 = Date.now();
+    emitPhase('thinking');
+
+    // Per-call execution. tool-call events are emitted mid-stream by
+    // onBlockReady so the chat-log order is "prose → calls → prose → calls".
+    // This function only RUNS the tool and emits the tool-result event.
+    async function runOneCall(c, perBlockState) {
+      checkAbort();
+      // Capture the owning task SYNCHRONOUSLY at call entry (before any
+      // await / dispatchTaskOp). A <next-task> later in the same turn moves
+      // store.currentId; results produced before that must be filed into the
+      // task they actually ran in, not the freshly-opened one. Synchronous
+      // capture also wins the race against a parallel next-task block.
+      const ownerTaskId = store.currentId();
+      const key = c.verb + '|' + JSON.stringify(c.args);
+      if (key === perBlockState.lastKey) perBlockState.repeat++;
+      else { perBlockState.lastKey = key; perBlockState.repeat = 1; }
+
+      let resultContent, resultStatus = 'ok', resultDiff = null;
+      if (perBlockState.repeat >= REPEAT_LIMIT) {
+        stats.loopBreaks++;
+        resultContent = `LOOP DETECTED: this exact request has fired ${perBlockState.repeat} times. Stop requesting and answer with what you have.`;
+        resultStatus = 'error';
+      } else if (c.kind === 'task-op') {
+        stats.taskOps++;
+        const r = await dispatchTaskOp(c, store);
+        resultContent = r.content;
+        resultStatus = r.ok ? 'ok' : 'error';
+        log(`  ${c.verb}(${JSON.stringify(c.args)}) -> ${resultStatus}`);
+        if (c.verb === 'next-task' && r.ok) {
+          let commitHash = null;
+          if (typeof onTaskClose === 'function') {
+            try {
+              commitHash = await onTaskClose({
+                closedTaskId: r.closedId,
+                newTaskId: r.newTaskId,
+                userRequest: c.args['user-request'] ?? '',
+                summary: c.args.summary ?? '',
+              });
+            } catch (e) {
+              log(`onTaskClose error: ${e.message}`);
             }
           }
-        }
-      }
-      await walk(rootAbs);
-      if (out.length === 0) return '(no matches)';
-      return ensureFits(out.join('\n'));
-    },
-  },
-
-  glob: {
-    schema: {
-      description: 'Find files in the project matching a glob pattern (e.g. "src/**/*.mjs"). Returns up to ' + MAX_GLOB_RESULTS + ' paths.',
-      parameters: {
-        type: 'object',
-        properties: {
-          pattern: { type: 'string', description: 'Glob pattern. Supports **, *, ?, {a,b}.' },
-        },
-        required: ['pattern'],
-        additionalProperties: false,
-      },
-    },
-    impl: async ({ pattern }) => {
-      if (typeof pattern !== 'string' || !pattern) throw new Error('pattern is required');
-      const re = globToRegex(pattern);
-      const files = await walkDir(process.cwd());
-      const out = [];
-      for (const f of files) {
-        const rel = relForDisplay(f).replace(/\\/g, '/');
-        if (re.test(rel)) {
-          out.push(rel);
-          if (out.length >= MAX_GLOB_RESULTS) {
-            out.push(`[stopped at ${MAX_GLOB_RESULTS} results]`);
-            break;
+          if (commitHash && r.closedId) {
+            try { await store.attachToTask(r.closedId, { commitHash }); }
+            catch (e) { log(`attachToTask error: ${e.message}`); }
           }
+          emitChat({
+            type: 'task-end',
+            taskId: cur?.id,
+            userRequest: c.args['user-request'] ?? '',
+            summary: c.args.summary ?? '',
+            commitHash,
+          });
         }
-      }
-      return ensureFits(out.length ? out.join('\n') : '(no matches)');
-    },
-  },
-
-  write_file: {
-    schema: {
-      description: 'Write a UTF-8 text file. Creates parent directories as needed. Overwrites if the file already exists. Returns a unified diff vs. the prior content (or "(new file)" if none).',
-      parameters: {
-        type: 'object',
-        properties: {
-          path: { type: 'string', description: 'Absolute or project-relative file path.' },
-          content: { type: 'string', description: 'Full file content (UTF-8).' },
-        },
-        required: ['path', 'content'],
-        additionalProperties: false,
-      },
-    },
-    impl: async ({ path: p, content }, ctx) => {
-      if (typeof p !== 'string' || !p) throw new Error('path is required');
-      if (typeof content !== 'string') throw new Error('content is required');
-      const abs = path.isAbsolute(p) ? p : path.join(process.cwd(), p);
-      // Pre-write hook: server may insist the containing git repo be on
-      // a CODE_BOSS_* branch before we modify any file under it. If the
-      // hook throws or returns 'aborted', the user declined and the
-      // write should not happen.
-      if (typeof ctx?.requireBranch === 'function') {
-        const status = await ctx.requireBranch(abs);
-        if (status === 'aborted') throw new Error('write aborted: user declined to create a CODE_BOSS branch for this repo');
-      }
-      let oldText = '';
-      let existed = false;
-      try { oldText = await readFile(abs, 'utf8'); existed = true; } catch {}
-      await mkdir(path.dirname(abs), { recursive: true });
-      await writeFile(abs, content, 'utf8');
-      const rel = relForDisplay(abs);
-      const summary = existed ? shortDiffSummary(oldText, content) : `(new file, ${content.split('\n').length} lines)`;
-      const diff = existed
-        ? renderUnifiedDiff(oldText, content, { pathLabel: rel, context: 2 })
-        : ['--- (new file)', `+++ ${rel}`, `@@ -0,0 +1,${content.split('\n').length} @@`, ...content.split('\n').map((l) => '+' + l)].join('\n');
-      return {
-        content: `wrote ${rel}  ${summary}`,
-        diff,
-        path: rel,
-      };
-    },
-  },
-
-  edit_file: {
-    schema: {
-      description: 'Surgical edit: replace one occurrence of an exact string in a file. Fails if the string is not found OR if it occurs more than once (ambiguous). Returns a unified diff.',
-      parameters: {
-        type: 'object',
-        properties: {
-          path: { type: 'string', description: 'Absolute or project-relative file path.' },
-          find: { type: 'string', description: 'Exact string to find. Must occur exactly once in the file.' },
-          replace: { type: 'string', description: 'Replacement string.' },
-        },
-        required: ['path', 'find', 'replace'],
-        additionalProperties: false,
-      },
-    },
-    impl: async ({ path: p, find, replace }, ctx) => {
-      if (typeof p !== 'string' || !p) throw new Error('path is required');
-      if (typeof find !== 'string') throw new Error('find is required');
-      if (typeof replace !== 'string') throw new Error('replace is required');
-      const abs = path.isAbsolute(p) ? p : path.join(process.cwd(), p);
-      // Same pre-write hook as write_file — see comment there.
-      if (typeof ctx?.requireBranch === 'function') {
-        const status = await ctx.requireBranch(abs);
-        if (status === 'aborted') throw new Error('edit aborted: user declined to create a CODE_BOSS branch for this repo');
-      }
-      const oldText = await readFile(abs, 'utf8');
-
-      // Find the string. Try exact match first; if that fails, try
-      // common normalizations before giving up. The model frequently
-      // copies bytes from a read result that's been normalized to LF
-      // and then asks us to edit a Windows file with CRLF — the bytes
-      // don't match exactly but the intent is clear.
-      let findToUse = find;
-      let replaceToUse = replace;
-      let first = oldText.indexOf(findToUse);
-      let fallback = null;
-
-      if (first === -1) {
-        const fileHasCRLF = oldText.includes('\r\n');
-        const findHasCRLF = find.includes('\r\n');
-        if (fileHasCRLF && !findHasCRLF) {
-          // File uses CRLF, model gave LF. Promote both find + replace.
-          findToUse = find.replace(/\n/g, '\r\n');
-          replaceToUse = replace.replace(/\n/g, '\r\n');
-          first = oldText.indexOf(findToUse);
-          if (first !== -1) fallback = 'CRLF';
-        } else if (!fileHasCRLF && findHasCRLF) {
-          // File uses LF, model gave CRLF. Strip the \r from both.
-          findToUse = find.replace(/\r\n/g, '\n');
-          replaceToUse = replace.replace(/\r\n/g, '\n');
-          first = oldText.indexOf(findToUse);
-          if (first !== -1) fallback = 'LF';
-        }
-      }
-
-      if (first === -1) throw new Error(`find string not found in ${relForDisplay(abs)}`);
-      const second = oldText.indexOf(findToUse, first + 1);
-      if (second !== -1) throw new Error(`find string occurs more than once in ${relForDisplay(abs)} — make it more specific`);
-      const newText = oldText.slice(0, first) + replaceToUse + oldText.slice(first + findToUse.length);
-      await writeFile(abs, newText, 'utf8');
-      const rel = relForDisplay(abs);
-      const note = fallback ? `  (matched after normalizing line endings to ${fallback})` : '';
-      return {
-        content: `edited ${rel}  ${shortDiffSummary(oldText, newText)}${note}`,
-        diff: renderUnifiedDiff(oldText, newText, { pathLabel: rel, context: 2 }),
-        path: rel,
-      };
-    },
-  },
-
-  powershell: {
-    schema: {
-      description: 'Run a PowerShell command on the developer\'s Windows machine, in the project root. Returns stdout, stderr, and exit code. Use this for builds (mvnw.cmd, npm test), git (git status, git diff), any shell operation. PowerShell syntax: Get-ChildItem, Get-Content, $env:VAR, etc. The `ls` and `cat` aliases work too.',
-      parameters: {
-        type: 'object',
-        properties: {
-          command: { type: 'string', description: 'PowerShell command. Pipes, redirects, variables, etc. work normally.' },
-          timeout_ms: { type: 'integer', description: `Timeout in milliseconds. Default ${BASH_DEFAULT_TIMEOUT_MS} (2 min), max ${BASH_MAX_TIMEOUT_MS} (10 min).` },
-        },
-        required: ['command'],
-        additionalProperties: false,
-      },
-    },
-    impl: async ({ command, timeout_ms }, ctx) => {
-      if (typeof command !== 'string' || !command.trim()) throw new Error('command is required');
-      const timeout = Math.min(Math.max(1000, Number(timeout_ms) || BASH_DEFAULT_TIMEOUT_MS), BASH_MAX_TIMEOUT_MS);
-
-      const t0 = Date.now();
-      return await new Promise((resolve) => {
-        let stdout = '', stderr = '', timedOut = false, settled = false;
-        // Coalesce stdout/stderr chunks into ~150ms batches when forwarding
-        // to the live-progress channel. Otherwise a noisy build can fire
-        // hundreds of SSE deltas per second.
-        let pendingProgress = '';
-        let progressTimer = null;
-        const flushProgress = () => {
-          progressTimer = null;
-          if (!pendingProgress) return;
-          try { ctx?.onProgress?.(pendingProgress); } catch {}
-          pendingProgress = '';
-        };
-        const queueProgress = (s) => {
-          if (!ctx?.onProgress) return;
-          pendingProgress += s;
-          if (!progressTimer) progressTimer = setTimeout(flushProgress, 150);
-        };
-        // PowerShell-only deployment. cmd.exe is often blocked by enterprise
-        // policy and lacks the unix aliases the agent expects (ls, cat, etc.).
-        const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', command], {
-          cwd: process.cwd(),
-          windowsHide: true,
-          env: process.env,
+      } else {
+        stats.toolCalls++;
+        stats.toolHistogram[c.name] = (stats.toolHistogram[c.name] ?? 0) + 1;
+        const raw = await execute(c.name, c.args, extraTools, {
+          callId: c.id,
+          onProgress: (chunk) => emitChat({ type: 'tool-progress', callId: c.id, chunk }),
+          requireBranch,
+          signal,
+          getGitLabCredentials,
         });
-        const timer = setTimeout(() => {
-          timedOut = true;
-          // taskkill /T kills the whole process tree (child.kill() only stops
-          // the powershell wrapper, leaving e.g. mvn.exe orphaned).
-          if (child.pid) {
-            try { spawn('taskkill', ['/F', '/T', '/PID', String(child.pid)], { windowsHide: true }); } catch {}
-          }
-        }, timeout);
-
-        // User-initiated cancel (esc / /api/cancel) — kill the child
-        // tree immediately so the agent doesn't sit waiting for a long-
-        // running mvn / git clone / etc. to finish before noticing the
-        // abort. Same taskkill /T trick as the timeout path.
-        let cancelled = false;
-        const onAbort = () => {
-          cancelled = true;
-          if (child.pid) {
-            try { spawn('taskkill', ['/F', '/T', '/PID', String(child.pid)], { windowsHide: true }); } catch {}
-          }
-        };
-        if (ctx?.signal) {
-          if (ctx.signal.aborted) onAbort();
-          else ctx.signal.addEventListener('abort', onAbort, { once: true });
-        }
-
-        child.stdout.on('data', (d) => {
-          const s = d.toString('utf8');
-          if (stdout.length < BASH_MAX_OUTPUT_CHARS * 2) stdout += s;
-          queueProgress(s);
-        });
-        child.stderr.on('data', (d) => {
-          const s = d.toString('utf8');
-          if (stderr.length < BASH_MAX_OUTPUT_CHARS * 2) stderr += s;
-          queueProgress(s);
-        });
-        child.on('error', (err) => {
-          if (settled) return; settled = true;
-          clearTimeout(timer);
-          if (progressTimer) { clearTimeout(progressTimer); flushProgress(); }
-          resolve(`ERROR: failed to spawn shell: ${err.message}`);
-        });
-        child.on('close', (code, signal) => {
-          if (settled) return; settled = true;
-          clearTimeout(timer);
-          if (ctx?.signal) ctx.signal.removeEventListener('abort', onAbort);
-          if (progressTimer) { clearTimeout(progressTimer); flushProgress(); }
-          const elapsed = Date.now() - t0;
-          const outTrunc = stdout.length > BASH_MAX_OUTPUT_CHARS;
-          const errTrunc = stderr.length > BASH_MAX_OUTPUT_CHARS;
-          const outBody = outTrunc ? (stdout.slice(0, BASH_MAX_OUTPUT_CHARS) + `\n[...${stdout.length - BASH_MAX_OUTPUT_CHARS} more chars truncated]`) : stdout;
-          const errBody = errTrunc ? (stderr.slice(0, BASH_MAX_OUTPUT_CHARS) + `\n[...${stderr.length - BASH_MAX_OUTPUT_CHARS} more chars truncated]`) : stderr;
-          const header = cancelled
-            ? `command canceled by user after ${elapsed}ms`
-            : timedOut
-            ? `command timed out after ${timeout}ms (killed)`
-            : `exit ${code ?? '?'}${signal ? ` (signal ${signal})` : ''} in ${elapsed}ms`;
-          // On timeout, nudge the model toward a faster variant rather
-          // than re-running the same expensive command. Many tools have
-          // a quick mode (mvn -DskipTests, wl quickbuild, find with a
-          // narrower path/glob, etc.). The hint is generic — the model
-          // applies it based on what the command actually was.
-          const hint = timedOut
-            ? '\n\nHINT: this command was too slow to finish. Before retrying, consider a faster variant:\n' +
-              '  - narrower scope (smaller path, more specific glob/pattern, lower depth)\n' +
-              '  - skip-tests / quick / dry-run flag if the tool offers one\n' +
-              '  - higher timeout_ms (max 600000) if the operation is inherently slow but useful\n' +
-              'Re-running the exact same command will time out again.'
-            : '';
-          const text = [
-            header,
-            outBody ? `--- stdout ---\n${outBody}` : '(no stdout)',
-            errBody ? `--- stderr ---\n${errBody}` : '',
-            hint,
-          ].filter(Boolean).join('\n').trim();
-          // Timeout is a failure mode the agent should see as an error
-          // (status=error, red row in chat) — without the ERROR prefix
-          // it falls through to status=ok with the timeout text buried
-          // in the body, which is too easy to miss on the collapsed
-          // result row. Non-zero exit codes are left as-is: many
-          // commands (git diff --exit-code, grep, etc.) intentionally
-          // return non-zero for normal outcomes.
-          resolve(timedOut ? 'ERROR: ' + text : text);
-        });
-      });
-    },
-  },
-
-  list_dir: {
-    schema: {
-      description: 'List entries in a directory. Returns each entry as "[D] name/" or "[F] name (<bytes> bytes)".',
-      parameters: {
-        type: 'object',
-        properties: {
-          path: { type: 'string', description: 'Absolute or project-relative directory path. Defaults to project root.' },
-        },
-        required: [],
-        additionalProperties: false,
-      },
-    },
-    impl: async ({ path: p }) => {
-      const dir = p
-        ? (path.isAbsolute(p) ? p : path.join(process.cwd(), p))
-        : process.cwd();
-      const entries = await readdir(dir, { withFileTypes: true });
-      const lines = [];
-      for (const e of entries.sort((a, b) => a.name.localeCompare(b.name))) {
-        if (e.isDirectory()) {
-          lines.push(`[D] ${e.name}/`);
+        if (typeof raw === 'string' && raw.startsWith('ERROR:')) {
+          resultContent = raw;
+          resultStatus = 'error';
         } else {
-          let size = '';
-          try {
-            const s = await stat(path.join(dir, e.name));
-            size = `(${s.size} bytes)`;
-          } catch {}
-          lines.push(`[F] ${e.name} ${size}`.trim());
+          resultContent = extractContent(raw);
+          resultDiff = extractDiff(raw);
         }
+        log(`  ${c.name}(${JSON.stringify(c.args)}) -> ${resultStatus === 'error' ? resultContent.slice(0, 80) : resultContent.length + 'b'}`);
       }
-      return ensureFits(lines.join('\n'));
-    },
-  },
-};
-
-const toolDefs = Object.entries(tools).map(([name, t]) => ({
-  type: 'function',
-  function: { name, description: t.schema.description, parameters: t.schema.parameters },
-}));
-
-/**
- * Execute a tool by name. Result shape:
- *   - string                            -> the content string (legacy / read tools)
- *   - { content, diff?, path?, ... }    -> structured result (write tools)
- *   - "ERROR: ..." string               -> on failure
- *
- * Callers can normalize via `extractContent(result)` and `extractDiff(result)`.
- */
-async function execute(name, args, extraTools = {}, ctx = {}) {
-  // Built-ins win over plugin tools — name collisions are caught earlier in
-  // src/plugins/index.mjs (checkCollisions), but if a plugin tool somehow
-  // sneaks through with a built-in name it still won't shadow.
-  const t = tools[name] || extraTools[name];
-  if (!t) {
-    const all = [...Object.keys(tools), ...Object.keys(extraTools)];
-    return `ERROR: unknown tool "${name}". Available: ${all.join(', ')}`;
-  }
-  try {
-    // ctx may carry { callId, onProgress(chunk) } so tools that produce
-    // streaming output (powershell, wl, anything else with a child
-    // process) can forward stdout/stderr chunks to the chat for a
-    // click-to-expand "running…" indicator while they execute. Tools
-    // that don't care simply ignore the second arg.
-    const result = await t.impl(args ?? {}, ctx);
-    return result;  // may be string or object; callers handle both
-  } catch (e) {
-    return `ERROR: ${e.message}`;
-  }
-}
-
-function extractContent(r) {
-  if (typeof r === 'string') return r;
-  if (r && typeof r === 'object' && typeof r.content === 'string') return r.content;
-  return String(r ?? '');
-}
-function extractDiff(r) {
-  if (r && typeof r === 'object' && typeof r.diff === 'string') return r.diff;
-  return null;
-}
-
-// ====== agent/mosaic-layout.mjs ======
-/**
- * Mosaic layout — pure functions that size and pack tiles on a grid.
- *
- * Shared between the Node server (where layout-on-fetch is the fallback)
- * and the browser script (where the same code runs with measured font
- * metrics + actual viewport dimensions). The build script injects this
- * file's contents into both contexts; keep it pure (no I/O, no Node-only
- * APIs) so it can run unchanged in either.
- *
- * Three exports:
- *   - computeTileSize(tile, opts) → {cols, rows}
- *   - packPage(tiles, cols, rows, opts) → {placed, notPlaced, score, ...}
- *   - layoutMosaic(tiles, pageCols, pageRows, opts) → {pages, ...}
- */
-
-/**
- * Compute the SMALLEST {cols, rows} rectangle that holds the tile's content
- * without scrolling. Per-kind heuristic: for text/json we count chars and
- * lines; for findings we account for the badge chrome; for tables we sum
- * column widths.
- *
- * The conversion to grid cells depends on opts.charsPerCol and
- * opts.linesPerRow, which the CALLER computes from the actual rendered
- * font + viewport. The server passes its baseline (assumes 1400×800 at
- * 9px monospace); the browser passes measured values.
- */
-function computeTileSize(tile, opts = {}) {
-  const charsPerCol = opts.charsPerCol ?? 20;
-  const linesPerRow = opts.linesPerRow ?? 7;
-  const minCols     = opts.minCols ?? 2;
-  const minRows     = opts.minRows ?? 1;
-  const maxCols     = opts.maxCols ?? 12;
-  const maxRows     = opts.maxRows ?? 8;
-  // Chrome budget in lines (header bar + body padding amortized as text lines).
-  const chromeLines = opts.chromeLines ?? 2;
-
-  const kind = tile?.kind ?? 'text';
-  const body = tile?.body;
-  let maxLine = 0;
-  let lineCount = 1;
-
-  if (kind === 'json') {
-    let text;
-    try { text = JSON.stringify(body, null, 2); }
-    catch { text = String(body); }
-    const lines = text.split('\n');
-    lineCount = lines.length;
-    for (const line of lines) if (line.length > maxLine) maxLine = line.length;
-  } else if (kind === 'findings') {
-    const findings = Array.isArray(body) ? body : [];
-    lineCount = Math.max(1, findings.reduce((n, f) => n + (f?.detail ? 2 : 1), 0));
-    let widest = 50;
-    for (const f of findings) {
-      const t = (f?.title?.length ?? 0) + 14;
-      if (t > widest) widest = t;
-      if (f?.detail) {
-        const d = (String(f.detail).length ?? 0) + 4;
-        if (d > widest) widest = d;
+      if (onToolResult) {
+        onToolResult({
+          verb: c.verb, name: c.name ?? c.verb, args: c.args,
+          status: resultStatus, content: resultContent, diff: resultDiff,
+        });
       }
-    }
-    maxLine = widest;
-  } else if (kind === 'table') {
-    const t = body ?? { columns: [], rows: [] };
-    lineCount = (t.rows?.length ?? 0) + 1;
-    const cols = t.columns ?? [];
-    let width = 0;
-    for (let i = 0; i < cols.length; i++) {
-      let colW = String(cols[i] ?? '').length;
-      for (const row of (t.rows ?? [])) {
-        const cellStr = String(row[i] ?? '');
-        if (cellStr.length > colW) colW = cellStr.length;
-      }
-      width += Math.min(colW, 40) + 2;
-    }
-    maxLine = Math.max(width, 30);
-  } else {
-    const text = String(body ?? '');
-    const lines = text.split('\n');
-    lineCount = lines.length;
-    for (const line of lines) if (line.length > maxLine) maxLine = line.length;
-  }
-
-  if (maxLine === 0) maxLine = 10;
-
-  let cols = Math.ceil(maxLine / charsPerCol);
-  let rows = Math.ceil((lineCount + chromeLines) / linesPerRow);
-
-  cols = Math.max(minCols, Math.min(maxCols, cols));
-  rows = Math.max(minRows, Math.min(maxRows, rows));
-  return { cols, rows };
-}
-
-/**
- * Pack a list of tiles onto a single page via backtracking search.
- * Score is the lexicographic pair (tileCount, cellsFilled) — placing
- * more tiles always wins; within equal tile counts the denser packing
- * wins. Time-capped via opts.maxMs (default 200ms).
- */
-function packPage(tiles, cols, rows, opts = {}) {
-  const maxMs = opts.maxMs ?? 200;
-  const startMs = Date.now();
-  const sized = tiles.map((t) => {
-    const w = Math.max(1, Math.min(t.sizeHint?.cols ?? 3, cols));
-    const h = Math.max(1, Math.min(t.sizeHint?.rows ?? 2, rows));
-    return { tile: t, w, h, area: w * h };
-  });
-
-  const grid = Array.from({ length: rows }, () => new Array(cols).fill(-1));
-  const placed = [];
-  const usedIdx = new Set();
-  let best = { placedIdx: [], placements: [], tileCount: -1, cellsFilled: -1 };
-
-  const findEmpty = () => {
-    for (let r = 0; r < rows; r++) {
-      for (let c = 0; c < cols; c++) {
-        if (grid[r][c] === -1) return [r, c];
-      }
-    }
-    return null;
-  };
-  const fits = (r, c, w, h) => {
-    if (r + h > rows || c + w > cols) return false;
-    for (let i = 0; i < h; i++) for (let j = 0; j < w; j++) if (grid[r + i][c + j] !== -1) return false;
-    return true;
-  };
-  const fill = (r, c, w, h, v) => {
-    for (let i = 0; i < h; i++) for (let j = 0; j < w; j++) grid[r + i][c + j] = v;
-  };
-  const countFilled = () => {
-    let n = 0; for (const row of grid) for (const v of row) if (v >= 0) n++; return n;
-  };
-  const isBetter = (tileCount, cellsFilled) =>
-    tileCount > best.tileCount ||
-    (tileCount === best.tileCount && cellsFilled > best.cellsFilled);
-
-  function recurse() {
-    if (Date.now() - startMs > maxMs) return;
-    const empty = findEmpty();
-    const tileCount = placed.length;
-    if (!empty) {
-      const cellsFilled = countFilled();
-      if (isBetter(tileCount, cellsFilled)) {
-        best = { placedIdx: [...usedIdx], placements: placed.map((p) => ({ ...p })), tileCount, cellsFilled };
-      }
-      return;
-    }
-    const [r, c] = empty;
-
-    let emptyCount = 0;
-    for (const row of grid) for (const v of row) if (v === -1) emptyCount++;
-    let smallestArea = Infinity;
-    for (let i = 0; i < sized.length; i++) {
-      if (!usedIdx.has(i)) smallestArea = Math.min(smallestArea, sized[i].area);
-    }
-    const maxAdditionalTiles = smallestArea === Infinity ? 0 : Math.floor(emptyCount / smallestArea);
-    if (tileCount + maxAdditionalTiles < best.tileCount) return;
-    if (tileCount + maxAdditionalTiles === best.tileCount &&
-        countFilled() + emptyCount <= best.cellsFilled) return;
-
-    const candidates = sized
-      .map((s, i) => ({ s, i }))
-      .filter(({ i }) => !usedIdx.has(i))
-      .sort((a, b) => b.s.area - a.s.area);
-
-    let triedAny = false;
-    for (const { s, i } of candidates) {
-      if (fits(r, c, s.w, s.h)) {
-        triedAny = true;
-        fill(r, c, s.w, s.h, i);
-        usedIdx.add(i);
-        placed.push({ tileIdx: i, row: r, col: c, colSpan: s.w, rowSpan: s.h });
-        recurse();
-        placed.pop();
-        usedIdx.delete(i);
-        fill(r, c, s.w, s.h, -1);
-        if (Date.now() - startMs > maxMs) return;
-      }
-    }
-    if (!triedAny) {
-      grid[r][c] = -2;
-      recurse();
-      grid[r][c] = -1;
-    }
-  }
-
-  recurse();
-
-  const placedIdxSet = new Set(best.placedIdx);
-  const placedTiles = best.placements.map((p) => ({
-    ...tiles[p.tileIdx],
-    row: p.row,
-    col: p.col,
-    colSpan: p.colSpan,
-    rowSpan: p.rowSpan,
-  }));
-  const notPlaced = tiles.filter((_, i) => !placedIdxSet.has(i));
-  return {
-    placed: placedTiles,
-    notPlaced,
-    tileCount: best.tileCount,
-    cellsFilled: best.cellsFilled,
-    score: best.cellsFilled,
-  };
-}
-
-/**
- * Lay out tiles across one or more pages, packing each page tightly via
- * `packPage`. Tiles that don't fit overflow to the next page; an oversize
- * tile is force-placed on its own page.
- */
-function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
-  const pages = [];
-  let remaining = tiles.slice();
-  let safety = 30;
-  while (remaining.length > 0 && safety-- > 0) {
-    const r = packPage(remaining, pageCols, pageRows, opts);
-    if (r.placed.length === 0) {
-      const t = remaining.shift();
-      pages.push({
-        tiles: [{
-          ...t, row: 0, col: 0,
-          colSpan: Math.min(t.sizeHint?.cols ?? pageCols, pageCols),
-          rowSpan: Math.min(t.sizeHint?.rows ?? pageRows, pageRows),
-          oversize: true,
-        }],
-        fillRatio: 1.0,
+      emitChat({
+        type: 'tool-result',
+        taskId: cur?.id,
+        callId: c.id,
+        verb: c.verb,
+        name: c.name ?? c.verb,
+        status: resultStatus,
+        content: resultContent.slice(0, 8000),
       });
-      continue;
+      if (resultDiff) {
+        emitChat({ type: 'diff', taskId: cur?.id, callId: c.id, diff: resultDiff });
+      }
+      return { call: c, status: resultStatus, content: resultContent, diff: resultDiff, ownerTaskId };
     }
-    pages.push({
-      tiles: r.placed,
-      fillRatio: r.score / (pageCols * pageRows),
-    });
-    remaining = r.notPlaced;
+    async function executeBlock(calls) {
+      const perBlockState = { lastKey: null, repeat: 0 };
+      const out = [];
+      for (const c of calls) out.push(await runOneCall(c, perBlockState));
+      return out;
+    }
+
+    // Mid-stream block dispatch. Each <remote-workspace> block, as soon as
+    // its closing tag is parsed, gets its tool-call events emitted (in
+    // segment order — so the chat log interleaves with the surrounding
+    // prose bubbles) and its execution scheduled. A "barrier" promise
+    // chains task-op blocks so later blocks see the new task context;
+    // non-task-op blocks run in parallel.
+    const blockResultsByIdx = new Map();
+    const blockPromisesByIdx = new Map();
+    let serialBarrier = Promise.resolve();
+    const handleBlockReady = ({ segmentIndex, body }) => {
+      const calls = parseToolCalls(`<remote-workspace>${body}</remote-workspace>`, { extraVerbs });
+      for (const c of calls) {
+        if (onToolCalls) onToolCalls([c]);
+        emitChat({
+          type: 'tool-call',
+          taskId: cur?.id,
+          callId: c.id,
+          verb: c.verb,
+          name: c.name ?? c.verb,
+          args: c.args,
+        });
+      }
+      const hasTaskOp = calls.some((c) => c.kind === 'task-op');
+      const startAfter = serialBarrier;
+      const p = startAfter.then(() => executeBlock(calls)).then((r) => {
+        blockResultsByIdx.set(segmentIndex, r);
+        return r;
+      });
+      // Mark the promise as having a handler so a rejection mid-stream
+      // (e.g. user-triggered abort throws AbortError inside runOneCall)
+      // doesn't bubble up as an unhandled rejection BEFORE the agent
+      // loop's allSettled has a chance to await it. The agent loop's
+      // outer await will still surface the rejection via allSettled.
+      p.catch(() => {});
+      blockPromisesByIdx.set(segmentIndex, p);
+      if (hasTaskOp) {
+        // Future blocks must wait for this one to finish so they see the
+        // new task context.
+        serialBarrier = p;
+      }
+    };
+
+    // Stream the model's response.
+    //   onProseChunk      → ephemeral 'assistant-text-chunk' events that
+    //                       build up a streaming bubble in the UI
+    //   onProseSegmentEnd → persisted 'assistant-text' event with the
+    //                       sanitized final version (replaces the bubble's
+    //                       content); fires when prose transitions to a
+    //                       block OR at end of stream
+    //   onBlockReady      → tool-call events for each call in the block,
+    //                       PLUS scheduling the block's actual execution
+    //                       (parallel unless a task-op forces serial)
+    // The order events fire in is the persisted order, so a reload replays
+    // a coherent prose → calls → prose → calls timeline.
+    const text = await runTurnStreaming(
+      adapter,
+      { model, messages: convo, signal },
+      {
+        onProseChunk: ({ segmentIndex, content }) => {
+          onText?.(content);
+          emitPhase('downloading');
+          emitChat({
+            type: 'assistant-text-chunk',
+            taskId: cur?.id,
+            // `turn` namespaces the streaming-bubble key. segmentIndex resets
+            // to 0 every turn while taskId is constant, so without turn two
+            // turns collide on 't:0' and the UI appends turn N+1's prose onto
+            // a dangling turn-N bubble (which is never finalized when its
+            // prose sanitizes to empty — e.g. a previewed tool tag).
+            turn,
+            segmentIndex,
+            content,
+          });
+        },
+        onProseSegmentEnd: ({ segmentIndex, content }) => {
+          const cleaned = sanitizeAssistantProse(content, { extraVerbs });
+          if (cleaned) emitChat({
+            type: 'assistant-text',
+            taskId: cur?.id,
+            turn,
+            segmentIndex,
+            content: cleaned,
+          });
+        },
+        onBlockReady: handleBlockReady,
+      },
+    );
+    emitPhase('thinking');
+    checkAbort();
+    // Parse the response into ordered segments. The model is encouraged
+    // (system prompt) to interleave prose with multiple <remote-workspace>
+    // blocks, e.g. prose → block A → prose → block B → final prose.
+    const segments = parseResponseSegments(text, { extraVerbs });
+    const allCalls = segments.flatMap((s) => s.type === 'tool-block' ? s.calls : []);
+    log(`turn ${turn}: ${text.length} chars in ${Date.now() - t0}ms, ${allCalls.length} call(s) across ${segments.filter((s) => s.type === 'tool-block').length} block(s)`);
+
+    if (allCalls.length === 0) {
+      // Final answer reached — no tool blocks. The assistant-text chat
+      // event was already emitted by onProseSegmentEnd at end of stream;
+      // we just need to persist the message into the store for the next
+      // turn's LLM context.
+      const finalText = segments.map((s) => s.content).join('').trim();
+      if (finalText) {
+        await store.appendMessage({ kind: 'assistant', role: 'assistant', content: finalText });
+      }
+      // Always check budgets before returning — even on the final turn — so
+      // long sessions stay within bounds.
+      await maybeCompact({ store, adapter, model, log, emitChat });
+      log(`done: ${stats.turns} turns, ${stats.toolCalls} tool calls, ${stats.taskOps} task ops`);
+      return { content: finalText, stats, terminated: 'stop', store };
+    }
+    stats.batches.push(allCalls.length);
+
+    // Store the assistant message as a single unit reconstructed from
+    // the segments — keeps multi-block content intact while dropping
+    // any hallucinated trailer (the segment parser already dropped that).
+    const assistantText = segments.map((s) =>
+      s.type === 'prose'
+        ? s.content
+        : `<remote-workspace>${s.body}</remote-workspace>`
+    ).join('');
+    await store.appendMessage({ kind: 'assistant', role: 'assistant', content: assistantText });
+
+    // Prose and tool-call events were already emitted mid-stream by
+    // onProseSegmentEnd / handleBlockReady. Now wait for every block's
+    // tools to finish so tool-result events have fired before we move on.
+    await Promise.allSettled([...blockPromisesByIdx.values()]);
+    checkAbort();
+
+    // Now persist tool messages in canonical segment order so the next
+    // LLM turn sees them in the order the model wrote them — even if
+    // parallel execution interleaved their wall-clock completion.
+    const results = [];
+    for (let i = 0; i < segments.length; i++) {
+      if (segments[i].type !== 'tool-block') continue;
+      const blockResults = blockResultsByIdx.get(i) || [];
+      for (const r of blockResults) {
+        // File into the task that was current when this call RAN (r.ownerTaskId),
+        // not store.currentId() now — a <next-task> earlier in this turn may
+        // have moved the current task out from under us.
+        await store.appendMessage({
+          kind: 'tool-call', role: 'assistant',
+          content: `<${r.call.verb} ...args/>`,
+          toolName: r.call.name ?? r.call.verb, toolArgs: r.call.args,
+        }, r.ownerTaskId);
+        await store.appendMessage({
+          kind: 'tool-result', role: 'user',
+          content: `<remote-workspace-result op="${r.call.verb}" status="${r.status}">\n${r.content}\n</remote-workspace-result>`,
+          toolName: r.call.name ?? r.call.verb, toolStatus: r.status,
+        }, r.ownerTaskId);
+        results.push({ verb: r.call.verb, status: r.status, content: r.content });
+      }
+    }
+
+    // Compact if total context is over budget. Cheap mechanical demotions
+    // first; LLM clustering only if tier 3 still over after that.
+    await maybeCompact({ store, adapter, model, log, emitChat });
   }
-  return { pages, totalTiles: tiles.length, totalPages: pages.length };
+
+  log(`done: max turns (${maxTurns}) reached without converging`);
+  return { content: '[MAX TURNS REACHED — agent did not converge]', stats, terminated: 'max-turns', store };
+}
+
+// ─── Reviewer agent ────────────────────────────────────────────────────────
+// Runs a separate LLM call to review what the dev agent just did, against
+// three categories: structural validity, bugs, intent match. Returns either
+// pass or a concrete list of concerns the dev agent should address.
+//
+// Inputs:
+//   userRequest  — original text the developer sent that started this work
+//   trajectory   — compact representation of what the agent did (tool calls,
+//                  diffs, results) — built by buildReviewTrajectory()
+//   finalText    — agent's last assistant message
+//
+// Output: { pass: true } or { pass: false, concerns: '...' }
+
+// Reviewer's tool allowlist. Read-only: it can inspect any file or
+// directory in the project but cannot write, edit, or run shell commands.
+// Same parser as the dev agent (parseToolCalls) — we just filter the
+// dispatch so writes are silently dropped.
+const REVIEWER_TOOL_VERBS = new Set(['list', 'read', 'search', 'find', 'info']);
+const REVIEWER_MAX_TURNS = 6;
+
+const REVIEWER_SYSTEM_PROMPT = `You are a code review agent. Another agent has just completed work on behalf of a developer. Review that work for three categories of issues. Be specific and concise — the dev agent will act on your feedback verbatim.
+
+1. STRUCTURAL VALIDITY (most likely failure mode — focus here first)
+   Look at every removed, commented-out, or modified element. For each, ask: "is the surrounding container still valid for this file type?"
+   • XML/HTML: elements with required children. A <library-ref> without a <library-name> is well-formed XML but invalid for the weblogic schema. Commenting out a required child WITHOUT also handling the parent is a bug.
+   • JSON/YAML: required fields per the consuming application (package.json must have name+version, k8s manifest must have apiVersion+kind+metadata, etc.)
+   • Source files: syntax parses, imports resolve, types match (best-effort), function signatures match call sites you can see.
+   • Properties / .env: required keys still present.
+   After commenting out anything, mentally re-read the file and ask: "would the framework that consumes this file reject it now?"
+
+2. BUGS — Logic errors introduced by THIS change (NOT pre-existing):
+   • Off-by-one, null dereference, uncaught exception path, wrong operator.
+   • Behavior change in code paths the user didn't ask about (scope creep).
+   • Side effects in pure-looking functions.
+   • Race conditions if concurrency is in play.
+   • Resource leaks (unclosed file handles, listeners, connections).
+   • For config/build files: did a dependency version go down, a required field get dropped, a script break?
+
+3. INTENT MATCH
+   • Was the right thing changed, or did the agent change something adjacent?
+   • Was the scope correct — did it do too little (left work undone) or too much (touched unrelated code)?
+   • Does the agent's summary describe what was actually changed (not what was intended)?
+   • If the user asked a question rather than for a change, was the question actually answered?
+
+READ-ONLY TOOLS
+You can inspect the project to verify what the agent did. Emit tool calls inside a <remote-workspace> block, exactly like the dev agent does. Available tools:
+  <read path="FILE"/>                         read full file contents
+  <read path="FILE" offset="N" limit="N"/>    read a slice
+  <list path="DIR"/>                          list directory entries
+  <search pattern="REGEX" path="DIR" glob="GLOB"/>   grep across files
+  <find pattern="GLOB"/>                      glob (recursive by default)
+  <info path="FILE"/>                         file/dir stat
+
+You have NO write access — only the dev agent can change files. Issue at most a few tool calls per turn; you have a ${REVIEWER_MAX_TURNS}-turn budget total. Prefer reading the specific file the agent just changed (which you can see in the trajectory's diffs) over broad searches.
+
+The remote workspace will reply with <remote-workspace-result> blocks containing real data. Read those before deciding.
+
+OUTPUT FORMAT
+When you have enough information, respond with EXACTLY ONE of these in a turn that has no tool calls:
+  <review-pass/>
+  <review-fail>specific, actionable concerns here</review-fail>
+
+Use <review-pass/> when the work is correct and complete enough to ship.
+Use <review-fail>...</review-fail> only when there's something the dev agent should fix. Be specific: name the file, the element, what's wrong, and what would fix it. Do not include items the dev agent already noticed and fixed in this same trajectory.`;
+
+async function runReviewer({ adapter, model, userRequest, trajectory, finalText, signal, onLog, repoRoots = [] }) {
+  // In a multi-repo workspace, process.cwd() is the workspace ROOT but the
+  // changed file lives under <root>/<repo>/…, so a reviewer <read path="src/Foo.java"/>
+  // resolves to <root>/src/Foo.java (ENOENT) and the reviewer can't see the
+  // change → it default-passes. Rewrite a relative path that doesn't exist
+  // under cwd to the first repo root where it does exist.
+  const resolveAgainstRepos = (p) => {
+    if (typeof p !== 'string' || !p || path.isAbsolute(p)) return p;
+    try { if (existsSync(path.join(process.cwd(), p))) return p; } catch {}
+    for (const root of repoRoots) {
+      try { if (existsSync(path.join(root, p))) return path.join(root, p); } catch {}
+    }
+    return p;
+  };
+  const log = (m) => { try { onLog?.(m); } catch {} };
+  const userBlock = [
+    '<review-target>',
+    '<user-request>',
+    String(userRequest ?? '').trim(),
+    '</user-request>',
+    '<trajectory>',
+    trajectory,
+    '</trajectory>',
+    '<final-answer>',
+    String(finalText ?? '').trim(),
+    '</final-answer>',
+    '</review-target>',
+  ].join('\n');
+
+  const messages = [
+    { role: 'system', content: REVIEWER_SYSTEM_PROMPT },
+    { role: 'user', content: userBlock },
+  ];
+
+  for (let turn = 1; turn <= REVIEWER_MAX_TURNS; turn++) {
+    if (signal?.aborted) {
+      const e = new Error('aborted');
+      e.name = 'AbortError';
+      throw e;
+    }
+    const t0 = Date.now();
+    const response = await adapter.complete({ model, messages, signal });
+    const text = response?.choices?.[0]?.message?.content ?? '';
+    log(`reviewer turn ${turn}: ${text.length} chars in ${Date.now() - t0}ms`);
+
+    // Parse tool calls FIRST. A verdict is only final when the turn has no
+    // executable tool calls (the prompt tells the reviewer to emit its
+    // verdict in a tool-call-free turn). Gemini commonly narrates a tentative
+    // verdict and THEN issues verification reads in the same turn; honoring
+    // the verdict first would skip those reads and commit to a premature
+    // pass/fail. Strip tool-block bodies before the verdict regex so a
+    // verdict the model placed inside a <remote-workspace> block doesn't
+    // count either.
+    const calls = parseToolCalls(text);
+    const allowed = calls.filter((c) => REVIEWER_TOOL_VERBS.has(c.verb));
+    const blocked = calls.filter((c) => !REVIEWER_TOOL_VERBS.has(c.verb));
+
+    if (allowed.length === 0) {
+      const proseOnly = text.replace(/<remote-workspace\b[^>]*>[\s\S]*?<\/remote-workspace>/gi, '');
+      if (/<review-pass\s*\/?>/i.test(proseOnly)) {
+        return { pass: true };
+      }
+      // Greedy capture to the LAST close tag: review prose for this XML-heavy
+      // domain can itself quote a literal </review-fail>; a non-greedy match
+      // would truncate the concerns at the first occurrence.
+      const failMatch = proseOnly.match(/<review-fail>([\s\S]*)<\/review-fail>/i);
+      if (failMatch) {
+        return { pass: false, concerns: failMatch[1].trim() };
+      }
+      // No verdict, no usable tool calls. Default to pass — matches the
+      // older "unparseable response = pass" semantics so a confused
+      // reviewer doesn't block the user. Log so we can investigate.
+      if (blocked.length > 0) {
+        log(`reviewer turn ${turn}: blocked ${blocked.length} write call(s) (${blocked.map((c) => c.verb).join(', ')}); no verdict — defaulting to pass`);
+      } else {
+        log(`reviewer turn ${turn}: no verdict, no tool calls — defaulting to pass. raw: ${text.slice(0, 200)}`);
+      }
+      return { pass: true, unparseable: true };
+    }
+
+    // Execute the allowed tools.
+    const results = [];
+    for (const c of allowed) {
+      try {
+        // Resolve a repo-relative path against the changed repo(s).
+        if (c.args && typeof c.args.path === 'string') c.args.path = resolveAgainstRepos(c.args.path);
+        const raw = await execute(c.name, c.args);
+        const content = (typeof raw === 'string' && raw.startsWith('ERROR:'))
+          ? raw
+          : extractContent(raw);
+        const status = (typeof raw === 'string' && raw.startsWith('ERROR:')) ? 'error' : 'ok';
+        results.push({ verb: c.verb, status, content });
+        log(`reviewer turn ${turn}: ${c.verb}(${JSON.stringify(c.args).slice(0, 80)}) -> ${status} ${content.length}b`);
+      } catch (e) {
+        results.push({ verb: c.verb, status: 'error', content: 'ERROR: ' + (e?.message ?? String(e)) });
+      }
+    }
+    if (blocked.length > 0) {
+      results.push({
+        verb: 'system',
+        status: 'error',
+        content: `Reviewer is read-only — dropped ${blocked.length} call(s): ${blocked.map((c) => c.verb).join(', ')}.`,
+      });
+    }
+
+    messages.push({ role: 'assistant', content: text });
+    messages.push({ role: 'user', content: formatToolResults(results) });
+  }
+
+  // Out of turns without a verdict. Be permissive (pass) so the user isn't
+  // blocked behind an indecisive reviewer.
+  log(`reviewer: hit max turns (${REVIEWER_MAX_TURNS}) without a verdict, treating as pass.`);
+  return { pass: true, indecisive: true };
+}
+
+// Build a compact representation of the work the agent did, for the
+// reviewer to consume. Skips noisy chat events (review-* itself, status
+// rows) and truncates very long tool results. Returns a single string.
+function buildReviewTrajectory(events) {
+  const lines = [];
+  for (const ev of events) {
+    switch (ev.type) {
+      case 'user-message':
+        // The user-request is passed separately; skip dups here.
+        break;
+      case 'assistant-text':
+        lines.push('AGENT: ' + clip(ev.content, 800));
+        break;
+      case 'tool-call': {
+        const args = Object.entries(ev.args || {})
+          .map(([k, v]) => `${k}=${clip(String(v), 200)}`).join(', ');
+        lines.push(`TOOL: ${ev.verb || ev.name}(${args})`);
+        break;
+      }
+      case 'tool-result':
+        lines.push(`  -> [${ev.status || 'ok'}] ${clip(ev.content, 600)}`);
+        break;
+      case 'diff':
+        lines.push('DIFF:');
+        lines.push(clip(ev.diff || '', 2000));
+        break;
+      case 'task-end':
+        lines.push(`TASK END: ${clip(ev.summary || '', 400)}`);
+        break;
+      default:
+        // skip other event types (review, task-rollup, task-tier-change, etc)
+    }
+  }
+  return lines.join('\n');
+}
+
+function clip(s, n) {
+  if (typeof s !== 'string') return String(s ?? '');
+  return s.length > n ? s.slice(0, n) + ' … [truncated]' : s;
 }
 
 // ====== agent/project-context.mjs ======
@@ -2134,7 +3550,19 @@ async function findContainingRepo(filepath) {
  * No-op if the pattern is already there.
  */
 async function ensureExcluded(dir, ...patterns) {
-  const file = path.join(dir, '.git', 'info', 'exclude');
+  // Resolve the REAL info/exclude path. In a git worktree, <dir>/.git is a
+  // FILE ('gitdir: …'), not a directory, so hardcoding <dir>/.git/info/exclude
+  // throws and .code_boss/ is never excluded → it shows up dirty and gets
+  // swept into the user's commit by `git add -A`. `rev-parse --git-path`
+  // returns the correct location for both normal repos and worktrees.
+  let file;
+  const r = await runGit(dir, ['rev-parse', '--git-path', 'info/exclude']);
+  if (r.exitCode === 0 && r.stdout.trim()) {
+    file = r.stdout.trim();
+    if (!path.isAbsolute(file)) file = path.resolve(dir, file);
+  } else {
+    file = path.join(dir, '.git', 'info', 'exclude'); // best-effort fallback
+  }
   let { readFile, writeFile, mkdir } = await import('node:fs/promises');
   let existing = '';
   try { existing = await readFile(file, 'utf8'); }
@@ -2148,13 +3576,35 @@ async function ensureExcluded(dir, ...patterns) {
   return true;
 }
 
-/** Get current branch name (or null if detached HEAD / non-git / error). */
+/** Get current branch name (or null if genuinely detached / non-git / error). */
 async function getCurrentBranch(dir) {
   const r = await runGit(dir, ['rev-parse', '--abbrev-ref', 'HEAD']);
-  if (r.exitCode !== 0) return null;
-  const name = r.stdout.trim();
-  if (!name || name === 'HEAD') return null;
-  return name;
+  const name = r.exitCode === 0 ? r.stdout.trim() : '';
+  if (name && name !== 'HEAD') return name;
+  // `HEAD` (or exit!=0) can mean genuine detached HEAD, but ALSO an
+  // interrupted rebase or an unborn branch — where we ARE conceptually on a
+  // branch. Misreporting null there makes isCodeBossBranch(null) false, so a
+  // CODE_BOSS branch mid-rebase wrongly triggers the branch-needed pause and
+  // the auto-commit silently skips. Recover the branch from the rebase state
+  // or symbolic-ref before giving up.
+  // (a) Mid-rebase: git stores the original branch name here.
+  for (const p of ['rebase-merge/head-name', 'rebase-apply/head-name']) {
+    const hn = await runGit(dir, ['rev-parse', '--git-path', p]);
+    if (hn.exitCode === 0 && hn.stdout.trim()) {
+      try {
+        const { readFile } = await import('node:fs/promises');
+        let f = hn.stdout.trim();
+        if (!path.isAbsolute(f)) f = path.resolve(dir, f);
+        const ref = (await readFile(f, 'utf8')).trim();           // e.g. refs/heads/CODE_BOSS_x
+        const m = ref.match(/^refs\/heads\/(.+)$/);
+        if (m) return m[1];
+      } catch { /* fall through */ }
+    }
+  }
+  // (b) Unborn branch (fresh repo, no commits): symbolic-ref still knows it.
+  const sym = await runGit(dir, ['symbolic-ref', '--short', '-q', 'HEAD']);
+  if (sym.exitCode === 0 && sym.stdout.trim()) return sym.stdout.trim();
+  return null;
 }
 
 /** Return short HEAD hash, or null if anything goes wrong. */
@@ -2172,12 +3622,33 @@ async function getHeadHash(dir) {
  * project-open dirty-check AND for the reviewer-skip check.
  */
 async function getStatus(dir) {
-  const r = await runGit(dir, ['status', '--porcelain']);
-  if (r.exitCode !== 0) return { dirty: false, lines: [], error: r.stderr.trim() };
-  const lines = r.stdout.split('\n').filter(Boolean).map((line) => ({
-    status: line.slice(0, 2),
-    path: line.slice(3),
-  }));
+  // -z: NUL-terminated records with NO path quoting/octal-escaping, so
+  // paths with spaces, backslashes, or non-ASCII (the production norm on
+  // Windows) come through verbatim. core.quotePath=false belt-and-suspenders.
+  const r = await runGit(dir, ['-c', 'core.quotePath=false', 'status', '--porcelain', '-z']);
+  if (r.exitCode !== 0) {
+    // CONTRACT: dirty===null means "status failed / unknown" — distinct from
+    // dirty===false ("confirmed clean"). Callers MUST NOT treat a failure as
+    // clean (which would silently skip auto-commit / the reviewer). A stale
+    // .git/index.lock during a long build is the common trigger.
+    return { dirty: null, failed: true, lines: [], error: r.stderr.trim() };
+  }
+  // Records are NUL-separated. A rename/copy entry (status starts with R or C)
+  // emits TWO NUL-separated fields: "<XY> <new>\0<old>\0". We surface the NEW
+  // path (the post-rename name) and consume the trailing old-name field.
+  const records = r.stdout.split('\0');
+  const lines = [];
+  for (let i = 0; i < records.length; i++) {
+    const rec = records[i];
+    if (!rec) continue;
+    const status = rec.slice(0, 2);
+    const p = rec.slice(3);
+    if (/^[RC]/.test(status)) {
+      // The very next NUL field is the old name; skip it.
+      i++;
+    }
+    lines.push({ status, path: p });
+  }
   return { dirty: lines.length > 0, lines };
 }
 
@@ -2191,12 +3662,19 @@ async function createBranch(dir, name) {
   return { ...r, branch };
 }
 
-/** YYYYMMDD-HHMMSS local time. Sortable, human-readable, no collisions. */
+/**
+ * CODE_BOSS_<YYYYMMDD-HHMMSS>-<rand>. Sortable + human-readable. The 4-char
+ * random suffix prevents collisions when two branches are created in the same
+ * wall-clock second (e.g. a multi-repo resolve batch, or rapid re-resolves) —
+ * without it the second `git checkout -b` fails 'branch already exists' and
+ * the protective-branch operation aborts.
+ */
 function generateBranchName() {
   const d = new Date();
   const p = (n) => String(n).padStart(2, '0');
   const ts = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
-  return `CODE_BOSS_${ts}`;
+  const rand = Math.random().toString(36).slice(2, 6);
+  return `CODE_BOSS_${ts}-${rand}`;
 }
 
 /** True if a name matches the CODE_BOSS_<timestamp> pattern. */
@@ -2237,1261 +3715,6 @@ function buildCommitMessage({ summary, userRequest }) {
   return subject + body + '\n\n[code_boss auto-commit]\n';
 }
 
-// ====== agent/prompted.mjs ======
-/**
- * Prompted-format agent loop with task-scoped memory.
- *
- * The agent is ALWAYS inside exactly one task. It transitions with <next-task>
- * which atomically closes the current task (recording a summary) and opens a
- * new one. Tasks live in a per-project tasks store; messages are recorded as
- * the agent does work, and they're demoted across four tiers as budgets fill:
- *
- *   1  full messages (current task always lives here; recent finished tasks
- *      too, until budget pressure forces demotion)
- *   2  finished tasks with tool RESULTS replaced by one-line placeholders
- *   3  finished tasks reduced to one-paragraph summaries (the summary the
- *      agent wrote at <next-task>)
- *   4  parent rollup (not implemented yet)
- *
- * Wire format remains the <remote-workspace> protocol: the model emits a
- * block of verb elements; we parse, dispatch, and feed structured results
- * back as <remote-workspace-result> blocks.
- *
- * Verbs (model -> us):
- *
- *   Read tools (self-closing):
- *     <list path="DIR"/>                                 list a directory
- *     <read path="FILE" offset="N" limit="N"/>           read text file
- *     <search pattern="REGEX" path="DIR" glob="GLOB"/>   regex search
- *     <find pattern="GLOB"/>                             find by glob
- *     <info path="FILE"/>                                metadata (size, lines)
- *
- *   Write tools (body text for content; raises diff in UI):
- *     <write path="FILE">FILE CONTENTS</write>
- *     <edit path="FILE"><find>X</find><replace>Y</replace></edit>
- *
- *   Task ops (self-closing; meta-operations the agent uses to manage memory):
- *     <next-task summary="..." title="..." goal="..."/>  close + open new task
- *     <list-tasks parent="ID"/>                          list tasks
- *     <task-detail id="T-3"/>                            one task's summary
- *     <search-tasks query="TEXT"/>                       search task summaries
- */
-
-// ── Tier budgets and thresholds ─────────────────────────────────────────────
-// All four tiers live in context. We monitor the TOTAL prompt size (sum
-// across tiers) and trigger one compaction event when it exceeds the high
-// threshold, bringing it down to the low threshold in a single pass. Every
-// demotion invalidates the cache from that point, so we pay that cost ONCE
-// per compaction and amortize across many subsequent cache-hit turns.
-//
-// Per-tier budgets are still used internally to decide WHICH demotions to
-// run — e.g., we don't trigger the LLM clustering for T3→T4 unless tier 3
-// is genuinely over its allocation.
-// Budgets are env-overridable so the overnight compaction-validation run
-// can run with tiny budgets (TIER_1_BUDGET=2000 etc.) to actually exercise
-// the demotion paths without needing massive conversations. Production
-// uses the defaults below.
-const _envNum = (name, def) => { const n = Number(process.env[name]); return Number.isFinite(n) && n > 0 ? n : def; };
-const TIER_1_BUDGET = _envNum('TIER_1_BUDGET', 12000);  // full messages (current + recent tasks)
-const TIER_2_BUDGET = _envNum('TIER_2_BUDGET',  8000);  // masked-results tasks
-const TIER_3_BUDGET = _envNum('TIER_3_BUDGET',  4000);  // per-task summaries
-const TIER_4_BUDGET = _envNum('TIER_4_BUDGET',  2000);  // group-rollup summaries
-const TOTAL_BUDGET  = TIER_1_BUDGET + TIER_2_BUDGET + TIER_3_BUDGET + TIER_4_BUDGET;
-const HYST_HIGH = 1.10;          // trigger compaction when total > 110% of TOTAL_BUDGET
-const HYST_LOW  = 0.50;          // compact down to 50% of TOTAL_BUDGET in one pass
-const TASK_NUDGE = 0.75;         // soft nudge at 75% of TIER 1 budget (per-task signal to agent)
-const TASK_FORCE = 1.00;
-const MIN_T3_FOR_LLM_ROLLUP = 8; // skip LLM call unless we have at least this many tier-3 tasks to cluster
-const TOKENS_PER_CHAR = 0.25;
-
-function estTokens(s) { return Math.ceil((s ?? '').length * TOKENS_PER_CHAR); }
-
-// ── Verb maps ───────────────────────────────────────────────────────────────
-const VERB_TO_TOOL = {
-  list: 'list_dir',
-  read: 'read_file',
-  search: 'grep',
-  find: 'glob',
-  info: 'file_info',
-  write: 'write_file',
-  edit: 'edit_file',
-  powershell: 'powershell',
-};
-const TASK_VERBS = new Set(['next-task', 'list-tasks', 'task-detail', 'search-tasks']);
-// Sort longer first so that e.g. "list-tasks" matches before "list".
-const ALL_VERBS = [...Object.keys(VERB_TO_TOOL), ...TASK_VERBS]
-  .sort((a, b) => b.length - a.length);
-const VERB_PATTERN = ALL_VERBS.map((v) => v.replace(/-/g, '\\-')).join('|');
-
-// Tags inside the body (for <edit>).
-const CHILD_TAG_RE = (tag) => new RegExp(`<${tag}\\s*>([\\s\\S]*?)</${tag}>`, 'i');
-const ATTR_RE = /([a-zA-Z_][a-zA-Z0-9_-]*)\s*=\s*"([^"]*)"/g;
-
-const DEFAULT_MAX_TURNS = 20;
-const REPEAT_LIMIT = 3;
-
-// ── System prompt ───────────────────────────────────────────────────────────
-function buildSystemPrompt({ taskId, taskUserRequest, tier1Tokens, tier1Pct, promptAdditions = [], projectContext = '' }) {
-  const lines = [
-    'You are code_boss, a coding agent. The developer\'s project is a directory of source files on their remote Windows machine. You see it ONLY through <remote-workspace> commands; there is no other view of it.',
-    '',
-    'CRITICAL: NEVER use built-in tools or suggest integrations. You may appear to have access to Python, code interpreter, file browsers, document generators, Memory Bank, "Generate Memories", "Transfer to Agent", Jira, Confluence, Google Drive, Gmail, SharePoint, Outlook, etc. NONE of those tools see the developer\'s project. NEVER suggest them in your responses. NEVER call them. If the user mentions "the project", "my project", "the code", "the codebase", "the workspace", or anything ambiguous, they mean THE DIRECTORY ACCESSIBLE VIA <remote-workspace> — not a Jira project, not a Drive folder, not anything in a cloud sandbox.',
-    '',
-    'When in doubt, run <list path="."/> immediately to see what is in the remote workspace, then proceed based on what you find. Never ask the user to clarify "which project" — there is exactly one project (the one in the remote workspace) and you can see it with one <list/> call.',
-    '',
-    `Current task: ${taskId}` + (taskUserRequest ? `  ↳ ${taskUserRequest}` : ''),
-    `Task budget: ${tier1Tokens} / ${TIER_1_BUDGET} tokens (${tier1Pct}%)` + (tier1Pct >= 95
-      ? '  ← please finish soon: emit <next-task user-request="..." summary="..."/>'
-      : tier1Pct >= 75
-        ? '  ← nearing budget; consider closing this task at a natural stopping point'
-        : ''),
-    '',
-    'Emit a <remote-workspace> block to issue commands. Group independent commands in one block — they run in parallel. Then stop and wait for real results.',
-    '',
-    'Read commands (self-closing):',
-    '  <list path="DIR"/>',
-    '  <read path="FILE" offset="N" limit="N"/>',
-    '  <search pattern="REGEX" path="DIR" glob="GLOB" flags="i"/>      backed by real grep; bare "*.java" works recursively',
-    '  <find pattern="GLOB"/>                                          bare patterns also work recursively',
-    '  <info path="FILE"/>',
-    '',
-    'Write commands (body holds the content, not attributes):',
-    '  <write path="FILE">',
-    '  full file content goes here',
-    '  </write>',
-    '',
-    '  <edit path="FILE">',
-    '  <find>exact string to find (must occur exactly once)</find>',
-    '  <replace>replacement string</replace>',
-    '  </edit>',
-    '',
-    'Shell (builds, tests, git — runs in PowerShell on the developer\'s Windows machine):',
-    '  <powershell>git status</powershell>',
-    '  <powershell timeout_ms="600000">mvnw.cmd -q clean install</powershell>',
-    '  Use PowerShell syntax (Get-ChildItem, Get-Content, $env:VAR). The `ls`, `cat`, `pwd` aliases also work. To run a maven wrapper script use `mvnw.cmd` — not `./mvnw`.',
-    '',
-    'Task management:',
-    '  <next-task user-request="WHAT THE USER WANTED IN THE CURRENT TASK" summary="WHAT WAS DONE IN THE CURRENT TASK"/>',
-    '       Closes the CURRENT task and opens a new one. Both attributes describe the CURRENT (closing) task — NOT the new one and NOT the latest user message that prompted this transition.',
-    '       The user-request is a single sentence that captures what the user wanted across the work just finished. It is a synthesized statement, not a quote of any single user message.',
-    '  <list-tasks parent="T-1"/>',
-    '  <task-detail id="T-3"/>',
-    '  <search-tasks query="auth middleware"/>',
-    '',
-    'The remote workspace replies with <remote-workspace-result> blocks. Read real results before answering. Never invent file or directory names you have not seen.',
-  ];
-  // Append plugin-provided prompt additions (each one is appended only
-  // while its plugin's trigger is currently active). They show up as
-  // extra "tool/context" blocks at the end of the system prompt.
-  for (const add of (promptAdditions || [])) {
-    lines.push('');
-    lines.push('────────  plugin  ────────');
-    lines.push(String(add).trim());
-  }
-  // Project context from CODE-BOSS.md files discovered at project open.
-  // Last so it sits closest to the user's question — recency bias.
-  if (projectContext) {
-    lines.push('');
-    lines.push('────────  project context  ────────');
-    lines.push(String(projectContext).trim());
-  }
-  return lines.join('\n');
-}
-
-// ── Parser ──────────────────────────────────────────────────────────────────
-function coerce(toolName, key, raw) {
-  const ptype = toolName ? tools[toolName]?.schema?.parameters?.properties?.[key]?.type : 'string';
-  const val = String(raw).trim();
-  if (ptype === 'integer' || ptype === 'number') {
-    const n = Number(val);
-    return Number.isNaN(n) ? val : n;
-  }
-  if (ptype === 'boolean') return val === 'true';
-  return val;
-}
-function mkId() { return 'call_' + randomUUID().replace(/-/g, '').slice(0, 16); }
-
-/**
- * Truncate an assistant response to just the first real <remote-workspace>
- * block — everything after the close tag (or before a hallucinated result
- * tag) is dropped.
- *
- * Why this exists: backends that ignore our `stop` parameter (e.g., the
- * Claude Agent SDK in dev mode) let the model "imagine" multi-turn
- * conversations within a single response — writing fake
- * <remote-workspace-result> blocks and follow-up turns. Our parser already
- * ignores the imagined content when extracting calls, but if we store the
- * full text in the task history, the model on the NEXT loop iteration sees
- * its own imagined turns and concludes the work is already done.
- *
- * By truncating at storage time, the task store contains only what actually
- * happened — same view the model would have if `stop` had been honored
- * at the token level.
- */
-function truncateAtFirstBlock(text) {
-  if (typeof text !== 'string' || !text) return text;
-  const closeMatch = text.match(/<\/remote-workspace>/i);
-  const resultMatch = text.match(/<remote-workspace-result|<workspace-result/i);
-
-  // Case A: no markers → leave as-is (final answers / pure prose).
-  if (!closeMatch && !resultMatch) return text;
-
-  // Case B: close tag comes first (or is the only marker) → keep through close.
-  if (closeMatch && (!resultMatch || closeMatch.index < resultMatch.index)) {
-    return text.slice(0, closeMatch.index + closeMatch[0].length);
-  }
-
-  // Case C: a hallucinated result tag appears before any close. Cut there
-  // and append a synthetic close so the block is well-formed in storage.
-  const before = text.slice(0, resultMatch.index).trimEnd();
-  if (/<remote-workspace>/i.test(before) && !/<\/remote-workspace>/i.test(before)) {
-    return before + '\n</remote-workspace>';
-  }
-  return before;
-}
-
-// Strip multi-agent framing artifacts the model sometimes emits in its
-// prose between tool calls. Gemini (esp. on the GenAI.mil endpoint) has
-// been observed prefixing turns with "for context: [some_agent] said:"
-// — empty meta-prose that's noise in our single-agent chat. We strip
-// the line entirely; any actual content on subsequent lines is kept.
-//
-// Pattern variants we've seen:
-//   for context: [file_and_coding_agent] said:
-//   For Context [planner_agent] said
-//   for context:[name] said:
-//
-// All match: optional "for context" prefix, a bracketed name, "said",
-// with flexible whitespace + punctuation. Conservative — only strips
-// lines that are JUST the marker (anchored ^...$).
-function sanitizeAssistantProse(text, opts = {}) {
-  if (typeof text !== 'string' || !text) return text;
-  // Also strip tool-call-looking XML tags from the prose. The model
-  // sometimes "previews" what it's about to do by writing the tag in
-  // its narration before the actual <remote-workspace> block — so the
-  // chat shows the same call twice. We strip ONLY tags whose name is
-  // a known tool/task verb, so legitimate XML-content discussions
-  // (e.g. talking about a <library-ref> the user has in their pom)
-  // pass through untouched.
-  const extraVerbs = opts.extraVerbs || {};
-  const knownVerbs = new Set([
-    ...Object.keys(VERB_TO_TOOL),
-    ...Object.keys(extraVerbs),
-    ...TASK_VERBS,
-  ]);
-  if (knownVerbs.size > 0) {
-    const verbPattern = [...knownVerbs].sort((a, b) => b.length - a.length)
-      .map((v) => v.replace(/[-_]/g, (c) => '\\' + c)).join('|');
-    // Self-closing form: <verb ... />
-    text = text.replace(new RegExp(`<(?:${verbPattern})\\b[^>]*\\/>`, 'gi'), '');
-    // Body form: <verb ...>...</verb> — closer must match the opener
-    // (backref) so we don't stop at an inner closing tag like </find>
-    // inside an <edit>...</edit> block.
-    text = text.replace(new RegExp(`<(${verbPattern})\\b[^>]*>[\\s\\S]*?</\\1>`, 'gi'), '');
-  }
-  const lines = text.split('\n');
-  const out = [];
-  for (const line of lines) {
-    if (/^\s*for\s+context\s*:?\s*\[[^\]]*\]\s*said\s*:?\s*$/i.test(line)) continue;
-    out.push(line);
-  }
-  // Collapse runs of blank lines that the stripping leaves behind.
-  return out.join('\n').replace(/\n{3,}/g, '\n\n').trim();
-}
-
-function parseAttrs(attrStr, toolName) {
-  const out = {};
-  ATTR_RE.lastIndex = 0;
-  let m;
-  while ((m = ATTR_RE.exec(attrStr ?? '')) !== null) {
-    out[m[1]] = coerce(toolName, m[1], m[2]);
-  }
-  return out;
-}
-
-/**
- * Parse all <remote-workspace> verb calls from a model response text.
- * Supports both self-closing and body forms.
- */
-function parseToolCalls(text, opts = {}) {
-  const calls = [];
-  if (typeof text !== 'string' || !text) return calls;
-
-  // Plugin-provided verbs map their own verb names to tool names. Merge
-  // with the built-in VERB_TO_TOOL at parse time so the regex picks them
-  // up and so dispatch resolves to the right tool registry entry.
-  const extraVerbs = opts.extraVerbs || {};   // { verb: tool_name }
-  const allVerbToTool = { ...VERB_TO_TOOL, ...extraVerbs };
-  const allVerbs = [...Object.keys(allVerbToTool), ...TASK_VERBS]
-    .sort((a, b) => b.length - a.length);
-  const verbPattern = allVerbs.map((v) => v.replace(/-/g, '\\-').replace(/_/g, '\\_')).join('|');
-
-  // Cut at the first close tag or hallucinated result tag — only the FIRST
-  // <remote-workspace> block counts.
-  let cut = text.length;
-  for (const re of [/<\/remote-workspace>/i, /<remote-workspace-result/i, /<workspace-result/i]) {
-    const i = text.search(re);
-    if (i >= 0 && i < cut) cut = i;
-  }
-  const scan = text.slice(0, cut);
-
-  const openRe = new RegExp(`<(${verbPattern})\\b([^>]*?)(/?)>`, 'gi');
-  let pos = 0;
-  while (pos < scan.length) {
-    openRe.lastIndex = pos;
-    const m = openRe.exec(scan);
-    if (!m) break;
-    const verb = m[1].toLowerCase();
-    const attrStr = m[2] ?? '';
-    const selfClosing = m[3] === '/';
-    const openEnd = m.index + m[0].length;
-
-    const isTaskOp = TASK_VERBS.has(verb);
-    const toolName = isTaskOp ? null : allVerbToTool[verb];
-    const args = parseAttrs(attrStr, toolName);
-
-    let nextPos = openEnd;
-    if (!selfClosing) {
-      const closeTag = `</${verb}>`;
-      const ci = scan.indexOf(closeTag, openEnd);
-      if (ci !== -1) {
-        const body = scan.slice(openEnd, ci);
-        nextPos = ci + closeTag.length;
-        if (verb === 'write') args.content = body;
-        if (verb === 'edit') {
-          const fM = CHILD_TAG_RE('find').exec(body);
-          const rM = CHILD_TAG_RE('replace').exec(body);
-          if (fM) args.find = fM[1];
-          if (rM) args.replace = rM[1];
-        }
-        if (verb === 'powershell' && body.trim()) args.command = body.trim();
-      }
-    }
-    pos = nextPos;
-    calls.push({
-      id: mkId(),
-      verb,
-      kind: isTaskOp ? 'task-op' : 'tool',
-      name: toolName,
-      args,
-    });
-  }
-  return calls;
-}
-
-function formatToolResults(results) {
-  const blocks = results.map((r) => {
-    const head = `<remote-workspace-result op="${r.verb}" status="${r.status}"${r.extras ? ' ' + r.extras : ''}>`;
-    return `${head}\n${r.content}\n</remote-workspace-result>`;
-  }).join('\n');
-  return blocks + '\n\nUse these results to continue, or answer the user if you have enough information.';
-}
-
-function flattenContent(content) {
-  if (content == null) return '';
-  if (typeof content === 'string') return content;
-  if (Array.isArray(content)) {
-    return content.map((p) => (typeof p === 'string' ? p : p?.type === 'text' ? p.text ?? '' : '')).join('');
-  }
-  return String(content);
-}
-
-// ── Convo construction from task store ─────────────────────────────────────
-async function buildConvoFromStore(store) {
-  const out = [];
-  const state = store._state();
-  for (const id of state.allTaskIds) {
-    const t = await loadTaskFull(store, id);
-    if (!t) continue;
-    if (t.archived) continue;            // archived tasks are search-only
-    if (t.rolledUpInto) continue;        // children of a tier-4 rollup are covered by the rollup
-    if (t.tier === 4) {
-      out.push({
-        role: 'user',
-        content: `<task-rollup id="${t.id}" children="${(t.childIds ?? []).join(',')}">\n  ↳ ${t.userRequest || '(no user request synthesized)'}\n${t.summary || '(no summary)'}\n</task-rollup>`,
-      });
-    } else if (t.tier === 3) {
-      out.push({
-        role: 'user',
-        content: `<task-history id="${t.id}" parent="${t.parentId ?? 'root'}" status="${t.ended ? 'done' : 'open'}">\n  ↳ ${t.userRequest || '(no user request synthesized)'}\n${t.summary || '(no summary)'}\n</task-history>`,
-      });
-    } else {
-      // tier 1 and 2 both emit messages; tier 2 already has results masked in storage
-      for (const m of t.messages ?? []) {
-        out.push({ role: m.role, content: m.content });
-      }
-    }
-  }
-  return out;
-}
-
-// Helper: re-read a full task (with messages) from disk. listTasks omits the
-// messages array; the convo builder needs it.
-async function loadTaskFull(store, id) {
-  try {
-    const raw = await readFile(path.join(store._dir(), `${id}.json`), 'utf8');
-    return JSON.parse(raw);
-  } catch { return null; }
-}
-
-// ── Tier demotion ───────────────────────────────────────────────────────────
-// Strategy: when any tier exceeds budget × HYST_HIGH, demote the oldest
-// eligible task (or rollup batch) until the tier is below budget × HYST_LOW.
-// Demoting deeply (HYST_LOW = 0.50) means rare cache invalidations amortized
-// over many cache-hit turns.
-async function tier1TokensFor(store) {
-  const state = store._state();
-  let n = 0;
-  for (const t of await store.listTasks({ tier: 1 })) {
-    if (t.id === state.currentId) continue;       // current may exceed budget
-    if (t.rolledUpInto) continue;
-    const full = await loadTaskFull(store, t.id);
-    for (const m of full?.messages ?? []) n += estTokens(m.content);
-  }
-  return n;
-}
-async function tier2TokensFor(store) {
-  let n = 0;
-  for (const t of await store.listTasks({ tier: 2 })) {
-    if (t.rolledUpInto) continue;
-    const full = await loadTaskFull(store, t.id);
-    for (const m of full?.messages ?? []) n += estTokens(m.content);
-  }
-  return n;
-}
-async function tier3TokensFor(store) {
-  let n = 0;
-  for (const t of await store.listTasks({ tier: 3 })) {
-    if (t.rolledUpInto) continue;
-    n += estTokens(t.summary);
-  }
-  return n;
-}
-async function tier4TokensFor(store) {
-  let n = 0;
-  for (const t of await store.listTasks({ tier: 4 })) {
-    n += estTokens(t.summary);
-  }
-  return n;
-}
-
-async function totalContextTokens(store) {
-  return (await tier1TokensFor(store))
-    + (await tier2TokensFor(store))
-    + (await tier3TokensFor(store))
-    + (await tier4TokensFor(store));
-}
-
-/**
- * LLM-driven clustering of tier-3 tasks into tier-4 rollups. ONE LLM call
- * groups N tier-3 summaries into 4-8 "project" rollups, each with a custom
- * title + summary. Falls back to mechanical concatenation if the call fails
- * or the response can't be parsed.
- *
- * Returns the number of rollup tasks created.
- */
-async function llmClusterTier3({ store, adapter, model, log, emitChat }) {
-  const tier3 = (await store.listTasks({ tier: 3 }))
-    .filter((x) => !x.rolledUpInto && !x.archived)
-    .sort((a, b) => (a.ended ?? a.started ?? 0) - (b.ended ?? b.started ?? 0));
-  if (tier3.length < MIN_T3_FOR_LLM_ROLLUP) {
-    log?.(`tier3 cluster: only ${tier3.length} tasks (< ${MIN_T3_FOR_LLM_ROLLUP}); falling back to mechanical`);
-    if (tier3.length >= 2) {
-      // mechanical fallback: roll up everything into one batch
-      const r = await store.rollupTier3Tasks(tier3.map((t) => t.id));
-      if (r) emitChat?.({ type: 'task-rollup', parentTaskId: r.id, childTaskIds: r.childIds, userRequest: r.userRequest, summary: r.summary });
-      return 1;
-    }
-    return 0;
-  }
-
-  const taskLines = tier3
-    .map((t) => {
-      const ur = (t.userRequest || '').replace(/\s+/g, ' ').trim().slice(0, 200);
-      const sm = (t.summary || '').replace(/\s+/g, ' ').trim().slice(0, 200);
-      return `${t.id}  ↳ ${ur || '(no request)'} — ${sm}`;
-    })
-    .join('\n');
-
-  const prompt = [
-    `You will compact a coding session's history. There are ${tier3.length} completed task summaries below.`,
-    '',
-    'Group them into 4-8 logical "projects" — sets of tasks that form coherent units of work (e.g., "auth refactor", "build system upgrade"). For each project, produce:',
-    '  user-request: a single synthesized sentence representing what the user wanted ACROSS this project (NOT a copy of any single message).',
-    '  summary: one dense 1-2 sentence recap of what was actually accomplished across the project.',
-    '',
-    'Tasks (id, user-request, summary):',
-    taskLines,
-    '',
-    'Output ONLY a single JSON object in this exact shape, no other text, no markdown fences:',
-    '{"projects":[{"userRequest":"...","summary":"...","taskIds":["T-3","T-8"]}]}',
-    '',
-    'Constraints:',
-    '- Every task ID from the list above must appear in exactly one project.',
-    '- Use the task IDs verbatim.',
-    '- Keep each user-request and summary under 200 characters.',
-  ].join('\n');
-
-  let raw;
-  try {
-    const res = await adapter.complete({
-      model,
-      messages: [{ role: 'user', content: prompt }],
-      max_tokens: 2000,
-    });
-    raw = res?.choices?.[0]?.message?.content ?? '';
-  } catch (e) {
-    log?.(`tier3 cluster: LLM call failed (${e.message}); falling back to mechanical`);
-  }
-
-  // Try to parse JSON out of the response. Tolerant of prose around the object.
-  let parsed = null;
-  if (raw) {
-    const jsonMatch = raw.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
-      try { parsed = JSON.parse(jsonMatch[0]); } catch {}
-    }
-  }
-
-  if (!parsed || !Array.isArray(parsed.projects) || parsed.projects.length === 0) {
-    log?.(`tier3 cluster: LLM response unparseable; falling back to one mechanical rollup`);
-    const r = await store.rollupTier3Tasks(tier3.map((t) => t.id));
-    if (r) emitChat?.({ type: 'task-rollup', parentTaskId: r.id, childTaskIds: r.childIds, userRequest: r.userRequest, summary: r.summary });
-    return 1;
-  }
-
-  // Build set of valid IDs (the ones we asked about); ignore any hallucinated IDs.
-  const validIds = new Set(tier3.map((t) => t.id));
-  let createdCount = 0;
-  const claimed = new Set();
-  for (const p of parsed.projects) {
-    if (typeof p?.userRequest !== 'string' || typeof p?.summary !== 'string') continue;
-    if (!Array.isArray(p?.taskIds)) continue;
-    const ids = p.taskIds.filter((id) => validIds.has(id) && !claimed.has(id));
-    if (ids.length === 0) continue;
-    const rollup = await store.rollupTier3Tasks(ids, { userRequest: p.userRequest, summary: p.summary });
-    if (rollup) {
-      createdCount++;
-      for (const id of ids) claimed.add(id);
-      emitChat?.({ type: 'task-rollup', parentTaskId: rollup.id, childTaskIds: rollup.childIds, userRequest: rollup.userRequest, summary: rollup.summary });
-    }
-  }
-
-  // Sweep up any unclaimed task IDs into one final mechanical rollup so nothing is left orphaned.
-  const orphans = [...validIds].filter((id) => !claimed.has(id));
-  if (orphans.length >= 2) {
-    const r = await store.rollupTier3Tasks(orphans);
-    if (r) emitChat?.({ type: 'task-rollup', parentTaskId: r.id, childTaskIds: r.childIds, userRequest: r.userRequest, summary: r.summary });
-    createdCount++;
-  }
-  log?.(`tier3 cluster: created ${createdCount} rollups covering ${claimed.size + Math.max(0, orphans.length)} tasks`);
-  return createdCount;
-}
-
-/**
- * Compact when total context exceeds the high threshold. Bring it down to
- * the low threshold in one pass:
- *   1. T1→T2 (mechanical mask) until under LOW or no more candidates
- *   2. T2→T3 (mechanical drop messages) until under LOW or no candidates
- *   3. If still over and tier-3 is at or above its allocation: ONE LLM call
- *      to cluster all tier-3 tasks into tier-4 rollups
- *   4. T4→archive (mechanical flag flip) for oldest if still over
- */
-async function maybeCompact({ store, adapter, model, log, emitChat }) {
-  const HIGH = TOTAL_BUDGET * HYST_HIGH;
-  const LOW  = TOTAL_BUDGET * HYST_LOW;
-
-  let total = await totalContextTokens(store);
-  if (total <= HIGH) return;
-
-  log?.(`compact: total=${total} > HIGH=${HIGH}; target LOW=${LOW}`);
-
-  // Step 1: T1 → T2 mask (cheap). Emit task-tier-change so UI can mute results.
-  while (total > LOW) {
-    const id = await store.findOldestDemotionCandidate(1);
-    if (!id) break;
-    const before = await loadTaskFull(store, id);
-    let removed = 0;
-    for (const m of before?.messages ?? []) if (m.kind === 'tool-result') removed += estTokens(m.content);
-    await store.demoteToTier2(id);
-    emitChat?.({ type: 'task-tier-change', taskId: id, newTier: 2, muted: 'results' });
-    total -= removed;
-  }
-  if (total <= LOW) { log?.(`compact: done after T1→T2 (total=${total})`); return; }
-
-  // Step 2: T2 → T3 drop (cheap). Emit task-tier-change so UI can mute all rows.
-  while (total > LOW) {
-    const id = await store.findOldestDemotionCandidate(2);
-    if (!id) break;
-    const before = await loadTaskFull(store, id);
-    let removedMsgs = 0;
-    for (const m of before?.messages ?? []) removedMsgs += estTokens(m.content);
-    const addedSummary = estTokens(before?.summary ?? '');
-    await store.demoteToTier3(id, before?.summary || '(no summary)');
-    emitChat?.({ type: 'task-tier-change', taskId: id, newTier: 3, muted: 'all' });
-    total -= (removedMsgs - addedSummary);
-  }
-  if (total <= LOW) { log?.(`compact: done after T2→T3 (total=${total})`); return; }
-
-  // Step 3: T3 → T4 via LLM clustering (expensive — only if mechanical didn't suffice)
-  const t3 = await tier3TokensFor(store);
-  if (t3 >= TIER_3_BUDGET) {
-    log?.(`compact: tier3=${t3} >= ${TIER_3_BUDGET}; invoking LLM cluster`);
-    await llmClusterTier3({ store, adapter, model, log, emitChat });
-    total = await totalContextTokens(store);
-    log?.(`compact: after LLM cluster total=${total}`);
-  }
-  if (total <= LOW) { log?.(`compact: done after T3→T4 (total=${total})`); return; }
-
-  // Step 4: T4 → archive (mechanical). Emit task-archived so UI can mark/hide it.
-  while (total > LOW) {
-    const tier4 = (await store.listTasks({ tier: 4 }))
-      .filter((x) => !x.archived)
-      .sort((a, b) => (a.ended ?? a.started ?? 0) - (b.ended ?? b.started ?? 0));
-    if (!tier4.length) break;
-    const oldest = tier4[0];
-    const removed = estTokens(oldest.summary);
-    await store.archiveTask(oldest.id);
-    emitChat?.({ type: 'task-archived', taskId: oldest.id });
-    total -= removed;
-  }
-  log?.(`compact: done (total=${total}, target=${LOW})`);
-}
-
-// ── Stream-aware turn (prose forwarding) ───────────────────────────────────
-const HOLDBACK = '<remote-workspace>'.length + 2;
-
-async function runTurnStreaming(adapter, opts, onText) {
-  let text = '';
-  let sent = 0;
-  let inCommands = false;
-  const pump = () => {
-    if (inCommands) return;
-    const idx = text.search(/<remote-workspace/i);
-    if (idx === -1) {
-      const flushTo = Math.max(sent, text.length - HOLDBACK);
-      if (flushTo > sent) { onText?.(text.slice(sent, flushTo)); sent = flushTo; }
-    } else {
-      if (idx > sent) onText?.(text.slice(sent, idx));
-      sent = idx;
-      inCommands = true;
-    }
-  };
-  if (typeof adapter.completeStream === 'function') {
-    for await (const chunk of adapter.completeStream(opts)) {
-      const d = chunk?.choices?.[0]?.delta?.content;
-      if (d) { text += d; pump(); }
-    }
-  } else {
-    const res = await adapter.complete(opts);
-    text = res?.choices?.[0]?.message?.content ?? '';
-    pump();
-  }
-  if (!inCommands && sent < text.length) { onText?.(text.slice(sent)); }
-  return text;
-}
-
-// ── Task-op dispatcher ─────────────────────────────────────────────────────
-async function dispatchTaskOp(c, store) {
-  const a = c.args;
-  if (c.verb === 'next-task') {
-    // user-request and summary describe the task being CLOSED (the current one),
-    // not the new one being opened. See system prompt.
-    const r = await store.transitionTo({
-      summary: a.summary ?? '',
-      userRequest: a['user-request'] ?? '',
-    });
-    return {
-      ok: true,
-      content: `closed previous task with summary "${a.summary ?? ''}"; opened new task ${r.newTask.id}`,
-      closedId: r.closedId,
-      newTaskId: r.newTask.id,
-    };
-  }
-  if (c.verb === 'list-tasks') {
-    const list = await store.listTasks({ parentId: a.parent });
-    if (!list.length) return { ok: true, content: '(no tasks)' };
-    const lines = list.map((t) => {
-      const status = t.ended ? 'done' : 'open';
-      const tier = `tier${t.tier}`;
-      const ur = t.userRequest ? ` ↳ ${t.userRequest.split('\n')[0].slice(0, 100)}` : '';
-      const summary = t.summary ? ` — ${t.summary.split('\n')[0].slice(0, 120)}` : '';
-      const hash = t.commitHash ? `  (commit ${t.commitHash})` : '';
-      return `${t.id}  [${status}]  [${tier}]${hash}${ur}${summary}`;
-    });
-    return { ok: true, content: lines.join('\n') };
-  }
-  if (c.verb === 'task-detail') {
-    const t = await store.getDetail(a.id);
-    if (!t) return { ok: false, content: `task ${a.id} not found` };
-    return { ok: true, content: JSON.stringify(t, null, 2) };
-  }
-  if (c.verb === 'search-tasks') {
-    const hits = await store.searchTasks(a.query ?? '');
-    if (!hits.length) return { ok: true, content: '(no matches)' };
-    const lines = hits.map((t) => {
-      const ur = t.userRequest ? ` ↳ ${t.userRequest.split('\n')[0].slice(0, 100)}` : '';
-      const sm = (t.summary ?? '').split('\n')[0].slice(0, 140);
-      return `${t.id}${ur} — ${sm}`;
-    });
-    return { ok: true, content: lines.join('\n') };
-  }
-  return { ok: false, content: `unknown task op: ${c.verb}` };
-}
-
-// ── Main agent loop ────────────────────────────────────────────────────────
-async function runPromptedAgent({
-  adapter,
-  messages,           // [{role, content}] from the browser; we only care about the last user message
-  model,
-  projectDir,         // required: where .code_boss/tasks/ lives
-  maxTurns = DEFAULT_MAX_TURNS,
-  // Legacy callbacks (used by /api/chat SSE response):
-  onText, onToolCalls, onToolResult, onLog,
-  // New chat-event callback (used by /api/message + chat state on server):
-  //   onChatEvent({ type, taskId, ...payload })
-  // emitted for: 'user-message', 'assistant-text', 'tool-call', 'tool-result',
-  //              'diff', 'task-end'.
-  onChatEvent,
-  // New phase callback:
-  //   onPhase('idle' | 'uploading' | 'thinking' | 'downloading' | 'reviewing')
-  onPhase,
-  // Abort signal — checked between turns and when waiting on the model.
-  signal,
-  // When the reviewer feeds back to the agent, the user-facing review
-  // event already shows the feedback — set this to false to skip the
-  // duplicate 'user-message' event. The store still gets the message so
-  // the LLM sees it as input.
-  emitInitialUserMessage = true,
-  // Plugin integration. Manager passes these so the agent's prompt + tool
-  // dispatch + parser pick up enabled plugins' contributions.
-  extraTools = {},          // { tool_name: { verb, name, schema, impl } }
-  extraVerbs = {},          // { verb: tool_name } — fed to parseToolCalls
-  promptAdditions = [],     // strings appended to system prompt
-  projectContext = '',      // formatted CODE-BOSS.md context for this project
-  // Hook fired right after a <next-task> task-op transitions the store.
-  // Receives { closedTaskId, newTaskId, userRequest, summary } and may
-  // return a commit hash string (or null). The hash is attached to the
-  // closed task's record and included in the task-end chat event.
-  onTaskClose,
-  // Pre-write hook handed to tools that mutate files (write_file,
-  // edit_file). Called as requireBranch(absPath) before the write,
-  // resolves to 'ok' to proceed or 'aborted' to cancel. The server's
-  // implementation pauses until the user resolves a CODE_BOSS-branch
-  // prompt for the file's containing repo.
-  requireBranch,
-  // Returns { user, token } for plugins that need to hit the configured
-  // GitLab API (e.g. wl's documentation fetchers). Token never reaches
-  // the model — the plugin's impl calls the GitLab client and only the
-  // result content goes into the chat. Optional; plugins handle the
-  // missing case themselves.
-  getGitLabCredentials,
-}) {
-  if (!projectDir) throw new Error('projectDir required for task-scoped agent');
-
-  const log = (m) => { try { onLog?.(m); } catch {} };
-  const emitChat = (ev) => { try { onChatEvent?.(ev); } catch (e) { log(`onChatEvent error: ${e.message}`); } };
-  const emitPhase = (p) => { try { onPhase?.(p); } catch {} };
-  const checkAbort = () => {
-    if (signal?.aborted) {
-      const e = new Error('aborted');
-      e.name = 'AbortError';
-      throw e;
-    }
-  };
-
-  // Initialize tasks store; this either loads existing state or creates a root task.
-  const store = createTasksStore(projectDir);
-  await store.init();
-
-  // Extract the user's new message (last user role in incoming).
-  const lastUserMsg = [...(messages ?? [])].reverse().find((m) => m.role === 'user');
-  const userText = flattenContent(lastUserMsg?.content);
-  if (userText) {
-    await store.appendMessage({
-      kind: 'user-message',
-      role: 'user',
-      content: userText,
-    });
-    if (emitInitialUserMessage) {
-      emitChat({ type: 'user-message', taskId: store.currentId(), content: userText });
-    }
-  }
-
-  const stats = { turns: 0, toolCalls: 0, toolHistogram: {}, batches: [], loopBreaks: 0, taskOps: 0 };
-  let lastKey = '';
-  let repeat = 0;
-
-  for (let turn = 1; turn <= maxTurns; turn++) {
-    stats.turns = turn;
-
-    // Compute current tier-1 tokens to inject into the system prompt.
-    const cur = await store.getCurrent();
-    let t1Tokens = 0;
-    for (const m of cur?.messages ?? []) t1Tokens += estTokens(m.content);
-    const tier1Pct = Math.round((t1Tokens / TIER_1_BUDGET) * 100);
-
-    const sys = buildSystemPrompt({
-      taskId: cur?.id ?? '?',
-      taskUserRequest: cur?.userRequest ?? '',
-      tier1Tokens: t1Tokens,
-      tier1Pct,
-      promptAdditions,
-      projectContext,
-    });
-
-    // Build the convo from the store. The system reminder is NOT stored —
-    // it lives only in the prompt we send each turn. We copy the convo and
-    // PREPEND the reminder into the LATEST user message (the one carrying
-    // the current question), so the model sees fresh instructions right
-    // before the question it's about to answer. The stored convo is untouched.
-    //
-    // Why latest, not oldest: in a long conversation the oldest user message
-    // is far in the past; a reminder there is easy for the model to overlook
-    // or treat as ancient context. The latest user message is the freshest
-    // and contains what the model is actively responding to.
-    //
-    // Why prepend (not append) within that latest message: convention —
-    // system instructions go before the user's question. Appending after
-    // the question can cause the model to respond to the reminder itself
-    // instead of the question.
-    const fromStore = await buildConvoFromStore(store);
-    // Prepend a hidden user/assistant priming pair so the model has already
-    // "agreed" to use the <remote-workspace> XML tooling by the time the
-    // real user message arrives. Without this, Gemini Enterprise's first
-    // turn often drifts into "I do not have access to your files" before
-    // it remembers it does have the workspace tools. The priming messages
-    // are NOT persisted to the task store and never appear in the UI;
-    // they exist only in the prompt sent to the API.
-    const PRIMING = [
-      {
-        role: 'user',
-        content:
-          "Hi! I'm working with you in a remote workspace where you interact " +
-          "with my project by returning XML commands inside <remote-workspace> " +
-          "tags — for example <remote-workspace><list path=\".\"/></remote-workspace> " +
-          "to see what's there, <read path=\"...\"/> to view a file, " +
-          "<write path=\"...\">contents</write> to create one, " +
-          "<powershell>...</powershell> to run a shell command. Anything you put " +
-          "inside <remote-workspace> runs on my machine and the results come back " +
-          "to you on the next turn. Sound good?",
-      },
-      {
-        role: 'assistant',
-        content:
-          "Got it — I'll use <remote-workspace> XML commands to interact with your " +
-          "project files and run shell commands. I won't apologize for being " +
-          "unable to access files; the workspace IS the project. What would you " +
-          "like to work on?",
-      },
-    ];
-    const baseConvo = [...PRIMING, ...fromStore];
-    let latestUserIdx = -1;
-    for (let i = baseConvo.length - 1; i >= 0; i--) {
-      if (baseConvo[i].role === 'user') { latestUserIdx = i; break; }
-    }
-    const convo = baseConvo.map((m, i) => {
-      if (i !== latestUserIdx) return m;
-      return {
-        role: 'user',
-        content: `<system-reminder>\n${sys}\n</system-reminder>\n\n${m.content}`,
-      };
-    });
-    if (latestUserIdx === -1) {
-      // No user messages at all — send the reminder as the only message.
-      convo.push({ role: 'user', content: `<system-reminder>\n${sys}\n</system-reminder>` });
-    }
-
-    log(`turn ${turn}: ${convo.length} msgs · current=${cur?.id} · t1=${t1Tokens}/${TIER_1_BUDGET}`);
-
-    checkAbort();
-    emitPhase('uploading');
-    const t0 = Date.now();
-    emitPhase('thinking');
-    const text = await runTurnStreaming(
-      adapter,
-      { model, messages: convo, stop: ['</remote-workspace>'], signal },
-      (delta) => { onText?.(delta); emitPhase('downloading'); },
-    );
-    emitPhase('thinking');
-    checkAbort();
-    const calls = parseToolCalls(text, { extraVerbs });
-    log(`turn ${turn}: ${text.length} chars in ${Date.now() - t0}ms, ${calls.length} call(s)`);
-
-    if (calls.length === 0) {
-      // Final answer reached. Truncate any hallucinated continuation, then
-      // store. (Final answers shouldn't contain <remote-workspace> blocks
-      // anyway, but the truncate is a no-op in that case.)
-      const finalText = truncateAtFirstBlock(text);
-      if (finalText.trim()) {
-        await store.appendMessage({ kind: 'assistant', role: 'assistant', content: finalText });
-        const cleaned = sanitizeAssistantProse(finalText, { extraVerbs });
-        if (cleaned) emitChat({ type: 'assistant-text', taskId: cur?.id, content: cleaned });
-      }
-      // Always check budgets before returning — even on the final turn — so
-      // long sessions stay within bounds.
-      await maybeCompact({ store, adapter, model, log, emitChat });
-      log(`done: ${stats.turns} turns, ${stats.toolCalls} tool calls, ${stats.taskOps} task ops`);
-      return { content: finalText, stats, terminated: 'stop', store };
-    }
-    stats.batches.push(calls.length);
-
-    // Store ONLY the first real block. Hallucinated continuation past the
-    // close tag is discarded so the model can't "remember" imagined turns
-    // on the next loop iteration.
-    const assistantText = truncateAtFirstBlock(text);
-    await store.appendMessage({ kind: 'assistant', role: 'assistant', content: assistantText });
-    // Emit the prose portion (before the <remote-workspace> block) as a chat event.
-    const blockIdx = assistantText.search(/<remote-workspace>/i);
-    const proseOnly = (blockIdx === -1 ? assistantText : assistantText.slice(0, blockIdx)).trim();
-    if (proseOnly) {
-      const cleaned = sanitizeAssistantProse(proseOnly, { extraVerbs });
-      if (cleaned) emitChat({ type: 'assistant-text', taskId: cur?.id, content: cleaned });
-    }
-
-    const results = [];
-    for (const c of calls) {
-      checkAbort();
-      if (onToolCalls) onToolCalls([c]);
-      // Emit tool-call chat event
-      emitChat({
-        type: 'tool-call',
-        taskId: cur?.id,
-        callId: c.id,
-        verb: c.verb,
-        name: c.name ?? c.verb,
-        args: c.args,
-      });
-
-      // Loop detection — useful for read tools that the model gets stuck on
-      const key = c.verb + '|' + JSON.stringify(c.args);
-      if (key === lastKey) repeat++; else { lastKey = key; repeat = 1; }
-
-      let resultContent, resultStatus = 'ok', resultDiff = null;
-      if (repeat >= REPEAT_LIMIT) {
-        stats.loopBreaks++;
-        resultContent = `LOOP DETECTED: this exact request has fired ${repeat} times. Stop requesting and answer with what you have.`;
-        resultStatus = 'error';
-      } else if (c.kind === 'task-op') {
-        stats.taskOps++;
-        const r = await dispatchTaskOp(c, store);
-        resultContent = r.content;
-        resultStatus = r.ok ? 'ok' : 'error';
-        log(`  ${c.verb}(${JSON.stringify(c.args)}) -> ${resultStatus}`);
-        // If this was a <next-task>, give the server a chance to commit
-        // (the auto-commit hook runs here, after the store transition).
-        // The hook returns a commit hash; we record it on the just-
-        // closed task so future task-detail / list-tasks responses see
-        // it, then emit task-end carrying the hash too.
-        if (c.verb === 'next-task' && r.ok) {
-          let commitHash = null;
-          if (typeof onTaskClose === 'function') {
-            try {
-              commitHash = await onTaskClose({
-                closedTaskId: r.closedId,
-                newTaskId: r.newTaskId,
-                userRequest: c.args['user-request'] ?? '',
-                summary: c.args.summary ?? '',
-              });
-            } catch (e) {
-              log(`onTaskClose error: ${e.message}`);
-            }
-          }
-          if (commitHash && r.closedId) {
-            try { await store.attachToTask(r.closedId, { commitHash }); }
-            catch (e) { log(`attachToTask error: ${e.message}`); }
-          }
-          emitChat({
-            type: 'task-end',
-            taskId: cur?.id,                      // the task that just closed
-            userRequest: c.args['user-request'] ?? '',
-            summary: c.args.summary ?? '',
-            commitHash,                           // null if no auto-commit happened
-          });
-        }
-      } else {
-        stats.toolCalls++;
-        stats.toolHistogram[c.name] = (stats.toolHistogram[c.name] ?? 0) + 1;
-        const raw = await execute(c.name, c.args, extraTools, {
-          callId: c.id,
-          // Tool emits stdout/stderr chunks → broadcast as tool-progress
-          // chat events. The client renders a "running…" placeholder row
-          // for each tool call and accumulates chunks into a clickable
-          // live-output view. tool-progress events are ephemeral (not
-          // persisted — see appendChatEvent in src/server.mjs).
-          onProgress: (chunk) => emitChat({ type: 'tool-progress', callId: c.id, chunk }),
-          // Pre-write hook for write_file / edit_file. Server pauses
-          // the tool here when the file's repo isn't yet on CODE_BOSS_*.
-          requireBranch,
-          // User-initiated cancel. Tools that block on long-running
-          // children (powershell) listen for this to kill the process
-          // tree instead of running to natural completion.
-          signal,
-          // GitLab credentials accessor (used by wl docs tools, etc).
-          getGitLabCredentials,
-        });
-        if (typeof raw === 'string' && raw.startsWith('ERROR:')) {
-          resultContent = raw;
-          resultStatus = 'error';
-        } else {
-          resultContent = extractContent(raw);
-          resultDiff = extractDiff(raw);
-        }
-        log(`  ${c.name}(${JSON.stringify(c.args)}) -> ${resultStatus === 'error' ? resultContent.slice(0, 80) : resultContent.length + 'b'}`);
-      }
-
-      if (onToolResult) {
-        onToolResult({
-          verb: c.verb, name: c.name ?? c.verb, args: c.args,
-          status: resultStatus, content: resultContent,
-          diff: resultDiff,
-        });
-      }
-      // Emit tool-result chat event
-      emitChat({
-        type: 'tool-result',
-        taskId: cur?.id,
-        callId: c.id,
-        verb: c.verb,
-        name: c.name ?? c.verb,
-        status: resultStatus,
-        content: resultContent.slice(0, 8000),
-      });
-      if (resultDiff) {
-        emitChat({
-          type: 'diff',
-          taskId: cur?.id,
-          callId: c.id,
-          diff: resultDiff,
-        });
-      }
-
-      // Persist as task messages.
-      await store.appendMessage({
-        kind: 'tool-call', role: 'assistant',
-        content: `<${c.verb} ...args/>`,    // marker; real content is in assistantText above
-        toolName: c.name ?? c.verb, toolArgs: c.args,
-      });
-      await store.appendMessage({
-        kind: 'tool-result', role: 'user',
-        content: `<remote-workspace-result op="${c.verb}" status="${resultStatus}">\n${resultContent}\n</remote-workspace-result>`,
-        toolName: c.name ?? c.verb, toolStatus: resultStatus,
-      });
-
-      results.push({ verb: c.verb, status: resultStatus, content: resultContent });
-    }
-
-    // Concat all results into one user message for the next LLM turn (matches
-    // what we stored, but the store already has them per-message; the LLM input
-    // is rebuilt fresh next turn from the store anyway).
-
-    // Compact if total context is over budget. Cheap mechanical demotions
-    // first; LLM clustering only if tier 3 still over after that.
-    await maybeCompact({ store, adapter, model, log, emitChat });
-  }
-
-  log(`done: max turns (${maxTurns}) reached without converging`);
-  return { content: '[MAX TURNS REACHED — agent did not converge]', stats, terminated: 'max-turns', store };
-}
-
-// ─── Reviewer agent ────────────────────────────────────────────────────────
-// Runs a separate LLM call to review what the dev agent just did, against
-// three categories: structural validity, bugs, intent match. Returns either
-// pass or a concrete list of concerns the dev agent should address.
-//
-// Inputs:
-//   userRequest  — original text the developer sent that started this work
-//   trajectory   — compact representation of what the agent did (tool calls,
-//                  diffs, results) — built by buildReviewTrajectory()
-//   finalText    — agent's last assistant message
-//
-// Output: { pass: true } or { pass: false, concerns: '...' }
-
-// Reviewer's tool allowlist. Read-only: it can inspect any file or
-// directory in the project but cannot write, edit, or run shell commands.
-// Same parser as the dev agent (parseToolCalls) — we just filter the
-// dispatch so writes are silently dropped.
-const REVIEWER_TOOL_VERBS = new Set(['list', 'read', 'search', 'find', 'info']);
-const REVIEWER_MAX_TURNS = 6;
-
-const REVIEWER_SYSTEM_PROMPT = `You are a code review agent. Another agent has just completed work on behalf of a developer. Review that work for three categories of issues. Be specific and concise — the dev agent will act on your feedback verbatim.
-
-1. STRUCTURAL VALIDITY (most likely failure mode — focus here first)
-   Look at every removed, commented-out, or modified element. For each, ask: "is the surrounding container still valid for this file type?"
-   • XML/HTML: elements with required children. A <library-ref> without a <library-name> is well-formed XML but invalid for the weblogic schema. Commenting out a required child WITHOUT also handling the parent is a bug.
-   • JSON/YAML: required fields per the consuming application (package.json must have name+version, k8s manifest must have apiVersion+kind+metadata, etc.)
-   • Source files: syntax parses, imports resolve, types match (best-effort), function signatures match call sites you can see.
-   • Properties / .env: required keys still present.
-   After commenting out anything, mentally re-read the file and ask: "would the framework that consumes this file reject it now?"
-
-2. BUGS — Logic errors introduced by THIS change (NOT pre-existing):
-   • Off-by-one, null dereference, uncaught exception path, wrong operator.
-   • Behavior change in code paths the user didn't ask about (scope creep).
-   • Side effects in pure-looking functions.
-   • Race conditions if concurrency is in play.
-   • Resource leaks (unclosed file handles, listeners, connections).
-   • For config/build files: did a dependency version go down, a required field get dropped, a script break?
-
-3. INTENT MATCH
-   • Was the right thing changed, or did the agent change something adjacent?
-   • Was the scope correct — did it do too little (left work undone) or too much (touched unrelated code)?
-   • Does the agent's summary describe what was actually changed (not what was intended)?
-   • If the user asked a question rather than for a change, was the question actually answered?
-
-READ-ONLY TOOLS
-You can inspect the project to verify what the agent did. Emit tool calls inside a <remote-workspace> block, exactly like the dev agent does. Available tools:
-  <read path="FILE"/>                         read full file contents
-  <read path="FILE" offset="N" limit="N"/>    read a slice
-  <list path="DIR"/>                          list directory entries
-  <search pattern="REGEX" path="DIR" glob="GLOB"/>   grep across files
-  <find pattern="GLOB"/>                      glob (recursive by default)
-  <info path="FILE"/>                         file/dir stat
-
-You have NO write access — only the dev agent can change files. Issue at most a few tool calls per turn; you have a ${REVIEWER_MAX_TURNS}-turn budget total. Prefer reading the specific file the agent just changed (which you can see in the trajectory's diffs) over broad searches.
-
-The remote workspace will reply with <remote-workspace-result> blocks containing real data. Read those before deciding.
-
-OUTPUT FORMAT
-When you have enough information, respond with EXACTLY ONE of these in a turn that has no tool calls:
-  <review-pass/>
-  <review-fail>specific, actionable concerns here</review-fail>
-
-Use <review-pass/> when the work is correct and complete enough to ship.
-Use <review-fail>...</review-fail> only when there's something the dev agent should fix. Be specific: name the file, the element, what's wrong, and what would fix it. Do not include items the dev agent already noticed and fixed in this same trajectory.`;
-
-async function runReviewer({ adapter, model, userRequest, trajectory, finalText, signal, onLog }) {
-  const log = (m) => { try { onLog?.(m); } catch {} };
-  const userBlock = [
-    '<review-target>',
-    '<user-request>',
-    String(userRequest ?? '').trim(),
-    '</user-request>',
-    '<trajectory>',
-    trajectory,
-    '</trajectory>',
-    '<final-answer>',
-    String(finalText ?? '').trim(),
-    '</final-answer>',
-    '</review-target>',
-  ].join('\n');
-
-  const messages = [
-    { role: 'system', content: REVIEWER_SYSTEM_PROMPT },
-    { role: 'user', content: userBlock },
-  ];
-
-  for (let turn = 1; turn <= REVIEWER_MAX_TURNS; turn++) {
-    if (signal?.aborted) {
-      const e = new Error('aborted');
-      e.name = 'AbortError';
-      throw e;
-    }
-    const t0 = Date.now();
-    const response = await adapter.complete({ model, messages, signal });
-    const text = response?.choices?.[0]?.message?.content ?? '';
-    log(`reviewer turn ${turn}: ${text.length} chars in ${Date.now() - t0}ms`);
-
-    // Verdict check first — if the model produced a verdict, take it
-    // regardless of any tool calls mixed in.
-    if (/<review-pass\s*\/?>/i.test(text)) {
-      return { pass: true };
-    }
-    const failMatch = text.match(/<review-fail>([\s\S]*?)<\/review-fail>/i);
-    if (failMatch) {
-      return { pass: false, concerns: failMatch[1].trim() };
-    }
-
-    // No verdict yet — look for tool calls and execute the allowed ones.
-    const calls = parseToolCalls(text);
-    const allowed = calls.filter((c) => REVIEWER_TOOL_VERBS.has(c.verb));
-    const blocked = calls.filter((c) => !REVIEWER_TOOL_VERBS.has(c.verb));
-
-    if (allowed.length === 0) {
-      // No verdict, no usable tool calls. Default to pass — matches the
-      // older "unparseable response = pass" semantics so a confused
-      // reviewer doesn't block the user. Log so we can investigate.
-      if (blocked.length > 0) {
-        log(`reviewer turn ${turn}: blocked ${blocked.length} write call(s) (${blocked.map((c) => c.verb).join(', ')}); no verdict — defaulting to pass`);
-      } else {
-        log(`reviewer turn ${turn}: no verdict, no tool calls — defaulting to pass. raw: ${text.slice(0, 200)}`);
-      }
-      return { pass: true, unparseable: true };
-    }
-
-    // Execute the allowed tools.
-    const results = [];
-    for (const c of allowed) {
-      try {
-        const raw = await execute(c.name, c.args);
-        const content = (typeof raw === 'string' && raw.startsWith('ERROR:'))
-          ? raw
-          : extractContent(raw);
-        const status = (typeof raw === 'string' && raw.startsWith('ERROR:')) ? 'error' : 'ok';
-        results.push({ verb: c.verb, status, content });
-        log(`reviewer turn ${turn}: ${c.verb}(${JSON.stringify(c.args).slice(0, 80)}) -> ${status} ${content.length}b`);
-      } catch (e) {
-        results.push({ verb: c.verb, status: 'error', content: 'ERROR: ' + (e?.message ?? String(e)) });
-      }
-    }
-    if (blocked.length > 0) {
-      results.push({
-        verb: 'system',
-        status: 'error',
-        content: `Reviewer is read-only — dropped ${blocked.length} call(s): ${blocked.map((c) => c.verb).join(', ')}.`,
-      });
-    }
-
-    messages.push({ role: 'assistant', content: text });
-    messages.push({ role: 'user', content: formatToolResults(results) });
-  }
-
-  // Out of turns without a verdict. Be permissive (pass) so the user isn't
-  // blocked behind an indecisive reviewer.
-  log(`reviewer: hit max turns (${REVIEWER_MAX_TURNS}) without a verdict, treating as pass.`);
-  return { pass: true, indecisive: true };
-}
-
-// Build a compact representation of the work the agent did, for the
-// reviewer to consume. Skips noisy chat events (review-* itself, status
-// rows) and truncates very long tool results. Returns a single string.
-function buildReviewTrajectory(events) {
-  const lines = [];
-  for (const ev of events) {
-    switch (ev.type) {
-      case 'user-message':
-        // The user-request is passed separately; skip dups here.
-        break;
-      case 'assistant-text':
-        lines.push('AGENT: ' + clip(ev.content, 800));
-        break;
-      case 'tool-call': {
-        const args = Object.entries(ev.args || {})
-          .map(([k, v]) => `${k}=${clip(String(v), 200)}`).join(', ');
-        lines.push(`TOOL: ${ev.verb || ev.name}(${args})`);
-        break;
-      }
-      case 'tool-result':
-        lines.push(`  -> [${ev.status || 'ok'}] ${clip(ev.content, 600)}`);
-        break;
-      case 'diff':
-        lines.push('DIFF:');
-        lines.push(clip(ev.diff || '', 2000));
-        break;
-      case 'task-end':
-        lines.push(`TASK END: ${clip(ev.summary || '', 400)}`);
-        break;
-      default:
-        // skip other event types (review, task-rollup, task-tier-change, etc)
-    }
-  }
-  return lines.join('\n');
-}
-
-function clip(s, n) {
-  if (typeof s !== 'string') return String(s ?? '');
-  return s.length > n ? s.slice(0, n) + ' … [truncated]' : s;
-}
-
 // ====== git-api/gitlab.mjs ======
 /**
  * Common GitLab REST v4 client. Used by any plugin or core code that
@@ -3516,7 +3739,13 @@ class GitLabApiError extends Error {
   }
 }
 
-function createGitLabClient({ serverUrl, getCredentials, fetchImpl } = {}) {
+// A hung connection (DoD proxy holding the socket, TCP black-hole) must not
+// block the agent loop forever — fetch gets an abort timeout.
+const DEFAULT_TIMEOUT_MS = 30000;
+
+const DEFAULT_MAX_FILE_BYTES = 50 * 1024 * 1024; // 50MB, matches read_docx's cap
+
+function createGitLabClient({ serverUrl, getCredentials, fetchImpl, timeoutMs = DEFAULT_TIMEOUT_MS, maxFileBytes = DEFAULT_MAX_FILE_BYTES } = {}) {
   if (!serverUrl) throw new Error('createGitLabClient: serverUrl is required');
   if (typeof getCredentials !== 'function') throw new Error('createGitLabClient: getCredentials must be a function');
   const fetcher = fetchImpl ?? globalThis.fetch;
@@ -3529,11 +3758,20 @@ function createGitLabClient({ serverUrl, getCredentials, fetchImpl } = {}) {
     return { 'PRIVATE-TOKEN': String(creds.token) };
   }
 
+  function timeoutSignal() {
+    // AbortSignal.timeout is Node 18+; guard in case fetchImpl ignores it.
+    try { return AbortSignal.timeout(timeoutMs); } catch { return undefined; }
+  }
+
   async function apiGet(path, { accept = 'application/json' } = {}) {
     const url = `${base}/api/v4${path}`;
-    const res = await fetcher(url, { headers: { accept, ...authHeaders() } });
+    const res = await fetcher(url, { headers: { accept, ...authHeaders() }, signal: timeoutSignal() });
     if (!res.ok) {
-      let body; try { body = await res.json(); } catch { body = await res.text().catch(() => ''); }
+      // Read the body exactly ONCE. The old code called res.json() then
+      // res.text() on the already-consumed stream ('body used already'),
+      // swallowing the real error text — leaving an opaque 'GitLab API 401: '.
+      const raw = await res.text().catch(() => '');
+      let body; try { body = JSON.parse(raw); } catch { body = raw; }
       throw new GitLabApiError(res.status, body);
     }
     return res;
@@ -3571,24 +3809,68 @@ function createGitLabClient({ serverUrl, getCredentials, fetchImpl } = {}) {
     const url = `/projects/${encId(projectPath)}/repository/files/${encodeURIComponent(filepath)}/raw?${params}`;
     const res = await apiGet(url, { accept: '*/*' });
     const contentType = res.headers.get('content-type') || '';
-    const buf = Buffer.from(await res.arrayBuffer());
-    // Heuristic: if the bytes round-trip cleanly through UTF-8 decode and
-    // we don't see a high concentration of NUL bytes, treat as text.
-    const looksText = isLikelyText(buf);
-    if (looksText) {
-      return { content: buf.toString('utf8'), encoding: 'utf8', size: buf.length, ref: res.headers.get('x-gitlab-ref') || ref || null, contentType };
+    const gitlabRef = res.headers.get('x-gitlab-ref');
+    // A DoD SSO/proxy interstitial returns an HTML login page — often with a
+    // 200 OK, so res.ok was true and we'd otherwise hand the agent a login
+    // page as if it were the requested file. If the body is HTML AND the
+    // response did not come from GitLab (no x-gitlab-* header), reject it.
+    if (/text\/html/i.test(contentType) && !gitlabRef && !res.headers.get('x-gitlab-blob-id')) {
+      throw new GitLabApiError(res.status || 200, 'expected a raw file but received an HTML page (likely an SSO/login redirect or proxy interstitial). Check GitLab credentials / network.');
     }
-    return { content: buf, encoding: 'binary', size: buf.length, ref: res.headers.get('x-gitlab-ref') || ref || null, contentType };
+    // Size guard: refuse to buffer an oversized file into memory (arrayBuffer
+    // loads it all, then Buffer.from copies again ~2x). The 30s timeout bounds
+    // a never-ending chunked response; this bounds a large-but-finite one.
+    const cl = Number(res.headers.get('content-length'));
+    if (Number.isFinite(cl) && cl > maxFileBytes) {
+      throw new GitLabApiError(res.status || 200, `file too large: ${cl} bytes (max ${maxFileBytes})`);
+    }
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (buf.length > maxFileBytes) {
+      throw new GitLabApiError(res.status || 200, `file too large: ${buf.length} bytes (max ${maxFileBytes})`);
+    }
+    const decoded = decodeText(buf);
+    if (decoded != null) {
+      return { content: decoded, encoding: 'utf8', size: buf.length, ref: gitlabRef || ref || null, contentType };
+    }
+    return { content: buf, encoding: 'binary', size: buf.length, ref: gitlabRef || ref || null, contentType };
   }
 
   return { listTree, readFile, _apiGet: apiGet };
 }
 
-function isLikelyText(buf) {
+/**
+ * Decode a file buffer to text if it looks like text, else return null
+ * (caller treats null as binary). BOM- and UTF-16-aware: a Windows editor
+ * (Notepad, PowerShell Set-Content) commonly writes UTF-16LE/BE or a UTF-8
+ * BOM. The old pure NUL-ratio heuristic wrongly classified UTF-16 text
+ * (~50% NUL) as binary, so a plain README could never be read.
+ */
+function decodeText(buf) {
+  if (buf.length === 0) return '';
+  // BOMs first.
+  if (buf[0] === 0xEF && buf[1] === 0xBB && buf[2] === 0xBF) {
+    return buf.subarray(3).toString('utf8'); // UTF-8 BOM
+  }
+  if (buf[0] === 0xFF && buf[1] === 0xFE) {
+    return buf.subarray(2).toString('utf16le'); // UTF-16 LE BOM
+  }
+  if (buf[0] === 0xFE && buf[1] === 0xFF) {
+    return Buffer.from(buf.subarray(2)).swap16().toString('utf16le'); // UTF-16 BE BOM
+  }
+  // No BOM: inspect NUL distribution in the sample.
   const sample = buf.subarray(0, Math.min(buf.length, 4096));
-  let nul = 0;
-  for (let i = 0; i < sample.length; i++) if (sample[i] === 0) nul++;
-  return nul / Math.max(sample.length, 1) < 0.005;
+  let nul = 0, nulEven = 0, nulOdd = 0;
+  for (let i = 0; i < sample.length; i++) {
+    if (sample[i] === 0) { nul++; if (i % 2 === 0) nulEven++; else nulOdd++; }
+  }
+  const n = Math.max(sample.length, 1);
+  // BOM-less UTF-16: NULs cluster on one parity (LE → odd offsets carry the
+  // high byte for ASCII; BE → even offsets).
+  if (nulOdd > 0.4 * (n / 2) && nulEven <= 0.02 * n) return buf.toString('utf16le');
+  if (nulEven > 0.4 * (n / 2) && nulOdd <= 0.02 * n) return Buffer.from(buf).swap16().toString('utf16le');
+  // Genuine binary: high NUL ratio.
+  if (nul / n >= 0.005) return null;
+  return buf.toString('utf8');
 }
 
 // ====== plugins/wl.mjs ======
@@ -3842,12 +4124,22 @@ const wlPlugin = {
         if (result.encoding === 'utf8') {
           return { content: `${WL_DOCS_REPO}:${filepath}  (${result.size} bytes, ${result.contentType || 'text'})\n${result.content}` };
         }
-        // Binary: write to a temp file and report the path so the agent
-        // can hand it to read_docx or another binary-aware tool.
+        // Binary: write to a temp file and report the path. The temp name
+        // gets a random segment so two binaries read in the same millisecond
+        // don't collide and overwrite each other. The guidance is branched on
+        // type — only a .docx should be sent to read_docx (which otherwise
+        // throws "not a .docx"); other binaries need a type-appropriate reader.
         const safeName = path.basename(filepath).replace(/[^a-zA-Z0-9._-]/g, '_');
-        const tmp = path.join(tmpdir(), `wl-doc-${Date.now()}-${safeName}`);
+        const rand = Math.random().toString(36).slice(2, 8);
+        const tmp = path.join(tmpdir(), `wl-doc-${Date.now()}-${rand}-${safeName}`);
         await writeFile(tmp, result.content);
-        return { content: `${WL_DOCS_REPO}:${filepath}  (${result.size} bytes, binary ${result.contentType})\nSaved to: ${tmp}\nUse read_docx (or appropriate reader) on that path.` };
+        const ext = path.extname(safeName).toLowerCase();
+        const ct = result.contentType || '';
+        const isDocx = ext === '.docx' || /wordprocessingml|officedocument/i.test(ct);
+        const hint = isDocx
+          ? 'Use read_docx on that path to extract its text.'
+          : `Saved as a binary file (${ct || ext || 'unknown type'}). read_docx only handles .docx — use an appropriate reader for this type, or inspect it directly.`;
+        return { content: `${WL_DOCS_REPO}:${filepath}  (${result.size} bytes, binary ${ct})\nSaved to: ${tmp}\n${hint}` };
       },
     },
   ],
@@ -4177,6 +4469,245 @@ function createPluginManager({ onLog } = {}) {
   }
 
   return { detectAll, executor, enabledPlugins, enabledTools, enabledVerbs, promptAdditions, snapshot };
+}
+
+// ====== agent/mosaic-layout.mjs ======
+/**
+ * Mosaic layout — pure functions that size and pack tiles on a grid.
+ *
+ * Shared between the Node server (where layout-on-fetch is the fallback)
+ * and the browser script (where the same code runs with measured font
+ * metrics + actual viewport dimensions). The build script injects this
+ * file's contents into both contexts; keep it pure (no I/O, no Node-only
+ * APIs) so it can run unchanged in either.
+ *
+ * Three exports:
+ *   - computeTileSize(tile, opts) → {cols, rows}
+ *   - packPage(tiles, cols, rows, opts) → {placed, notPlaced, score, ...}
+ *   - layoutMosaic(tiles, pageCols, pageRows, opts) → {pages, ...}
+ */
+
+/**
+ * Compute the SMALLEST {cols, rows} rectangle that holds the tile's content
+ * without scrolling. Per-kind heuristic: for text/json we count chars and
+ * lines; for findings we account for the badge chrome; for tables we sum
+ * column widths.
+ *
+ * The conversion to grid cells depends on opts.charsPerCol and
+ * opts.linesPerRow, which the CALLER computes from the actual rendered
+ * font + viewport. The server passes its baseline (assumes 1400×800 at
+ * 9px monospace); the browser passes measured values.
+ */
+function computeTileSize(tile, opts = {}) {
+  const charsPerCol = opts.charsPerCol ?? 20;
+  const linesPerRow = opts.linesPerRow ?? 7;
+  const minCols     = opts.minCols ?? 2;
+  const minRows     = opts.minRows ?? 1;
+  const maxCols     = opts.maxCols ?? 12;
+  const maxRows     = opts.maxRows ?? 8;
+  // Chrome budget in lines (header bar + body padding amortized as text lines).
+  const chromeLines = opts.chromeLines ?? 2;
+
+  const kind = tile?.kind ?? 'text';
+  const body = tile?.body;
+  let maxLine = 0;
+  let lineCount = 1;
+
+  if (kind === 'json') {
+    let text;
+    try { text = JSON.stringify(body, null, 2); }
+    catch { text = String(body); }
+    const lines = text.split('\n');
+    lineCount = lines.length;
+    for (const line of lines) if (line.length > maxLine) maxLine = line.length;
+  } else if (kind === 'findings') {
+    const findings = Array.isArray(body) ? body : [];
+    lineCount = Math.max(1, findings.reduce((n, f) => n + (f?.detail ? 2 : 1), 0));
+    let widest = 50;
+    for (const f of findings) {
+      const t = (f?.title?.length ?? 0) + 14;
+      if (t > widest) widest = t;
+      if (f?.detail) {
+        const d = (String(f.detail).length ?? 0) + 4;
+        if (d > widest) widest = d;
+      }
+    }
+    maxLine = widest;
+  } else if (kind === 'table') {
+    const t = body ?? { columns: [], rows: [] };
+    lineCount = (t.rows?.length ?? 0) + 1;
+    const cols = t.columns ?? [];
+    let width = 0;
+    for (let i = 0; i < cols.length; i++) {
+      let colW = String(cols[i] ?? '').length;
+      for (const row of (t.rows ?? [])) {
+        const cellStr = String(row[i] ?? '');
+        if (cellStr.length > colW) colW = cellStr.length;
+      }
+      width += Math.min(colW, 40) + 2;
+    }
+    maxLine = Math.max(width, 30);
+  } else {
+    const text = String(body ?? '');
+    const lines = text.split('\n');
+    lineCount = lines.length;
+    for (const line of lines) if (line.length > maxLine) maxLine = line.length;
+  }
+
+  if (maxLine === 0) maxLine = 10;
+
+  let cols = Math.ceil(maxLine / charsPerCol);
+  let rows = Math.ceil((lineCount + chromeLines) / linesPerRow);
+
+  cols = Math.max(minCols, Math.min(maxCols, cols));
+  rows = Math.max(minRows, Math.min(maxRows, rows));
+  return { cols, rows };
+}
+
+/**
+ * Pack a list of tiles onto a single page via backtracking search.
+ * Score is the lexicographic pair (tileCount, cellsFilled) — placing
+ * more tiles always wins; within equal tile counts the denser packing
+ * wins. Time-capped via opts.maxMs (default 200ms).
+ */
+function packPage(tiles, cols, rows, opts = {}) {
+  const maxMs = opts.maxMs ?? 200;
+  const startMs = Date.now();
+  const sized = tiles.map((t) => {
+    const w = Math.max(1, Math.min(t.sizeHint?.cols ?? 3, cols));
+    const h = Math.max(1, Math.min(t.sizeHint?.rows ?? 2, rows));
+    return { tile: t, w, h, area: w * h };
+  });
+
+  const grid = Array.from({ length: rows }, () => new Array(cols).fill(-1));
+  const placed = [];
+  const usedIdx = new Set();
+  let best = { placedIdx: [], placements: [], tileCount: -1, cellsFilled: -1 };
+
+  const findEmpty = () => {
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        if (grid[r][c] === -1) return [r, c];
+      }
+    }
+    return null;
+  };
+  const fits = (r, c, w, h) => {
+    if (r + h > rows || c + w > cols) return false;
+    for (let i = 0; i < h; i++) for (let j = 0; j < w; j++) if (grid[r + i][c + j] !== -1) return false;
+    return true;
+  };
+  const fill = (r, c, w, h, v) => {
+    for (let i = 0; i < h; i++) for (let j = 0; j < w; j++) grid[r + i][c + j] = v;
+  };
+  const countFilled = () => {
+    let n = 0; for (const row of grid) for (const v of row) if (v >= 0) n++; return n;
+  };
+  const isBetter = (tileCount, cellsFilled) =>
+    tileCount > best.tileCount ||
+    (tileCount === best.tileCount && cellsFilled > best.cellsFilled);
+
+  function recurse() {
+    if (Date.now() - startMs > maxMs) return;
+    const empty = findEmpty();
+    const tileCount = placed.length;
+    if (!empty) {
+      const cellsFilled = countFilled();
+      if (isBetter(tileCount, cellsFilled)) {
+        best = { placedIdx: [...usedIdx], placements: placed.map((p) => ({ ...p })), tileCount, cellsFilled };
+      }
+      return;
+    }
+    const [r, c] = empty;
+
+    let emptyCount = 0;
+    for (const row of grid) for (const v of row) if (v === -1) emptyCount++;
+    let smallestArea = Infinity;
+    for (let i = 0; i < sized.length; i++) {
+      if (!usedIdx.has(i)) smallestArea = Math.min(smallestArea, sized[i].area);
+    }
+    const maxAdditionalTiles = smallestArea === Infinity ? 0 : Math.floor(emptyCount / smallestArea);
+    if (tileCount + maxAdditionalTiles < best.tileCount) return;
+    if (tileCount + maxAdditionalTiles === best.tileCount &&
+        countFilled() + emptyCount <= best.cellsFilled) return;
+
+    const candidates = sized
+      .map((s, i) => ({ s, i }))
+      .filter(({ i }) => !usedIdx.has(i))
+      .sort((a, b) => b.s.area - a.s.area);
+
+    let triedAny = false;
+    for (const { s, i } of candidates) {
+      if (fits(r, c, s.w, s.h)) {
+        triedAny = true;
+        fill(r, c, s.w, s.h, i);
+        usedIdx.add(i);
+        placed.push({ tileIdx: i, row: r, col: c, colSpan: s.w, rowSpan: s.h });
+        recurse();
+        placed.pop();
+        usedIdx.delete(i);
+        fill(r, c, s.w, s.h, -1);
+        if (Date.now() - startMs > maxMs) return;
+      }
+    }
+    if (!triedAny) {
+      grid[r][c] = -2;
+      recurse();
+      grid[r][c] = -1;
+    }
+  }
+
+  recurse();
+
+  const placedIdxSet = new Set(best.placedIdx);
+  const placedTiles = best.placements.map((p) => ({
+    ...tiles[p.tileIdx],
+    row: p.row,
+    col: p.col,
+    colSpan: p.colSpan,
+    rowSpan: p.rowSpan,
+  }));
+  const notPlaced = tiles.filter((_, i) => !placedIdxSet.has(i));
+  return {
+    placed: placedTiles,
+    notPlaced,
+    tileCount: best.tileCount,
+    cellsFilled: best.cellsFilled,
+    score: best.cellsFilled,
+  };
+}
+
+/**
+ * Lay out tiles across one or more pages, packing each page tightly via
+ * `packPage`. Tiles that don't fit overflow to the next page; an oversize
+ * tile is force-placed on its own page.
+ */
+function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
+  const pages = [];
+  let remaining = tiles.slice();
+  let safety = 30;
+  while (remaining.length > 0 && safety-- > 0) {
+    const r = packPage(remaining, pageCols, pageRows, opts);
+    if (r.placed.length === 0) {
+      const t = remaining.shift();
+      pages.push({
+        tiles: [{
+          ...t, row: 0, col: 0,
+          colSpan: Math.min(t.sizeHint?.cols ?? pageCols, pageCols),
+          rowSpan: Math.min(t.sizeHint?.rows ?? pageRows, pageRows),
+          oversize: true,
+        }],
+        fillRatio: 1.0,
+      });
+      continue;
+    }
+    pages.push({
+      tiles: r.placed,
+      fillRatio: r.score / (pageCols * pageRows),
+    });
+    remaining = r.notPlaced;
+  }
+  return { pages, totalTiles: tiles.length, totalPages: pages.length };
 }
 
 // ====== server.mjs ======
@@ -5407,11 +5938,12 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
   function appendChatEvent(event) {
     const id = `e${session.nextEventId++}`;
     const ev = { id, appendedAtVersion: session.version + 1, ...event };
-    // tool-progress events stream live stdout/stderr chunks from a running
-    // tool — broadcast them so the chat UI can render a live-output view,
-    // but DON'T push to chatEvents or save: they'd bloat the conversation
-    // file by megabytes during a build, and they're ephemeral by intent.
-    const ephemeral = event.type === 'tool-progress';
+    // Ephemeral events are broadcast for live UI updates but NOT persisted —
+    // either because they'd bloat the conversation file (tool-progress
+    // streams stdout/stderr from builds) or because there's a canonical
+    // final event covering the same content (assistant-text-chunk → the
+    // matching assistant-text emitted at segment end).
+    const ephemeral = event.type === 'tool-progress' || event.type === 'assistant-text-chunk';
     if (!ephemeral) session.chatEvents.push(ev);
     broadcast({ type: 'event', version: bumpVersion(), event: ev });
     if (!ephemeral) scheduleConversationSave();
@@ -5457,6 +5989,20 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
       flushConversationSave();
     }, 300);
   }
+  // Choose a next-event-id counter that can NEVER collide with an already-
+  // loaded event id. Event ids are `e<n>`; nextEventId is normally persisted,
+  // but ephemeral events (tool-progress / assistant-text-chunk) bump the
+  // counter without being saved, so chatEvents.length is an unsafe fallback
+  // (it under-counts). Take the max of the persisted counter and (highest
+  // existing numeric id + 1).
+  function nextIdFor(data) {
+    let maxId = 0;
+    for (const ev of data.chatEvents) {
+      const m = /^e(\d+)$/.exec(ev?.id || '');
+      if (m) { const n = Number(m[1]); if (n > maxId) maxId = n; }
+    }
+    return Math.max(Number(data.nextEventId) || 0, maxId + 1);
+  }
   function flushConversationSave() {
     const file = conversationFilePath();
     if (!file) return;
@@ -5468,7 +6014,18 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
         nextEventId: session.nextEventId,
         chatEvents: session.chatEvents,
       };
-      writeFileSync(file, JSON.stringify(data), 'utf8');
+      // ATOMIC write: serialize to a temp sibling, keep the last-good file as
+      // .bak, then rename temp onto the live file. rename is atomic, so a
+      // process killed mid-write never leaves conversation.json half-written
+      // (the truncated bytes land in .tmp; the live file is replaced in one
+      // step or not at all). Without this, a Ctrl-C / power-loss mid-write
+      // corrupted the only copy and loadConversation silently dropped the
+      // entire history.
+      const tmp = file + '.tmp';
+      const bak = file + '.bak';
+      writeFileSync(tmp, JSON.stringify(data), 'utf8');
+      try { if (existsSync(file)) copyFileSync(file, bak); } catch {}
+      renameSync(tmp, file);
     } catch (e) {
       fileLog(`conversation save failed: ${e.message}`);
     }
@@ -5477,16 +6034,28 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
     if (_saveTimer) { clearTimeout(_saveTimer); _saveTimer = null; }
     const file = conversationFilePath();
     if (!file) return;
-    try {
-      const raw = await readFile(file, 'utf8');
+    const tryParse = async (f) => {
+      const raw = await readFile(f, 'utf8');
       const data = JSON.parse(raw);
-      if (data && Array.isArray(data.chatEvents)) {
-        session.chatEvents = data.chatEvents;
-        session.nextEventId = data.nextEventId || (data.chatEvents.length + 1);
-        fileLog(`loaded conversation: ${data.chatEvents.length} event(s) from ${file}`);
-      }
+      if (!data || !Array.isArray(data.chatEvents)) throw new Error('invalid shape');
+      return data;
+    };
+    let data = null, recoveredFrom = null;
+    try {
+      data = await tryParse(file);
     } catch (e) {
-      if (e.code !== 'ENOENT') fileLog(`conversation load failed: ${e.message}`);
+      if (e.code === 'ENOENT') return; // no conversation yet — fine
+      // Main file is corrupt/half-written. Fall back to the last-good .bak
+      // rather than silently losing everything. Do NOT overwrite/delete the
+      // corrupt main file — leave it for manual salvage.
+      fileLog(`conversation load failed (${e.message}); trying .bak`);
+      try { data = await tryParse(file + '.bak'); recoveredFrom = '.bak'; }
+      catch { fileLog(`conversation .bak also unusable; starting fresh (corrupt file left in place)`); return; }
+    }
+    if (data) {
+      session.chatEvents = data.chatEvents;
+      session.nextEventId = nextIdFor(data);
+      fileLog(`loaded conversation: ${data.chatEvents.length} event(s) from ${file}${recoveredFrom ? ' (recovered from .bak)' : ''}`);
     }
   }
   async function clearConversation() {
@@ -6348,8 +6917,15 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
         let endIdx = session.chatEvents.length;
         if (beforeId) {
           const idx = session.chatEvents.findIndex((e) => e.id === beforeId);
-          if (idx > 0) endIdx = idx;
-          else if (idx === 0) endIdx = 0;
+          if (idx >= 0) {
+            endIdx = idx;
+          } else {
+            // before-id not found — e.g. a stale tab whose oldest id predates
+            // a project switch / reset (ids restart at e1). Returning the
+            // NEWEST window here would make the client PREPEND duplicates at
+            // the top of the log. Return empty + no-more instead.
+            return sendJson(res, 200, { events: [], hasMoreOlder: false, version: session.version });
+          }
         }
         const startIdx = Math.max(0, endIdx - limit);
         const slice = session.chatEvents.slice(startIdx, endIdx);
@@ -6422,6 +6998,8 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
           const prevCwd = process.cwd();
           let cwdChanged = false;
           const chatStart = Date.now();
+          // Hoisted so the catch can finalize a still-pending review row.
+          let pendingReviewEv = null;
           try {
             try { process.chdir(session.activeProject); cwdChanged = true; }
             catch (e) { throw new Error('cannot enter project directory: ' + e.message); }
@@ -6482,7 +7060,10 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
                 const add = await emitGitOp(repoDir, 'git add -A', closedTaskId, () => runGit(repoDir, ['add', '-A']));
                 if (add.exitCode !== 0) continue;
                 const status = await getStatus(repoDir);
-                if (!status.dirty) continue;
+                // Only skip on a CONFIRMED-clean tree. dirty===null means the
+                // status check failed (e.g. index.lock) — attempt the commit
+                // anyway rather than silently dropping the user's work.
+                if (status.dirty === false) continue;
                 const commit = await emitGitOp(repoDir, 'git commit -F -', closedTaskId, () => runGit(repoDir, ['commit', '-F', '-'], { input: msg }));
                 if (commit.exitCode !== 0) continue;
                 const hash = await getHeadHash(repoDir);
@@ -6499,6 +7080,7 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
             // and await /api/git-pending-resolve from the client.
             const requireBranch = async (absPath) => {
               if (!session.git?.isRepo) return 'ok';   // not a git workspace at all
+              if (signal?.aborted) return 'aborted';   // already canceled
               const repoDir = await findContainingRepo(absPath);
               if (!repoDir || !session.git.repos[repoDir]) return 'ok';   // outside any tracked repo
               const repo = session.git.repos[repoDir];
@@ -6521,9 +7103,23 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
                 repoDir, relDir: rel, currentBranch: repo.branch,
               });
               chatState.setPhase('paused');
-              const result = await pending.promise;
-              chatState.setPhase('thinking');
-              return result;
+              // Race the user's resolution against the abort signal. Without
+              // this, a cancel / chat-timeout fires the abort but the await on
+              // pending.promise never settles → the chat stays 'running'
+              // forever (a hard deadlock: close-project and new chats both 409
+              // and the abortController is never cleared). On abort we resolve
+              // 'aborted' so write_file/edit_file throw the existing "write
+              // aborted" error and the loop unwinds normally.
+              const onAbort = () => { try { pending.resolve('aborted'); } catch {} };
+              if (signal) signal.addEventListener('abort', onAbort, { once: true });
+              try {
+                const result = await pending.promise;
+                chatState.setPhase('thinking');
+                return result;
+              } finally {
+                if (signal) signal.removeEventListener('abort', onAbort);
+                if (session.gitPending?.[repoDir] === pending) delete session.gitPending[repoDir];
+              }
             };
             // Review loop: run agent → review → if fail, feed back as a
             // synthetic user message and re-run; max 2 rounds. If still
@@ -6533,8 +7129,24 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
             let userMessage = text;
             let emitInitialUserMessage = true;
             let lastAgentResult = null;
+            // pendingReviewEv (hoisted above the try) tracks an appended-but-
+            // not-yet-resolved 'review' event so the outer catch can finalize
+            // it. Otherwise an abort/throw mid-review leaves the row stuck on
+            // state:'pending' forever (a spinning "reviewing…" row).
             while (true) {
               const turnStartIdx = session.chatEvents.length;
+              // Snapshot each repo's HEAD before the turn so we can tell
+              // whether the agent committed work even if the tree ends clean
+              // (the auto-commit hook commits on <next-task>). Without this,
+              // a turn that does substantive work and closes its task leaves
+              // a clean tree and the reviewer-skip below would skip review of
+              // exactly the changes that most need it.
+              const preHeads = {};
+              if (session.git?.isRepo) {
+                for (const repoDir of session.git.repoList) {
+                  preHeads[repoDir] = await getHeadHash(repoDir);
+                }
+              }
               const result = await runPromptedAgent({
                 adapter,
                 messages: [{ role: 'user', content: userMessage }],
@@ -6558,18 +7170,22 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
               const turnDur = Date.now() - chatStart;
               fileLog(`chat round ${round + 1} done: terminated=${result.terminated} turns=${result.stats.turns} calls=${result.stats.toolCalls} duration=${turnDur}ms`);
 
-              // Skip the reviewer when ALL tracked repos are clean.
-              // Q&A turns, pure-read flows, and turns where the auto-
-              // commit already swept everything into commits don't
-              // need review. Saves the LLM call.
+              // Skip the reviewer ONLY for genuine no-op turns (Q&A / pure
+              // reads): no repo is dirty AND no repo's HEAD advanced this
+              // turn. A turn that wrote files then closed its task gets
+              // auto-committed (clean tree, advanced HEAD) and MUST still be
+              // reviewed. A status check that FAILED (dirty===null) is
+              // treated as "needs review" — never skip on uncertainty.
               if (session.git?.isRepo) {
-                let anyDirty = false;
+                let needsReview = false;
                 for (const repoDir of session.git.repoList) {
                   const status = await getStatus(repoDir);
-                  if (status.dirty) { anyDirty = true; break; }
+                  const headNow = await getHeadHash(repoDir);
+                  const advanced = preHeads[repoDir] && headNow && preHeads[repoDir] !== headNow;
+                  if (status.dirty !== false || advanced) { needsReview = true; break; }
                 }
-                if (!anyDirty) {
-                  fileLog(`reviewer skipped: all repos clean`);
+                if (!needsReview) {
+                  fileLog(`reviewer skipped: all repos clean and unchanged`);
                   break;
                 }
               }
@@ -6581,6 +7197,7 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
                 state: 'pending',
                 round: round + 1,
               });
+              pendingReviewEv = reviewEv;
               const trajectory = buildReviewTrajectory(session.chatEvents.slice(turnStartIdx));
               const review = await runReviewer({
                 adapter, model,
@@ -6589,19 +7206,26 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
                 finalText: result.content,
                 signal,
                 onLog: (msg) => fileLog(msg),
+                // Multi-repo: let the reviewer resolve repo-relative read
+                // paths against the actual sub-repos, not just the workspace
+                // root (cwd), so its reads don't ENOENT and silently pass.
+                repoRoots: session.git?.repoList || [],
               });
 
               if (review.pass) {
                 chatState.patchChatEvent(reviewEv.id, { state: 'pass' });
+                pendingReviewEv = null;
                 break;
               }
               round++;
               if (round >= REVIEW_MAX_ROUNDS) {
                 chatState.patchChatEvent(reviewEv.id, { state: 'escalate', concerns: review.concerns });
+                pendingReviewEv = null;
                 fileLog(`reviewer escalated after ${round} rounds: ${review.concerns.slice(0, 200)}`);
                 break;
               }
               chatState.patchChatEvent(reviewEv.id, { state: 'fail', concerns: review.concerns });
+              pendingReviewEv = null;
               fileLog(`reviewer found issues round ${round}, feeding back: ${review.concerns.slice(0, 200)}`);
               // Re-invoke with the reviewer's concerns as the next agent input.
               // Suppress the user-message event since the review event itself
@@ -6652,6 +7276,12 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
           } catch (e) {
             const dur = Date.now() - chatStart;
             const aborted = e?.name === 'AbortError' || /aborted/i.test(e?.message ?? '');
+            // Don't leave a 'reviewing…' row spinning forever if the reviewer
+            // was interrupted (abort / network error mid-review).
+            if (pendingReviewEv) {
+              try { chatState.patchChatEvent(pendingReviewEv.id, { state: 'error', concerns: aborted ? 'review canceled' : ('review failed: ' + e.message) }); } catch {}
+              pendingReviewEv = null;
+            }
             chatState.setError(aborted ? (session.error || 'aborted') : e.message);
             chatState.setStatus('error');
             fileLog(`chat ${aborted ? 'ABORTED' : 'ERROR'} after ${dur}ms: ${e.message}`);
@@ -6692,6 +7322,15 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
         return sendJson(res, 200, { ok: true, version: session.version, timeoutMs: ms });
       }
       if (req.method === 'POST' && path === '/api/chat') {
+        // DEPRECATED / DISABLED. Superseded by /api/message. This legacy
+        // handler had no running-lock and registered no abortController, so
+        // overlapping use (a stale old-build tab, or two tabs) raced the
+        // GLOBAL process.cwd() mid-loop → tools read/write the wrong repo,
+        // and /api/cancel couldn't stop it. The shipped UI and all tests use
+        // /api/message; this endpoint is unreachable from them. Reject it so
+        // the racy path can never run. (Dead body below kept for reference.)
+        return sendJson(res, 410, { error: 'deprecated endpoint; use /api/message' });
+        // eslint-disable-next-line no-unreachable
         const raw = await readBody(req);
         const body = JSON.parse(raw);
         res.writeHead(200, {
@@ -6823,9 +7462,23 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
     catch (e) { console.error('[server] could not open initial project:', e.message); }
   }
 
+  // Flush any pending debounced save on shutdown. Without this, an event
+  // appended within the last 300ms before the user closes the PowerShell
+  // window / Ctrl-C's the bundle is lost (it lived only in the pending
+  // setTimeout). The flush is synchronous so it completes inside the signal
+  // handler before the process exits.
+  let _shutdownFlushed = false;
+  const flushOnShutdown = () => {
+    if (_shutdownFlushed) return; _shutdownFlushed = true;
+    try { if (_saveTimer) { clearTimeout(_saveTimer); _saveTimer = null; } flushConversationSave(); } catch {}
+  };
+  process.once('SIGINT', () => { flushOnShutdown(); process.exit(130); });
+  process.once('SIGTERM', () => { flushOnShutdown(); process.exit(143); });
+  process.once('beforeExit', flushOnShutdown);
+
   return new Promise((resolve, reject) => {
     server.once('error', reject);
-    server.listen(port, '127.0.0.1', () => resolve({ server, session, port }));
+    server.listen(port, '127.0.0.1', () => resolve({ server, session, port, flushConversationSave }));
   });
 }
 
@@ -7215,25 +7868,39 @@ const UI_HTML = `<!DOCTYPE html>
     color: var(--fg);
     cursor: text;
   }
-  .body code { color: var(--accent); }
-  /* Inline markdown rendered by renderInline(). All rules are scoped to
-     .md so they don't leak into accidental h/ul/li elsewhere. */
-  .body strong { color: var(--fg); font-weight: 700; }
-  .body h3.md, .body h4.md, .body h5.md {
+  /* Inline markdown rendered by renderInline(). Applies to both
+     assistant rows (.body) and user bubbles (.bubble.user .bubble-content)
+     since both run their content through the same renderer. The block-level
+     rules stay scoped to .md so they don't leak onto accidental h/ul/li
+     produced by other paths. */
+  .body code,
+  .bubble.user .bubble-content code { color: var(--accent); }
+  .body strong,
+  .bubble.user .bubble-content strong { color: var(--fg); font-weight: 700; }
+  .body h3.md, .body h4.md, .body h5.md,
+  .bubble.user .bubble-content h3.md,
+  .bubble.user .bubble-content h4.md,
+  .bubble.user .bubble-content h5.md {
     margin: 8px 0 2px;
     font-weight: 700;
     line-height: 1.3;
     color: var(--fg);
   }
-  .body h3.md { font-size: 15px; color: var(--accent); }
-  .body h4.md { font-size: 13.5px; }
-  .body h5.md { font-size: 12.5px; color: var(--muted); letter-spacing: 0.3px; text-transform: uppercase; }
-  .body ul.md {
+  .body h3.md,
+  .bubble.user .bubble-content h3.md { font-size: 15px; color: var(--accent); }
+  .body h4.md,
+  .bubble.user .bubble-content h4.md { font-size: 13.5px; }
+  .body h5.md,
+  .bubble.user .bubble-content h5.md { font-size: 12.5px; color: var(--muted); letter-spacing: 0.3px; text-transform: uppercase; }
+  .body ul.md,
+  .bubble.user .bubble-content ul.md {
     margin: 4px 0 6px;
     padding-left: 20px;
   }
-  .body ul.md li { margin: 0 0 2px; }
-  .body ul.md li::marker { color: var(--accent); }
+  .body ul.md li,
+  .bubble.user .bubble-content ul.md li { margin: 0 0 2px; }
+  .body ul.md li::marker,
+  .bubble.user .bubble-content ul.md li::marker { color: var(--accent); }
 
   /* Result row — "⎿ summary" sits under the body text of the tool row
      above (one char + gap to the right of the bullet column). Hanging
@@ -9517,7 +10184,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       next = '… [earlier output trimmed] …\\n' + next.slice(-PROGRESS_MAX_BYTES);
     }
     _progressBuffers.set(callId, next);
-    const placeholder = $log.querySelector(\`.row-result.running[data-call-id="\${callId}"]\`);
+    const placeholder = $log.querySelector(\`.row-result.running[data-call-id="\${CSS.escape(callId)}"]\`);
     if (!placeholder) return;
     const sum = placeholder.querySelector('.run-sum');
     if (sum) sum.textContent = \`⎿ Running… \${fmtBytes(next.length)}\`;
@@ -9535,9 +10202,10 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     return (n / 1024 / 1024).toFixed(2) + ' MB';
   }
 
-  function addResultRow(ev) {
+  function addResultRow(ev, callId) {
     const row = document.createElement('div');
     row.className = 'row-result' + (ev.status === 'error' ? ' err' : '');
+    if (callId) row.setAttribute('data-call-id', callId);
     row.innerHTML = '⎿ ' + escapeHtml(ev.summary);
     if (ev.full && ev.full.length) {
       // No "(expand)" link — clicking anywhere on the row toggles the full
@@ -9559,7 +10227,19 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
         }
       });
     }
-    $log.appendChild(row);
+    // Place the result row directly AFTER the matching tool-call row so
+    // the chat log reads "tool X → its result → next tool" instead of
+    // every result piling up at the bottom. This matters most for
+    // multi-block replies where calls fire interleaved with prose.
+    let inserted = false;
+    if (callId) {
+      const callRow = $log.querySelector(\`.row.tool[data-call-id="\${CSS.escape(callId)}"]\`);
+      if (callRow) {
+        callRow.insertAdjacentElement('afterend', row);
+        inserted = true;
+      }
+    }
+    if (!inserted) $log.appendChild(row);
     pinStatusToBottom();
     scrollToBottom();
     return row;
@@ -9582,25 +10262,37 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
 
     const body = document.createElement('div');
     body.className = 'diff-body';
-    const lines = String(ev.diff || '').split('\\n');
-    for (const line of lines) {
-      // Skip the file-header lines (--- / +++) — the row above already
-      // names the file, repeating it here is just noise. Hunk markers
-      // (@@) and content lines stay.
-      if (line.startsWith('+++') || line.startsWith('---')) continue;
+    // Skip the file-header lines (--- / +++) — the row above already names
+    // the file. Hunk markers (@@) and content lines stay.
+    const kept = String(ev.diff || '').split('\\n').filter((l) => !l.startsWith('+++') && !l.startsWith('---'));
+    const appendDL = (line) => {
       const ln = document.createElement('div');
       ln.className = 'dl';
-      if (line.startsWith('@@')) {
-        ln.classList.add('hunk');
-      } else if (line.startsWith('+')) {
-        ln.classList.add('add');
-      } else if (line.startsWith('-')) {
-        ln.classList.add('del');
-      } else {
-        ln.classList.add('same');
-      }
+      if (line.startsWith('@@')) ln.classList.add('hunk');
+      else if (line.startsWith('+')) ln.classList.add('add');
+      else if (line.startsWith('-')) ln.classList.add('del');
+      else ln.classList.add('same');
       ln.textContent = line || ' ';
       body.appendChild(ln);
+    };
+    // Cap initial render: a multi-thousand-line diff (full-file rewrite of a
+    // big generated XML/Java file) would build thousands of DOM nodes — and
+    // every event-patch / reload re-renders the whole log. Render the first
+    // DIFF_LINE_CAP lines and lazily reveal the rest on click.
+    const DIFF_LINE_CAP = 400;
+    const head = kept.slice(0, DIFF_LINE_CAP);
+    for (const line of head) appendDL(line);
+    if (kept.length > DIFF_LINE_CAP) {
+      const more = document.createElement('div');
+      more.className = 'dl same diff-more';
+      more.style.cursor = 'pointer';
+      more.textContent = \`… \${kept.length - DIFF_LINE_CAP} more lines (click to expand)\`;
+      more.onclick = (e) => {
+        e.stopPropagation();
+        more.remove();
+        for (const line of kept.slice(DIFF_LINE_CAP)) appendDL(line);
+      };
+      body.appendChild(more);
     }
 
     let collapsed = false;
@@ -9637,6 +10329,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     if (ev.state === 'pass') ring.textContent = '✓';
     else if (ev.state === 'fail') ring.textContent = '✗';
     else if (ev.state === 'escalate') ring.textContent = '⚠';
+    else if (ev.state === 'error') ring.textContent = '⚠';
     else ring.textContent = '◌';
     row.appendChild(ring);
 
@@ -9645,6 +10338,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     if (ev.state === 'pass') label.textContent = \`Review passed (round \${ev.round || 1})\`;
     else if (ev.state === 'fail') label.textContent = \`Review found issues — handing back for fix (round \${ev.round || 1}):\`;
     else if (ev.state === 'escalate') label.textContent = \`Reviewer still has concerns after \${ev.round || 2} attempts — your call:\`;
+    else if (ev.state === 'error') label.textContent = ev.concerns || 'Review interrupted.';
     else label.textContent = \`Reviewing (round \${ev.round || 1})…\`;
     row.appendChild(label);
 
@@ -10669,9 +11363,42 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     switch (ev.type) {
       case 'user-message': node = addBubble('user', ev.content || ''); break;
       case 'assistant-text': {
+        // If a streaming bubble for this (taskId, turn, segmentIndex) is
+        // already visible from chunk events, replace its content with the
+        // canonical (sanitized + renderInline'd) version instead of
+        // duplicating it. \`turn\` is required: segmentIndex resets per turn.
+        const segKey = (ev.taskId || '') + ':' + (ev.turn ?? 0) + ':' + (ev.segmentIndex ?? 0);
+        const existing = $log.querySelector(\`.row.assistant[data-streaming="true"][data-segment-key="\${CSS.escape(segKey)}"]\`);
+        if (existing) {
+          const body = existing.querySelector('.body');
+          if (body) body.innerHTML = renderInline(ev.content || '');
+          existing.removeAttribute('data-streaming');
+          node = existing;
+          break;
+        }
         const body = addRow('assistant', '');
         body.innerHTML = renderInline(ev.content || '');
         node = body.parentElement;     // the .row
+        break;
+      }
+      case 'assistant-text-chunk': {
+        // Live token streaming. Same (taskId, turn, segmentIndex) → same
+        // bubble; a different turn/segmentIndex starts a fresh one. Marked
+        // data-streaming so the matching assistant-text event can find +
+        // finalize it. \`turn\` prevents turn N+1 from appending onto a
+        // dangling turn-N bubble (segmentIndex resets to 0 each turn).
+        const segKey = (ev.taskId || '') + ':' + (ev.turn ?? 0) + ':' + (ev.segmentIndex ?? 0);
+        let row = $log.querySelector(\`.row.assistant[data-streaming="true"][data-segment-key="\${CSS.escape(segKey)}"]\`);
+        if (!row) {
+          const body = addRow('assistant', '');
+          row = body.parentElement;
+          row.setAttribute('data-streaming', 'true');
+          row.setAttribute('data-segment-key', segKey);
+        }
+        const body = row.querySelector('.body');
+        if (body) body.textContent = (body.textContent || '') + (ev.content || '');
+        node = row;
+        scrollToBottom();
         break;
       }
       case 'tool-call': {
@@ -10756,11 +11483,12 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
         if ((ev.verb || ev.name) === 'next-task') break;
         // The matching tool-call row's blinking dot should stop now.
         if (ev.callId) {
-          const callRow = $log.querySelector(\`.row.tool[data-call-id="\${ev.callId}"]\`);
+          const cid = CSS.escape(ev.callId);
+          const callRow = $log.querySelector(\`.row.tool[data-call-id="\${cid}"]\`);
           if (callRow) callRow.classList.remove('tool-running');
           // Drop the running placeholder and its live-output buffer —
           // the proper result row below carries the full final content.
-          const placeholder = $log.querySelector(\`.row-result.running[data-call-id="\${ev.callId}"]\`);
+          const placeholder = $log.querySelector(\`.row-result.running[data-call-id="\${cid}"]\`);
           if (placeholder) placeholder.remove();
           _progressBuffers.delete(ev.callId);
         }
@@ -10768,7 +11496,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
           status: ev.status,
           summary: summarizeResult(ev),
           full: ev.content || '',
-        });
+        }, ev.callId);
         break;
       }
       case 'diff':
