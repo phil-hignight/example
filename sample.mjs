@@ -15,7 +15,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '137';
+const BUILD_VERSION = '138';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
@@ -30,7 +30,7 @@ import { createServer } from 'node:http';
 import { fileURLToPath } from 'node:url';
 import { homedir, tmpdir } from 'node:os';
 import { readFile as _readFile, writeFile as _writeFile, mkdir as _mkdir, stat as _stat, readdir as _readdir, unlink as _unlink, rename as _rename, copyFile as _copyFile } from 'node:fs/promises';
-import { existsSync, appendFileSync, mkdirSync, statSync, readFileSync, writeFileSync, renameSync, copyFileSync, readdirSync } from 'node:fs';
+import { existsSync, appendFileSync, mkdirSync, statSync, readFileSync, writeFileSync, renameSync, copyFileSync, readdirSync, openSync, readSync, closeSync } from 'node:fs';
 import { randomUUID as _randomUUID } from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
 import path from 'node:path';
@@ -9650,8 +9650,23 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
             const s = statSync(lf);
             logExists = true;
             logBytes = s.size;
-            const buf = readFileSync(lf, 'utf8');
-            logTail = buf.length > 16000 ? '...' + buf.slice(-16000) : buf;
+            // Read only the TAIL (last ~16 KB), NOT the whole file. This runs
+            // on every /api/diagnostics + /api/queries (Snapshot) fetch, and a
+            // synchronous readFileSync of a multi-MB log blocks the event loop
+            // long enough to make the Snapshot fetch time out ("server
+            // unresponsive") on an established project. A bounded fd read is
+            // fast regardless of log size.
+            const want = 16000;
+            const start = s.size > want ? s.size - want : 0;
+            const len = s.size - start;
+            if (len > 0) {
+              const fd = openSync(lf, 'r');
+              try {
+                const buf = Buffer.allocUnsafe(len);
+                readSync(fd, buf, 0, len, start);
+                logTail = (start > 0 ? '...' : '') + buf.toString('utf8');
+              } finally { closeSync(fd); }
+            }
           } catch (e) { logTail = `(log read failed: ${e.message})`; }
         }
         const memUsage = (() => {
@@ -12813,6 +12828,16 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       $status.textContent = 'Loading models (this may pause for unlock)…';
       await loadModels();  // blocks here if a 401 unlock is needed
       console.log('[init] loadModels done after', tick());
+      // Models loaded → any API-key/unlock dance is definitively complete, so
+      // make sure the init modal ($initModalBg — the api-key/unlock overlay,
+      // a DIFFERENT element from the init view) can't stay stuck over the
+      // now-ready chat. Its own close paths (the /api/unlock-done fetch and the
+      // SSE 'unlock-done' message) can be missed if the response is slow; this
+      // is the backstop.
+      if ($initModalBg.classList.contains('show')) {
+        console.log('[init] closing leftover init/unlock modal after successful model load');
+        $initModalBg.classList.remove('show');
+      }
       $status.textContent = 'Ready.';
       $init.classList.add('hidden');
       _initialized = true;
@@ -13017,14 +13042,19 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       btn.disabled = true;
       msg.textContent = 'Telling server you unlocked, retrying request…';
       console.log('[unlock] user clicked done, posting /api/unlock-done');
-      try {
-        await fetch('/api/unlock-done', { method: 'POST' });
-        console.log('[unlock] /api/unlock-done returned');
-        $initModalBg.classList.remove('show');
-      } catch (e) {
-        msg.textContent = 'Could not signal server: ' + e.message;
-        btn.disabled = false;
-      }
+      // Close the modal OPTIMISTICALLY and don't block it on the fetch
+      // resolving. The server resolves the pending unlock the instant it
+      // RECEIVES this POST (the in-flight request retries on its own); waiting
+      // for the 200 to come back left the modal stuck on "retrying request…"
+      // when the response was slow/queued. A bounded fetch with a timeout
+      // fires the signal without ever hanging the UI.
+      const ctrl = new AbortController();
+      const tid = setTimeout(() => { try { ctrl.abort(); } catch {} }, 8000);
+      fetch('/api/unlock-done', { method: 'POST', signal: ctrl.signal })
+        .then(() => console.log('[unlock] /api/unlock-done returned'))
+        .catch((e) => console.log('[unlock] /api/unlock-done signal error (non-fatal):', e?.message))
+        .finally(() => clearTimeout(tid));
+      $initModalBg.classList.remove('show');
     };
   }
 
