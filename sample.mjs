@@ -15,7 +15,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '138';
+const BUILD_VERSION = '139';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
@@ -5883,13 +5883,15 @@ function bootstrapFromSource() {
     mkdirSync(libDir, { recursive: true });
     const e = new Error(
       'docx editing needs the Apache POI dependency jars (one-time setup). Copy these ' +
-      '13 jars — poi-ooxml, poi, poi-ooxml-lite, xmlbeans, SparseBitSet, curvesapi, ' +
-      'commons-codec, commons-collections4, commons-compress, commons-io, commons-lang3, ' +
-      'commons-math3, log4j-api (POI 5.5.1 and its dependencies) — into this folder:\n  ' +
+      '13 jars (the POI 5.5.1 closure code_boss was built + tested against) into this folder:\n  ' +
       libDir + '\n' +
-      '(or set CODEBOSS_DOCX_LIB to a folder that already contains them), then restart. ' +
-      'The helper itself is compiled automatically from source embedded in this bundle — ' +
-      'a JDK 11+ (javac) must be on PATH.'
+      '    poi-ooxml-5.5.1.jar, poi-5.5.1.jar, poi-ooxml-lite-5.5.1.jar, xmlbeans-5.3.0.jar,\n' +
+      '    SparseBitSet-1.3.jar, curvesapi-1.08.jar, commons-codec-1.20.0.jar,\n' +
+      '    commons-collections4-4.5.0.jar, commons-compress-1.28.0.jar, commons-io-2.21.0.jar,\n' +
+      '    commons-lang3-3.18.0.jar, commons-math3-3.6.1.jar, log4j-api-2.24.3.jar\n' +
+      '(matching versions are safest; or set CODEBOSS_DOCX_LIB to a folder that already ' +
+      'contains them). Then restart. The helper itself is compiled automatically from source ' +
+      'embedded in this bundle — a JDK 11+ (javac) must be on PATH.'
     );
     e.code = 'docx-needs-deps';
     throw e;
