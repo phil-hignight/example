@@ -15,7 +15,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '88';
+const BUILD_VERSION = '137';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
@@ -24,16 +24,18 @@ const MODEL    = 'gemini-3.1-pro-preview';          // default model selected in
 const PORT     = Number(process.env.PORT ?? 18888); // local UI port
 // ==================================
 
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { createServer } from 'node:http';
+import { fileURLToPath } from 'node:url';
 import { homedir, tmpdir } from 'node:os';
-import { readFile as _readFile, writeFile as _writeFile, mkdir as _mkdir, stat as _stat, readdir as _readdir, unlink as _unlink } from 'node:fs/promises';
-import { existsSync, appendFileSync, mkdirSync, statSync, readFileSync, writeFileSync, renameSync, copyFileSync } from 'node:fs';
+import { readFile as _readFile, writeFile as _writeFile, mkdir as _mkdir, stat as _stat, readdir as _readdir, unlink as _unlink, rename as _rename, copyFile as _copyFile } from 'node:fs/promises';
+import { existsSync, appendFileSync, mkdirSync, statSync, readFileSync, writeFileSync, renameSync, copyFileSync, readdirSync } from 'node:fs';
 import { randomUUID as _randomUUID } from 'node:crypto';
+import { StringDecoder } from 'node:string_decoder';
 import path from 'node:path';
 import zlib from 'node:zlib';
-const readFile = _readFile, writeFile = _writeFile, mkdir = _mkdir, stat = _stat, readdir = _readdir, unlink = _unlink;
+const readFile = _readFile, writeFile = _writeFile, mkdir = _mkdir, stat = _stat, readdir = _readdir, unlink = _unlink, rename = _rename, copyFile = _copyFile;
 const randomUUID = _randomUUID;
 
 
@@ -451,6 +453,275 @@ function createHttpAdapter(opts = {}) {
   return { complete, completeStream, listModels };
 }
 
+// ====== llm/anthropic-http.mjs ======
+/**
+ * Anthropic Messages API adapter — talks to an Anthropic-format endpoint
+ * (e.g. a local proxy at http://127.0.0.1:8080 that adds the key and drives
+ * Claude). Same SURFACE as the OpenAI adapter (createHttpAdapter):
+ *
+ *   const a = createAnthropicAdapter({ baseURL, apiKey })
+ *   await a.complete(openaiRequest)            -> openai-shaped response
+ *   for await (const c of a.completeStream(req)) { ... }  -> openai-shaped chunks
+ *   await a.listModels()                       -> { data: [...] }
+ *
+ * code_boss speaks one wire shape internally: OpenAI chat-completions
+ * (`{model, messages:[{role,content}]}` in; `{choices:[{message:{content}}]}`
+ * out; stream chunks `{choices:[{delta:{content}}]}`). This adapter translates
+ * THAT to/from Anthropic's `/v1/messages`:
+ *   - hoists any role:'system' messages into the top-level `system` field
+ *   - coalesces consecutive same-role turns (Anthropic requires alternation)
+ *   - sends the required `max_tokens` + `anthropic-version` header
+ *   - joins Anthropic `content:[{type:'text',text}]` blocks back into a string
+ *   - maps usage (input/output_tokens -> prompt/completion/total_tokens) so the
+ *     server's onUsage hook is unchanged
+ *   - parses Anthropic SSE (content_block_delta) into OpenAI chunks
+ *
+ * The agent uses the prose <remote-workspace> tool protocol, NOT OpenAI/
+ * Anthropic function-calling, so requests are text-only (no `tools` array) —
+ * which keeps this translation simple and lossless.
+ *
+ * No npm deps. Node 18+ built-in fetch only.
+ */
+
+const ANTHROPIC_DEFAULT_BASE_URL = 'http://127.0.0.1:8080/v1';
+const DEFAULT_MAX_TOKENS = 16384;
+const ANTHROPIC_VERSION = '2023-06-01';
+
+class AnthropicHttpError extends Error {
+  constructor(status, statusText, body) {
+    super(`HTTP ${status} ${statusText}: ${typeof body === 'string' ? body.slice(0, 500) : JSON.stringify(body).slice(0, 500)}`);
+    this.status = status; this.statusText = statusText; this.body = body;
+  }
+}
+function anthSleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+async function anthReadJson(res) { const t = await res.text(); try { return JSON.parse(t); } catch { return { raw: t }; } }
+
+// OpenAI finish_reason from Anthropic stop_reason.
+function mapStop(stopReason) {
+  switch (stopReason) {
+    case 'end_turn': case 'stop_sequence': return 'stop';
+    case 'max_tokens': return 'length';
+    case 'tool_use': return 'tool_calls';
+    default: return stopReason ? 'stop' : null;
+  }
+}
+
+// OpenAI usage from Anthropic usage.
+function mapUsage(u) {
+  if (!u) return null;
+  const prompt = u.input_tokens ?? 0;
+  const completion = u.output_tokens ?? 0;
+  return { prompt_tokens: prompt, completion_tokens: completion, total_tokens: prompt + completion };
+}
+
+/**
+ * Translate an OpenAI-shaped chat request into an Anthropic /v1/messages body.
+ * Returns { body, system }. `stream` is set by the caller.
+ */
+function toAnthropicBody(request, defaultMaxTokens) {
+  const src = Array.isArray(request.messages) ? request.messages : [];
+  const systemParts = [];
+  const turns = [];
+  for (const m of src) {
+    const content = typeof m.content === 'string' ? m.content : (Array.isArray(m.content) ? m.content.map((b) => (typeof b === 'string' ? b : b?.text || '')).join('') : String(m.content ?? ''));
+    if (m.role === 'system') { if (content.trim()) systemParts.push(content); continue; }
+    const role = m.role === 'assistant' ? 'assistant' : 'user';   // map tool/function/etc. → user
+    // Coalesce consecutive same-role turns (Anthropic requires strict
+    // user/assistant alternation).
+    const last = turns[turns.length - 1];
+    if (last && last.role === role) last.content += '\n\n' + content;
+    else turns.push({ role, content });
+  }
+  // Anthropic requires the first turn to be 'user' and the list non-empty.
+  while (turns.length && turns[0].role === 'assistant') turns.shift();
+  if (turns.length === 0) turns.push({ role: 'user', content: '(no input)' });
+  // Anthropic ALSO requires the conversation to END with a user message (no
+  // trailing-assistant "prefill"). The agent loop legitimately ends with an
+  // assistant turn right after <next-task> closes a task (the freshly-opened
+  // task has no user message yet) — OpenAI/Gemini accept that, Anthropic 400s.
+  // Append a minimal user continuation so the model can conclude or continue.
+  if (turns[turns.length - 1].role === 'assistant') {
+    turns.push({ role: 'user', content: 'Continue. If everything the previous request asked for is already done, reply with a brief confirmation and make no further tool calls.' });
+  }
+  const body = {
+    model: request.model,
+    max_tokens: Number(request.max_tokens) > 0 ? Number(request.max_tokens) : defaultMaxTokens,
+    messages: turns.map((t) => ({ role: t.role, content: t.content })),
+  };
+  if (request.temperature != null) body.temperature = request.temperature;
+  const system = systemParts.join('\n\n');
+  if (system) body.system = system;
+  return body;
+}
+
+// Anthropic message response → OpenAI chat-completion response.
+function toOpenAiResponse(json) {
+  const text = Array.isArray(json?.content)
+    ? json.content.filter((b) => b && b.type === 'text').map((b) => b.text || '').join('')
+    : '';
+  const usage = mapUsage(json?.usage);
+  return {
+    id: json?.id ?? 'msg',
+    object: 'chat.completion',
+    model: json?.model,
+    choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: mapStop(json?.stop_reason) ?? 'stop' }],
+    ...(usage ? { usage } : {}),
+  };
+}
+
+function createAnthropicAdapter(opts = {}) {
+  const baseURL = (opts.baseURL ?? process.env.AGENT_BASE_URL ?? ANTHROPIC_DEFAULT_BASE_URL).replace(/\/+$/, '');
+  const apiKeyOpt = opts.apiKey ?? process.env.AGENT_API_KEY ?? '';
+  const getApiKey = typeof apiKeyOpt === 'function' ? apiKeyOpt : () => apiKeyOpt;
+  const fetchImpl = opts.fetchImpl ?? globalThis.fetch;
+  // The proxy can momentarily 429 from its direct-API path (warm-pool /
+  // concurrency); be patient — retry several times with a real backoff.
+  const maxRetries = opts.maxRetries ?? 6;
+  const defaultMaxTokens = Number(opts.maxTokens ?? process.env.AGENT_MAX_TOKENS) > 0 ? Number(opts.maxTokens ?? process.env.AGENT_MAX_TOKENS) : DEFAULT_MAX_TOKENS;
+  const onUnlock = opts.onUnlock ?? (() => {});
+  const onRateLimit = opts.onRateLimit ?? (() => {});
+  const onUsage = opts.onUsage ?? (() => {});
+  const onTransaction = opts.onTransaction ?? (() => {});
+  const debug = opts.debug ?? (process.env.AGENT_DEBUG === '1');
+  if (!fetchImpl) throw new Error('createAnthropicAdapter: no fetch implementation available');
+
+  async function doFetchOnce(path, init, stream) {
+    const url = `${baseURL}${path}`;
+    const apiKey = getApiKey() || '';
+    const headers = {
+      'content-type': 'application/json',
+      accept: stream ? 'text/event-stream' : 'application/json',
+      'anthropic-version': ANTHROPIC_VERSION,
+      ...(apiKey ? { 'x-api-key': apiKey } : {}),   // proxy adds the key; only set if we actually have one
+      ...(init?.headers ?? {}),
+    };
+    return fetchImpl(url, { ...init, headers });
+  }
+
+  async function safeFetch(path, init, stream) {
+    let attempt = 0, unlocked = false;
+    while (true) {
+      const res = await doFetchOnce(path, init, stream);
+      if (res.ok) return res;
+      if (res.status === 401 && !unlocked) {
+        const body = await anthReadJson(res);
+        const unlockUrl = body?.unlock_url ?? body?.error?.unlock_url;
+        if (unlockUrl) { await Promise.resolve(onUnlock(unlockUrl)); unlocked = true; continue; }
+        throw new AnthropicHttpError(res.status, res.statusText, body);
+      }
+      if (res.status === 429 && attempt < maxRetries) {
+        const body = await anthReadJson(res);
+        const hdr = Number(res.headers.get?.('retry-after'));
+        // Floor at ~1.5s, exponential, capped at 20s — rides out a busy proxy.
+        const waitMs = Math.min(20000, Math.max((Number.isFinite(hdr) && hdr > 0 ? hdr : 1) * 1000, 1500 * Math.pow(2, attempt)));
+        onRateLimit(waitMs); await anthSleep(waitMs); attempt++; continue;
+      }
+      const body = await anthReadJson(res);
+      throw new AnthropicHttpError(res.status, res.statusText, body);
+    }
+  }
+
+  async function complete(request) {
+    if (!request || !Array.isArray(request.messages)) throw new TypeError('complete: request.messages is required');
+    const { signal } = request;
+    const body = toAnthropicBody(request, defaultMaxTokens);
+    const requestSnapshot = JSON.parse(JSON.stringify({ model: request.model, messages: request.messages }));
+    const t0 = Date.now();
+    if (debug) console.error(`[anthropic>] complete model=${body.model} msgs=${body.messages.length} sys=${body.system ? body.system.length + 'c' : 'none'}`);
+    const res = await safeFetch('/messages', { method: 'POST', body: JSON.stringify(body), signal }, false);
+    const json = await res.json();
+    const oai = toOpenAiResponse(json);
+    onTransaction({ type: 'chat_completions', request: requestSnapshot, response: oai, durationMs: Date.now() - t0 });
+    if (debug) console.error(`[anthropic<] complete stop=${json?.stop_reason} chars=${oai.choices[0].message.content.length}`);
+    if (oai.usage) onUsage(oai.usage);
+    return oai;
+  }
+
+  async function* completeStream(request) {
+    if (!request || !Array.isArray(request.messages)) throw new TypeError('completeStream: request.messages is required');
+    const { signal } = request;
+    const body = { ...toAnthropicBody(request, defaultMaxTokens), stream: true };
+    const requestSnapshot = JSON.parse(JSON.stringify({ model: request.model, messages: request.messages }));
+    const t0 = Date.now();
+    let accumulated = '';
+    let stopReason = null;
+    let usageIn = 0, usageOut = 0, usageFired = false;
+    let txEmitted = false;
+    const emitTx = () => {
+      if (txEmitted) return; txEmitted = true;
+      const usage = mapUsage({ input_tokens: usageIn, output_tokens: usageOut });
+      try {
+        onTransaction({
+          type: 'chat_completions', request: requestSnapshot, streamed: true, durationMs: Date.now() - t0,
+          response: { id: 'stream', object: 'chat.completion', choices: [{ index: 0, message: { role: 'assistant', content: accumulated }, finish_reason: mapStop(stopReason) ?? 'stop' }], ...(usage ? { usage } : {}) },
+        });
+      } catch {}
+    };
+    try {
+      const res = await safeFetch('/messages', { method: 'POST', body: JSON.stringify(body), signal }, true);
+      const ctype = res.headers.get('content-type') || '';
+      // Graceful fallback: endpoint ignored stream:true and returned plain JSON.
+      if (!ctype.includes('text/event-stream')) {
+        const json = await res.json();
+        const oai = toOpenAiResponse(json);
+        if (oai.usage) onUsage(oai.usage);
+        accumulated = oai.choices[0].message.content; stopReason = json?.stop_reason;
+        if (json?.usage) { usageIn = json.usage.input_tokens ?? 0; usageOut = json.usage.output_tokens ?? 0; }
+        txEmitted = true;
+        try { onTransaction({ type: 'chat_completions', request: requestSnapshot, response: oai, durationMs: Date.now() - t0, streamed: false }); } catch {}
+        yield { id: oai.id, object: 'chat.completion.chunk', choices: [{ index: 0, delta: { role: 'assistant', content: accumulated }, finish_reason: oai.choices[0].finish_reason }], ...(oai.usage ? { usage: oai.usage } : {}) };
+        return;
+      }
+      if (!res.body) throw new Error('completeStream: response has no body');
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      const fireUsage = () => { if (!usageFired && (usageIn || usageOut)) { usageFired = true; const u = mapUsage({ input_tokens: usageIn, output_tokens: usageOut }); if (u) onUsage(u); } };
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let idx;
+        while ((idx = buf.indexOf('\n')) !== -1) {
+          const line = buf.slice(0, idx).replace(/\r$/, '');
+          buf = buf.slice(idx + 1);
+          if (!line || line.startsWith(':') || line.startsWith('event:')) continue;
+          if (!line.startsWith('data:')) continue;
+          const data = line.slice(5).trim();
+          if (!data || data === '[DONE]') continue;
+          let ev; try { ev = JSON.parse(data); } catch { continue; }
+          const type = ev.type;
+          if (type === 'message_start') { usageIn = ev.message?.usage?.input_tokens ?? usageIn; }
+          else if (type === 'content_block_delta') {
+            const text = ev.delta?.text ?? (ev.delta?.type === 'text_delta' ? ev.delta.text : '') ?? '';
+            if (text) { accumulated += text; yield { id: 'stream', object: 'chat.completion.chunk', choices: [{ index: 0, delta: { content: text }, finish_reason: null }] }; }
+          } else if (type === 'message_delta') {
+            if (ev.delta?.stop_reason) stopReason = ev.delta.stop_reason;
+            if (ev.usage?.output_tokens != null) usageOut = ev.usage.output_tokens;
+          } else if (type === 'message_stop') {
+            fireUsage();
+          } else if (type === 'error') {
+            throw new AnthropicHttpError(500, 'anthropic-stream-error', ev.error || ev);
+          }
+        }
+      }
+      fireUsage();
+    } finally {
+      emitTx();
+    }
+  }
+
+  async function listModels() {
+    const t0 = Date.now();
+    const res = await safeFetch('/models', { method: 'GET' }, false);
+    const json = await res.json();
+    onTransaction({ type: 'list_models', request: null, response: json, durationMs: Date.now() - t0 });
+    return json;
+  }
+
+  return { complete, completeStream, listModels };
+}
+
 // ====== agent/diff.mjs ======
 /**
  * Small unified-diff helper. Zero deps.
@@ -588,6 +859,190 @@ function countLineDelta(oldText, newText) {
   for (const [line, nb] of fb) add += Math.max(0, nb - (fa.get(line) || 0));
   for (const [line, na] of fa) del += Math.max(0, na - (fb.get(line) || 0));
   return { add, del };
+}
+
+// ====== agent/codebase-memory.mjs ======
+/**
+ * Tier-1 CODEBASE MEMORY — durable, agent-maintained facts about THIS codebase.
+ *
+ * The three-tier memory model:
+ *   Layer 0  human AGENTS.md               (developer-authored; project-context.mjs)
+ *   Tier 1   agent codebase memory         (THIS FILE — what the agent learns
+ *            about the app: architecture, conventions, gotchas, where things
+ *            live, build/deploy specifics; persists across assignments)
+ *   Tier 2   per-assignment memory         (the assignment record; assignments.mjs)
+ *
+ * The agent maintains it with the <remember>/<forget> tools during work; it is
+ * injected into the worker's prompt every run so accrued knowledge compounds.
+ * The developer can review/curate it in the UI (it is plain, human-readable).
+ *
+ * Storage (per project): <project>/.code_boss/codebase-memory.json
+ *   { version, nextId, entries: [{ id, category, note, at }] }
+ * Atomic writes (temp + rename) since it outlives any one conversation. NO LLM
+ * calls here — capture is explicit (a tool) or human (the UI editor).
+ */
+
+const DIR = (projectDir) => path.join(projectDir, '.code_boss');
+const FILE = (projectDir) => path.join(DIR(projectDir), 'codebase-memory.json');
+
+// Bounds: keep the injected memory from blowing out the prompt. The human can
+// always prune in the UI; these are guard rails, not policy.
+const MAX_NOTE_LEN = 600;
+const MAX_ENTRIES = 200;
+const KNOWN_CATEGORIES = ['architecture', 'conventions', 'gotchas', 'where-things-live', 'build-deploy', 'general'];
+
+function normNote(s) { return String(s || '').trim().replace(/\s+/g, ' ').toLowerCase(); }
+function uid() { return process.pid + '-' + randomUUID().slice(0, 8); }
+
+// Per-project write serialization. load->mutate->save must be atomic with
+// respect to other writers: the worker's <remember>/<forget> tool calls and the
+// post-accept consolidation loop can run concurrently against the same file,
+// and an unserialized read-modify-write loses updates / duplicates ids. Chain a
+// promise per project file; fn runs after the previous write settles.
+const _writeChains = new Map();
+function withMemoryLock(projectDir, fn) {
+  const key = FILE(projectDir);
+  const prev = _writeChains.get(key) || Promise.resolve();
+  const next = prev.then(fn, fn);          // run fn regardless of prior outcome
+  _writeChains.set(key, next.then(() => {}, () => {}));   // keep the chain rejection-free
+  return next;
+}
+
+async function loadRaw(projectDir) {
+  let text;
+  try {
+    text = await readFile(FILE(projectDir), 'utf8');
+  } catch (e) {
+    // A fresh store is correct ONLY when the file genuinely doesn't exist yet.
+    if (e && e.code === 'ENOENT') return { version: 1, nextId: 1, entries: [] };
+    throw e;   // real read error (EACCES/EBUSY/…) — surface it, never silently wipe
+  }
+  try {
+    const j = JSON.parse(text);
+    if (!j || !Array.isArray(j.entries)) throw new Error('bad shape');
+    return j;
+  } catch {
+    // The file EXISTS but won't parse (a hand-edit typo, or — pre-mutex — a torn
+    // write). NEVER let the next save overwrite real data with an empty store:
+    // move the unparseable file aside so it's recoverable, then start fresh.
+    try { await rename(FILE(projectDir), FILE(projectDir) + '.corrupt-' + uid()); } catch {}
+    return { version: 1, nextId: 1, entries: [] };
+  }
+}
+
+async function saveRaw(projectDir, mem) {
+  await mkdir(DIR(projectDir), { recursive: true });
+  const file = FILE(projectDir);
+  const tmp = file + '.' + uid() + '.tmp';   // unique per write — never shared
+  await writeFile(tmp, JSON.stringify(mem, null, 2), 'utf8');
+  await rename(tmp, file);
+}
+
+/** All memory entries (in insertion order). */
+async function loadMemory(projectDir) {
+  if (!projectDir) return { version: 1, nextId: 1, entries: [] };
+  return loadRaw(projectDir);
+}
+
+/** Record a durable fact. Dedups on normalized note text (returns the existing
+ *  entry instead of a duplicate). Returns { entry, added, total }. */
+async function rememberFact(projectDir, { category = 'general', note } = {}) {
+  if (!projectDir) throw new Error('no project');
+  const clean = String(note || '').trim().slice(0, MAX_NOTE_LEN);
+  if (!clean) throw new Error('note is required');
+  const cat = KNOWN_CATEGORIES.includes(String(category)) ? String(category) : 'general';
+  return withMemoryLock(projectDir, async () => {
+    const mem = await loadRaw(projectDir);
+    const key = normNote(clean);
+    const existing = mem.entries.find((e) => normNote(e.note) === key);
+    if (existing) return { entry: existing, added: false, total: mem.entries.length };
+    if (mem.entries.length >= MAX_ENTRIES) {
+      return { entry: null, added: false, total: mem.entries.length, full: true };
+    }
+    const entry = { id: `M-${mem.nextId}`, category: cat, note: clean, at: Date.now() };
+    mem.nextId++;
+    mem.entries.push(entry);
+    await saveRaw(projectDir, mem);
+    return { entry, added: true, total: mem.entries.length };
+  });
+}
+
+/** Remove a fact by id (or by exact note match). Returns { removed }. */
+async function forgetFact(projectDir, { id, note } = {}) {
+  if (!projectDir) throw new Error('no project');
+  return withMemoryLock(projectDir, async () => {
+    const mem = await loadRaw(projectDir);
+    const before = mem.entries.length;
+    const key = note ? normNote(note) : null;
+    mem.entries = mem.entries.filter((e) => !(id && e.id === id) && !(key && normNote(e.note) === key));
+    const removed = before - mem.entries.length;
+    if (removed) await saveRaw(projectDir, mem);
+    return { removed };
+  });
+}
+
+/** Replace the whole entry set (used by the UI curation editor). `entries` may
+ *  be raw {category, note} objects; ids/timestamps are (re)assigned. */
+async function replaceEntries(projectDir, entries) {
+  if (!projectDir) throw new Error('no project');
+  return withMemoryLock(projectDir, async () => {
+    const mem = await loadRaw(projectDir);
+    const list = Array.isArray(entries) ? entries : [];
+    let nextId = mem.nextId;
+    const seen = new Set();      // normalized notes (dedup)
+    const seenIds = new Set();   // assigned ids (no two entries share an id)
+    const out = [];
+    for (const e of list) {
+      const clean = String(e?.note || '').trim().slice(0, MAX_NOTE_LEN);
+      if (!clean) continue;
+      const key = normNote(clean);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const cat = KNOWN_CATEGORIES.includes(String(e?.category)) ? String(e.category) : 'general';
+      // Preserve a valid, not-yet-used supplied id; otherwise mint a fresh one.
+      let id = (typeof e?.id === 'string' && /^M-\d+$/.test(e.id) && !seenIds.has(e.id)) ? e.id : `M-${nextId++}`;
+      while (seenIds.has(id)) id = `M-${nextId++}`;   // guard against a mint colliding with a later supplied id
+      seenIds.add(id);
+      out.push({ id, category: cat, note: clean, at: Number(e?.at) || Date.now() });
+      if (out.length >= MAX_ENTRIES) break;
+    }
+    const used = out.map((e) => Number((e.id.match(/^M-(\d+)$/) || [])[1]) || 0);
+    mem.nextId = Math.max(nextId, ...used.map((n) => n + 1), 1);   // strictly past every used id
+    mem.entries = out;
+    await saveRaw(projectDir, mem);
+    return mem;
+  });
+}
+
+/** Render the memory as a compact, prompt-ready (and human-readable) block.
+ *  Empty memory → ''. Grouped by category, capped to `budgetChars`. */
+function renderMemory(memOrEntries, { budgetChars = 6000 } = {}) {
+  const entries = Array.isArray(memOrEntries) ? memOrEntries : (memOrEntries?.entries || []);
+  if (!entries.length) return '';
+  const byCat = new Map();
+  for (const e of entries) {
+    const c = e.category || 'general';
+    if (!byCat.has(c)) byCat.set(c, []);
+    byCat.get(c).push(e);
+  }
+  const order = [...KNOWN_CATEGORIES, ...[...byCat.keys()].filter((c) => !KNOWN_CATEGORIES.includes(c))];
+  const lines = [];
+  let used = 0;
+  for (const cat of order) {
+    const list = byCat.get(cat);
+    if (!list || !list.length) continue;
+    const header = `## ${cat}`;
+    if (used + header.length > budgetChars) break;
+    lines.push(header); used += header.length;
+    for (const e of list) {
+      // Include the id so the model can target it with <forget id="M-N"/>.
+      const line = e.id ? `- [${e.id}] ${e.note}` : `- ${e.note}`;
+      if (used + line.length > budgetChars) { lines.push('- […memory truncated for budget…]'); used = budgetChars; break; }
+      lines.push(line); used += line.length;
+    }
+    if (used >= budgetChars) break;
+  }
+  return lines.join('\n');
 }
 
 // ====== agent/tools.mjs ======
@@ -1133,7 +1588,13 @@ const tools = {
           if (progressTimer) { clearTimeout(progressTimer); flushProgress(); }
           resolve(`ERROR: failed to spawn shell: ${err.message}`);
         });
-        const finish = (code, signal) => {
+        // Hoisted function declaration (NOT a const arrow): the grace timer's
+        // callback in armGrace() calls finish() and is scheduled before this
+        // point lexically. A const/let would be in the temporal dead zone if
+        // that timer ever fired early, throwing "Cannot access 'finish' before
+        // initialization". A function declaration is hoisted, so it's always
+        // callable.
+        function finish(code, signal) {
           if (settled) return; settled = true;
           clearTimeout(timer);
           if (killGraceTimer) { clearTimeout(killGraceTimer); killGraceTimer = null; }
@@ -1183,7 +1644,7 @@ const tools = {
           // commands (git diff --exit-code, grep, etc.) intentionally
           // return non-zero for normal outcomes.
           resolve((timedOut || signal === 'killfail') ? 'ERROR: ' + text : text);
-        };
+        }
         child.on('close', finish);
       });
     },
@@ -1220,6 +1681,46 @@ const tools = {
         }
       }
       return ensureFits(lines.join('\n'));
+    },
+  },
+
+  remember: {
+    schema: {
+      description: 'Record ONE durable, reusable fact about THIS codebase into the persistent codebase memory (injected into your context every future run). Use for architecture, conventions, gotchas, where-things-live, and build/deploy specifics that will help future work. Do NOT record task-specific, transient, or obvious-from-the-code details. Keep it concise and factual. Duplicates are ignored.',
+      parameters: {
+        type: 'object',
+        properties: {
+          note: { type: 'string', description: 'The fact, in one or two sentences.' },
+          category: { type: 'string', description: `One of: ${KNOWN_CATEGORIES.join(', ')}. Defaults to general.`, enum: KNOWN_CATEGORIES },
+        },
+        required: ['note'],
+        additionalProperties: false,
+      },
+    },
+    impl: async ({ note, category }) => {
+      const r = await rememberFact(process.cwd(), { note, category });
+      if (r.full) return `ERROR: codebase memory is full (${r.total} entries); ask the developer to prune it before adding more.`;
+      if (!r.added) return `Already remembered (${r.entry?.id || 'existing'}): "${r.entry?.note || ''}". No change.`;
+      return `Remembered [${r.entry.category}] ${r.entry.id}: "${r.entry.note}". Codebase memory now has ${r.total} fact(s).`;
+    },
+  },
+
+  forget: {
+    schema: {
+      description: 'Remove a fact from the persistent codebase memory — by its id (e.g. "M-3") or by an exact note match. Use when a remembered fact has become wrong or obsolete.',
+      parameters: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', description: 'The memory id to remove, e.g. "M-3".' },
+          note: { type: 'string', description: 'Alternatively, the exact note text to remove.' },
+        },
+        required: [],
+        additionalProperties: false,
+      },
+    },
+    impl: async ({ id, note }) => {
+      const r = await forgetFact(process.cwd(), { id, note });
+      return r.removed ? `Forgot ${r.removed} fact(s).` : 'No matching fact found; nothing removed.';
     },
   },
 };
@@ -1520,6 +2021,18 @@ function createTasksStore(projectDir) {
     return out;
   }
 
+  /** Backfill/overwrite a closed task's summary (e.g. when the agent emitted
+   *  <next-task> with a blank summary and we synthesized one afterward).
+   *  Persists; works at any tier. No-op on a missing task or empty summary. */
+  async function setSummary(id, summary) {
+    if (typeof summary !== 'string' || !summary.trim()) return null;
+    const t = await loadTask(id);
+    if (!t) return null;
+    t.summary = summary.trim();
+    await saveTask(t);
+    return t.id;
+  }
+
   async function getDetail(id) {
     const t = await loadTask(id);
     if (!t) return null;
@@ -1704,7 +2217,7 @@ function createTasksStore(projectDir) {
     transitionTo,
     attachToTask,
     appendMessage,
-    listTasks, getDetail, searchTasks,
+    listTasks, getDetail, searchTasks, setSummary,
     demoteToTier2, demoteToTier3,
     rollupTier3Tasks, archiveTask,
     findOldestDemotionCandidate,
@@ -1793,8 +2306,29 @@ const VERB_TO_TOOL = {
   write: 'write_file',
   edit: 'edit_file',
   powershell: 'powershell',
+  remember: 'remember',
+  forget: 'forget',
 };
 const TASK_VERBS = new Set(['next-task', 'list-tasks', 'task-detail', 'search-tasks']);
+// Tool verbs the worker may use in read-only "Discuss" mode. Anything not here
+// (write, edit, powershell, plugin write-tools) is refused with an error so the
+// model investigates/explains instead of changing the project. Task-ops bypass
+// this set entirely (they are dispatched on a separate branch, never filtered).
+const WORKER_READONLY_VERBS = new Set(['list', 'read', 'search', 'find', 'info', 'remember', 'forget']);
+// Tool verbs that MUTATE files or require the single developer-approval slot.
+// A block containing one of these must run SERIALLY (it waits for all prior
+// blocks and becomes a barrier for later ones, exactly like a task-op block).
+// Running two of these concurrently — which happens when the model emits one
+// edit per <remote-workspace> block, so they dispatch as parallel sibling
+// blocks — races the single session.approvalPending slot (one approval prompt
+// clobbers another and hangs) and, for edits to the same file (the docx POI
+// helper rewrites the whole document per edit), corrupts the file itself.
+// Read-only blocks still overlap. Plugin write-tools list their verbs here.
+// `powershell` is included even though it is often read-only (git status,
+// running a test): the harness can't tell a read command from a mutating one
+// (echo > file, a build, git commit) at dispatch time, so we serialize all
+// shell to stay race-safe — chosen over keeping parallel read commands fast.
+const MUTATING_VERBS = new Set(['write', 'edit', 'powershell', 'edit_docx', 'format_docx', 'style_docx', 'delete_paragraph_docx']);
 // Sort longer first so that e.g. "list-tasks" matches before "list".
 const ALL_VERBS = [...Object.keys(VERB_TO_TOOL), ...TASK_VERBS]
   .sort((a, b) => b.length - a.length);
@@ -1808,7 +2342,7 @@ const DEFAULT_MAX_TURNS = 20;
 const REPEAT_LIMIT = 3;
 
 // ── System prompt ───────────────────────────────────────────────────────────
-function buildSystemPrompt({ taskId, taskUserRequest, tier1Tokens, tier1Pct, promptAdditions = [], projectContext = '' }) {
+function buildSystemPrompt({ taskId, taskUserRequest, tier1Tokens, tier1Pct, promptAdditions = [], projectContext = '', codebaseMemory = '', discussMode = false }) {
   const lines = [
     'You are code_boss, a coding agent. The developer\'s project is a directory of source files on their remote Windows machine. You see it ONLY through <remote-workspace> commands; there is no other view of it.',
     '',
@@ -1828,6 +2362,7 @@ function buildSystemPrompt({ taskId, taskUserRequest, tier1Tokens, tier1Pct, pro
     '  - Write a sentence or two of prose before each tool block explaining what you are about to look at and why. End the reply with a final prose section saying what you plan to do once you see results — or, if no tools are needed at all, the entire reply is just prose.',
     '  - You CANNOT react to tool results within the same reply — all tools in a reply run only AFTER you finish writing it, and you get the results in your NEXT reply. So the prose AFTER a tool block in the same reply describes intent ("then I will…"), not findings ("the file shows…").',
     '  - Group truly-independent commands inside ONE block — they run together. Use SEPARATE blocks when you want to narrate between them.',
+    '  - Turn economics: a turn round-trip (you reply, the tools run, you read results next turn) costs far more than an extra tool call. Before writing blocks, list every call you need and mark each INDEPENDENT (can run now) or DEPENDENT (needs a prior result); put ALL the independent ones in ONE block. Prefer one wide block over several turns — e.g. read three files in a single block, not across three replies.',
     '',
     'Example reply shape (fake commands, shown for structure only):',
     '  Looking for TODO markers under src/api/ first.',
@@ -1846,28 +2381,39 @@ function buildSystemPrompt({ taskId, taskUserRequest, tier1Tokens, tier1Pct, pro
     '  <find pattern="GLOB"/>                                          bare patterns also work recursively',
     '  <info path="FILE"/>',
     '',
-    'Write commands (body holds the content, not attributes):',
-    '  <write path="FILE">',
-    '  full file content goes here',
-    '  </write>',
-    '',
-    '  <edit path="FILE">',
-    '  <find>exact string to find (must occur exactly once)</find>',
-    '  <replace>replacement string</replace>',
-    '  </edit>',
-    '',
-    'Shell (builds, tests, git — runs in PowerShell on the developer\'s Windows machine):',
-    '  <powershell>git status</powershell>',
-    '  <powershell timeout_ms="600000">mvnw.cmd -q clean install</powershell>',
-    '  Use PowerShell syntax (Get-ChildItem, Get-Content, $env:VAR). The `ls`, `cat`, `pwd` aliases also work. To run a maven wrapper script use `mvnw.cmd` — not `./mvnw`.',
+    ...(discussMode ? [
+      'DISCUSS (read-only) mode is ON: investigate and explain, but do NOT modify anything. The write, edit, and shell (PowerShell) commands are DISABLED this session and will return an error if you use them. Read/list/search/find/info, codebase memory (remember/forget), and task management still work. If the developer asks for a change, describe precisely WHAT you would change and in WHICH files; they will switch Discuss mode off to let you make it.',
+    ] : [
+      'Write commands (body holds the content, not attributes):',
+      '  <write path="FILE">',
+      '  full file content goes here',
+      '  </write>',
+      '',
+      '  <edit path="FILE">',
+      '  <find>exact string to find (must occur exactly once)</find>',
+      '  <replace>replacement string</replace>',
+      '  </edit>',
+      '',
+      'Shell (builds, tests, git — runs in PowerShell on the developer\'s Windows machine):',
+      '  <powershell>git status</powershell>',
+      '  <powershell timeout_ms="600000">mvnw.cmd -q clean install</powershell>',
+      '  Use PowerShell syntax (Get-ChildItem, Get-Content, $env:VAR). The `ls`, `cat`, `pwd` aliases also work. To run a maven wrapper script use `mvnw.cmd` — not `./mvnw`.',
+    ]),
     '',
     'Task management:',
     '  <next-task user-request="WHAT THE USER WANTED IN THE CURRENT TASK" summary="WHAT WAS DONE IN THE CURRENT TASK"/>',
     '       Closes the CURRENT task and opens a new one. Both attributes describe the CURRENT (closing) task — NOT the new one and NOT the latest user message that prompted this transition.',
     '       The user-request is a single sentence that captures what the user wanted across the work just finished. It is a synthesized statement, not a quote of any single user message.',
+    '       IMPORTANT — emit <next-task/> PROACTIVELY: the moment you have finished a discrete unit of work (a fix, a feature, a question fully answered), close it with <next-task/> in that SAME reply, after your final prose. Closing a task is what triggers the code review and records the work — if you never close it, none of that happens. Do not wait to be asked; do not leave a finished task open. (Only skip it mid-task when more work on the SAME unit remains.)',
+    '       VERIFY BEFORE YOU CLOSE a code-editing task — do not report a change as done on assumption. Run the project build or tests via <powershell> (e.g. mvnw.cmd -q test, npm test, or node test/...) and state the outcome in the summary (e.g. "tests pass 12/12"). If the task is read-only, a discussion, or the project has no build/test to run, say so in the summary instead.',
     '  <list-tasks parent="T-1"/>',
     '  <task-detail id="T-3"/>',
     '  <search-tasks query="auth middleware"/>',
+    '',
+    'Codebase memory (durable facts about THIS codebase; injected into every future run):',
+    '  <remember category="architecture|conventions|gotchas|where-things-live|build-deploy|general" note="ONE concise durable fact"/>',
+    '  <forget id="M-3"/>                                              remove a fact that is now wrong or obsolete',
+    '  Record reusable knowledge as you discover it (how the app is structured, conventions, gotchas, where things live, build/deploy specifics) — NOT task-specific or transient details. Your current codebase memory is shown in the context below; keep it accurate with <forget>.',
     '',
     'The remote workspace replies with <remote-workspace-result> blocks. Read real results before answering. Never invent file or directory names you have not seen.',
   ];
@@ -1879,7 +2425,14 @@ function buildSystemPrompt({ taskId, taskUserRequest, tier1Tokens, tier1Pct, pro
     lines.push('────────  plugin  ────────');
     lines.push(String(add).trim());
   }
-  // Project context from CODE-BOSS.md files discovered at project open.
+  // Agent-maintained codebase memory (Tier 1). Distinct from the human's
+  // AGENTS.md so the model knows which it may edit (this one, via the tools).
+  if (codebaseMemory) {
+    lines.push('');
+    lines.push('────────  codebase memory (yours — keep it accurate)  ────────');
+    lines.push(String(codebaseMemory).trim());
+  }
+  // Project context from AGENTS.md files discovered at project open.
   // Last so it sits closest to the user's question — recency bias.
   if (projectContext) {
     lines.push('');
@@ -2394,9 +2947,26 @@ async function maybeCompact({ store, adapter, model, log, emitChat }) {
   // reclaim every finished task, instead of never firing at all.
   const demotableTotal = await totalContextTokens(store);
   const triggerTotal = demotableTotal + (await currentTaskTokens(store));
+  // Report context-window fill to the UI EVERY turn (this runs once per turn),
+  // not just when compaction fires, so the developer always sees how full the
+  // window is. budgetPct is the binding constraint: total context vs TOTAL_BUDGET.
+  emitChat?.({
+    type: 'context-fill',
+    totalTokens: triggerTotal,
+    budgetTokens: TOTAL_BUDGET,
+    budgetPct: Math.min(100, Math.round((triggerTotal / TOTAL_BUDGET) * 100)),
+  });
   if (triggerTotal <= HIGH) return;
   let total = demotableTotal;
 
+  // Surface compaction as a VISIBLE event — it is a quality cliff (old tasks get
+  // masked/dropped), not a silent housekeeping step.
+  emitChat?.({
+    type: 'compacting-started',
+    totalTokens: triggerTotal,
+    budgetTokens: TOTAL_BUDGET,
+    budgetPct: Math.min(100, Math.round((triggerTotal / TOTAL_BUDGET) * 100)),
+  });
   log?.(`compact: trigger=${triggerTotal} (demotable=${demotableTotal}, current=${triggerTotal - demotableTotal}) > HIGH=${HIGH}; target LOW=${LOW}`);
   if (total <= LOW) {
     log?.(`compact: current task alone exceeds budget; demotable context already minimal (no finished tasks to reclaim)`);
@@ -2654,7 +3224,8 @@ async function runPromptedAgent({
   extraTools = {},          // { tool_name: { verb, name, schema, impl } }
   extraVerbs = {},          // { verb: tool_name } — fed to parseToolCalls
   promptAdditions = [],     // strings appended to system prompt
-  projectContext = '',      // formatted CODE-BOSS.md context for this project
+  projectContext = '',      // formatted AGENTS.md context for this project
+  codebaseMemory = '',      // rendered Tier-1 codebase memory (agent-maintained)
   // Hook fired right after a <next-task> task-op transitions the store.
   // Receives { closedTaskId, newTaskId, userRequest, summary } and may
   // return a commit hash string (or null). The hash is attached to the
@@ -2666,12 +3237,29 @@ async function runPromptedAgent({
   // implementation pauses until the user resolves a CODE_BOSS-branch
   // prompt for the file's containing repo.
   requireBranch,
+  // Developer-approval gate handed to tools that need explicit human OK
+  // (e.g. edit_docx flatten). Called as requireApproval({kind, message}),
+  // resolves to true (approved) / false (denied or aborted). The server
+  // pauses and shows an Approve/Deny modal; absent in non-interactive runs.
+  requireApproval,
   // Returns { user, token } for plugins that need to hit the configured
   // GitLab API (e.g. wl's documentation fetchers). Token never reaches
   // the model — the plugin's impl calls the GitLab client and only the
   // result content goes into the chat. Optional; plugins handle the
   // missing case themselves.
   getGitLabCredentials,
+  // Read-only "Discuss" mode: when true, the worker may read/search/list and
+  // use codebase memory + task-ops, but write/edit/powershell (and any other
+  // non-read tool) are refused. The prompt also drops the write/edit/shell
+  // docs (see buildSystemPrompt). Lets the developer plan/ask safely without
+  // the agent touching the project.
+  discussMode = false,
+  // Mid-run "steer": a function that returns (and clears) any user messages
+  // queued via the steer channel while this run was in flight. Drained at the
+  // TOP of each turn — the queued text becomes a fresh user message for the
+  // next turn, so the developer can redirect mid-run without cancelling (Esc)
+  // or waiting for a full stop (the queue). Returns an array of strings.
+  drainSteer,
 }) {
   if (!projectDir) throw new Error('projectDir required for task-scoped agent');
 
@@ -2709,6 +3297,23 @@ async function runPromptedAgent({
   for (let turn = 1; turn <= maxTurns; turn++) {
     stats.turns = turn;
 
+    // Drain the steer channel at the TOP of the turn (a turn boundary — the
+    // previous turn's streaming + tools have finished, nothing is mid-flight).
+    // Anything the developer queued via /api/steer while the run was in flight
+    // becomes a fresh user message for THIS turn. Not mid-stream: a turn that
+    // already started talking to the model can't take new input until it ends.
+    if (typeof drainSteer === 'function') {
+      let steered = [];
+      try { steered = drainSteer() || []; } catch (e) { log(`drainSteer error: ${e.message}`); }
+      for (const text of steered) {
+        const t = String(text || '').trim();
+        if (!t) continue;
+        await store.appendMessage({ kind: 'user-message', role: 'user', content: t });
+        emitChat({ type: 'user-message', taskId: store.currentId(), content: t });
+        log(`steer: injected "${t.slice(0, 60)}" at turn ${turn}`);
+      }
+    }
+
     // Compute current tier-1 tokens to inject into the system prompt.
     const cur = await store.getCurrent();
     let t1Tokens = 0;
@@ -2722,6 +3327,8 @@ async function runPromptedAgent({
       tier1Pct,
       promptAdditions,
       projectContext,
+      codebaseMemory,
+      discussMode,
     });
 
     // Build the convo from the store. The system reminder is NOT stored —
@@ -2767,6 +3374,45 @@ async function runPromptedAgent({
           "project files and run shell commands. I won't apologize for being " +
           "unable to access files; the workspace IS the project. What would you " +
           "like to work on?",
+      },
+      // Second priming pair: DEMONSTRATE the task rhythm — do a unit of work,
+      // then CLOSE it with <next-task/> in the same reply. Models (Sonnet
+      // especially) reliably do the work but skip the close unless they've
+      // seen the finish-and-close pattern by example. This is illustrative
+      // (greet.js is not real) and, like the pair above, is never persisted.
+      {
+        role: 'user',
+        content:
+          "One more thing about the rhythm: whenever you finish a discrete unit " +
+          "of work, CLOSE it with <next-task/> in that same reply — that's what " +
+          "records the work and triggers review. For example, if I asked you to " +
+          "\"add a hello() function to greet.js\", I'd expect:",
+      },
+      {
+        role: 'assistant',
+        content:
+          "Sure — I'll add it, verify it runs, then close the task.\n" +
+          "<remote-workspace>\n" +
+          "<edit path=\"greet.js\"><find>module.exports = {};</find>" +
+          "<replace>function hello() {\n  return 'hi';\n}\n\nmodule.exports = { hello };</replace></edit>\n" +
+          "<powershell>node -e \"console.log(require('./greet').hello())\"</powershell>\n" +
+          "</remote-workspace>\n" +
+          "Once I see that prints 'hi', hello() works and the unit is complete and verified, so I'll close it:\n" +
+          "<remote-workspace>\n" +
+          "<next-task user-request=\"add a hello() function to greet.js\" summary=\"added and exported hello() in greet.js; verified with node that it returns 'hi'\"/>\n" +
+          "</remote-workspace>",
+      },
+      {
+        role: 'user',
+        content:
+          "Exactly right — that's the rhythm: do the work, verify it, then close each " +
+          "finished unit with <next-task/>. Now let's work on my actual project the same way.",
+      },
+      {
+        role: 'assistant',
+        content:
+          "Understood. I'll do each piece of work and then close it with <next-task/> " +
+          "when it's complete, before moving on. What would you like to work on?",
       },
     ];
     const baseConvo = [...PRIMING, ...fromStore];
@@ -2821,14 +3467,23 @@ async function runPromptedAgent({
         log(`  ${c.verb}(${JSON.stringify(c.args)}) -> ${resultStatus}`);
         if (c.verb === 'next-task' && r.ok) {
           let commitHash = null;
+          let commits = null;
           if (typeof onTaskClose === 'function') {
             try {
-              commitHash = await onTaskClose({
+              const closeRes = await onTaskClose({
                 closedTaskId: r.closedId,
                 newTaskId: r.newTaskId,
                 userRequest: c.args['user-request'] ?? '',
                 summary: c.args.summary ?? '',
               });
+              // onTaskClose may return a bare hash string (legacy/tests) or
+              // { hash, commits } (multi-repo). Accept both shapes.
+              if (closeRes && typeof closeRes === 'object') {
+                commitHash = closeRes.hash ?? null;
+                commits = Array.isArray(closeRes.commits) ? closeRes.commits : null;
+              } else {
+                commitHash = closeRes ?? null;
+              }
             } catch (e) {
               log(`onTaskClose error: ${e.message}`);
             }
@@ -2843,8 +3498,13 @@ async function runPromptedAgent({
             userRequest: c.args['user-request'] ?? '',
             summary: c.args.summary ?? '',
             commitHash,
+            commits,
           });
         }
+      } else if (discussMode && !WORKER_READONLY_VERBS.has(c.verb)) {
+        resultContent = `ERROR: '${c.verb}' is disabled in Discuss (read-only) mode. Describe what you would change and in which files instead; the developer will turn Discuss mode off to let you apply it.`;
+        resultStatus = 'error';
+        log(`  ${c.verb} blocked (discuss mode)`);
       } else {
         stats.toolCalls++;
         stats.toolHistogram[c.name] = (stats.toolHistogram[c.name] ?? 0) + 1;
@@ -2852,6 +3512,7 @@ async function runPromptedAgent({
           callId: c.id,
           onProgress: (chunk) => emitChat({ type: 'tool-progress', callId: c.id, chunk }),
           requireBranch,
+          requireApproval,
           signal,
           getGitLabCredentials,
         });
@@ -2894,12 +3555,19 @@ async function runPromptedAgent({
     // Mid-stream block dispatch. Each <remote-workspace> block, as soon as
     // its closing tag is parsed, gets its tool-call events emitted (in
     // segment order — so the chat log interleaves with the surrounding
-    // prose bubbles) and its execution scheduled. A "barrier" promise
-    // chains task-op blocks so later blocks see the new task context;
-    // non-task-op blocks run in parallel.
+    // prose bubbles) and its execution scheduled.
+    // Ordering rules:
+    //   - A block containing a TASK-OP (<next-task>) must observe the effects
+    //     of ALL prior blocks this turn — e.g. a write block before it must
+    //     finish (and auto-commit on close must see the written file). So a
+    //     task-op block waits for every prior block.
+    //   - A normal block waits only for the last task-op (serialBarrier), so
+    //     it runs against the correct task context but otherwise overlaps with
+    //     sibling read/write blocks.
     const blockResultsByIdx = new Map();
     const blockPromisesByIdx = new Map();
-    let serialBarrier = Promise.resolve();
+    const allBlockPromises = [];
+    let serialBarrier = Promise.resolve();   // resolves after the last task-op block
     const handleBlockReady = ({ segmentIndex, body }) => {
       const calls = parseToolCalls(`<remote-workspace>${body}</remote-workspace>`, { extraVerbs });
       for (const c of calls) {
@@ -2914,7 +3582,13 @@ async function runPromptedAgent({
         });
       }
       const hasTaskOp = calls.some((c) => c.kind === 'task-op');
-      const startAfter = serialBarrier;
+      // A block that mutates files / needs developer approval must also run
+      // serially: two such blocks in parallel race the single approval slot
+      // and same-file writes. Treat them like task-op blocks for ordering.
+      const needsSerial = hasTaskOp || calls.some((c) => MUTATING_VERBS.has(c.verb));
+      const startAfter = needsSerial
+        ? Promise.allSettled(allBlockPromises.slice())   // wait for ALL prior blocks
+        : serialBarrier;                                  // wait for the last serial block only
       const p = startAfter.then(() => executeBlock(calls)).then((r) => {
         blockResultsByIdx.set(segmentIndex, r);
         return r;
@@ -2926,9 +3600,11 @@ async function runPromptedAgent({
       // outer await will still surface the rejection via allSettled.
       p.catch(() => {});
       blockPromisesByIdx.set(segmentIndex, p);
-      if (hasTaskOp) {
-        // Future blocks must wait for this one to finish so they see the
-        // new task context.
+      allBlockPromises.push(p);
+      if (needsSerial) {
+        // Future blocks must wait for this one to finish — so a task-op sees
+        // the new task context, and a file edit / approval prompt never
+        // overlaps the next one.
         serialBarrier = p;
       }
     };
@@ -3067,11 +3743,12 @@ async function runPromptedAgent({
 //
 // Output: { pass: true } or { pass: false, concerns: '...' }
 
-// Reviewer's tool allowlist. Read-only: it can inspect any file or
-// directory in the project but cannot write, edit, or run shell commands.
-// Same parser as the dev agent (parseToolCalls) — we just filter the
-// dispatch so writes are silently dropped.
-const REVIEWER_TOOL_VERBS = new Set(['list', 'read', 'search', 'find', 'info']);
+// Reviewer's tool allowlist. It can inspect any file/dir AND run shell
+// commands for verification (git diff/show/log, compile/test checks). It
+// still has NO write_file/edit_file — the only mutation risk is via
+// powershell, which the prompt explicitly forbids (read-only/verification
+// use only). Same parser as the dev agent; non-allowlisted verbs are dropped.
+const REVIEWER_TOOL_VERBS = new Set(['list', 'read', 'search', 'find', 'info', 'powershell']);
 const REVIEWER_MAX_TURNS = 6;
 
 const REVIEWER_SYSTEM_PROMPT = `You are a code review agent. Another agent has just completed work on behalf of a developer. Review that work for three categories of issues. Be specific and concise — the dev agent will act on your feedback verbatim.
@@ -3098,33 +3775,199 @@ const REVIEWER_SYSTEM_PROMPT = `You are a code review agent. Another agent has j
    • Does the agent's summary describe what was actually changed (not what was intended)?
    • If the user asked a question rather than for a change, was the question actually answered?
 
-READ-ONLY TOOLS
-You can inspect the project to verify what the agent did. Emit tool calls inside a <remote-workspace> block, exactly like the dev agent does. Available tools:
+VERIFICATION TOOLS
+You can inspect the project AND run read-only/verification commands to check the agent's work. Emit tool calls inside a <remote-workspace> block, exactly like the dev agent does. Available tools:
   <read path="FILE"/>                         read full file contents
   <read path="FILE" offset="N" limit="N"/>    read a slice
   <list path="DIR"/>                          list directory entries
   <search pattern="REGEX" path="DIR" glob="GLOB"/>   grep across files
   <find pattern="GLOB"/>                      glob (recursive by default)
   <info path="FILE"/>                         file/dir stat
+  <powershell>...</powershell>                run a shell command (PowerShell, Windows)
 
-You have NO write access — only the dev agent can change files. Issue at most a few tool calls per turn; you have a ${REVIEWER_MAX_TURNS}-turn budget total. Prefer reading the specific file the agent just changed (which you can see in the trajectory's diffs) over broad searches.
+USING powershell (this is your strongest verification tool — use it):
+  • SEE EXACTLY WHAT CHANGED: \`git diff HEAD\` (working-tree changes), \`git diff HEAD~1 HEAD\` or \`git show HEAD\` (the last commit — the agent auto-commits on task close, so its work is usually the HEAD commit). The <changes> block below holds the diffs we captured, but a large diff may be truncated; run git diff to see the FULL change when it matters.
+  • In a multi-repo workspace, target the right repo: \`git -C <repoSubdir> diff HEAD\`.
+  • VALIDATE: compile/build/test if it's cheap and the change warrants it (e.g. \`mvnw.cmd -q -o compile\`, run the specific test). Schema-validate XML/JSON where a validator exists.
+  • STRICTLY READ-ONLY: you may inspect, diff, compile-check, and run tests, but you MUST NOT modify files or repo state — no Set-Content/Out-File/redirection, no git add/commit/checkout/reset/clean/stash, no installs/deploys. Only the dev agent changes things. If verifying would require a mutation, don't do it — reason from what you can read instead.
+
+Issue at most a few tool calls per turn; you have a ${REVIEWER_MAX_TURNS}-turn budget total (shared across all tasks if there is more than one). Prefer \`git diff HEAD\` + reading the specific changed file over broad searches.
+
+INPUT SHAPE
+You are given one or more <task id="..."> blocks — each is a completed task to review, with its <request>, <summary>, and the <changes> (diffs) it produced. A trailing <context> block (if present) holds earlier steps FOR UNDERSTANDING ONLY — it is NOT what you are reviewing; do not flag issues in it.
 
 The remote workspace will reply with <remote-workspace-result> blocks containing real data. Read those before deciding.
 
 OUTPUT FORMAT
-When you have enough information, respond with EXACTLY ONE of these in a turn that has no tool calls:
+When you have enough information, emit a verdict for EVERY task, in a turn with NO tool calls. Address each task by id:
+  <review task="T-3" pass/>
+  <review task="T-5" fail>specific, actionable concerns for T-5</review>
+If there is exactly ONE task you may omit the id and use the short form:
   <review-pass/>
-  <review-fail>specific, actionable concerns here</review-fail>
+  <review-fail>specific, actionable concerns</review-fail>
 
-Use <review-pass/> when the work is correct and complete enough to ship.
-Use <review-fail>...</review-fail> only when there's something the dev agent should fix. Be specific: name the file, the element, what's wrong, and what would fix it. Do not include items the dev agent already noticed and fixed in this same trajectory.`;
+Pass a task when its work is correct and complete enough to ship. Fail only when there's something the dev agent should fix — be specific: name the file, the element, what's wrong, and what would fix it. Do not flag items the dev agent already noticed and fixed in the same task, and do not flag anything that only appears in <context>.`;
 
-async function runReviewer({ adapter, model, userRequest, trajectory, finalText, signal, onLog, repoRoots = [] }) {
-  // In a multi-repo workspace, process.cwd() is the workspace ROOT but the
-  // changed file lives under <root>/<repo>/…, so a reviewer <read path="src/Foo.java"/>
-  // resolves to <root>/src/Foo.java (ENOENT) and the reviewer can't see the
-  // change → it default-passes. Rewrite a relative path that doesn't exist
-  // under cwd to the first repo root where it does exist.
+// Budget for the reviewer's PRE-LOADED input (chars; ~/4 ≈ tokens). The
+// reviewer can always git diff / read for more, so this just bounds what we
+// front-load. Env-overridable.
+const REVIEW_INPUT_BUDGET_CHARS = (() => { const n = Number(process.env.REVIEW_INPUT_BUDGET_CHARS); return Number.isFinite(n) && n > 0 ? n : 40000; })();
+const REVIEW_PER_CHANGE_CHARS = 12000;   // ceiling on one task's inline diff
+
+function fmtContextEvent(ev) {
+  switch (ev.type) {
+    case 'assistant-text': return 'AGENT: ' + clip(ev.content, 800);
+    case 'tool-call': {
+      const args = Object.entries(ev.args || {}).map(([k, v]) => `${k}=${clip(String(v), 200)}`).join(', ');
+      return `TOOL: ${ev.verb || ev.name}(${args})`;
+    }
+    case 'tool-result': return `  -> [${ev.status || 'ok'}] ${clip(ev.content, 600)}`;
+    default: return null;
+  }
+}
+
+/**
+ * Build the reviewer's user block from the closed task(s), budget-first:
+ *   Priority 1 — the CHANGES (diffs) + request/summary for each task, never
+ *                dropped (a too-large diff is head-capped with a "git diff"
+ *                pointer).
+ *   Priority 2 — earlier trajectory steps, newest-first, filling the leftover
+ *                budget, clearly labelled context-only.
+ * Always lets the reviewer see the changes; context is best-effort.
+ */
+function buildBudgetedReviewInput(tasks, { budgetChars = REVIEW_INPUT_BUDGET_CHARS, perChangeChars = REVIEW_PER_CHANGE_CHARS } = {}) {
+  const multi = tasks.length > 1;
+  const taskBlocks = [];
+  let used = 0;
+  for (const t of tasks) {
+    const diffs = (t.events || []).filter((e) => e.type === 'diff').map((e) => e.diff || '').filter(Boolean);
+    let changesText;
+    if (diffs.length) {
+      let joined = diffs.join('\n');
+      if (joined.length > perChangeChars) joined = joined.slice(0, perChangeChars) + '\n[diff truncated — run `git diff HEAD` for the full change]';
+      changesText = joined;
+    } else {
+      changesText = '(no inline diff captured — run `git diff HEAD` / `git show HEAD` to see the changes)';
+    }
+    const block = [
+      `<task id="${t.taskId || 'task'}">`,
+      `<request>${clip(String(t.userRequest || ''), 600)}</request>`,
+      `<summary>${clip(String(t.summary || ''), 600)}</summary>`,
+      '<changes>', changesText, '</changes>',
+      '</task>',
+    ].join('\n');
+    taskBlocks.push(block);
+    used += block.length;
+  }
+  // Context: every non-diff event across the tasks, newest-first, until the
+  // remaining budget is spent. Presented chronologically with an omitted marker.
+  const allContext = [];
+  for (const t of tasks) for (const ev of (t.events || [])) {
+    if (ev.type === 'diff') continue;
+    const line = fmtContextEvent(ev);
+    if (line) allContext.push(line);
+  }
+  let remaining = Math.max(0, budgetChars - used - 200);
+  const picked = [];
+  for (let i = allContext.length - 1; i >= 0; i--) {
+    const ln = allContext[i];
+    if (ln.length + 1 > remaining) { picked.unshift(`[... ${i + 1} earlier step(s) omitted — use read / git diff if needed ...]`); break; }
+    picked.unshift(ln);
+    remaining -= ln.length + 1;
+  }
+  const parts = [];
+  parts.push(multi
+    ? `You are reviewing ${tasks.length} completed tasks. Review EACH and emit a per-task verdict (see OUTPUT FORMAT).`
+    : 'You are reviewing the completed task below.');
+  parts.push(taskBlocks.join('\n'));
+  if (picked.length) {
+    parts.push('<context note="earlier steps, for understanding only — NOT what you are reviewing">');
+    parts.push(picked.join('\n'));
+    parts.push('</context>');
+  }
+  return parts.join('\n');
+}
+
+// Parse per-task verdicts out of a (tool-call-stripped) reviewer response.
+// Adds to `verdicts` (Map taskId → {pass, concerns}). Returns count added.
+function parseReviewVerdicts(prose, taskIds, verdicts) {
+  let added = 0;
+  const add = (id, v) => { if (id && taskIds.includes(id) && !verdicts.has(id)) { verdicts.set(id, v); added++; } };
+  let m;
+  const passRe = /<review\s+task="([^"]+)"\s+pass\s*\/?>/gi;
+  while ((m = passRe.exec(prose)) !== null) add(m[1], { pass: true });
+  const failRe = /<review\s+task="([^"]+)"\s+fail\s*>([\s\S]*?)<\/review>/gi;
+  while ((m = failRe.exec(prose)) !== null) add(m[1], { pass: false, concerns: m[2].trim() });
+  // Short form (no task= attribute). For a single task it attributes to that
+  // task. For MULTIPLE tasks, if the model used the short form (and no per-task
+  // verdict matched), apply it to ALL unruled tasks rather than letting them
+  // fall through to default-pass — a short-form <review-fail> in a multi-task
+  // review must NOT be silently swallowed into a pass (fail-open).
+  if (added === 0) {
+    const failM = prose.match(/<review-fail>([\s\S]*)<\/review-fail>/i);  // greedy: survives embedded close tags
+    const passM = /<review-pass\s*\/?>/i.test(prose);
+    if (failM) { for (const id of taskIds) add(id, { pass: false, concerns: failM[1].trim() }); }
+    else if (passM) { for (const id of taskIds) add(id, { pass: true }); }
+  }
+  return added;
+}
+
+// Surface a manager-pass parse miss (the model finished but emitted no
+// parseable structured tag, so the pass fell back to its safe default). The
+// raw model text is carried so the UI can show it for prompt-tuning against
+// whatever model is deployed. Best-effort; never throws.
+function emitDiag(onDiag, kind, reason, raw) {
+  try { onDiag?.({ kind, reason, raw: String(raw || '').slice(0, 4000) }); } catch {}
+}
+// The last assistant turn in a message list (for max-turns diagnostics).
+function lastAssistantText(messages) {
+  for (let i = messages.length - 1; i >= 0; i--) if (messages[i]?.role === 'assistant') return messages[i].content || '';
+  return '';
+}
+
+// Read-only PowerShell screen for the manager passes. <powershell> is allowed
+// (they need `git diff`/`git log`/`git show`/`git status`, builds, tests,
+// Get-*/Select-String) but the read-only guarantee must be ENFORCED, not just
+// requested — so block obviously-mutating commands. Conservative denylist; a
+// safety screen, not a sandbox. Returns an error string to block, or null.
+const SHELL_DENY = [
+  /\bgit\s+(add|commit|checkout|switch|reset|clean|stash|rm|mv|restore|apply|push|pull|fetch|merge|rebase|cherry-pick|revert|tag|init|config|branch\s+-)/i,
+  /\b(Remove-Item|Rename-Item|Move-Item|New-Item|Set-Content|Add-Content|Out-File|Set-ItemProperty|Clear-Content|Copy-Item|Clear-Item|Tee-Object)\b/i,
+  /\b(mkdir|rmdir|del|erase|ren|rd|md)\b/i,
+  /(^|\s)(rm|mv|cp|ni|sc|ac|move|copy|ren)(\s|$)/i,
+  /(^|\s)>>?/,                                            // output redirection
+  /\b(Start-Process|Stop-Process|Restart-Computer|Stop-Computer|Set-Location|Push-Location|Pop-Location|chdir)\b/i,
+  /(^|\s)cd(\s|$)/i,
+  /\b(Invoke-WebRequest|Invoke-RestMethod|iwr|irm|curl|wget)\b/i,
+];
+function screenReadOnlyShell(command) {
+  const cmd = String(command || '');
+  if (!cmd.trim()) return null;
+  for (const re of SHELL_DENY) {
+    if (re.test(cmd)) return `ERROR: blocked — this is a READ-ONLY pass; the PowerShell command appears to mutate state or have side effects. Use only read-only inspection (git diff/log/show/status, Get-Content, Select-String, a non-mutating compile/test).`;
+  }
+  return null;
+}
+
+/**
+ * Review one or more completed tasks in a SINGLE reviewer session.
+ *   tasks: [{ taskId, userRequest, summary, events }]  (events = the task's
+ *          whole-task chat events; diffs are the review target)
+ * Returns { verdicts: [{ taskId, pass, concerns }] } — one per task (a task
+ * the reviewer never ruled on defaults to pass, so the user isn't blocked).
+ */
+async function runReviewer({ adapter, model, tasks, signal, onLog, onDiag, repoRoots = [] }) {
+  const taskList = Array.isArray(tasks) ? tasks : [];
+  const taskIds = taskList.map((t) => t.taskId);
+  const verdicts = new Map();
+  const finalize = () => {
+    for (const id of taskIds) if (!verdicts.has(id)) verdicts.set(id, { pass: true, unparseable: true });
+    return { verdicts: taskIds.map((id) => ({ taskId: id, ...verdicts.get(id) })) };
+  };
+  if (taskList.length === 0) return { verdicts: [] };
+
+  // In a multi-repo workspace, resolve repo-relative read paths against the
+  // changed sub-repos (cwd is the workspace root).
   const resolveAgainstRepos = (p) => {
     if (typeof p !== 'string' || !p || path.isAbsolute(p)) return p;
     try { if (existsSync(path.join(process.cwd(), p))) return p; } catch {}
@@ -3134,20 +3977,7 @@ async function runReviewer({ adapter, model, userRequest, trajectory, finalText,
     return p;
   };
   const log = (m) => { try { onLog?.(m); } catch {} };
-  const userBlock = [
-    '<review-target>',
-    '<user-request>',
-    String(userRequest ?? '').trim(),
-    '</user-request>',
-    '<trajectory>',
-    trajectory,
-    '</trajectory>',
-    '<final-answer>',
-    String(finalText ?? '').trim(),
-    '</final-answer>',
-    '</review-target>',
-  ].join('\n');
-
+  const userBlock = ['<review-target>', buildBudgetedReviewInput(taskList), '</review-target>'].join('\n');
   const messages = [
     { role: 'system', content: REVIEWER_SYSTEM_PROMPT },
     { role: 'user', content: userBlock },
@@ -3164,51 +3994,33 @@ async function runReviewer({ adapter, model, userRequest, trajectory, finalText,
     const text = response?.choices?.[0]?.message?.content ?? '';
     log(`reviewer turn ${turn}: ${text.length} chars in ${Date.now() - t0}ms`);
 
-    // Parse tool calls FIRST. A verdict is only final when the turn has no
-    // executable tool calls (the prompt tells the reviewer to emit its
-    // verdict in a tool-call-free turn). Gemini commonly narrates a tentative
-    // verdict and THEN issues verification reads in the same turn; honoring
-    // the verdict first would skip those reads and commit to a premature
-    // pass/fail. Strip tool-block bodies before the verdict regex so a
-    // verdict the model placed inside a <remote-workspace> block doesn't
-    // count either.
+    // Tool calls FIRST: a verdict is only honored in a turn with no executable
+    // tool calls (so a tentative verdict + verification reads in the same turn
+    // doesn't short-circuit the reads).
     const calls = parseToolCalls(text);
     const allowed = calls.filter((c) => REVIEWER_TOOL_VERBS.has(c.verb));
     const blocked = calls.filter((c) => !REVIEWER_TOOL_VERBS.has(c.verb));
 
     if (allowed.length === 0) {
       const proseOnly = text.replace(/<remote-workspace\b[^>]*>[\s\S]*?<\/remote-workspace>/gi, '');
-      if (/<review-pass\s*\/?>/i.test(proseOnly)) {
-        return { pass: true };
-      }
-      // Greedy capture to the LAST close tag: review prose for this XML-heavy
-      // domain can itself quote a literal </review-fail>; a non-greedy match
-      // would truncate the concerns at the first occurrence.
-      const failMatch = proseOnly.match(/<review-fail>([\s\S]*)<\/review-fail>/i);
-      if (failMatch) {
-        return { pass: false, concerns: failMatch[1].trim() };
-      }
-      // No verdict, no usable tool calls. Default to pass — matches the
-      // older "unparseable response = pass" semantics so a confused
-      // reviewer doesn't block the user. Log so we can investigate.
-      if (blocked.length > 0) {
-        log(`reviewer turn ${turn}: blocked ${blocked.length} write call(s) (${blocked.map((c) => c.verb).join(', ')}); no verdict — defaulting to pass`);
-      } else {
-        log(`reviewer turn ${turn}: no verdict, no tool calls — defaulting to pass. raw: ${text.slice(0, 200)}`);
-      }
-      return { pass: true, unparseable: true };
+      parseReviewVerdicts(proseOnly, taskIds, verdicts);
+      if (taskIds.every((id) => verdicts.has(id))) return finalize();
+      // No tool calls and not all tasks ruled on → the reviewer is done;
+      // default the rest to pass so the user isn't blocked.
+      log(`reviewer turn ${turn}: no tool calls; ${verdicts.size}/${taskIds.length} tasks ruled on — defaulting the rest to pass`);
+      emitDiag(onDiag, 'reviewer', `no <review-pass>/<review-fail> verdict for ${taskIds.length - verdicts.size} of ${taskIds.length} task(s); defaulted them to pass`, proseOnly);
+      return finalize();
     }
 
-    // Execute the allowed tools.
+    // Execute the allowed (read-only) tools.
     const results = [];
     for (const c of allowed) {
+      const shellBlock = c.verb === 'powershell' ? screenReadOnlyShell(c.args?.command) : null;
+      if (shellBlock) { results.push({ verb: c.verb, status: 'error', content: shellBlock }); continue; }
       try {
-        // Resolve a repo-relative path against the changed repo(s).
         if (c.args && typeof c.args.path === 'string') c.args.path = resolveAgainstRepos(c.args.path);
-        const raw = await execute(c.name, c.args);
-        const content = (typeof raw === 'string' && raw.startsWith('ERROR:'))
-          ? raw
-          : extractContent(raw);
+        const raw = await execute(c.name, c.args, {}, { signal });
+        const content = (typeof raw === 'string' && raw.startsWith('ERROR:')) ? raw : extractContent(raw);
         const status = (typeof raw === 'string' && raw.startsWith('ERROR:')) ? 'error' : 'ok';
         results.push({ verb: c.verb, status, content });
         log(`reviewer turn ${turn}: ${c.verb}(${JSON.stringify(c.args).slice(0, 80)}) -> ${status} ${content.length}b`);
@@ -3217,21 +4029,419 @@ async function runReviewer({ adapter, model, userRequest, trajectory, finalText,
       }
     }
     if (blocked.length > 0) {
-      results.push({
-        verb: 'system',
-        status: 'error',
-        content: `Reviewer is read-only — dropped ${blocked.length} call(s): ${blocked.map((c) => c.verb).join(', ')}.`,
-      });
+      results.push({ verb: 'system', status: 'error', content: `Reviewer is read-only — dropped ${blocked.length} call(s): ${blocked.map((c) => c.verb).join(', ')}.` });
     }
-
     messages.push({ role: 'assistant', content: text });
     messages.push({ role: 'user', content: formatToolResults(results) });
   }
 
-  // Out of turns without a verdict. Be permissive (pass) so the user isn't
-  // blocked behind an indecisive reviewer.
-  log(`reviewer: hit max turns (${REVIEWER_MAX_TURNS}) without a verdict, treating as pass.`);
-  return { pass: true, indecisive: true };
+  log(`reviewer: hit max turns (${REVIEWER_MAX_TURNS}); ${verdicts.size}/${taskIds.length} ruled on — rest default to pass.`);
+  if (verdicts.size < taskIds.length) emitDiag(onDiag, 'reviewer', `hit ${REVIEWER_MAX_TURNS}-turn budget with ${taskIds.length - verdicts.size} task(s) unruled; defaulted them to pass`, lastAssistantText(messages));
+  return finalize();
+}
+
+// ── Acceptance check (assignment-level requirement fulfilment) ──────────────
+// A HIGHER-altitude sibling of the code reviewer: the reviewer asks "is THIS
+// diff correct?" per task; acceptance asks "does the FINISHED ASSIGNMENT fulfil
+// the ORIGINAL requirement?" Read-only, budgeted, and FAILS SAFE to
+// not-fulfilled (the inverse of the reviewer's default-pass) — a wrong auto-
+// "done" on a maintained system is the expensive error.
+const ACCEPTANCE_SYSTEM_PROMPT = `You are an acceptance checker. A developer was ASSIGNED a piece of work with a captured REQUIREMENT (and maybe acceptance criteria). A coding agent did the work; each of its tasks was already code-reviewed for correctness. Your job is the HIGHER-LEVEL check the per-task reviewer cannot make: does the FINISHED WORK, as a whole, FULFIL the original requirement?
+
+Check, against the requirement:
+- COMPLETENESS — is every part actually addressed? List anything MISSING or only partially done.
+- DRIFT — did the work change things outside the requirement, or solve a different problem?
+- INTENT — does the cumulative change actually achieve what was asked?
+Do NOT re-litigate diff-level bugs/style — the per-task code review caught those, EXCEPT for any task marked ESCALATED below (its review hit the round limit with concerns left UNRESOLVED). For an escalated task, treat its concerns as still OPEN and weigh whether the requirement is genuinely fulfilled despite them, rather than assuming review handled it. You judge fulfilment, not correctness.
+
+VERIFY read-only (same tools as the code reviewer; emit calls inside a <remote-workspace> block):
+  <read path="FILE"/>  <list path="DIR"/>  <search pattern="REGEX" path="DIR"/>  <find pattern="GLOB"/>  <info path="FILE"/>
+  <powershell>git diff HEAD~1 HEAD</powershell> / git log / a cheap compile or the specific test, where it confirms fulfilment.
+You may inspect, diff, and run read-only checks; you MUST NOT modify anything.
+
+When you have enough information, emit ONE verdict in a turn with NO tool calls:
+  <accept-fulfilled>one-line rationale</accept-fulfilled>
+OR
+  <accept-unfulfilled>
+  <missing>what is not done / only partial — be specific; name files, criteria, the gap</missing>
+  <drift>work done outside the requirement (or leave empty)</drift>
+  <rationale>why it does not fulfil the requirement yet</rationale>
+  </accept-unfulfilled>
+
+Be conservative: declare fulfilled ONLY when you are confident the requirement is met. If a requirement cannot be verified from what you can read (e.g. runtime/deploy behaviour), say so in <missing> and declare unfulfilled rather than guess.`;
+
+function buildAcceptanceInput(assignment, tasks) {
+  const parts = [
+    '<requirement>', clip(String(assignment?.requirement || '(no requirement captured)'), 4000), '</requirement>',
+  ];
+  if (assignment?.acceptanceCriteria) {
+    parts.push('<acceptance-criteria>', clip(String(assignment.acceptanceCriteria), 4000), '</acceptance-criteria>');
+  }
+  const verdicts = (tasks || []).filter((t) => t.verdict).map((t) => {
+    const v = t.verdict;
+    if (v.escalated) return `  ${t.taskId}: code-review ESCALATED (concerns unresolved after review rounds) — ${clip(String(v.concerns || ''), 300)}`;
+    if (v.pass === false) return `  ${t.taskId}: code-review FAIL — ${clip(String(v.concerns || ''), 300)}`;
+    return `  ${t.taskId}: code-review pass`;
+  });
+  if (verdicts.length) parts.push('<per-task-code-review>', verdicts.join('\n'), '</per-task-code-review>');
+  parts.push('<work note="the tasks done for this assignment, with their changes; earlier steps are context-only">',
+    buildBudgetedReviewInput(tasks || [], { budgetChars: 30000 }),
+    '</work>');
+  return parts.join('\n');
+}
+
+function parseAcceptanceVerdict(prose) {
+  if (/<accept-fulfilled\s*\/>/i.test(prose)) return { fulfilled: true, missing: '', drift: '', rationale: '' };
+  const fm = prose.match(/<accept-fulfilled>([\s\S]*?)<\/accept-fulfilled>/i);
+  if (fm) return { fulfilled: true, missing: '', drift: '', rationale: fm[1].trim() };
+  const um = prose.match(/<accept-unfulfilled>([\s\S]*)<\/accept-unfulfilled>/i);
+  if (um) {
+    const body = um[1];
+    const grab = (tag) => { const m = body.match(new RegExp('<' + tag + '>([\\s\\S]*?)</' + tag + '>', 'i')); return m ? m[1].trim() : ''; };
+    return { fulfilled: false, missing: grab('missing'), drift: grab('drift'), rationale: grab('rationale') || body.trim() };
+  }
+  return null;
+}
+
+/**
+ * Acceptance check for a completed assignment.
+ *   assignment: { id, requirement, acceptanceCriteria }
+ *   tasks:      [{ taskId, userRequest, summary, events, verdict }]  (verdict =
+ *               the per-task code-review result, optional)
+ * Returns { fulfilled, missing, drift, rationale, autoVerifyFailed? }. Fails
+ * safe to fulfilled:false when it can't reach a verdict.
+ */
+async function runAcceptance({ adapter, model, assignment, tasks = [], signal, onLog, onDiag, repoRoots = [] }) {
+  const log = (m) => { try { onLog?.(m); } catch {} };
+  const resolveAgainstRepos = (p) => {
+    if (typeof p !== 'string' || !p || path.isAbsolute(p)) return p;
+    try { if (existsSync(path.join(process.cwd(), p))) return p; } catch {}
+    for (const root of repoRoots) { try { if (existsSync(path.join(root, p))) return path.join(root, p); } catch {} }
+    return p;
+  };
+  const NOT_VERIFIED = (why) => ({ fulfilled: false, missing: 'could not auto-verify', drift: '', rationale: why, autoVerifyFailed: true });
+
+  const userBlock = ['<acceptance-target>', buildAcceptanceInput(assignment || {}, tasks), '</acceptance-target>'].join('\n');
+  const messages = [
+    { role: 'system', content: ACCEPTANCE_SYSTEM_PROMPT },
+    { role: 'user', content: userBlock },
+  ];
+
+  for (let turn = 1; turn <= REVIEWER_MAX_TURNS; turn++) {
+    if (signal?.aborted) { const e = new Error('aborted'); e.name = 'AbortError'; throw e; }
+    const t0 = Date.now();
+    const response = await adapter.complete({ model, messages, signal });
+    const text = response?.choices?.[0]?.message?.content ?? '';
+    log(`acceptance turn ${turn}: ${text.length} chars in ${Date.now() - t0}ms`);
+
+    const calls = parseToolCalls(text);
+    const allowed = calls.filter((c) => REVIEWER_TOOL_VERBS.has(c.verb));
+    const blocked = calls.filter((c) => !REVIEWER_TOOL_VERBS.has(c.verb));
+
+    if (allowed.length === 0) {
+      const prose = text.replace(/<remote-workspace\b[^>]*>[\s\S]*?<\/remote-workspace>/gi, '');
+      const v = parseAcceptanceVerdict(prose);
+      if (v) return v;
+      log(`acceptance turn ${turn}: no parseable verdict — failing safe to not-fulfilled`);
+      emitDiag(onDiag, 'acceptance', 'no <accept-fulfilled>/<accept-unfulfilled> verdict — failed safe to not-fulfilled', prose);
+      return NOT_VERIFIED('The acceptance check produced no clear verdict; review the work manually.');
+    }
+
+    const results = [];
+    for (const c of allowed) {
+      const shellBlock = c.verb === 'powershell' ? screenReadOnlyShell(c.args?.command) : null;
+      if (shellBlock) { results.push({ verb: c.verb, status: 'error', content: shellBlock }); continue; }
+      try {
+        if (c.args && typeof c.args.path === 'string') c.args.path = resolveAgainstRepos(c.args.path);
+        const raw = await execute(c.name, c.args, {}, { signal });
+        const content = (typeof raw === 'string' && raw.startsWith('ERROR:')) ? raw : extractContent(raw);
+        const status = (typeof raw === 'string' && raw.startsWith('ERROR:')) ? 'error' : 'ok';
+        results.push({ verb: c.verb, status, content });
+        log(`acceptance turn ${turn}: ${c.verb}(${JSON.stringify(c.args).slice(0, 80)}) -> ${status} ${content.length}b`);
+      } catch (e) {
+        results.push({ verb: c.verb, status: 'error', content: 'ERROR: ' + (e?.message ?? String(e)) });
+      }
+    }
+    if (blocked.length > 0) {
+      results.push({ verb: 'system', status: 'error', content: `Acceptance is read-only — dropped ${blocked.length} call(s): ${blocked.map((c) => c.verb).join(', ')}.` });
+    }
+    messages.push({ role: 'assistant', content: text });
+    messages.push({ role: 'user', content: formatToolResults(results) });
+  }
+
+  log(`acceptance: hit max turns (${REVIEWER_MAX_TURNS}) without a verdict — failing safe to not-fulfilled.`);
+  emitDiag(onDiag, 'acceptance', `hit ${REVIEWER_MAX_TURNS}-turn budget without a verdict — failed safe to not-fulfilled`, lastAssistantText(messages));
+  return NOT_VERIFIED('Acceptance ran out of verification turns without a verdict; review the work manually.');
+}
+
+// ── Conversational intake (requirement capture) ─────────────────────────────
+// A write-blocked MANAGER persona that turns pasted emails/specs/notes into ONE
+// structured, editable requirement card. Same read-only tool loop as the
+// reviewer/acceptance (so the write-block is STRUCTURAL — non-allowlisted verbs
+// are dropped, never executed). It converses in prose between turns, may read
+// the repo read-only to scope the requirement, and emits a single
+// <requirement-card> only once it is confident. Multi-turn ACROSS separate HTTP
+// POSTs is the caller's job: it replays the persisted thread back into
+// `messages`; within one call this loop handles its own read-tool turns.
+const INTAKE_TOOL_VERBS = REVIEWER_TOOL_VERBS;   // identical read-only allowlist
+const INTAKE_MAX_TURNS = 8;
+
+const INTAKE_SYSTEM_PROMPT = `You are an intake manager for a software-maintenance team. A developer pastes you raw material — emails, tickets, specs, notes — describing work they need done. Your job is to turn it into ONE clear, frozen REQUIREMENT that a coding agent and an acceptance checker can both act on. You do NOT do the work yourself and you MUST NOT modify anything.
+
+You may ground yourself by reading the repository READ-ONLY (same tools as a reviewer; emit calls inside a <remote-workspace> block):
+  <read path="FILE"/>  <list path="DIR"/>  <search pattern="REGEX" path="DIR"/>  <find pattern="GLOB"/>  <info path="FILE"/>
+  <powershell>git log --oneline -n 5</powershell>   (read-only commands only)
+
+How to behave:
+- BIAS STRONGLY TOWARD EMITTING THE CARD. The card is editable — the developer refines or corrects it after you emit it — so a good-enough card beats another question. Do NOT hold the card back waiting for perfect certainty.
+- Ask clarifying questions ONLY when the material is genuinely too ambiguous to write any definition of done, and then ask AT MOST one short round. The moment the developer answers (or says "that's the whole requirement" / "go ahead" / confirms), emit the card immediately — do not ask again.
+- If the material is already clear enough to state a definition of done, emit the card on your FIRST turn (after at most a quick read to ground it). Don't ask a question you can answer by reading the code or by making a reasonable, editable assumption.
+- Read the codebase when it helps you scope the requirement accurately (confirm an app/file exists, find the relevant module), but keep it cheap.
+- Do NOT invent scope the material does not support. Prefer the developer's own words. The requirement must be a single, testable definition of done.
+
+When you can state an unambiguous definition of done — which is usually now — emit EXACTLY ONE card, in a turn with NO tool calls:
+
+<requirement-card>
+<title>short imperative title</title>
+<requirement>the single frozen definition of done: what must be true when this work is complete; specific and verifiable</requirement>
+<acceptance-criteria>a checklist the acceptance checker can verify, one item per line; or leave empty</acceptance-criteria>
+<sources>where this came from (e.g. "ticket OPS-1421; email from Pat 2026-05-29"); or leave empty</sources>
+</requirement-card>
+
+Until you emit the card, just talk to the developer. After you emit the card, stop.`;
+
+/**
+ * Parse the manager's requirement card out of a prose turn. Returns
+ * { title, requirement, acceptanceCriteria, sources } or null when there is no
+ * card (or a card with an empty requirement — fail-safe: an empty requirement
+ * is treated as "no card yet", never as a capturable definition of done).
+ */
+function parseRequirementCard(prose) {
+  const m = String(prose || '').match(/<requirement-card>([\s\S]*?)<\/requirement-card>/i);
+  if (!m) return null;
+  const body = m[1];
+  const grab = (tag) => { const mm = body.match(new RegExp('<' + tag + '>([\\s\\S]*?)</' + tag + '>', 'i')); return mm ? mm[1].trim() : ''; };
+  const requirement = grab('requirement');
+  if (!requirement) return null;
+  return { title: grab('title'), requirement, acceptanceCriteria: grab('acceptance-criteria'), sources: grab('sources') };
+}
+
+/**
+ * One intake exchange. `messages` is the prior conversation (user/assistant
+ * turns, latest user paste LAST); runIntake prepends the system prompt itself.
+ * `onTurn` streams progress: { kind:'message', content } for a manager prose
+ * turn, { kind:'tools', calls, results } for a read-tool turn, and
+ * { kind:'card', card, prose } when a card is emitted.
+ * Returns:
+ *   { complete:true, card, prose, transcript }                 — a card was emitted
+ *   { complete:false, reason:'awaiting-user', assistantText }  — a clarifying turn; user replies next
+ *   { complete:false, reason:'max-turns' }                     — ran out of turns with no card
+ */
+async function runIntake({ adapter, model, messages = [], signal, onLog, onTurn, onDiag, repoRoots = [] }) {
+  const log = (m) => { try { onLog?.(m); } catch {} };
+  // Awaited so a callback that persists state (e.g. addSource) completes before
+  // the next turn — prevents floating promises AND torn concurrent writes.
+  const emit = async (ev) => { try { await onTurn?.(ev); } catch {} };
+  const resolveAgainstRepos = (p) => {
+    if (typeof p !== 'string' || !p || path.isAbsolute(p)) return p;
+    try { if (existsSync(path.join(process.cwd(), p))) return p; } catch {}
+    for (const root of repoRoots) { try { if (existsSync(path.join(root, p))) return path.join(root, p); } catch {} }
+    return p;
+  };
+  const convo = [{ role: 'system', content: INTAKE_SYSTEM_PROMPT }, ...(Array.isArray(messages) ? messages : [])];
+
+  for (let turn = 1; turn <= INTAKE_MAX_TURNS; turn++) {
+    if (signal?.aborted) { const e = new Error('aborted'); e.name = 'AbortError'; throw e; }
+    const t0 = Date.now();
+    const response = await adapter.complete({ model, messages: convo, signal });
+    const text = response?.choices?.[0]?.message?.content ?? '';
+    log(`intake turn ${turn}: ${text.length} chars in ${Date.now() - t0}ms`);
+
+    const calls = parseToolCalls(text);
+    const allowed = calls.filter((c) => INTAKE_TOOL_VERBS.has(c.verb));
+    const blocked = calls.filter((c) => !INTAKE_TOOL_VERBS.has(c.verb));
+    const prose = text.replace(/<remote-workspace\b[^>]*>[\s\S]*?<\/remote-workspace>/gi, '').trim();
+
+    // A requirement-card WINS even if the model also grounded with read-only
+    // tools in the SAME reply (it commits to the card; the card is editable).
+    // Without this, a card emitted alongside e.g. <list/> is silently dropped
+    // and intake dead-ends — the model then claims it "already emitted the card"
+    // while nothing was captured.
+    const card = parseRequirementCard(prose);
+    if (card) { await emit({ kind: 'card', card, prose }); return { complete: true, card, prose, transcript: convo }; }
+
+    if (allowed.length === 0) {
+      // No tools and no card -> a clarifying/manager turn; return control to the user.
+      await emit({ kind: 'message', content: prose });
+      return { complete: false, reason: 'awaiting-user', assistantText: prose, transcript: convo };
+    }
+
+    const results = [];
+    for (const c of allowed) {
+      const shellBlock = c.verb === 'powershell' ? screenReadOnlyShell(c.args?.command) : null;
+      if (shellBlock) { results.push({ verb: c.verb, status: 'error', content: shellBlock }); continue; }
+      try {
+        if (c.args && typeof c.args.path === 'string') c.args.path = resolveAgainstRepos(c.args.path);
+        const raw = await execute(c.name, c.args, {}, { signal });
+        const content = (typeof raw === 'string' && raw.startsWith('ERROR:')) ? raw : extractContent(raw);
+        const status = (typeof raw === 'string' && raw.startsWith('ERROR:')) ? 'error' : 'ok';
+        results.push({ verb: c.verb, status, content });
+        log(`intake turn ${turn}: ${c.verb}(${JSON.stringify(c.args).slice(0, 80)}) -> ${status} ${content.length}b`);
+      } catch (e) {
+        results.push({ verb: c.verb, status: 'error', content: 'ERROR: ' + (e?.message ?? String(e)) });
+      }
+    }
+    if (blocked.length > 0) {
+      results.push({ verb: 'system', status: 'error', content: `Intake is read-only — dropped ${blocked.length} call(s): ${blocked.map((c) => c.verb).join(', ')}.` });
+    }
+    await emit({ kind: 'tools', calls: allowed, results });
+    convo.push({ role: 'assistant', content: text });
+    convo.push({ role: 'user', content: formatToolResults(results) });
+  }
+
+  log(`intake: hit max turns (${INTAKE_MAX_TURNS}) without a card.`);
+  emitDiag(onDiag, 'intake', `hit ${INTAKE_MAX_TURNS}-turn budget without a <requirement-card>`, lastAssistantText(convo));
+  await emit({ kind: 'message', content: 'I could not fully structure this within my turn budget. Please edit the card fields directly and capture.' });
+  return { complete: false, reason: 'max-turns', transcript: convo };
+}
+
+// ── Memory consolidation (post-acceptance fact extraction) ──────────────────
+// After an assignment is ACCEPTED, a read-only pass over the work just done,
+// proposing DURABLE codebase facts for Tier-1 memory (NOT task-specific or
+// already-known ones). Fail-safe to an empty list — recording nothing is the
+// correct, harmless default.
+const CONSOLIDATION_SYSTEM_PROMPT = `You are a codebase-memory curator. A unit of work on a codebase just completed and was accepted. Extract a SHORT list of DURABLE, REUSABLE facts about the codebase that will help FUTURE work — the kind a new teammate would want written down.
+
+RECORD: how the app is structured, conventions in force, non-obvious gotchas, where key things live, build/test/deploy specifics.
+DO NOT RECORD: anything task-specific or transient ("fixed bug X", "added method Y"), anything obvious from a glance at the code, anything already covered by the EXISTING MEMORY below, or speculation.
+
+You may verify read-only with the usual tools inside a <remote-workspace> block:
+  <read path="FILE"/>  <list path="DIR"/>  <search pattern="REGEX" path="DIR"/>  <find pattern="GLOB"/>  <info path="FILE"/>  <powershell>git log --oneline -n 5</powershell>
+You MUST NOT modify anything.
+
+When done, emit ONE block in a turn with NO tool calls. Either:
+<facts>
+<fact category="architecture|conventions|gotchas|where-things-live|build-deploy|general">one concise durable fact</fact>
+... (zero or more)
+</facts>
+or, if nothing is worth recording:
+<facts/>
+
+Be conservative — an empty list is the right answer when the work taught nothing durable. NEVER restate an existing fact.`;
+
+function parseFacts(prose) {
+  if (/<facts\s*\/>/i.test(prose)) return [];
+  const block = prose.match(/<facts>([\s\S]*?)<\/facts>/i);
+  if (!block) return null;   // no facts block at all → signal "no verdict"
+  const facts = [];
+  const re = /<fact\b([^>]*)>([\s\S]*?)<\/fact>/gi;
+  let m;
+  while ((m = re.exec(block[1]))) {
+    const catM = (m[1] || '').match(/category\s*=\s*"([^"]*)"/i);
+    const note = m[2].trim();
+    if (note) facts.push({ category: catM ? catM[1].trim() : 'general', note });
+  }
+  return facts;
+}
+
+/**
+ * Consolidate durable codebase facts from a completed assignment.
+ *   assignment:     { id, requirement }
+ *   tasks:          [{ taskId, userRequest, summary, events, verdict }]
+ *   existingMemory: rendered current memory (so it won't restate facts)
+ * Returns { facts: [{ category, note }] }. Fails safe to { facts: [] }.
+ */
+async function runConsolidation({ adapter, model, assignment, tasks = [], existingMemory = '', signal, onLog, onDiag, repoRoots = [] }) {
+  const log = (m) => { try { onLog?.(m); } catch {} };
+  const resolveAgainstRepos = (p) => {
+    if (typeof p !== 'string' || !p || path.isAbsolute(p)) return p;
+    try { if (existsSync(path.join(process.cwd(), p))) return p; } catch {}
+    for (const root of repoRoots) { try { if (existsSync(path.join(root, p))) return path.join(root, p); } catch {} }
+    return p;
+  };
+  const parts = ['<assignment-requirement>', clip(String(assignment?.requirement || '(none)'), 2000), '</assignment-requirement>'];
+  if (existingMemory) parts.push('<existing-memory note="do NOT restate any of these">', clip(String(existingMemory), 6000), '</existing-memory>');
+  parts.push('<work note="what was just completed and accepted">', buildBudgetedReviewInput(tasks || [], { budgetChars: 20000 }), '</work>');
+  const messages = [
+    { role: 'system', content: CONSOLIDATION_SYSTEM_PROMPT },
+    { role: 'user', content: parts.join('\n') },
+  ];
+
+  for (let turn = 1; turn <= REVIEWER_MAX_TURNS; turn++) {
+    if (signal?.aborted) { const e = new Error('aborted'); e.name = 'AbortError'; throw e; }
+    const t0 = Date.now();
+    const response = await adapter.complete({ model, messages, signal });
+    const text = response?.choices?.[0]?.message?.content ?? '';
+    log(`consolidation turn ${turn}: ${text.length} chars in ${Date.now() - t0}ms`);
+
+    const calls = parseToolCalls(text);
+    const allowed = calls.filter((c) => REVIEWER_TOOL_VERBS.has(c.verb));
+    const blocked = calls.filter((c) => !REVIEWER_TOOL_VERBS.has(c.verb));
+
+    if (allowed.length === 0) {
+      const prose = text.replace(/<remote-workspace\b[^>]*>[\s\S]*?<\/remote-workspace>/gi, '');
+      const facts = parseFacts(prose);
+      if (facts) return { facts };
+      log('consolidation: no facts block — recording nothing');
+      emitDiag(onDiag, 'consolidation', 'no <facts> block emitted — recorded nothing', prose);
+      return { facts: [] };
+    }
+
+    const results = [];
+    for (const c of allowed) {
+      const shellBlock = c.verb === 'powershell' ? screenReadOnlyShell(c.args?.command) : null;
+      if (shellBlock) { results.push({ verb: c.verb, status: 'error', content: shellBlock }); continue; }
+      try {
+        if (c.args && typeof c.args.path === 'string') c.args.path = resolveAgainstRepos(c.args.path);
+        const raw = await execute(c.name, c.args, {}, { signal });
+        const content = (typeof raw === 'string' && raw.startsWith('ERROR:')) ? raw : extractContent(raw);
+        const status = (typeof raw === 'string' && raw.startsWith('ERROR:')) ? 'error' : 'ok';
+        results.push({ verb: c.verb, status, content });
+      } catch (e) {
+        results.push({ verb: c.verb, status: 'error', content: 'ERROR: ' + (e?.message ?? String(e)) });
+      }
+    }
+    if (blocked.length > 0) {
+      results.push({ verb: 'system', status: 'error', content: `Consolidation is read-only — dropped ${blocked.length} call(s): ${blocked.map((c) => c.verb).join(', ')}.` });
+    }
+    messages.push({ role: 'assistant', content: text });
+    messages.push({ role: 'user', content: formatToolResults(results) });
+  }
+
+  log('consolidation: hit max turns without a facts block — recording nothing.');
+  emitDiag(onDiag, 'consolidation', `hit ${REVIEWER_MAX_TURNS}-turn budget without a <facts> block`, lastAssistantText(messages));
+  return { facts: [] };
+}
+
+// ── Task summary backfill (when the agent closed a task with a blank summary) ─
+// A single-shot, dedicated "give me ONLY a one-line summary" call — the most
+// reliable shape (nothing else asked for). Reads the closed task's diff/work
+// and returns one factual sentence. Fail-safe to '' so the caller can fall back.
+const SUMMARIZER_SYSTEM_PROMPT = `You write a ONE-sentence (two at most) factual summary of what a coding task accomplished, for a work log and commit message. You are given the task's request and its diff. Reply with ONLY the summary text — no preamble, no markdown, no tags, no quotes, no lists. Describe concretely what changed (files, functions, behaviour). If the diff is empty or unclear, give a brief best-effort description from the request.`;
+
+async function runSummarizer({ adapter, model, task, signal, onLog }) {
+  const log = (m) => { try { onLog?.(m); } catch {} };
+  try {
+    const input = [
+      '<task>',
+      task?.userRequest ? `request: ${clip(String(task.userRequest), 500)}` : '',
+      buildBudgetedReviewInput(task ? [task] : [], { budgetChars: 12000 }),
+      '</task>',
+    ].filter(Boolean).join('\n');
+    const messages = [
+      { role: 'system', content: SUMMARIZER_SYSTEM_PROMPT },
+      { role: 'user', content: `Summarize what this task accomplished, in one sentence (two at most):\n${input}` },
+    ];
+    const t0 = Date.now();
+    const response = await adapter.complete({ model, messages, signal });
+    const text = response?.choices?.[0]?.message?.content ?? '';
+    log(`summarizer: ${text.length} chars in ${Date.now() - t0}ms`);
+    // Strip stray tags/quotes/markdown, collapse whitespace, cap length.
+    return text.replace(/<[^>]+>/g, '').replace(/^[\s"'`*>-]+|[\s"'`*]+$/g, '').replace(/\s+/g, ' ').slice(0, 300).trim();
+  } catch (e) {
+    log(`summarizer failed: ${e?.message ?? e}`);
+    return '';
+  }
 }
 
 // Build a compact representation of the work the agent did, for the
@@ -3277,13 +4487,15 @@ function clip(s, n) {
 
 // ====== agent/project-context.mjs ======
 /**
- * Discover and format per-project context from CODE-BOSS.md files.
+ * Discover and format per-project context from AGENTS.md files.
  *
  * On project open, walk the project directory recursively looking for
- * files named CODE-BOSS.md. Each directory that contains one is treated
- * as a project; its contents get injected into the agent's system
- * prompt every turn so the model has the project-specific instructions
- * the developer has captured there.
+ * files named AGENTS.md (the cross-tool standard) — or the legacy
+ * CODE-BOSS.md, kept as a back-compat alias so projects authored before
+ * the rename keep working without a migration. Each directory that
+ * contains one is treated as a project; its contents get injected into
+ * the agent's system prompt every turn so the model has the
+ * project-specific instructions the developer has captured there.
  *
  * Two render modes:
  *   - Exactly one file, AT the project root → include its text directly
@@ -3299,7 +4511,7 @@ function clip(s, n) {
 
 // Directories we will not recurse into. Build outputs, version-control
 // internals, dependency caches — none of these legitimately contain
-// CODE-BOSS.md, and walking them is expensive.
+// an AGENTS.md, and walking them is expensive.
 const SKIP_DIRS = new Set([
   '.git', '.hg', '.svn',
   '.code_boss', '.agent',
@@ -3309,16 +4521,22 @@ const SKIP_DIRS = new Set([
   '__pycache__', '.gradle', '.mvn',
 ]);
 
-const CODE_BOSS_FILE = 'CODE-BOSS.md';
+// Recognized project-context filenames, in priority order. AGENTS.md is the
+// cross-tool standard; CODE-BOSS.md is the legacy alias we still honor. If a
+// directory has both, the first one in this list wins (AGENTS.md), so a project
+// can migrate by adding AGENTS.md without first deleting the old file.
+const CONTEXT_FILES = ['AGENTS.md', 'CODE-BOSS.md'];
 const MAX_DEPTH = 6;             // root + 6 levels — deeper is almost always inside a dependency
 const MAX_FILES = 25;            // hard stop so a generated tree can't pile up forever
 const MAX_FILE_BYTES = 16 * 1024;  // 16KB per file is plenty for project instructions
 const MAX_TOTAL_BYTES = 200 * 1024; // hard cap on the combined output
 
 /**
- * Walk `rootDir` looking for CODE-BOSS.md files. Returns
- *   [{ relDir, absPath, content, truncated, originalBytes }, ...]
- * with relDir relative to rootDir ('.' for the root itself).
+ * Walk `rootDir` looking for project-context files (AGENTS.md or the legacy
+ * CODE-BOSS.md). Returns
+ *   [{ relDir, absPath, name, content, truncated, originalBytes }, ...]
+ * with relDir relative to rootDir ('.' for the root itself) and `name` the
+ * actual filename that matched.
  */
 async function discoverCodeBossFiles(rootDir) {
   const found = [];
@@ -3331,12 +4549,15 @@ async function discoverCodeBossFiles(rootDir) {
     let entries;
     try { entries = await readdir(dir, { withFileTypes: true }); }
     catch { return; }   // permission denied, broken symlink, etc.
-    // Read files in this dir first, then descend — gives a stable
-    // top-down order in the result.
-    for (const e of entries) {
-      if (!e.isFile()) continue;
-      if (e.name !== CODE_BOSS_FILE) continue;
-      const abs = path.join(dir, e.name);
+    // Read the file in this dir first, then descend — gives a stable
+    // top-down order in the result. At most one context file per directory:
+    // prefer AGENTS.md, fall back to the legacy CODE-BOSS.md only when
+    // AGENTS.md isn't present here (so both can coexist during a migration).
+    const present = new Set();
+    for (const e of entries) if (e.isFile()) present.add(e.name);
+    const pick = CONTEXT_FILES.find((n) => present.has(n));
+    if (pick) {
+      const abs = path.join(dir, pick);
       try {
         const buf = await readFile(abs, 'utf8');
         const truncated = buf.length > MAX_FILE_BYTES;
@@ -3345,7 +4566,7 @@ async function discoverCodeBossFiles(rootDir) {
           : buf;
         totalBytes += content.length;
         const rel = path.relative(rootDir, dir) || '.';
-        found.push({ relDir: rel, absPath: abs, content, truncated, originalBytes: buf.length });
+        found.push({ relDir: rel, absPath: abs, name: pick, content, truncated, originalBytes: buf.length });
         if (found.length >= MAX_FILES) return;
         if (totalBytes >= MAX_TOTAL_BYTES) return;
       } catch { /* unreadable; skip */ }
@@ -3379,8 +4600,8 @@ function formatProjectContext(found) {
 
   if (found.length === 1 && found[0].relDir === '.') {
     return [
-      'The developer has placed a CODE-BOSS.md file in the project root with',
-      'instructions specific to this project. Follow these:',
+      `The developer has placed a project-instructions file (${found[0].name || 'AGENTS.md'})`,
+      'in the project root with instructions specific to this project. Follow these:',
       '',
       String(found[0].content).trim(),
     ].join('\n');
@@ -3388,10 +4609,10 @@ function formatProjectContext(found) {
 
   const sections = found.map((f) => {
     const heading = f.relDir === '.' ? '(project root)' : f.relDir.split(path.sep).join('/');
-    return `### ${heading}/CODE-BOSS.md\n\n${String(f.content).trim()}`;
+    return `### ${heading}/${f.name || 'AGENTS.md'}\n\n${String(f.content).trim()}`;
   });
   return [
-    `The active directory contains ${found.length} CODE-BOSS.md file(s), one per`,
+    `The active directory contains ${found.length} project-instructions file(s), one per`,
     'sub-project. Each section below names the directory and gives the',
     'developer\'s instructions for that part of the codebase. Use the relevant',
     'one(s) when working inside a given subdirectory:',
@@ -3408,6 +4629,238 @@ async function loadProjectContext(rootDir) {
   if (!rootDir) return { context: '', files: [] };
   const files = await discoverCodeBossFiles(rootDir);
   return { context: formatProjectContext(files), files };
+}
+
+// ====== agent/assignments.mjs ======
+/**
+ * Assignment-scoped store — the durable BACKLOG of real-world assignments.
+ *
+ * An "assignment" is one ratified bundle of work with a lifecycle:
+ *   capturing -> ready -> active -> accepted   (or parked)
+ * It is the PROSPECTIVE form of a "project" but is stored SEPARATELY from the
+ * tier-4 task-cluster rollup (which is a token-budget compaction artifact). The
+ * assignment references the tasks that fulfil it via `taskIds`; its own
+ * identity/requirement/commit-evidence live here and survive task demotion.
+ *
+ * Unlike tasks.mjs there are NO tiers, messages, or compaction here — this is a
+ * small, durable index. Writes are atomic (temp + rename) since the backlog
+ * outlives any single conversation (capture-now-work-later).
+ *
+ * Storage layout (per project):
+ *   <project>/.code_boss/assignments/
+ *     state.json   { version, nextId, order: ["A-2","A-1"], activeId }
+ *     A-1.json     full AssignmentRecord
+ *
+ * AssignmentRecord:
+ *   {
+ *     id:                 "A-3",
+ *     title:              "Reconcile App-A/App-B runbooks",
+ *     requirement:        "..." | null,    frozen "definition of done" (set on capture)
+ *     acceptanceCriteria: "..." | null,    free-text for v1
+ *     sources:            [{ kind:'email'|'spec'|'note'|'file', text, capturedAt }],
+ *     status:             'capturing'|'ready'|'active'|'accepted'|'parked',
+ *     createdAt, readyAt, startedAt, acceptedAt:  epoch ms | null,
+ *     taskIds:            ["T-7","T-8"],    worker tasks bound to this assignment
+ *     commitHashes:       [...],            durable evidence (survives demotion)
+ *     lastVerdict:        { round, fulfilled, missing, drift, rationale } | null,
+ *     checkpoints:        [{ kind, at, userAction }],  UI audit — NEVER fed to the LLM
+ *   }
+ */
+
+const ASSIGN_STATE_FILE = 'state.json';
+const ASSIGN_FILE = (id) => `${id}.json`;
+const STATUSES = new Set(['capturing', 'ready', 'active', 'accepted', 'parked']);
+const STATUS_STAMP = { ready: 'readyAt', active: 'startedAt', accepted: 'acceptedAt' };
+
+function assignNowMs() { return Date.now(); }
+
+function createAssignmentsStore(projectDir) {
+  if (!projectDir) throw new Error('projectDir required');
+  const dir = path.join(projectDir, '.code_boss', 'assignments');
+
+  let state = null;            // { version, nextId, order: [], activeId }
+  const cache = new Map();     // id -> AssignmentRecord
+
+  async function ensureDir() { await mkdir(dir, { recursive: true }); }
+
+  async function writeJsonAtomic(file, obj) {
+    await ensureDir();
+    const tmp = file + '.tmp';
+    await writeFile(tmp, JSON.stringify(obj, null, 2), 'utf8');
+    await rename(tmp, file);
+  }
+
+  async function saveState() { await writeJsonAtomic(path.join(dir, ASSIGN_STATE_FILE), state); }
+  async function loadState() {
+    try { return JSON.parse(await readFile(path.join(dir, ASSIGN_STATE_FILE), 'utf8')); }
+    catch { return null; }
+  }
+  async function loadAssignment(id) {
+    if (cache.has(id)) return cache.get(id);
+    try {
+      const a = JSON.parse(await readFile(path.join(dir, ASSIGN_FILE(id)), 'utf8'));
+      cache.set(id, a);
+      return a;
+    } catch { return null; }
+  }
+  async function saveAssignment(a) {
+    cache.set(a.id, a);
+    await writeJsonAtomic(path.join(dir, ASSIGN_FILE(a.id)), a);
+  }
+
+  function newId() {
+    const id = `A-${state.nextId}`;
+    state.nextId++;
+    return id;
+  }
+
+  async function init() {
+    await ensureDir();
+    state = await loadState();
+    if (!state) {
+      state = { version: 1, nextId: 1, order: [], activeId: null };
+      await saveState();
+    }
+    return state;
+  }
+
+  /** Create a new assignment (default status 'capturing') at the END of the
+   *  backlog. The requirement is null until intake freezes it. */
+  async function create({ title = 'Untitled assignment', requirement = null, acceptanceCriteria = null, sources = [], status = 'capturing' } = {}) {
+    const id = newId();
+    const a = {
+      id,
+      title,
+      requirement,
+      acceptanceCriteria,
+      sources: Array.isArray(sources) ? sources : [],
+      status: STATUSES.has(status) ? status : 'capturing',
+      createdAt: assignNowMs(),
+      readyAt: null, startedAt: null, acceptedAt: null,
+      taskIds: [],
+      commitHashes: [],
+      lastVerdict: null,
+      checkpoints: [],
+    };
+    if (STATUS_STAMP[a.status]) a[STATUS_STAMP[a.status]] = a.createdAt;
+    await saveAssignment(a);
+    state.order.push(id);
+    await saveState();
+    return a;
+  }
+
+  async function get(id) { return loadAssignment(id); }
+
+  /** Assignments in backlog order (index 0 = front/next). */
+  async function list() {
+    const out = [];
+    for (const id of state.order) {
+      const a = await loadAssignment(id);
+      if (a) out.push(a);
+    }
+    return out;
+  }
+
+  function activeId() { return state?.activeId ?? null; }
+  async function getActive() { return state?.activeId ? loadAssignment(state.activeId) : null; }
+
+  /** Merge fields into an assignment. A `status` change auto-stamps its
+   *  timestamp (readyAt/startedAt/acceptedAt). */
+  async function patch(id, fields = {}) {
+    const a = await loadAssignment(id);
+    if (!a) return null;
+    if (fields.status && !STATUSES.has(fields.status)) throw new Error(`invalid status: ${fields.status}`);
+    Object.assign(a, fields);
+    if (fields.status && STATUS_STAMP[fields.status] && !a[STATUS_STAMP[fields.status]]) {
+      a[STATUS_STAMP[fields.status]] = assignNowMs();
+    }
+    await saveAssignment(a);
+    return a;
+  }
+
+  /** Replace the backlog ordering. `newOrder` must be a permutation of the
+   *  current ids (extra/missing ids are rejected). */
+  async function reorder(newOrder) {
+    if (!Array.isArray(newOrder)) throw new Error('reorder expects an array of ids');
+    const cur = new Set(state.order);
+    const next = new Set(newOrder);
+    // Must be a true permutation: same length, no duplicates, exact same id set.
+    // (Set-only membership checks would let ['A-1','A-2','A-2'] through.)
+    if (newOrder.length !== state.order.length || next.size !== newOrder.length
+        || cur.size !== next.size || [...cur].some((id) => !next.has(id))) {
+      throw new Error('reorder must be a permutation of the existing assignment ids');
+    }
+    state.order = [...newOrder];
+    await saveState();
+    return state.order;
+  }
+
+  /** Move one assignment to a new index in the backlog. */
+  async function move(id, toIndex) {
+    const from = state.order.indexOf(id);
+    if (from < 0) return state.order;
+    state.order.splice(from, 1);
+    const idx = Math.max(0, Math.min(state.order.length, Number(toIndex) || 0));
+    state.order.splice(idx, 0, id);
+    await saveState();
+    return state.order;
+  }
+
+  async function setActive(id) {
+    if (id != null && !state.order.includes(id)) throw new Error(`no such assignment: ${id}`);
+    state.activeId = id ?? null;
+    await saveState();
+    return state.activeId;
+  }
+
+  /** Bind a worker task to an assignment (the join key). */
+  async function addTask(id, taskId) {
+    const a = await loadAssignment(id);
+    if (!a || !taskId) return a;
+    if (!a.taskIds.includes(taskId)) { a.taskIds.push(taskId); await saveAssignment(a); }
+    return a;
+  }
+  async function addCommit(id, hash) {
+    const a = await loadAssignment(id);
+    if (!a || !hash) return a;
+    if (!a.commitHashes.includes(hash)) { a.commitHashes.push(hash); await saveAssignment(a); }
+    return a;
+  }
+  async function addSource(id, source) {
+    const a = await loadAssignment(id);
+    if (!a) return a;
+    a.sources.push({ capturedAt: assignNowMs(), ...source });
+    await saveAssignment(a);
+    return a;
+  }
+  async function setVerdict(id, verdict) { return patch(id, { lastVerdict: verdict }); }
+  async function checkpoint(id, entry) {
+    const a = await loadAssignment(id);
+    if (!a) return a;
+    a.checkpoints.push({ at: assignNowMs(), ...entry });
+    await saveAssignment(a);
+    return a;
+  }
+
+  /** Remove an assignment entirely (e.g. an abandoned capture). */
+  async function remove(id) {
+    state.order = state.order.filter((x) => x !== id);
+    if (state.activeId === id) state.activeId = null;
+    cache.delete(id);
+    await saveState();
+    try { await unlink(path.join(dir, ASSIGN_FILE(id))); } catch { /* already gone */ }
+  }
+
+  return {
+    init,
+    create, get, list,
+    activeId, getActive, setActive,
+    patch, reorder, move,
+    addTask, addCommit, addSource, setVerdict, checkpoint,
+    remove,
+    _state: () => state,
+    _dir: () => dir,
+  };
 }
 
 // ====== agent/git-workflow.mjs ======
@@ -3479,7 +4932,7 @@ async function isGitRepo(dir) {
 }
 
 // Directories we never recurse into when looking for nested git repos.
-// Same list the CODE-BOSS.md scanner uses, plus the obvious build outputs
+// Same list the AGENTS.md scanner uses, plus the obvious build outputs
 // where a vendored dependency might keep its own .git as a footgun.
 const GIT_SCAN_SKIP_DIRS = new Set([
   '.git', '.hg', '.svn', '.code_boss', '.agent',
@@ -3709,10 +5162,16 @@ async function commitAll(dir, message) {
  * summary (truncated to fit a normal git log column); body has the
  * user-request that prompted the work.
  */
-function buildCommitMessage({ summary, userRequest }) {
-  const subject = String(summary || 'task').replace(/\s+/g, ' ').trim().slice(0, 72) || 'task';
+function buildCommitMessage({ summary, userRequest, assignmentId }) {
+  const tag = assignmentId ? `[${assignmentId}] ` : '';
+  // Prefer the agent's summary; if it's blank, fall back to the user-request
+  // (the one-line "what was wanted") before the generic 'task', so a task closed
+  // with an empty <next-task> summary doesn't produce a bare "task" commit.
+  const base = String(summary || '').trim() || String(userRequest || '').replace(/\s+/g, ' ').trim() || 'task';
+  const subject = (tag + base.replace(/\s+/g, ' ').trim()).slice(0, 72) || 'task';
   const body = userRequest ? `\n\nUser request: ${String(userRequest).trim()}` : '';
-  return subject + body + '\n\n[code_boss auto-commit]\n';
+  const asg = assignmentId ? `\nAssignment: ${assignmentId}` : '';
+  return subject + body + asg + '\n\n[code_boss auto-commit]\n';
 }
 
 // ====== git-api/gitlab.mjs ======
@@ -3923,6 +5382,15 @@ Examples:
   <wl args="quickbuild milconnect"/>    build skipping tests
   <wl args="pull allportlets"/>         git pull
   <wl args="all teb . start milconnect"/>  chain: build teb, then start milconnect
+
+Starting / stopping WebLogic (use these directly — do NOT test PowerShell with
+"Write-Output Hello" or similar; the shell works, just run the wl command):
+  <wl args="run milconnect"/>     build (as needed), deploy, and START the app on WebLogic
+  <wl args="start milconnect"/>   start an already-deployed app
+  <wl args="stop milconnect"/>    stop a running app
+  If the request is to start/stop the WebLogic SERVER itself (not a single app),
+  the exact invocation is in the wl user guide — read it with wl_read_doc first
+  rather than guessing.
 
 The tool can take many minutes — full builds especially. Prefer quickbuild
 over build when iterating, and pass a higher timeout_ms for slow operations.
@@ -4308,6 +5776,640 @@ function decodeEntities(s) {
 
 docxPlugin;
 
+// ====== plugins/docx-edit.mjs ======
+/**
+ * `docx-edit` plugin — full-fidelity .docx read + edit via the Apache POI
+ * Java helper (codeboss-docx-helper.jar + lib/). Node stays zero-dependency;
+ * all Word fidelity (formatting, lists, headers/footers, images, tables,
+ * hyperlinks, TOC fields) lives in the JVM.
+ *
+ * Two tools:
+ *   read_docx_full  — anchored, editable view of every paragraph (body,
+ *                     table cells, headers/footers) with a stable [#id] anchor.
+ *   edit_docx       — unique-per-paragraph find/replace, mirroring edit_file's
+ *                     contract. Only the matched runs' text changes; everything
+ *                     else round-trips byte-faithfully.
+ *
+ * Helper resolution (ensureHelper):
+ *   1. A PREBUILT jar — <bundleDir>/tools/, ../tools/, dev docx-helper/target/,
+ *      or CODEBOSS_DOCX_HELPER=<jar>. Requires a JRE on PATH.
+ *   2. Else COMPILE FROM EMBEDDED SOURCE — the production bundle carries the
+ *      helper's Java source (DOCX_HELPER_SOURCES, injected by scripts/build.mjs)
+ *      so only ONE .mjs need be transferred to an air-gapped box. On first use
+ *      it writes the source to ~/.code_boss/docx-helper/ and `javac`s it against
+ *      user-supplied POI jars in that folder's lib/ (or CODEBOSS_DOCX_LIB). If
+ *      the jars aren't there yet it tells the operator exactly what to copy
+ *      where; this needs a JDK (javac), not just a JRE.
+ */
+
+const HELPER_MAIN = 'com.codeboss.docx.DocxHelper';
+const HELPER_JAR = 'codeboss-docx-helper.jar';
+
+// Same root-containment guard as the built-in write tools (resolveDocxWritePath in
+// src/agent/tools.mjs — not exported, so replicated here). Reads are NOT gated.
+function resolveDocxWritePath(p) {
+  const root = path.resolve(process.cwd());
+  const abs = path.isAbsolute(p) ? path.resolve(p) : path.resolve(root, p);
+  if (abs !== root && !abs.startsWith(root + path.sep)) {
+    throw new Error(`path escapes project root: ${p}`);
+  }
+  return abs;
+}
+
+function resolveAbsRead(p) {
+  return path.isAbsolute(p) ? path.resolve(p) : path.resolve(process.cwd(), p);
+}
+
+// Locate a PREBUILT helper jar + build a classpath including its lib/ folder.
+// Returns { classpath } or null if not found.
+function locatePrebuiltHelper() {
+  const candidates = [];
+  if (process.env.CODEBOSS_DOCX_HELPER) candidates.push(process.env.CODEBOSS_DOCX_HELPER);
+  let moduleDir = '';
+  try { moduleDir = path.dirname(fileURLToPath(import.meta.url)); } catch { moduleDir = process.cwd(); }
+  // Bundled: <bundleDir>/tools/<jar>. Dev (src/plugins): ../../docx-helper/target/<jar>.
+  candidates.push(path.join(moduleDir, 'tools', HELPER_JAR));
+  candidates.push(path.join(moduleDir, '..', 'tools', HELPER_JAR));
+  candidates.push(path.join(moduleDir, '..', '..', 'docx-helper', 'target', HELPER_JAR));
+  for (const c of candidates) {
+    try {
+      if (existsSync(c)) {
+        const dir = path.dirname(c);
+        const cp = `${c}${path.delimiter}${path.join(dir, 'lib', '*')}`;
+        return { classpath: cp };
+      }
+    } catch { /* ignore */ }
+  }
+  return null;
+}
+
+// Where the bundle writes + compiles the helper from its embedded source when
+// no prebuilt jar is deployed. Per-user so it survives across runs.
+function helperWorkDir() { return path.join(homedir(), '.code_boss', 'docx-helper'); }
+
+// Single-file deploy path: the production bundle embeds the helper's Java
+// source (DOCX_HELPER_SOURCES, injected by scripts/build.mjs). On first use we
+// write it out and `javac` it against user-supplied POI jars, so only ONE .mjs
+// has to be transferred to the air-gapped box. Returns { classpath } on
+// success, null if no embedded source (dev — use the prebuilt jar), or THROWS
+// a descriptive error (.code = docx-needs-deps | docx-needs-jdk |
+// docx-compile-failed) so the plugin trigger can tell the operator what to do.
+function bootstrapFromSource() {
+  // In dev (running src/) the constant isn't injected — fall back to prebuilt.
+  if (typeof DOCX_HELPER_SOURCES === 'undefined' || !DOCX_HELPER_SOURCES) return null;
+  const workDir = helperWorkDir();
+  const srcDir = path.join(workDir, 'src');
+  const classesDir = path.join(workDir, 'classes');
+  const libDir = process.env.CODEBOSS_DOCX_LIB || path.join(workDir, 'lib');
+  const classpath = `${classesDir}${path.delimiter}${path.join(libDir, '*')}`;
+  const mainClass = path.join(classesDir, 'com', 'codeboss', 'docx', 'DocxHelper.class');
+
+  // Already compiled on a previous run.
+  if (existsSync(mainClass)) return { classpath };
+
+  // Write the embedded sources to disk (package-relative paths).
+  const javaFiles = [];
+  for (const [rel, src] of Object.entries(DOCX_HELPER_SOURCES)) {
+    const dest = path.join(srcDir, rel);
+    mkdirSync(path.dirname(dest), { recursive: true });
+    writeFileSync(dest, src, 'utf8');
+    javaFiles.push(dest);
+  }
+
+  // Dependencies present?
+  let libs = [];
+  try { libs = existsSync(libDir) ? readdirSync(libDir).filter((f) => f.toLowerCase().endsWith('.jar')) : []; } catch { /* */ }
+  if (!libs.length) {
+    mkdirSync(libDir, { recursive: true });
+    const e = new Error(
+      'docx editing needs the Apache POI dependency jars (one-time setup). Copy these ' +
+      '13 jars — poi-ooxml, poi, poi-ooxml-lite, xmlbeans, SparseBitSet, curvesapi, ' +
+      'commons-codec, commons-collections4, commons-compress, commons-io, commons-lang3, ' +
+      'commons-math3, log4j-api (POI 5.5.1 and its dependencies) — into this folder:\n  ' +
+      libDir + '\n' +
+      '(or set CODEBOSS_DOCX_LIB to a folder that already contains them), then restart. ' +
+      'The helper itself is compiled automatically from source embedded in this bundle — ' +
+      'a JDK 11+ (javac) must be on PATH.'
+    );
+    e.code = 'docx-needs-deps';
+    throw e;
+  }
+
+  // Compile the embedded source against the supplied jars (needs a JDK).
+  // `--release 11` pins both the language level and the bytecode target to
+  // Java 11 (matching docx-helper/pom.xml's maven.compiler.release), so even
+  // on a newer build JDK the output still loads on a JRE 11 — verified
+  // end-to-end on a real JDK/JRE 11.0.26 (compile + read + tracked edit). POI
+  // 5.5.1 and all its deps are <= Java 8 bytecode, so they load on 11 too.
+  mkdirSync(classesDir, { recursive: true });
+  const r = spawnSync('javac', ['--release', '11', '-cp', path.join(libDir, '*'), '-d', classesDir, ...javaFiles], { encoding: 'utf8' });
+  if (r.error && r.error.code === 'ENOENT') {
+    const e = new Error('docx editing needs a JDK (javac) on PATH to build the helper from source — a JRE alone is not enough. Install a JDK 11+ (the deploy box already needs java; use a JDK), or deploy a prebuilt codeboss-docx-helper.jar under tools/.');
+    e.code = 'docx-needs-jdk';
+    throw e;
+  }
+  if (r.status !== 0 || !existsSync(mainClass)) {
+    const e = new Error('docx helper failed to compile: ' + String(r.stderr || r.stdout || '(no output)').slice(0, 400));
+    e.code = 'docx-compile-failed';
+    throw e;
+  }
+  return { classpath };
+}
+
+// Resolve a runnable helper classpath: a prebuilt jar if deployed, else
+// compile-from-embedded-source. Caches the success so we javac at most once.
+let _helperCache = null;
+function ensureHelper() {
+  if (_helperCache) return _helperCache;
+  const pre = locatePrebuiltHelper();
+  if (pre) { _helperCache = pre; return pre; }
+  const built = bootstrapFromSource();   // may throw (deps/jdk/compile)
+  if (built) { _helperCache = built; return built; }
+  return null;
+}
+
+// Spawn `java ... DocxHelper <op>`, feed the JSON spec on stdin, parse the one
+// JSON document on stdout. Returns the parsed object (may be { ok:false, ... }).
+function runHelper(op, spec, { signal, timeoutMs = 60000 } = {}) {
+  let loc;
+  try { loc = ensureHelper(); }
+  catch (e) { return Promise.resolve({ ok: false, code: 'file-error', error: e.message }); }
+  if (!loc) return Promise.resolve({ ok: false, code: 'file-error', error: `docx helper jar not found (set CODEBOSS_DOCX_HELPER or deploy ${HELPER_JAR} under tools/)` });
+  return new Promise((resolve) => {
+    const outDec = new StringDecoder('utf8');
+    const errDec = new StringDecoder('utf8');
+    let stdout = '', stderr = '', settled = false;
+    const child = spawn('java', ['-Dfile.encoding=UTF-8', '-cp', loc.classpath, HELPER_MAIN, op], {
+      cwd: process.cwd(), windowsHide: true,
+    });
+    const onAbort = () => { try { child.kill(); } catch {} };
+    if (signal) {
+      if (signal.aborted) onAbort();
+      else signal.addEventListener('abort', onAbort, { once: true });
+    }
+    const tid = setTimeout(() => { try { child.kill(); } catch {} }, Math.min(Math.max(5000, timeoutMs), 600000));
+    const settle = (obj) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(tid);
+      if (signal) try { signal.removeEventListener('abort', onAbort); } catch {}
+      resolve(obj);
+    };
+    child.stdout.on('data', (d) => { stdout += outDec.write(d); });
+    child.stderr.on('data', (d) => { stderr += errDec.write(d); });
+    child.on('error', (e) => settle({ ok: false, code: 'file-error', error: `cannot spawn java: ${e.message} (is a JRE on PATH?)` }));
+    child.on('close', () => {
+      stdout += outDec.end();
+      stderr += errDec.end();
+      // The helper writes exactly one JSON document; take the last non-empty line.
+      const lines = stdout.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+      const last = lines.length ? lines[lines.length - 1] : '';
+      try {
+        resolve(JSON.parse(last));
+      } catch {
+        settle({ ok: false, code: 'file-error', error: `unparseable helper output: ${(last || stderr || '(empty)').slice(0, 400)}` });
+      }
+    });
+    try {
+      child.stdin.write(Buffer.from(JSON.stringify(spec), 'utf8'));
+      child.stdin.end();
+    } catch (e) {
+      settle({ ok: false, code: 'file-error', error: `cannot write to helper stdin: ${e.message}` });
+    }
+  });
+}
+
+// Spec-maintenance is the DEFAULT posture for this deployment: every change to
+// a mature/scrutinized spec must be explicitly approved by the developer (the
+// TOOL enforces it — not the agent) and is recorded as a tracked revision. Set
+// CODEBOSS_DOCX_GENERAL=1 to opt into the less-restrictive general profile
+// (direct edits, no mandatory approval).
+function specMode() { return process.env.CODEBOSS_DOCX_GENERAL !== '1'; }
+
+function describeChange(ops, dry) {
+  const lines = ops.map((op, i) => {
+    const r = (dry.ops && dry.ops[i]) || {};
+    const t = op.op || 'replace';
+    if (t === 'setRunFormat') return `• format #${op.id} ${JSON.stringify(op.find)} → {${Object.entries(op.format || {}).map(([k, v]) => `${k}=${v}`).join(', ')}}`;
+    if (t === 'setParaStyle') return `• style #${op.id} → ${op.style}`;
+    if (t === 'setParaProps') return `• paragraph #${op.id} → ${Object.keys(op).filter((k) => k !== 'op' && k !== 'id').map((k) => `${k}=${op[k]}`).join(', ')}`;
+    if (t === 'setListMembership') return `• list #${op.id} → numId ${op.numId}`;
+    return `• #${op.id}: ${JSON.stringify(r.before)} → ${JSON.stringify(r.after)}`;
+  });
+  return `Approve this tracked change to the document?\n${lines.join('\n')}\n(It will be recorded as a Word revision you can review/accept.)`;
+}
+
+// Run an edit through the spec-maintenance gate (dry-run preview → mandatory
+// developer approval → apply as a tracked revision) or, in general mode,
+// directly. Returns { res } (helper result) or { error } (string).
+async function applyOps(abs, ops, ctx) {
+  if (typeof ctx?.requireBranch === 'function') {
+    const s = await ctx.requireBranch(abs);
+    if (s === 'aborted') return { error: 'edit aborted: user declined to create a CODE_BOSS branch for this repo' };
+  }
+  const base = { op: 'edit', docx: abs, ops, author: 'code_boss', date: new Date().toISOString() };
+  if (specMode()) {
+    if (typeof ctx?.requireApproval !== 'function') {
+      return { error: 'spec-maintenance mode requires explicit developer approval, which is not available in this context' };
+    }
+    const dry = await runHelper('edit', { ...base, dryRun: true, tracked: true }, { signal: ctx?.signal });
+    if (!dry || dry.ok !== true) return { res: dry };   // surface validation error (not-found, straddle, …)
+    const approved = await ctx.requireApproval({ kind: 'docx-change', message: describeChange(ops, dry) });
+    if (!approved) return { error: 'change not approved by developer' };
+    return { res: await runHelper('edit', { ...base, dryRun: false, tracked: true }, { signal: ctx?.signal }) };
+  }
+  return { res: await runHelper('edit', { ...base, dryRun: false }, { signal: ctx?.signal }) };
+}
+
+function formatOpsResult(res, abs) {
+  const rel = path.relative(process.cwd(), abs) || abs;
+  const o = (res.ops && res.ops[0]) || {};
+  const trk = res.trackChanges ? '  [tracked change — shows as a Word revision]' : '';
+  const field = res.updateFieldsOnOpen ? '  (TOC/fields refresh when opened in Word)' : '';
+  const t = o.op || 'replace';
+  let summary, diff;
+  if (t === 'replace' || o.before !== undefined) {
+    const flat = o.flattened ? '  [FORMAT FLATTENED — review/fix formatting manually]' : '';
+    summary = `edited ${rel} #${o.id}  ${shortDiffSummary(o.before || '', o.after || '')}${flat}`;
+    diff = renderUnifiedDiff(o.before || '', o.after || '', { pathLabel: `${rel} #${o.id}`, context: 2 });
+  } else if (t === 'setRunFormat') {
+    summary = `formatted ${rel} #${o.id}  ${JSON.stringify(o.find)} → {${Object.entries(o.format || {}).map(([k, v]) => `${k}=${v}`).join(', ')}}`;
+  } else if (t === 'setParaStyle') {
+    summary = `styled ${rel} #${o.id} → ${o.style}`;
+  } else {
+    summary = `changed ${rel} #${o.id} (${t})`;
+  }
+  const out = { content: summary + trk + field, path: rel };
+  if (diff) out.diff = diff;
+  return out;
+}
+
+function renderRead(res, { offset, limit }) {
+  const paras = Array.isArray(res.paragraphs) ? res.paragraphs : [];
+  const meta = res.meta || {};
+  const start = Math.max(0, (Number(offset) || 1) - 1);
+  const max = Math.min(5000, Math.max(1, Number(limit) || 1000));
+  const slice = paras.slice(start, start + max);
+  const lines = slice.map((p) => {
+    const reason = p.hasRevisions ? 'tracked-changes' : p.contentControl ? 'content-control' : 'field/TOC';
+    const ro = p.readOnly ? ` READ-ONLY(${reason})` : '';
+    const lvl = (p.listLevel != null) ? ` list:L${p.listLevel}` : '';
+    const where = p.scope === 'body' ? 'body' : `${p.scope} ${p.location}`;
+    const marks = [];
+    if (p.hasEquation) marks.push('[equation]');
+    if (p.deletedText) marks.push(`[deleted: ${JSON.stringify(p.deletedText)}]`);
+    const suffix = marks.length ? '  ' + marks.join(' ') : '';
+    return `[#${p.id}] (${where}${lvl}${ro}) ${p.text}${suffix}`;
+  });
+  const warns = [];
+  if (meta.documentProtection) warns.push(`!! DOCUMENT PROTECTED (${meta.documentProtection}) — edits will be refused; remove protection in Word first.`);
+  if (meta.hasTrackChanges) warns.push(`!! This document has TRACKED CHANGES (${meta.revisionParagraphs} paragraph(s)); those paragraphs are read-only here — review/accept changes in Word, or edit elsewhere. Deleted text is shown as [deleted: ...].`);
+  if (meta.contentControls) warns.push(`Note: ${meta.contentControls} content control(s) present (shown read-only).`);
+  if (meta.equationParagraphs) warns.push(`Note: ${meta.equationParagraphs} paragraph(s) contain equations (shown as [equation]).`);
+  const head = `${res.docx}  (${paras.length} editable paragraphs, showing ${start + 1}..${start + slice.length})`;
+  const note = 'Edit with edit_docx using the [#id] anchor + a unique find string within that paragraph. READ-ONLY paragraphs (TOC/fields, tracked-changes, content-controls) cannot be edited here.';
+  return `${head}\n${note}${warns.length ? '\n' + warns.join('\n') : ''}\n\n${lines.join('\n')}`;
+}
+
+function renderDetail(res) {
+  const paras = Array.isArray(res.paragraphs) ? res.paragraphs : [];
+  const out = [];
+  for (const p of paras) {
+    if (p.contentControl) { out.push(`[#${p.id}] (content-control, read-only) ${p.text || ''}`); continue; }
+    const bits = [];
+    if (p.styleName || p.style) bits.push(`style=${p.styleName || p.style}`);
+    if (p.outlineLevel != null) bits.push(`heading-level ${p.outlineLevel}`);
+    if (p.alignment && p.alignment !== 'LEFT') bits.push(`align=${p.alignment}`);
+    if (p.numbering) bits.push(`list numId=${p.numbering.numId} level=${p.numbering.ilvl ?? 0}`);
+    if (p.pPr) {
+      const pp = p.pPr, pb = [];
+      if (pp.indentLeftTwips) pb.push(`indentL=${pp.indentLeftTwips}tw`);
+      if (pp.spacingBeforeTwips) pb.push(`spBefore=${pp.spacingBeforeTwips}`);
+      if (pp.spacingAfterTwips) pb.push(`spAfter=${pp.spacingAfterTwips}`);
+      if (pb.length) bits.push(pb.join(' '));
+    }
+    out.push(`[#${p.id}]${p.readOnly ? ' READ-ONLY' : ''}  ${bits.join('  ')}`);
+    for (const r of (p.runs || [])) {
+      const e = r.effective || {};
+      const efmt = [
+        e.bold ? 'bold' : null, e.italic ? 'italic' : null,
+        (e.underline && e.underline !== 'none') ? `underline:${e.underline}` : null,
+        e.font ? `font:${e.font}` : null, e.sizePt ? `${e.sizePt}pt` : null, e.color ? `#${e.color}` : null,
+      ].filter(Boolean).join(', ') || 'plain';
+      const auth = r.authored ? `  (authored: ${Object.entries(r.authored).map(([k, v]) => `${k}=${v}`).join(', ')})` : '';
+      out.push(`   r${r.r} @${r.start}..${r.end} ${JSON.stringify(r.text)}  [${efmt}]${auth}`);
+    }
+  }
+  return out.join('\n');
+}
+
+const docxEditPlugin = {
+  name: 'docx-edit',
+  description: 'Full-fidelity .docx read + edit via an Apache POI Java helper (preserves formatting, lists, headers, images, tables, hyperlinks, TOC). Requires a JRE + the helper jar.',
+  async trigger(executor) {
+    // Resolve (or build-from-embedded-source) the helper. A missing-deps /
+    // missing-JDK condition THROWS — letting the message surface in the plugin
+    // status (boot log + Snapshot query 48) so the operator knows what to copy.
+    const loc = ensureHelper();
+    if (!loc) return false;
+    try {
+      const r = await executor.run('if (Get-Command java -ErrorAction SilentlyContinue) { "yes" } else { "no" }');
+      return r.exitCode === 0 && /^yes/i.test(r.stdout.trim());
+    } catch {
+      return false;
+    }
+  },
+  promptAddition: () => {
+    const common = `
+Editing Microsoft Word .docx files (full fidelity):
+  <read_docx_full path="doc.docx"/>          read the doc as an anchored outline (text + structure)
+  <read_docx_detail path="doc.docx" paragraphs="12,13"/>  inspect formatting of specific paragraphs
+  <edit_docx path="doc.docx" paragraph="12" find="exact text" replace="new text"/>
+  <format_docx path="doc.docx" paragraph="12" find="some words" bold="true" color="FF0000"/>
+  <style_docx path="doc.docx" paragraph="12" style="Heading1" alignment="CENTER"/>
+
+read_docx_full lists every editable paragraph with a [#id] anchor and marks
+READ-ONLY regions (TOC/fields, tracked-changes, content-controls). edit_docx
+replaces ONE exact occurrence of "find" within paragraph [#id] (fails if missing
+or not unique). format_docx changes character formatting of a span; style_docx
+changes paragraph style/alignment/indent/list. Only what you target changes;
+all other formatting, lists, images, tables, hyperlinks, headers, and the TOC
+are preserved. Workflow: read_docx_full for anchors, read_docx_detail to inspect
+formatting, then edit/format/style per change.`;
+    if (specMode()) {
+      return (common + `
+
+SPEC-MAINTENANCE MODE (these are mature, scrutinized specifications):
+- Make ONLY the minimal change required by the task. Do NOT add new content,
+  reword for style, or "improve" anything that is not actually wrong.
+- EVERY change must be confirmed by the developer — each edit_docx/format_docx/
+  style_docx call pauses for an explicit Approve/Deny, and applies the change as
+  a TRACKED REVISION so it can be reviewed and accepted in Word. Expect to make
+  many small, individually-approved edits rather than broad changes.
+- If unsure whether a change is warranted, ask the developer rather than editing.`).trim();
+    }
+    return (common + `
+
+Track changes: add asTracked="true" to edit_docx to record an edit as a Word
+revision instead of a direct edit; edits auto-track when the doc already has
+tracked changes. A find that spans a formatting boundary needs allowFormatFlatten
+(developer-approved); prefer narrowing the find to one format.`).trim();
+  },
+  tools: [
+    {
+      verb: 'read_docx_full',
+      name: 'read_docx_full',
+      schema: {
+        description: 'Read a .docx as an anchored, editable text view: every paragraph (body, table cells, headers, footers) with a [#id] anchor, scope, and read-only field/TOC markers. Use before edit_docx. For prose-only reading use read_docx instead.',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'Absolute or project-relative path to a .docx file.' },
+            offset: { type: 'integer', description: 'Optional 1-based starting paragraph (for paging).' },
+            limit: { type: 'integer', description: 'Optional max paragraphs to return (default 1000).' },
+          },
+          required: ['path'],
+        },
+      },
+      async impl({ path: p, offset, limit }, ctx) {
+        if (typeof p !== 'string' || !p) return 'ERROR: path is required';
+        const abs = resolveAbsRead(p);
+        const res = await runHelper('read', { op: 'read', docx: abs }, { signal: ctx?.signal });
+        if (!res || res.ok !== true) return `ERROR: ${res?.code || 'file-error'}: ${res?.error || 'read failed'}`;
+        return { content: renderRead(res, { offset, limit }) };
+      },
+    },
+    {
+      verb: 'read_docx_detail',
+      name: 'read_docx_detail',
+      schema: {
+        description: 'Detailed formatting view of specific paragraphs — per-run EFFECTIVE formatting (what Word shows, resolved through the style cascade) and AUTHORED formatting (set directly on the run), char-offset ranges, paragraph style/outline-level/alignment/indent/spacing, and list numbering. Use after read_docx_full to inspect formatting before editing.',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'Absolute or project-relative path to a .docx file.' },
+            paragraphs: { type: 'array', items: { type: 'integer' }, description: 'The [#id] anchors (from read_docx_full) to inspect in detail.' },
+          },
+          required: ['path', 'paragraphs'],
+        },
+      },
+      async impl({ path: p, paragraphs }, ctx) {
+        if (typeof p !== 'string' || !p) return 'ERROR: path is required';
+        const abs = resolveAbsRead(p);
+        // The prose <...> protocol passes attributes as STRINGS, so `paragraphs`
+        // arrives as "0,2,8,23" (or a single "0"), not a JSON array. Accept
+        // both: a real array, or a comma/space-separated string of [#id]s.
+        const rawList = Array.isArray(paragraphs)
+          ? paragraphs
+          : String(paragraphs ?? '').split(/[,\s]+/);
+        // Strip any non-digits so the [#id] forms the model naturally writes
+        // ("#0", "[#0]", "0") all coerce to the numeric anchor.
+        const anchors = rawList
+          .map((n) => String(n).replace(/[^0-9]/g, ''))
+          .filter(Boolean)
+          .map(Number)
+          .filter((n) => !Number.isNaN(n));
+        if (!anchors.length) return 'ERROR: paragraphs ([#id] list) is required';
+        const res = await runHelper('detail', { op: 'detail', docx: abs, anchors }, { signal: ctx?.signal });
+        if (!res || res.ok !== true) return `ERROR: ${res?.code || 'file-error'}: ${res?.error || 'detail failed'}`;
+        return { content: renderDetail(res) };
+      },
+    },
+    {
+      verb: 'edit_docx',
+      name: 'edit_docx',
+      schema: {
+        description: 'Edit a .docx in place: replace ONE exact occurrence of "find" with "replace" within paragraph [#id] (from read_docx_full). Mirrors edit_file — fails if find is missing or occurs more than once in that paragraph. All formatting, lists, images, tables, hyperlinks, headers, and TOC are preserved; only the matched text changes.',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'Absolute or project-relative path to a .docx file (must be inside the project).' },
+            paragraph: { type: 'integer', description: 'The [#id] anchor of the paragraph to edit (from read_docx_full).' },
+            find: { type: 'string', description: 'Exact text to find within that paragraph. Must occur exactly once there.' },
+            replace: { type: 'string', description: 'Replacement text (empty string to delete the found text).' },
+            asTracked: { type: 'boolean', description: 'Apply as a TRACKED CHANGE (Word revision: w:del of the old text + w:ins of the new) instead of a direct edit. Auto-forced when the document already contains tracked changes. The author is "code_boss".' },
+            allowFormatFlatten: { type: 'boolean', description: 'Only set true if a find that spans a formatting boundary (e.g. plain into bold) is genuinely needed. Triggers a developer-approval prompt; the replaced text takes the first run\'s format and the developer fixes formatting afterward. Prefer narrowing the find to one format instead.' },
+          },
+          required: ['path', 'paragraph', 'find', 'replace'],
+        },
+      },
+      async impl({ path: p, paragraph, find, replace, allowFormatFlatten, asTracked }, ctx) {
+        if (typeof p !== 'string' || !p) return 'ERROR: path is required';
+        if (paragraph == null || Number.isNaN(Number(paragraph))) return 'ERROR: paragraph ([#id]) is required';
+        if (typeof find !== 'string' || !find) return 'ERROR: find is required';
+        if (typeof replace !== 'string') return 'ERROR: replace is required';
+        let abs;
+        try { abs = resolveDocxWritePath(p); } catch (e) { return `ERROR: ${e.message}`; }
+
+        const op = { id: Number(paragraph), find, replace };
+        if (asTracked) op.asTracked = true;
+        if (allowFormatFlatten) op.allowFormatFlatten = true;
+
+        // SPEC-MAINTENANCE MODE: every edit is dry-run-previewed, requires an
+        // explicit developer Approve/Deny, and is applied as a tracked revision.
+        if (specMode()) {
+          const { res, error } = await applyOps(abs, [op], ctx);
+          if (error) return 'ERROR: ' + error;
+          if (!res || res.ok !== true) return `ERROR: ${res?.code || 'file-error'}: ${res?.error || 'edit failed'}`;
+          return formatOpsResult(res, abs);
+        }
+
+        // ===== GENERAL MODE (direct edits; flatten gated separately) =====
+        // Same pre-write hook as edit_file: ensure the repo is on a CODE_BOSS branch.
+        if (typeof ctx?.requireBranch === 'function') {
+          const status = await ctx.requireBranch(abs);
+          if (status === 'aborted') return 'ERROR: edit aborted: user declined to create a CODE_BOSS branch for this repo';
+        }
+
+        // Format-flatten requires explicit developer approval (a flatten loses
+        // intra-span formatting, so the developer fixes it after). The approval
+        // gate is ctx.requireApproval; until it is wired, flatten is refused so
+        // it can never happen silently.
+        if (allowFormatFlatten) {
+          if (typeof ctx?.requireApproval === 'function') {
+            const preview = await runHelper('edit', { op: 'edit', docx: abs, dryRun: true, ops: [{ ...op, allowFormatFlatten: true }] }, { signal: ctx?.signal });
+            const previewText = preview?.ops?.[0] ? `"${preview.ops[0].before}" -> "${preview.ops[0].after}"` : `${find} -> ${replace}`;
+            const ok = await ctx.requireApproval({
+              kind: 'docx-flatten',
+              message: `Editing paragraph #${paragraph} would flatten formatting across a bold/plain boundary: ${previewText}. The replaced text takes the first run's format; you will likely need to fix formatting manually afterward. Approve?`,
+            });
+            if (!ok) return 'ERROR: format-flatten not approved by developer; narrow the find to stay within one format, or split into separate edits';
+            op.allowFormatFlatten = true;
+          } else {
+            return 'ERROR: this edit needs format flattening, which requires developer approval (not available in this context). Narrow the find to stay within one format, or split into separate edits.';
+          }
+        }
+
+        const res = await runHelper('edit', { op: 'edit', docx: abs, dryRun: false, ops: [op], author: 'code_boss', date: new Date().toISOString() }, { signal: ctx?.signal });
+        if (!res || res.ok !== true) return `ERROR: ${res?.code || 'file-error'}: ${res?.error || 'edit failed'}`;
+        const o = (res.ops && res.ops[0]) || { before: '', after: '', flattened: false };
+        const rel = path.relative(process.cwd(), abs) || abs;
+        const flat = o.flattened ? '  [FORMAT FLATTENED — review/fix formatting manually]' : '';
+        const fieldNote = res.updateFieldsOnOpen ? '  (TOC/fields will refresh when opened in Word)' : '';
+        const trk = (asTracked || res.trackChanges) ? '  [tracked change — shows as a Word revision]' : '';
+        return {
+          content: `edited ${rel} #${paragraph}  ${shortDiffSummary(o.before, o.after)}${trk}${flat}${fieldNote}`,
+          diff: renderUnifiedDiff(o.before, o.after, { pathLabel: `${rel} #${paragraph}`, context: 2 }),
+          path: rel,
+        };
+      },
+    },
+    {
+      verb: 'format_docx',
+      name: 'format_docx',
+      schema: {
+        description: 'Apply CHARACTER formatting (bold/italic/underline/strike/font/size/color) to a unique text span within a paragraph. Splits runs so only the matched span is affected; all other formatting is preserved. The text is unchanged.',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'Absolute or project-relative path to a .docx (inside the project).' },
+            paragraph: { type: 'integer', description: 'The [#id] anchor (from read_docx_full).' },
+            find: { type: 'string', description: 'Exact text within that paragraph to (re)format. Must occur exactly once.' },
+            bold: { type: 'boolean' },
+            italic: { type: 'boolean' },
+            underline: { type: 'string', description: 'e.g. "single", "double", or "none".' },
+            strike: { type: 'boolean' },
+            font: { type: 'string', description: 'Font family name.' },
+            sizePt: { type: 'number', description: 'Font size in points.' },
+            color: { type: 'string', description: 'Hex RRGGBB (with or without #).' },
+          },
+          required: ['path', 'paragraph', 'find'],
+        },
+      },
+      async impl({ path: p, paragraph, find, bold, italic, underline, strike, font, sizePt, color }, ctx) {
+        if (typeof p !== 'string' || !p) return 'ERROR: path is required';
+        if (paragraph == null) return 'ERROR: paragraph ([#id]) is required';
+        if (typeof find !== 'string' || !find) return 'ERROR: find is required';
+        const format = {};
+        if (bold !== undefined) format.bold = bold;
+        if (italic !== undefined) format.italic = italic;
+        if (underline !== undefined) format.underline = underline;
+        if (strike !== undefined) format.strike = strike;
+        if (font !== undefined) format.font = font;
+        if (sizePt !== undefined) format.sizePt = sizePt;
+        if (color !== undefined) format.color = color;
+        if (!Object.keys(format).length) return 'ERROR: provide at least one of bold/italic/underline/strike/font/sizePt/color';
+        let abs;
+        try { abs = resolveDocxWritePath(p); } catch (e) { return `ERROR: ${e.message}`; }
+        const { res, error } = await applyOps(abs, [{ op: 'setRunFormat', id: Number(paragraph), find, format }], ctx);
+        if (error) return 'ERROR: ' + error;
+        if (!res || res.ok !== true) return `ERROR: ${res?.code || 'file-error'}: ${res?.error || 'format failed'}`;
+        return formatOpsResult(res, abs);
+      },
+    },
+    {
+      verb: 'style_docx',
+      name: 'style_docx',
+      schema: {
+        description: 'Apply PARAGRAPH-level changes: set the paragraph style (e.g. a heading), alignment, indent/spacing, or list membership. Targets a whole paragraph by [#id]. Text is unchanged.',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'Absolute or project-relative path to a .docx (inside the project).' },
+            paragraph: { type: 'integer', description: 'The [#id] anchor (from read_docx_full).' },
+            style: { type: 'string', description: 'A style ID present in the document (e.g. "Heading1"). Use read_docx_detail to see style ids.' },
+            alignment: { type: 'string', description: 'LEFT, CENTER, RIGHT, or BOTH (justified).' },
+            indentLeftTwips: { type: 'integer', description: 'Left indent in twips (1440 = 1 inch).' },
+            spacingBeforeTwips: { type: 'integer' },
+            spacingAfterTwips: { type: 'integer' },
+            numId: { type: 'integer', description: 'List numbering id to attach the paragraph to (use a numId already in the document).' },
+            ilvl: { type: 'integer', description: 'List level (0-based), used with numId.' },
+          },
+          required: ['path', 'paragraph'],
+        },
+      },
+      async impl({ path: p, paragraph, style, alignment, indentLeftTwips, spacingBeforeTwips, spacingAfterTwips, numId, ilvl }, ctx) {
+        if (typeof p !== 'string' || !p) return 'ERROR: path is required';
+        if (paragraph == null) return 'ERROR: paragraph ([#id]) is required';
+        const id = Number(paragraph);
+        const ops = [];
+        if (style !== undefined) ops.push({ op: 'setParaStyle', id, style });
+        const props = {};
+        if (alignment !== undefined) props.alignment = alignment;
+        if (indentLeftTwips !== undefined) props.indentLeftTwips = indentLeftTwips;
+        if (spacingBeforeTwips !== undefined) props.spacingBeforeTwips = spacingBeforeTwips;
+        if (spacingAfterTwips !== undefined) props.spacingAfterTwips = spacingAfterTwips;
+        if (Object.keys(props).length) ops.push({ op: 'setParaProps', id, ...props });
+        if (numId !== undefined && numId !== null) ops.push({ op: 'setListMembership', id, numId, ...(ilvl !== undefined ? { ilvl } : {}) });
+        if (!ops.length) return 'ERROR: provide a style, and/or alignment/indent/spacing, and/or numId';
+        let abs;
+        try { abs = resolveDocxWritePath(p); } catch (e) { return `ERROR: ${e.message}`; }
+        const { res, error } = await applyOps(abs, ops, ctx);
+        if (error) return 'ERROR: ' + error;
+        if (!res || res.ok !== true) return `ERROR: ${res?.code || 'file-error'}: ${res?.error || 'style edit failed'}`;
+        return formatOpsResult(res, abs);
+      },
+    },
+    {
+      verb: 'delete_paragraph_docx',
+      name: 'delete_paragraph_docx',
+      schema: {
+        description: 'Structural: delete a paragraph by [#id]. In spec/tracked mode this marks the whole paragraph\'s content as a tracked deletion (struck-through; a reviewer accepts it in Word to remove it) rather than physically removing it. Use to remove outdated content from a spec.',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'Absolute or project-relative path to a .docx (inside the project).' },
+            paragraph: { type: 'integer', description: 'The [#id] anchor (from read_docx_full) of the paragraph to delete.' },
+          },
+          required: ['path', 'paragraph'],
+        },
+      },
+      async impl({ path: p, paragraph }, ctx) {
+        if (typeof p !== 'string' || !p) return 'ERROR: path is required';
+        if (paragraph == null) return 'ERROR: paragraph ([#id]) is required';
+        let abs;
+        try { abs = resolveDocxWritePath(p); } catch (e) { return `ERROR: ${e.message}`; }
+        const { res, error } = await applyOps(abs, [{ op: 'deleteParagraph', id: Number(paragraph) }], ctx);
+        if (error) return 'ERROR: ' + error;
+        if (!res || res.ok !== true) return `ERROR: ${res?.code || 'file-error'}: ${res?.error || 'delete failed'}`;
+        return formatOpsResult(res, abs);
+      },
+    },
+  ],
+};
+
+docxEditPlugin;
+
 // ====== plugins/index.mjs ======
 /**
  * Plugin registry + manager.
@@ -4334,7 +6436,7 @@ docxPlugin;
  */
 
 // All built-in plugins. New plugins get added here.
-const PLUGINS = [wlPlugin, docxPlugin];
+const PLUGINS = [wlPlugin, docxPlugin, docxEditPlugin];
 
 const PLUGIN_REDETECT_MS = 5 * 60 * 1000;
 
@@ -4957,6 +7059,28 @@ const QUERY_CATALOG = [
     },
   },
 
+  {
+    id: 9, name: 'Anthropic message-shape check', category: 'prompt',
+    description: 'Validates the last request against Anthropic Messages rules: ends with a user message, no two same-role messages in a row, and no system message INSIDE the array (Anthropic takes system as a separate top-level param). Critical on the Anthropic backend, advisory otherwise.',
+    sizeHint: { cols: 6, rows: 3 },
+    compute: (d) => {
+      const tx = _lastChatTx(d);
+      const msgs = tx?.request?.messages;
+      if (!Array.isArray(msgs) || !msgs.length) return { kind: 'text', severity: 'info', body: '(no request to validate)' };
+      const issues = [];
+      const last = msgs[msgs.length - 1];
+      if (last?.role !== 'user') issues.push(`last message is role=${last?.role} (Anthropic requires the final message to be user)`);
+      for (let i = 1; i < msgs.length; i++) {
+        if (msgs[i].role === msgs[i - 1].role) issues.push(`two "${msgs[i].role}" messages in a row at index ${i - 1}-${i}`);
+      }
+      const sysInArray = msgs.filter((m) => m.role === 'system').length;
+      if (sysInArray) issues.push(`${sysInArray} system message(s) in the array (Anthropic takes system separately)`);
+      const fmt = d.config?.apiFormat ?? '?';
+      if (!issues.length) return { kind: 'text', severity: 'ok', body: `OK (backend=${fmt}) — ${msgs.length} msgs, ends with user, no same-role runs` };
+      return { kind: 'text', severity: fmt === 'anthropic' ? 'critical' : 'warn', body: `backend=${fmt}\n` + issues.join('\n') };
+    },
+  },
+
   // ─── 10-19: RESPONSE (what came back) ───────────────────────────────────
   {
     id: 10, name: 'Last response (full text)', category: 'response',
@@ -5050,6 +7174,47 @@ const QUERY_CATALOG = [
     },
   },
 
+  {
+    id: 17, name: 'Empty / no-tool response', category: 'response',
+    description: 'Flags when the last response was empty, or carried NO tool tags (the model just chatted instead of acting through the <remote-workspace> protocol).',
+    sizeHint: { cols: 4, rows: 3 },
+    compute: (d) => {
+      const tx = _lastChatTx(d);
+      if (!tx) return { kind: 'text', severity: 'info', body: '(no response yet)' };
+      const c = String(tx?.response?.choices?.[0]?.message?.content ?? '');
+      if (!c.trim()) return { kind: 'text', severity: 'critical', body: 'EMPTY response — model returned no content (proxy may have dropped the body, or it was content-filtered)' };
+      const hasTag = /<(remote-workspace|list|read|write|edit|glob|grep|powershell|next-task)[\s>/]/i.test(c);
+      if (hasTag) return { kind: 'text', severity: 'ok', body: `response carried tool tags (${c.length} chars)` };
+      return { kind: 'text', severity: 'warn', body: `no tool tags in a ${c.length}-char reply — model answered in prose instead of acting` };
+    },
+  },
+  {
+    id: 18, name: 'Protocol wrapping check', category: 'response',
+    description: 'Detects tool tags wrapped in markdown ``` fences or HTML-escaped (&lt;) — a common reason the workspace parser sees no tags even though the model "wrote" them. Points at a proxy that reformats output.',
+    sizeHint: { cols: 4, rows: 3 },
+    compute: (d) => {
+      const tx = _lastChatTx(d);
+      const c = String(tx?.response?.choices?.[0]?.message?.content ?? '');
+      if (!c) return { kind: 'text', severity: 'info', body: '(no response)' };
+      const issues = [];
+      if (/```[\s\S]*<(remote-workspace|read|write|edit|list|powershell|next-task)[\s>/]/i.test(c)) issues.push('tool tags appear INSIDE a ``` code fence — the parser ignores fenced content');
+      if (/&lt;(remote-workspace|read|write|edit|list|powershell|next-task)\b/i.test(c)) issues.push('tool tags are HTML-escaped (&lt;...) — the proxy is entity-encoding model output');
+      if (!issues.length) return { kind: 'text', severity: 'ok', body: 'no fence/escape wrapping detected' };
+      return { kind: 'text', severity: 'warn', body: issues.join('\n') };
+    },
+  },
+  {
+    id: 19, name: 'Streaming mode (recent calls)', category: 'response',
+    description: 'Whether each recent chat call returned streamed or non-streamed, with duration. Some proxies break SSE streaming and hang or silently truncate.',
+    sizeHint: { cols: 4, rows: 3 },
+    compute: (d) => {
+      const txs = _allChatTxs(d).slice(-10);
+      if (!txs.length) return { kind: 'text', severity: 'info', body: '(no calls)' };
+      const rows = txs.map((t, i) => `#${i + 1}  ${t.streamed ? 'streamed' : 'non-stream'}  ${_fmtMs(t.durationMs ?? null)}`);
+      return { kind: 'text', body: rows.join('\n') };
+    },
+  },
+
   // ─── 20-29: FINDINGS ────────────────────────────────────────────────────
   {
     id: 20, name: 'All findings', category: 'findings',
@@ -5065,6 +7230,18 @@ const QUERY_CATALOG = [
       const f = (d.findings ?? []).filter((x) => x.severity === 'critical' || x.severity === 'warn');
       if (!f.length) return { kind: 'text', severity: 'ok', body: 'no critical or warn findings' };
       return { kind: 'findings', body: f };
+    },
+  },
+  {
+    id: 22, name: 'Findings summary', category: 'findings',
+    description: 'Count of findings by severity — the one-glance health number.',
+    sizeHint: { cols: 3, rows: 2 },
+    compute: (d) => {
+      const f = d.findings ?? [];
+      const by = (s) => f.filter((x) => x.severity === s).length;
+      const crit = by('critical'), warn = by('warn');
+      return { kind: 'text', severity: crit ? 'critical' : warn ? 'warn' : 'ok',
+        body: `critical: ${crit}\nwarn:     ${warn}\ninfo:     ${by('info')}\nok:       ${by('ok')}` };
     },
   },
 
@@ -5143,6 +7320,51 @@ const QUERY_CATALOG = [
     },
   },
 
+  {
+    id: 36, name: 'Last LLM/proxy error', category: 'server',
+    description: 'The most recent error transaction — a failed model call (the HttpError message carries the HTTP status + body slice from the proxy), a timeout, or a thrown adapter error. THE first tile to pull when responses stop coming back.',
+    sizeHint: { cols: 6, rows: 3 },
+    compute: (d) => {
+      const errs = (d.transactions?.events ?? []).filter((e) => e.type === 'error');
+      if (!errs.length) return { kind: 'text', severity: 'ok', body: '(no error transactions recorded)' };
+      const last = errs[errs.length - 1];
+      return { kind: 'text', severity: 'critical', body: `+${last.at}ms\n${last.message ?? last.summary ?? '(no message)'}` };
+    },
+  },
+  {
+    id: 37, name: 'LLM error history', category: 'server',
+    description: 'Every error transaction this session — the failed-call log. Repeated 401/429/5xx here points squarely at the proxy rather than code_boss.',
+    sizeHint: { cols: 6, rows: 3 },
+    compute: (d) => {
+      const errs = (d.transactions?.events ?? []).filter((e) => e.type === 'error');
+      if (!errs.length) return { kind: 'text', severity: 'ok', body: '(no errors)' };
+      const body = errs.slice(-15).map((e) => `+${e.at}ms  ${String(e.message ?? e.summary ?? '').slice(0, 160)}`).join('\n');
+      return { kind: 'text', severity: 'critical', body };
+    },
+  },
+  {
+    id: 38, name: 'Current chat error', category: 'server',
+    description: 'session.error — the message shown when the last run ended in error (LLM failure, timeout, project/git problem). "(no current error)" when the last run was clean.',
+    sizeHint: { cols: 6, rows: 2 },
+    compute: (d) => {
+      const err = d.chat?.error;
+      if (!err) return { kind: 'text', severity: 'ok', body: '(no current error)' };
+      return { kind: 'text', severity: 'critical', body: String(err) };
+    },
+  },
+  {
+    id: 39, name: 'Project context loaded', category: 'server',
+    description: 'AGENTS.md / context files discovered for the active project, with sizes. Empty while a project is open means the worker has NO human-authored guidance — a likely cause of off-target behavior.',
+    sizeHint: { cols: 4, rows: 3 },
+    compute: (d) => {
+      if (!d.project?.activeProject) return { kind: 'text', severity: 'info', body: '(no project open)' };
+      const files = d.project?.contextFiles ?? [];
+      if (!files.length) return { kind: 'text', severity: 'warn', body: 'no AGENTS.md / context files found in this project' };
+      const body = files.map((f) => `${f.relDir && f.relDir !== '.' ? f.relDir + '/' : ''}${f.name}  ${_fmtBytes(f.bytes)}`).join('\n') + `\n— total ${d.project.contextChars ?? '?'} chars`;
+      return { kind: 'text', severity: 'ok', body };
+    },
+  },
+
   // ─── 40-49: CONFIG ──────────────────────────────────────────────────────
   {
     id: 40, name: 'Active project', category: 'config',
@@ -5174,7 +7396,22 @@ const QUERY_CATALOG = [
     },
   },
 
-  // ─── 43-49: AUTH (API key + 401 unlock state) ─────────────────────────
+  {
+    id: 43, name: 'Backend / adapter', category: 'config',
+    description: 'Which API format the adapter speaks (anthropic vs openai), the base URL + model, and whether a custom dev/test adapter is in use instead of the live HTTP one. The first thing to confirm when responses look wrong.',
+    sizeHint: { cols: 6, rows: 2 },
+    compute: (d) => {
+      const c = d.config ?? {};
+      return { kind: 'text', body: [
+        `format:   ${c.apiFormat ?? '?'}`,
+        `base:     ${c.baseURL ?? '?'}`,
+        `model:    ${c.defaultModel ?? '?'}`,
+        `adapter:  ${c.usingProvidedAdapter ? 'custom (dev/test)' : 'live HTTP'}`,
+      ].join('\n') };
+    },
+  },
+
+  // ─── 44-47: AUTH (API key + 401 unlock state) ─────────────────────────
   {
     id: 44, name: 'API key state', category: 'config',
     description: 'Whether the server has a key loaded, and its prefix.',
@@ -5219,6 +7456,30 @@ const QUERY_CATALOG = [
       if (!evs.length) return { kind: 'text', severity: 'info', body: '(none)' };
       const body = evs.map((e) => `+${e.at}ms  ${e.type}  ${e.summary ?? ''}`).join('\n');
       return { kind: 'text', body };
+    },
+  },
+
+  {
+    id: 48, name: 'Plugins detected', category: 'config',
+    description: 'Which optional tool plugins lit up (detected by probing for the underlying CLI on PATH). Shows whether e.g. the docx / WebLogic helpers are active, with the reason a plugin stayed off.',
+    sizeHint: { cols: 4, rows: 3 },
+    compute: (d) => {
+      const ps = d.plugins ?? [];
+      if (!ps.length) return { kind: 'text', severity: 'info', body: '(no plugins registered)' };
+      const body = ps.map((p) => `${p.enabled ? '[on] ' : '[off]'} ${p.name ?? '?'}` + (p.error ? `  — ${String(p.error).slice(0, 80)}` : (p.enabled && p.tools?.length ? `  (${p.tools.join(', ')})` : ''))).join('\n');
+      return { kind: 'text', body };
+    },
+  },
+  {
+    id: 49, name: 'Git workspace state', category: 'config',
+    description: 'Each tracked repo: branch, short HEAD, whether it sits on a CODE_BOSS_* working branch, and whether it was already dirty at open. Pull this when commits or task-undo are not landing.',
+    sizeHint: { cols: 6, rows: 3 },
+    compute: (d) => {
+      const g = d.git ?? {};
+      if (!g.isRepo) return { kind: 'text', severity: 'info', body: '(active project is not a git repo)' };
+      if (!g.repoList?.length) return { kind: 'text', severity: 'warn', body: 'git repo flagged but no repos enumerated' };
+      const rows = g.repoList.map((r) => [r.relDir, r.branch ?? '?', r.head ?? '?', r.codeBoss ? 'yes' : 'no', r.dirtyAtOpen ? 'yes' : 'no']);
+      return { kind: 'table', body: { columns: ['repo', 'branch', 'head', 'CODE_BOSS', 'dirtyAtOpen'], rows } };
     },
   },
 
@@ -5302,6 +7563,33 @@ const QUERY_CATALOG = [
     },
   },
 
+  {
+    id: 57, name: 'Call status history', category: 'transactions',
+    description: 'Timeline of every model call this session: OK (with finish_reason + duration) or ERROR (with message). The fastest way to spot an intermittent proxy failure pattern.',
+    sizeHint: { cols: 6, rows: 4 },
+    compute: (d) => {
+      const evs = (d.transactions?.events ?? []).filter((e) => e.type === 'chat_completions' || e.type === 'error');
+      if (!evs.length) return { kind: 'text', severity: 'info', body: '(no calls)' };
+      const rows = evs.slice(-40).map((e) => {
+        if (e.type === 'error') return [String(e.at ?? ''), 'ERROR', String(e.message ?? '').slice(0, 120)];
+        const fr = e.response?.choices?.[0]?.finish_reason ?? '?';
+        return [String(e.at ?? ''), `ok (${fr})`, _fmtMs(e.durationMs ?? null)];
+      });
+      return { kind: 'table', body: { columns: ['+ms', 'status', 'detail'], rows } };
+    },
+  },
+  {
+    id: 58, name: 'Unlock / rate-limit events', category: 'transactions',
+    description: 'unlock (401 + unlock_url) and rate-limit (429 backoff) transactions — the proxy auth/throttle history. A burst here explains a stalled or slow session.',
+    sizeHint: { cols: 6, rows: 3 },
+    compute: (d) => {
+      const evs = (d.transactions?.events ?? []).filter((e) => e.type === 'unlock' || e.type === 'rate-limit');
+      if (!evs.length) return { kind: 'text', severity: 'ok', body: '(no unlock / rate-limit events)' };
+      const body = evs.slice(-20).map((e) => `+${e.at}ms  ${e.type}  ${e.summary ?? ''}`).join('\n');
+      return { kind: 'text', severity: 'warn', body };
+    },
+  },
+
   // ─── 60-69: CHAT EVENTS ─────────────────────────────────────────────────
   {
     id: 60, name: 'Chat events table', category: 'events',
@@ -5340,6 +7628,34 @@ const QUERY_CATALOG = [
     },
   },
 
+  {
+    id: 63, name: 'Task lifecycle + commits', category: 'events',
+    description: 'Each closed task (<next-task> boundary): id, recorded commit hash, repo count, and summary. A closed write-heavy task with "(none)" for commit means the auto-commit hook did not fire.',
+    sizeHint: { cols: 6, rows: 4 },
+    compute: (d) => {
+      const evs = (d.chatEvents ?? []).filter((e) => e.type === 'task-end');
+      if (!evs.length) return { kind: 'text', severity: 'info', body: '(no closed tasks)' };
+      const rows = evs.slice(-30).map((e) => [
+        String(e.taskId ?? ''),
+        e.commitHash ? String(e.commitHash).slice(0, 8) : '(none)',
+        Array.isArray(e.commits) ? String(e.commits.length) : '?',
+        String(e.summary ?? '').replace(/\s+/g, ' ').slice(0, 120),
+      ]);
+      return { kind: 'table', body: { columns: ['task', 'commit', '#repos', 'summary'], rows } };
+    },
+  },
+  {
+    id: 64, name: 'Tool / shell errors', category: 'events',
+    description: 'tool-result events that failed (status=error): write/edit/powershell/git failures. This is where a broken build command, blocked cmd.exe, or a failed git op surfaces.',
+    sizeHint: { cols: 6, rows: 4 },
+    compute: (d) => {
+      const evs = (d.chatEvents ?? []).filter((e) => e.type === 'tool-result' && e.status === 'error');
+      if (!evs.length) return { kind: 'text', severity: 'ok', body: '(no failed tool calls)' };
+      const body = evs.slice(-15).map((e) => `[${e.verb ?? e.name ?? '?'}] ${String(e.content ?? '').replace(/\s+/g, ' ').slice(0, 200)}`).join('\n\n');
+      return { kind: 'text', severity: 'warn', body };
+    },
+  },
+
   // ─── 70-79: TRENDS / COMPARISONS ────────────────────────────────────────
   {
     id: 70, name: 'Parallelism stats', category: 'trends',
@@ -5354,6 +7670,18 @@ const QUERY_CATALOG = [
         `avg / turn:     ${p.avgPerTurn ?? 0}`,
         `max parallel:   ${p.maxParallel ?? 0}`,
       ].join('\n') };
+    },
+  },
+
+  {
+    id: 71, name: 'Manager-pass diagnostics', category: 'trends',
+    description: 'Diagnostics from the reviewer / acceptance / intake / consolidation passes (manager-diagnostic events) — e.g. "no verdict emitted; defaulted to pass". Tells you when a manager LLM call drifted off-protocol.',
+    sizeHint: { cols: 6, rows: 4 },
+    compute: (d) => {
+      const evs = (d.chatEvents ?? []).filter((e) => e.type === 'manager-diagnostic');
+      if (!evs.length) return { kind: 'text', severity: 'info', body: '(no manager passes have flagged anything)' };
+      const body = evs.slice(-12).map((e) => `${e.kind ?? 'pass'}: ${String(e.reason ?? e.summary ?? '').replace(/\s+/g, ' ').slice(0, 180)}`).join('\n\n');
+      return { kind: 'text', severity: 'warn', body };
     },
   },
 
@@ -5402,6 +7730,20 @@ const QUERY_CATALOG = [
 // Add 20 (all findings), 21 (critical only), 50/51 (full TX bodies), etc.
 // by typing them into the active-IDs input. The catalog page lists every
 // available query with its ID.
+//
+// Recommended sets to type in when a specific symptom shows up in
+// production (screenshot the resulting page and send the numbers back):
+//
+//   PROXY / "it stopped responding"     →  43, 36, 37, 57, 58, 38
+//     (which backend, last error + history, call timeline, auth/throttle,
+//      current chat error)
+//   WRONG / OFF-TARGET ANSWERS          →  1, 2, 9, 13, 17, 18, 39
+//     (reminder present?, reminder text, Anthropic shape, identity drift,
+//      empty/no-tool reply, fenced/escaped tags, AGENTS.md loaded?)
+//   WORK NOT LANDING (no commits/edits) →  49, 63, 64, 30
+//     (git workspace, task+commit lifecycle, tool/shell errors, stderr)
+//   MANAGER PASSES (review/acceptance)  →  20, 71, 60
+//     (all findings, manager-pass diagnostics, chat-events table)
 const DEFAULT_QUERY_IDS = [1, 4, 10, 13, 30];
 
 /**
@@ -5747,6 +8089,51 @@ function runDiagnosticChecks(diag) {
     });
   }
 
+  // 9. LLM / proxy call failures. The adapter throws on non-2xx (the message
+  //    carries "HTTP <status>: <body>"), a timeout, or a network error; the
+  //    run handler records it as an 'error' transaction. On a flaky air-gapped
+  //    proxy this is the single most likely failure, so surface it loudly.
+  const errorTxs = (diag.transactions?.events ?? []).filter((e) => e.type === 'error');
+  if (errorTxs.length) {
+    const last = errorTxs[errorTxs.length - 1];
+    findings.push({
+      severity: 'critical', category: 'llm',
+      title: `Last model call failed (${errorTxs.length} error tx this session)`,
+      detail: String(last.message ?? last.summary ?? '').slice(0, 300),
+    });
+  }
+
+  // 10. Failed tool calls — write/edit/powershell/git that returned an error.
+  //     Catches a broken build command, blocked cmd.exe, or git failure that
+  //     the worker may have silently moved past.
+  const toolErrs = (diag.chatEvents ?? []).filter((e) => e.type === 'tool-result' && e.status === 'error');
+  if (toolErrs.length) {
+    const last = toolErrs[toolErrs.length - 1];
+    findings.push({
+      severity: 'warn', category: 'tools',
+      title: `${toolErrs.length} tool call(s) failed this session`,
+      detail: `last: [${last.verb ?? last.name ?? '?'}] ${String(last.content ?? '').replace(/\s+/g, ' ').slice(0, 200)}`,
+    });
+  }
+
+  // 11. Anthropic message-shape — only meaningful on the Anthropic backend,
+  //     which requires the request to end with a user message and to avoid
+  //     same-role runs (the trailing-user rule). Guarded so it stays silent
+  //     on the OpenAI backend and in unit tests (no apiFormat set).
+  if (diag.config?.apiFormat === 'anthropic' && lastChat?.request?.messages?.length) {
+    const m = lastChat.request.messages;
+    const shapeIssues = [];
+    if (m[m.length - 1]?.role !== 'user') shapeIssues.push('last message is not role=user');
+    for (let i = 1; i < m.length; i++) if (m[i].role === m[i - 1].role) { shapeIssues.push(`same-role run at index ${i - 1}-${i} (${m[i].role})`); break; }
+    if (shapeIssues.length) {
+      findings.push({
+        severity: 'critical', category: 'prompt',
+        title: 'Anthropic message-shape violation in the last request',
+        detail: shapeIssues.join('; ') + ' — the Anthropic Messages API will reject this.',
+      });
+    }
+  }
+
   // Sort: critical first, then warn, then info, then ok — so problems
   // float to the top of the panel where they're most visible in screenshots.
   const order = { critical: 0, warn: 1, info: 2, ok: 3 };
@@ -5823,7 +8210,7 @@ process.stderr.write = function (chunk, ...rest) {
 // When running src/ directly (dev/tests), it's undefined — fall back to '(dev)'.
 const BUILD_VERSION_RUNTIME = (typeof BUILD_VERSION !== 'undefined') ? BUILD_VERSION : '(dev)';
 
-async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, port = 18888, adapter: providedAdapter, modelsList, initialProject = null }) {
+async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, port = 18888, adapter: providedAdapter, modelsList, initialProject = null, apiFormat = null }) {
   // Migrate legacy ~/.code-boss/ → ~/.code_boss/ (hyphen → underscore) if a
   // user is upgrading from an older bundle. Best-effort; falls through if
   // the legacy dir is absent or permissions block the rename.
@@ -5889,7 +8276,56 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
     // Concurrent 401s reuse the same pending entry (one modal, many
     // resolvers).
     pendingUnlock: null,  // { url, resolvers: [...] }
+
+    // Mid-run "steer" channel: strings the developer queued via /api/steer
+    // while a run is in flight. The worker loop drains this at each turn
+    // boundary (see drainSteer below). Reset at the start of every run.
+    steerBuffer: [],
+
+    // ── Assignment manager (backlog) ──
+    // The durable assignment backlog store (createAssignmentsStore), set per
+    // project in openProject. Separate from the conversation + task stores.
+    assignments: null,
+    // The assignment currently being worked (its id), or null. Bound to closed
+    // tasks during a run; cleared in the chat finally block.
+    activeAssignment: null,
+    // The in-flight conversational-intake AbortController, or null when idle.
+    // Doubles as the busy-flag (non-null => an intake turn is running) AND the
+    // cancel handle. Intake takes NO running-lock (it is read-only and must not
+    // block or be blocked by worker chat), so this is its own concurrency gate.
+    intakeAbort: null,
+    // True while a post-acceptance memory-consolidation pass is running (a
+    // fire-and-forget read-only LLM pass); guards against overlap.
+    memoryConsolidating: false,
+    // AbortController for the in-flight consolidation pass (so it can be
+    // cancelled on project close / shutdown), or null when idle.
+    consolidationAbort: null,
   };
+
+  // ── Single-owner project cwd (refcounted) ──────────────────────────────────
+  // process.cwd() is global, but the worker run AND the fire-and-forget intake
+  // / consolidation passes all need cwd = the active project, and they can
+  // overlap (intake/consolidation take no running-lock). A naive per-site
+  // chdir + restore lets one pass restore cwd out from under another, silently
+  // redirecting a live worker's file/shell/git tools to the wrong directory.
+  // Refcount it: the FIRST entrant chdirs in, the LAST to leave restores. Every
+  // entrant targets the same activeProject, so the directory is stable for as
+  // long as ANY cwd-dependent work is in flight.
+  let _cwdRef = 0, _cwdPrev = null;
+  function enterProjectCwd(project) {
+    if (!project) return false;
+    if (_cwdRef === 0) {
+      _cwdPrev = process.cwd();
+      try { process.chdir(project); } catch { _cwdPrev = null; return false; }
+    }
+    _cwdRef++;
+    return true;
+  }
+  function exitProjectCwd(entered) {
+    if (!entered) return;
+    _cwdRef = Math.max(0, _cwdRef - 1);
+    if (_cwdRef === 0 && _cwdPrev) { try { process.chdir(_cwdPrev); } catch {} _cwdPrev = null; }
+  }
 
   // Bumps version, returns the new value. Used by all chat-state setters.
   function bumpVersion() { session.version += 1; return session.version; }
@@ -5943,7 +8379,10 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
     // streams stdout/stderr from builds) or because there's a canonical
     // final event covering the same content (assistant-text-chunk → the
     // matching assistant-text emitted at segment end).
-    const ephemeral = event.type === 'tool-progress' || event.type === 'assistant-text-chunk';
+    // 'context-fill' is a per-turn gauge update (window fill %): broadcast it
+    // live but never persist — it fires every turn and would bloat the file.
+    // ('compacting-started' IS persisted — it's a rare, meaningful transcript marker.)
+    const ephemeral = event.type === 'tool-progress' || event.type === 'assistant-text-chunk' || event.type === 'context-fill';
     if (!ephemeral) session.chatEvents.push(ev);
     broadcast({ type: 'event', version: bumpVersion(), event: ev });
     if (!ephemeral) scheduleConversationSave();
@@ -6097,6 +8536,11 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
       gitPending: session.gitPending
         ? Object.fromEntries(Object.entries(session.gitPending).map(([k, v]) => [k, { repoDir: k, currentBranch: v.currentBranch }]))
         : null,
+      // A tool asked for explicit developer approval (e.g. edit_docx format
+      // flatten). Bare metadata only — the resolver Promise isn't serializable.
+      approvalPending: session.approvalPending
+        ? { id: session.approvalPending.id, kind: session.approvalPending.kind, message: session.approvalPending.message }
+        : null,
     };
   }
   // Expose helpers so we can use them from /api/chat and from new endpoints later.
@@ -6172,14 +8616,29 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
     // Broadcast a snapshot so any connected browser swaps to the restored
     // events instead of the empty post-reset state.
     await loadConversation();
+    // Cancel any in-flight manager passes bound to the project we're leaving so
+    // they don't keep running (and writing) against a now-stale project.
+    try { session.intakeAbort?.abort(); } catch {}
+    session.intakeAbort = null;
+    try { session.consolidationAbort?.abort(); } catch {}
+    session.consolidationAbort = null;
+    // Load the durable assignment backlog for this project.
+    session.activeAssignment = null;
+    try {
+      session.assignments = createAssignmentsStore(p);
+      await session.assignments.init();
+    } catch (e) {
+      session.assignments = null;
+      fileLog(`assignments store init failed: ${e.message}`);
+    }
     broadcast({ type: 'reset', version: bumpVersion() });
     for (const ev of session.chatEvents) {
       broadcast({ type: 'event', version: bumpVersion(), event: ev });
     }
-    // Scan for CODE-BOSS.md files and cache the prompt-ready string.
-    // Also re-runs every PLUGIN_REDETECT_MS (see the interval below)
-    // so edits to CODE-BOSS.md files take effect within ~5 min without
-    // a project reopen.
+    // Scan for AGENTS.md files (legacy CODE-BOSS.md still honored) and
+    // cache the prompt-ready string. Also re-runs every PLUGIN_REDETECT_MS
+    // (see the interval below) so edits to those files take effect within
+    // ~5 min without a project reopen.
     await refreshProjectContext({ openLog: true });
     // Git workflow: branch automatically onto CODE_BOSS_<timestamp>
     // if we're opening a non-CODE_BOSS branch with a clean tree. If
@@ -6210,7 +8669,17 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
       } catch (e) { fileLog(`git: could not update ${dir}/.git/info/exclude: ${e.message}`); }
       const branch = await getCurrentBranch(dir);
       const head = await getHeadHash(dir);
-      session.git.repos[dir] = { dir, branch, head };
+      // Snapshot whether the repo already had uncommitted changes at open.
+      // These are the USER's pre-existing work — we must NOT silently sweep
+      // them onto a CODE_BOSS branch. When the agent first needs to change a
+      // repo: clean-at-open → auto-create the CODE_BOSS branch; dirty-at-open
+      // → pause and let the user decide. (Only meaningful while NOT already on
+      // a CODE_BOSS branch.)
+      const st0 = await getStatus(dir);
+      // dirty===null means git-status FAILED (per getStatus contract) — treat as
+      // dirty so a transient failure never lets the auto-branch path sweep
+      // pre-existing user work onto a CODE_BOSS branch without pausing.
+      session.git.repos[dir] = { dir, branch, head, dirtyAtOpen: st0.dirty !== false };
       session.git.repoList.push(dir);
     }
     const rel = (d) => path.relative(session.activeProject, d) || '.';
@@ -6236,9 +8705,9 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
       // No log when a periodic scan finds nothing new.
       const changed = context !== prev;
       if (files.length > 0 && (openLog || changed)) {
-        fileLog(`project context: ${files.length} CODE-BOSS.md file(s), ${context.length} chars${changed && !openLog ? ' (changed since last scan)' : ''}`);
+        fileLog(`project context: ${files.length} AGENTS.md file(s), ${context.length} chars${changed && !openLog ? ' (changed since last scan)' : ''}`);
       } else if (changed && !openLog) {
-        fileLog(`project context: cleared (no CODE-BOSS.md files found)`);
+        fileLog(`project context: cleared (no AGENTS.md files found)`);
       }
     } catch (e) {
       session.projectContext = '';
@@ -6270,7 +8739,7 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
   const pluginManager = createPluginManager({ onLog: (m) => fileLog(`[plugin] ${m}`) });
   await pluginManager.detectAll();
   // The 5-min loop refreshes BOTH plugin enablement (in case a tool got
-  // installed mid-session) AND project context (in case a CODE-BOSS.md
+  // installed mid-session) AND project context (in case an AGENTS.md
   // file was edited). Same cadence on purpose — one timer, one source
   // of "stuff that might have changed on disk".
   const _pluginInterval = setInterval(() => {
@@ -6282,8 +8751,10 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
   if (typeof _pluginInterval.unref === 'function') _pluginInterval.unref();
 
   // Use a caller-provided adapter (e.g. the dev claude-code-headless adapter)
-  // if given; otherwise default to a fresh production HTTP adapter.
-  const adapter = providedAdapter ?? createHttpAdapter({
+  // if given; otherwise default to an HTTP adapter. AGENT_API_FORMAT=anthropic
+  // selects the Anthropic Messages adapter (e.g. a local Claude proxy); the
+  // default is the OpenAI-compatible adapter (api.genai.mil / Gemini).
+  const _adapterOpts = {
     baseURL,
     // Pass a getter so hot-updates to session.apiKey (via POST /api/api-key)
     // take effect on the next request without re-creating the adapter.
@@ -6320,7 +8791,13 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
       logEvent('usage', u);
     },
     onTransaction: (t) => logEvent(t.type, t),
-  });
+  };
+  // Resolved once so buildDiagnostics (catalog 43 "Backend / adapter") can
+  // report which API format the live adapter is actually speaking.
+  const resolvedApiFormat = (apiFormat === 'anthropic' || process.env.AGENT_API_FORMAT === 'anthropic')
+    ? 'anthropic' : 'openai';
+  const _makeAdapter = resolvedApiFormat === 'anthropic' ? createAnthropicAdapter : createHttpAdapter;
+  const adapter = providedAdapter ?? _makeAdapter(_adapterOpts);
 
   async function readBody(req) {
     const chunks = [];
@@ -6580,6 +9057,23 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
         delete session.gitPending[repoDir];
         return sendJson(res, 200, { repoDir, branch: newBranchRes.branch, result: 'ok' });
       }
+      if (req.method === 'POST' && path === '/api/approval-resolve') {
+        // Resolve a pending developer-approval gate (e.g. edit_docx flatten).
+        // Body: { id?, approved: bool }. id is optional but, if given, must
+        // match the current pending request (guards against a stale click
+        // resolving a newer prompt).
+        const raw = await readBody(req);
+        let body; try { body = JSON.parse(raw); }
+        catch { return sendJson(res, 400, { error: 'invalid JSON' }); }
+        const pending = session.approvalPending;
+        if (!pending) return sendJson(res, 400, { error: 'no pending approval' });
+        if (body.id && body.id !== pending.id) return sendJson(res, 409, { error: 'approval id mismatch (stale)' });
+        const approved = body.approved === true;
+        fileLog(`approval ${pending.kind} (${pending.id}): ${approved ? 'APPROVED' : 'denied'}`);
+        try { pending.resolve(approved); } catch {}
+        session.approvalPending = null;
+        return sendJson(res, 200, { ok: true, approved, version: session.version });
+      }
       if (req.method === 'POST' && path === '/api/git-resolve-batch') {
         // End-of-chat resolution: process one decision per repo listed
         // in a git-pending-resolution event. Body:
@@ -6620,7 +9114,7 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
           }
           let message = String(r.message || '').trim();
           const status = await getStatus(repoDir);
-          if (!status.dirty) {
+          if (status.dirty === false) {   // null (status failed) is NOT clean — attempt the commit
             outcomes.push({ repoDir, status: 'noop', note: 'tree clean' });
             continue;
           }
@@ -6753,6 +9247,359 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
         const limit = Number(url.searchParams.get('limit')) || 100;
         return sendJson(res, 200, chatState.chatStateSnapshot({ eventLimit: limit }));
       }
+      // ── Assignment backlog (the manager's durable store) ──
+      if (req.method === 'GET' && path === '/api/assignments/list') {
+        if (!session.assignments) return sendJson(res, 200, { assignments: [], activeId: null });
+        return sendJson(res, 200, { assignments: await session.assignments.list(), activeId: session.assignments.activeId() });
+      }
+      if (req.method === 'POST' && path === '/api/assignments/create') {
+        if (!session.assignments) return sendJson(res, 409, { error: 'no project open' });
+        const raw = await readBody(req);
+        let body; try { body = JSON.parse(raw || '{}'); } catch { return sendJson(res, 400, { error: 'invalid JSON' }); }
+        const a = await session.assignments.create({
+          title: body.title || 'Untitled assignment',
+          requirement: body.requirement ?? null,
+          acceptanceCriteria: body.acceptanceCriteria ?? null,
+          sources: Array.isArray(body.sources) ? body.sources : [],
+          status: body.status,
+        });
+        broadcast({ type: 'backlog', version: bumpVersion() });
+        fileLog(`assignment created: ${a.id} "${a.title}"`);
+        return sendJson(res, 200, { assignment: a });
+      }
+      if (req.method === 'POST' && path === '/api/assignments/patch') {
+        if (!session.assignments) return sendJson(res, 409, { error: 'no project open' });
+        const raw = await readBody(req);
+        let body; try { body = JSON.parse(raw); } catch { return sendJson(res, 400, { error: 'invalid JSON' }); }
+        if (!body.id) return sendJson(res, 400, { error: 'id required' });
+        let a; try { a = await session.assignments.patch(body.id, body.fields || {}); } catch (e) { return sendJson(res, 400, { error: e.message }); }
+        if (!a) return sendJson(res, 404, { error: 'no such assignment' });
+        broadcast({ type: 'backlog', version: bumpVersion() });
+        return sendJson(res, 200, { assignment: a });
+      }
+      if (req.method === 'POST' && path === '/api/assignments/reorder') {
+        if (!session.assignments) return sendJson(res, 409, { error: 'no project open' });
+        const raw = await readBody(req);
+        let body; try { body = JSON.parse(raw); } catch { return sendJson(res, 400, { error: 'invalid JSON' }); }
+        try {
+          if (Array.isArray(body.order)) await session.assignments.reorder(body.order);
+          else if (body.id != null && body.toIndex != null) await session.assignments.move(body.id, body.toIndex);
+          else return sendJson(res, 400, { error: 'provide order[] or {id, toIndex}' });
+        } catch (e) { return sendJson(res, 400, { error: e.message }); }
+        broadcast({ type: 'backlog', version: bumpVersion() });
+        return sendJson(res, 200, { ok: true, activeId: session.assignments.activeId() });
+      }
+      if (req.method === 'POST' && path === '/api/assignments/start') {
+        if (!session.assignments) return sendJson(res, 409, { error: 'no project open' });
+        if (session.status === 'running') return sendJson(res, 409, { error: 'a chat is already running' });
+        const raw = await readBody(req);
+        let body; try { body = JSON.parse(raw); } catch { return sendJson(res, 400, { error: 'invalid JSON' }); }
+        const a = await session.assignments.get(body?.id);
+        if (!a) return sendJson(res, 404, { error: 'no such assignment' });
+        if (!a.requirement) return sendJson(res, 400, { error: 'assignment has no captured requirement yet — capture it first' });
+        await session.assignments.setActive(a.id);
+        await session.assignments.patch(a.id, { status: 'active' });
+        session.activeAssignment = a.id;   // bind the upcoming run to this assignment
+        // Resume = re-arming an assignment that already has work bound to it
+        // (e.g. picked up in a later session). Reword the seed so the worker
+        // continues rather than restarts.
+        const isResume = body.resume === true || (Array.isArray(a.taskIds) && a.taskIds.length > 0);
+        const seedText = (isResume
+          ? `I'm resuming assignment ${a.id}: ${a.title} — continue where the previous work left off (review what's already done first).\n\nRequirement:\n${a.requirement}`
+          : `I'm starting assignment ${a.id}: ${a.title}\n\nRequirement:\n${a.requirement}`)
+          + (a.acceptanceCriteria ? `\n\nAcceptance criteria:\n${a.acceptanceCriteria}` : '')
+          + `\n\nWork through this, making only the changes it requires, and break the work into <next-task> units as you go.`;
+        broadcast({ type: 'backlog', version: bumpVersion() });
+        fileLog(`assignment ${isResume ? 'resumed' : 'started'}: ${a.id} "${a.title}"`);
+        // The caller now POSTs /api/message with seedText; activeAssignment is
+        // already set so that run injects the requirement, stamps tasks, and
+        // auto-runs acceptance at the end.
+        return sendJson(res, 200, { ok: true, assignmentId: a.id, seedText });
+      }
+      if (req.method === 'POST' && (path === '/api/assignments/accept' || path === '/api/assignments/park')) {
+        if (!session.assignments) return sendJson(res, 409, { error: 'no project open' });
+        const raw = await readBody(req);
+        let body; try { body = JSON.parse(raw); } catch { return sendJson(res, 400, { error: 'invalid JSON' }); }
+        if (!body.id) return sendJson(res, 400, { error: 'id required' });
+        const isAccept = path.endsWith('/accept');
+        const status = isAccept ? 'accepted' : 'parked';
+        const a = await session.assignments.patch(body.id, { status });
+        if (!a) return sendJson(res, 404, { error: 'no such assignment' });
+        if (session.assignments.activeId() === body.id) await session.assignments.setActive(null);
+        broadcast({ type: 'backlog', version: bumpVersion() });
+        fileLog(`assignment ${body.id} -> ${status}`);
+        sendJson(res, 200, { assignment: a });
+        // On ACCEPT, consolidate durable codebase facts from the completed work
+        // into Tier-1 memory (fire-and-forget, read-only, fail-safe). Only when
+        // there was real work and no other consolidation is already running.
+        if (isAccept && session.activeProject && Array.isArray(a.taskIds) && a.taskIds.length && !session.memoryConsolidating) {
+          session.memoryConsolidating = true;
+          const projectAtAccept = session.activeProject;   // snapshot — may change under us
+          const consAbort = new AbortController();
+          session.consolidationAbort = consAbort;
+          (async () => {
+            const entered = enterProjectCwd(projectAtAccept);
+            try {
+              const taskIds = new Set(a.taskIds || []);
+              const verdictByTask = new Map();
+              for (const ev of session.chatEvents) {
+                if (ev.type === 'review' && ev.reviewTaskId) verdictByTask.set(ev.reviewTaskId, ev.state === 'pass' ? { pass: true } : { pass: false, concerns: ev.concerns });
+              }
+              const tasks = session.chatEvents
+                .filter((e) => e.type === 'task-end' && taskIds.has(e.taskId))
+                .map((te) => ({ taskId: te.taskId, userRequest: te.userRequest, summary: te.summary, events: session.chatEvents.filter((e) => e.taskId === te.taskId), verdict: verdictByTask.get(te.taskId) }));
+              const existingMemory = renderMemory(await loadMemory(projectAtAccept));
+              const { facts } = await runConsolidation({
+                adapter, model: session.defaultModel,
+                assignment: { id: a.id, requirement: a.requirement },
+                tasks, existingMemory, signal: consAbort.signal, onLog: fileLog, repoRoots: session.git?.repoList || [],
+                onDiag: (d) => appendChatEvent({ type: 'manager-diagnostic', assignmentId: a.id, ...d }),
+              });
+              const added = [];
+              for (const f of (facts || [])) {
+                try { const r = await rememberFact(projectAtAccept, f); if (r.added) added.push({ id: r.entry.id, category: r.entry.category, note: r.entry.note }); } catch {}
+              }
+              if (added.length) {
+                appendChatEvent({ type: 'memory-consolidated', assignmentId: a.id, added });
+                broadcast({ type: 'memory', version: bumpVersion() });
+                fileLog(`memory consolidation: added ${added.length} fact(s) from ${a.id}`);
+              } else {
+                fileLog(`memory consolidation: nothing durable from ${a.id}`);
+              }
+            } catch (e) {
+              fileLog(`memory consolidation failed (${a.id}): ${e?.message ?? e}`);
+            } finally {
+              exitProjectCwd(entered);
+              if (session.consolidationAbort === consAbort) session.consolidationAbort = null;
+              session.memoryConsolidating = false;
+            }
+          })();
+        }
+        return;
+      }
+      if (req.method === 'POST' && path === '/api/assignments/remove') {
+        if (!session.assignments) return sendJson(res, 409, { error: 'no project open' });
+        const raw = await readBody(req);
+        let body; try { body = JSON.parse(raw); } catch { return sendJson(res, 400, { error: 'invalid JSON' }); }
+        if (!body.id) return sendJson(res, 400, { error: 'id required' });
+        await session.assignments.remove(body.id);
+        broadcast({ type: 'backlog', version: bumpVersion() });
+        return sendJson(res, 200, { ok: true });
+      }
+      // Edit a closed task's summary (the tier-rollup working memory). Same
+      // dual-write as the blank-summary backfill: patch the chat event (footer
+      // + persisted transcript + acceptance input) AND the task store (the
+      // rollup source that feeds future context).
+      if (req.method === 'POST' && path === '/api/tasks/update-summary') {
+        if (!session.activeProject) return sendJson(res, 409, { error: 'no project open' });
+        const raw = await readBody(req);
+        let body; try { body = JSON.parse(raw); } catch { return sendJson(res, 400, { error: 'invalid JSON' }); }
+        const eventId = body?.eventId;
+        const summary = String(body?.summary ?? '').trim();
+        if (!eventId || !summary) return sendJson(res, 400, { error: 'eventId and non-empty summary required' });
+        const te = session.chatEvents.find((e) => e.id === eventId && e.type === 'task-end');
+        if (!te) return sendJson(res, 404, { error: 'task-end event not found' });
+        chatState.patchChatEvent(eventId, { summary });
+        if (te.taskId) {
+          try {
+            const ts = createTasksStore(session.activeProject);
+            await ts.init();
+            await ts.setSummary(te.taskId, summary);
+          } catch (e) { fileLog(`update-summary setSummary failed for ${te.taskId}: ${e.message}`); }
+        }
+        fileLog(`task summary edited (${te.taskId || eventId}): ${summary.slice(0, 80)}`);
+        return sendJson(res, 200, { eventId, summary });
+      }
+      // Undo a closed task: git revert --no-edit each commit recorded at close
+      // (per-repo). Creates revert commits — non-destructive, auditable.
+      if (req.method === 'POST' && path === '/api/task-undo') {
+        if (!session.activeProject) return sendJson(res, 409, { error: 'no project open' });
+        if (session.status === 'running') return sendJson(res, 409, { error: 'chat is running — stop it first' });
+        const raw = await readBody(req);
+        let body; try { body = JSON.parse(raw); } catch { return sendJson(res, 400, { error: 'invalid JSON' }); }
+        const taskId = body?.taskId;
+        if (!taskId) return sendJson(res, 400, { error: 'taskId required' });
+        const te = session.chatEvents.find((e) => e.type === 'task-end' && e.taskId === taskId);
+        if (!te) return sendJson(res, 404, { error: 'task not found' });
+        // New tasks carry per-repo commits; fall back to the single commitHash
+        // for tasks closed before the multi-repo fix.
+        let commits = Array.isArray(te.commits) ? te.commits.filter((c) => c && c.hash) : [];
+        if (!commits.length && te.commitHash) {
+          const repoDir = session.git?.repoList?.[0];
+          if (repoDir) commits = [{ repoDir, hash: te.commitHash }];
+        }
+        if (!commits.length) return sendJson(res, 400, { error: 'no commits recorded for this task' });
+        const results = [];
+        for (const { repoDir, hash } of commits) {
+          if (!repoDir || !session.git?.repos?.[repoDir]) { results.push({ repoDir, hash, status: 'skipped', reason: 'repo not tracked' }); continue; }
+          try {
+            const r = await runGit(repoDir, ['revert', '--no-edit', hash]);
+            if (r.exitCode === 0) { results.push({ repoDir, hash, status: 'ok' }); fileLog(`task-undo: reverted ${hash} in ${nodePath.relative(session.activeProject, repoDir) || '.'}`); }
+            else { results.push({ repoDir, hash, status: 'error', message: (r.stderr || '').slice(0, 200) }); fileLog(`task-undo: revert failed in ${repoDir}: ${(r.stderr || '').slice(0, 200)}`); }
+          } catch (e) { results.push({ repoDir, hash, status: 'error', message: String(e.message).slice(0, 200) }); }
+        }
+        chatState.appendChatEvent({ type: 'task-undo', taskId, results });
+        return sendJson(res, 200, { taskId, results });
+      }
+      // Mid-run "steer": queue text to inject at the worker's next turn
+      // boundary (drained by drainSteer in runPromptedAgent). Returns at once;
+      // the effect lands next turn, not now. Only valid while a run is active.
+      if (req.method === 'POST' && path === '/api/steer') {
+        const raw = await readBody(req);
+        let body; try { body = JSON.parse(raw); } catch { return sendJson(res, 400, { error: 'invalid JSON' }); }
+        const text = String(body?.text ?? '').trim();
+        if (!text) return sendJson(res, 400, { error: 'text required' });
+        if (session.status !== 'running') return sendJson(res, 409, { error: 'no run in progress to steer' });
+        if (session.steerBuffer.length >= 10) return sendJson(res, 429, { error: 'steer buffer full (10) — wait for the agent to catch up' });
+        session.steerBuffer.push(text);
+        fileLog(`steer queued (${session.steerBuffer.length}): ${text.slice(0, 80)}`);
+        return sendJson(res, 200, { ok: true, queued: session.steerBuffer.length });
+      }
+      // Conversational intake: a write-blocked MANAGER persona turns the user's
+      // pasted material into an editable requirement card. NO running-lock (it
+      // is read-only and must not block / be blocked by worker chat); its own
+      // AbortController (session.intakeAbort) is both the busy-flag and the
+      // cancel handle. The reply streams in as intake-message / requirement-card
+      // chat events; multi-turn survives across POSTs by replaying the thread
+      // persisted on the draft assignment as kind:'intake' sources.
+      if (req.method === 'POST' && path === '/api/assignments/intake') {
+        if (!session.assignments) return sendJson(res, 409, { error: 'no project open' });
+        if (session.intakeAbort) return sendJson(res, 409, { error: 'intake already running' });
+        const raw = await readBody(req);
+        let body; try { body = JSON.parse(raw); } catch { return sendJson(res, 400, { error: 'invalid JSON' }); }
+        const text = (body?.text ?? '').toString().trim();
+        if (!text) return sendJson(res, 400, { error: 'text required' });
+        let a;
+        if (body.assignmentId) {
+          a = await session.assignments.get(body.assignmentId);
+          if (!a) return sendJson(res, 404, { error: 'no such assignment' });
+        } else {
+          a = await session.assignments.create({ title: '(capturing…)', status: 'capturing' });
+        }
+        const assignmentId = a.id;
+        // Persist this user turn into the durable intake thread + show it.
+        await session.assignments.addSource(assignmentId, { kind: 'intake', role: 'user', text });
+        appendChatEvent({ type: 'intake-message', assignmentId, senderRole: 'user', content: text });
+        // Rebuild the conversation from the persisted thread (multi-turn across
+        // separate POSTs); the just-appended user turn is included.
+        const fresh = await session.assignments.get(assignmentId);
+        const convoMessages = (fresh?.sources || [])
+          .filter((s) => s.kind === 'intake')
+          .map((s) => ({ role: s.role === 'manager' ? 'assistant' : 'user', content: s.text }));
+        const intakeModel = body?.model ?? session.defaultModel;
+        session.intakeAbort = new AbortController();
+        const signal = session.intakeAbort.signal;
+        broadcast({ type: 'backlog', version: bumpVersion() });
+        fileLog(`intake START: ${assignmentId} text="${text.slice(0, 120).replace(/\s+/g, ' ')}"`);
+        sendJson(res, 200, { ok: true, assignmentId, version: session.version });
+        (async () => {
+          const entered = enterProjectCwd(session.activeProject);
+          try {
+            // onTurn is awaited by runIntake (emit is async), so addSource here
+            // is sequenced and its rejection is handled — not a floating promise.
+            const onTurn = async (ev) => {
+              if (ev.kind === 'message') {
+                try { await session.assignments.addSource(assignmentId, { kind: 'intake', role: 'manager', text: ev.content }); } catch (e) { fileLog(`intake addSource failed: ${e.message}`); }
+                appendChatEvent({ type: 'intake-message', assignmentId, senderRole: 'manager', content: ev.content });
+              } else if (ev.kind === 'tools') {
+                for (let k = 0; k < ev.calls.length; k++) {
+                  const c = ev.calls[k]; const r = ev.results[k] || {};
+                  appendChatEvent({ type: 'tool-call', callId: c.id, verb: c.verb, name: c.name ?? c.verb, args: c.args });
+                  appendChatEvent({ type: 'tool-result', callId: c.id, verb: c.verb, name: c.name ?? c.verb, status: r.status || 'ok', content: (r.content || '').slice(0, 8000) });
+                }
+              } else if (ev.kind === 'card') {
+                // Persist the card-bearing prose so a later "Refine" turn sees
+                // its own prior card; render the editable card in the log.
+                try { await session.assignments.addSource(assignmentId, { kind: 'intake', role: 'manager', text: ev.prose }); } catch (e) { fileLog(`intake addSource failed: ${e.message}`); }
+                appendChatEvent({ type: 'requirement-card', assignmentId, card: ev.card });
+              }
+            };
+            const result = await runIntake({
+              adapter, model: intakeModel, messages: convoMessages, signal,
+              onLog: fileLog, onTurn, repoRoots: session.git?.repoList || [],
+              onDiag: (d) => appendChatEvent({ type: 'manager-diagnostic', assignmentId, ...d }),
+            });
+            if (!result.complete && result.reason === 'max-turns') {
+              // Best-effort empty card so the user always gets editable fields.
+              appendChatEvent({ type: 'requirement-card', assignmentId, card: { title: fresh.title === '(capturing…)' ? '' : (fresh.title || ''), requirement: '', acceptanceCriteria: '', sources: '' } });
+            }
+          } catch (e) {
+            const msg = e?.name === 'AbortError' ? 'Intake cancelled.' : ('Intake error: ' + (e?.message ?? String(e)));
+            appendChatEvent({ type: 'intake-message', assignmentId, senderRole: 'manager', content: msg });
+            fileLog(`intake error (${assignmentId}): ${e?.message ?? e}`);
+          } finally {
+            exitProjectCwd(entered);
+            session.intakeAbort = null;
+          }
+        })();
+        return;
+      }
+      if (req.method === 'POST' && path === '/api/assignments/intake-cancel') {
+        if (session.intakeAbort) { try { session.intakeAbort.abort(); } catch {} }
+        return sendJson(res, 200, { ok: true });
+      }
+      // Capture-from-card: freeze the (possibly user-edited) card into the
+      // assignment. patch(status:'ready') auto-stamps readyAt — THAT is the
+      // freeze. Reuses the unchanged store; the draft already sits at the end
+      // of the backlog from the create() in /intake, so no reorder is needed.
+      if (req.method === 'POST' && path === '/api/assignments/capture') {
+        if (!session.assignments) return sendJson(res, 409, { error: 'no project open' });
+        const raw = await readBody(req);
+        let body; try { body = JSON.parse(raw); } catch { return sendJson(res, 400, { error: 'invalid JSON' }); }
+        if (!body.id) return sendJson(res, 400, { error: 'id required' });
+        const requirement = (body.requirement ?? '').toString().trim();
+        if (!requirement) return sendJson(res, 400, { error: 'requirement required — capture must freeze a definition of done' });
+        const fields = { requirement, acceptanceCriteria: (body.acceptanceCriteria ?? '').toString().trim() || null, status: 'ready' };
+        if (body.title && body.title.toString().trim()) fields.title = body.title.toString().trim();
+        const a = await session.assignments.patch(body.id, fields);
+        if (!a) return sendJson(res, 404, { error: 'no such assignment' });
+        await session.assignments.checkpoint(body.id, { kind: 'captured', userAction: 'capture-from-card' });
+        broadcast({ type: 'backlog', version: bumpVersion() });
+        fileLog(`assignment captured: ${a.id} "${a.title}" (status ready)`);
+        return sendJson(res, 200, { assignment: a });
+      }
+      // Drift feedback: re-dispatch the worker on an assignment the acceptance
+      // check found UNFULFILLED, seeding it with the named gaps. User-triggered
+      // from the assignment-gate (the user stays the final approver); re-arms
+      // activeAssignment so the next run re-runs acceptance and produces a fresh
+      // gate. Returns a seedText the caller POSTs to /api/message (mirrors
+      // /api/assignments/start).
+      if (req.method === 'POST' && path === '/api/assignments/send-fix') {
+        if (!session.assignments) return sendJson(res, 409, { error: 'no project open' });
+        if (session.status === 'running') return sendJson(res, 409, { error: 'a chat is already running' });
+        const raw = await readBody(req);
+        let body; try { body = JSON.parse(raw); } catch { return sendJson(res, 400, { error: 'invalid JSON' }); }
+        const a = await session.assignments.get(body?.id);
+        if (!a) return sendJson(res, 404, { error: 'no such assignment' });
+        if (!a.requirement) return sendJson(res, 400, { error: 'assignment has no captured requirement' });
+        const v = a.lastVerdict || {};
+        await session.assignments.setActive(a.id);
+        await session.assignments.patch(a.id, { status: 'active' });
+        session.activeAssignment = a.id;
+        const seedText = `Continuing assignment ${a.id}: ${a.title}\n\nThe acceptance check found the requirement is NOT yet fulfilled. Address the gaps below — make only the changes they require, and close each unit with <next-task> when fixed.\n\nRequirement:\n${a.requirement}`
+          + (v.missing ? `\n\nWhat's missing:\n${v.missing}` : '')
+          + (v.drift ? `\n\nOut-of-scope drift to avoid or undo:\n${v.drift}` : '')
+          + (v.rationale ? `\n\nReviewer rationale:\n${v.rationale}` : '');
+        await session.assignments.checkpoint(a.id, { kind: 'fix-dispatched', userAction: 'send-fix' });
+        broadcast({ type: 'backlog', version: bumpVersion() });
+        fileLog(`assignment fix dispatched: ${a.id}`);
+        return sendJson(res, 200, { ok: true, assignmentId: a.id, seedText });
+      }
+      // ── Tier-1 codebase memory (agent-maintained; developer-curated) ──
+      if (req.method === 'GET' && path === '/api/memory') {
+        if (!session.activeProject) return sendJson(res, 200, { entries: [], text: '' });
+        const mem = await loadMemory(session.activeProject);
+        return sendJson(res, 200, { entries: mem.entries, text: renderMemory(mem) });
+      }
+      if (req.method === 'POST' && path === '/api/memory/replace') {
+        if (!session.activeProject) return sendJson(res, 409, { error: 'no project open' });
+        const raw = await readBody(req);
+        let body; try { body = JSON.parse(raw); } catch { return sendJson(res, 400, { error: 'invalid JSON' }); }
+        const mem = await replaceEntries(session.activeProject, Array.isArray(body.entries) ? body.entries : []);
+        broadcast({ type: 'memory', version: bumpVersion() });
+        fileLog(`codebase memory replaced: ${mem.entries.length} entr(ies) by developer`);
+        return sendJson(res, 200, { entries: mem.entries, text: renderMemory(mem) });
+      }
       if (req.method === 'GET' && path === '/api/diagnostics') {
         // One-stop diagnostic dump + investigative findings. Rendered as a
         // full-page view by the Snapshot UI. Findings are surfaced at the top
@@ -6865,13 +9712,39 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
             logFileExists: logExists,
             logFileBytes: logBytes,
             recent: session.recent,
+            // Catalog 39 "Project context loaded": which AGENTS.md / context
+            // files the worker is actually being fed, and their sizes.
+            contextFiles: (session.projectContextFiles ?? []).map((f) => ({
+              name: f.name, relDir: f.relDir, bytes: (f.content ?? '').length,
+            })),
+            contextChars: (session.projectContext ?? '').length,
           },
           config: {
             baseURL: session.baseURL,
             defaultModel: session.defaultModel,
             apiKeyPrefix: session.apiKeyPrefix,
             modelInUseDefault: session.defaultModel,
+            apiFormat: resolvedApiFormat,
+            usingProvidedAdapter: !!providedAdapter,
           },
+          // Catalog 49 "Git workspace state": per-repo branch/head/dirtyAtOpen,
+          // read straight off the cached session.git state (no git spawns).
+          git: session.git ? {
+            isRepo: !!session.git.isRepo,
+            repoList: (session.git.repoList ?? []).map((dir) => {
+              const r = session.git.repos?.[dir] || {};
+              return {
+                relDir: nodePath.relative(session.activeProject || dir, dir) || '.',
+                branch: r.branch ?? null,
+                head: r.head ? String(r.head).slice(0, 8) : null,
+                parentBranch: r.parentBranch ?? null,
+                dirtyAtOpen: !!r.dirtyAtOpen,
+                codeBoss: isCodeBossBranch(r.branch),
+              };
+            }),
+          } : { isRepo: false, repoList: [] },
+          // Catalog 48 "Plugins detected".
+          plugins: pluginManager ? pluginManager.snapshot() : [],
           parallelism,
           transactions: {
             count: session.events.length,
@@ -6897,7 +9770,7 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
           try {
             const branch = await getCurrentBranch(dir);
             const status = await getStatus(dir);
-            if (status.dirty) {
+            if (status.dirty !== false) {   // include on dirty OR unknown (null) — never hide a possibly-dirty repo
               repos.push({
                 relDir: nodePath.relative(session.activeProject, dir) || '.',
                 branch: branch || '(detached HEAD)',
@@ -6967,9 +9840,14 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
         const raw = await readBody(req);
         let body; try { body = JSON.parse(raw); } catch { return sendJson(res, 400, { error: 'invalid JSON' }); }
         const text = (body?.text ?? '').toString();
+        // Read-only "Discuss" mode: the worker may read/search but not write/
+        // edit/run shell (enforced in runPromptedAgent's dispatch + prompt).
+        const discussMode = body?.mode === 'discuss';
         if (!text.trim()) return sendJson(res, 400, { error: 'text is required' });
         if (!session.activeProject) return sendJson(res, 400, { error: 'no project open' });
         if (session.status === 'running') return sendJson(res, 409, { error: 'chat is already running' });
+        // Fresh run — drop any steer text left over from a prior run.
+        session.steerBuffer = [];
         fileLog(`/api/message received: model=${body?.model ?? session.defaultModel} text="${text.slice(0, 100).replace(/\s+/g, ' ')}"`);
 
         // Lock in running state BEFORE we return, so a fast second call sees the lock.
@@ -6995,14 +9873,14 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
 
         // Fire-and-forget: run the agent loop async, return 200 now.
         (async () => {
-          const prevCwd = process.cwd();
-          let cwdChanged = false;
+          let entered = false;
           const chatStart = Date.now();
-          // Hoisted so the catch can finalize a still-pending review row.
-          let pendingReviewEv = null;
+          // Hoisted so the catch can finalize still-pending review row(s).
+          // One combined reviewer call can leave several task footers pending.
+          let pendingReviewEvs = [];
           try {
-            try { process.chdir(session.activeProject); cwdChanged = true; }
-            catch (e) { throw new Error('cannot enter project directory: ' + e.message); }
+            entered = enterProjectCwd(session.activeProject);
+            if (!entered) throw new Error('cannot enter project directory');
             fileLog(`chat START: model=${model} q="${text.slice(0, 200).replace(/\s+/g, ' ')}"`);
             // Auto-commit hook: fires from runPromptedAgent after every
             // <next-task> task-op. Only does anything when the project
@@ -7037,25 +9915,45 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
               return r;
             };
             const gitAutoCommitHook = async ({ closedTaskId, userRequest, summary }) => {
+              // Discuss (read-only) mode: a closed task is just a conversational
+              // boundary — no writes happened, so do NOT bind it to the active
+              // assignment or commit (and review/acceptance are skipped below).
+              if (discussMode) return null;
+              // Bind the closed task to the active assignment (independent of git).
+              if (session.activeAssignment && session.assignments && closedTaskId) {
+                try { await session.assignments.addTask(session.activeAssignment, closedTaskId); } catch (e) { fileLog(`assignment task-stamp failed: ${e.message}`); }
+              }
               if (!session.git?.isRepo) return null;
-              const msg = buildCommitMessage({ summary, userRequest });
-              // Walk all repos. Commit each one on a CODE_BOSS_* branch
-              // with changes. Return the FIRST hash for the task store
-              // (we attach one commit hash per closed task — multi-repo
-              // commits will all be visible in the chat as separate
-              // tool-result rows).
-              let firstHash = null;
+              const msg = buildCommitMessage({ summary, userRequest, assignmentId: session.activeAssignment || null });
+              // Walk all repos. Commit each one on a CODE_BOSS_* branch with
+              // changes, recording EVERY repo's commit hash. (Previously only
+              // the first repo's hash was kept — a multi-repo bug that lost
+              // traceability + made undo miss every repo but the first.)
+              const commitsByRepo = [];   // [{ repoDir, hash }]
               for (const repoDir of session.git.repoList) {
                 const repo = session.git.repos[repoDir];
                 // Refresh branch in case the user resolved a wizard mid-task.
                 repo.branch = await getCurrentBranch(repoDir);
                 if (!isCodeBossBranch(repo.branch)) {
-                  // Per-repo per-task warning suppressed: a single
-                  // end-of-chat resolution event surfaces ALL dirty
-                  // non-CODE_BOSS repos in one go (see the block below
-                  // the review loop). Cleaner UX than spamming a row
-                  // per task close.
-                  continue;
+                  // Not on a CODE_BOSS branch. END-OF-TASK CATCH: if this repo
+                  // was CLEAN at open but is now dirty, the agent changed it
+                  // via powershell / wl / some path that bypassed the
+                  // write_file pre-write hook (which would have auto-branched).
+                  // Auto-create the CODE_BOSS branch now (carrying the changes)
+                  // so the work is committed below. Repos with PRE-EXISTING
+                  // user changes (dirtyAtOpen) are left alone — the end-of-chat
+                  // git-pending-resolution warning surfaces those for the user
+                  // to decide; we never sweep their work onto a CODE_BOSS branch.
+                  if (repo.dirtyAtOpen) continue;
+                  const st = await getStatus(repoDir);
+                  if (st.dirty !== true) continue;   // clean (and clean-at-open) → nothing to do
+                  const parent = repo.branch;
+                  const br = await emitGitOp(repoDir, 'git checkout -b <CODE_BOSS> (auto)', closedTaskId, () => createBranch(repoDir));
+                  if (br.exitCode !== 0) continue;
+                  repo.parentBranch = parent;
+                  repo.branch = br.branch;
+                  fileLog(`git: end-of-task auto-branch ${br.branch} on ${nodePath.relative(session.activeProject, repoDir) || '.'} (clean at open, dirtied via non-write_file path)`);
+                  // fall through to add + commit on the new CODE_BOSS branch
                 }
                 const add = await emitGitOp(repoDir, 'git add -A', closedTaskId, () => runGit(repoDir, ['add', '-A']));
                 if (add.exitCode !== 0) continue;
@@ -7068,9 +9966,20 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
                 if (commit.exitCode !== 0) continue;
                 const hash = await getHeadHash(repoDir);
                 repo.head = hash;
-                if (!firstHash) firstHash = hash;
+                commitsByRepo.push({ repoDir, hash });
               }
-              return firstHash;
+              // Record EVERY commit hash on the active assignment (the task
+              // itself was bound at the top of this hook, independent of git).
+              if (commitsByRepo.length && session.activeAssignment && session.assignments) {
+                for (const { hash } of commitsByRepo) {
+                  try { await session.assignments.addCommit(session.activeAssignment, hash); } catch {}
+                }
+              }
+              // Return { hash, commits }: `hash` (the first) preserves the
+              // existing single-hash task-store attach + task-end contract;
+              // `commits` carries the full per-repo list for the task-end event
+              // and one-click undo. (runPromptedAgent accepts either shape.)
+              return { hash: commitsByRepo[0]?.hash || null, commits: commitsByRepo };
             };
             // Pre-write hook: tools (write_file, edit_file) call this
             // before modifying any file. If the file's containing repo
@@ -7078,21 +9987,56 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
             // pause: emit a 'git-needs-branch' SSE delta with the repo
             // info, register a Promise resolver on session.gitPending,
             // and await /api/git-pending-resolve from the client.
-            const requireBranch = async (absPath) => {
-              if (!session.git?.isRepo) return 'ok';   // not a git workspace at all
-              if (signal?.aborted) return 'aborted';   // already canceled
-              const repoDir = await findContainingRepo(absPath);
-              if (!repoDir || !session.git.repos[repoDir]) return 'ok';   // outside any tracked repo
+            // Emit a chat row for an auto-created CODE_BOSS branch so the user
+            // can see it happened (mirrors the auto-commit git rows).
+            const emitAutoBranch = (repoDir, branchName, parent) => {
+              const rel = nodePath.relative(session.activeProject, repoDir) || '.';
+              const callId = randomUUID();
+              chatState.appendChatEvent({ type: 'tool-call', callId, verb: 'git', name: 'git', args: { command: `[${rel}] git checkout -b ${branchName} (auto)` } });
+              chatState.appendChatEvent({ type: 'tool-result', callId, verb: 'git', name: 'git', status: 'ok', content: `forked from ${parent} — your changes ride on the new branch` });
+            };
+            // Bring a repo onto a CODE_BOSS_* branch so the agent's change is
+            // recoverable. Three outcomes:
+            //   - already on CODE_BOSS         → 'ok'
+            //   - non-CODE_BOSS, no PRE-EXISTING (open-time) changes → AUTO-CREATE
+            //     a CODE_BOSS branch (carries any agent-made working-tree changes
+            //     onto it) and proceed, no prompt
+            //   - non-CODE_BOSS WITH pre-existing user changes → PAUSE + let the
+            //     user decide (the changes are theirs; we won't sweep them)
+            // Used by the write_file/edit_file pre-write hook AND the post-shell
+            // survey. Returns 'ok' | 'aborted'.
+            const ensureCodeBossBranch = async (repoDir) => {
+              if (!repoDir || !session.git.repos[repoDir]) return 'ok'; // untracked / non-git
               const repo = session.git.repos[repoDir];
-              // Always re-check the branch; the user might have
-              // resolved a prior wizard and put us on CODE_BOSS_*.
               repo.branch = await getCurrentBranch(repoDir);
               if (isCodeBossBranch(repo.branch)) return 'ok';
+              if (signal?.aborted) return 'aborted';
               // Already pending for THIS repo? Wait on the same Promise.
               const existing = session.gitPending?.[repoDir];
               if (existing) return await existing.promise;
+              if (!repo.dirtyAtOpen) {
+                // Clean at open → no user work to protect. Auto-create the
+                // CODE_BOSS branch (git checkout -b carries any agent-made
+                // working-tree changes onto it). No prompt.
+                const parent = repo.branch;
+                const r = await createBranch(repoDir);
+                if (r.exitCode !== 0) {
+                  fileLog(`git: auto-branch failed for ${repoDir}: ${r.stderr?.trim?.() || r.exitCode}`);
+                  return 'aborted';
+                }
+                repo.parentBranch = parent;
+                repo.branch = r.branch;
+                repo.head = await getHeadHash(repoDir);
+                fileLog(`git: auto-created ${r.branch} on ${nodePath.relative(session.activeProject, repoDir) || '.'} (was ${parent}, clean at open)`);
+                emitAutoBranch(repoDir, r.branch, parent);
+                return 'ok';
+              }
+              // dirtyAtOpen → pre-existing user changes → pause + decide.
+              return await pauseForBranch(repoDir, repo);
+            };
+            const pauseForBranch = async (repoDir, repo) => {
               const rel = nodePath.relative(session.activeProject, repoDir) || '.';
-              fileLog(`git: pausing on ${rel} (currentBranch=${repo.branch}) — emitting git-needs-branch`);
+              fileLog(`git: pausing on ${rel} (currentBranch=${repo.branch}, pre-existing changes) — emitting git-needs-branch`);
               session.gitPending = session.gitPending || {};
               const pending = { currentBranch: repo.branch };
               pending.promise = new Promise((resolve) => { pending.resolve = resolve; });
@@ -7121,6 +10065,40 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
                 if (session.gitPending?.[repoDir] === pending) delete session.gitPending[repoDir];
               }
             };
+            // Pre-write hook handed to write_file/edit_file: before the agent
+            // modifies a file, make sure its repo is on a CODE_BOSS branch.
+            const requireBranch = async (absPath) => {
+              if (!session.git?.isRepo) return 'ok';                 // not a git workspace
+              if (signal?.aborted) return 'aborted';
+              const repoDir = await findContainingRepo(absPath);
+              if (!repoDir || !session.git.repos[repoDir]) return 'ok'; // non-git / untracked write → let through
+              return await ensureCodeBossBranch(repoDir);
+            };
+            // Generic developer-approval gate handed to tools that need an
+            // explicit human OK before a consequential action (e.g. edit_docx
+            // flattening formatting). Mirrors pauseForBranch: register a
+            // resolver on session.approvalPending, broadcast so the UI shows an
+            // Approve/Deny modal, await /api/approval-resolve, and race the
+            // abort signal so a cancel can't deadlock. Returns boolean.
+            const requireApproval = async ({ kind, message } = {}) => {
+              if (signal?.aborted) return false;
+              const id = randomUUID();
+              const pending = { id, kind: kind || 'approval', message: String(message || 'Approve this action?') };
+              pending.promise = new Promise((resolve) => { pending.resolve = resolve; });
+              session.approvalPending = pending;
+              chatState.broadcast({ type: 'approval-needed', version: chatState.bumpVersion(), id, kind: pending.kind, message: pending.message });
+              chatState.setPhase('paused');
+              const onAbort = () => { try { pending.resolve(false); } catch {} };
+              if (signal) signal.addEventListener('abort', onAbort, { once: true });
+              try {
+                const result = await pending.promise;
+                chatState.setPhase('thinking');
+                return result === true;
+              } finally {
+                if (signal) signal.removeEventListener('abort', onAbort);
+                if (session.approvalPending?.id === id) session.approvalPending = null;
+              }
+            };
             // Review loop: run agent → review → if fail, feed back as a
             // synthetic user message and re-run; max 2 rounds. If still
             // failing after round 2, surface the issue to the user.
@@ -7129,24 +10107,36 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
             let userMessage = text;
             let emitInitialUserMessage = true;
             let lastAgentResult = null;
-            // pendingReviewEv (hoisted above the try) tracks an appended-but-
-            // not-yet-resolved 'review' event so the outer catch can finalize
-            // it. Otherwise an abort/throw mid-review leaves the row stuck on
-            // state:'pending' forever (a spinning "reviewing…" row).
+            // If an assignment is being worked, inject its FROZEN requirement
+            // into the durable prompt channel every turn (so the worker can't
+            // drift even after the seed message compacts out of tier-1).
+            const activeAsg = (session.activeAssignment && session.assignments)
+              ? await session.assignments.get(session.activeAssignment) : null;
+            const assignmentPromptAdditions = activeAsg?.requirement
+              ? [`CURRENT ASSIGNMENT (${activeAsg.id}) — your one and only goal:\n${activeAsg.requirement}`
+                  + (activeAsg.acceptanceCriteria ? `\n\nAcceptance criteria:\n${activeAsg.acceptanceCriteria}` : '')
+                  + `\nStay strictly within this requirement; make only the changes it needs. Break the work into <next-task> units as you go.`]
+              : [];
+            // Tier-1 CODEBASE MEMORY: load the agent-maintained durable facts
+            // and inject them so accrued knowledge compounds across runs. Read
+            // fresh at run start (the agent may have updated it on a prior run).
+            let codebaseMemory = '';
+            try {
+              if (session.activeProject) codebaseMemory = renderMemory(await loadMemory(session.activeProject));
+            } catch (e) { fileLog(`codebase memory load failed: ${e.message}`); }
+            // Band this run in the chat log: one marker row so the user can
+            // see which stretch of the conversation belongs to which assignment
+            // (worker turns are the default bubbles; manager turns are already
+            // styled distinctly).
+            if (activeAsg) {
+              chatState.appendChatEvent({ type: 'assignment-banner', assignmentId: activeAsg.id, title: activeAsg.title });
+            }
+            // pendingReviewEvs (hoisted above the try) tracks appended-but-
+            // not-yet-resolved 'review' events so the outer catch can finalize
+            // them. Otherwise an abort/throw mid-review leaves rows stuck on
+            // state:'pending' forever (spinning "reviewing…" rows).
             while (true) {
               const turnStartIdx = session.chatEvents.length;
-              // Snapshot each repo's HEAD before the turn so we can tell
-              // whether the agent committed work even if the tree ends clean
-              // (the auto-commit hook commits on <next-task>). Without this,
-              // a turn that does substantive work and closes its task leaves
-              // a clean tree and the reviewer-skip below would skip review of
-              // exactly the changes that most need it.
-              const preHeads = {};
-              if (session.git?.isRepo) {
-                for (const repoDir of session.git.repoList) {
-                  preHeads[repoDir] = await getHeadHash(repoDir);
-                }
-              }
               const result = await runPromptedAgent({
                 adapter,
                 messages: [{ role: 'user', content: userMessage }],
@@ -7160,77 +10150,130 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
                 emitInitialUserMessage,
                 extraTools: pluginManager.enabledTools(),
                 extraVerbs: pluginManager.enabledVerbs(),
-                promptAdditions: pluginManager.promptAdditions(),
+                promptAdditions: [...pluginManager.promptAdditions(), ...assignmentPromptAdditions],
                 projectContext: session.projectContext || '',
+                codebaseMemory,
                 onTaskClose: gitAutoCommitHook,
                 requireBranch,
+                requireApproval,
                 getGitLabCredentials: () => session.gitlabCreds,
+                discussMode,
+                // Drain queued steer text at each turn boundary. splice(0) is
+                // atomic within a JS tick, so a concurrent /api/steer push
+                // either lands before the drain (this turn) or after (next).
+                drainSteer: () => session.steerBuffer.splice(0),
               });
               lastAgentResult = result;
               const turnDur = Date.now() - chatStart;
               fileLog(`chat round ${round + 1} done: terminated=${result.terminated} turns=${result.stats.turns} calls=${result.stats.toolCalls} duration=${turnDur}ms`);
+              // Discuss (read-only) runs have no durable work to verify — skip the
+              // per-task review + acceptance gate entirely (one agent run, then stop).
+              if (discussMode) { fileLog('discuss mode: skipping review + acceptance'); break; }
 
-              // Skip the reviewer ONLY for genuine no-op turns (Q&A / pure
-              // reads): no repo is dirty AND no repo's HEAD advanced this
-              // turn. A turn that wrote files then closed its task gets
-              // auto-committed (clean tree, advanced HEAD) and MUST still be
-              // reviewed. A status check that FAILED (dirty===null) is
-              // treated as "needs review" — never skip on uncertainty.
-              if (session.git?.isRepo) {
-                let needsReview = false;
-                for (const repoDir of session.git.repoList) {
-                  const status = await getStatus(repoDir);
-                  const headNow = await getHeadHash(repoDir);
-                  const advanced = preHeads[repoDir] && headNow && preHeads[repoDir] !== headNow;
-                  if (status.dirty !== false || advanced) { needsReview = true; break; }
-                }
-                if (!needsReview) {
-                  fileLog(`reviewer skipped: all repos clean and unchanged`);
-                  break;
-                }
+              // PER-TASK REVIEW: the reviewer fires ONLY when the agent marked
+              // a task done (<next-task> → a 'task-end' event this round), and
+              // reviews the WHOLE task. A round that closes no task (pure Q&A /
+              // reads, or work left in the still-open current task) gets NO
+              // review. This replaces the old per-round dirty/HEAD heuristic.
+              const roundSlice = session.chatEvents.slice(turnStartIdx);
+              const closedTaskEnds = roundSlice.filter((e) => e.type === 'task-end');
+              if (closedTaskEnds.length === 0) {
+                fileLog('reviewer skipped: no task closed this round');
+                break;
               }
-              // Fire the reviewer on what just happened. The review event
-              // is patched in place from 'pending' → 'pass'/'fail'/'escalate'.
               chatState.setPhase('reviewing');
-              const reviewEv = chatState.appendChatEvent({
-                type: 'review',
-                state: 'pending',
-                round: round + 1,
-              });
-              pendingReviewEv = reviewEv;
-              const trajectory = buildReviewTrajectory(session.chatEvents.slice(turnStartIdx));
-              const review = await runReviewer({
+              // COMBINED REVIEW: ONE reviewer session per round for ALL tasks
+              // closed this round. Each task gets its own footer row (pending),
+              // and the single runReviewer call returns a per-task verdict that
+              // we map back to its row. Whole-task scope per task: every event
+              // tagged with that task id across the ENTIRE conversation (a task
+              // can span multiple user-message rounds); compaction never deletes
+              // from chatEvents so the filter survives demotion.
+              const reviewRows = [];      // { te, reviewTaskId, reviewEv }
+              const reviewTasks = [];     // runReviewer({ tasks }) input
+              for (const te of closedTaskEnds) {
+                const reviewTaskId = te.taskId || null;
+                const reviewEv = chatState.appendChatEvent({
+                  type: 'review',
+                  state: 'pending',
+                  round: round + 1,
+                  reviewTaskId,
+                });
+                pendingReviewEvs.push(reviewEv);
+                reviewRows.push({ te, reviewTaskId, reviewEv });
+                const taskEvents = reviewTaskId
+                  ? session.chatEvents.filter((e) => e.taskId === reviewTaskId)
+                  : roundSlice;
+                reviewTasks.push({
+                  taskId: reviewTaskId || reviewEv.id,
+                  userRequest: te.userRequest || text,
+                  summary: te.summary || result.content,
+                  events: taskEvents,
+                });
+              }
+              const { verdicts } = await runReviewer({
                 adapter, model,
-                userRequest: text,            // always the ORIGINAL user request
-                trajectory,
-                finalText: result.content,
+                tasks: reviewTasks,
                 signal,
                 onLog: (msg) => fileLog(msg),
-                // Multi-repo: let the reviewer resolve repo-relative read
-                // paths against the actual sub-repos, not just the workspace
-                // root (cwd), so its reads don't ENOENT and silently pass.
+                onDiag: (d) => chatState.appendChatEvent({ type: 'manager-diagnostic', ...d }),
+                // Multi-repo: resolve the reviewer's repo-relative read paths
+                // against the actual sub-repos, not just the workspace root.
                 repoRoots: session.git?.repoList || [],
               });
-
-              if (review.pass) {
-                chatState.patchChatEvent(reviewEv.id, { state: 'pass' });
-                pendingReviewEv = null;
-                break;
+              const verdictById = new Map(verdicts.map((v) => [v.taskId, v]));
+              // Map each verdict back to its footer row. Collect ALL failing
+              // tasks' concerns into one feedback message for the re-run.
+              const failingConcerns = [];
+              for (const row of reviewRows) {
+                const v = verdictById.get(row.reviewTaskId || row.reviewEv.id) || { pass: true };
+                if (v.pass) {
+                  chatState.patchChatEvent(row.reviewEv.id, { state: 'pass' });
+                } else if (round + 1 >= REVIEW_MAX_ROUNDS) {
+                  chatState.patchChatEvent(row.reviewEv.id, { state: 'escalate', concerns: v.concerns });
+                  fileLog(`reviewer escalated ${row.reviewTaskId || ''} after ${round + 1} rounds: ${String(v.concerns).slice(0, 200)}`);
+                } else {
+                  chatState.patchChatEvent(row.reviewEv.id, { state: 'fail', concerns: v.concerns });
+                  fileLog(`reviewer found issues in ${row.reviewTaskId || ''} round ${round + 1}: ${String(v.concerns).slice(0, 200)}`);
+                  failingConcerns.push({ taskId: row.reviewTaskId, summary: row.te.summary, concerns: v.concerns });
+                }
               }
+              pendingReviewEvs = [];   // all rows resolved
+              // #2 BACKFILL: if the agent closed a task with a BLANK summary, the
+              // tier rollup, the task footer, and the acceptance input would show
+              // "(no summary)". Synthesize one with a dedicated single-shot
+              // summarizer over the task's diff (the auto-commit already used the
+              // user-request fallback). Best-effort; only fires on blank summaries.
+              if (session.activeProject) {
+                for (const row of reviewRows) {
+                  if (!row.reviewTaskId || String(row.te.summary || '').trim()) continue;
+                  let summary = '';
+                  try {
+                    const t = reviewTasks.find((x) => x.taskId === row.reviewTaskId);
+                    summary = await runSummarizer({ adapter, model, task: t, signal, onLog: (m) => fileLog(m) });
+                  } catch (e) { fileLog(`summary backfill failed for ${row.reviewTaskId}: ${e.message}`); }
+                  if (summary) {
+                    chatState.patchChatEvent(row.te.id, { summary });   // footer + persisted event + acceptance input
+                    try {
+                      const ts = createTasksStore(session.activeProject);
+                      await ts.init();
+                      await ts.setSummary(row.reviewTaskId, summary);   // tier-rollup source
+                    } catch (e) { fileLog(`setSummary failed for ${row.reviewTaskId}: ${e.message}`); }
+                    fileLog(`backfilled blank summary for ${row.reviewTaskId}: ${summary.slice(0, 80)}`);
+                  }
+                }
+              }
+              if (failingConcerns.length === 0) break;   // every closed task passed/escalated — round done
+              // Build one combined re-run message naming each failing task.
+              const failedConcerns = failingConcerns.length === 1
+                ? failingConcerns[0].concerns
+                : failingConcerns.map((f) => `• Task ${f.taskId || ''}${f.summary ? ` (${f.summary})` : ''}:\n${f.concerns}`).join('\n\n');
               round++;
-              if (round >= REVIEW_MAX_ROUNDS) {
-                chatState.patchChatEvent(reviewEv.id, { state: 'escalate', concerns: review.concerns });
-                pendingReviewEv = null;
-                fileLog(`reviewer escalated after ${round} rounds: ${review.concerns.slice(0, 200)}`);
-                break;
-              }
-              chatState.patchChatEvent(reviewEv.id, { state: 'fail', concerns: review.concerns });
-              pendingReviewEv = null;
-              fileLog(`reviewer found issues round ${round}, feeding back: ${review.concerns.slice(0, 200)}`);
               // Re-invoke with the reviewer's concerns as the next agent input.
               // Suppress the user-message event since the review event itself
               // already shows the feedback to the user.
-              userMessage = `The reviewer found issues with your last work:\n\n${review.concerns}\n\nPlease address these concerns.`;
+              const taskNoun = failingConcerns.length === 1 ? 'the task you just closed' : 'tasks you just closed';
+              userMessage = `The reviewer found issues with ${taskNoun}:\n\n${failedConcerns}\n\nPlease address these concerns, then close the task again with <next-task> when fixed.`;
               emitInitialUserMessage = false;
               chatState.setPhase('uploading');
             }
@@ -7254,7 +10297,7 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
                 const branch = await getCurrentBranch(repoDir);
                 if (isCodeBossBranch(branch)) continue;
                 const status = await getStatus(repoDir);
-                if (!status.dirty) continue;
+                if (status.dirty === false) continue;   // null (status failed) is NOT clean — surface it rather than hide it
                 dirtyRepos.push({
                   repoDir,
                   relDir: nodePath.relative(session.activeProject, repoDir) || '.',
@@ -7272,15 +10315,77 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
                 fileLog(`git-pending-resolution: ${dirtyRepos.length} repo(s) need branch+commit (${dirtyRepos.map((r) => r.relDir).join(', ')})`);
               }
             }
+            // AUTO-ACCEPTANCE: when the worker run completes and an assignment
+            // was being worked, run the requirement-fulfilment check and surface
+            // a verdict gate. The user remains the final approver (Accept/Edit/
+            // Pause); we only set the verdict + leave the assignment 'active'.
+            if (activeAsg && session.assignments && session.activeProject && !discussMode) {
+              try {
+                chatState.setPhase('manager');
+                const asgNow = await session.assignments.get(activeAsg.id);
+                const taskIds = new Set(asgNow?.taskIds || []);
+                const verdictByTask = new Map();
+                for (const ev of session.chatEvents) {
+                  if (ev.type === 'review' && ev.reviewTaskId) {
+                    if (ev.state === 'pass') verdictByTask.set(ev.reviewTaskId, { pass: true });
+                    else if (ev.state === 'escalate') verdictByTask.set(ev.reviewTaskId, { pass: false, escalated: true, concerns: ev.concerns });
+                    else verdictByTask.set(ev.reviewTaskId, { pass: false, concerns: ev.concerns });
+                  }
+                }
+                const acceptanceTasks = session.chatEvents
+                  .filter((e) => e.type === 'task-end' && taskIds.has(e.taskId))
+                  .map((te) => ({
+                    taskId: te.taskId,
+                    userRequest: te.userRequest,
+                    summary: te.summary,
+                    events: session.chatEvents.filter((e) => e.taskId === te.taskId),
+                    verdict: verdictByTask.get(te.taskId),
+                  }));
+                const verdict = await runAcceptance({
+                  adapter, model,
+                  assignment: { id: asgNow.id, requirement: asgNow.requirement, acceptanceCriteria: asgNow.acceptanceCriteria },
+                  tasks: acceptanceTasks,
+                  signal,
+                  onLog: (m) => fileLog(m),
+                  onDiag: (d) => chatState.appendChatEvent({ type: 'manager-diagnostic', ...d }),
+                  repoRoots: session.git?.repoList || [],
+                });
+                await session.assignments.setVerdict(asgNow.id, { round: round + 1, ...verdict });
+                // Surface per-task review state on the gate so the Accept
+                // decision is loud when a bound task escalated (review hit the
+                // round limit unresolved) — acceptance no longer silently
+                // overrides it; the UI warns + requires an explicit confirm.
+                const taskVerdicts = acceptanceTasks.map((t) => ({
+                  taskId: t.taskId,
+                  state: t.verdict?.escalated ? 'escalate' : (t.verdict && t.verdict.pass === false ? 'fail' : 'pass'),
+                  concerns: t.verdict?.concerns || '',
+                }));
+                const escalationCount = taskVerdicts.filter((v) => v.state === 'escalate').length;
+                chatState.appendChatEvent({
+                  type: 'assignment-gate', assignmentId: asgNow.id,
+                  fulfilled: verdict.fulfilled, missing: verdict.missing,
+                  drift: verdict.drift, rationale: verdict.rationale,
+                  taskVerdicts, escalationCount,
+                });
+                if (escalationCount) fileLog(`acceptance gate for ${asgNow.id}: ${escalationCount} escalated task(s) flagged`);
+                broadcast({ type: 'backlog', version: bumpVersion() });
+                fileLog(`acceptance ${asgNow.id}: fulfilled=${verdict.fulfilled}${verdict.missing ? ' — missing: ' + String(verdict.missing).slice(0, 150) : ''}`);
+              } catch (e) {
+                fileLog(`acceptance check failed: ${e.message}`);
+              }
+            }
             chatState.setStatus('done');
           } catch (e) {
             const dur = Date.now() - chatStart;
             const aborted = e?.name === 'AbortError' || /aborted/i.test(e?.message ?? '');
-            // Don't leave a 'reviewing…' row spinning forever if the reviewer
-            // was interrupted (abort / network error mid-review).
-            if (pendingReviewEv) {
-              try { chatState.patchChatEvent(pendingReviewEv.id, { state: 'error', concerns: aborted ? 'review canceled' : ('review failed: ' + e.message) }); } catch {}
-              pendingReviewEv = null;
+            // Don't leave 'reviewing…' rows spinning forever if the reviewer
+            // was interrupted (abort / network error mid-review). One combined
+            // call can have several task footers pending at once.
+            if (pendingReviewEvs.length) {
+              for (const ev of pendingReviewEvs) {
+                try { chatState.patchChatEvent(ev.id, { state: 'error', concerns: aborted ? 'review canceled' : ('review failed: ' + e.message) }); } catch {}
+              }
+              pendingReviewEvs = [];
             }
             chatState.setError(aborted ? (session.error || 'aborted') : e.message);
             chatState.setStatus('error');
@@ -7293,8 +10398,12 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
             clearTimeout(timeoutId);
             session.abortController = null;
             session.chatStartedAt = null;
+            // Clear the run-level assignment binding so the next free-form
+            // message isn't mis-attributed (the assignment's lifecycle status
+            // persists in the store; this only unbinds the current run).
+            session.activeAssignment = null;
             chatState.setPhase('idle');
-            if (cwdChanged) try { process.chdir(prevCwd); } catch {}
+            exitProjectCwd(entered);
           }
         })().catch((e) => {
           // Shouldn't reach here — errors are handled inside. But if it does,
@@ -7476,11 +10585,26 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
   process.once('SIGTERM', () => { flushOnShutdown(); process.exit(143); });
   process.once('beforeExit', flushOnShutdown);
 
+  // Closing the server cancels-and-flushes the pending debounced save FIRST,
+  // synchronously. Otherwise the 300ms timer can fire AFTER close() returns —
+  // re-creating .code_boss/conversation.json(.tmp) just as a caller tears the
+  // project dir down, which surfaces as an ENOTEMPTY rmdir race (and, in prod,
+  // a stray write into a directory we're done with). The signal handlers above
+  // cover hard kills; this covers the graceful close() path.
+  const _rawClose = server.close.bind(server);
+  server.close = (cb) => {
+    try { if (_saveTimer) { clearTimeout(_saveTimer); _saveTimer = null; flushConversationSave(); } } catch {}
+    return _rawClose(cb);
+  };
+
   return new Promise((resolve, reject) => {
     server.once('error', reject);
     server.listen(port, '127.0.0.1', () => resolve({ server, session, port, flushConversationSave }));
   });
 }
+
+// ====== embedded docx helper Java sources (written + compiled on first run) ======
+const DOCX_HELPER_SOURCES = {"com/codeboss/docx/DocxHelper.java":"package com.codeboss.docx;\r\n\r\nimport org.apache.poi.xwpf.usermodel.IBody;\r\nimport org.apache.poi.xwpf.usermodel.IBodyElement;\r\nimport org.apache.poi.xwpf.usermodel.ParagraphAlignment;\r\nimport org.apache.poi.xwpf.usermodel.UnderlinePatterns;\r\nimport org.apache.poi.xwpf.usermodel.XWPFDocument;\r\nimport org.apache.poi.xwpf.usermodel.XWPFFooter;\r\nimport org.apache.poi.xwpf.usermodel.XWPFHeader;\r\nimport org.apache.poi.xwpf.usermodel.XWPFParagraph;\r\nimport org.apache.poi.xwpf.usermodel.XWPFRun;\r\nimport org.apache.poi.xwpf.usermodel.XWPFSDT;\r\nimport org.apache.poi.xwpf.usermodel.XWPFStyle;\r\nimport org.apache.poi.xwpf.usermodel.XWPFStyles;\r\nimport org.apache.poi.xwpf.usermodel.XWPFTable;\r\nimport org.apache.poi.xwpf.usermodel.XWPFTableCell;\r\nimport org.apache.poi.xwpf.usermodel.XWPFTableRow;\r\n\r\nimport javax.xml.namespace.QName;\r\nimport org.apache.xmlbeans.XmlCursor;\r\nimport org.apache.xmlbeans.XmlObject;\r\nimport org.openxmlformats.schemas.wordprocessingml.x2006.main.CTR;\r\nimport org.openxmlformats.schemas.wordprocessingml.x2006.main.CTRPr;\r\nimport org.openxmlformats.schemas.wordprocessingml.x2006.main.CTRPrChange;\r\nimport org.openxmlformats.schemas.wordprocessingml.x2006.main.CTRunTrackChange;\r\nimport org.openxmlformats.schemas.wordprocessingml.x2006.main.CTText;\r\n\r\nimport java.io.ByteArrayInputStream;\r\nimport java.io.FileOutputStream;\r\nimport java.io.InputStream;\r\nimport java.io.PrintStream;\r\nimport java.math.BigInteger;\r\nimport java.nio.charset.StandardCharsets;\r\nimport java.nio.file.Files;\r\nimport java.nio.file.Path;\r\nimport java.nio.file.Paths;\r\nimport java.nio.file.StandardCopyOption;\r\nimport java.util.ArrayList;\r\nimport java.util.LinkedHashMap;\r\nimport java.util.List;\r\nimport java.util.Map;\r\n\r\n/**\r\n * code_boss full-fidelity .docx edit helper.\r\n *\r\n *   java -cp \"codeboss-docx-helper.jar;lib/*\" com.codeboss.docx.DocxHelper read|edit\r\n *\r\n * Reads ONE JSON request on stdin, writes ONE JSON response on stdout. All\r\n * docx fidelity (formatting, lists, headers/footers, images, tables,\r\n * hyperlinks, TOC fields) is preserved because POI re-serializes every part\r\n * we don't touch byte-faithfully and we only rewrite the text of the runs a\r\n * find/replace actually overlaps.\r\n *\r\n * READ : {\"op\":\"read\",\"docx\":\"<abs>\"}\r\n *        -> {\"ok\":true,\"docx\":..,\"paragraphs\":[{id,scope,location,style,listLevel,readOnly,text}],\"meta\":{hasFields}}\r\n * EDIT : {\"op\":\"edit\",\"docx\":\"<abs>\",\"dryRun\":false,\"ops\":[{\"id\":N,\"find\":\"..\",\"replace\":\"..\",\"allowFormatFlatten\":false}]}\r\n *        -> {\"ok\":true,\"applied\":N,\"updateFieldsOnOpen\":bool,\"ops\":[{id,before,after,runsTouched,flattened}]}\r\n * ERROR: {\"ok\":false,\"error\":\"..\",\"code\":\"..\",\"opIndex\":n|null}  (+ nonzero exit)\r\n */\r\npublic final class DocxHelper {\r\n\r\n  // exit codes\r\n  private static final int EX_OK = 0, EX_VALIDATION = 2, EX_FILE = 3, EX_BAD_REQUEST = 4, EX_VERIFY = 5;\r\n\r\n  private static PrintStream out;\r\n\r\n  public static void main(String[] args) {\r\n    try {\r\n      out = new PrintStream(System.out, true, \"UTF-8\");\r\n    } catch (Exception e) {\r\n      System.err.println(\"cannot init UTF-8 stdout: \" + e);\r\n      System.exit(EX_FILE);\r\n      return;\r\n    }\r\n    try {\r\n      if (args.length < 1) throw new Fail(EX_BAD_REQUEST, \"bad-request\", \"missing op (read|edit)\", null);\r\n      String op = args[0];\r\n      String input = readAll(System.in);\r\n      Map<String, Object> spec;\r\n      try {\r\n        spec = Json.obj(Json.parse(input));\r\n      } catch (Exception e) {\r\n        throw new Fail(EX_BAD_REQUEST, \"bad-request\", \"invalid request JSON: \" + e.getMessage(), null);\r\n      }\r\n      Map<String, Object> res = dispatch(op, spec);\r\n      out.println(Json.write(res));\r\n    } catch (Fail f) {\r\n      emitError(f);\r\n      System.exit(f.exit);\r\n    } catch (Throwable t) {\r\n      emitError(new Fail(EX_FILE, \"file-error\", String.valueOf(t.getMessage()), null));\r\n      System.exit(EX_FILE);\r\n    }\r\n  }\r\n\r\n  static Map<String, Object> dispatch(String op, Map<String, Object> spec) throws Exception {\r\n    if (\"read\".equals(op)) return doRead(spec);\r\n    if (\"detail\".equals(op)) return doDetail(spec);\r\n    if (\"edit\".equals(op)) return doEdit(spec);\r\n    throw new Fail(EX_BAD_REQUEST, \"bad-request\", \"unknown op: \" + op, null);\r\n  }\r\n\r\n  // ---------------------------------------------------------------- read ----\r\n  static Map<String, Object> doRead(Map<String, Object> spec) throws Exception {\r\n    Path path = docxPath(spec);\r\n    XWPFDocument doc = open(path);\r\n    try {\r\n      List<ParaRef> refs = enumerate(doc);\r\n      XWPFStyles xs = doc.getStyles();\r\n      boolean hasFields = false;\r\n      int revs = 0, eqs = 0, sdts = 0;\r\n      List<Object> paras = new ArrayList<>();\r\n      for (ParaRef r : refs) {\r\n        if (r.hasField) hasFields = true;\r\n        if (r.hasRevisions) revs++;\r\n        if (r.hasEquation) eqs++;\r\n        if (r.isSdt) sdts++;\r\n        Map<String, Object> m = new LinkedHashMap<>();\r\n        m.put(\"id\", (long) r.id);\r\n        m.put(\"scope\", r.scope);\r\n        m.put(\"location\", r.location);\r\n        m.put(\"style\", r.styleId);\r\n        m.put(\"listLevel\", r.listLevel);   // Long or null\r\n        m.put(\"readOnly\", r.readOnly);\r\n        m.put(\"text\", refText(r));\r\n        if (r.para != null) {\r\n          Integer ol = outlineLevelOf(r.para, xs);\r\n          if (ol != null) m.put(\"outlineLevel\", (long) (int) ol);\r\n          String al = String.valueOf(r.para.getAlignment());\r\n          if (al != null && !\"LEFT\".equals(al)) m.put(\"alignment\", al);\r\n          var nid = r.para.getNumID();\r\n          if (nid != null) m.put(\"numId\", nid.toString());\r\n          String fl = flagsOf(r.para);\r\n          if (!fl.isEmpty()) m.put(\"flags\", fl);\r\n        }\r\n        if (r.hasRevisions) m.put(\"hasRevisions\", Boolean.TRUE);\r\n        if (r.hasEquation) m.put(\"hasEquation\", Boolean.TRUE);\r\n        if (r.isSdt) m.put(\"contentControl\", Boolean.TRUE);\r\n        if (r.deletedText != null && !r.deletedText.isEmpty()) m.put(\"deletedText\", r.deletedText);\r\n        paras.add(m);\r\n      }\r\n      Map<String, Object> res = new LinkedHashMap<>();\r\n      res.put(\"ok\", Boolean.TRUE);\r\n      res.put(\"docx\", path.toString());\r\n      res.put(\"paragraphs\", paras);\r\n      Map<String, Object> meta = new LinkedHashMap<>();\r\n      meta.put(\"hasFields\", hasFields);\r\n      meta.put(\"paragraphCount\", (long) refs.size());\r\n      meta.put(\"revisionParagraphs\", (long) revs);\r\n      meta.put(\"equationParagraphs\", (long) eqs);\r\n      meta.put(\"contentControls\", (long) sdts);\r\n      meta.put(\"hasTrackChanges\", revs > 0);\r\n      meta.put(\"documentProtection\", documentProtection(doc));   // String or null\r\n      res.put(\"meta\", meta);\r\n      return res;\r\n    } finally {\r\n      doc.close();\r\n    }\r\n  }\r\n\r\n  // ---------------------------------------------------------------- edit ----\r\n  static Map<String, Object> doEdit(Map<String, Object> spec) throws Exception {\r\n    Path path = docxPath(spec);\r\n    boolean dryRun = Json.bool(spec.get(\"dryRun\"), false);\r\n    List<Object> opsRaw;\r\n    try {\r\n      opsRaw = Json.arr(spec.get(\"ops\"));\r\n    } catch (Exception e) {\r\n      throw new Fail(EX_BAD_REQUEST, \"bad-request\", \"ops[] is required\", null);\r\n    }\r\n    if (opsRaw.isEmpty()) throw new Fail(EX_BAD_REQUEST, \"bad-request\", \"ops[] is empty\", null);\r\n\r\n    XWPFDocument doc = open(path);\r\n    try {\r\n      // Refuse to edit a protection-enforced document — a direct write would be\r\n      // illegitimate (and Word may reject the file).\r\n      String prot = documentProtection(doc);\r\n      if (prot != null) {\r\n        throw new Fail(EX_FILE, \"document-protected\",\r\n            \"document has editing protection enforced (\" + prot + \"); remove protection in Word before editing\", null);\r\n      }\r\n      List<ParaRef> refs = enumerate(doc);\r\n      Map<Integer, ParaRef> byId = new LinkedHashMap<>();\r\n      for (ParaRef r : refs) byId.put(r.id, r);\r\n\r\n      // Snapshot every paragraph's text (for the untouched-paragraphs verify).\r\n      Map<Integer, String> before = new LinkedHashMap<>();\r\n      for (ParaRef r : refs) before.put(r.id, refText(r));\r\n\r\n      // VALIDATE-ALL (atomic): nothing is mutated until every op is legal.\r\n      // expectedById layers multiple ops on the same paragraph so the verify\r\n      // target is exact.\r\n      Map<Integer, String> expectedById = new LinkedHashMap<>();\r\n      List<int[]> opTouched = new ArrayList<>();   // runsTouched per op\r\n      List<Boolean> opFlattened = new ArrayList<>();\r\n      List<Map<String, Object>> postChecks = new ArrayList<>();   // per-op structural post-conditions\r\n      XWPFStyles xs = doc.getStyles();\r\n      boolean hasFields = false;\r\n      for (ParaRef r : refs) if (r.hasField) hasFields = true;\r\n\r\n      // Track-changes config. A replace op is tracked if spec.tracked or\r\n      // op.asTracked is set, OR the doc is already under review (so new edits\r\n      // stay consistent with existing revisions rather than bypassing markup).\r\n      boolean specTracked = Json.bool(spec.get(\"tracked\"), false);\r\n      String trkAuthor = Json.str(spec.get(\"author\"));\r\n      String trkDate = Json.str(spec.get(\"date\"));\r\n      boolean docInReview = false;\r\n      for (ParaRef r : refs) if (r.hasRevisions) { docInReview = true; break; }\r\n      IdAlloc idAlloc = idAllocFor(doc);\r\n      boolean[] anyTracked = { false };\r\n\r\n      for (int oi = 0; oi < opsRaw.size(); oi++) {\r\n        Map<String, Object> op = Json.obj(opsRaw.get(oi));\r\n        String type = opType(op);\r\n        Integer id = Integer.valueOf(Json.intval(op.get(\"id\"), Integer.MIN_VALUE));\r\n        if (id == Integer.MIN_VALUE) throw new Fail(EX_BAD_REQUEST, \"bad-request\", \"op missing integer id\", oi);\r\n        ParaRef ref = byId.get(id);\r\n        if (ref == null) throw new Fail(EX_VALIDATION, \"anchor-not-found\", \"no paragraph with id \" + id + \" (re-read the document)\", oi);\r\n        if (ref.readOnly) throw new Fail(EX_VALIDATION, \"protected-region\", \"paragraph \" + id + \" is a field/TOC/tracked/content-control region and cannot be edited\", oi);\r\n\r\n        if (\"replace\".equals(type) || \"setRunFormat\".equals(type)) {\r\n          if (ref.para == null) throw new Fail(EX_VALIDATION, \"protected-region\", \"paragraph \" + id + \" has no editable text runs\", oi);\r\n          String find = Json.str(op.get(\"find\"));\r\n          if (find == null || find.isEmpty()) throw new Fail(EX_BAD_REQUEST, \"bad-request\", \"op \" + oi + \" missing non-empty find\", oi);\r\n          String curr = expectedById.getOrDefault(id, before.get(id));\r\n          int s = curr.indexOf(find);\r\n          if (s < 0) throw new Fail(EX_VALIDATION, \"not-found\", \"find not present in paragraph \" + id, oi);\r\n          if (curr.indexOf(find, s + 1) >= 0) throw new Fail(EX_VALIDATION, \"ambiguous-match\", \"find occurs more than once in paragraph \" + id + \" — make it more specific\", oi);\r\n          int e = s + find.length();\r\n\r\n          if (\"replace\".equals(type)) {\r\n            String replace = Json.str(op.get(\"replace\"));\r\n            if (replace == null) replace = \"\";\r\n            boolean allowFlatten = Json.bool(op.get(\"allowFormatFlatten\"), false);\r\n            StraddleInfo st = straddle(ref.para, s, e);\r\n            if (st != null && st.straddles && !allowFlatten) {\r\n              throw new Fail(EX_VALIDATION, \"format-straddle\",\r\n                  \"find spans a formatting change in paragraph \" + id + \" near offset \" + st.changeOffset\r\n                      + \" (\\\"\" + snippet(curr, st.changeOffset) + \"\\\"). Narrow find to stay within one format, split into per-format edits, \"\r\n                      + \"or set allowFormatFlatten:true (requires developer approval).\",\r\n                  oi);\r\n            }\r\n            opTouched.add(new int[]{ st == null ? 0 : st.runsTouched });\r\n            opFlattened.add(st != null && st.straddles && allowFlatten);\r\n            expectedById.put(id, curr.substring(0, s) + replace + curr.substring(e));\r\n          } else {   // setRunFormat — formats the span, no text change\r\n            Map<String, Object> fmt;\r\n            try { fmt = Json.obj(op.get(\"format\")); } catch (Exception ex) { throw new Fail(EX_BAD_REQUEST, \"bad-request\", \"setRunFormat op \" + oi + \" missing format{}\", oi); }\r\n            if (fmt.isEmpty()) throw new Fail(EX_BAD_REQUEST, \"bad-request\", \"setRunFormat op \" + oi + \" empty format{}\", oi);\r\n            Map<String, Object> pc = new LinkedHashMap<>();\r\n            pc.put(\"type\", \"setRunFormat\"); pc.put(\"id\", (long) id); pc.put(\"find\", find); pc.put(\"format\", fmt);\r\n            postChecks.add(pc);\r\n            opTouched.add(new int[]{0}); opFlattened.add(Boolean.FALSE);\r\n          }\r\n        } else if (\"setParaStyle\".equals(type)) {\r\n          String style = Json.str(op.get(\"style\"));\r\n          if (style == null || style.isEmpty()) throw new Fail(EX_BAD_REQUEST, \"bad-request\", \"setParaStyle op \" + oi + \" missing style\", oi);\r\n          if (xs == null || xs.getStyle(style) == null) throw new Fail(EX_VALIDATION, \"no-such-style\", \"style \\\"\" + style + \"\\\" not found in this document\", oi);\r\n          Map<String, Object> pc = new LinkedHashMap<>();\r\n          pc.put(\"type\", \"setParaStyle\"); pc.put(\"id\", (long) id); pc.put(\"style\", style);\r\n          postChecks.add(pc);\r\n          opTouched.add(new int[]{0}); opFlattened.add(Boolean.FALSE);\r\n        } else if (\"setParaProps\".equals(type)) {\r\n          if (!(op.containsKey(\"alignment\") || op.containsKey(\"indentLeftTwips\") || op.containsKey(\"spacingBeforeTwips\") || op.containsKey(\"spacingAfterTwips\")))\r\n            throw new Fail(EX_BAD_REQUEST, \"bad-request\", \"setParaProps op \" + oi + \" has no recognized property\", oi);\r\n          Map<String, Object> pc = new LinkedHashMap<>();\r\n          pc.put(\"type\", \"setParaProps\"); pc.put(\"id\", (long) id); pc.put(\"op\", op);\r\n          postChecks.add(pc);\r\n          opTouched.add(new int[]{0}); opFlattened.add(Boolean.FALSE);\r\n        } else if (\"setListMembership\".equals(type)) {\r\n          if (op.get(\"numId\") == null) throw new Fail(EX_BAD_REQUEST, \"bad-request\", \"setListMembership op \" + oi + \" missing numId\", oi);\r\n          Map<String, Object> pc = new LinkedHashMap<>();\r\n          pc.put(\"type\", \"setListMembership\"); pc.put(\"id\", (long) id); pc.put(\"numId\", op.get(\"numId\").toString());\r\n          postChecks.add(pc);\r\n          opTouched.add(new int[]{0}); opFlattened.add(Boolean.FALSE);\r\n        } else if (\"deleteParagraph\".equals(type)) {\r\n          // Structural: remove the paragraph's content. Tracked → marked as a\r\n          // deletion (struck, reviewer accepts); direct → emptied. Either way the\r\n          // paragraph remains so ids/count stay stable (clean verify).\r\n          if (ref.para == null) throw new Fail(EX_VALIDATION, \"protected-region\", \"paragraph \" + id + \" has no editable text runs\", oi);\r\n          expectedById.put(id, \"\");   // accepted text after deletion is empty\r\n          opTouched.add(new int[]{0}); opFlattened.add(Boolean.FALSE);\r\n        } else {\r\n          throw new Fail(EX_BAD_REQUEST, \"bad-request\", \"unknown op type \\\"\" + type + \"\\\"\", oi);\r\n        }\r\n      }\r\n\r\n      // DRY-RUN: report would-be results, write nothing.\r\n      if (dryRun) {\r\n        return editResult(opsRaw, before, expectedById, opTouched, opFlattened, hasFields, false);\r\n      }\r\n\r\n      // APPLY-ALL in document order; re-find against the live paragraph so\r\n      // multiple ops on one paragraph compose correctly.\r\n      for (int oi = 0; oi < opsRaw.size(); oi++) {\r\n        Map<String, Object> op = Json.obj(opsRaw.get(oi));\r\n        String type = opType(op);\r\n        int id = Json.intval(op.get(\"id\"), Integer.MIN_VALUE);\r\n        ParaRef ref = byId.get(id);\r\n        if (ref == null || ref.para == null) continue;\r\n        switch (type) {\r\n          case \"setRunFormat\": {\r\n            boolean tr = specTracked || Json.bool(op.get(\"asTracked\"), false) || docInReview;\r\n            applyRunFormat(ref.para, Json.str(op.get(\"find\")), Json.obj(op.get(\"format\")), tr, trkAuthor, trkDate, idAlloc);\r\n            if (tr) anyTracked[0] = true;\r\n            break;\r\n          }\r\n          case \"setParaStyle\": ref.para.setStyle(Json.str(op.get(\"style\"))); break;\r\n          case \"setParaProps\": applyParaProps(ref.para, op); break;\r\n          case \"setListMembership\": applyListMembership(ref.para, op); break;\r\n          case \"deleteParagraph\": {\r\n            String whole = text(ref.para);\r\n            if (!whole.isEmpty()) {\r\n              boolean tr = specTracked || Json.bool(op.get(\"asTracked\"), false) || docInReview;\r\n              if (tr) { applyTrackedReplace(ref.para, whole, \"\", trkAuthor, trkDate, idAlloc); anyTracked[0] = true; }\r\n              else applyReplace(ref.para, whole, \"\", oi);\r\n            }\r\n            break;\r\n          }\r\n          default: {\r\n            String find = Json.str(op.get(\"find\"));\r\n            String replace = Json.str(op.get(\"replace\"));\r\n            if (replace == null) replace = \"\";\r\n            boolean tracked = specTracked || Json.bool(op.get(\"asTracked\"), false) || docInReview;\r\n            if (tracked) { applyTrackedReplace(ref.para, find, replace, trkAuthor, trkDate, idAlloc); anyTracked[0] = true; }\r\n            else applyReplace(ref.para, find, replace, oi);\r\n          }\r\n        }\r\n      }\r\n\r\n      // Authoring tracked edits → open the doc in track-changes mode.\r\n      if (anyTracked[0]) { try { doc.setTrackRevisions(true); } catch (Throwable ignore) {} }\r\n\r\n      // Flag TOC/TOF/TOT + other fields to refresh on next open in Word.\r\n      boolean updateFields = false;\r\n      if (hasFields) {\r\n        try { doc.enforceUpdateFields(); updateFields = true; } catch (Throwable ignore) {}\r\n      }\r\n\r\n      // ATOMIC WRITE + VERIFY: write a sibling temp, re-open it, confirm every\r\n      // edited paragraph matches its expected text and every other paragraph\r\n      // is byte-identical, then atomically move it over the original.\r\n      Path tmp = path.resolveSibling(path.getFileName().toString() + \".cb-tmp-\" + Long.toHexString(System.nanoTime()));\r\n      try {\r\n        try (FileOutputStream fos = new FileOutputStream(tmp.toFile())) {\r\n          doc.write(fos);\r\n        }\r\n        verify(tmp, before, expectedById, postChecks);\r\n        try {\r\n          Files.move(tmp, path, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);\r\n        } catch (Throwable atomicFail) {\r\n          Files.move(tmp, path, StandardCopyOption.REPLACE_EXISTING);\r\n        }\r\n      } finally {\r\n        try { Files.deleteIfExists(tmp); } catch (Throwable ignore) {}\r\n      }\r\n\r\n      Map<String, Object> result = editResult(opsRaw, before, expectedById, opTouched, opFlattened, hasFields, updateFields);\r\n      result.put(\"trackChanges\", anyTracked[0]);\r\n      return result;\r\n    } finally {\r\n      doc.close();\r\n    }\r\n  }\r\n\r\n  private static Map<String, Object> editResult(List<Object> opsRaw, Map<Integer, String> before,\r\n      Map<Integer, String> expectedById, List<int[]> touched, List<Boolean> flattened,\r\n      boolean hasFields, boolean updateFields) {\r\n    List<Object> opResults = new ArrayList<>();\r\n    // before/after per op: track the running text per id so each op's \"before\"\r\n    // reflects prior ops on the same paragraph.\r\n    Map<Integer, String> running = new LinkedHashMap<>(before);\r\n    for (int oi = 0; oi < opsRaw.size(); oi++) {\r\n      Map<String, Object> op = Json.obj(opsRaw.get(oi));\r\n      String type = opType(op);\r\n      int id = Json.intval(op.get(\"id\"), Integer.MIN_VALUE);\r\n      Map<String, Object> m = new LinkedHashMap<>();\r\n      m.put(\"id\", (long) id);\r\n      m.put(\"op\", type);\r\n      if (\"replace\".equals(type)) {\r\n        String find = Json.str(op.get(\"find\"));\r\n        String replace = Json.str(op.get(\"replace\"));\r\n        if (replace == null) replace = \"\";\r\n        String b = running.getOrDefault(id, \"\");\r\n        int s = b.indexOf(find);\r\n        String a = (s < 0) ? b : b.substring(0, s) + replace + b.substring(s + find.length());\r\n        running.put(id, a);\r\n        m.put(\"before\", b);\r\n        m.put(\"after\", a);\r\n        m.put(\"runsTouched\", (long) (touched.get(oi)[0]));\r\n        m.put(\"flattened\", flattened.get(oi));\r\n      } else if (\"setRunFormat\".equals(type)) {\r\n        m.put(\"find\", Json.str(op.get(\"find\")));\r\n        m.put(\"format\", op.get(\"format\"));\r\n      } else if (\"setParaStyle\".equals(type)) {\r\n        m.put(\"style\", Json.str(op.get(\"style\")));\r\n      } else if (\"deleteParagraph\".equals(type)) {\r\n        String b = running.getOrDefault(id, \"\");\r\n        running.put(id, \"\");\r\n        m.put(\"before\", b);\r\n        m.put(\"after\", \"\");\r\n      } else {\r\n        m.put(\"applied\", Boolean.TRUE);\r\n      }\r\n      opResults.add(m);\r\n    }\r\n    Map<String, Object> res = new LinkedHashMap<>();\r\n    res.put(\"ok\", Boolean.TRUE);\r\n    res.put(\"applied\", (long) opsRaw.size());\r\n    res.put(\"updateFieldsOnOpen\", updateFields);\r\n    res.put(\"hasFields\", hasFields);\r\n    res.put(\"ops\", opResults);\r\n    return res;\r\n  }\r\n\r\n  // -------------------------------------------------------- run surgery ----\r\n  /** Re-find `find` in the live paragraph and splice `replace` across runs. */\r\n  private static void applyReplace(XWPFParagraph para, String find, String replace, int opIndex) throws Fail {\r\n    List<XWPFRun> runs = para.getRuns();\r\n    int n = runs.size();\r\n    int[] starts = new int[n];\r\n    String[] texts = new String[n];\r\n    int p = 0;\r\n    StringBuilder full = new StringBuilder();\r\n    for (int i = 0; i < n; i++) {\r\n      String t = runs.get(i).getText(0);\r\n      if (t == null) t = \"\";\r\n      texts[i] = t;\r\n      starts[i] = p;\r\n      p += t.length();\r\n      full.append(t);\r\n    }\r\n    String all = full.toString();\r\n    int s = all.indexOf(find);\r\n    if (s < 0) throw new Fail(EX_VERIFY, \"verify-failed\", \"find vanished before apply in op \" + opIndex, opIndex);\r\n    if (all.indexOf(find, s + 1) >= 0) throw new Fail(EX_VERIFY, \"verify-failed\", \"find became ambiguous before apply in op \" + opIndex, opIndex);\r\n    int e = s + find.length();\r\n\r\n    List<Integer> ov = new ArrayList<>();\r\n    for (int i = 0; i < n; i++) {\r\n      int a = starts[i], b = a + texts[i].length();\r\n      if (texts[i].length() > 0 && a < e && b > s) ov.add(i);\r\n    }\r\n    int fi = ov.get(0), li = ov.get(ov.size() - 1);\r\n    String prefix = texts[fi].substring(0, s - starts[fi]);\r\n    String suffix = texts[li].substring(e - starts[li]);\r\n    if (fi == li) {\r\n      runs.get(fi).setText(prefix + replace + suffix, 0);\r\n    } else {\r\n      runs.get(fi).setText(prefix + replace, 0);\r\n      for (int k = fi + 1; k < li; k++) {\r\n        if (texts[k].length() > 0) runs.get(k).setText(\"\", 0);\r\n      }\r\n      runs.get(li).setText(suffix, 0);\r\n    }\r\n  }\r\n\r\n  // ---- P2 formatting / paragraph edit primitives ------------------------\r\n  static String opType(Map<String, Object> op) {\r\n    String t = Json.str(op.get(\"op\"));\r\n    return (t == null || t.isEmpty()) ? \"replace\" : t;\r\n  }\r\n\r\n  // Apply character formatting to the (unique) `find` span within a paragraph,\r\n  // splitting boundary runs so only the span is affected. The new boundary runs\r\n  // inherit the original run's full rPr (copied via XmlObject.set — lite-safe).\r\n  private static void applyRunFormat(XWPFParagraph p, String find, Map<String, Object> fmt,\r\n      boolean tracked, String who, String date, IdAlloc ids) {\r\n    String all = text(p);\r\n    int s = all.indexOf(find);\r\n    if (s < 0) return;\r\n    int e = s + find.length();\r\n    ensureBoundaryAt(p, e);\r\n    ensureBoundaryAt(p, s);\r\n    java.util.Calendar c0 = tracked ? cal(date) : null;\r\n    String author = (who == null || who.isEmpty()) ? \"code_boss\" : who;\r\n    List<XWPFRun> runs = p.getRuns();\r\n    int pos = 0;\r\n    for (XWPFRun run : runs) {\r\n      String t = run.getText(0);\r\n      if (t == null) t = \"\";\r\n      int a = pos, b = pos + t.length();\r\n      if (t.length() > 0 && a >= s && b <= e) {\r\n        // Snapshot the run's PREVIOUS rPr before mutating, so a tracked format\r\n        // change can record it in an rPrChange.\r\n        CTRPr oldClone = null;\r\n        if (tracked) { try { var cur = run.getCTR().getRPr(); if (cur != null) oldClone = (CTRPr) cur.copy(); } catch (Throwable ig) {} }\r\n        applyFmtToRun(run, fmt);\r\n        if (tracked) {\r\n          try {\r\n            CTRPr nowRpr = run.getCTR().getRPr();\r\n            if (nowRpr == null) nowRpr = run.getCTR().addNewRPr();\r\n            if (!nowRpr.isSetRPrChange()) {\r\n              CTRPrChange rpc = nowRpr.addNewRPrChange();\r\n              rpc.setAuthor(author); rpc.setId(ids.next()); rpc.setDate(c0);\r\n              if (oldClone != null) rpc.addNewRPr().set(oldClone); else rpc.addNewRPr();\r\n            }\r\n          } catch (Throwable ig) {}\r\n        }\r\n      }\r\n      pos = b;\r\n    }\r\n  }\r\n\r\n  // Ensure a run boundary exists at character offset `off` (split the straddling\r\n  // run, cloning its rPr so formatting is preserved on both halves).\r\n  private static void ensureBoundaryAt(XWPFParagraph p, int off) {\r\n    if (off <= 0) return;\r\n    List<XWPFRun> runs = p.getRuns();\r\n    int pos = 0;\r\n    for (int i = 0; i < runs.size(); i++) {\r\n      XWPFRun run = runs.get(i);\r\n      String t = run.getText(0);\r\n      if (t == null) t = \"\";\r\n      int a = pos, b = pos + t.length();\r\n      if (off > a && off < b) {\r\n        String pre = t.substring(0, off - a), suf = t.substring(off - a);\r\n        XWPFRun nr = p.insertNewRun(i + 1);\r\n        try { var src = run.getCTR().getRPr(); if (src != null) nr.getCTR().addNewRPr().set(src); } catch (Throwable ignore) {}\r\n        nr.setText(suf, 0);\r\n        run.setText(pre, 0);\r\n        return;\r\n      }\r\n      pos = b;\r\n    }\r\n  }\r\n\r\n  private static void applyFmtToRun(XWPFRun run, Map<String, Object> fmt) {\r\n    if (fmt.containsKey(\"bold\")) run.setBold(truthy(fmt.get(\"bold\")));\r\n    if (fmt.containsKey(\"italic\")) run.setItalic(truthy(fmt.get(\"italic\")));\r\n    if (fmt.containsKey(\"strike\")) run.setStrikeThrough(truthy(fmt.get(\"strike\")));\r\n    if (fmt.containsKey(\"font\")) { Object v = fmt.get(\"font\"); if (v != null) run.setFontFamily(String.valueOf(v)); }\r\n    if (fmt.containsKey(\"sizePt\")) { double d = numOf(fmt.get(\"sizePt\")); if (d > 0) run.setFontSize(d); }\r\n    if (fmt.containsKey(\"color\")) { Object v = fmt.get(\"color\"); if (v != null) run.setColor(String.valueOf(v).replace(\"#\", \"\")); }\r\n    if (fmt.containsKey(\"underline\")) run.setUnderline(underlineOf(String.valueOf(fmt.get(\"underline\"))));\r\n  }\r\n\r\n  private static boolean truthy(Object o) {\r\n    if (o instanceof Boolean) return (Boolean) o;\r\n    String s = String.valueOf(o).toLowerCase();\r\n    return s.equals(\"true\") || s.equals(\"1\") || s.equals(\"on\") || s.equals(\"yes\");\r\n  }\r\n  private static double numOf(Object o) {\r\n    if (o instanceof Number) return ((Number) o).doubleValue();\r\n    try { return Double.parseDouble(String.valueOf(o)); } catch (Exception e) { return -1; }\r\n  }\r\n  private static UnderlinePatterns underlineOf(String s) {\r\n    if (s == null) return UnderlinePatterns.SINGLE;\r\n    String u = s.trim().toLowerCase();\r\n    if (u.equals(\"none\") || u.equals(\"false\") || u.equals(\"0\")) return UnderlinePatterns.NONE;\r\n    try { return UnderlinePatterns.valueOf(s.trim().toUpperCase()); } catch (Exception e) { return UnderlinePatterns.SINGLE; }\r\n  }\r\n\r\n  private static void applyParaProps(XWPFParagraph p, Map<String, Object> op) {\r\n    if (op.containsKey(\"alignment\")) {\r\n      try { p.setAlignment(ParagraphAlignment.valueOf(String.valueOf(op.get(\"alignment\")).trim().toUpperCase())); } catch (Exception ignore) {}\r\n    }\r\n    if (op.containsKey(\"indentLeftTwips\")) p.setIndentationLeft(Json.intval(op.get(\"indentLeftTwips\"), 0));\r\n    if (op.containsKey(\"spacingBeforeTwips\")) p.setSpacingBefore(Json.intval(op.get(\"spacingBeforeTwips\"), 0));\r\n    if (op.containsKey(\"spacingAfterTwips\")) p.setSpacingAfter(Json.intval(op.get(\"spacingAfterTwips\"), 0));\r\n  }\r\n\r\n  private static void applyListMembership(XWPFParagraph p, Map<String, Object> op) {\r\n    Object numId = op.get(\"numId\");\r\n    if (numId != null) {\r\n      p.setNumID(java.math.BigInteger.valueOf(Json.intval(numId, 0)));\r\n      if (op.containsKey(\"ilvl\")) p.setNumILvl(java.math.BigInteger.valueOf(Json.intval(op.get(\"ilvl\"), 0)));\r\n    }\r\n  }\r\n\r\n  // ---- P3 track-changes (raw OOXML — POI has no revision authoring API) ----\r\n  private static final String WNS = \"http://schemas.openxmlformats.org/wordprocessingml/2006/main\";\r\n  private static final String XML_NS = \"http://www.w3.org/XML/1998/namespace\";\r\n\r\n  // Monotonic w:id allocator, seeded above every existing numeric w:id in the\r\n  // document so a new revision never collides with an existing id.\r\n  static final class IdAlloc {\r\n    long n;\r\n    IdAlloc(long start) { n = start; }\r\n    java.math.BigInteger next() { return java.math.BigInteger.valueOf(n++); }\r\n  }\r\n  static IdAlloc idAllocFor(XWPFDocument doc) {\r\n    long max = 0;\r\n    try {\r\n      String xml = doc.getDocument().xmlText();\r\n      var m = java.util.regex.Pattern.compile(\"[A-Za-z0-9]+:id=\\\"(\\\\d+)\\\"\").matcher(xml);\r\n      while (m.find()) { try { max = Math.max(max, Long.parseLong(m.group(1))); } catch (Exception e) {} }\r\n    } catch (Throwable ignore) {}\r\n    return new IdAlloc(max + 1);\r\n  }\r\n\r\n  private static java.util.Calendar cal(String date) {\r\n    java.util.Calendar c = new java.util.GregorianCalendar();\r\n    if (date != null) { try { c.setTime(java.util.Date.from(java.time.Instant.parse(date))); } catch (Exception e) {} }\r\n    return c;\r\n  }\r\n  private static void preserveSpace(XmlObject ctText) {\r\n    XmlCursor cc = ctText.newCursor();\r\n    try { cc.setAttributeText(new QName(XML_NS, \"space\"), \"preserve\"); } catch (Throwable t) {} finally { cc.dispose(); }\r\n  }\r\n\r\n  // Tracked find/replace: wrap the matched runs in <w:del> (w:t -> w:delText)\r\n  // and add a <w:ins> with the replacement, both stamped author/date/id. Final\r\n  // element order: [prefix][w:del old][w:ins new][suffix]. replace=\"\" = pure\r\n  // tracked deletion.\r\n  private static void applyTrackedReplace(XWPFParagraph p, String find, String replace, String author, String date, IdAlloc ids) throws Fail {\r\n    String all = text(p);\r\n    int s = all.indexOf(find);\r\n    if (s < 0) throw new Fail(EX_VERIFY, \"verify-failed\", \"find vanished before tracked apply\", null);\r\n    if (all.indexOf(find, s + 1) >= 0) throw new Fail(EX_VERIFY, \"verify-failed\", \"find became ambiguous before tracked apply\", null);\r\n    int e = s + find.length();\r\n    ensureBoundaryAt(p, e);\r\n    ensureBoundaryAt(p, s);\r\n    List<XWPFRun> old = runsInSpan(p, s, e);\r\n    if (old.isEmpty()) return;\r\n    java.util.Calendar c0 = cal(date);\r\n    String who = (author == null || author.isEmpty()) ? \"code_boss\" : author;\r\n\r\n    // <w:del> inserted before the first matched run, holding the old runs as delText\r\n    XmlCursor dc = old.get(0).getCTR().newCursor();\r\n    dc.beginElement(new QName(WNS, \"del\", \"w\"));\r\n    dc.toParent();\r\n    CTRunTrackChange del = (CTRunTrackChange) dc.getObject();\r\n    dc.dispose();\r\n    del.setAuthor(who); del.setId(ids.next()); del.setDate(c0);\r\n    for (XWPFRun r : old) {\r\n      CTR nr = del.addNewR();\r\n      var rpr = r.getCTR().getRPr();\r\n      if (rpr != null) nr.addNewRPr().set(rpr);\r\n      CTText dt = nr.addNewDelText();\r\n      String tx = r.getText(0);\r\n      dt.setStringValue(tx == null ? \"\" : tx);\r\n      preserveSpace(dt);\r\n    }\r\n    // <w:ins> with the replacement (skipped for a pure deletion)\r\n    if (replace != null && !replace.isEmpty()) {\r\n      XmlCursor ic = old.get(0).getCTR().newCursor();\r\n      ic.beginElement(new QName(WNS, \"ins\", \"w\"));\r\n      ic.toParent();\r\n      CTRunTrackChange ins = (CTRunTrackChange) ic.getObject();\r\n      ic.dispose();\r\n      ins.setAuthor(who); ins.setId(ids.next()); ins.setDate(c0);\r\n      CTR nr = ins.addNewR();\r\n      var rpr0 = old.get(0).getCTR().getRPr();\r\n      if (rpr0 != null) nr.addNewRPr().set(rpr0);\r\n      CTText t = nr.addNewT();\r\n      t.setStringValue(replace);\r\n      preserveSpace(t);\r\n    }\r\n    // remove the original (now-duplicated) matched runs\r\n    for (XWPFRun r : old) { XmlCursor rc = r.getCTR().newCursor(); rc.removeXml(); rc.dispose(); }\r\n  }\r\n\r\n  private static List<XWPFRun> runsInSpan(XWPFParagraph p, int s, int e) {\r\n    List<XWPFRun> out = new ArrayList<>();\r\n    int pos = 0;\r\n    for (XWPFRun r : p.getRuns()) {\r\n      String t = r.getText(0);\r\n      if (t == null) t = \"\";\r\n      int a = pos, b = pos + t.length();\r\n      if (t.length() > 0 && a >= s && b <= e) out.add(r);\r\n      pos = b;\r\n    }\r\n    return out;\r\n  }\r\n\r\n  /** Does the match span [s,e) cross a run-formatting boundary? */\r\n  private static StraddleInfo straddle(XWPFParagraph para, int s, int e) {\r\n    List<XWPFRun> runs = para.getRuns();\r\n    int n = runs.size();\r\n    int[] starts = new int[n];\r\n    String[] texts = new String[n];\r\n    int p = 0;\r\n    for (int i = 0; i < n; i++) {\r\n      String t = runs.get(i).getText(0);\r\n      if (t == null) t = \"\";\r\n      texts[i] = t;\r\n      starts[i] = p;\r\n      p += t.length();\r\n    }\r\n    String firstSig = null;\r\n    int runsTouched = 0;\r\n    int changeOffset = -1;\r\n    boolean straddles = false;\r\n    for (int i = 0; i < n; i++) {\r\n      int a = starts[i], b = a + texts[i].length();\r\n      if (texts[i].length() > 0 && a < e && b > s) {\r\n        runsTouched++;\r\n        String sig = fmtSig(runs.get(i));\r\n        if (firstSig == null) {\r\n          firstSig = sig;\r\n        } else if (!firstSig.equals(sig)) {\r\n          straddles = true;\r\n          if (changeOffset < 0) changeOffset = Math.max(a, s);\r\n        }\r\n      }\r\n    }\r\n    StraddleInfo info = new StraddleInfo();\r\n    info.straddles = straddles;\r\n    info.runsTouched = runsTouched;\r\n    info.changeOffset = changeOffset < 0 ? s : changeOffset;\r\n    return info;\r\n  }\r\n\r\n  private static String fmtSig(XWPFRun r) {\r\n    StringBuilder b = new StringBuilder();\r\n    b.append(r.isBold() ? '1' : '0');\r\n    b.append(r.isItalic() ? '1' : '0');\r\n    try { b.append(r.isStrikeThrough() ? '1' : '0'); } catch (Throwable t) { b.append('0'); }\r\n    b.append('|').append(String.valueOf(r.getUnderline()));\r\n    b.append('|').append(nz(r.getFontFamily()));\r\n    Object sz;\r\n    try { sz = r.getFontSizeAsDouble(); } catch (Throwable t) { sz = null; }\r\n    b.append('|').append(String.valueOf(sz));\r\n    b.append('|').append(nz(r.getColor()));\r\n    return b.toString();\r\n  }\r\n\r\n  // ----------------------------------------------------------- enumerate ----\r\n  private static List<ParaRef> enumerate(XWPFDocument doc) {\r\n    List<ParaRef> out = new ArrayList<>();\r\n    int[] id = {0};\r\n    walkBody(doc, \"body\", out, id);\r\n    int hi = 0;\r\n    for (XWPFHeader h : doc.getHeaderList()) walkBody(h, \"header[\" + (hi++) + \"]\", out, id);\r\n    int fi = 0;\r\n    for (XWPFFooter f : doc.getFooterList()) walkBody(f, \"footer[\" + (fi++) + \"]\", out, id);\r\n    return out;\r\n  }\r\n\r\n  private static void walkBody(IBody body, String loc, List<ParaRef> out, int[] id) {\r\n    for (IBodyElement el : body.getBodyElements()) {\r\n      if (el instanceof XWPFParagraph) {\r\n        out.add(makeRef(id[0]++, scopeOf(loc), loc, (XWPFParagraph) el));\r\n      } else if (el instanceof XWPFTable) {\r\n        XWPFTable tbl = (XWPFTable) el;\r\n        int ri = 0;\r\n        for (XWPFTableRow row : tbl.getRows()) {\r\n          int ci = 0;\r\n          for (XWPFTableCell cell : row.getTableCells()) {\r\n            walkBody(cell, loc + \"/table/r\" + ri + \"/c\" + ci, out, id);\r\n            ci++;\r\n          }\r\n          ri++;\r\n        }\r\n      } else if (el instanceof XWPFSDT) {\r\n        // Content control (structured document tag). Its text was previously\r\n        // INVISIBLE (getBodyElements doesn't descend into it). Surface it as a\r\n        // read-only node so the AI sees the content; editing SDT values is a\r\n        // later phase.\r\n        ParaRef r = new ParaRef();\r\n        r.id = id[0]++;\r\n        r.scope = \"sdt\";\r\n        r.location = loc + \"/sdt\";\r\n        r.isSdt = true;\r\n        r.readOnly = true;\r\n        try { r.sdtText = ((XWPFSDT) el).getContent().getText(); } catch (Throwable t) { r.sdtText = \"\"; }\r\n        out.add(r);\r\n      }\r\n    }\r\n  }\r\n\r\n  private static String scopeOf(String loc) {\r\n    if (loc.startsWith(\"header\")) return \"header\";\r\n    if (loc.startsWith(\"footer\")) return \"footer\";\r\n    if (loc.contains(\"/table/\")) return \"cell\";\r\n    return \"body\";\r\n  }\r\n\r\n  private static ParaRef makeRef(int id, String scope, String loc, XWPFParagraph para) {\r\n    ParaRef r = new ParaRef();\r\n    r.id = id;\r\n    r.scope = scope;\r\n    r.location = loc;\r\n    r.para = para;\r\n    r.styleId = para.getStyleID();\r\n    BigInteger ilvl = para.getNumIlvl();\r\n    r.listLevel = (ilvl == null) ? null : Long.valueOf(ilvl.longValue());\r\n    r.hasField = hasField(para);\r\n    r.hasRevisions = hasRevisions(para);\r\n    r.hasEquation = hasEquation(para);\r\n    r.deletedText = deletedText(para);\r\n    // Protect TOC/field AND revision-bearing paragraphs from editing for now —\r\n    // editing within tracked changes is handled by the dedicated track-changes\r\n    // phase, not the plain find/replace path (which is blind to del/ins runs).\r\n    r.readOnly = r.hasField || isTocStyle(r.styleId) || r.hasRevisions;\r\n    return r;\r\n  }\r\n\r\n  // A paragraph carries tracked changes if it has ins/del/move runs or a\r\n  // property-change (rPrChange/pPrChange). Detected on the raw CT model so it\r\n  // is robust regardless of how POI's getRuns() treats revision wrappers.\r\n  private static boolean hasRevisions(XWPFParagraph p) {\r\n    try {\r\n      var ctp = p.getCTP();\r\n      if (ctp.sizeOfInsArray() > 0 || ctp.sizeOfDelArray() > 0\r\n          || ctp.sizeOfMoveFromArray() > 0 || ctp.sizeOfMoveToArray() > 0) return true;\r\n      if (ctp.getPPr() != null && ctp.getPPr().isSetPPrChange()) return true;\r\n    } catch (Throwable ignore) {}\r\n    for (XWPFRun run : p.getRuns()) {\r\n      try {\r\n        var rpr = run.getCTR().getRPr();\r\n        if (rpr != null && rpr.isSetRPrChange()) return true;\r\n      } catch (Throwable ignore) {}\r\n    }\r\n    return false;\r\n  }\r\n\r\n  // Recover the text of tracked deletions (w:delText), which plain text() drops\r\n  // entirely — so a doc already under review reads honestly.\r\n  private static String deletedText(XWPFParagraph p) {\r\n    StringBuilder b = new StringBuilder();\r\n    try {\r\n      for (var del : p.getCTP().getDelList()) {\r\n        for (var r : del.getRList()) {\r\n          for (var t : r.getDelTextList()) {\r\n            String v = t.getStringValue();\r\n            if (v != null) b.append(v);\r\n          }\r\n        }\r\n      }\r\n    } catch (Throwable ignore) {}\r\n    return b.toString();\r\n  }\r\n\r\n  // OMML equations carry no w:t, so a math-only paragraph reads as empty. Flag\r\n  // it so the AI doesn't treat the paragraph as missing content.\r\n  private static boolean hasEquation(XWPFParagraph p) {\r\n    try { return p.getCTP().xmlText().contains(\"oMath\"); } catch (Throwable t) { return false; }\r\n  }\r\n\r\n  // Editing-blocking document protection (read-only / comments-only /\r\n  // filling-forms / tracked-changes-enforced). Returns a comma list or null.\r\n  private static String documentProtection(XWPFDocument doc) {\r\n    java.util.List<String> on = new java.util.ArrayList<>();\r\n    try { if (doc.isEnforcedReadonlyProtection()) on.add(\"readOnly\"); } catch (Throwable ignore) {}\r\n    try { if (doc.isEnforcedCommentsProtection()) on.add(\"comments\"); } catch (Throwable ignore) {}\r\n    try { if (doc.isEnforcedFillingFormsProtection()) on.add(\"fillingForms\"); } catch (Throwable ignore) {}\r\n    try { if (doc.isEnforcedTrackedChangesProtection()) on.add(\"trackedChanges\"); } catch (Throwable ignore) {}\r\n    return on.isEmpty() ? null : String.join(\",\", on);\r\n  }\r\n\r\n  // Text of a ParaRef: a real paragraph's run text, or a content-control's text.\r\n  private static String refText(ParaRef r) {\r\n    if (r.para != null) return text(r.para);\r\n    return r.sdtText == null ? \"\" : r.sdtText;\r\n  }\r\n\r\n  // -------------------------------------------------------------- detail ----\r\n  // Layer-1 \"Word open\" detail for specific paragraphs: per-run AUTHORED rPr\r\n  // deltas + EFFECTIVE formatting (resolved through the style cascade, which\r\n  // POI does not do), paragraph properties, and char-offset ranges so any\r\n  // sub-span is addressable.\r\n  static Map<String, Object> doDetail(Map<String, Object> spec) throws Exception {\r\n    Path path = docxPath(spec);\r\n    XWPFDocument doc = open(path);\r\n    try {\r\n      List<ParaRef> refs = enumerate(doc);\r\n      Map<Integer, ParaRef> byId = new LinkedHashMap<>();\r\n      for (ParaRef r : refs) byId.put(r.id, r);\r\n      XWPFStyles xs = doc.getStyles();\r\n      Map<String, Rpr> cache = new LinkedHashMap<>();\r\n\r\n      List<Integer> ids = new ArrayList<>();\r\n      Object a = spec.get(\"anchors\");\r\n      if (a instanceof List) for (Object o : (List<?>) a) ids.add(Json.intval(o, Integer.MIN_VALUE));\r\n      if (ids.isEmpty()) for (ParaRef r : refs) ids.add(r.id);   // default: whole doc (caller should scope)\r\n\r\n      List<Object> out = new ArrayList<>();\r\n      for (int id : ids) {\r\n        ParaRef r = byId.get(id);\r\n        if (r == null) continue;\r\n        Map<String, Object> m = new LinkedHashMap<>();\r\n        m.put(\"id\", (long) id);\r\n        m.put(\"scope\", r.scope);\r\n        m.put(\"location\", r.location);\r\n        m.put(\"readOnly\", r.readOnly);\r\n        if (r.para == null) {                 // content control / non-paragraph node\r\n          m.put(\"contentControl\", Boolean.TRUE);\r\n          m.put(\"text\", refText(r));\r\n          out.add(m);\r\n          continue;\r\n        }\r\n        XWPFParagraph p = r.para;\r\n        m.put(\"style\", r.styleId);\r\n        m.put(\"styleName\", styleName(xs, r.styleId));\r\n        Integer ol = outlineLevelOf(p, xs);\r\n        if (ol != null) m.put(\"outlineLevel\", (long) (int) ol);\r\n        m.put(\"alignment\", String.valueOf(p.getAlignment()));\r\n        var numId = p.getNumID();\r\n        if (numId != null) {\r\n          Map<String, Object> num = new LinkedHashMap<>();\r\n          num.put(\"numId\", numId.toString());\r\n          var il = p.getNumIlvl();\r\n          num.put(\"ilvl\", il == null ? null : Long.valueOf(il.longValue()));\r\n          m.put(\"numbering\", num);\r\n        }\r\n        Map<String, Object> pPr = new LinkedHashMap<>();\r\n        try { int v = p.getIndentationLeft(); if (v != -1) pPr.put(\"indentLeftTwips\", (long) v); } catch (Throwable t) {}\r\n        try { int v = p.getSpacingBefore(); if (v != -1) pPr.put(\"spacingBeforeTwips\", (long) v); } catch (Throwable t) {}\r\n        try { int v = p.getSpacingAfter(); if (v != -1) pPr.put(\"spacingAfterTwips\", (long) v); } catch (Throwable t) {}\r\n        if (!pPr.isEmpty()) m.put(\"pPr\", pPr);\r\n\r\n        List<Object> runs = new ArrayList<>();\r\n        List<XWPFRun> rs = p.getRuns();\r\n        int pos = 0;\r\n        for (int i = 0; i < rs.size(); i++) {\r\n          XWPFRun run = rs.get(i);\r\n          String t = run.getText(0);\r\n          if (t == null) t = \"\";\r\n          Map<String, Object> rm = new LinkedHashMap<>();\r\n          rm.put(\"r\", (long) i);\r\n          rm.put(\"start\", (long) pos);\r\n          rm.put(\"end\", (long) (pos + t.length()));\r\n          rm.put(\"text\", t);\r\n          Map<String, Object> authored = authoredDelta(run);\r\n          if (!authored.isEmpty()) rm.put(\"authored\", authored);\r\n          rm.put(\"effective\", effectiveMap(effectiveRpr(run, r.styleId, xs, cache)));\r\n          runs.add(rm);\r\n          pos += t.length();\r\n        }\r\n        m.put(\"runs\", runs);\r\n        out.add(m);\r\n      }\r\n      Map<String, Object> res = new LinkedHashMap<>();\r\n      res.put(\"ok\", Boolean.TRUE);\r\n      res.put(\"docx\", path.toString());\r\n      res.put(\"paragraphs\", out);\r\n      return res;\r\n    } finally {\r\n      doc.close();\r\n    }\r\n  }\r\n\r\n  // Resolved character-formatting properties (null = inherit/unset).\r\n  private static final class Rpr {\r\n    Boolean bold, italic;\r\n    String underline, font, color;\r\n    Double sizePt;\r\n    Rpr copy() { Rpr r = new Rpr(); r.bold = bold; r.italic = italic; r.underline = underline; r.font = font; r.color = color; r.sizePt = sizePt; return r; }\r\n    void applyFrom(Rpr o) {\r\n      if (o.bold != null) bold = o.bold;\r\n      if (o.italic != null) italic = o.italic;\r\n      if (o.underline != null) underline = o.underline;\r\n      if (o.font != null) font = o.font;\r\n      if (o.color != null) color = o.color;\r\n      if (o.sizePt != null) sizePt = o.sizePt;\r\n    }\r\n  }\r\n\r\n  // --- rPr reading via serialized XML. The deployed poi-ooxml-LITE schema jar\r\n  // trims the singular CTRPr getters (getB/isSetB/...), so we parse the run's\r\n  // or style's xmlText() instead of the typed CT API. Robust on lite AND full. ---\r\n  private static final java.util.regex.Pattern RPR_BLOCK =\r\n      java.util.regex.Pattern.compile(\"<(?:[A-Za-z0-9]+:)?rPr\\\\b[^>]*>(.*?)</(?:[A-Za-z0-9]+:)?rPr>\", java.util.regex.Pattern.DOTALL);\r\n  private static final java.util.regex.Pattern PPR_BLOCK =\r\n      java.util.regex.Pattern.compile(\"<(?:[A-Za-z0-9]+:)?pPr\\\\b[^>]*>.*?</(?:[A-Za-z0-9]+:)?pPr>\", java.util.regex.Pattern.DOTALL);\r\n\r\n  private static final java.util.regex.Pattern RPRCHANGE_BLOCK =\r\n      java.util.regex.Pattern.compile(\"<(?:[A-Za-z0-9]+:)?rPrChange\\\\b.*?</(?:[A-Za-z0-9]+:)?rPrChange>\", java.util.regex.Pattern.DOTALL);\r\n\r\n  private static String rprInnerOf(String containerXml) {\r\n    if (containerXml == null) return \"\";\r\n    // Strip any tracked-format-change block first, so its nested <w:rPr> (the\r\n    // PREVIOUS formatting) isn't mistaken for the run's current rPr.\r\n    String x = RPRCHANGE_BLOCK.matcher(containerXml).replaceAll(\"\");\r\n    var m = RPR_BLOCK.matcher(x);\r\n    return m.find() ? m.group(1) : \"\";\r\n  }\r\n  private static java.util.regex.Matcher tagOf(String xml, String local) {\r\n    return java.util.regex.Pattern.compile(\"<(?:[A-Za-z0-9]+:)?\" + local + \"(?=[ />])([^>]*)>\").matcher(xml);\r\n  }\r\n  private static String attrVal(String attrs, String attr) {\r\n    if (attrs == null) return null;\r\n    var m = java.util.regex.Pattern.compile(\"(?:[A-Za-z0-9]+:)?\" + attr + \"\\\\s*=\\\\s*\\\"([^\\\"]*)\\\"\").matcher(attrs);\r\n    return m.find() ? m.group(1) : null;\r\n  }\r\n  private static Boolean boolTag(String xml, String local) {\r\n    var m = tagOf(xml, local);\r\n    if (!m.find()) return null;\r\n    String v = attrVal(m.group(1), \"val\");\r\n    if (v == null) return Boolean.TRUE;          // presence with no val = on\r\n    String s = v.toLowerCase();\r\n    return !(s.equals(\"false\") || s.equals(\"0\") || s.equals(\"off\"));\r\n  }\r\n  private static String valTag(String xml, String local) {\r\n    var m = tagOf(xml, local);\r\n    return m.find() ? attrVal(m.group(1), \"val\") : null;\r\n  }\r\n  private static String attrTag(String xml, String local, String attr) {\r\n    var m = tagOf(xml, local);\r\n    return m.find() ? attrVal(m.group(1), attr) : null;\r\n  }\r\n  private static void applyRprXml(Rpr r, String rprInner) {\r\n    if (rprInner == null || rprInner.isEmpty()) return;\r\n    Boolean b = boolTag(rprInner, \"b\"); if (b != null) r.bold = b;\r\n    Boolean i = boolTag(rprInner, \"i\"); if (i != null) r.italic = i;\r\n    String u = valTag(rprInner, \"u\"); if (u != null) r.underline = u;\r\n    String f = attrTag(rprInner, \"rFonts\", \"ascii\"); if (f != null) r.font = f;\r\n    String sz = valTag(rprInner, \"sz\"); if (sz != null) { try { r.sizePt = Double.parseDouble(sz) / 2.0; } catch (Exception e) {} }\r\n    String c = valTag(rprInner, \"color\"); if (c != null) r.color = c;\r\n  }\r\n\r\n  // Resolve a style's effective rPr by walking its basedOn chain (cached;\r\n  // cycle-guarded). docDefaults are NOT resolved (acceptable approximation).\r\n  private static Rpr resolveStyleRpr(String styleId, XWPFStyles xs, Map<String, Rpr> cache) {\r\n    if (styleId == null || xs == null) return new Rpr();\r\n    Rpr cached = cache.get(styleId);\r\n    if (cached != null) return cached;\r\n    Rpr base = new Rpr();\r\n    cache.put(styleId, base);   // temp, breaks cycles\r\n    try {\r\n      XWPFStyle st = xs.getStyle(styleId);\r\n      if (st != null) {\r\n        String sx = st.getCTStyle().xmlText();\r\n        String basedOn = attrTag(sx, \"basedOn\", \"val\");\r\n        Rpr b = resolveStyleRpr(basedOn, xs, cache).copy();\r\n        // Strip the pPr block so its paragraph-mark rPr isn't mistaken for the\r\n        // style's character rPr (the style's own rPr is a sibling of pPr).\r\n        String sxNoP = PPR_BLOCK.matcher(sx).replaceAll(\"\");\r\n        applyRprXml(b, rprInnerOf(sxNoP));\r\n        base = b;\r\n      }\r\n    } catch (Throwable ignore) {}\r\n    cache.put(styleId, base);\r\n    return base;\r\n  }\r\n\r\n  private static Rpr effectiveRpr(XWPFRun run, String paraStyleId, XWPFStyles xs, Map<String, Rpr> cache) {\r\n    Rpr eff = resolveStyleRpr(paraStyleId, xs, cache).copy();\r\n    try {\r\n      String rprInner = rprInnerOf(run.getCTR().xmlText());\r\n      String rStyle = attrTag(rprInner, \"rStyle\", \"val\");\r\n      if (rStyle != null) eff.applyFrom(resolveStyleRpr(rStyle, xs, cache));\r\n      applyRprXml(eff, rprInner);\r\n    } catch (Throwable ignore) {}\r\n    return eff;\r\n  }\r\n\r\n  private static Map<String, Object> effectiveMap(Rpr e) {\r\n    Map<String, Object> m = new LinkedHashMap<>();\r\n    m.put(\"bold\", e.bold != null && e.bold);\r\n    m.put(\"italic\", e.italic != null && e.italic);\r\n    m.put(\"underline\", e.underline == null ? \"none\" : e.underline);\r\n    if (e.font != null) m.put(\"font\", e.font);\r\n    if (e.sizePt != null) m.put(\"sizePt\", e.sizePt);\r\n    if (e.color != null) m.put(\"color\", e.color);\r\n    return m;\r\n  }\r\n\r\n  // Only the properties actually SET on the run's own rPr (the authored delta),\r\n  // read from the run's serialized XML (lite-jar-safe).\r\n  private static Map<String, Object> authoredDelta(XWPFRun run) {\r\n    Map<String, Object> m = new LinkedHashMap<>();\r\n    try {\r\n      String x = rprInnerOf(run.getCTR().xmlText());\r\n      if (x.isEmpty()) return m;\r\n      Boolean b = boolTag(x, \"b\"); if (b != null) m.put(\"bold\", b);\r\n      Boolean i = boolTag(x, \"i\"); if (i != null) m.put(\"italic\", i);\r\n      String u = valTag(x, \"u\"); if (u != null) m.put(\"underline\", u);\r\n      Boolean st = boolTag(x, \"strike\"); if (st != null) m.put(\"strike\", st);\r\n      String f = attrTag(x, \"rFonts\", \"ascii\"); if (f != null) m.put(\"font\", f);\r\n      String sz = valTag(x, \"sz\"); if (sz != null) { try { m.put(\"sizePt\", Double.parseDouble(sz) / 2.0); } catch (Exception e) {} }\r\n      String c = valTag(x, \"color\"); if (c != null) m.put(\"color\", c);\r\n      String hl = valTag(x, \"highlight\"); if (hl != null) m.put(\"highlight\", hl);\r\n      String va = valTag(x, \"vertAlign\"); if (va != null) m.put(\"vertAlign\", va);\r\n      Boolean caps = boolTag(x, \"caps\"); if (caps != null) m.put(\"caps\", caps);\r\n      Boolean vanish = boolTag(x, \"vanish\"); if (vanish != null) m.put(\"hidden\", vanish);\r\n      String cs = attrTag(x, \"rStyle\", \"val\"); if (cs != null) m.put(\"charStyle\", cs);\r\n    } catch (Throwable ignore) {}\r\n    return m;\r\n  }\r\n\r\n  private static String styleName(XWPFStyles xs, String id) {\r\n    if (xs == null || id == null) return null;\r\n    try { var st = xs.getStyle(id); if (st != null && st.getCTStyle().isSetName()) return st.getCTStyle().getName().getVal(); } catch (Throwable t) {}\r\n    return null;\r\n  }\r\n\r\n  // Heading/outline level 1-9 from pPr outlineLvl or the style name/id \"heading N\".\r\n  private static Integer outlineLevelOf(XWPFParagraph p, XWPFStyles xs) {\r\n    try {\r\n      var pPr = p.getCTP().getPPr();\r\n      if (pPr != null && pPr.isSetOutlineLvl()) {\r\n        int lv = new java.math.BigDecimal(String.valueOf(pPr.getOutlineLvl().getVal())).intValue();\r\n        return lv + 1;\r\n      }\r\n    } catch (Throwable ignore) {}\r\n    String id = p.getStyleID();\r\n    String nm = styleName(xs, id);\r\n    String probe = (nm != null ? nm : (id != null ? id : \"\")).toLowerCase().replace(\" \", \"\");\r\n    var mm = java.util.regex.Pattern.compile(\"heading(\\\\d)\").matcher(probe);\r\n    if (mm.find()) { try { return Integer.parseInt(mm.group(1)); } catch (Exception e) {} }\r\n    return null;\r\n  }\r\n\r\n  // Compact presence flags for the Layer-0 outline.\r\n  private static String flagsOf(XWPFParagraph p) {\r\n    StringBuilder b = new StringBuilder();\r\n    try { for (XWPFRun r : p.getRuns()) { if (!r.getEmbeddedPictures().isEmpty()) { b.append('I'); break; } } } catch (Throwable t) {}\r\n    try { if (p.getCTP().sizeOfHyperlinkArray() > 0) b.append('H'); } catch (Throwable t) {}\r\n    try { if (p.getCTP().sizeOfBookmarkStartArray() > 0) b.append('B'); } catch (Throwable t) {}\r\n    return b.toString();\r\n  }\r\n\r\n  private static boolean hasField(XWPFParagraph para) {\r\n    try {\r\n      if (para.getCTP().sizeOfFldSimpleArray() > 0) return true;\r\n    } catch (Throwable ignore) {}\r\n    for (XWPFRun run : para.getRuns()) {\r\n      try {\r\n        if (run.getCTR().sizeOfFldCharArray() > 0) return true;\r\n        if (run.getCTR().sizeOfInstrTextArray() > 0) return true;\r\n      } catch (Throwable ignore) {}\r\n    }\r\n    return false;\r\n  }\r\n\r\n  private static boolean isTocStyle(String styleId) {\r\n    if (styleId == null) return false;\r\n    String s = styleId.toLowerCase();\r\n    return s.startsWith(\"toc\") || s.contains(\"tableoffigures\") || s.contains(\"tableofcontents\") || s.contains(\"tableoftables\");\r\n  }\r\n\r\n  // -------------------------------------------------------------- verify ----\r\n  private static void verify(Path tmp, Map<Integer, String> before, Map<Integer, String> expectedById,\r\n      List<Map<String, Object>> postChecks) throws Exception {\r\n    XWPFDocument re = open(tmp);\r\n    try {\r\n      List<ParaRef> refs = enumerate(re);\r\n      if (refs.size() != before.size()) {\r\n        throw new Fail(EX_VERIFY, \"verify-failed\", \"paragraph count changed after write (\" + before.size() + \" -> \" + refs.size() + \")\", null);\r\n      }\r\n      Map<Integer, ParaRef> byId = new LinkedHashMap<>();\r\n      for (ParaRef r : refs) byId.put(r.id, r);\r\n      // TEXT post-conditions: edited paragraphs match expected; others unchanged.\r\n      for (ParaRef r : refs) {\r\n        String actual = refText(r);\r\n        String expect = expectedById.containsKey(r.id) ? expectedById.get(r.id) : before.get(r.id);\r\n        if (expect == null) continue;\r\n        if (!expect.equals(actual)) {\r\n          throw new Fail(EX_VERIFY, \"verify-failed\",\r\n              \"post-write mismatch in paragraph \" + r.id + (expectedById.containsKey(r.id) ? \" (target)\" : \" (untouched)\"), null);\r\n        }\r\n      }\r\n      // STRUCTURAL post-conditions (formatting / paragraph props actually landed).\r\n      XWPFStyles xs = re.getStyles();\r\n      for (Map<String, Object> pc : postChecks) verifyPost(pc, byId, xs);\r\n    } finally {\r\n      re.close();\r\n    }\r\n  }\r\n\r\n  private static void verifyPost(Map<String, Object> pc, Map<Integer, ParaRef> byId, XWPFStyles xs) throws Fail {\r\n    int id = Json.intval(pc.get(\"id\"), -1);\r\n    ParaRef r = byId.get(id);\r\n    if (r == null || r.para == null) throw new Fail(EX_VERIFY, \"verify-failed\", \"post: paragraph \" + id + \" missing after write\", null);\r\n    String type = String.valueOf(pc.get(\"type\"));\r\n    if (\"setParaStyle\".equals(type)) {\r\n      String want = String.valueOf(pc.get(\"style\"));\r\n      if (!want.equals(r.para.getStyleID())) throw new Fail(EX_VERIFY, \"verify-failed\", \"post: paragraph \" + id + \" style not applied (got \" + r.para.getStyleID() + \")\", null);\r\n    } else if (\"setListMembership\".equals(type)) {\r\n      String want = String.valueOf(pc.get(\"numId\"));\r\n      var nid = r.para.getNumID();\r\n      if (nid == null || !want.equals(nid.toString())) throw new Fail(EX_VERIFY, \"verify-failed\", \"post: paragraph \" + id + \" numId not applied\", null);\r\n    } else if (\"setParaProps\".equals(type)) {\r\n      Map<String, Object> op = Json.obj(pc.get(\"op\"));\r\n      if (op.containsKey(\"alignment\")) {\r\n        String want = String.valueOf(op.get(\"alignment\")).trim().toUpperCase();\r\n        if (!want.equals(String.valueOf(r.para.getAlignment()))) throw new Fail(EX_VERIFY, \"verify-failed\", \"post: paragraph \" + id + \" alignment not applied (got \" + r.para.getAlignment() + \")\", null);\r\n      }\r\n      // indent/spacing: best-effort (POI normalizes units), not strictly checked\r\n    } else if (\"setRunFormat\".equals(type)) {\r\n      String find = String.valueOf(pc.get(\"find\"));\r\n      Map<String, Object> fmt = Json.obj(pc.get(\"format\"));\r\n      String all = text(r.para);\r\n      int s = all.indexOf(find);\r\n      if (s < 0) throw new Fail(EX_VERIFY, \"verify-failed\", \"post: format target text vanished in paragraph \" + id, null);\r\n      XWPFRun run = runAtOffset(r.para, s);\r\n      if (run == null) throw new Fail(EX_VERIFY, \"verify-failed\", \"post: no run at format target in paragraph \" + id, null);\r\n      Map<String, Object> auth = authoredDelta(run);\r\n      for (var en : fmt.entrySet()) {\r\n        String k = en.getKey();\r\n        if (k.equals(\"bold\") || k.equals(\"italic\") || k.equals(\"strike\")) {\r\n          if (truthy(en.getValue())) {\r\n            Object got = auth.get(k);\r\n            if (!(got instanceof Boolean && (Boolean) got)) throw new Fail(EX_VERIFY, \"verify-failed\", \"post: \" + k + \" not applied to paragraph \" + id, null);\r\n          }\r\n        } else if (k.equals(\"color\")) {\r\n          String want = String.valueOf(en.getValue()).replace(\"#\", \"\");\r\n          if (!want.equalsIgnoreCase(String.valueOf(auth.get(\"color\")))) throw new Fail(EX_VERIFY, \"verify-failed\", \"post: color not applied to paragraph \" + id, null);\r\n        } else if (k.equals(\"font\")) {\r\n          if (!String.valueOf(en.getValue()).equals(auth.get(\"font\"))) throw new Fail(EX_VERIFY, \"verify-failed\", \"post: font not applied to paragraph \" + id, null);\r\n        }\r\n        // underline / sizePt: best-effort, not strictly checked\r\n      }\r\n    }\r\n  }\r\n\r\n  private static XWPFRun runAtOffset(XWPFParagraph p, int off) {\r\n    int pos = 0;\r\n    for (XWPFRun run : p.getRuns()) {\r\n      String t = run.getText(0);\r\n      if (t == null) t = \"\";\r\n      int a = pos, b = pos + t.length();\r\n      if (off >= a && off < b) return run;\r\n      pos = b;\r\n    }\r\n    List<XWPFRun> rs = p.getRuns();\r\n    return rs.isEmpty() ? null : rs.get(rs.size() - 1);\r\n  }\r\n\r\n  // ----------------------------------------------------------- utilities ----\r\n  private static Path docxPath(Map<String, Object> spec) throws Fail {\r\n    String p = Json.str(spec.get(\"docx\"));\r\n    if (p == null || p.isEmpty()) throw new Fail(EX_BAD_REQUEST, \"bad-request\", \"docx path is required\", null);\r\n    Path path = Paths.get(p);\r\n    if (!Files.isRegularFile(path)) throw new Fail(EX_FILE, \"file-error\", \"not a file: \" + p, null);\r\n    String lower = p.toLowerCase();\r\n    if (lower.endsWith(\".doc\")) throw new Fail(EX_FILE, \"file-error\", \"legacy .doc (binary) is not supported; convert to .docx first\", null);\r\n    return path;\r\n  }\r\n\r\n  private static XWPFDocument open(Path path) throws Fail {\r\n    try {\r\n      byte[] bytes = Files.readAllBytes(path);\r\n      try (InputStream is = new ByteArrayInputStream(bytes)) {\r\n        return new XWPFDocument(is);\r\n      }\r\n    } catch (Throwable t) {\r\n      throw new Fail(EX_FILE, \"file-error\", \"cannot open as .docx: \" + t.getMessage(), null);\r\n    }\r\n  }\r\n\r\n  private static String text(XWPFParagraph para) {\r\n    StringBuilder b = new StringBuilder();\r\n    for (XWPFRun run : para.getRuns()) {\r\n      String t = run.getText(0);\r\n      if (t != null) b.append(t);\r\n    }\r\n    return b.toString();\r\n  }\r\n\r\n  private static String snippet(String s, int off) {\r\n    int a = Math.max(0, off - 8), b = Math.min(s.length(), off + 8);\r\n    return s.substring(a, b).replace(\"\\n\", \" \");\r\n  }\r\n\r\n  private static String nz(String s) { return s == null ? \"\" : s; }\r\n\r\n  private static String readAll(InputStream in) throws Exception {\r\n    java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();\r\n    byte[] buf = new byte[8192];\r\n    int r;\r\n    while ((r = in.read(buf)) != -1) bos.write(buf, 0, r);\r\n    return new String(bos.toByteArray(), StandardCharsets.UTF_8);\r\n  }\r\n\r\n  private static void emitError(Fail f) {\r\n    Map<String, Object> m = new LinkedHashMap<>();\r\n    m.put(\"ok\", Boolean.FALSE);\r\n    m.put(\"error\", f.getMessage());\r\n    m.put(\"code\", f.code);\r\n    m.put(\"opIndex\", f.opIndex);\r\n    String json = Json.write(m);\r\n    if (out != null) out.println(json);\r\n    System.err.println(json);\r\n  }\r\n\r\n  // ------------------------------------------------------------- structs ----\r\n  private static final class ParaRef {\r\n    int id;\r\n    String scope;\r\n    String location;\r\n    String styleId;\r\n    Long listLevel;\r\n    boolean readOnly;\r\n    boolean hasField;\r\n    boolean hasRevisions;   // contains tracked changes (ins/del/move/*Change)\r\n    boolean hasEquation;    // contains OMML (m:oMath) — invisible to plain text()\r\n    boolean isSdt;          // a content-control (structured document tag) node\r\n    String deletedText;     // recovered w:delText (tracked deletions), may be \"\"\r\n    String sdtText;         // text inside a content control (for isSdt nodes)\r\n    XWPFParagraph para;     // null for isSdt nodes\r\n  }\r\n\r\n  private static final class StraddleInfo {\r\n    boolean straddles;\r\n    int runsTouched;\r\n    int changeOffset;\r\n  }\r\n\r\n  static final class Fail extends Exception {\r\n    final int exit;\r\n    final String code;\r\n    final Integer opIndex;\r\n    Fail(int exit, String code, String msg, Integer opIndex) {\r\n      super(msg);\r\n      this.exit = exit;\r\n      this.code = code;\r\n      this.opIndex = opIndex;\r\n    }\r\n  }\r\n}\r\n","com/codeboss/docx/Json.java":"package com.codeboss.docx;\r\n\r\nimport java.util.ArrayList;\r\nimport java.util.LinkedHashMap;\r\nimport java.util.List;\r\nimport java.util.Map;\r\n\r\n/**\r\n * Minimal, dependency-free JSON parser + writer. Keeps the helper's offline\r\n * dependency closure to just poi-ooxml. Handles objects, arrays, strings\r\n * (with \\\\uXXXX + standard escapes), numbers, booleans, and null. Output is\r\n * UTF-8-clean: only \", \\\\, and control chars (&lt;0x20) are escaped; non-ASCII\r\n * is emitted verbatim (the caller writes a UTF-8 stream).\r\n */\r\nfinal class Json {\r\n  private Json() {}\r\n\r\n  // ---- parse ----\r\n  static Object parse(String s) {\r\n    P p = new P(s);\r\n    p.ws();\r\n    Object v = p.value();\r\n    p.ws();\r\n    if (!p.end()) throw new RuntimeException(\"trailing characters at \" + p.i);\r\n    return v;\r\n  }\r\n\r\n  @SuppressWarnings(\"unchecked\")\r\n  static Map<String, Object> obj(Object o) {\r\n    if (o instanceof Map) return (Map<String, Object>) o;\r\n    throw new RuntimeException(\"expected object\");\r\n  }\r\n\r\n  @SuppressWarnings(\"unchecked\")\r\n  static List<Object> arr(Object o) {\r\n    if (o instanceof List) return (List<Object>) o;\r\n    throw new RuntimeException(\"expected array\");\r\n  }\r\n\r\n  static String str(Object o) { return o == null ? null : String.valueOf(o); }\r\n\r\n  static boolean bool(Object o, boolean dflt) {\r\n    return (o instanceof Boolean) ? (Boolean) o : dflt;\r\n  }\r\n\r\n  static int intval(Object o, int dflt) {\r\n    if (o instanceof Number) return ((Number) o).intValue();\r\n    if (o instanceof String) { try { return Integer.parseInt((String) o); } catch (Exception e) { return dflt; } }\r\n    return dflt;\r\n  }\r\n\r\n  private static final class P {\r\n    final String s; int i = 0;\r\n    P(String s) { this.s = s; }\r\n    boolean end() { return i >= s.length(); }\r\n    char cur() { return s.charAt(i); }\r\n    void ws() { while (i < s.length()) { char c = s.charAt(i); if (c == ' ' || c == '\\t' || c == '\\n' || c == '\\r') i++; else break; } }\r\n\r\n    Object value() {\r\n      ws();\r\n      if (end()) throw new RuntimeException(\"unexpected end\");\r\n      char c = cur();\r\n      switch (c) {\r\n        case '{': return object();\r\n        case '[': return array();\r\n        case '\"': return string();\r\n        case 't': case 'f': return bool();\r\n        case 'n': return nul();\r\n        default: return number();\r\n      }\r\n    }\r\n\r\n    Map<String, Object> object() {\r\n      Map<String, Object> m = new LinkedHashMap<>();\r\n      i++; // {\r\n      ws();\r\n      if (!end() && cur() == '}') { i++; return m; }\r\n      while (true) {\r\n        ws();\r\n        if (end() || cur() != '\"') throw new RuntimeException(\"expected key string at \" + i);\r\n        String k = string();\r\n        ws();\r\n        if (end() || cur() != ':') throw new RuntimeException(\"expected ':' at \" + i);\r\n        i++;\r\n        Object v = value();\r\n        m.put(k, v);\r\n        ws();\r\n        if (end()) throw new RuntimeException(\"unterminated object\");\r\n        char c = cur();\r\n        if (c == ',') { i++; continue; }\r\n        if (c == '}') { i++; break; }\r\n        throw new RuntimeException(\"expected ',' or '}' at \" + i);\r\n      }\r\n      return m;\r\n    }\r\n\r\n    List<Object> array() {\r\n      List<Object> a = new ArrayList<>();\r\n      i++; // [\r\n      ws();\r\n      if (!end() && cur() == ']') { i++; return a; }\r\n      while (true) {\r\n        Object v = value();\r\n        a.add(v);\r\n        ws();\r\n        if (end()) throw new RuntimeException(\"unterminated array\");\r\n        char c = cur();\r\n        if (c == ',') { i++; continue; }\r\n        if (c == ']') { i++; break; }\r\n        throw new RuntimeException(\"expected ',' or ']' at \" + i);\r\n      }\r\n      return a;\r\n    }\r\n\r\n    String string() {\r\n      StringBuilder b = new StringBuilder();\r\n      i++; // opening quote\r\n      while (true) {\r\n        if (end()) throw new RuntimeException(\"unterminated string\");\r\n        char c = s.charAt(i++);\r\n        if (c == '\"') break;\r\n        if (c == '\\\\') {\r\n          if (end()) throw new RuntimeException(\"unterminated escape\");\r\n          char e = s.charAt(i++);\r\n          switch (e) {\r\n            case '\"': b.append('\"'); break;\r\n            case '\\\\': b.append('\\\\'); break;\r\n            case '/': b.append('/'); break;\r\n            case 'b': b.append('\\b'); break;\r\n            case 'f': b.append('\\f'); break;\r\n            case 'n': b.append('\\n'); break;\r\n            case 'r': b.append('\\r'); break;\r\n            case 't': b.append('\\t'); break;\r\n            case 'u':\r\n              if (i + 4 > s.length()) throw new RuntimeException(\"bad \\\\u escape\");\r\n              b.append((char) Integer.parseInt(s.substring(i, i + 4), 16));\r\n              i += 4;\r\n              break;\r\n            default: throw new RuntimeException(\"bad escape \\\\\" + e);\r\n          }\r\n        } else {\r\n          b.append(c);\r\n        }\r\n      }\r\n      return b.toString();\r\n    }\r\n\r\n    Object bool() {\r\n      if (s.startsWith(\"true\", i)) { i += 4; return Boolean.TRUE; }\r\n      if (s.startsWith(\"false\", i)) { i += 5; return Boolean.FALSE; }\r\n      throw new RuntimeException(\"bad literal at \" + i);\r\n    }\r\n\r\n    Object nul() {\r\n      if (s.startsWith(\"null\", i)) { i += 4; return null; }\r\n      throw new RuntimeException(\"bad literal at \" + i);\r\n    }\r\n\r\n    Object number() {\r\n      int start = i;\r\n      while (i < s.length()) {\r\n        char c = s.charAt(i);\r\n        if ((c >= '0' && c <= '9') || c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E') i++;\r\n        else break;\r\n      }\r\n      String num = s.substring(start, i);\r\n      if (num.isEmpty()) throw new RuntimeException(\"bad value at \" + start);\r\n      if (num.indexOf('.') < 0 && num.indexOf('e') < 0 && num.indexOf('E') < 0) {\r\n        try { return Long.parseLong(num); } catch (Exception ignore) {}\r\n      }\r\n      return Double.parseDouble(num);\r\n    }\r\n  }\r\n\r\n  // ---- write ----\r\n  static String write(Object o) {\r\n    StringBuilder b = new StringBuilder();\r\n    writeValue(b, o);\r\n    return b.toString();\r\n  }\r\n\r\n  @SuppressWarnings(\"unchecked\")\r\n  private static void writeValue(StringBuilder b, Object o) {\r\n    if (o == null) { b.append(\"null\"); return; }\r\n    if (o instanceof String) { writeString(b, (String) o); return; }\r\n    if (o instanceof Boolean || o instanceof Number) { b.append(o.toString()); return; }\r\n    if (o instanceof Map) {\r\n      b.append('{');\r\n      boolean first = true;\r\n      for (Map.Entry<String, Object> e : ((Map<String, Object>) o).entrySet()) {\r\n        if (!first) b.append(',');\r\n        first = false;\r\n        writeString(b, e.getKey());\r\n        b.append(':');\r\n        writeValue(b, e.getValue());\r\n      }\r\n      b.append('}');\r\n      return;\r\n    }\r\n    if (o instanceof Iterable) {\r\n      b.append('[');\r\n      boolean first = true;\r\n      for (Object x : (Iterable<Object>) o) {\r\n        if (!first) b.append(',');\r\n        first = false;\r\n        writeValue(b, x);\r\n      }\r\n      b.append(']');\r\n      return;\r\n    }\r\n    // Fallback: treat as string.\r\n    writeString(b, String.valueOf(o));\r\n  }\r\n\r\n  private static void writeString(StringBuilder b, String s) {\r\n    b.append('\"');\r\n    for (int i = 0; i < s.length(); i++) {\r\n      char c = s.charAt(i);\r\n      switch (c) {\r\n        case '\"': b.append(\"\\\\\\\"\"); break;\r\n        case '\\\\': b.append(\"\\\\\\\\\"); break;\r\n        case '\\n': b.append(\"\\\\n\"); break;\r\n        case '\\r': b.append(\"\\\\r\"); break;\r\n        case '\\t': b.append(\"\\\\t\"); break;\r\n        case '\\b': b.append(\"\\\\b\"); break;\r\n        case '\\f': b.append(\"\\\\f\"); break;\r\n        default:\r\n          if (c < 0x20) {\r\n            b.append(String.format(\"\\\\u%04x\", (int) c));\r\n          } else {\r\n            b.append(c); // non-ASCII emitted verbatim; stream is UTF-8\r\n          }\r\n      }\r\n    }\r\n    b.append('\"');\r\n  }\r\n}\r\n"};
 
 
 
@@ -8074,6 +11198,17 @@ const UI_HTML = `<!DOCTYPE html>
     flex-shrink: 0;
     align-self: baseline;
   }
+  /* Per-task review verdict badge in the task footer (✓ reviewed / ✗ issues). */
+  .task-foot-review {
+    margin-left: 10px;
+    font-style: normal;
+    font-weight: 600;
+    font-size: 11px;
+  }
+  .task-foot-review.review-pass { color: #6cc46c; }
+  .task-foot-review.review-fail { color: var(--error); }
+  .task-foot-review.review-escalate, .task-foot-review.review-error { color: var(--error); }
+  .task-foot-review.review-pending { color: var(--muted); }
   /* Project (tier-4) rollup: same shape, brighter bracket. */
   .task-wrap.project::before {
     opacity: 0.85;
@@ -8269,6 +11404,52 @@ const UI_HTML = `<!DOCTYPE html>
   .input-row .queue-btn:hover { color: var(--accent); background: var(--bg); }
   .input-row .queue-btn svg { display: block; }
   .input-row .queue-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  /* Context-window fill gauge in the status row (item A). */
+  .context-bar {
+    display: inline-block; width: 90px; height: 6px; margin-left: 8px;
+    vertical-align: middle; background: var(--bg); border: 1px solid var(--border);
+    border-radius: 3px; overflow: hidden;
+  }
+  .context-bar > i { display: block; height: 100%; background: var(--accent); transition: width 0.3s ease; }
+  .context-bar.hot > i { background: #d9534f; }
+  .context-pct { color: var(--muted); font-size: 11px; margin-left: 4px; font-variant-numeric: tabular-nums; }
+
+  /* Visible "compacting…" marker (item A). */
+  .compaction-row {
+    margin: 6px 0; padding: 4px 10px; font-size: 12px; color: var(--muted);
+    background: var(--bg); border: 1px dashed var(--border); border-radius: 4px; text-align: center;
+  }
+
+  /* Editable task summary (item D). */
+  .task-foot-summary { cursor: text; border-bottom: 1px dotted transparent; }
+  .task-foot-summary:hover { border-bottom-color: var(--muted); }
+  .task-foot-edit {
+    font: inherit; font-family: var(--mono, monospace); background: var(--bg); color: var(--fg);
+    border: 1px solid var(--accent); border-radius: 3px; padding: 1px 6px; min-width: 260px;
+  }
+
+  /* Undo-task control on a failed/escalated review footer (item F). */
+  .task-undo-btn {
+    margin-left: 8px; padding: 1px 7px; font: inherit; font-size: 11px; cursor: pointer;
+    background: var(--bg); color: var(--muted); border: 1px solid var(--border); border-radius: 3px;
+  }
+  .task-undo-btn:hover { color: #d9534f; border-color: #d9534f; }
+  .task-undo-btn:disabled { opacity: 0.5; cursor: default; }
+
+  /* Steer button — send now, takes effect next turn (item H). */
+  .input-row .steer-btn:hover { color: var(--accent); background: var(--bg); }
+
+  /* Read-only "Discuss" toggle in the input subbar (item G). */
+  .discuss-toggle {
+    display: inline-flex; align-items: center; gap: 4px; font-size: 11px; color: var(--muted);
+    cursor: pointer; user-select: none; margin-right: 8px;
+  }
+  .discuss-toggle input { cursor: pointer; margin: 0; }
+  .discuss-toggle:hover { color: var(--fg); }
+
+  /* Loud escalation line on the acceptance gate (item J). */
+  .row.assignment-gate .gate-line.escalation { color: #d9534f; font-weight: 500; }
 
   /* Pending-message queue above the input. Each row is one item; clicking
      anywhere outside the play/delete buttons swaps the row's text with the
@@ -9123,6 +12304,85 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
 </div>
 
 <div id="chat" class="hidden">
+  <style>
+    .backlog-panel { border-bottom: 1px solid var(--border); background: var(--panel-alt); font-size: 12px; max-height: 38vh; overflow: auto; }
+    .backlog-panel.hidden { display: none; }
+    .backlog-head { display: flex; align-items: center; gap: 8px; padding: 6px 10px; position: sticky; top: 0; background: var(--panel-alt); border-bottom: 1px solid var(--border); }
+    .backlog-title { font-weight: 600; }
+    .backlog-count { color: var(--muted); }
+    .backlog-head button { background: none; border: 1px solid var(--border); color: var(--fg); border-radius: 4px; cursor: pointer; padding: 1px 7px; }
+    .backlog-head .backlog-new-btn { margin-left: auto; }
+    .backlog-form { display: flex; flex-direction: column; gap: 6px; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+    .backlog-form.hidden { display: none; }
+    .backlog-form input, .backlog-form textarea { background: var(--panel); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 5px 7px; font: inherit; box-sizing: border-box; width: 100%; }
+    .backlog-form-actions { display: flex; gap: 6px; justify-content: flex-end; }
+    .backlog-row { display: flex; align-items: center; gap: 8px; padding: 5px 10px; border-bottom: 1px solid var(--border); }
+    .backlog-row .asg-pill { font-size: 10px; text-transform: uppercase; padding: 1px 6px; border-radius: 8px; background: var(--border); color: var(--fg); }
+    .backlog-row .asg-pill.ready { background: #2d4a2d; }
+    .backlog-row .asg-pill.active { background: #43431e; }
+    .backlog-row .asg-pill.accepted { background: #1e3a3a; }
+    .backlog-row .asg-pill.capturing { background: #3a2d1e; }
+    .backlog-row .asg-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .backlog-row button { background: none; border: 1px solid var(--border); color: var(--fg); border-radius: 4px; cursor: pointer; padding: 1px 6px; }
+    .backlog-row .asg-work { background: #2d4a2d; }
+    .backlog-empty { padding: 8px 10px; color: var(--muted); font-size: 12px; }
+    .backlog-head .backlog-mem-btn { margin-left: auto; }
+    .memory-entry { display: flex; gap: 6px; align-items: flex-start; padding: 6px 0; border-bottom: 1px solid var(--border); }
+    .memory-entry select { background: var(--panel); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 3px; font: inherit; flex: 0 0 130px; }
+    .memory-entry textarea { flex: 1; background: var(--panel); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 4px 6px; font: inherit; resize: vertical; }
+    .memory-entry .mem-del { background: none; border: 1px solid var(--border); color: var(--fg); border-radius: 4px; cursor: pointer; padding: 2px 7px; }
+    .memory-empty { color: var(--muted); font-size: 12px; padding: 8px 0; }
+    .intake-status { flex: 1; color: var(--muted); font-size: 11px; align-self: center; }
+    .bubble.intake-manager { border-left: 3px solid #6a8db0; }
+    .bubble.intake-manager::before { content: 'Intake manager'; display: block; font-size: 10px; text-transform: uppercase; color: var(--muted); margin-bottom: 3px; }
+    .row.requirement-card { border-left: 3px solid #6a8db0; padding: 8px 10px; margin: 6px 0; background: var(--panel-alt); }
+    .row.requirement-card .rc-title { font-weight: 600; margin-bottom: 6px; }
+    .row.requirement-card label { display: block; font-size: 11px; text-transform: uppercase; color: var(--muted); margin: 6px 0 2px; }
+    .row.requirement-card input, .row.requirement-card textarea { width: 100%; box-sizing: border-box; background: var(--panel); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 5px 7px; font: inherit; }
+    .row.requirement-card .rc-actions { display: flex; gap: 6px; margin-top: 8px; }
+    .row.requirement-card.captured { opacity: 0.7; }
+    .row.assignment-banner { color: var(--muted); font-size: 12px; border-top: 1px solid var(--border); padding: 6px 10px; margin-top: 8px; }
+    .row.memory-consolidated { border-left: 3px solid #6a8db0; padding: 6px 10px; margin: 6px 0; font-size: 12px; }
+    .row.memory-consolidated .mc-head { color: var(--fg); margin-bottom: 3px; }
+    .row.memory-consolidated .mc-line { color: var(--muted); }
+    .row.manager-diagnostic { border-left: 3px solid #c9a227; padding: 6px 10px; margin: 6px 0; font-size: 12px; }
+    .row.manager-diagnostic summary { color: #c9a227; cursor: pointer; }
+    .row.manager-diagnostic .md-raw { white-space: pre-wrap; word-break: break-word; margin: 6px 0 0; padding: 6px 8px; background: var(--panel); border: 1px solid var(--border); border-radius: 4px; max-height: 280px; overflow: auto; color: var(--fg); }
+    .row.assignment-gate { border-left: 3px solid var(--muted); padding: 8px 10px; margin: 6px 0; }
+    .row.assignment-gate.ok { border-left-color: #4a9d4a; }
+    .row.assignment-gate.warn { border-left-color: #c9a227; }
+    .row.assignment-gate .gate-title { font-weight: 600; margin-bottom: 4px; }
+    .row.assignment-gate .gate-line { margin: 2px 0; }
+    .row.assignment-gate .gate-line.missing { color: #c9a227; }
+    .row.assignment-gate .gate-line.drift { color: var(--muted); }
+    .row.assignment-gate .gate-actions { display: flex; gap: 6px; margin-top: 6px; }
+  </style>
+  <div id="backlogPanel" class="backlog-panel hidden">
+    <div class="backlog-head">
+      <span class="backlog-title">Assignments</span>
+      <span class="backlog-count" id="backlogCount"></span>
+      <button class="backlog-mem-btn" onclick="openMemory()" title="View and curate what the agent has learned about this codebase">🧠 Memory</button>
+      <button class="backlog-chat-btn" onclick="openIntake()" title="Capture a requirement by chatting with the intake manager">🗩 Chat</button>
+      <button class="backlog-new-btn" onclick="toggleAssignmentForm()" title="New assignment">＋ New</button>
+    </div>
+    <div class="backlog-form hidden" id="backlogForm">
+      <input id="asgTitle" placeholder="Assignment title" />
+      <textarea id="asgReq" placeholder="Requirement — the definition of done (leave blank to capture later)…" rows="2"></textarea>
+      <div class="backlog-form-actions">
+        <button class="btn" onclick="toggleAssignmentForm()">Cancel</button>
+        <button class="btn primary" onclick="createAssignmentFromForm()">Capture</button>
+      </div>
+    </div>
+    <div class="backlog-form hidden" id="intakeForm">
+      <textarea id="intakeText" placeholder="Paste the email / ticket / spec / notes. The intake manager will ask questions, read the code read-only, and draft a requirement card you can edit and capture…" rows="3"></textarea>
+      <div class="backlog-form-actions">
+        <span id="intakeStatus" class="intake-status"></span>
+        <button class="btn" onclick="closeIntake()">Cancel</button>
+        <button class="btn primary" id="intakeSendBtn" onclick="sendIntake()">Send</button>
+      </div>
+    </div>
+    <div class="backlog-list" id="backlogList"></div>
+  </div>
   <main id="logScroll">
     <div class="log" id="log">
       <div class="bubble system">Type a question and press Enter (Shift+Enter for newline).</div>
@@ -9150,10 +12410,24 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
           <rect x="2" y="11.1" width="10" height="1.5" rx="0.4"/>
         </svg>
       </button>
+      <button id="steerBtn"
+              class="queue-btn steer-btn"
+              title="Send now — steers the running agent at its next step (no restart, no lost work)"
+              onclick="steerCurrentInput()"
+              style="display: none;">
+        <svg width="14" height="14" viewBox="0 0 14 14" fill="none"
+             stroke="currentColor" stroke-width="1.3"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M2 7 L11 7 M7.5 3.5 L11 7 L7.5 10.5"/>
+        </svg>
+      </button>
     </div>
     <div class="input-subbar">
       <span class="dirty-indicator" id="gitDirtyIndicator" title="" style="display:none;">⚠</span>
       <span class="proj-path" id="projectPath" title="">(no project)</span>
+      <label class="discuss-toggle" title="Read-only: the agent investigates and explains, but does not modify files or run shell commands this turn">
+        <input type="checkbox" id="discussToggle"> Discuss
+      </label>
       <button class="settings-btn" id="settingsBtn" onclick="openSettings()" title="Settings">⚙</button>
     </div>
   </footer>
@@ -9200,6 +12474,28 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
         <button class="btn" onclick="changeProject()">Change project…</button>
         <button class="btn" onclick="clearConversation()">Clear conversation</button>
       </div>
+    </div>
+  </div>
+</div>
+
+<!-- Codebase memory: the agent-maintained Tier-1 facts about this codebase.
+     The developer can edit/prune them here; the agent reads them every run and
+     maintains them with <remember>/<forget>. -->
+<div class="modal-bg" id="memoryModalBg" onclick="if (event.target === this) closeMemory()">
+  <div class="modal" id="memoryModal" style="max-width: 640px; width: 92%;">
+    <div class="modal-header">
+      <h2>Codebase memory</h2>
+      <button class="modal-close" onclick="closeMemory()">&times;</button>
+    </div>
+    <div class="modal-body" style="padding: 12px 16px;">
+      <div class="muted" style="font-size: 12px; margin-bottom: 8px;">Durable facts the agent has learned about this codebase. It reads these every run and updates them as it works — you can correct or prune them here.</div>
+      <div id="memoryList"></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn" onclick="addMemoryRow()">＋ Add fact</button>
+      <span style="flex:1"></span>
+      <button class="btn" onclick="closeMemory()">Cancel</button>
+      <button class="btn primary" onclick="saveMemory()">Save</button>
     </div>
   </div>
 </div>
@@ -9292,6 +12588,10 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   // ---- Inline status row (spinner + verb + timer + tokens) ----
   const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
   const VERB = 'Working';
+  // The active status-row verb. Most phases read as "Working", but the manager
+  // phases (per-task review, assignment acceptance) relabel so the user can see
+  // WHO is busy — the worker vs the reviewer vs the acceptance manager.
+  let statusVerb = VERB;
   const PHASE = { UPLOADING: 'uploading', THINKING: 'thinking', DOWNLOADING: 'downloading', DONE: 'done', CANCELED: 'canceled' };
   let statusTimer = null, upAnimTimer = null;
   let statusStart = 0, statusFrame = 0;
@@ -9301,6 +12601,12 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   let lastDir = 'up';      // direction of the most recent activity (for THINKING arrow)
   let lastDeltaTime = 0;   // timestamp of last content delta — for stall detection
   let upTokens = 0, downTokens = 0;
+  // Context-window fill gauge (item A): { totalTokens, budgetTokens, budgetPct } or null when unknown.
+  let contextFill = null;
+  // Diff collapse state keyed by event id (item K) — survives the clearLog()
+  // + full re-render that an event-patch triggers (the DOM is wiped, so the
+  // state can't live on the element).
+  const _diffCollapsed = new Map();
   const STALL_MS = 1500;   // no traffic this long → switch to THINKING (blinking)
 
   function ensureStatusRow() {
@@ -9354,6 +12660,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     ensureStatusRow();
     if (!statusTimer) startSpinner();
     phase = PHASE.UPLOADING;
+    statusVerb = VERB;   // a fresh turn always starts as the worker "Working"
     lastDir = 'up';
     lastDeltaTime = Date.now();
     statusRow.classList.remove('thinking');
@@ -9418,9 +12725,21 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     const arrow = isDown ? '↓' : '↑';
     const count = isDown ? downTokens : upTokens;
     statusRow.innerHTML =
-      '<span class="spin">' + sp + '</span> ' + VERB + '… ' +
+      '<span class="spin">' + sp + '</span> ' + statusVerb + '… ' +
       '<span class="arrow">' + arrow + '</span> <span class="count">' + fmt(count) + '</span>' +
-      ' <span class="dim">tokens · ' + secs + 's · esc to interrupt</span>';
+      ' <span class="dim">tokens · ' + secs + 's · esc to interrupt</span>' +
+      contextBarHtml();
+  }
+  // Context-window fill gauge: total context vs the agent's total budget (the
+  // binding constraint that triggers compaction). Hidden until the first
+  // context-fill arrives. Turns red as it approaches the compaction threshold.
+  function contextBarHtml() {
+    if (!contextFill || contextFill.budgetPct == null) return '';
+    const pct = Math.max(0, Math.min(100, contextFill.budgetPct));
+    const hot = pct >= 80 ? ' hot' : '';
+    const tip = \`context: \${contextFill.totalTokens} / \${contextFill.budgetTokens} tokens (\${pct}%)\`;
+    return \` <span class="context-bar\${hot}" title="\${tip}"><i style="width:\${pct}%"></i></span>\`
+      + \`<span class="context-pct">\${pct}%</span>\`;
   }
   function estimateTokens(s) { return Math.ceil((s || '').length / 4); }
 
@@ -9816,6 +13135,47 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
         $err.textContent = 'Failed: ' + e.message;
       }
     };
+  }
+
+  // Mid-task developer-approval prompt. Fired from the SSE 'approval-needed'
+  // handler (and re-shown on reconnect from state.approvalPending) when a tool
+  // — e.g. edit_docx flattening formatting — needs an explicit human OK. The
+  // tool's impl is awaiting our /api/approval-resolve POST. Reuses the git
+  // wizard overlay (only one mid-task prompt is ever live at a time).
+  function showApprovalPrompt({ id, kind, message }) {
+    const $bg = document.getElementById('gitWizardBg');
+    const $body = document.getElementById('gitWizardBody');
+    $body.innerHTML = \`
+      <p style="margin: 0 0 12px; color: var(--fg); font-size: 13px;">\${escapeHtml(message || 'Approve this action?')}</p>
+      <p id="ap-err" style="margin: 8px 0 0; color: var(--error); font-size: 12px; min-height: 14px;"></p>
+      <div style="display:flex; gap:8px; justify-content:flex-end; margin-top: 14px;">
+        <button id="ap-deny" class="btn">Deny</button>
+        <button id="ap-approve" class="btn primary">Approve</button>
+      </div>
+    \`;
+    $bg.classList.add('show');
+    const $err = document.getElementById('ap-err');
+    function close() { $bg.classList.remove('show'); $body.innerHTML = ''; }
+    async function resolve(approved) {
+      const $a = document.getElementById('ap-approve');
+      const $d = document.getElementById('ap-deny');
+      $a.disabled = true; $d.disabled = true;
+      try {
+        const r = await fetch('/api/approval-resolve', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ id, approved }),
+        });
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error ?? ('HTTP ' + r.status));
+        close();
+      } catch (e) {
+        $a.disabled = false; $d.disabled = false;
+        $err.textContent = 'Failed: ' + e.message;
+      }
+    }
+    document.getElementById('ap-approve').onclick = () => resolve(true);
+    document.getElementById('ap-deny').onclick = () => resolve(false);
   }
 
   // Tracks the most-recent project so the folder picker starts at its
@@ -10246,9 +13606,110 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   }
 
   // Render a unified diff as a code block with + / - / hunk highlights.
+  // Visible "compacting…" marker (item A) — compaction masks/drops old tasks,
+  // a quality cliff, so we surface it rather than doing it silently.
+  function addCompactionRow(ev) {
+    const row = document.createElement('div');
+    row.className = 'compaction-row';
+    const pct = ev.budgetPct != null ? \` (\${ev.budgetPct}% of window)\` : '';
+    row.textContent = \`↔ Context window full\${pct} — compacting: older tasks are being summarized/archived to free room.\`;
+    $log.appendChild(row);
+    pinStatusToBottom();
+    scrollToBottom();
+    return row;
+  }
+
+  // Result row for a task undo (item F).
+  function addTaskUndoRow(ev) {
+    const row = document.createElement('div');
+    row.className = 'review-row review-ok';
+    const ring = document.createElement('span'); ring.className = 'review-ring'; ring.textContent = '↶'; row.appendChild(ring);
+    const label = document.createElement('span'); label.className = 'review-label';
+    const r = ev.results || [];
+    const ok = r.filter((x) => x.status === 'ok').length;
+    const skip = r.filter((x) => x.status === 'skipped').length;
+    const err = r.filter((x) => x.status === 'error').length;
+    label.textContent = \`Task \${ev.taskId || ''} reverted — \${ok} repo(s)\`
+      + (skip ? \`, \${skip} skipped\` : '') + (err ? \`, \${err} error(s)\` : '') + '.';
+    row.appendChild(label);
+    if (r.length) {
+      const list = document.createElement('div'); list.className = 'review-concerns';
+      list.textContent = r.map((x) => \`\${basename(x.repoDir || '') || 'repo'}: \${x.status}\` + (x.message ? \` — \${x.message}\` : (x.reason ? \` — \${x.reason}\` : ''))).join('\\n');
+      row.appendChild(list);
+    }
+    $log.appendChild(row);
+    pinStatusToBottom();
+    scrollToBottom();
+    return row;
+  }
+
+  // Revert a closed task's commits (item F). Creates git revert commits.
+  async function handleTaskUndo(taskId, btn) {
+    if (session?.status === 'running') { showError('Undo', new Error('stop the running chat first')); return; }
+    if (!confirm('Revert this task\\'s commits? This creates git revert commits on the affected repo(s) — the rest of your history is untouched.')) return;
+    if (btn) { btn.disabled = true; btn.textContent = '↶ reverting…'; }
+    try {
+      const r = await fetch('/api/task-undo', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ taskId }) });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
+    } catch (e) {
+      showError('Undo failed', e);
+      if (btn) { btn.disabled = false; btn.textContent = '↶ undo'; }
+    }
+  }
+
+  // Steer the running agent (item H): queue text to inject at the next turn
+  // boundary. Returns at once; the text lands as a fresh user row when the
+  // agent reaches its next step.
+  async function steerCurrentInput() {
+    const text = $input.value.trim();
+    if (!text) return;
+    try {
+      const r = await fetch('/api/steer', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text }) });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
+      $input.value = '';
+      autoGrowInput();
+    } catch (e) { showError('Steer failed', e); }
+  }
+
+  // Inline edit of a closed task's summary (item D). Dual-writes via
+  // /api/tasks/update-summary (chat event + tier-rollup store).
+  function beginEditTaskSummary(foot, summarySpan, ev) {
+    if (!ev.id || foot.querySelector('.task-foot-edit')) return;
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'task-foot-edit';
+    input.value = ev.summary || '';
+    let done = false;
+    const finish = (save) => {
+      if (done) return; done = true;
+      const val = input.value.trim();
+      input.remove();
+      summarySpan.style.display = '';
+      if (save && val && val !== (ev.summary || '')) {
+        ev.summary = val;
+        summarySpan.textContent = val;
+        fetch('/api/tasks/update-summary', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ eventId: ev.id, summary: val }) })
+          .then((r) => { if (!r.ok) return r.json().catch(() => ({})).then((d) => { throw new Error(d.error || ('HTTP ' + r.status)); }); })
+          .catch((e) => showError('Summary update failed', e));
+      }
+    };
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+      else if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+    });
+    input.addEventListener('blur', () => finish(true));
+    summarySpan.style.display = 'none';
+    foot.insertBefore(input, summarySpan);
+    input.focus();
+    input.select();
+  }
+
   function addDiffBlock(ev) {
     const block = document.createElement('div');
     block.className = 'diff-block';
+    if (ev.id) block.dataset.eventId = String(ev.id);
 
     const hdr = document.createElement('div');
     hdr.className = 'diff-hdr';
@@ -10295,11 +13756,16 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       body.appendChild(more);
     }
 
-    let collapsed = false;
+    // Restore collapse state across event-patch re-renders (item K). The state
+    // lives in _diffCollapsed (keyed by event id) because clearLog() wipes the
+    // DOM before re-rendering, so it can't be read back off the old element.
+    let collapsed = ev.id ? (_diffCollapsed.get(String(ev.id)) || false) : false;
+    if (collapsed) { body.classList.add('collapsed'); exp.textContent = 'expand'; }
     exp.onclick = () => {
       collapsed = !collapsed;
       body.classList.toggle('collapsed', collapsed);
       exp.textContent = collapsed ? 'expand' : 'collapse';
+      if (ev.id) _diffCollapsed.set(String(ev.id), collapsed);
     };
 
     block.appendChild(hdr);
@@ -10355,6 +13821,51 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     pinStatusToBottom();
     scrollToBottom();
     return row;
+  }
+
+  // Render a per-task review verdict INTO the task's footer (the ✓/✗ the user
+  // expects to see on the task box). Returns false if no matching task-wrap is
+  // present, so the caller can fall back to a standalone row.
+  function renderReviewIntoFooter(ev) {
+    const wrap = $log.querySelector(\`.task-wrap[data-task-id="\${CSS.escape(String(ev.reviewTaskId))}"]\`);
+    if (!wrap) return false;
+    const foot = wrap.querySelector('.task-foot');
+    if (!foot) return false;
+    // Re-render safety: drop any prior badge/concerns/undo for this wrap.
+    foot.querySelector('.task-foot-review')?.remove();
+    foot.querySelector('.task-undo-btn')?.remove();
+    wrap.querySelector(':scope > .review-concerns')?.remove();
+    const st = ev.state || 'pending';
+    const glyph = st === 'pass' ? '✓' : st === 'fail' ? '✗' : (st === 'escalate' || st === 'error') ? '⚠' : '◌';
+    const labelByState = {
+      pass: 'reviewed', fail: 'review: issues found',
+      escalate: 'review: unresolved', error: 'review interrupted', pending: 'reviewing…',
+    };
+    const badge = document.createElement('span');
+    badge.className = 'task-foot-review review-' + st;
+    badge.textContent = \`\${glyph} \${labelByState[st] || st}\`;
+    if (ev.concerns) badge.title = ev.concerns;
+    foot.appendChild(badge);
+    // Offer one-click undo when a task's review failed/escalated (item F): its
+    // commits can be reverted (git revert) without leaving the UI.
+    if ((st === 'fail' || st === 'escalate') && ev.reviewTaskId) {
+      const undo = document.createElement('button');
+      undo.className = 'task-undo-btn';
+      undo.textContent = '↶ undo';
+      undo.title = "Revert this task's commits (creates revert commits)";
+      undo.onclick = (e) => { e.stopPropagation(); handleTaskUndo(ev.reviewTaskId, undo); };
+      foot.appendChild(undo);
+    }
+    // Surface concerns text under the footer for fail/escalate so the user
+    // (and the screenshot) sees what's wrong without hovering.
+    if (ev.concerns && (st === 'fail' || st === 'escalate')) {
+      const c = document.createElement('div');
+      c.className = 'review-concerns';
+      c.innerHTML = renderInline(String(ev.concerns));
+      wrap.appendChild(c);
+    }
+    scrollToBottom();
+    return true;
   }
 
   // Inline warning when the task-close auto-commit found a repo that
@@ -10498,11 +14009,12 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     if (!text) return;
     $input.value = '';
     autoGrowInput();  // shrink the textarea back to one line
+    const discuss = document.getElementById('discussToggle')?.checked;
     try {
       const r = await fetch('/api/message', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ text, model: $model.value }),
+        body: JSON.stringify({ text, model: $model.value, mode: discuss ? 'discuss' : undefined }),
       });
       if (!r.ok) {
         const body = await r.text();
@@ -10517,6 +14029,430 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   async function cancelChat() {
     try { await fetch('/api/cancel', { method: 'POST' }); }
     catch (e) { showError('Cancel failed', e); }
+  }
+
+  // ── Assignment backlog ──────────────────────────────────────────────────
+  let _backlog = [];
+  async function loadBacklog() {
+    try {
+      const r = await fetch('/api/assignments/list');
+      const data = await r.json();
+      _backlog = data.assignments || [];
+      renderBacklog(data.activeId || null);
+    } catch { /* offline / no project */ }
+  }
+  function renderBacklog(activeId) {
+    const panel = document.getElementById('backlogPanel');
+    const list = document.getElementById('backlogList');
+    const count = document.getElementById('backlogCount');
+    if (!panel || !list) return;
+    // The panel is shown whenever a project is open (so the "+ New" form is
+    // always reachable, including to capture the very first assignment). It is
+    // only hidden when there is no project at all.
+    if (!activeProject) { panel.classList.add('hidden'); list.innerHTML = ''; return; }
+    panel.classList.remove('hidden');
+    count.textContent = _backlog.length ? \`(\${_backlog.length})\` : '';
+    list.innerHTML = '';
+    if (!_backlog.length) {
+      const empty = document.createElement('div');
+      empty.className = 'backlog-empty';
+      empty.textContent = 'No assignments yet — click ＋ New to capture one.';
+      list.appendChild(empty);
+      return;
+    }
+    _backlog.forEach((a, i) => {
+      const row = document.createElement('div');
+      row.className = 'backlog-row';
+      const pill = document.createElement('span');
+      pill.className = 'asg-pill ' + (a.status || '');
+      pill.textContent = a.status || '';
+      const title = document.createElement('span');
+      title.className = 'asg-title';
+      title.textContent = \`\${a.id}  \${a.title}\`;
+      title.title = a.requirement || '(no requirement yet)';
+      row.appendChild(pill); row.appendChild(title);
+      const mkBtn = (label, fn, t) => { const b = document.createElement('button'); b.textContent = label; if (t) b.title = t; b.onclick = fn; return b; };
+      if (i > 0) row.appendChild(mkBtn('▲', () => reorderAssignment(a.id, i - 1), 'Move up'));
+      if (i < _backlog.length - 1) row.appendChild(mkBtn('▼', () => reorderAssignment(a.id, i + 1), 'Move down'));
+      if (a.requirement && a.status !== 'active' && a.status !== 'accepted') {
+        const work = mkBtn('Work this', () => startAssignment(a.id), 'Start working this assignment');
+        work.className = 'asg-work';
+        row.appendChild(work);
+      } else if (a.requirement && a.status === 'active') {
+        // An active assignment with no run in flight (e.g. picked up in a new
+        // session) — let the user resume it.
+        const resume = mkBtn('Resume', () => startAssignment(a.id, true), 'Resume working this assignment');
+        resume.className = 'asg-work';
+        row.appendChild(resume);
+      }
+      row.appendChild(mkBtn('✕', () => removeAssignment(a.id), 'Remove'));
+      list.appendChild(row);
+    });
+  }
+  function toggleBacklogForm(show) {
+    const f = document.getElementById('backlogForm');
+    if (f) f.classList.toggle('hidden', show === undefined ? undefined : !show);
+  }
+  function toggleAssignmentForm() {
+    const f = document.getElementById('backlogForm');
+    if (f) f.classList.toggle('hidden');
+  }
+  async function createAssignmentFromForm() {
+    const title = (document.getElementById('asgTitle').value || '').trim();
+    const requirement = (document.getElementById('asgReq').value || '').trim();
+    if (!title) { showError('New assignment', new Error('title is required')); return; }
+    try {
+      await fetch('/api/assignments/create', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ title, requirement: requirement || null, status: requirement ? 'ready' : 'capturing' }),
+      });
+      document.getElementById('asgTitle').value = '';
+      document.getElementById('asgReq').value = '';
+      toggleAssignmentForm();
+      loadBacklog();
+    } catch (e) { showError('Create assignment failed', e); }
+  }
+  async function startAssignment(id, resume) {
+    if (session?.status === 'running') { showError('Start assignment', new Error('a chat is already running')); return; }
+    try {
+      const r = await fetch('/api/assignments/start', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id, resume: !!resume }),
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
+      // Kick the worker with the seed message (the run is already bound to the assignment).
+      await fetch('/api/message', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ text: data.seedText, model: $model.value }),
+      });
+    } catch (e) { showError('Start assignment failed', e); }
+  }
+  async function reorderAssignment(id, toIndex) {
+    try {
+      await fetch('/api/assignments/reorder', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id, toIndex }),
+      });
+    } catch (e) { showError('Reorder failed', e); }
+  }
+  async function removeAssignment(id) {
+    // If we're removing the draft an open intake thread points at, drop the
+    // pointer so the next Send doesn't 404 against a deleted assignment.
+    if (id === __intakeAssignmentId) __intakeAssignmentId = null;
+    try {
+      await fetch('/api/assignments/remove', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id }),
+      });
+    } catch (e) { showError('Remove failed', e); }
+  }
+  async function gateAction(id, action, node) {
+    try {
+      const r = await fetch('/api/assignments/' + action, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id }),
+      });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      if (node) { const a = node.querySelector('.gate-actions'); if (a) a.innerHTML = \`<span class="gate-line">\${action === 'accept' ? 'Accepted ✓' : 'Paused'}</span>\`; }
+      if (action === 'accept') offerNextReady(node);
+    } catch (e) { showError('Assignment ' + action + ' failed', e); }
+  }
+  // After accepting an assignment, surface the next ready one so the user can
+  // chain into it without hunting the backlog.
+  async function offerNextReady(node) {
+    if (!node) return;
+    try {
+      const data = await (await fetch('/api/assignments/list')).json();
+      const next = (data.assignments || []).find((a) => a.status === 'ready' && a.requirement);
+      const actions = node.querySelector('.gate-actions');
+      if (!next || !actions) return;
+      const line = document.createElement('span');
+      line.className = 'gate-line';
+      line.textContent = \` Next ready: \${next.id} \${next.title} \`;
+      const work = document.createElement('button');
+      work.className = 'btn primary';
+      work.textContent = 'Work it';
+      work.onclick = () => startAssignment(next.id);
+      actions.appendChild(line);
+      actions.appendChild(work);
+    } catch { /* best-effort */ }
+  }
+  function acceptAssignment(id, node) { return gateAction(id, 'accept', node); }
+  function parkAssignment(id, node) { return gateAction(id, 'park', node); }
+
+  function addAssignmentGate(ev) {
+    const row = document.createElement('div');
+    // An open escalation (a bound task whose review never resolved) makes the
+    // gate a WARN even if the acceptance check said fulfilled — acceptance no
+    // longer silently overrides the per-task reviewer (item J).
+    const escalations = (ev.taskVerdicts || []).filter((v) => v.state === 'escalate');
+    const hasEscalations = escalations.length > 0;
+    row.className = 'row assignment-gate ' + (ev.fulfilled && !hasEscalations ? 'ok' : 'warn');
+    const title = document.createElement('div');
+    title.className = 'gate-title';
+    if (hasEscalations) {
+      title.textContent = \`⚠ Assignment \${ev.assignmentId}: \${escalations.length} task(s) have UNRESOLVED review concerns — review before accepting\`;
+    } else {
+      title.textContent = ev.fulfilled
+        ? \`✓ Assignment \${ev.assignmentId}: acceptance check passed — does it meet the requirement?\`
+        : \`⚠ Assignment \${ev.assignmentId}: not yet fulfilled\`;
+    }
+    row.appendChild(title);
+    const line = (cls, text) => { if (!text) return; const d = document.createElement('div'); d.className = 'gate-line ' + cls; d.textContent = text; row.appendChild(d); };
+    for (const v of escalations) line('escalation', \`Task \${v.taskId}: \${String(v.concerns || '(no detail)').slice(0, 200)}\`);
+    line('', ev.rationale || '');
+    line('missing', ev.missing ? ('Missing: ' + ev.missing) : '');
+    line('drift', ev.drift ? ('Drift (out of scope): ' + ev.drift) : '');
+    const actions = document.createElement('div');
+    actions.className = 'gate-actions';
+    // When unfulfilled, the primary action is to send the gaps back to the
+    // worker; Accept is still offered (the user may accept despite the gap).
+    if (!ev.fulfilled) {
+      const fix = document.createElement('button'); fix.className = 'btn primary'; fix.textContent = 'Send fix to worker';
+      fix.onclick = () => sendFixToWorker(ev.assignmentId, row);
+      actions.appendChild(fix);
+    }
+    const accept = document.createElement('button');
+    accept.className = 'btn' + (ev.fulfilled && !hasEscalations ? ' primary' : '');
+    accept.textContent = hasEscalations ? 'Accept anyway' : 'Accept';
+    // Require an explicit confirm to accept over an open escalation.
+    accept.onclick = () => {
+      if (hasEscalations && !confirm(\`\${escalations.length} task(s) still have unresolved review concerns. Accept the assignment anyway?\`)) return;
+      acceptAssignment(ev.assignmentId, row);
+    };
+    const park = document.createElement('button'); park.className = 'btn'; park.textContent = 'Pause'; park.onclick = () => parkAssignment(ev.assignmentId, row);
+    actions.appendChild(accept); actions.appendChild(park);
+    row.appendChild(actions);
+    $log.appendChild(row);
+    return row;
+  }
+  async function sendFixToWorker(id, node) {
+    if (session?.status === 'running') { showError('Send fix', new Error('a chat is already running')); return; }
+    try {
+      const r = await fetch('/api/assignments/send-fix', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id }),
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
+      if (node) { const a = node.querySelector('.gate-actions'); if (a) a.innerHTML = '<span class="gate-line">Sent back to the worker…</span>'; }
+      // Kick the worker with the gap-seeded fix message (run is already armed).
+      await fetch('/api/message', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ text: data.seedText, model: $model.value }),
+      });
+    } catch (e) { showError('Send fix failed', e); }
+  }
+
+  function addAssignmentBanner(ev) {
+    const row = document.createElement('div');
+    row.className = 'row assignment-banner';
+    row.textContent = \`▸ Working assignment \${ev.assignmentId}\${ev.title ? ': ' + ev.title : ''}\`;
+    $log.appendChild(row);
+    scrollToBottom();
+    return row;
+  }
+  function addManagerDiagnostic(ev) {
+    // A read-only manager pass (reviewer/acceptance/intake/consolidation) could
+    // not parse its expected tag and fell back to its safe default. Surface the
+    // raw model output (collapsed) so prompts can be tuned to the deployed model.
+    const row = document.createElement('div');
+    row.className = 'row manager-diagnostic';
+    const det = document.createElement('details');
+    const sum = document.createElement('summary');
+    sum.textContent = \`⚠ \${ev.kind || 'manager'}: \${ev.reason || 'parse miss'} — show raw model output\`;
+    det.appendChild(sum);
+    const pre = document.createElement('pre');
+    pre.className = 'md-raw';
+    pre.textContent = ev.raw || '(empty)';
+    det.appendChild(pre);
+    row.appendChild(det);
+    $log.appendChild(row);
+    scrollToBottom();
+    return row;
+  }
+  function addMemoryConsolidated(ev) {
+    const added = Array.isArray(ev.added) ? ev.added : [];
+    const row = document.createElement('div');
+    row.className = 'row memory-consolidated';
+    const head = document.createElement('div');
+    head.className = 'mc-head';
+    head.textContent = \`🧠 Recorded \${added.length} codebase fact\${added.length === 1 ? '' : 's'} from \${ev.assignmentId} into memory\`;
+    row.appendChild(head);
+    for (const f of added) {
+      const line = document.createElement('div');
+      line.className = 'mc-line';
+      line.textContent = \`[\${f.category || 'general'}] \${f.note}\`;
+      row.appendChild(line);
+    }
+    $log.appendChild(row);
+    scrollToBottom();
+    return row;
+  }
+
+  // ── Conversational intake ─────────────────────────────────────────────────
+  let __intakeAssignmentId = null;   // the draft assignment the intake thread targets
+  function toggleIntakeForm() {
+    const f = document.getElementById('intakeForm');
+    if (!f) return;
+    f.classList.toggle('hidden');
+    if (!f.classList.contains('hidden')) { const ta = document.getElementById('intakeText'); if (ta) ta.focus(); }
+  }
+  // Fresh capture (the "Chat" button): start a NEW draft, never continue a stale
+  // one left over from a prior cancel/session.
+  function openIntake() {
+    __intakeAssignmentId = null;
+    const f = document.getElementById('intakeForm');
+    if (f) f.classList.remove('hidden');
+    const ta = document.getElementById('intakeText'); if (ta) { ta.value = ''; ta.focus(); }
+  }
+  // Cancel: hide the form AND drop the draft pointer so the next capture is fresh.
+  function closeIntake() {
+    __intakeAssignmentId = null;
+    const f = document.getElementById('intakeForm');
+    if (f) f.classList.add('hidden');
+  }
+  function startIntake() {
+    // Used by "Refine" — caller sets __intakeAssignmentId first; just ensure shown.
+    const f = document.getElementById('intakeForm');
+    if (f && f.classList.contains('hidden')) toggleIntakeForm();
+  }
+  function setIntakeBusy(busy, msg) {
+    const btn = document.getElementById('intakeSendBtn');
+    const st = document.getElementById('intakeStatus');
+    if (btn) btn.disabled = busy;
+    if (st) st.textContent = msg !== undefined ? msg : (busy ? 'Manager is thinking…' : '');
+  }
+  async function sendIntake() {
+    const ta = document.getElementById('intakeText');
+    const text = (ta?.value || '').trim();
+    if (!text) return;
+    setIntakeBusy(true);
+    try {
+      const r = await fetch('/api/assignments/intake', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ text, assignmentId: __intakeAssignmentId || undefined, model: $model.value }),
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
+      __intakeAssignmentId = data.assignmentId;
+      if (ta) ta.value = '';
+    } catch (e) {
+      setIntakeBusy(false, '');
+      showError('Intake failed', e);
+    }
+  }
+  function addIntakeMessage(ev) {
+    // Clear the busy spinner only on the MANAGER's reply — not on the user-echo
+    // event the server broadcasts before the manager turn even starts.
+    if (ev.senderRole === 'manager') setIntakeBusy(false, '');
+    const div = addBubble(ev.senderRole === 'manager' ? 'assistant' : 'user', ev.content || '');
+    if (ev.senderRole === 'manager') div.classList.add('intake-manager');
+    return div;
+  }
+  function addEditableRequirementCard(ev) {
+    setIntakeBusy(false, '');
+    const card = ev.card || {};
+    const row = document.createElement('div');
+    row.className = 'row requirement-card';
+    row.dataset.assignmentId = ev.assignmentId || '';
+    const head = document.createElement('div');
+    head.className = 'rc-title';
+    head.textContent = \`Requirement card — \${ev.assignmentId || ''} (edit, then Capture)\`;
+    row.appendChild(head);
+    const field = (labelText, value, tag, cls, rows) => {
+      const label = document.createElement('label'); label.textContent = labelText; row.appendChild(label);
+      const el = document.createElement(tag);
+      el.className = cls;
+      if (tag === 'textarea') el.rows = rows || 2;
+      el.value = value || '';
+      row.appendChild(el);
+      return el;
+    };
+    const titleEl = field('Title', card.title, 'input', 'rc-field-title');
+    const reqEl = field('Requirement (definition of done)', card.requirement, 'textarea', 'rc-field-requirement', 3);
+    const accEl = field('Acceptance criteria', card.acceptanceCriteria, 'textarea', 'rc-field-acceptance', 3);
+    const actions = document.createElement('div'); actions.className = 'rc-actions';
+    const capture = document.createElement('button'); capture.className = 'btn primary'; capture.textContent = 'Capture';
+    capture.onclick = async () => {
+      const requirement = (reqEl.value || '').trim();
+      if (!requirement) { showError('Capture', new Error('requirement is required')); return; }
+      try {
+        const r = await fetch('/api/assignments/capture', {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ id: ev.assignmentId, title: (titleEl.value || '').trim(), requirement, acceptanceCriteria: (accEl.value || '').trim() }),
+        });
+        if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.error || ('HTTP ' + r.status)); }
+        row.classList.add('captured');
+        actions.innerHTML = '<span class="intake-status">Captured ✓ — added to the backlog as ready</span>';
+        __intakeAssignmentId = null;
+        loadBacklog();
+      } catch (e) { showError('Capture failed', e); }
+    };
+    const refine = document.createElement('button'); refine.className = 'btn'; refine.textContent = 'Refine';
+    refine.onclick = () => { __intakeAssignmentId = ev.assignmentId; startIntake(); };
+    const discard = document.createElement('button'); discard.className = 'btn'; discard.textContent = 'Discard';
+    discard.onclick = async () => {
+      try { await fetch('/api/assignments/remove', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: ev.assignmentId }) }); }
+      catch (e) { showError('Discard failed', e); return; }
+      row.classList.add('captured');
+      actions.innerHTML = '<span class="intake-status">Discarded</span>';
+      __intakeAssignmentId = null;
+      loadBacklog();
+    };
+    actions.appendChild(capture); actions.appendChild(refine); actions.appendChild(discard);
+    row.appendChild(actions);
+    $log.appendChild(row);
+    scrollToBottom();
+    return row;
+  }
+
+  // ── Codebase memory (Tier-1) viewer / editor ──────────────────────────────
+  const MEM_CATEGORIES = ['architecture', 'conventions', 'gotchas', 'where-things-live', 'build-deploy', 'general'];
+  async function openMemory() {
+    let entries = [];
+    try { const r = await fetch('/api/memory'); entries = (await r.json()).entries || []; }
+    catch (e) { showError('Load memory failed', e); }
+    renderMemoryEditor(entries);
+    const bg = document.getElementById('memoryModalBg');
+    if (bg) bg.classList.add('show');
+  }
+  function closeMemory() { const bg = document.getElementById('memoryModalBg'); if (bg) bg.classList.remove('show'); }
+  function renderMemoryEditor(entries) {
+    const list = document.getElementById('memoryList');
+    if (!list) return;
+    list.innerHTML = '';
+    if (!entries.length) {
+      const e = document.createElement('div'); e.className = 'memory-empty';
+      e.textContent = 'No facts yet. The agent records these with <remember> as it works; you can also add one here.';
+      list.appendChild(e);
+      return;
+    }
+    for (const en of entries) addMemoryRow(en);
+  }
+  function addMemoryRow(entry) {
+    const list = document.getElementById('memoryList');
+    if (!list) return;
+    const empty = list.querySelector('.memory-empty'); if (empty) empty.remove();
+    const row = document.createElement('div'); row.className = 'memory-entry';
+    const sel = document.createElement('select');
+    for (const c of MEM_CATEGORIES) { const o = document.createElement('option'); o.value = c; o.textContent = c; sel.appendChild(o); }
+    sel.value = (entry && MEM_CATEGORIES.includes(entry.category)) ? entry.category : 'general';
+    const ta = document.createElement('textarea'); ta.rows = 2; ta.value = (entry && entry.note) || '';
+    const del = document.createElement('button'); del.className = 'mem-del'; del.textContent = '✕'; del.title = 'Remove'; del.onclick = () => row.remove();
+    row.appendChild(sel); row.appendChild(ta); row.appendChild(del);
+    list.appendChild(row);
+    if (!entry) ta.focus();
+  }
+  async function saveMemory() {
+    const list = document.getElementById('memoryList');
+    const rows = list ? Array.from(list.querySelectorAll('.memory-entry')) : [];
+    const entries = rows
+      .map((r) => ({ category: r.querySelector('select').value, note: (r.querySelector('textarea').value || '').trim() }))
+      .filter((e) => e.note);
+    try {
+      const r = await fetch('/api/memory/replace', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ entries }),
+      });
+      if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.error || ('HTTP ' + r.status)); }
+      closeMemory();
+    } catch (e) { showError('Save memory failed', e); }
   }
 
   // Minimal markdown rendering for assistant text. Supports:
@@ -11081,6 +15017,13 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
 
   function renderSessionInChat(s) {
     showChat(activeProject);
+    // Re-arm infinite-scroll from THIS snapshot. The snapshot is the most
+    // recent <=100 events and carries hasMoreOlder. Without resetting here,
+    // an SSE reconnect / refetch that replaces session.events would leave
+    // _noMoreOlder stuck from a prior full scroll-back, permanently killing
+    // scroll-to-load-older for the rest of the session.
+    _loadingOlder = false;
+    _noMoreOlder = (s.hasMoreOlder === false);
     // Only wipe the welcome banner if there are real events to render in
     // its place. Empty-session initialization should leave the welcome
     // visible so the user has something to read while typing.
@@ -11097,6 +15040,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       stopSpinTick();
     }
     renderStatus();
+    loadBacklog();
   }
 
   function onInit(s) {
@@ -11106,6 +15050,9 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     // If a 401 unlock is in flight when we connect, re-show the modal so
     // a reload or late-arriving tab doesn't leave the user stranded.
     if (s.pendingUnlockUrl) showUnlockModal(s.pendingUnlockUrl);
+    // Re-show a mid-task developer-approval prompt so a reload / late tab
+    // doesn't strand the paused agent.
+    if (s.approvalPending) showApprovalPrompt(s.approvalPending);
     if (!activeProject) {
       showLanding(s.recent || []);
       stopSpinTick();
@@ -11122,6 +15069,15 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     if (!session) return;
     session.version = msg.version;
     switch (msg.type) {
+      case 'backlog':
+        // The assignment backlog changed server-side — refetch + re-render.
+        loadBacklog();
+        break;
+      case 'memory':
+        // Codebase memory changed server-side (consolidation/curation). Do NOT
+        // re-fetch into an OPEN editor — that would wipe the developer's
+        // in-progress edits. openMemory() always fetches fresh on next open.
+        break;
       case 'event':
         // tool-progress streams live stdout from a running tool — render
         // it but do NOT keep it in session.events. The server doesn't
@@ -11130,6 +15086,13 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
         // case below) — visually fine but wasteful, and worse: when the
         // conversation is reloaded from disk after a restart we'd be
         // replaying chunks for a tool that has long since finished.
+        // context-fill is a per-turn gauge update, not a chat row — update the
+        // bar and stop (the server never persists it; don't push it either).
+        if (msg.event.type === 'context-fill') {
+          contextFill = { totalTokens: msg.event.totalTokens, budgetTokens: msg.event.budgetTokens, budgetPct: msg.event.budgetPct };
+          renderStatus();
+          break;
+        }
         if (msg.event.type !== 'tool-progress') session.events.push(msg.event);
         renderEvent(msg.event);
         break;
@@ -11172,6 +15135,18 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
           // Defensive: any tool row still marked running (e.g., agent
           // aborted mid-tool) should stop blinking now.
           $log.querySelectorAll('.row.tool.tool-running').forEach((r) => r.classList.remove('tool-running'));
+          // Sweep ORPHANED streaming bubbles: a prose segment that sanitized to
+          // empty (pure tool-tag noise like "<read ...args/>") never gets its
+          // finalize event, so its data-streaming row is never replaced/removed.
+          // On terminal status, drop any such row whose content is ONLY tool-tag
+          // noise (real prose leaves visible text and is kept).
+          $log.querySelectorAll('.row.assistant[data-streaming="true"]').forEach((r) => {
+            const stripped = (r.textContent || '')
+              .replace(/<remote-workspace\\b[\\s\\S]*?<\\/remote-workspace>/gi, '')
+              .replace(/<\\/?(?:remote-workspace|read|write|edit|list|find|search|info|powershell|next-task|list-tasks|task-detail|search-tasks|remember|forget)\\b[^>]*>/gi, '')
+              .replace(/[\\s●.]+/g, '');   // strip the leading marker + whitespace + stray dots
+            if (!stripped) r.remove();
+          });
           // Repos most likely changed during the chat — refresh the
           // footer indicator now rather than waiting for the next poll.
           refreshGitDirty();
@@ -11183,9 +15158,13 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       case 'phase':
         session.phase = msg.phase;
         // Map server phase strings to the UI's status row phase functions.
-        if (msg.phase === 'uploading')        setUploading();
-        else if (msg.phase === 'thinking')    setThinking();
-        else if (msg.phase === 'downloading') setDownloading();
+        if (msg.phase === 'uploading')        { statusVerb = VERB; setUploading(); }
+        else if (msg.phase === 'thinking')    { statusVerb = VERB; setThinking(); }
+        else if (msg.phase === 'downloading') { statusVerb = VERB; setDownloading(); }
+        // Manager phases: the worker is done; the reviewer / acceptance manager
+        // is now running. Keep the spinner alive but relabel WHO is busy.
+        else if (msg.phase === 'reviewing')   { statusVerb = 'Reviewing'; setThinking(); }
+        else if (msg.phase === 'manager')     { statusVerb = 'Checking the assignment'; setThinking(); }
         renderStatus();
         break;
       case 'tokens':
@@ -11239,6 +15218,12 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
         // is awaiting our /api/git-pending-resolve POST.
         console.log('[sse] git-needs-branch', msg.repoDir);
         showGitBranchPrompt({ repoDir: msg.repoDir, relDir: msg.relDir, currentBranch: msg.currentBranch });
+        break;
+      case 'approval-needed':
+        // Mid-task pause: a tool wants explicit developer approval (e.g.
+        // edit_docx flatten). The tool is awaiting /api/approval-resolve.
+        console.log('[sse] approval-needed', msg.kind);
+        showApprovalPrompt({ id: msg.id, kind: msg.kind, message: msg.message });
         break;
     }
     // Some compaction events the server emits as regular chat events via
@@ -11500,13 +15485,45 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
         break;
       }
       case 'diff':
-        node = addDiffBlock({ diff: ev.diff || '', summary: ev.summary || '' });
+        node = addDiffBlock(ev);
         break;
       case 'review':
+        // Per-task reviews render their verdict in the task's footer. Fall
+        // back to a standalone row when there's no matching task-wrap (e.g.
+        // a legacy review with no reviewTaskId, or a task with no body rows).
+        if (ev.reviewTaskId && renderReviewIntoFooter(ev)) { node = null; break; }
         node = addReviewRow(ev);
         break;
       case 'git-pending-resolution':
         node = addPendingResolutionRow(ev);
+        break;
+      case 'assignment-gate':
+        node = addAssignmentGate(ev);
+        break;
+      case 'assignment-banner':
+        node = addAssignmentBanner(ev);
+        break;
+      case 'memory-consolidated':
+        node = addMemoryConsolidated(ev);
+        break;
+      case 'manager-diagnostic':
+        node = addManagerDiagnostic(ev);
+        break;
+      case 'intake-message':
+        node = addIntakeMessage(ev);
+        break;
+      case 'requirement-card':
+        node = addEditableRequirementCard(ev);
+        break;
+      case 'compacting-started':
+        // Just the marker row. Do NOT seed the live gauge from this event: it is
+        // persisted and gets replayed on every full re-render/reload, where its
+        // numbers are historical. The per-turn ephemeral 'context-fill' SSE
+        // (emitted alongside it live) owns the gauge.
+        node = addCompactionRow(ev);
+        break;
+      case 'task-undo':
+        node = addTaskUndoRow(ev);
         break;
     }
 
@@ -11575,10 +15592,19 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     // Move rows into the body
     for (const r of rows) body.appendChild(r);
 
-    // Footer
+    // Footer — the summary is click-to-edit (item D); it feeds the tier rollup
+    // (future context), so the developer can correct a vague/wrong one. Held in
+    // its own span so the review badge appended later (renderReviewIntoFooter)
+    // coexists with it.
     const foot = document.createElement('div');
     foot.className = 'task-foot';
-    foot.textContent = ev.summary || '(no summary)';
+    if (ev.id) foot.dataset.eventId = String(ev.id);
+    const summarySpan = document.createElement('span');
+    summarySpan.className = 'task-foot-summary';
+    summarySpan.textContent = ev.summary || '(no summary)';
+    summarySpan.title = 'Click to edit this summary';
+    summarySpan.addEventListener('click', () => beginEditTaskSummary(foot, summarySpan, ev));
+    foot.appendChild(summarySpan);
     wrap.appendChild(foot);
 
     scrollToBottom();
@@ -11619,6 +15645,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       try { $input.focus(); } catch {}
     }
     if ($queueBtn) $queueBtn.style.display = running ? '' : 'none';
+    if ($steerBtn) $steerBtn.style.display = running ? '' : 'none';   // steer only matters mid-run (item H)
     renderQueue();        // play buttons enable/disable when status flips
   }
 
@@ -11629,6 +15656,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   // dropped on page reload by design.
   const $queueStack = document.getElementById('queueStack');
   const $queueBtn   = document.getElementById('queueBtn');
+  const $steerBtn   = document.getElementById('steerBtn');
   let _inputQueue = [];     // [{ id, text }]
   let _queueIdCounter = 0;
 
