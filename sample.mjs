@@ -15,7 +15,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '139';
+const BUILD_VERSION = '140';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
@@ -5805,6 +5805,27 @@ docxPlugin;
 const HELPER_MAIN = 'com.codeboss.docx.DocxHelper';
 const HELPER_JAR = 'codeboss-docx-helper.jar';
 
+// The POI 5.5.1 dependency closure the helper is compiled against, each with
+// its Maven repository path. Surfaced verbatim in the missing-deps message so
+// an air-gapped operator can pull the exact files. Coordinates confirmed from
+// each jar's META-INF/maven pom.properties (or manifest Implementation-Vendor
+// for the POI/xmlbeans jars, which strip pom.properties).
+const DOCX_DEP_JARS = [
+  ['poi-ooxml-5.5.1.jar',           'org/apache/poi/poi-ooxml/5.5.1/poi-ooxml-5.5.1.jar'],
+  ['poi-5.5.1.jar',                 'org/apache/poi/poi/5.5.1/poi-5.5.1.jar'],
+  ['poi-ooxml-lite-5.5.1.jar',      'org/apache/poi/poi-ooxml-lite/5.5.1/poi-ooxml-lite-5.5.1.jar'],
+  ['xmlbeans-5.3.0.jar',            'org/apache/xmlbeans/xmlbeans/5.3.0/xmlbeans-5.3.0.jar'],
+  ['SparseBitSet-1.3.jar',          'com/zaxxer/SparseBitSet/1.3/SparseBitSet-1.3.jar'],
+  ['curvesapi-1.08.jar',            'com/github/virtuald/curvesapi/1.08/curvesapi-1.08.jar'],
+  ['commons-codec-1.20.0.jar',      'commons-codec/commons-codec/1.20.0/commons-codec-1.20.0.jar'],
+  ['commons-collections4-4.5.0.jar','org/apache/commons/commons-collections4/4.5.0/commons-collections4-4.5.0.jar'],
+  ['commons-compress-1.28.0.jar',   'org/apache/commons/commons-compress/1.28.0/commons-compress-1.28.0.jar'],
+  ['commons-io-2.21.0.jar',         'commons-io/commons-io/2.21.0/commons-io-2.21.0.jar'],
+  ['commons-lang3-3.18.0.jar',      'org/apache/commons/commons-lang3/3.18.0/commons-lang3-3.18.0.jar'],
+  ['commons-math3-3.6.1.jar',       'org/apache/commons/commons-math3/3.6.1/commons-math3-3.6.1.jar'],
+  ['log4j-api-2.24.3.jar',          'org/apache/logging/log4j/log4j-api/2.24.3/log4j-api-2.24.3.jar'],
+];
+
 // Same root-containment guard as the built-in write tools (resolveDocxWritePath in
 // src/agent/tools.mjs — not exported, so replicated here). Reads are NOT gated.
 function resolveDocxWritePath(p) {
@@ -5881,17 +5902,15 @@ function bootstrapFromSource() {
   try { libs = existsSync(libDir) ? readdirSync(libDir).filter((f) => f.toLowerCase().endsWith('.jar')) : []; } catch { /* */ }
   if (!libs.length) {
     mkdirSync(libDir, { recursive: true });
+    const bullets = DOCX_DEP_JARS.map(([jar, p]) => `  - ${jar}\n        ${p}`).join('\n');
     const e = new Error(
-      'docx editing needs the Apache POI dependency jars (one-time setup). Copy these ' +
-      '13 jars (the POI 5.5.1 closure code_boss was built + tested against) into this folder:\n  ' +
-      libDir + '\n' +
-      '    poi-ooxml-5.5.1.jar, poi-5.5.1.jar, poi-ooxml-lite-5.5.1.jar, xmlbeans-5.3.0.jar,\n' +
-      '    SparseBitSet-1.3.jar, curvesapi-1.08.jar, commons-codec-1.20.0.jar,\n' +
-      '    commons-collections4-4.5.0.jar, commons-compress-1.28.0.jar, commons-io-2.21.0.jar,\n' +
-      '    commons-lang3-3.18.0.jar, commons-math3-3.6.1.jar, log4j-api-2.24.3.jar\n' +
-      '(matching versions are safest; or set CODEBOSS_DOCX_LIB to a folder that already ' +
-      'contains them). Then restart. The helper itself is compiled automatically from source ' +
-      'embedded in this bundle — a JDK 11+ (javac) must be on PATH.'
+      'docx editing needs the Apache POI 5.5.1 dependency jars (one-time setup; the closure ' +
+      'code_boss was built + tested against). Copy these 13 jars into:\n  ' + libDir + '\n' +
+      'Each jar, with its Maven repository path:\n' +
+      bullets + '\n' +
+      '(matching versions are safest; or set CODEBOSS_DOCX_LIB to a folder that already contains ' +
+      'them). Then restart. The helper compiles automatically from source embedded in this bundle ' +
+      '— a JDK 11+ (javac) must be on PATH.'
     );
     e.code = 'docx-needs-deps';
     throw e;
