@@ -15,7 +15,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '172';
+const BUILD_VERSION = '179';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
@@ -214,6 +214,10 @@ function createHttpAdapter(opts = {}) {
   const maxRetries = opts.maxRetries ?? 3;
   const onUnlock = opts.onUnlock ?? (() => {});
   const onRateLimit = opts.onRateLimit ?? (() => {});
+  // Called before each network-retry backoff ({attempt,max,waitMs,cause}) and on
+  // recovery — lets the host show a "Reconnecting…" status instead of a silent hang.
+  const onNetworkRetry = opts.onNetworkRetry ?? (() => {});
+  const onNetworkRecover = opts.onNetworkRecover ?? (() => {});
   const onUsage = opts.onUsage ?? (() => {});
   const debug = opts.debug ?? (process.env.AGENT_DEBUG === '1');
   const onTransaction = opts.onTransaction ?? (() => {});
@@ -240,6 +244,7 @@ function createHttpAdapter(opts = {}) {
       let res;
       try {
         res = await doFetchOnce(path, init);
+        if (netAttempt > 0) onNetworkRecover();   // connection came back after retrying
       } catch (err) {
         // NETWORK-level failure: the request never got an HTTP response
         // (connection refused, DNS, reset, TLS). Node surfaces this as a bare
@@ -250,8 +255,10 @@ function createHttpAdapter(opts = {}) {
         if (err?.name === 'AbortError') throw err;
         const cause = err?.cause?.code || err?.cause?.message || err?.code || err?.message || 'network error';
         if (netAttempt < maxRetries) {
-          await sleep(500 * Math.pow(2, netAttempt));
+          const waitMs = 500 * Math.pow(2, netAttempt);
           netAttempt++;
+          onNetworkRetry({ attempt: netAttempt, max: maxRetries, waitMs, cause });
+          await sleep(waitMs);
           continue;
         }
         const e = new Error(`could not reach the LLM endpoint ${baseURL} (${cause}) after ${maxRetries + 1} attempts. Is the endpoint/proxy running and reachable from this machine?`);
@@ -602,6 +609,8 @@ function createAnthropicAdapter(opts = {}) {
   const defaultMaxTokens = Number(opts.maxTokens ?? process.env.AGENT_MAX_TOKENS) > 0 ? Number(opts.maxTokens ?? process.env.AGENT_MAX_TOKENS) : DEFAULT_MAX_TOKENS;
   const onUnlock = opts.onUnlock ?? (() => {});
   const onRateLimit = opts.onRateLimit ?? (() => {});
+  const onNetworkRetry = opts.onNetworkRetry ?? (() => {});
+  const onNetworkRecover = opts.onNetworkRecover ?? (() => {});
   const onUsage = opts.onUsage ?? (() => {});
   const onTransaction = opts.onTransaction ?? (() => {});
   const debug = opts.debug ?? (process.env.AGENT_DEBUG === '1');
@@ -626,6 +635,7 @@ function createAnthropicAdapter(opts = {}) {
       let res;
       try {
         res = await doFetchOnce(path, init, stream);
+        if (netAttempt > 0) onNetworkRecover();
       } catch (err) {
         // Network-level failure (no HTTP response): refused/DNS/reset/TLS — Node
         // surfaces it as a bare "fetch failed". A user abort is not retryable;
@@ -634,8 +644,10 @@ function createAnthropicAdapter(opts = {}) {
         if (err?.name === 'AbortError') throw err;
         const cause = err?.cause?.code || err?.cause?.message || err?.code || err?.message || 'network error';
         if (netAttempt < maxRetries) {
-          await anthSleep(500 * Math.pow(2, Math.min(netAttempt, 5)));
+          const waitMs = 500 * Math.pow(2, Math.min(netAttempt, 5));
           netAttempt++;
+          onNetworkRetry({ attempt: netAttempt, max: maxRetries, waitMs, cause });
+          await anthSleep(waitMs);
           continue;
         }
         const e = new Error(`could not reach the LLM endpoint ${baseURL} (${cause}) after ${maxRetries + 1} attempts. Is the proxy/endpoint running and reachable?`);
@@ -1104,18 +1116,16 @@ function stripBom(s) {
 }
 
 /**
- * Guard a WRITE path against escaping the project root. process.cwd() is
- * chdir'd to the active project (the workspace root) during a chat, so any
- * write must resolve under it. Reads are intentionally NOT gated — the wl
- * workflow legitimately reads the user's ~/myWlSetup.bat outside the project.
+ * Resolve a WRITE path. Relative paths resolve under the project root (cwd is
+ * chdir'd to the active project during a chat); absolute paths are honored as-is.
+ * We do NOT contain writes to the project: the agent legitimately edits files
+ * OUTSIDE it (e.g. ~/myWlSetup.bat to clear MY_WL_SERVER before a deploy), and
+ * since it can already write anywhere via PowerShell, blocking the write/edit
+ * tool only pushed it onto a worse path. (Reads were already ungated.)
  */
 function resolveWritePath(p) {
   const root = path.resolve(process.cwd());
-  const abs = path.isAbsolute(p) ? path.resolve(p) : path.resolve(root, p);
-  if (abs !== root && !abs.startsWith(root + path.sep)) {
-    throw new Error(`path escapes project root: ${p}`);
-  }
-  return abs;
+  return path.isAbsolute(p) ? path.resolve(p) : path.resolve(root, p);
 }
 
 const IGNORE_DIRS = new Set(['node_modules', '.git', 'dist', '.code_boss', '.agent', 'coverage']);
@@ -1136,7 +1146,14 @@ const MAX_GLOB_RESULTS = 5000;
 // Bash defaults — match Claude Code's tunables loosely.
 const BASH_DEFAULT_TIMEOUT_MS = 120000;     // 2 min
 const BASH_MAX_TIMEOUT_MS = 600000;         // 10 min
-const BASH_MAX_OUTPUT_CHARS = 30000;        // truncate stdout/stderr beyond this
+// Shell output capture. We keep the HEAD (what command/context) AND the TAIL
+// (the result — BUILD SUCCESS/FAILURE + the actual error live at the END of a
+// build log). The old code kept only a 30k HEAD and stopped accumulating, so a
+// long Maven/WebLogic build's outcome was never even captured — "cut short".
+// Generous so most builds aren't truncated at all; bounded so a runaway command
+// can't OOM the loop.
+const SHELL_OUTPUT_HEAD = 12000;            // keep the first N chars
+const SHELL_OUTPUT_TAIL = 120000;           // keep the last N chars (the result)
 
 class TooLargeError extends Error {
   constructor(actualBytes) {
@@ -1543,7 +1560,29 @@ const tools = {
 
       const t0 = Date.now();
       return await new Promise((resolve) => {
+        // Head + tail capture (see SHELL_OUTPUT_HEAD/TAIL): *Head holds the first
+        // chars, the main buffer holds the last TAIL chars (sliding), *Total is the
+        // full byte count for the truncation notice.
         let stdout = '', stderr = '', timedOut = false, settled = false;
+        let stdoutHead = '', stderrHead = '', stdoutTotal = 0, stderrTotal = 0;
+        const capture = (which, s) => {
+          if (which === 'out') {
+            stdoutTotal += s.length;
+            if (stdoutHead.length < SHELL_OUTPUT_HEAD) stdoutHead = (stdoutHead + s).slice(0, SHELL_OUTPUT_HEAD);
+            stdout = (stdout + s).slice(-SHELL_OUTPUT_TAIL);
+          } else {
+            stderrTotal += s.length;
+            if (stderrHead.length < SHELL_OUTPUT_HEAD) stderrHead = (stderrHead + s).slice(0, SHELL_OUTPUT_HEAD);
+            stderr = (stderr + s).slice(-SHELL_OUTPUT_TAIL);
+          }
+        };
+        // Build the display body: full output if it fit in the tail buffer,
+        // else HEAD + a truncation marker + TAIL (so the build's outcome survives).
+        const bodyFor = (tail, head, total) => {
+          if (total <= SHELL_OUTPUT_TAIL) return tail;
+          const dropped = total - SHELL_OUTPUT_HEAD - tail.length;
+          return head + `\n[... ${dropped} chars truncated from the middle — showing the first ${SHELL_OUTPUT_HEAD} and last ${tail.length} ...]\n` + tail;
+        };
         // Coalesce stdout/stderr chunks into ~150ms batches when forwarding
         // to the live-progress channel. Otherwise a noisy build can fire
         // hundreds of SSE deltas per second.
@@ -1613,12 +1652,12 @@ const tools = {
         const errDecoder = new StringDecoder('utf8');
         child.stdout.on('data', (d) => {
           const s = outDecoder.write(d);
-          if (stdout.length < BASH_MAX_OUTPUT_CHARS * 2) stdout += s;
+          capture('out', s);
           queueProgress(s);
         });
         child.stderr.on('data', (d) => {
           const s = errDecoder.write(d);
-          if (stderr.length < BASH_MAX_OUTPUT_CHARS * 2) stderr += s;
+          capture('err', s);
           queueProgress(s);
         });
         child.on('error', (err) => {
@@ -1641,16 +1680,14 @@ const tools = {
           if (ctx?.signal) ctx.signal.removeEventListener('abort', onAbort);
           // Flush any bytes the decoders are still holding (a trailing
           // partial multi-byte sequence at stream end).
-          const outTail = outDecoder.end();
-          if (outTail && stdout.length < BASH_MAX_OUTPUT_CHARS * 2) stdout += outTail;
-          const errTail = errDecoder.end();
-          if (errTail && stderr.length < BASH_MAX_OUTPUT_CHARS * 2) stderr += errTail;
+          const outFlush = outDecoder.end();
+          if (outFlush) capture('out', outFlush);
+          const errFlush = errDecoder.end();
+          if (errFlush) capture('err', errFlush);
           if (progressTimer) { clearTimeout(progressTimer); flushProgress(); }
           const elapsed = Date.now() - t0;
-          const outTrunc = stdout.length > BASH_MAX_OUTPUT_CHARS;
-          const errTrunc = stderr.length > BASH_MAX_OUTPUT_CHARS;
-          const outBody = outTrunc ? (stdout.slice(0, BASH_MAX_OUTPUT_CHARS) + `\n[...${stdout.length - BASH_MAX_OUTPUT_CHARS} more chars truncated]`) : stdout;
-          const errBody = errTrunc ? (stderr.slice(0, BASH_MAX_OUTPUT_CHARS) + `\n[...${stderr.length - BASH_MAX_OUTPUT_CHARS} more chars truncated]`) : stderr;
+          const outBody = bodyFor(stdout, stdoutHead, stdoutTotal);
+          const errBody = bodyFor(stderr, stderrHead, stderrTotal);
           const header = cancelled
             ? `command canceled by user after ${elapsed}ms`
             : timedOut
@@ -1670,10 +1707,14 @@ const tools = {
               '  - higher timeout_ms (max 600000) if the operation is inherently slow but useful\n' +
               'Re-running the exact same command will time out again.'
             : '';
+          // ALWAYS emit both delimited sections (stdout AND stderr), even when
+          // empty, so the model is never left guessing whether stderr was shown
+          // — especially on a failure whose only output is on stderr. Both
+          // streams are captured + head/tail-capped independently above.
           const text = [
             header,
-            outBody ? `--- stdout ---\n${outBody}` : '(no stdout)',
-            errBody ? `--- stderr ---\n${errBody}` : '',
+            `--- stdout ---\n${outBody || '(no stdout)'}`,
+            `--- stderr ---\n${errBody || '(no stderr)'}`,
             hint,
           ].filter(Boolean).join('\n').trim();
           // Timeout is a failure mode the agent should see as an error
@@ -3645,19 +3686,23 @@ async function runPromptedAgent({
     const r = await store.transitionTo({ summary, userRequest });
     stats.autoClosed++;
     log(`auto-close: task ${r.closedId} hit budget — closed with summary "${summary.slice(0, 80)}"; opened ${r.newTask.id}`);
-    let commitHash = null, commits = null;
+    let commitHash = null, commits = null, committedRepos = null, commitError = null;
     if (typeof onTaskClose === 'function') {
       try {
         const closeRes = await onTaskClose({ closedTaskId: r.closedId, newTaskId: r.newTask.id, userRequest, summary });
-        if (closeRes && typeof closeRes === 'object') { commitHash = closeRes.hash ?? null; commits = Array.isArray(closeRes.commits) ? closeRes.commits : null; }
-        else commitHash = closeRes ?? null;
+        if (closeRes && typeof closeRes === 'object') {
+          commitHash = closeRes.hash ?? null;
+          commits = Array.isArray(closeRes.commits) ? closeRes.commits : null;
+          committedRepos = Array.isArray(closeRes.committedRepos) ? closeRes.committedRepos : null;
+          commitError = closeRes.gitError ?? null;
+        } else commitHash = closeRes ?? null;
       } catch (e) { log(`auto-close onTaskClose error: ${e.message}`); }
     }
     if (commitHash && r.closedId) { try { await store.attachToTask(r.closedId, { commitHash }); } catch { /* */ } }
     // Auto-close fires at turn TOP, before any work for M this turn — so M (if
     // it just arrived into the now-closed task) belongs to the fresh task.
     await maybeRelocateLeadingUserMsg(r.closedId, r.newTask.id);
-    emitChat({ type: 'task-end', taskId: r.closedId, userRequest, summary, commitHash, commits, auto: true });
+    emitChat({ type: 'task-end', taskId: r.closedId, userRequest, summary, commitHash, commits, committedRepos, commitError, auto: true });
     // Demote the just-closed task right away so THIS turn's prompt is bounded.
     try { await maybeCompact({ store, adapter, model, log, emitChat }); } catch { /* */ }
     return store.getCurrent();
@@ -3952,6 +3997,8 @@ async function runPromptedAgent({
           if (!closingHadUserMsg && !didMutateThisTurn) sawUnproductiveClose = true;
           let commitHash = null;
           let commits = null;
+          let committedRepos = null;
+          let commitError = null;
           if (typeof onTaskClose === 'function') {
             try {
               const closeRes = await onTaskClose({
@@ -3961,10 +4008,12 @@ async function runPromptedAgent({
                 summary: c.args.summary ?? '',
               });
               // onTaskClose may return a bare hash string (legacy/tests) or
-              // { hash, commits } (multi-repo). Accept both shapes.
+              // { hash, commits, committedRepos, gitError } (multi-repo). Accept both.
               if (closeRes && typeof closeRes === 'object') {
                 commitHash = closeRes.hash ?? null;
                 commits = Array.isArray(closeRes.commits) ? closeRes.commits : null;
+                committedRepos = Array.isArray(closeRes.committedRepos) ? closeRes.committedRepos : null;
+                commitError = closeRes.gitError ?? null;
               } else {
                 commitHash = closeRes ?? null;
               }
@@ -3983,6 +4032,8 @@ async function runPromptedAgent({
             summary: c.args.summary ?? '',
             commitHash,
             commits,
+            committedRepos,
+            commitError,
           });
         }
       } else if (discussMode && !WORKER_READONLY_VERBS.has(c.verb)) {
@@ -4288,6 +4339,14 @@ async function runPromptedAgent({
 // use only). Same parser as the dev agent; non-allowlisted verbs are dropped.
 const REVIEWER_TOOL_VERBS = new Set(['list', 'read', 'search', 'find', 'info', 'powershell']);
 const REVIEWER_MAX_TURNS = 6;
+// When the reviewer's verdict turn has no parseable tag, re-prompt it to emit
+// the tag (rather than guessing from prose). Bounded so a model that keeps
+// reporting in Markdown can't loop forever — after this many corrections we
+// fall back to prose-inference + default-pass.
+const REVIEWER_MAX_CORRECTIONS = (() => {
+  const n = Number(process.env.REVIEWER_MAX_CORRECTIONS);
+  return Number.isFinite(n) && n >= 0 ? n : 2;
+})();
 
 const REVIEWER_SYSTEM_PROMPT = `You are a code review agent. Another agent has just completed work on behalf of a developer. Review that work for three categories of issues. Be specific and concise — the dev agent will act on your feedback verbatim.
 
@@ -4336,13 +4395,21 @@ You are given one or more <task id="..."> blocks — each is a completed task to
 
 The remote workspace will reply with <remote-workspace-result> blocks containing real data. Read those before deciding.
 
-OUTPUT FORMAT
-When you have enough information, emit a verdict for EVERY task, in a turn with NO tool calls. Address each task by id:
+OUTPUT FORMAT — STRICT. When you are done verifying, your FINAL turn must have NO tool calls and consist of ONLY the verdict tag(s) below. Do NOT write a Markdown report, a heading, a table, or a "### Final Verdict" / "Execution Assessment" / "Task Review Summary" section. Do NOT restate the task or address the developer. Emit the tag(s) and nothing else — the literal tag is the only signal we read; prose verdicts are discarded.
+
+Emit one verdict per task, addressed by id:
   <review task="T-3" pass/>
-  <review task="T-5" fail>specific, actionable concerns for T-5</review>
-If there is exactly ONE task you may omit the id and use the short form:
+  <review task="T-5" fail>name the file, what is wrong, and what would fix it</review>
+If there is EXACTLY ONE task, omit the id and use the short form:
   <review-pass/>
   <review-fail>specific, actionable concerns</review-fail>
+
+A CORRECT single-task PASS is this and only this — the ENTIRE response:
+  <review-pass/>
+A CORRECT single-task FAIL is the ENTIRE response, e.g.:
+  <review-fail>src/auth.js:42 — the new early-return skips the audit-log call on the success path; move the log above the return.</review-fail>
+
+Do NOT write "I find this task successfully completed", "### Final Verdict", or any prose summary — that is NOT a valid verdict.
 
 Pass a task when its work is correct and complete enough to ship. Fail only when there's something the dev agent should fix — be specific: name the file, the element, what's wrong, and what would fix it. Do not flag items the dev agent already noticed and fixed in the same task, and do not flag anything that only appears in <context>.`;
 
@@ -4450,6 +4517,22 @@ function parseReviewVerdicts(prose, taskIds, verdicts) {
   return added;
 }
 
+// Fallback when the reviewer emits a PROSE verdict (a Markdown "Final Verdict"
+// report) instead of the <review-pass>/<review-fail> tag. Classify the prose so
+// a prose FAIL is NOT silently turned into a default pass (fail-closed bias).
+// Returns { pass, lowConfidence } or null when there is no signal at all.
+function inferVerdictFromProse(prose) {
+  const t = String(prose || '').toLowerCase();
+  if (!t.trim()) return null;
+  const failRe = /\b(review[- ]?fail|fail(ed|s|ure)?|not\s+(complete|completed|done|fulfilled)|incomplete|does not (pass|meet)|issues? (found|remain)|problems? found|must (fix|be fixed)|should (fix|be fixed)|reject(ed)?|blocking|regression)\b/;
+  const passRe = /\b(review[- ]?pass|successfully completed|task (is )?(successfully )?(complete|completed|done)|find this task (successfully )?completed|looks good|lgtm|no issues|approved|ship it|correct and complete|passes( review)?)\b/;
+  const failHit = failRe.test(t);
+  const passHit = passRe.test(t);
+  if (failHit) return { pass: false, lowConfidence: true };   // any failure language → fail-closed (even if pass words also appear)
+  if (passHit) return { pass: true, lowConfidence: true };
+  return null;
+}
+
 // Surface a manager-pass parse miss (the model finished but emitted no
 // parseable structured tag, so the pass fell back to its safe default). The
 // raw model text is carried so the UI can show it for prompt-tuning against
@@ -4520,6 +4603,9 @@ async function runReviewer({ adapter, model, tasks, signal, onLog, onDiag, repoR
     { role: 'system', content: REVIEWER_SYSTEM_PROMPT },
     { role: 'user', content: userBlock },
   ];
+  // Cumulative corrective re-prompts issued across the whole review (NOT reset
+  // per turn) so the retry budget is hard-bounded.
+  let corrections = 0;
 
   for (let turn = 1; turn <= REVIEWER_MAX_TURNS; turn++) {
     if (signal?.aborted) {
@@ -4543,8 +4629,35 @@ async function runReviewer({ adapter, model, tasks, signal, onLog, onDiag, repoR
       const proseOnly = text.replace(/<remote-workspace\b[^>]*>[\s\S]*?<\/remote-workspace>/gi, '');
       parseReviewVerdicts(proseOnly, taskIds, verdicts);
       if (taskIds.every((id) => verdicts.has(id))) return finalize();
-      // No tool calls and not all tasks ruled on → the reviewer is done;
-      // default the rest to pass so the user isn't blocked.
+      // No parseable tag for some task(s). FIRST try: re-prompt the reviewer to
+      // emit the tag (some models reply with a Markdown "Final Verdict" report
+      // instead). Only after the correction budget is spent do we guess from
+      // prose / default to pass. The guard `turn < REVIEWER_MAX_TURNS` avoids
+      // burning the final turn on a re-prompt that has no turn left to answer.
+      const unruled = taskIds.filter((id) => !verdicts.has(id));
+      if (corrections < REVIEWER_MAX_CORRECTIONS && turn < REVIEWER_MAX_TURNS) {
+        corrections++;
+        const tagHelp = taskList.length === 1
+          ? '<review-pass/>\nOR\n<review-fail>specific, actionable concerns</review-fail>'
+          : unruled.map((id) => `<review task="${id}" pass/>   (or)   <review task="${id}" fail>concerns</review>`).join('\n');
+        const correction = `Your last turn did not include a parseable verdict tag for ${unruled.length} task(s): ${unruled.join(', ')}. A Markdown report or "Final Verdict" prose is NOT read — only the literal tag is. Reply with ONLY the verdict tag(s) below and nothing else:\n${tagHelp}`;
+        log(`reviewer turn ${turn}: no verdict tag; corrective re-prompt ${corrections}/${REVIEWER_MAX_CORRECTIONS} for ${unruled.join(', ')}`);
+        emitDiag(onDiag, 'reviewer', `reviewer reply had no <review-pass>/<review-fail> tag for ${unruled.length} task(s) (${unruled.join(', ')}); sent a corrective re-prompt (retry ${corrections}/${REVIEWER_MAX_CORRECTIONS})`, proseOnly);
+        messages.push({ role: 'assistant', content: text });
+        messages.push({ role: 'user', content: correction });
+        continue;
+      }
+      // Correction budget spent. Before defaulting to pass, try to INFER
+      // pass/fail from the reviewer's prose. A prose FAIL must NOT be silently
+      // turned into a pass.
+      const inferred = inferVerdictFromProse(proseOnly);
+      if (inferred) {
+        let n = 0;
+        for (const id of taskIds) if (!verdicts.has(id)) { verdicts.set(id, { ...inferred, inferredFromProse: true }); n++; }
+        emitDiag(onDiag, 'reviewer', `reviewer emitted a PROSE verdict instead of a <review-${inferred.pass ? 'pass' : 'fail'}> tag for ${n} task(s); inferred ${inferred.pass ? 'PASS' : 'FAIL'} from the text (low confidence — verify)`, proseOnly);
+        if (taskIds.every((id) => verdicts.has(id))) return finalize();
+      }
+      // Still unruled with no signal at all → default to pass so the user isn't blocked.
       log(`reviewer turn ${turn}: no tool calls; ${verdicts.size}/${taskIds.length} tasks ruled on — defaulting the rest to pass`);
       emitDiag(onDiag, 'reviewer', `no <review-pass>/<review-fail> verdict for ${taskIds.length - verdicts.size} of ${taskIds.length} task(s); defaulted them to pass`, proseOnly);
       return finalize();
@@ -5696,16 +5809,42 @@ async function commitAll(dir, message) {
 }
 
 /**
+ * Strip Markdown / report formatting from a summary down to a clean one-line
+ * commit subject. The worker's <next-task summary> sometimes pastes the
+ * reviewer's Markdown verdict ("### Final Verdict\n- ✅ looks good"), which
+ * makes for an ugly commit log. Take the first meaningful line, drop heading
+ * hashes, leading bullets/numbering, surrounding emphasis, and emoji.
+ */
+function sanitizeSummary(summary) {
+  const lines = String(summary || '').replace(/\r\n/g, '\n').split('\n');
+  for (let raw of lines) {
+    let s = raw
+      .replace(/^[#>\s]+/, '')              // heading hashes / blockquote markers / indent
+      .replace(/^[-*+•]\s+/, '')            // bullet markers
+      .replace(/^\d+[.)]\s+/, '')           // numbered list "1." / "1)"
+      .replace(/[*_`]+/g, '')               // emphasis / code ticks
+      // strip a leading emoji + optional separator (✅ 🚀 etc.)
+      .replace(/^[\u{1F000}-\u{1FFFF}\u{2190}-\u{27BF}\u{2B00}-\u{2BFF}️‍]+[\s:–—-]*/u, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    // Skip pure-formatting lines (e.g. a "---" rule or an empty heading).
+    if (s && !/^[-=_*\s]+$/.test(s)) return s;
+  }
+  return '';
+}
+
+/**
  * Build a commit message from the next-task attributes. Subject is the
  * summary (truncated to fit a normal git log column); body has the
  * user-request that prompted the work.
  */
 function buildCommitMessage({ summary, userRequest, assignmentId }) {
   const tag = assignmentId ? `[${assignmentId}] ` : '';
-  // Prefer the agent's summary; if it's blank, fall back to the user-request
-  // (the one-line "what was wanted") before the generic 'task', so a task closed
-  // with an empty <next-task> summary doesn't produce a bare "task" commit.
-  const base = String(summary || '').trim() || String(userRequest || '').replace(/\s+/g, ' ').trim() || 'task';
+  // Prefer the agent's summary (sanitized of any pasted Markdown); if it's
+  // blank, fall back to the user-request (the one-line "what was wanted")
+  // before the generic 'task', so a task closed with an empty <next-task>
+  // summary doesn't produce a bare "task" commit.
+  const base = sanitizeSummary(summary) || String(userRequest || '').replace(/\s+/g, ' ').trim() || 'task';
   const subject = (tag + base.replace(/\s+/g, ' ').trim()).slice(0, 72) || 'task';
   const body = userRequest ? `\n\nUser request: ${String(userRequest).trim()}` : '';
   const asg = assignmentId ? `\nAssignment: ${assignmentId}` : '';
@@ -5897,6 +6036,112 @@ const WL_START_SCRIPT = process.env.CODEBOSS_WL_START_SCRIPT || 'D:\\j\\wls\\12c
 const WL_GIT_SERVER = 'https://git-oci.int.dmdc.osd.mil';
 const WL_DOCS_REPO  = 'incubator/sandbox/weblogicdesktopscripts';
 
+// ── App URL construction (for the UI "Open" button — NO browser launch) ─────
+// `wl run <app>` prints the URL but also opens a browser tab. To get the URL
+// WITHOUT a tab we construct it ourselves: https://<host>:7102/[<prefix>/]<ctx>
+// where host comes from MY_WL_SERVER (default localhost), the context-root from
+// the app's EAR META-INF/application.xml, and an optional Appj prefix from the
+// same wl config. The server monitors the SERVER on 7101; 7102 is the app's
+// HTTPS listen port. Env-overridable in case a domain uses a different port.
+const WL_HTTPS_PORT = Number(process.env.CODEBOSS_WL_HTTPS_PORT) || 7102;
+
+// Parse the wl user-config (a Windows .bat of `set NAME=VALUE` lines) into a
+// {NAME: VALUE} map WITHOUT executing it. Missing file → {} (host defaults).
+async function readWlConfig(configPath = WL_CONFIG_PATH) {
+  let text;
+  try { text = await readFile(configPath, 'utf8'); }
+  catch { return {}; }
+  const cfg = {};
+  for (const line of text.split(/\r?\n/)) {
+    const m = line.match(/^\s*set\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/i);
+    if (!m) continue;
+    let v = m[2].replace(/\s+$/, '').trim();
+    if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
+    cfg[m[1].toUpperCase()] = v;   // last-wins on duplicates
+  }
+  return cfg;
+}
+
+// Host for the app URL: MY_WL_SERVER if it names a real host, else localhost.
+function wlHostFromConfig(cfg) {
+  const v = (cfg?.MY_WL_SERVER || '').trim();
+  if (!v || /^(localhost|127\.0\.0\.1)$/i.test(v)) return 'localhost';
+  return v;
+}
+
+// Optional extra path segment ("Appj Prefix"). The exact config var name varies
+// by install; accept a few plausible keys and treat blank / "not set" as unset.
+function wlAppjPrefix(cfg) {
+  const raw = (cfg?.APPJ_PREFIX || cfg?.APPJPREFIX || cfg?.MY_APPJ_PREFIX || cfg?.APPJ || '').trim();
+  if (!raw || /^not\s*set$/i.test(raw)) return '';
+  return raw.replace(/^\/+|\/+$/g, '');
+}
+
+// Find the EAR application descriptor under an app dir and pull the WEB module's
+// <context-root>. Regex parse (zero-dep, namespace-agnostic) — survives the JEE
+// vs Jakarta namespace variants. Returns { contextRoot, filePath, multiple } or
+// null when no descriptor/context-root is found.
+async function readContextRoot(appDir) {
+  const matches = [];
+  await (async function walk(dir, depth) {
+    if (depth > 8) return;
+    let entries;
+    try { entries = await readdir(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) {
+        if (e.name === 'node_modules' || e.name === '.git') continue;
+        await walk(full, depth + 1);
+      } else if (e.isFile() && e.name.toLowerCase() === 'application.xml'
+                 && /[\\/]META-INF[\\/]application\.xml$/i.test(full)) {
+        matches.push(full);
+      }
+    }
+  })(appDir, 0);
+  if (matches.length === 0) return null;
+  // Prefer a built/staging copy (target/dist/build/staging/.ear) over a source one.
+  const score = (p) => (/(?:target|dist|build|staging|\.ear)[\\/]/i.test(p) ? 1 : 0);
+  matches.sort((a, b) => score(b) - score(a));
+  for (const file of matches) {
+    let xml;
+    try { xml = await readFile(file, 'utf8'); } catch { continue; }
+    const clean = xml.replace(/<!--[\s\S]*?-->/g, '');   // ignore commented-out modules
+    const m = clean.match(/<(?:\w+:)?web>[\s\S]*?<(?:\w+:)?context-root>\s*([^<]+?)\s*<\/(?:\w+:)?context-root>/i);
+    if (m) {
+      let cr = m[1].trim();
+      if (!cr.startsWith('/')) cr = '/' + cr;
+      cr = cr.replace(/\/+$/, '') || '/';
+      return { contextRoot: cr, filePath: file, multiple: matches.length > 1 };
+    }
+  }
+  return null;
+}
+
+// Compose the full app URL. ALWAYS resolves (never throws) so a failure here
+// can never break a deploy — the UI just disables the Open button with a reason.
+async function computeAppUrl(appName, workspaceDir) {
+  try {
+    const name = String(appName || '').trim();
+    if (!name || /[\\/]/.test(name) || name.includes('..')) {
+      return { ok: false, reason: 'bad-app', detail: 'invalid app name' };
+    }
+    if (!workspaceDir) return { ok: false, reason: 'no-workspace', detail: 'no project open' };
+    const appDir = path.join(workspaceDir, name);
+    const cfg = await readWlConfig();
+    const host = wlHostFromConfig(cfg);
+    const prefix = wlAppjPrefix(cfg);
+    const cr = await readContextRoot(appDir);
+    if (!cr) {
+      return { ok: false, reason: 'no-context-root', detail: `Could not find META-INF/application.xml with a <context-root> under ${appDir}` };
+    }
+    const segs = [prefix, cr.contextRoot.replace(/^\//, '')].filter(Boolean).join('/');
+    const url = `https://${host}:${WL_HTTPS_PORT}/${segs}`;
+    return { ok: true, url, host, port: WL_HTTPS_PORT, contextRoot: cr.contextRoot, appjPrefix: prefix || null, source: cr.filePath, multipleWebModules: cr.multiple === true };
+  } catch (e) {
+    return { ok: false, reason: 'error', detail: e?.message || String(e) };
+  }
+}
+
 const WL_PROMPT = `
 The "wl" command is available — a developer wrapper around git + maven for
 WebLogic-deployable projects. It runs from the WORKSPACE directory (the active
@@ -5919,8 +6164,14 @@ Build / deploy / run actions — THIS is exactly what each does; do not assume:
                    WebLogic server status (RUNNING / STOPPED on port 7101) is reported to you
                    EVERY turn in your context — wait until it says RUNNING.
 
-So to deploy your latest changes AND view them, use "quickall <app>" (or
-"all <app>" if you need unit tests / the front-end build) — NOT "run". If the
+So to deploy your latest changes, your DEFAULT is to build + push config +
+deploy, WITHOUT opening a browser:
+  quickbuild <app> . projprops <app> . deploy <app>
+(use "build" instead of "quickbuild" only when you need unit tests / the
+front-end). Do NOT append "run" and do NOT use "quickall"/"all" — those open a
+browser tab on every deploy, which the user does not want. The user opens the
+app themselves with the "Open" button in the UI once you report the deploy
+succeeded. Only use "run" if the user EXPLICITLY asks you to open the app. If the
 WebLogic status below says STOPPED and your task needs the server, run
 "startWebLogic" first and wait for it to come up.
 
@@ -5931,10 +6182,11 @@ Deployables: any app or sharedlib name (sharedlibs start with "sharedlib-").
 Chain different action/deployable groups with " . " — e.g. wl all teb . start.
 
 Examples:
-  <wl args="quickall myapp"/>     quickbuild + projprops + deploy + open in browser
+  <wl args="quickbuild myapp . projprops myapp . deploy myapp"/>  DEFAULT: build + config + deploy, NO browser
+  <wl args="build myapp . projprops myapp . deploy myapp"/>       same, but full build (tests + front-end)
   <wl args="quickbuild myapp"/>   fast build (skips tests + front-end)
   <wl args="deploy myapp"/>       undeploy then deploy
-  <wl args="run myapp"/>          JUST open the app in a browser tab (no build/deploy)
+  <wl args="run myapp"/>          JUST open the app in a browser tab (ONLY if the user asks)
   <wl args="start myapp"/>        start the deployed APP "myapp" on the server
   <wl args="startWebLogic"/>      start the WebLogic SERVER in the background (then wait for RUNNING)
 
@@ -9653,6 +9905,14 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
       });
     }),
     onRateLimit: (ms) => logEvent('rate-limit', { ms }),
+    // Network retry/recover: surface a visible "Reconnecting…" status (the
+    // backoff is otherwise indistinguishable from a slow turn). setPhase
+    // broadcasts to the chat status row; recovery flips it back to working.
+    onNetworkRetry: ({ attempt, max, cause }) => {
+      logEvent('network-retry', { attempt, max, cause });
+      chatState.setPhase(`reconnecting:${attempt}/${max}`);
+    },
+    onNetworkRecover: () => chatState.setPhase('thinking'),
     onUsage: (u) => {
       session.totalTokens += u.total_tokens ?? 0;
       // Feed the response-side token count into chatTokens so the browser's
@@ -9776,6 +10036,22 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
       if (req.method === 'POST' && path === '/api/pick-folder') {
         const chosen = await pickFolderNative();
         return sendJson(res, 200, { path: chosen });
+      }
+      if (req.method === 'GET' && path === '/api/app-url') {
+        // Construct a deployed app's URL (https://host:7102/context-root) WITHOUT
+        // opening a browser, for the UI "Open" button. The browser can't read
+        // ~/myWlSetup.bat or the app's application.xml; the server can. Returns
+        // 200 with {ok:false,reason} (not a 4xx) when the URL can't be computed —
+        // that's an expected, non-error outcome (deploy still succeeded).
+        const app = (url.searchParams.get('app') || '').trim();
+        if (!app) return sendJson(res, 400, { ok: false, error: 'app is required' });
+        if (!session.activeProject) return sendJson(res, 409, { ok: false, error: 'no project open' });
+        try {
+          const r = await computeAppUrl(app, session.activeProject);
+          return sendJson(res, 200, r);
+        } catch (e) {
+          return sendJson(res, 200, { ok: false, reason: 'error', detail: e?.message || String(e) });
+        }
       }
       if (req.method === 'GET' && path === '/api/list-dir') {
         // In-browser folder picker. Returns subdirs of `path` (or the home
@@ -10810,24 +11086,6 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
             // pre-write hook will have prompted the user already; if
             // they declined we won't have any uncommitted CODE_BOSS
             // work to commit on those).
-            const emitGitOp = async (repoDir, cmdLabel, taskId, run) => {
-              const callId = randomUUID();
-              const rel = nodePath.relative(session.activeProject, repoDir) || '.';
-              chatState.appendChatEvent({
-                type: 'tool-call', callId, verb: 'git', name: 'git',
-                args: { command: `[${rel}] ${cmdLabel}` }, taskId,
-              });
-              const r = await run();
-              const status = r.exitCode === 0 ? 'ok' : 'error';
-              const content = r.exitCode === 0
-                ? (r.stdout.trim() || '(ok)')
-                : (r.stderr.trim() || `exit ${r.exitCode}`);
-              chatState.appendChatEvent({
-                type: 'tool-result', callId, verb: 'git', name: 'git',
-                status, content, taskId,
-              });
-              return r;
-            };
             const gitAutoCommitHook = async ({ closedTaskId, userRequest, summary }) => {
               // Discuss (read-only) mode: a closed task is just a conversational
               // boundary — no writes happened, so do NOT bind it to the active
@@ -10843,8 +11101,16 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
               // changes, recording EVERY repo's commit hash. (Previously only
               // the first repo's hash was kept — a multi-repo bug that lost
               // traceability + made undo miss every repo but the first.)
+              //
+              // NOISE: instead of emitting a tool-call/tool-result PAIR per git
+              // op per repo (3 repos × add+commit+branch = up to 9 rows for a
+              // one-line change — and another 9 after a build that regenerates
+              // checked-in JS), we run the ops silently and emit ONE summary row
+              // tagged with the closed task so it nests inside that task.
               const commitsByRepo = [];   // [{ repoDir, hash }]
+              const outcomes = [];        // [{ rel, status, hash, branch, detail }]
               for (const repoDir of session.git.repoList) {
+                const rel = nodePath.relative(session.activeProject, repoDir) || '.';
                 const repo = session.git.repos[repoDir];
                 // Refresh branch in case the user resolved a wizard mid-task.
                 repo.branch = await getCurrentBranch(repoDir);
@@ -10862,25 +11128,26 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
                   const st = await getStatus(repoDir);
                   if (st.dirty !== true) continue;   // clean (and clean-at-open) → nothing to do
                   const parent = repo.branch;
-                  const br = await emitGitOp(repoDir, 'git checkout -b <CODE_BOSS> (auto)', closedTaskId, () => createBranch(repoDir));
-                  if (br.exitCode !== 0) continue;
+                  const br = await createBranch(repoDir);
+                  if (br.exitCode !== 0) { outcomes.push({ rel, status: 'branch-error', detail: br.stderr?.trim() || `exit ${br.exitCode}` }); continue; }
                   repo.parentBranch = parent;
                   repo.branch = br.branch;
-                  fileLog(`git: end-of-task auto-branch ${br.branch} on ${nodePath.relative(session.activeProject, repoDir) || '.'} (clean at open, dirtied via non-write_file path)`);
+                  fileLog(`git: end-of-task auto-branch ${br.branch} on ${rel} (clean at open, dirtied via non-write_file path)`);
                   // fall through to add + commit on the new CODE_BOSS branch
                 }
-                const add = await emitGitOp(repoDir, 'git add -A', closedTaskId, () => runGit(repoDir, ['add', '-A']));
-                if (add.exitCode !== 0) continue;
+                const add = await runGit(repoDir, ['add', '-A']);
+                if (add.exitCode !== 0) { outcomes.push({ rel, status: 'add-error', detail: add.stderr?.trim() || `exit ${add.exitCode}` }); continue; }
                 const status = await getStatus(repoDir);
                 // Only skip on a CONFIRMED-clean tree. dirty===null means the
                 // status check failed (e.g. index.lock) — attempt the commit
                 // anyway rather than silently dropping the user's work.
                 if (status.dirty === false) continue;
-                const commit = await emitGitOp(repoDir, 'git commit -F -', closedTaskId, () => runGit(repoDir, ['commit', '-F', '-'], { input: msg }));
-                if (commit.exitCode !== 0) continue;
+                const commit = await runGit(repoDir, ['commit', '-F', '-'], { input: msg });
+                if (commit.exitCode !== 0) { outcomes.push({ rel, status: 'commit-error', detail: commit.stderr?.trim() || `exit ${commit.exitCode}` }); continue; }
                 const hash = await getHeadHash(repoDir);
                 repo.head = hash;
                 commitsByRepo.push({ repoDir, hash });
+                outcomes.push({ rel, status: 'committed', hash, branch: repo.branch });
               }
               // Record EVERY commit hash on the active assignment (the task
               // itself was bound at the top of this hook, independent of git).
@@ -10889,11 +11156,39 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
                   try { await session.assignments.addCommit(session.activeAssignment, hash); } catch {}
                 }
               }
-              // Return { hash, commits }: `hash` (the first) preserves the
-              // existing single-hash task-store attach + task-end contract;
-              // `commits` carries the full per-repo list for the task-end event
-              // and one-click undo. (runPromptedAgent accepts either shape.)
-              return { hash: commitsByRepo[0]?.hash || null, commits: commitsByRepo };
+              // Successful commits now surface as a "✓ Committed" badge in the
+              // task footer (built from the task-end event below), NOT as a chat
+              // row — that's the noise reduction. We ONLY emit a visible row when
+              // git actually ERRORED, so a real problem is never hidden. The row,
+              // when emitted, lists the errors plus any successes for context,
+              // tagged with closedTaskId so it nests in the task.
+              const committed = outcomes.filter((o) => o.status === 'committed');
+              const errors = outcomes.filter((o) => /error/.test(o.status));
+              if (errors.length) {
+                const callId = randomUUID();
+                const label = `git · ${errors.length} error${errors.length > 1 ? 's' : ''}${committed.length ? ` (${committed.length} committed)` : ''}`;
+                chatState.appendChatEvent({ type: 'tool-call', callId, verb: 'git', name: 'git', args: { command: label }, taskId: closedTaskId });
+                const lines = outcomes.map((o) => {
+                  if (o.status === 'committed') return `${o.rel}: committed ${o.hash ? o.hash.slice(0, 9) : ''} on ${o.branch}`;
+                  if (o.status === 'branch-error') return `${o.rel}: branch failed — ${o.detail}`;
+                  if (o.status === 'add-error') return `${o.rel}: git add failed — ${o.detail}`;
+                  if (o.status === 'commit-error') return `${o.rel}: commit failed — ${o.detail}`;
+                  return `${o.rel}: ${o.status}`;
+                });
+                chatState.appendChatEvent({ type: 'tool-result', callId, verb: 'git', name: 'git', status: 'error', content: lines.join('\n'), taskId: closedTaskId });
+              }
+              // Return: `hash` (first) preserves the existing single-hash task-store
+              // attach + undo contract; `commits` carries the full per-repo list.
+              // `committedRepos` is a display-friendly list (relative path + hash)
+              // and `gitError` a human summary — both ride the task-end event so the
+              // footer can render a "✓ Committed" / "⚠ commit issue" badge that
+              // survives full re-renders (footer is rebuilt from task-end fields).
+              return {
+                hash: commitsByRepo[0]?.hash || null,
+                commits: commitsByRepo,
+                committedRepos: committed.map((o) => ({ rel: o.rel, hash: o.hash, branch: o.branch })),
+                gitError: errors.length ? errors.map((e) => `${e.rel}: ${e.status.replace('-error', '')} failed — ${e.detail}`).join('\n') : null,
+              };
             };
             // Pre-write hook: tools (write_file, edit_file) call this
             // before modifying any file. If the file's containing repo
@@ -11116,6 +11411,11 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
                   state: 'pending',
                   round: round + 1,
                   reviewTaskId,
+                  // Also carry it as taskId so the UI nests this review row
+                  // inside the task it reviewed. Reviews are emitted at the END
+                  // of the round (after every task-end), so without this they
+                  // float at the bottom instead of inside the right task.
+                  taskId: reviewTaskId,
                 });
                 pendingReviewEvs.push(reviewEv);
                 reviewRows.push({ te, reviewTaskId, reviewEv });
@@ -11927,6 +12227,15 @@ const UI_HTML = `<!DOCTYPE html>
      produced by other paths. */
   .body code,
   .bubble.user .bubble-content code { color: var(--accent); }
+  /* Fenced \`\`\` blocks: a scrollable literal block, distinct from inline code. */
+  .body pre.md,
+  .bubble.user .bubble-content pre.md {
+    margin: 6px 0; padding: 8px 10px;
+    background: var(--panel-alt); border: 1px solid var(--border);
+    border-radius: 6px; overflow-x: auto; white-space: pre;
+  }
+  .body pre.md code,
+  .bubble.user .bubble-content pre.md code { color: var(--fg); }
   .body strong,
   .bubble.user .bubble-content strong { color: var(--fg); font-weight: 700; }
   .body h3.md, .body h4.md, .body h5.md,
@@ -12164,6 +12473,11 @@ const UI_HTML = `<!DOCTYPE html>
   .task-foot-review.review-fail { color: var(--error); }
   .task-foot-review.review-escalate, .task-foot-review.review-error { color: var(--error); }
   .task-foot-review.review-pending { color: var(--muted); }
+  /* "✓ Committed" badge — sits next to the review badge to the right of the
+     summary. Replaces the per-commit chat row (git noise reduction). */
+  .task-foot-commit { margin-left: 10px; font-weight: 600; font-size: 11px; }
+  .task-foot-commit.commit-ok { color: #6cc46c; }
+  .task-foot-commit.commit-error { color: var(--error); }
   /* Project (tier-4) rollup: same shape, brighter bracket. */
   .task-wrap.project::before {
     opacity: 0.85;
@@ -12175,21 +12489,29 @@ const UI_HTML = `<!DOCTYPE html>
      has both endpoints to span. */
   .task-wrap.collapsed .task-body { display: none; }
 
-  /* Standalone task-end marker (rendered when task-end fires with no events
-     to wrap retroactively). Small inline pill rather than a full box. */
-  .task-end-marker {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    margin: 8px 0;
-    padding: 2px 10px;
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    font-size: 11px;
-    color: var(--muted);
+  /* A closed task with no body rows still renders as a real .task-wrap (so its
+     review verdict + late git/diff rows can nest), just styled tighter. Use
+     :empty so the padding collapses ONLY while the body is genuinely empty —
+     if a late git/diff row gets relocated in, normal padding returns. */
+  .task-wrap .task-body:empty { padding: 0; min-height: 0; }
+  .task-wrap.empty .task-head { border-bottom: none; }
+
+  /* "Open in browser" button shown after a successful wl deploy. Clearly an
+     action that opens a new tab — distinct from the plain '⎿' result text. */
+  .open-app-bar { margin: 4px 0 2px 18px; }
+  .open-app-btn {
+    display: inline-flex; align-items: center; gap: 4px;
+    margin: 2px 6px 2px 0;
+    padding: 3px 11px;
+    font-size: 11px; font-weight: 600;
+    color: var(--accent);
     background: var(--panel-alt);
+    border: 1px solid var(--accent);
+    border-radius: 11px;
+    cursor: pointer;
   }
-  .task-end-marker .ur { color: var(--accent); font-weight: 600; }
+  .open-app-btn:hover:not(:disabled) { background: var(--accent); color: var(--panel); }
+  .open-app-btn:disabled { opacity: 0.55; cursor: default; }
 
   /* Reviewer feedback row. Inline below the just-completed work.
      States: pending (gray + animated ring), pass (green), fail (warn),
@@ -13344,8 +13666,8 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       <span class="backlog-title">Assignments</span>
       <span class="backlog-count" id="backlogCount"></span>
       <button class="backlog-mem-btn" onclick="openMemory()" title="View and curate what the agent has learned about this codebase">🧠 Memory</button>
-      <button class="backlog-chat-btn" onclick="openIntake()" title="Capture a requirement by chatting with the intake manager">🗩 Chat</button>
-      <button class="backlog-new-btn" onclick="toggleAssignmentForm()" title="New assignment">＋ New</button>
+      <button class="backlog-chat-btn" onclick="openIntake()" title="Capture a NEW backlog requirement by chatting with the intake manager — it reads code read-only and drafts a requirement card. This is NOT the main chat: it does not run the worker agent or edit files. (Use the box at the bottom for that.)">🗩 Capture</button>
+      <button class="backlog-new-btn" onclick="toggleAssignmentForm()" title="Add a backlog assignment by filling in a title + requirement yourself (no chat)">＋ New</button>
     </div>
     <div class="backlog-form hidden" id="backlogForm">
       <input id="asgTitle" placeholder="Assignment title" />
@@ -13381,7 +13703,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       <textarea id="input" placeholder="Ask…" rows="1"></textarea>
       <button id="queueBtn"
               class="queue-btn"
-              title="Add to queue — same as Enter while the agent is busy"
+              title="Queue this message for later — stack up several and send each with ▶ when you're ready"
               onclick="enqueueCurrentInput()"
               style="display: none;">
         <svg width="14" height="14" viewBox="0 0 14 14" fill="none"
@@ -14651,6 +14973,60 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     return row;
   }
 
+  // wl actions that DEPLOY an app (so the result warrants an "Open" button).
+  const WL_DEPLOY_ACTIONS = new Set(['deploy', 'd', 'all', 'a', 'quickall', 'qa']);
+  // Pull the deployed app name(s) out of a wl args string, handling ' . ' chains
+  // like "quickbuild teb . projprops teb . deploy teb" → ["teb"].
+  function wlDeployApps(argsStr) {
+    const apps = [];
+    for (const seg of String(argsStr || '').split(/\\s+\\.\\s+/)) {
+      const toks = seg.trim().split(/\\s+/);
+      if (toks.length >= 2 && WL_DEPLOY_ACTIONS.has(toks[0].toLowerCase()) && !apps.includes(toks[1])) {
+        apps.push(toks[1]);
+      }
+    }
+    return apps;
+  }
+  // After a SUCCESSFUL wl deploy, attach an "Open" button that opens the app in
+  // a NEW browser tab — the URL is constructed server-side (no browser launched
+  // during the deploy). Clearly labeled as opening a tab. Disables itself with a
+  // reason if the URL can't be constructed (the deploy still succeeded).
+  function maybeAttachOpenButton(row, ev) {
+    if (!row || (ev.verb || ev.name) !== 'wl' || ev.status === 'error') return;
+    const call = (session?.events || []).find((e) => e.type === 'tool-call' && e.callId === ev.callId);
+    const apps = wlDeployApps(call?.args?.args || '');
+    if (!apps.length) return;
+    const bar = document.createElement('div');
+    bar.className = 'open-app-bar';
+    for (const app of apps) {
+      const btn = document.createElement('button');
+      btn.className = 'open-app-btn';
+      btn.textContent = \`Open \${app} ↗\`;
+      btn.title = \`Opens the deployed app "\${app}" in a NEW browser tab (resolves the URL without launching a browser).\`;
+      btn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        btn.disabled = true;
+        try {
+          const r = await fetch('/api/app-url?app=' + encodeURIComponent(app));
+          const j = await r.json().catch(() => ({}));
+          if (j && j.ok && j.url) {
+            window.open(j.url, '_blank', 'noopener');
+            btn.title = 'Opened ' + j.url;
+            btn.disabled = false;
+          } else {
+            btn.textContent = \`Can't open \${app}\`;
+            btn.title = 'Could not construct the URL: ' + (j?.detail || j?.reason || 'unknown') + ' — the deploy still succeeded. Open it manually.';
+          }
+        } catch (err) {
+          btn.disabled = false;
+          btn.title = 'Open failed: ' + (err?.message || err);
+        }
+      });
+      bar.appendChild(btn);
+    }
+    row.appendChild(bar);
+  }
+
   // Render a unified diff as a code block with + / - / hunk highlights.
   // Visible "compacting…" marker (item A) — compaction masks/drops old tasks,
   // a quality cliff, so we surface it rather than doing it silently.
@@ -15547,7 +15923,28 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     return (l && r) ? 'center' : r ? 'right' : l ? 'left' : '';
   }
   function renderInline(text) {
-    const escaped = escapeHtml(text);
+    // Protect code FIRST so the Markdown block/inline transforms below never
+    // re-parse text inside backticks — a code line like \`# Comment\` must stay
+    // literal, not become a heading; \`- x\` must not become a bullet; \`a | b\`
+    // must not become a table; \`**x**\` must not become bold. Extract fenced
+    // blocks + inline spans into inert NUL-delimited placeholders (with their
+    // contents HTML-escaped), run the normal transforms, then restore.
+    const codeStore = [];
+    const PH = (i) => \`\\u0000\${i}\\u0000\`;   // sentinel: no #,-,*,|,\`,<,> so no transform matches it
+    let work = String(text == null ? '' : text);
+    // Fenced \`\`\`lang\\n…\`\`\` → one placeholder for the whole block (literal inside).
+    work = work.replace(/\`\`\`[^\\n]*\\n([\\s\\S]*?)\`\`\`/g, (m, body) => {
+      const i = codeStore.length;
+      codeStore.push(\`<pre class="md"><code>\${escapeHtml(body.replace(/\\n$/, ''))}</code></pre>\`);
+      return PH(i);
+    });
+    // Inline \`…\` — a run of N backticks delimits, so \`\` \`a\` \`\` (backtick in code) works.
+    work = work.replace(/(\`+)([\\s\\S]+?)\\1/g, (m, ticks, body) => {
+      const i = codeStore.length;
+      codeStore.push(\`<code>\${escapeHtml(body.trim())}</code>\`);
+      return PH(i);
+    });
+    const escaped = escapeHtml(work);
     const lines = escaped.split('\\n');
     const tokens = [];   // { kind: 'text' | 'block', value: string }
     let inList = false;
@@ -15598,10 +15995,14 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       if (i > 0 && tokens[i].kind === 'text' && tokens[i - 1].kind === 'text') out += '\\n';
       out += tokens[i].value;
     }
-    // Inline passes — applied AFTER block extraction so they work inside
-    // both plain text and block-element bodies (e.g., bold in a header).
+    // Inline bold — applied AFTER block extraction so it works inside both
+    // plain text and block-element bodies (e.g., bold in a header). Code spans
+    // were already extracted to placeholders up top, so a \`**x**\` INSIDE
+    // backticks stays literal.
     out = out.replace(/\\*\\*([^*]+)\\*\\*/g, '<strong>$1</strong>');
-    out = out.replace(/\`([^\`]+)\`/g, '<code>$1</code>');
+    // Restore the protected code spans / fenced blocks (their contents were
+    // HTML-escaped at capture time, so they render literally).
+    out = out.replace(/\\u0000(\\d+)\\u0000/g, (m, i) => codeStore[Number(i)] || '');
     return out;
   }
 
@@ -16358,6 +16759,14 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
         // is now running. Keep the spinner alive but relabel WHO is busy.
         else if (msg.phase === 'reviewing')   { statusVerb = 'Reviewing'; setThinking(); }
         else if (msg.phase === 'manager')     { statusVerb = 'Checking the assignment'; setThinking(); }
+        // Network retry/backoff: the LLM endpoint was unreachable and we're
+        // retrying. "reconnecting:N/M" carries the attempt count. Make it visibly
+        // distinct from a normal slow turn (recovery flips back to "Working").
+        else if (msg.phase.indexOf('reconnecting') === 0) {
+          const m = (msg.phase.split(':')[1] || '').trim();
+          statusVerb = 'Reconnecting to the LLM' + (m ? \` (attempt \${m})\` : '');
+          setThinking();
+        }
         renderStatus();
         break;
       case 'tokens':
@@ -16687,6 +17096,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
           summary: summarizeResult(ev),
           full: ev.content || '',
         }, ev.callId);
+        maybeAttachOpenButton(node, ev);
         break;
       }
       case 'diff':
@@ -16733,7 +17143,20 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     }
 
     // Tag the rendered node with its task id so task-end can wrap it later.
-    if (node && ev.taskId) node.dataset.taskId = ev.taskId;
+    if (node && ev.taskId) {
+      node.dataset.taskId = ev.taskId;
+      // LATE rows: some events for a task are emitted AFTER it closed and got
+      // wrapped — the collapsed git-commit summary (tagged with the closed
+      // task) and any other tail row. Without this they'd float at the bottom,
+      // landing visually between later tasks instead of inside the task they
+      // belong to. If the wrap already exists, move the row into its body so
+      // it nests correctly (review verdicts use renderReviewIntoFooter above).
+      if (!node.closest('.task-wrap')) {
+        const wrap = $log.querySelector(\`.task-wrap[data-task-id="\${CSS.escape(String(ev.taskId))}"]\`);
+        const body = wrap && wrap.querySelector('.task-body');
+        if (body) { body.appendChild(node); scrollToBottom(); }
+      }
+    }
   }
 
   // When <next-task> closes a task, wrap all the just-rendered rows that belong
@@ -16745,26 +17168,16 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     // Find all rows for this task that are NOT already inside a wrap.
     const rows = Array.from($log.querySelectorAll(\`[data-task-id="\${taskId}"]\`))
       .filter((r) => !r.closest('.task-wrap'));
-    if (rows.length === 0) {
-      // No body rows (e.g., task with no user message and no tool calls). Still
-      // render a small inline pill marker so the user sees the boundary.
-      const marker = document.createElement('div');
-      marker.className = 'task-end-marker';
-      if (ev.userRequest) {
-        const ur = document.createElement('span');
-        ur.className = 'ur';
-        ur.textContent = ev.userRequest;
-        marker.appendChild(ur);
-      }
-      if (ev.summary) {
-        marker.appendChild(document.createTextNode(' — ' + ev.summary));
-      }
-      $log.appendChild(marker);
-      scrollToBottom();
-      return;
-    }
+    // NOTE: a 0-row task (e.g. the last/thinnest task, whose only rows were
+    // already consumed, or a task with no standalone body rows) STILL gets a
+    // real .task-wrap below — NOT a bare pill. A pill had no data-task-id and
+    // no .task-foot, so a later review verdict (emitted after every task-end)
+    // and late git/diff rows for that task had nothing to nest into and floated
+    // at the bottom. Every closed task is now a wrap so renderReviewIntoFooter,
+    // the late-row relocation above, and wrapRollup can all find it. The body
+    // may just be empty (styled compactly via .task-wrap.empty).
     const wrap = document.createElement('div');
-    wrap.className = 'task-wrap';
+    wrap.className = 'task-wrap' + (rows.length === 0 ? ' empty' : '');
     wrap.dataset.taskId = taskId;
 
     // Header
@@ -16791,10 +17204,12 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     body.className = 'task-body';
     wrap.appendChild(body);
 
-    // Insert wrap at the position of the first row
+    // Insert wrap at the position of the first row. With no rows, firstRow is
+    // undefined → insertBefore(wrap, null) appends at end-of-log, which is the
+    // correct spot for a freshly-closed task.
     const firstRow = rows[0];
-    $log.insertBefore(wrap, firstRow);
-    // Move rows into the body
+    $log.insertBefore(wrap, firstRow || null);
+    // Move rows into the body (no-op for an empty task)
     for (const r of rows) body.appendChild(r);
 
     // Footer — the summary is click-to-edit (item D); it feeds the tier rollup
@@ -16810,9 +17225,35 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     summarySpan.title = 'Click to edit this summary';
     summarySpan.addEventListener('click', () => beginEditTaskSummary(foot, summarySpan, ev));
     foot.appendChild(summarySpan);
+    // "✓ Committed" badge (or "⚠ commit issue") to the right of the summary,
+    // next to the review badge. Derives purely from the persisted task-end
+    // fields so it survives full re-renders. Replaces the per-commit git row.
+    renderCommitIntoFooter(foot, ev);
     wrap.appendChild(foot);
 
     scrollToBottom();
+  }
+
+  // Render the commit status into a task footer from the task-end event's
+  // committedRepos (rel+hash) / commits (absolute repoDir fallback) / commitError.
+  function renderCommitIntoFooter(foot, ev) {
+    if (!foot) return;
+    foot.querySelector('.task-foot-commit')?.remove();   // re-render safety
+    const list = (Array.isArray(ev.committedRepos) && ev.committedRepos.length)
+      ? ev.committedRepos.map((c) => ({ label: c.rel || basename(c.repoDir || '') || 'repo', hash: c.hash }))
+      : (Array.isArray(ev.commits) ? ev.commits.map((c) => ({ label: basename(c.repoDir || '') || 'repo', hash: c.hash })) : []);
+    if (!list.length && !ev.commitError) return;   // nothing committed, no error → no badge
+    const badge = document.createElement('span');
+    if (ev.commitError) {
+      badge.className = 'task-foot-commit commit-error';
+      badge.textContent = '⚠ commit issue';
+      badge.title = ev.commitError + (list.length ? '\\n\\nCommitted:\\n' + list.map((c) => \`\${c.label}@\${(c.hash || '').slice(0, 9)}\`).join('\\n') : '');
+    } else {
+      badge.className = 'task-foot-commit commit-ok';
+      badge.textContent = list.length > 1 ? \`✓ committed · \${list.length} repos\` : '✓ committed';
+      badge.title = list.map((c) => \`\${c.label}@\${(c.hash || '').slice(0, 9)}\`).join('\\n');
+    }
+    foot.appendChild(badge);
   }
 
   function summarizeResult(ev) {
@@ -16845,11 +17286,14 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     $input.disabled = false;
     $input.placeholder = running
       ? 'Agent running — Enter to queue, Esc to stop'
-      : 'Ask…';
+      : 'Ask… (Enter to send, ⤓ to queue for later)';
     if (!running) {
       try { $input.focus(); } catch {}
     }
-    if ($queueBtn) $queueBtn.style.display = running ? '' : 'none';
+    // Queue button shows in BOTH states now: while idle you can stack up
+    // messages (⤓) and fire them one at a time with ▶ — type one, queue it,
+    // do another, come back. Only the steer button is mid-run-only.
+    if ($queueBtn) $queueBtn.style.display = '';
     if ($steerBtn) $steerBtn.style.display = running ? '' : 'none';   // steer only matters mid-run (item H)
     renderQueue();        // play buttons enable/disable when status flips
   }
