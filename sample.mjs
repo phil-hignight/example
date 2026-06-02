@@ -15,7 +15,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '140';
+const BUILD_VERSION = '148';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
@@ -2349,13 +2349,19 @@ function buildSystemPrompt({ taskId, taskUserRequest, tier1Tokens, tier1Pct, pro
     'CRITICAL: NEVER use built-in tools or suggest integrations. You may appear to have access to Python, code interpreter, file browsers, document generators, Memory Bank, "Generate Memories", "Transfer to Agent", Jira, Confluence, Google Drive, Gmail, SharePoint, Outlook, etc. NONE of those tools see the developer\'s project. NEVER suggest them in your responses. NEVER call them. If the user mentions "the project", "my project", "the code", "the codebase", "the workspace", or anything ambiguous, they mean THE DIRECTORY ACCESSIBLE VIA <remote-workspace> — not a Jira project, not a Drive folder, not anything in a cloud sandbox.',
     '',
     'When in doubt, run <list path="."/> immediately to see what is in the remote workspace, then proceed based on what you find. Never ask the user to clarify "which project" — there is exactly one project (the one in the remote workspace) and you can see it with one <list/> call.',
+    'Work AUTONOMOUSLY: once the developer gives you a task, carry out the obvious next steps yourself. Do NOT end a reply asking permission to proceed ("would you like me to…?", "should I…?") when the next action is clear from the task or from what you just read — just take it. Use information already in the request instead of asking for it again. Ask the developer ONLY when you are genuinely blocked: the request is too ambiguous to pick any reasonable next step, or an action is destructive/irreversible and they did not ask for it. (Tool-level approvals — e.g. branch creation, tracked .docx edits — still pause on their own; that is separate from this.)',
     '',
     `Current task: ${taskId}` + (taskUserRequest ? `  ↳ ${taskUserRequest}` : ''),
-    `Task budget: ${tier1Tokens} / ${TIER_1_BUDGET} tokens (${tier1Pct}%)` + (tier1Pct >= 95
-      ? '  ← please finish soon: emit <next-task user-request="..." summary="..."/>'
-      : tier1Pct >= 75
-        ? '  ← nearing budget; consider closing this task at a natural stopping point'
+    `Task budget: ${tier1Tokens} / ${TIER_1_BUDGET} tokens (${tier1Pct}%)` + (tier1Pct >= TASK_FORCE * 100
+      ? '  ← OVER BUDGET. Close this task NOW: emit <next-task user-request="..." summary="..."/> in this reply. If you do not, the system will auto-close it for you and you lose control of the summary.'
+      : tier1Pct >= TASK_NUDGE * 100
+        ? '  ← nearing budget; close this task at the next natural stopping point with <next-task .../>'
         : ''),
+    '',
+    'END EVERY REPLY WITH A TASK-STATUS SIGNAL — this is REQUIRED, every turn:',
+    '  - If the current unit of work is COMPLETE: close it with <next-task user-request="what the task was" summary="what you did"/> inside a <remote-workspace> block.',
+    '  - If it is NOT complete: emit <task-progress percent="N">one sentence on what still remains</task-progress> as a standalone tag in your prose (N = your honest 0-100 estimate of completion).',
+    '  - Provide EXACTLY ONE of these at the end of EVERY reply. Omitting both returns an error and you must redo the turn. Estimating what remains each turn forces you to notice when nothing real is left — that is when you close the task. Do NOT let one task run forever.',
     '',
     'Mixing prose with tool blocks — IMPORTANT:',
     '  - A single reply may contain MULTIPLE <remote-workspace>...</remote-workspace> blocks with prose freely around and between them. The user sees the prose as chat messages and watches the tools run in order.',
@@ -2510,6 +2516,9 @@ function truncateAtFirstBlock(text) {
 // lines that are JUST the marker (anchored ^...$).
 function sanitizeAssistantProse(text, opts = {}) {
   if (typeof text !== 'string' || !text) return text;
+  // <task-progress> is a per-turn status SIGNAL, not chat content — strip it
+  // from the visible prose (it is surfaced as a 'task-progress' event instead).
+  text = text.replace(/<task-progress\b[\s\S]*?<\/task-progress>/gi, '').replace(/<task-progress\b[^>]*\/>/gi, '');
   // Also strip tool-call-looking XML tags from the prose. The model
   // sometimes "previews" what it's about to do by writing the tag in
   // its narration before the actual <remote-workspace> block — so the
@@ -2711,6 +2720,37 @@ function flattenContent(content) {
 }
 
 // ── Convo construction from task store ─────────────────────────────────────
+// Bound an OPEN task's contribution to the prompt with a sliding window. A
+// model that never emits <next-task> (some backends, e.g. Gemini, won't) piles
+// every read / build log / tool result into ONE task that grows past the
+// context window: the prompt balloons (observed: a single task at 126k tokens
+// vs a 12k tier-1 budget), compaction fires every turn but reclaims nothing
+// (no FINISHED task to demote), and the request eventually 502s. So keep the
+// task open but only send the NEWEST slice: always the first message (the
+// task's goal) + the most recent messages up to `budgetTokens`; replace the
+// CONTENT of the older messages in between with a tiny stub. The full text
+// stays in the transcript/store — this only trims what we send the model.
+function elideTaskMessages(messages, budgetTokens) {
+  const msgs = Array.isArray(messages) ? messages : [];
+  if (msgs.length <= 2) return msgs;
+  let total = 0;
+  for (const m of msgs) total += estTokens(m.content);
+  if (total <= budgetTokens) return msgs;
+  const keep = new Array(msgs.length).fill(false);
+  keep[0] = true;                                   // the task seed / goal
+  let used = estTokens(msgs[0].content);
+  for (let i = msgs.length - 1; i >= 1; i--) {      // recent window, newest-first
+    const t = estTokens(msgs[i].content);
+    if (used + t > budgetTokens) break;
+    keep[i] = true; used += t;
+  }
+  return msgs.map((m, i) => {
+    if (keep[i]) return m;
+    const label = m.kind || m.role || 'message';
+    return { ...m, content: `[earlier ${label} elided to bound context (~${estTokens(m.content)} tokens) — full text is in the transcript]` };
+  });
+}
+
 async function buildConvoFromStore(store) {
   const out = [];
   const state = store._state();
@@ -2730,8 +2770,14 @@ async function buildConvoFromStore(store) {
         content: `<task-history id="${t.id}" parent="${t.parentId ?? 'root'}" status="${t.ended ? 'done' : 'open'}">\n  ↳ ${t.userRequest || '(no user request synthesized)'}\n${t.summary || '(no summary)'}\n</task-history>`,
       });
     } else {
-      // tier 1 and 2 both emit messages; tier 2 already has results masked in storage
-      for (const m of t.messages ?? []) {
+      // tier 1 and 2 both emit messages; tier 2 already has results masked in storage.
+      // The CURRENT (open) task can't be demoted while in progress, so bound it
+      // with a sliding window here — otherwise a task the model never closes
+      // grows the prompt without limit.
+      const msgs = (id === state.currentId)
+        ? elideTaskMessages(t.messages ?? [], TIER_1_BUDGET)
+        : (t.messages ?? []);
+      for (const m of msgs) {
         out.push({ role: m.role, content: m.content });
       }
     }
@@ -2806,8 +2852,12 @@ async function currentTaskTokens(store) {
   const state = store._state();
   if (!state?.currentId) return 0;
   const full = await loadTaskFull(store, state.currentId);
+  // Count the ELIDED size — that's what actually goes to the model — so the
+  // compaction trigger reflects the real (bounded) prompt and doesn't fire
+  // uselessly every turn on an over-budget open task it can't reclaim.
+  const msgs = elideTaskMessages(full?.messages ?? [], TIER_1_BUDGET);
   let n = 0;
-  for (const m of full?.messages ?? []) n += estTokens(m.content);
+  for (const m of msgs) n += estTokens(m.content);
   return n;
 }
 
@@ -3292,7 +3342,36 @@ async function runPromptedAgent({
     }
   }
 
-  const stats = { turns: 0, toolCalls: 0, toolHistogram: {}, batches: [], loopBreaks: 0, taskOps: 0 };
+  const stats = { turns: 0, toolCalls: 0, toolHistogram: {}, batches: [], loopBreaks: 0, taskOps: 0, autoClosed: 0 };
+
+  // LAYER 1 — deterministic auto-close. A model that won't emit <next-task>
+  // (the soft budget nudge in the prompt is ignored) grows one task past the
+  // window. When the OPEN task crosses TASK_FORCE × the tier-1 budget, the
+  // SYSTEM closes it: one LLM call summarizes it (so the closed task degrades
+  // gracefully through the existing tier/project compaction — not crude
+  // elision), then a fresh task opens. Works regardless of the model.
+  async function autoCloseCurrentTask(curTask) {
+    let summary = '';
+    try { summary = await runSummarizer({ adapter, model, task: curTask, signal, onLog: log }); } catch { /* */ }
+    if (!summary) summary = `auto-closed at budget (${curTask?.messages?.length || 0} messages of accumulated work)`;
+    const userRequest = curTask?.userRequest || '';
+    const r = await store.transitionTo({ summary, userRequest });
+    stats.autoClosed++;
+    log(`auto-close: task ${r.closedId} hit budget — closed with summary "${summary.slice(0, 80)}"; opened ${r.newTask.id}`);
+    let commitHash = null, commits = null;
+    if (typeof onTaskClose === 'function') {
+      try {
+        const closeRes = await onTaskClose({ closedTaskId: r.closedId, newTaskId: r.newTask.id, userRequest, summary });
+        if (closeRes && typeof closeRes === 'object') { commitHash = closeRes.hash ?? null; commits = Array.isArray(closeRes.commits) ? closeRes.commits : null; }
+        else commitHash = closeRes ?? null;
+      } catch (e) { log(`auto-close onTaskClose error: ${e.message}`); }
+    }
+    if (commitHash && r.closedId) { try { await store.attachToTask(r.closedId, { commitHash }); } catch { /* */ } }
+    emitChat({ type: 'task-end', taskId: r.closedId, userRequest, summary, commitHash, commits, auto: true });
+    // Demote the just-closed task right away so THIS turn's prompt is bounded.
+    try { await maybeCompact({ store, adapter, model, log, emitChat }); } catch { /* */ }
+    return store.getCurrent();
+  }
 
   for (let turn = 1; turn <= maxTurns; turn++) {
     stats.turns = turn;
@@ -3315,9 +3394,16 @@ async function runPromptedAgent({
     }
 
     // Compute current tier-1 tokens to inject into the system prompt.
-    const cur = await store.getCurrent();
+    let cur = await store.getCurrent();
     let t1Tokens = 0;
     for (const m of cur?.messages ?? []) t1Tokens += estTokens(m.content);
+    // LAYER 1: if the open task is over the hard budget, auto-close it before
+    // building this turn, then recompute against the fresh task.
+    if (t1Tokens > TASK_FORCE * TIER_1_BUDGET && (cur?.messages?.length ?? 0) > 1) {
+      cur = await autoCloseCurrentTask(cur);
+      t1Tokens = 0;
+      for (const m of cur?.messages ?? []) t1Tokens += estTokens(m.content);
+    }
     const tier1Pct = Math.round((t1Tokens / TIER_1_BUDGET) * 100);
 
     const sys = buildSystemPrompt({
@@ -3375,6 +3461,32 @@ async function runPromptedAgent({
           "unable to access files; the workspace IS the project. What would you " +
           "like to work on?",
       },
+      // Autonomy pair: DEMONSTRATE proceeding through the obvious next steps
+      // instead of stopping to ask the developer "would you like me to…?".
+      // Observed failure: the agent deferred on a clear task ("would you like me
+      // to inspect these files or proceed?") instead of just acting. Uses a
+      // different task shape (reproduce → locate → fix) than the greet.js
+      // rhythm example so the behavior generalizes. Tool-level approval gates
+      // (git branch, tracked docx edits) still pause separately — autonomy is
+      // about not stopping the CHAT to ask, not about skipping those gates.
+      {
+        role: 'user',
+        content:
+          "A working-style note first: once I give you a task, just DO it — work " +
+          "through the obvious next steps yourself and only stop to ask me if the " +
+          "request is genuinely ambiguous or an action is destructive and I didn't " +
+          "ask for it. Don't end a reply with \"would you like me to X or Y?\" when " +
+          "the next step is clear. For example if I said \"the build is failing, fix it\":",
+      },
+      {
+        role: 'assistant',
+        content:
+          "On it — I'll reproduce the failure first so the compiler tells me which file is wrong.\n" +
+          "<remote-workspace>\n<powershell>mvnw.cmd -q compile</powershell>\n</remote-workspace>\n" +
+          "Once I see the error I'll open the offending file and fix it directly — I won't stop to " +
+          "ask which file, the error names it.\n" +
+          "<task-progress percent=\"15\">reproducing the build failure to locate the broken file</task-progress>",
+      },
       // Second priming pair: DEMONSTRATE the task rhythm — do a unit of work,
       // then CLOSE it with <next-task/> in the same reply. Models (Sonnet
       // especially) reliably do the work but skip the close unless they've
@@ -3402,11 +3514,28 @@ async function runPromptedAgent({
           "<next-task user-request=\"add a hello() function to greet.js\" summary=\"added and exported hello() in greet.js; verified with node that it returns 'hi'\"/>\n" +
           "</remote-workspace>",
       },
+      // Third pair: when a unit ISN'T finished yet, end the reply with a
+      // <task-progress> signal instead of closing. Required every turn.
       {
         role: 'user',
         content:
-          "Exactly right — that's the rhythm: do the work, verify it, then close each " +
-          "finished unit with <next-task/>. Now let's work on my actual project the same way.",
+          "And whenever a unit ISN'T done yet, end that reply with a progress signal " +
+          "instead — a percentage and what still remains. For example, partway through a " +
+          "bigger change:",
+      },
+      {
+        role: 'assistant',
+        content:
+          "Reading the two call sites before I change them.\n" +
+          "<remote-workspace>\n<read path=\"src/a.js\"/>\n<read path=\"src/b.js\"/>\n</remote-workspace>\n" +
+          "<task-progress percent=\"40\">read both call sites; still need to update them and run the tests</task-progress>",
+      },
+      {
+        role: 'user',
+        content:
+          "Exactly right — that's the rhythm: do the work, and END EVERY REPLY with either " +
+          "<next-task/> (if that unit is now complete) or <task-progress percent=\"N\">what remains</task-progress> " +
+          "(if not). Never omit both. Now let's work on my actual project the same way.",
       },
       {
         role: 'assistant',
@@ -3659,9 +3788,23 @@ async function runPromptedAgent({
     // Parse the response into ordered segments. The model is encouraged
     // (system prompt) to interleave prose with multiple <remote-workspace>
     // blocks, e.g. prose → block A → prose → block B → final prose.
-    const segments = parseResponseSegments(text, { extraVerbs });
+    // LAYER 3: pull the per-turn task-status signal out of the response.
+    // <task-progress percent="N">why not done</task-progress> is a SIGNAL, not a
+    // tool — surface it as a progress event and strip it BEFORE parsing so it
+    // never becomes a bogus call or bloats the stored transcript.
+    const progressMatch = text.match(/<task-progress\b[^>]*\bpercent\s*=\s*["']?(\d{1,3})["']?[^>]*>([\s\S]*?)<\/task-progress>/i);
+    const hasProgressSignal = !!progressMatch;
+    if (progressMatch) {
+      emitChat({
+        type: 'task-progress', taskId: cur?.id,
+        percent: Math.min(100, parseInt(progressMatch[1], 10)),
+        note: progressMatch[2].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim().slice(0, 300),
+      });
+    }
+    const cleanText = text.replace(/<task-progress\b[\s\S]*?<\/task-progress>/gi, '').replace(/<task-progress\b[^>]*\/>/gi, '');
+    const segments = parseResponseSegments(cleanText, { extraVerbs });
     const allCalls = segments.flatMap((s) => s.type === 'tool-block' ? s.calls : []);
-    log(`turn ${turn}: ${text.length} chars in ${Date.now() - t0}ms, ${allCalls.length} call(s) across ${segments.filter((s) => s.type === 'tool-block').length} block(s)`);
+    log(`turn ${turn}: ${text.length} chars in ${Date.now() - t0}ms, ${allCalls.length} call(s) across ${segments.filter((s) => s.type === 'tool-block').length} block(s)${hasProgressSignal ? ` · progress=${Math.min(100, parseInt(progressMatch[1], 10))}%` : ''}`);
 
     if (allCalls.length === 0) {
       // Final answer reached — no tool blocks. The assistant-text chat
@@ -3719,6 +3862,21 @@ async function runPromptedAgent({
         }, r.ownerTaskId);
         results.push({ verb: r.call.verb, status: r.status, content: r.content });
       }
+    }
+
+    // LAYER 3 (forcing function): a WORKING turn must declare task status —
+    // either it closed the task (<next-task>) or it emitted a <task-progress>
+    // signal. If neither, feed an error back so the next turn must comply. The
+    // tools already ran (real work — never discarded); the NEXT turn is the
+    // "retry" the developer asked for. Auto-close (Layer 1) is the hard
+    // guarantee if the model keeps ignoring this.
+    const closedThisTurn = allCalls.some((c) => c.verb === 'next-task');
+    if (!closedThisTurn && !hasProgressSignal) {
+      await store.appendMessage({
+        kind: 'tool-result', role: 'user',
+        content: '<remote-workspace-result op="task-status" status="error">\nRequired: end EVERY reply with either <next-task user-request="..." summary="..."/> (if the current unit is complete) or <task-progress percent="N">what still remains</task-progress> (if not). You provided neither. Include exactly one of these in your next reply.\n</remote-workspace-result>',
+      }, cur?.id);
+      log(`forcing: turn ${turn} had no next-task/progress signal — injected status reminder`);
     }
 
     // Compact if total context is over budget. Cheap mechanical demotions
@@ -7254,6 +7412,19 @@ const QUERY_CATALOG = [
     },
   },
   {
+    id: 24, name: 'Context window fill', category: 'findings',
+    description: 'Current prompt size vs the total context budget (the last per-turn gauge). At/over 100% means a large OPEN task is being dragged to the model every turn — the runaway-context failure (a model that never emits <next-task>) that caused slow turns + 502s. The open task is sliding-window elided to bound it, but persistent fullness is the signal to close/auto-close tasks.',
+    sizeHint: { cols: 4, rows: 2 },
+    compute: (d) => {
+      const c = d.context;
+      if (!c) return { kind: 'text', severity: 'info', body: '(no turn has run yet)' };
+      const pct = c.budgetPct ?? (c.budgetTokens ? Math.round((c.totalTokens / c.budgetTokens) * 100) : 0);
+      const sev = pct >= 100 ? 'critical' : pct >= 90 ? 'warn' : 'ok';
+      const age = c.at ? `\nas of ${new Date(c.at).toISOString().slice(11, 19)}Z` : '';
+      return { kind: 'text', severity: sev, body: `${c.totalTokens} / ${c.budgetTokens} tokens  (${pct}% of budget)${age}` };
+    },
+  },
+  {
     id: 22, name: 'Findings summary', category: 'findings',
     description: 'Count of findings by severity — the one-glance health number.',
     sizeHint: { cols: 3, rows: 2 },
@@ -7822,6 +7993,100 @@ function runQueries(ids, diag) {
   return out;
 }
 
+// Standalone diagnostics page served at GET /snapshot. Deliberately SELF-
+// CONTAINED: no SSE, no tab-leadership, no dependency on the app's UI state —
+// so it works when the main UI is wedged, and (because it opens no persistent
+// connection) it neither exhausts the connection pool nor steals the active
+// tab. Type query numbers (or use a preset) and it renders a grid of tiles
+// from /api/queries. Open directly at http://127.0.0.1:<port>/snapshot too.
+const SNAPSHOT_PAGE_HTML = `<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>code_boss diagnostics</title>
+<style>
+  :root{--bg:#100e0b;--panel:#161410;--panel2:#1b1914;--border:#3a372f;--fg:#e6e2d6;--muted:#8c887b;--accent:#d97757;--mono:ui-monospace,Consolas,Menlo,monospace}
+  *{box-sizing:border-box} html,body{margin:0;height:100%}
+  body{background:var(--bg);color:var(--fg);font:13px/1.45 var(--mono)}
+  header{position:sticky;top:0;background:var(--panel);border-bottom:1px solid var(--border);padding:8px 12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;z-index:5}
+  header b{color:var(--accent)} #status{color:var(--muted);margin-left:auto}
+  input{flex:0 0 320px;background:var(--panel2);color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:5px 8px;font:inherit}
+  button{background:var(--panel2);color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:5px 9px;font:inherit;cursor:pointer}
+  button:hover{border-color:var(--accent)} button.go{background:var(--accent);color:#100e0b;border-color:var(--accent);font-weight:600}
+  .presets{display:flex;gap:6px;flex-wrap:wrap;padding:6px 12px;border-bottom:1px solid var(--border);background:var(--panel)}
+  .presets button{font-size:11.5px;color:var(--muted)}
+  #grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:10px;padding:12px}
+  .tile{background:var(--panel);border:1px solid var(--border);border-left:3px solid var(--border);border-radius:5px;overflow:hidden;min-width:0}
+  .tile.sev-critical{border-left-color:#e5635a} .tile.sev-warn{border-left-color:#d9a13a} .tile.sev-ok{border-left-color:#5aa86b} .tile.sev-info{border-left-color:#6b87a8}
+  .thead{padding:6px 10px;background:var(--panel2);border-bottom:1px solid var(--border);display:flex;gap:6px;align-items:center}
+  .tid{color:var(--muted)} .tname{font-weight:600} .tag{margin-left:auto;font-size:10px;padding:1px 6px;border-radius:3px;text-transform:uppercase}
+  .tag.sev-critical{background:#3a1714;color:#e5635a} .tag.sev-warn{background:#2a2310;color:#d9a13a} .tag.sev-ok{background:#14271a;color:#5aa86b} .tag.sev-info{background:#16202a;color:#8fb3d9}
+  .tbody{padding:8px 10px;max-height:340px;overflow:auto}
+  pre{margin:0;white-space:pre-wrap;word-break:break-word;font:12px/1.4 var(--mono)}
+  table{border-collapse:collapse;font-size:11.5px;width:100%} th,td{border:1px solid var(--border);padding:2px 6px;text-align:left;vertical-align:top}
+  th{background:var(--panel2)}
+  .finding{padding:3px 0;border-bottom:1px solid var(--border)} .fsev{font-weight:700;font-size:10px;margin-right:6px}
+  .finding.sev-critical .fsev{color:#e5635a} .finding.sev-warn .fsev{color:#d9a13a} .finding.sev-ok .fsev{color:#5aa86b} .finding.sev-info .fsev{color:#8fb3d9}
+  .fdet{color:var(--muted);font-size:11px;margin:2px 0 0 4px}
+  #catalog{display:none;padding:8px 12px;border-top:1px solid var(--border);background:var(--panel);max-height:40vh;overflow:auto}
+  #catalog.show{display:block} .catrow{padding:1px 0} .catrow b{display:inline-block;width:28px;color:var(--accent)} .catdesc{color:var(--muted)}
+</style></head>
+<body>
+<header>
+  <b>code_boss</b> diagnostics
+  <input id="ids" placeholder="query numbers e.g. 43,36,37" autofocus>
+  <button class="go" id="go">Render</button>
+  <button id="catToggle">Catalog</button>
+  <span id="build"></span>
+  <span id="status"></span>
+</header>
+<div class="presets">
+  <span style="color:var(--muted);align-self:center">presets:</span>
+  <button data-ids="43,36,37,57,58,38">proxy / stopped responding</button>
+  <button data-ids="1,2,9,13,17,18,39">wrong / off-target answers</button>
+  <button data-ids="49,63,64,30">work not landing</button>
+  <button data-ids="24,7,35,71,20">context / runaway + findings</button>
+  <button data-ids="99">dense summary</button>
+</div>
+<div id="grid"></div>
+<div id="catalog"></div>
+<script>
+(function(){
+  var grid=document.getElementById('grid'),input=document.getElementById('ids'),status=document.getElementById('status');
+  function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+  function sc(s){return s?('sev-'+s):'';}
+  function body(t){
+    if(t.kind==='json')return '<pre>'+esc(JSON.stringify(t.body,null,2))+'</pre>';
+    if(t.kind==='table'&&t.body){var c=t.body.columns||[],r=t.body.rows||[];
+      return '<table><thead><tr>'+c.map(function(x){return '<th>'+esc(x)+'</th>';}).join('')+'</tr></thead><tbody>'+
+        r.map(function(row){return '<tr>'+row.map(function(x){return '<td>'+esc(x)+'</td>';}).join('')+'</tr>';}).join('')+'</tbody></table>';}
+    if(t.kind==='findings'&&Array.isArray(t.body))return (t.body.map(function(f){
+        return '<div class="finding '+sc(f.severity)+'"><span class="fsev">'+esc((f.severity||'').toUpperCase())+'</span>'+esc(f.title||'')+(f.detail?'<div class="fdet">'+esc(f.detail)+'</div>':'')+'</div>';}).join(''))||'(none)';
+    return '<pre>'+esc(t.body)+'</pre>';
+  }
+  function render(d){
+    grid.innerHTML='';
+    (d.tiles||[]).forEach(function(t){
+      var el=document.createElement('div'); el.className='tile '+sc(t.severity);
+      el.innerHTML='<div class="thead"><span class="tid">#'+t.id+'</span><span class="tname">'+esc(t.name)+'</span>'+(t.severity?'<span class="tag '+sc(t.severity)+'">'+esc(t.severity)+'</span>':'')+'</div><div class="tbody">'+body(t)+'</div>';
+      grid.appendChild(el);
+    });
+    document.getElementById('catalog').innerHTML=(d.catalog||[]).map(function(q){return '<div class="catrow"><b>'+q.id+'</b>'+esc(q.name)+' <span class="catdesc">'+esc(q.description||'')+'</span></div>';}).join('');
+    if(d.build)document.getElementById('build').textContent='build '+(d.build.version||'?');
+    status.textContent=(d.tiles||[]).length+' tiles · '+new Date().toLocaleTimeString();
+  }
+  function load(ids){
+    status.textContent='loading…';
+    var u='/api/queries'+(ids?'?ids='+encodeURIComponent(ids):'');
+    var ctrl=new AbortController(),to=setTimeout(function(){ctrl.abort();},10000);
+    fetch(u,{signal:ctrl.signal}).then(function(r){return r.json();}).then(function(d){clearTimeout(to);if(!input.value)input.value=(d.defaultIds||[]).join(',');render(d);}).catch(function(e){clearTimeout(to);status.textContent='fetch failed: '+(e&&e.message||e);});
+  }
+  document.getElementById('go').onclick=function(){load(input.value.trim());};
+  input.addEventListener('keydown',function(e){if(e.key==='Enter')load(input.value.trim());});
+  Array.prototype.forEach.call(document.querySelectorAll('[data-ids]'),function(b){b.onclick=function(){input.value=b.getAttribute('data-ids');load(input.value);};});
+  document.getElementById('catToggle').onclick=function(){document.getElementById('catalog').classList.toggle('show');};
+  var p=new URLSearchParams(location.search),initial=p.get('ids')||'';input.value=initial;load(initial);
+})();
+</script>
+</body></html>`;
+
 /**
  * Pack a list of tiles onto a single page of given dimensions via
  * backtracking search. Each tile contributes its `sizeHint.{cols,rows}`
@@ -8155,6 +8420,18 @@ function runDiagnosticChecks(diag) {
     }
   }
 
+  // 12. Context-window fill. At/over budget means a large OPEN task is being
+  //     dragged to the model every turn (a model that never closes tasks) —
+  //     the runaway-context failure that caused slow turns + 502s.
+  const cf = diag.context;
+  if (cf && (cf.budgetPct ?? 0) >= 100) {
+    findings.push({
+      severity: 'warn', category: 'state',
+      title: `Context at ${cf.budgetPct}% of budget (${cf.totalTokens}/${cf.budgetTokens} tokens)`,
+      detail: 'A large open task is dragged to the model each turn. The open task is sliding-window elided to bound the prompt, but this persists when the model never emits <next-task> — consider closing/auto-closing tasks.',
+    });
+  }
+
   // Sort: critical first, then warn, then info, then ok — so problems
   // float to the top of the panel where they're most visible in screenshots.
   const order = { critical: 0, warn: 1, info: 2, ok: 3 };
@@ -8403,7 +8680,14 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
     // 'context-fill' is a per-turn gauge update (window fill %): broadcast it
     // live but never persist — it fires every turn and would bloat the file.
     // ('compacting-started' IS persisted — it's a rare, meaningful transcript marker.)
-    const ephemeral = event.type === 'tool-progress' || event.type === 'assistant-text-chunk' || event.type === 'context-fill';
+    const ephemeral = event.type === 'tool-progress' || event.type === 'assistant-text-chunk' || event.type === 'context-fill' || event.type === 'task-progress';
+    // Stash the latest context-window fill so /api/diagnostics (Snapshot query
+    // 24) can surface it — a large/over-budget prompt means the agent is
+    // dragging a huge open task each turn (e.g. a model that never emits
+    // <next-task>), the runaway-context failure that 502'd in production.
+    if (event.type === 'context-fill') {
+      session.lastContextFill = { totalTokens: event.totalTokens, budgetTokens: event.budgetTokens, budgetPct: event.budgetPct, at: Date.now() };
+    }
     if (!ephemeral) session.chatEvents.push(ev);
     broadcast({ type: 'event', version: bumpVersion(), event: ev });
     if (!ephemeral) scheduleConversationSave();
@@ -8849,6 +9133,10 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
 
       if (req.method === 'GET' && path === '/') {
         return sendText(res, 200, html, 'text/html; charset=utf-8');
+      }
+      if (req.method === 'GET' && path === '/snapshot') {
+        // Standalone diagnostics page — works even when the main UI is wedged.
+        return sendText(res, 200, SNAPSHOT_PAGE_HTML, 'text/html; charset=utf-8');
       }
       if (req.method === 'GET' && path === '/api/health') {
         return sendJson(res, 200, { ok: true });
@@ -9732,6 +10020,9 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
             abortControllerActive: !!session.abortController,
             streamSubscribers: session.streamSubscribers.size,
           },
+          // Latest per-turn context-window fill (catalog 24). Large/over-budget
+          // => a big open task dragged every turn (the runaway-context failure).
+          context: session.lastContextFill || null,
           // Auth state — surfaced so the snapshot can show api-key + unlock
           // status as numbered queries (catalog 44–47). When pendingUnlock
           // is non-null, every LLM call is blocked waiting on the user.
@@ -11061,6 +11352,33 @@ const UI_HTML = `<!DOCTYPE html>
   .bubble.user .bubble-content ul.md li { margin: 0 0 2px; }
   .body ul.md li::marker,
   .bubble.user .bubble-content ul.md li::marker { color: var(--accent); }
+  /* GitHub-flavored markdown tables. white-space:normal undoes the body's
+     pre-wrap inside the table so cell text wraps naturally; the table itself
+     is a block so it sits on its own line. */
+  .body table.md,
+  .bubble.user .bubble-content table.md {
+    border-collapse: collapse;
+    margin: 6px 0;
+    font-size: 12.5px;
+    white-space: normal;
+    max-width: 100%;
+  }
+  .body table.md th, .body table.md td,
+  .bubble.user .bubble-content table.md th,
+  .bubble.user .bubble-content table.md td {
+    border: 1px solid var(--border);
+    padding: 3px 8px;
+    text-align: left;
+    vertical-align: top;
+  }
+  .body table.md th,
+  .bubble.user .bubble-content table.md th {
+    background: var(--panel-alt);
+    color: var(--fg);
+    font-weight: 600;
+  }
+  .body table.md tr:nth-child(even) td,
+  .bubble.user .bubble-content table.md tr:nth-child(even) td { background: rgba(255,255,255,0.02); }
 
   /* Result row — "⎿ summary" sits under the body text of the tool row
      above (one char + gap to the right of the bullet column). Hanging
@@ -12042,6 +12360,18 @@ const UI_HTML = `<!DOCTYPE html>
     margin: 0 0 12px;
   }
   .modal.error pre.dense { border-color: var(--error); }
+  /* Multiple-tabs warning. Each open code_boss tab holds a live SSE
+     connection; with several open, the browser's ~6-per-origin HTTP/1.1 cap
+     is hit and all new fetches (send, settings, snapshot) silently hang. */
+  #tabWarn {
+    display: none;
+    position: fixed; top: 0; left: 0; right: 0; z-index: 9999;
+    background: var(--warn-bg); color: var(--accent);
+    border-bottom: 1px solid var(--accent);
+    font: 12.5px/1.4 var(--mono);
+    padding: 6px 12px; text-align: center;
+  }
+  #tabWarn.show { display: block; }
 </style>
 <script>
 // ====== injected from agent/mosaic-layout.mjs ======
@@ -12639,6 +12969,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   let upTokens = 0, downTokens = 0;
   // Context-window fill gauge (item A): { totalTokens, budgetTokens, budgetPct } or null when unknown.
   let contextFill = null;
+  let taskProgress = null;       // latest <task-progress> signal: { percent, note }
   // Diff collapse state keyed by event id (item K) — survives the clearLog()
   // + full re-render that an event-patch triggers (the DOM is wiped, so the
   // state can't live on the element).
@@ -12764,7 +13095,14 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       '<span class="spin">' + sp + '</span> ' + statusVerb + '… ' +
       '<span class="arrow">' + arrow + '</span> <span class="count">' + fmt(count) + '</span>' +
       ' <span class="dim">tokens · ' + secs + 's · esc to interrupt</span>' +
-      contextBarHtml();
+      contextBarHtml() + progressChipHtml();
+  }
+  // The agent's latest per-turn completion estimate (the <task-progress> signal).
+  function progressChipHtml() {
+    if (!taskProgress || typeof taskProgress.percent !== 'number') return '';
+    const pct = Math.max(0, Math.min(100, taskProgress.percent));
+    const tip = taskProgress.note ? (' — ' + taskProgress.note) : '';
+    return \` <span class="dim" title="\${escapeHtml(taskProgress.note || '')}">· task ~\${pct}%\${escapeHtml(tip).slice(0, 80)}</span>\`;
   }
   // Context-window fill gauge: total context vs the agent's total budget (the
   // binding constraint that triggers compaction). Hidden until the first
@@ -14055,6 +14393,19 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
 
   // Send a user message. Server pushes back the user-message event via SSE,
   // then drives the agent and emits all subsequent events. Browser is a view.
+  // fetch() with a hard timeout. A bare fetch to 127.0.0.1 can HANG forever
+  // (no error, no resolve) when the browser's ~6-connections-per-origin pool
+  // is exhausted — which happens when several code_boss tabs are open (each
+  // holds a live SSE connection). Without a timeout, send()/openSettings()
+  // just silently do nothing. This turns that into a clear, recoverable error.
+  const TOO_MANY_TABS_HINT = 'If you have more than one code_boss tab open, close all but one (each tab holds a live connection and the browser allows only ~6 to 127.0.0.1), then retry.';
+  async function fetchWithTimeout(url, opts = {}, ms = 12000) {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => { try { ctrl.abort(); } catch {} }, ms);
+    try { return await fetch(url, { ...opts, signal: ctrl.signal }); }
+    finally { clearTimeout(t); }
+  }
+
   async function send() {
     const text = $input.value.trim();
     if (!text) return;
@@ -14062,18 +14413,21 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     autoGrowInput();  // shrink the textarea back to one line
     const discuss = document.getElementById('discussToggle')?.checked;
     try {
-      const r = await fetch('/api/message', {
+      const r = await fetchWithTimeout('/api/message', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ text, model: $model.value, mode: discuss ? 'discuss' : undefined }),
-      });
+      }, 15000);
       if (!r.ok) {
         const body = await r.text();
         throw new Error('HTTP ' + r.status + ' — ' + body.slice(0, 400));
       }
     } catch (e) {
       $input.value = text;   // restore the input so the user can retry
-      showError('Send failed', e);
+      const msg = e?.name === 'AbortError'
+        ? new Error('Send timed out — the server did not respond. ' + TOO_MANY_TABS_HINT)
+        : e;
+      showError('Send failed', msg);
     }
   }
 
@@ -14511,9 +14865,30 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   //   - **bold**
   //   - # header   (## and ### map to smaller headers)
   //   - - bullet / * bullet
+  //   - GitHub-flavored tables (header row + |---| delimiter row, optional
+  //     :--- / ---: / :---: alignment; leading/trailing pipes optional)
   // Anything else passes through with newlines preserved by the body's
-  // white-space: pre-wrap. Block elements (h, ul, li) carry their own
+  // white-space: pre-wrap. Block elements (h, ul, li, table) carry their own
   // line breaks so we omit \\n around them when reassembling.
+  // Split a table row into trimmed cells: strip the optional outer pipes, then
+  // split on unescaped '|' (so an escaped \\| stays literal inside a cell).
+  function _mdSplitRow(s) {
+    let t = s.trim();
+    if (t.startsWith('|')) t = t.slice(1);
+    if (t.endsWith('|')) t = t.slice(0, -1);
+    return t.split(/(?<!\\\\)\\|/).map((c) => c.replace(/\\\\\\|/g, '|').trim());
+  }
+  // A delimiter row is all cells matching :?-+:? (the --- separator line).
+  function _mdIsDelimRow(s) {
+    if (!s || s.indexOf('|') === -1 && !/^[\\s:|-]+$/.test(s)) return false;
+    const cells = _mdSplitRow(s);
+    return cells.length > 0 && cells.every((c) => /^:?-{1,}:?$/.test(c));
+  }
+  function _mdAlign(delimCell) {
+    const c = (delimCell || '').trim();
+    const l = c.startsWith(':'), r = c.endsWith(':');
+    return (l && r) ? 'center' : r ? 'right' : l ? 'left' : '';
+  }
   function renderInline(text) {
     const escaped = escapeHtml(text);
     const lines = escaped.split('\\n');
@@ -14522,7 +14897,27 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     const closeList = () => {
       if (inList) { tokens.push({ kind: 'block', value: '</ul>' }); inList = false; }
     };
-    for (const line of lines) {
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      // TABLE: a row containing '|' immediately followed by a delimiter row.
+      if (line.indexOf('|') !== -1 && i + 1 < lines.length && _mdIsDelimRow(lines[i + 1])) {
+        closeList();
+        const headers = _mdSplitRow(line);
+        const aligns = _mdSplitRow(lines[i + 1]).map(_mdAlign);
+        const th = (s, ci) => \`<th\${aligns[ci] ? \` style="text-align:\${aligns[ci]}"\` : ''}>\${s}</th>\`;
+        const td = (s, ci) => \`<td\${aligns[ci] ? \` style="text-align:\${aligns[ci]}"\` : ''}>\${s ?? ''}</td>\`;
+        let html = '<table class="md"><thead><tr>' + headers.map(th).join('') + '</tr></thead><tbody>';
+        let j = i + 2;
+        for (; j < lines.length; j++) {
+          if (lines[j].indexOf('|') === -1 || !lines[j].trim()) break;
+          const cells = _mdSplitRow(lines[j]);
+          html += '<tr>' + headers.map((_, ci) => td(cells[ci], ci)).join('') + '</tr>';
+        }
+        html += '</tbody></table>';
+        tokens.push({ kind: 'block', value: html });
+        i = j - 1;   // resume after the consumed table rows
+        continue;
+      }
       const bullet = line.match(/^\\s*[-*]\\s+(.+)$/);
       if (bullet) {
         if (!inList) { tokens.push({ kind: 'block', value: '<ul class="md">' }); inList = true; }
@@ -14574,16 +14969,17 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     try { localStorage.setItem(MOSAIC_LS_KEY, raw); } catch {}
   }
 
-  async function openSnapshot() {
-    _mosaicState.currentPage = 0;
-    // Show the modal frame FIRST (with a loading placeholder) so we can
-    // measure the actual modal-body dimensions before sizing tiles.
-    $modal.classList.remove('error');
-    $modalBg.classList.add('fullpage');
-    $modalBg.classList.add('show');
-    if ($modalBody) $modalBody.innerHTML = '<div style="padding:20px;color:var(--muted);font-family:var(--mono);font-size:10px;">measuring…</div>';
-    if ($modalTitle) $modalTitle.textContent = 'Mosaic';
-    await _fetchAndRenderMosaic();
+  function openSnapshot() {
+    // Diagnostics now live on a STANDALONE page (/snapshot) with its own
+    // connection — so it works even when THIS tab's UI is wedged, and you can
+    // also browse straight to http://127.0.0.1:<port>/snapshot. Open it in a
+    // separate tab (named target so repeated clicks reuse the same tab). The
+    // in-app mosaic (_fetchAndRenderMosaic) is kept below as a fallback but is
+    // no longer the primary path.
+    try {
+      const w = window.open('/snapshot', 'cb-snapshot');
+      if (!w) location.href = '/snapshot';   // popup blocked → navigate
+    } catch { location.href = '/snapshot'; }
   }
 
   async function _fetchAndRenderMosaic() {
@@ -14954,7 +15350,14 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   // Browser is a view: we mirror session, render from session.events.
   let _es = null;
   let _lastSseAt = 0;            // wallclock ms of most recent SSE message
+  // Tab leadership: only the ACTIVE tab holds an SSE connection. Multiple live
+  // SSE connections (one per tab) exhaust the browser's ~6-per-origin pool and
+  // silently hang every fetch. When this tab is passive we keep no connection
+  // and skip all (re)connect paths. See setupTabLeadership below.
+  let _tabActive = true;
+  let _ssePaused = false;
   function connectStream() {
+    if (_ssePaused || !_tabActive) { console.log('[sse] passive tab — not connecting'); return; }
     if (_es) { try { _es.close(); } catch {} _es = null; }
     _es = new EventSource('/api/stream');
     console.log('[sse] connecting');
@@ -14991,6 +15394,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     };
   }
   async function refetchAndReconnect() {
+    if (_ssePaused || !_tabActive) return;   // passive tab holds no connection
     try {
       const r = await fetch('/api/state');
       const s = await r.json();
@@ -15012,6 +15416,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   // /api/state directly and reconnect. Cheap insurance against silent SSE
   // drops; doesn't run when idle.
   setInterval(() => {
+    if (_ssePaused || !_tabActive) return;   // passive tab intentionally has no SSE
     if (!session) return;
     if (session.status !== 'running') return;
     if (!_lastSseAt) return;     // never connected yet — connectStream will handle it
@@ -15049,6 +15454,62 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     } catch {}
   }
   setInterval(refreshGitDirty, 8000);
+
+  // ── Tab leadership (single live SSE) ────────────────────────────────────
+  // Each open code_boss tab would hold its own SSE connection; several tabs
+  // exhaust the browser's ~6-connections-per-origin pool and silently hang
+  // EVERY fetch (send, settings, snapshot). So only ONE tab is ACTIVE (holds
+  // the SSE) at a time — newest wins. Opening or re-activating a tab broadcasts
+  // a CLAIM; any tab with an older claim steps down to PASSIVE: it closes its
+  // SSE (freeing the connection) and shows a "use this tab" banner. Clicking it
+  // reclaims leadership. Single-user app — one live view is all that's needed.
+  // Falls back to no-op (current single-tab behavior) if BroadcastChannel is
+  // unavailable.
+  (function setupTabLeadership() {
+    let bc;
+    try { bc = new BroadcastChannel('code_boss_tabs'); } catch { return; }
+    const TAB_ID = Math.random().toString(36).slice(2);
+    let myClaim = 0;                          // higher = newer; newest wins
+    const banner = document.createElement('div');
+    banner.id = 'tabWarn';
+    document.body.appendChild(banner);
+    function broadcastClaim() {
+      myClaim = Date.now() + Math.random();
+      try { bc.postMessage({ type: 'claim', id: TAB_ID, t: myClaim }); } catch {}
+    }
+    function showPassiveBanner(text) {
+      banner.innerHTML = escapeHtml(text) + ' <button id="tabReclaim" class="btn-sm">Use this tab here</button>';
+      banner.classList.add('show');
+      const b = document.getElementById('tabReclaim');
+      if (b) b.onclick = becomeActive;
+    }
+    function becomeActive() {
+      _tabActive = true;
+      _ssePaused = false;
+      banner.classList.remove('show');
+      broadcastClaim();                      // tell the other tabs to step down
+      refetchAndReconnect();                 // reopen SSE + refresh to current state
+    }
+    function goPassive() {
+      _tabActive = false;
+      _ssePaused = true;
+      try { _es?.close(); } catch {}
+      _es = null;
+      showPassiveBanner('Another code_boss tab is now the active one (only one runs at a time to avoid stalls).');
+    }
+    bc.onmessage = (e) => {
+      const m = e.data;
+      if (!m || m.id === TAB_ID) return;
+      // A newer claim than ours → we step down. (Ties broken by the random
+      // fractional part of t, so two tabs never both stay active or both drop.)
+      if (m.type === 'claim' && typeof m.t === 'number' && m.t > myClaim) goPassive();
+      else if (m.type === 'bye' && !_tabActive) showPassiveBanner('The active code_boss tab closed.');
+    };
+    // Claim leadership on load (newest wins). connectStream() runs later in
+    // init and will open the SSE because this tab is active.
+    broadcastClaim();
+    window.addEventListener('beforeunload', () => { try { bc.postMessage({ type: 'bye', id: TAB_ID }); } catch {} });
+  })();
 
   // Spinner tick — runs only while a chat is in progress so the spinner glyph
   // animates and the elapsed timer counts up.
@@ -15141,6 +15602,13 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
         // bar and stop (the server never persists it; don't push it either).
         if (msg.event.type === 'context-fill') {
           contextFill = { totalTokens: msg.event.totalTokens, budgetTokens: msg.event.budgetTokens, budgetPct: msg.event.budgetPct };
+          renderStatus();
+          break;
+        }
+        // task-progress is a per-turn signal (the agent's completion estimate +
+        // what remains), not a chat row — update the chip and stop.
+        if (msg.event.type === 'task-progress') {
+          taskProgress = { percent: msg.event.percent, note: msg.event.note };
           renderStatus();
           break;
         }
@@ -15860,22 +16328,26 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
 
   // ── Settings modal ─────────────────────────────────────────────────────
   async function openSettings() {
+    // Open the modal IMMEDIATELY — never gate it on a network fetch. A stalled
+    // fetch (e.g. connection pool exhausted by multiple tabs) must not make the
+    // gear button look dead; this is also the route to the Snapshot, which is
+    // exactly what you need when things are wedged.
     if ($settingsProject) $settingsProject.textContent = activeProject || '(none)';
     if ($settingsTokens)  $settingsTokens.textContent = totalTokens.toLocaleString();
     if ($settingsTimeout) $settingsTimeout.textContent = fmtTimeoutMins(session?.timeoutMs);
-    // Pull the current key prefix so the settings row reflects whatever
-    // was loaded from ~/.code_boss/api-key.txt (or set just now).
+    $settingsModalBg.classList.add('show');
+    // Then populate the key/creds prefixes asynchronously (bounded so a hung
+    // request leaves them blank rather than blocking the modal).
     try {
-      const ak = await fetch('/api/api-key').then((r) => r.json());
+      const ak = await fetchWithTimeout('/api/api-key', {}, 6000).then((r) => r.json());
       const el = document.getElementById('settingsApiKey');
       if (el) el.textContent = ak.hasKey ? (ak.prefix || '(set)') : '(not set)';
     } catch {}
     try {
-      const gc = await fetch('/api/gitlab-creds').then((r) => r.json());
+      const gc = await fetchWithTimeout('/api/gitlab-creds', {}, 6000).then((r) => r.json());
       const el = document.getElementById('settingsGitLab');
       if (el) el.textContent = gc.hasCreds ? (gc.user || '(set)') : '(not set)';
     } catch {}
-    $settingsModalBg.classList.add('show');
   }
   function closeSettings() {
     $settingsModalBg.classList.remove('show');
