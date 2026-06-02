@@ -15,7 +15,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '171';
+const BUILD_VERSION = '172';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
