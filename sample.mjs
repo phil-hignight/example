@@ -15,7 +15,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '169';
+const BUILD_VERSION = '171';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
@@ -234,9 +234,30 @@ function createHttpAdapter(opts = {}) {
 
   async function safeFetch(path, init) {
     let attempt = 0;
+    let netAttempt = 0;
     let unlocked = false;
     while (true) {
-      const res = await doFetchOnce(path, init);
+      let res;
+      try {
+        res = await doFetchOnce(path, init);
+      } catch (err) {
+        // NETWORK-level failure: the request never got an HTTP response
+        // (connection refused, DNS, reset, TLS). Node surfaces this as a bare
+        // "TypeError: fetch failed" — useless to show the developer. A user
+        // abort (/api/cancel) is NOT retryable. Otherwise retry a few times with
+        // backoff (the endpoint/proxy may be momentarily down or restarting),
+        // then throw a clear, actionable error naming the endpoint + cause.
+        if (err?.name === 'AbortError') throw err;
+        const cause = err?.cause?.code || err?.cause?.message || err?.code || err?.message || 'network error';
+        if (netAttempt < maxRetries) {
+          await sleep(500 * Math.pow(2, netAttempt));
+          netAttempt++;
+          continue;
+        }
+        const e = new Error(`could not reach the LLM endpoint ${baseURL} (${cause}) after ${maxRetries + 1} attempts. Is the endpoint/proxy running and reachable from this machine?`);
+        e.cause = err;
+        throw e;
+      }
       if (res.ok) return res;
 
       if (res.status === 401 && !unlocked) {
@@ -600,9 +621,27 @@ function createAnthropicAdapter(opts = {}) {
   }
 
   async function safeFetch(path, init, stream) {
-    let attempt = 0, unlocked = false;
+    let attempt = 0, netAttempt = 0, unlocked = false;
     while (true) {
-      const res = await doFetchOnce(path, init, stream);
+      let res;
+      try {
+        res = await doFetchOnce(path, init, stream);
+      } catch (err) {
+        // Network-level failure (no HTTP response): refused/DNS/reset/TLS — Node
+        // surfaces it as a bare "fetch failed". A user abort is not retryable;
+        // otherwise retry with backoff (the proxy may be down/restarting), then
+        // throw a clear error naming the endpoint + cause.
+        if (err?.name === 'AbortError') throw err;
+        const cause = err?.cause?.code || err?.cause?.message || err?.code || err?.message || 'network error';
+        if (netAttempt < maxRetries) {
+          await anthSleep(500 * Math.pow(2, Math.min(netAttempt, 5)));
+          netAttempt++;
+          continue;
+        }
+        const e = new Error(`could not reach the LLM endpoint ${baseURL} (${cause}) after ${maxRetries + 1} attempts. Is the proxy/endpoint running and reachable?`);
+        e.cause = err;
+        throw e;
+      }
       if (res.ok) return res;
       if (res.status === 401 && !unlocked) {
         const body = await anthReadJson(res);
