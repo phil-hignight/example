@@ -15,7 +15,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '148';
+const BUILD_VERSION = '163';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
@@ -1823,6 +1823,7 @@ const TASK_FILE = (id) => `${id}.json`;
 
 function nowMs() { return Date.now(); }
 function tokensOf(s) { return Math.ceil((s || '').length / 4); }
+function taskTmpId() { return process.pid + '-' + randomUUID().slice(0, 8); }
 
 function createTasksStore(projectDir) {
   if (!projectDir) throw new Error('projectDir required');
@@ -1830,6 +1831,32 @@ function createTasksStore(projectDir) {
 
   let state = null;            // { nextId, currentId, rootId, allTaskIds: [] }
   const cache = new Map();     // id -> TaskRecord (lazy)
+
+  // Per-FILE write serialization + atomic writes. On Windows two concurrent
+  // writeFile() calls to the SAME path throw EBUSY ("resource busy or locked"):
+  // the second open fails while the first handle is live. The task store has
+  // many interleaving async writers (parallel <remote-workspace> blocks each
+  // append tool-call/result to the same task file; maybeCompact demotes while a
+  // turn is still appending; rapid next-task transitions write the same files
+  // back-to-back), so an unserialized writeFile raced and crashed the agent
+  // (EBUSY on T-12.json). Mirror the proven codebase-memory + conversation.json
+  // pattern: chain writes per absolute path (so different files still write in
+  // parallel, the SAME file serializes) and write atomically via a UNIQUE temp
+  // file + rename (rename is atomic, so a torn/concurrent write never corrupts
+  // the live file). writeChains is scoped to THIS store instance.
+  const writeChains = new Map();   // absolute path -> Promise (tail of its write chain)
+  function withFileLock(filePath, fn) {
+    const prev = writeChains.get(filePath) || Promise.resolve();
+    const next = prev.then(fn, fn);            // run fn regardless of prior outcome
+    writeChains.set(filePath, next.then(() => {}, () => {}));   // keep the chain rejection-free
+    return next;
+  }
+  async function atomicWrite(filePath, data) {
+    await ensureDir();
+    const tmp = filePath + '.' + taskTmpId() + '.tmp';   // unique per write — never shared
+    await writeFile(tmp, data, 'utf8');
+    await rename(tmp, filePath);
+  }
 
   async function ensureDir() { await mkdir(dir, { recursive: true }); }
 
@@ -1840,8 +1867,8 @@ function createTasksStore(projectDir) {
     } catch { return null; }
   }
   async function saveState() {
-    await ensureDir();
-    await writeFile(path.join(dir, STATE_FILE), JSON.stringify(state, null, 2), 'utf8');
+    const file = path.join(dir, STATE_FILE);
+    return withFileLock(file, () => atomicWrite(file, JSON.stringify(state, null, 2)));
   }
 
   async function loadTask(id) {
@@ -1854,9 +1881,14 @@ function createTasksStore(projectDir) {
     } catch { return null; }
   }
   async function saveTask(t) {
-    await ensureDir();
-    cache.set(t.id, t);
-    await writeFile(path.join(dir, TASK_FILE(t.id)), JSON.stringify(t, null, 2), 'utf8');
+    const file = path.join(dir, TASK_FILE(t.id));
+    return withFileLock(file, async () => {
+      await atomicWrite(file, JSON.stringify(t, null, 2));
+      // Commit the cache only AFTER the write succeeds, so a failed write never
+      // leaves the in-memory record ahead of disk.
+      cache.set(t.id, t);
+      return t;
+    });
   }
 
   function newId() {
@@ -1997,6 +2029,33 @@ function createTasksStore(projectDir) {
   }
 
   /**
+   * Move ONE specific message (by object identity, captured when it was
+   * appended) from `fromId` to the end of `toId`. Used when a task is closed
+   * before any work was done for a just-arrived user message: that message
+   * belongs to the NEW task, not the one being closed. Identity (not position)
+   * is required because by the time the close fires, the turn's assistant prose
+   * has already been appended after the user message, so it is no longer the
+   * tail. Falls back to a content match if the exact reference is gone (e.g.
+   * after a reload). Returns the moved record, or null if not found.
+   */
+  async function relocateMessageRef(fromId, toId, ref) {
+    if (!ref || !fromId || !toId || fromId === toId) return null;
+    const from = await loadTask(fromId);
+    const to = await loadTask(toId);
+    if (!from || !to) return null;
+    const msgs = from.messages ?? [];
+    let idx = msgs.indexOf(ref);
+    if (idx === -1) idx = msgs.findIndex((m) => m.kind === ref.kind && m.content === ref.content);
+    if (idx === -1) return null;
+    const [msg] = msgs.splice(idx, 1);
+    from.messages = msgs;
+    to.messages = [...(to.messages ?? []), msg];
+    await saveTask(from);
+    await saveTask(to);
+    return msg;
+  }
+
+  /**
    * List tasks. If parentId is given, only its direct children. If tier is
    * given, only tasks at that tier. By default archived tasks are excluded;
    * pass includeArchived: true to include them (e.g., for search).
@@ -2060,6 +2119,18 @@ function createTasksStore(projectDir) {
     return hits;
   }
 
+  // Snapshot the full-fidelity messages ONCE, the first time a task leaves
+  // tier 1, so a later <task-detail> can recover the real detail of a compacted
+  // task (tier-2 masking and tier-3 dropping are both lossy). Kept on disk, NOT
+  // rendered into context and NOT counted toward any tier budget (tier 2 counts
+  // the masked messages; tier 3/4 count only the summary), so it costs context
+  // nothing — only disk, and only for the rare compacted task.
+  function snapshotMessages(t) {
+    if (!t.archivedMessages && Array.isArray(t.messages) && t.messages.length) {
+      t.archivedMessages = t.messages.map((m) => ({ ...m }));
+    }
+  }
+
   /**
    * Mechanical demotion: mark task as tier 2 and replace tool-result message
    * bodies with one-line placeholders. NO LLM call.
@@ -2068,6 +2139,7 @@ function createTasksStore(projectDir) {
     const t = await loadTask(id);
     if (!t) return null;
     if (t.tier >= 2) return t;
+    snapshotMessages(t);   // preserve full detail BEFORE masking results
     for (const m of t.messages ?? []) {
       if (m.kind === 'tool-result') {
         const lines = (m.content ?? '').split('\n').length;
@@ -2084,12 +2156,13 @@ function createTasksStore(projectDir) {
   /**
    * Summary demotion: replace messages with a one-paragraph summary. Caller
    * provides the summary text (we don't run the LLM here; agent loop owns
-   * that concern).
+   * that concern). The full messages survive in archivedMessages for retrieval.
    */
   async function demoteToTier3(id, summaryText) {
     const t = await loadTask(id);
     if (!t) return null;
     if (t.tier >= 3) return t;
+    snapshotMessages(t);   // in case the task skipped tier 2
     t.messages = [];
     t.summary = summaryText || t.summary || '(no summary written)';
     t.tier = 3;
@@ -2217,6 +2290,7 @@ function createTasksStore(projectDir) {
     transitionTo,
     attachToTask,
     appendMessage,
+    relocateMessageRef,
     listTasks, getDetail, searchTasks, setSummary,
     demoteToTier2, demoteToTier3,
     rollupTier3Tasks, archiveTask,
@@ -2261,10 +2335,11 @@ function createTasksStore(projectDir) {
  *     <edit path="FILE"><find>X</find><replace>Y</replace></edit>
  *
  *   Task ops (self-closing; meta-operations the agent uses to manage memory):
- *     <next-task summary="..." title="..." goal="..."/>  close + open new task
- *     <list-tasks parent="ID"/>                          list tasks
- *     <task-detail id="T-3"/>                            one task's summary
- *     <search-tasks query="TEXT"/>                       search task summaries
+ *     <next-task summary="..." user-request="..."/>      close + open new task
+ *     <task-detail id="T-3"/>      recover a COMPACTED (tier 3/4) task's detail
+ *     <search-tasks query="TEXT"/> search COMPACTED task summaries
+ *   (Inspection is GATED to compacted tasks only — in-context tasks expose no
+ *    id and are refused; <list-tasks> is disabled. See dispatchTaskOp.)
  */
 
 // ── Tier budgets and thresholds ─────────────────────────────────────────────
@@ -2282,10 +2357,21 @@ function createTasksStore(projectDir) {
 // the demotion paths without needing massive conversations. Production
 // uses the defaults below.
 const _envNum = (name, def) => { const n = Number(process.env[name]); return Number.isFinite(n) && n > 0 ? n : def; };
-const TIER_1_BUDGET = _envNum('TIER_1_BUDGET', 12000);  // full messages (current + recent tasks)
-const TIER_2_BUDGET = _envNum('TIER_2_BUDGET',  8000);  // masked-results tasks
-const TIER_3_BUDGET = _envNum('TIER_3_BUDGET',  4000);  // per-task summaries
-const TIER_4_BUDGET = _envNum('TIER_4_BUDGET',  2000);  // group-rollup summaries
+// Sized for a ~1M-token context model (Opus 4.8 1M / Gemini 3.x). TOTAL_BUDGET
+// ~= 500k is half the window, so compaction (HIGH = TOTAL*1.10 = 550k) leaves
+// ~450k of headroom for the system prompt, the always-sent PRIMING few-shot,
+// AGENTS.md/codebase memory, and a turn's output — and the orange context-fill
+// bar moves slowly through normal work instead of pinning at 100% almost
+// immediately (the old 26k total saturated on a single large build log / a few
+// file reads, and forced near-constant auto-close + compaction that threw away
+// history that easily fit in the real window). Rebalanced toward tier 1, which
+// holds the live full-fidelity messages (reads, build logs) that dominate real
+// usage. Still env-overridable so the compaction-validation tests can run with
+// tiny budgets to actually exercise the demotion paths.
+const TIER_1_BUDGET = _envNum('TIER_1_BUDGET', 300000); // full messages (current + recent tasks)
+const TIER_2_BUDGET = _envNum('TIER_2_BUDGET', 120000); // masked-results tasks
+const TIER_3_BUDGET = _envNum('TIER_3_BUDGET',  50000); // per-task summaries
+const TIER_4_BUDGET = _envNum('TIER_4_BUDGET',  30000); // group-rollup summaries
 const TOTAL_BUDGET  = TIER_1_BUDGET + TIER_2_BUDGET + TIER_3_BUDGET + TIER_4_BUDGET;
 const HYST_HIGH = 1.10;          // trigger compaction when total > 110% of TOTAL_BUDGET
 const HYST_LOW  = 0.50;          // compact down to 50% of TOTAL_BUDGET in one pass
@@ -2363,20 +2449,19 @@ function buildSystemPrompt({ taskId, taskUserRequest, tier1Tokens, tier1Pct, pro
     '  - If it is NOT complete: emit <task-progress percent="N">one sentence on what still remains</task-progress> as a standalone tag in your prose (N = your honest 0-100 estimate of completion).',
     '  - Provide EXACTLY ONE of these at the end of EVERY reply. Omitting both returns an error and you must redo the turn. Estimating what remains each turn forces you to notice when nothing real is left — that is when you close the task. Do NOT let one task run forever.',
     '',
-    'Mixing prose with tool blocks — IMPORTANT:',
-    '  - A single reply may contain MULTIPLE <remote-workspace>...</remote-workspace> blocks with prose freely around and between them. The user sees the prose as chat messages and watches the tools run in order.',
-    '  - Write a sentence or two of prose before each tool block explaining what you are about to look at and why. End the reply with a final prose section saying what you plan to do once you see results — or, if no tools are needed at all, the entire reply is just prose.',
-    '  - You CANNOT react to tool results within the same reply — all tools in a reply run only AFTER you finish writing it, and you get the results in your NEXT reply. So the prose AFTER a tool block in the same reply describes intent ("then I will…"), not findings ("the file shows…").',
-    '  - Group truly-independent commands inside ONE block — they run together. Use SEPARATE blocks when you want to narrate between them.',
-    '  - Turn economics: a turn round-trip (you reply, the tools run, you read results next turn) costs far more than an extra tool call. Before writing blocks, list every call you need and mark each INDEPENDENT (can run now) or DEPENDENT (needs a prior result); put ALL the independent ones in ONE block. Prefer one wide block over several turns — e.g. read three files in a single block, not across three replies.',
+    'Prose + tool blocks — keep narration TIGHT:',
+    '  - Lead with ONE short sentence saying what you are about to do, then the tool block. That is usually the whole reply.',
+    '  - Batch ALL independent calls into ONE block — they run together. (Before writing, decide which calls need no prior result and put them all in one block; e.g. read three files in a single block, not across three replies. A turn round-trip costs far more than an extra call.)',
+    '  - Do NOT narrate each individual call, and do NOT add a trailing "then I will… once I see the results…" sentence after the block — that just doubles the chatter. Only add a closing line if it carries real information. Never restate your whole plan every turn.',
+    '  - You CANNOT react to tool results in the same reply — tools run after you finish writing, and you get results in your NEXT reply. Use separate blocks across turns only when a call genuinely DEPENDS on a previous result.',
     '',
     'Example reply shape (fake commands, shown for structure only):',
-    '  Looking for TODO markers under src/api/ first.',
-    '  <remote-workspace><search pattern="TODO" path="src/api/"/></remote-workspace>',
-    '  Then I will read the README so I have project context for the next reply.',
-    '  <remote-workspace><read path="README.md"/></remote-workspace>',
-    '  Once I see the search hits and the README, I will pick the most likely file to dig into.',
+    '  Checking the project layout and the build file.',
+    '  <remote-workspace><list path="."/><read path="pom.xml"/><search pattern="TODO" path="src/"/></remote-workspace>',
+    '  (No trailing "then I will…" — the next reply reacts to these results.)',
     '',
+    'Example final-answer reply (no tools needed):',
+    '  This project uses Maven, not Gradle — you can run `mvnw.cmd -q test` from the repo root.',
     'Example final-answer reply (no tools needed):',
     '  This project uses Maven, not Gradle — you can run `mvnw.cmd -q test` from the repo root.',
     '',
@@ -2406,15 +2491,19 @@ function buildSystemPrompt({ taskId, taskUserRequest, tier1Tokens, tier1Pct, pro
       '  Use PowerShell syntax (Get-ChildItem, Get-Content, $env:VAR). The `ls`, `cat`, `pwd` aliases also work. To run a maven wrapper script use `mvnw.cmd` — not `./mvnw`.',
     ]),
     '',
-    'Task management:',
+    'Closing a unit of work:',
     '  <next-task user-request="WHAT THE USER WANTED IN THE CURRENT TASK" summary="WHAT WAS DONE IN THE CURRENT TASK"/>',
-    '       Closes the CURRENT task and opens a new one. Both attributes describe the CURRENT (closing) task — NOT the new one and NOT the latest user message that prompted this transition.',
-    '       The user-request is a single sentence that captures what the user wanted across the work just finished. It is a synthesized statement, not a quote of any single user message.',
-    '       IMPORTANT — emit <next-task/> PROACTIVELY: the moment you have finished a discrete unit of work (a fix, a feature, a question fully answered), close it with <next-task/> in that SAME reply, after your final prose. Closing a task is what triggers the code review and records the work — if you never close it, none of that happens. Do not wait to be asked; do not leave a finished task open. (Only skip it mid-task when more work on the SAME unit remains.)',
-    '       VERIFY BEFORE YOU CLOSE a code-editing task — do not report a change as done on assumption. Run the project build or tests via <powershell> (e.g. mvnw.cmd -q test, npm test, or node test/...) and state the outcome in the summary (e.g. "tests pass 12/12"). If the task is read-only, a discussion, or the project has no build/test to run, say so in the summary instead.',
-    '  <list-tasks parent="T-1"/>',
-    '  <task-detail id="T-3"/>',
-    '  <search-tasks query="auth middleware"/>',
+    '       Closes the CURRENT task and opens a new one. Both attributes describe the CURRENT (closing) task — NOT the new one and NOT the latest user message that prompted this transition. user-request is a single synthesized sentence of what the user wanted across the work just finished (not a quote).',
+    '       Emit it PROACTIVELY: the moment you finish a discrete unit of work (a fix, a feature, a question fully answered), close it with <next-task/> in that SAME reply, after your final prose. Closing records the work and triggers review. Do not leave a finished task open. (Only skip it mid-task when more work on the SAME unit remains.)',
+    '       VERIFY BEFORE YOU CLOSE a code-editing task — do not report a change as done on assumption. Run the project build or tests via <powershell> and state the outcome in the summary (e.g. "tests pass 12/12"). If the task is read-only, a discussion, or there is no build/test, say so in the summary instead.',
+    '       NEVER emit <next-task> on an EMPTY task (a freshly opened task with no developer request and no work in it). If you have finished everything the developer asked, reply with a short message and NO tool calls — that waits for their next instruction. Do not open-and-close empty tasks.',
+    '       Do NOT manage or list tasks. Your current work and SHORT summaries of past tasks are ALREADY in your context; spend your turns doing the developer\'s request and talking to them, not administering the task list.',
+    '',
+    'Recovering a COMPACTED task (rare — only when you actually need it):',
+    '  When the conversation grows, older finished tasks are compacted: their messages are dropped and they appear only as a one-line <task-history id="T-N">summary</task-history> (or <task-rollup id="T-N">). Those are the ONLY tasks with a visible ID. If — and only if — a summary tells you a compacted task holds specifics you need for the CURRENT request, you may pull it back:',
+    '  <task-detail id="T-N"/>          recover the full messages of a compacted task',
+    '  <search-tasks query="TEXT"/>     find compacted tasks whose summary matches',
+    '       These reach ONLY compacted tasks. A task still in context (its messages are right there above, with no ID) is refused — read it where it is. NEVER look at a previous task to DECIDE WHAT TO DO in the current one; only to recover a concrete detail you are missing. When in doubt, just do the work — do not go spelunking through history.',
     '',
     'Codebase memory (durable facts about THIS codebase; injected into every future run):',
     '  <remember category="architecture|conventions|gotchas|where-things-live|build-deploy|general" note="ONE concise durable fact"/>',
@@ -2995,8 +3084,38 @@ async function maybeCompact({ store, adapter, model, log, emitChat }) {
   // demotion loop on the demotable total (excl. current — it can't be masked
   // while in progress). This makes compaction fire on a long single task and
   // reclaim every finished task, instead of never firing at all.
+  // demotableTotal (totalContextTokens) and currentTaskTokens are DISJOINT by
+  // construction — tier1TokensFor skips state.currentId — so adding them is the
+  // true, non-double-counted prompt size. The context-fill % the UI shows is
+  // triggerTotal / TOTAL_BUDGET; keep these two sets disjoint if either is edited.
   const demotableTotal = await totalContextTokens(store);
-  const triggerTotal = demotableTotal + (await currentTaskTokens(store));
+  const currentTotal = await currentTaskTokens(store);
+  const triggerTotal = demotableTotal + currentTotal;
+  // Compact task-store breakdown for the Snapshot (catalog "Task store
+  // breakdown"). The server can't read the task store itself without blocking
+  // sync I/O (it lives on disk, owned by the agent), so the agent emits it here
+  // — once per turn, from the same place compaction already runs. One lightweight
+  // listTasks pass (metadata only, cached): per-tier counts + the current vs
+  // finished token split, so prod triage can see a runaway open task, how many
+  // finished tasks sit at each tier, and how close compaction is.
+  let taskStats = null;
+  try {
+    const tierCounts = { 1: 0, 2: 0, 3: 0, 4: 0 };
+    let totalTasks = 0;
+    for (const t of await store.listTasks()) {
+      if (t.rolledUpInto) continue;          // covered by its tier-4 rollup
+      totalTasks++;
+      if (tierCounts[t.tier] != null) tierCounts[t.tier]++;
+    }
+    taskStats = {
+      currentId: store.currentId(),
+      currentTokens: currentTotal,           // the OPEN task's (elided) prompt size
+      demotableTokens: demotableTotal,       // finished tasks still in context
+      perTaskCeiling: Math.round(TASK_FORCE * TIER_1_BUDGET),  // auto-close threshold
+      tierCounts,
+      totalTasks,
+    };
+  } catch { /* breakdown is best-effort; never block the gauge */ }
   // Report context-window fill to the UI EVERY turn (this runs once per turn),
   // not just when compaction fires, so the developer always sees how full the
   // window is. budgetPct is the binding constraint: total context vs TOTAL_BUDGET.
@@ -3005,6 +3124,7 @@ async function maybeCompact({ store, adapter, model, log, emitChat }) {
     totalTokens: triggerTotal,
     budgetTokens: TOTAL_BUDGET,
     budgetPct: Math.min(100, Math.round((triggerTotal / TOTAL_BUDGET) * 100)),
+    taskStats,
   });
   if (triggerTotal <= HIGH) return;
   let total = demotableTotal;
@@ -3116,10 +3236,34 @@ async function runTurnStreaming(adapter, opts, { onProseChunk, onProseSegmentEnd
   const findFrom = (re, from) => { re.lastIndex = from; const m = re.exec(text); return m ? m.index : -1; };
   const OPEN_RE = /<remote-workspace/gi;
   const CLOSE_RE = /<\/remote-workspace>/gi;
+  const PROG_OPEN_RE = /<task-progress/gi;
+  const PROG_CLOSE_RE = /<\/task-progress>/gi;
   const pump = () => {
     while (true) {
       if (state === 'prose') {
         const openIdx = findFrom(OPEN_RE, proseSent);
+        const progIdx = findFrom(PROG_OPEN_RE, proseSent);
+        // <task-progress …>…</task-progress> is a SIGNAL, not a tool block and
+        // not a segment break: the model emits one on most turns and the final
+        // prose is sanitized to remove it. Suppress the whole span from the
+        // STREAM too — otherwise the live bubble balloons to the raw multi-line
+        // tag and then snaps down to the stripped size when the segment
+        // finalizes. (The post-stream task-progress event/chip is extracted from
+        // the full text separately, so it is unaffected; proseStart is not moved,
+        // so the sanitized final segment is unchanged.)
+        if (progIdx !== -1 && (openIdx === -1 || progIdx < openIdx)) {
+          if (progIdx > proseSent) {
+            onProseChunk?.({ segmentIndex, content: text.slice(proseSent, progIdx) });
+            proseSent = progIdx;
+          }
+          const tagCloseIdx = text.indexOf('>', progIdx);
+          if (tagCloseIdx === -1) return;                            // opening tag still arriving — hold back
+          if (text[tagCloseIdx - 1] === '/') { proseSent = tagCloseIdx + 1; continue; }  // <task-progress …/>
+          const endIdx = findFrom(PROG_CLOSE_RE, tagCloseIdx + 1);
+          if (endIdx === -1) return;                                 // close not here yet — emit nothing
+          proseSent = endIdx + '</task-progress>'.length;            // skip the span; no emit, no segment break
+          continue;
+        }
         if (openIdx === -1) {
           // No open tag yet — emit prose up to HOLDBACK before the tail so
           // a partial tag mid-stream never appears in the UI.
@@ -3198,9 +3342,43 @@ async function runTurnStreaming(adapter, opts, { onProseChunk, onProseSegmentEnd
 }
 
 // ── Task-op dispatcher ─────────────────────────────────────────────────────
-async function dispatchTaskOp(c, store) {
+// A task is RETRIEVABLE (its detail can be pulled back via <task-detail>) ONLY
+// once its messages have been COMPACTED OUT of the live context: tier >= 3
+// (demoteToTier3 drops the messages, leaving only a summary + an ID in the
+// <task-history> block), or it was rolled into a tier-4 project, or archived.
+// tier 1/2 tasks are still rendered verbatim in the prompt — their content is
+// already present and they expose NO id — so they are not retrievable.
+function isRetrievableTask(t, currentId) {
+  if (!t || t.id === currentId) return false;
+  if (t.archived || t.rolledUpInto) return true;
+  return (t.tier ?? 1) >= 3;
+}
+// A task with no developer request and no work in it — nothing to summarize.
+// Closing one is the infinite "open empty task -> close it -> repeat" churn.
+function isEmptyTask(t) {
+  const msgs = t?.messages ?? [];
+  if (msgs.length === 0) return true;
+  return !msgs.some((m) => m.kind === 'user-message' || m.kind === 'tool-call' || m.kind === 'tool-result');
+}
+
+async function dispatchTaskOp(c, store, opts = {}) {
   const a = c.args;
   if (c.verb === 'next-task') {
+    // Refuse to close an EMPTY task (no request, no work). Closing one produced
+    // an infinite churn: <next-task> opens a fresh empty task, the model looks
+    // back at the prior (in-context) task, decides it is "waiting for
+    // instructions", and closes the empty task again — forever (and hammered the
+    // task store, which is how the EBUSY crash surfaced). didRealWork lets a
+    // same-turn read-then-close through: that turn's tool results are not stored
+    // yet at dispatch time, so isEmptyTask alone would mis-flag a worked task.
+    const cur = await store.getCurrent();
+    if (isEmptyTask(cur) && !opts.didRealWork) {
+      return {
+        ok: false,
+        emptyClose: true,
+        content: 'Nothing to close — this task has no developer request and no work in it. Do NOT emit <next-task> on an empty task. If you have finished everything the developer asked, reply with a short message and NO tool calls to wait for their next instruction.',
+      };
+    }
     // user-request and summary describe the task being CLOSED (the current one),
     // not the new one being opened. See system prompt.
     const r = await store.transitionTo({
@@ -3214,33 +3392,47 @@ async function dispatchTaskOp(c, store) {
       newTaskId: r.newTask.id,
     };
   }
+  // list-tasks stays disabled — pure navel-gazing with no legitimate gated use.
   if (c.verb === 'list-tasks') {
-    const list = await store.listTasks({ parentId: a.parent });
-    if (!list.length) return { ok: true, content: '(no tasks)' };
-    const lines = list.map((t) => {
-      const status = t.ended ? 'done' : 'open';
-      const tier = `tier${t.tier}`;
-      const ur = t.userRequest ? ` ↳ ${t.userRequest.split('\n')[0].slice(0, 100)}` : '';
-      const summary = t.summary ? ` — ${t.summary.split('\n')[0].slice(0, 120)}` : '';
-      const hash = t.commitHash ? `  (commit ${t.commitHash})` : '';
-      return `${t.id}  [${status}]  [${tier}]${hash}${ur}${summary}`;
-    });
-    return { ok: true, content: lines.join('\n') };
+    return {
+      ok: false,
+      content: 'Listing tasks is disabled. Your current work and recent tasks are already in your context — do not enumerate tasks.',
+    };
   }
+  // task-detail / search-tasks are GATED to COMPACTED tasks only (the ones shown
+  // as <task-history>/<task-rollup id="T-N"> summaries). A task still in context
+  // is refused — read it where it already is. Use these ONLY to recover the
+  // specifics of a compacted task you genuinely need for the CURRENT request;
+  // never to decide what to do.
   if (c.verb === 'task-detail') {
-    const t = await store.getDetail(a.id);
-    if (!t) return { ok: false, content: `task ${a.id} not found` };
-    return { ok: true, content: JSON.stringify(t, null, 2) };
+    const id = String(a.id || '').trim();
+    if (!id) return { ok: false, content: 'task-detail needs id="T-N".' };
+    if (id === store.currentId()) return { ok: false, content: 'That is your CURRENT task — its content is already in your context. Do not retrieve it.' };
+    const t = await loadTaskFull(store, id);
+    if (!t) return { ok: false, content: `No task ${id} exists.` };
+    if (!isRetrievableTask(t, store.currentId())) {
+      return { ok: false, content: `${id} is still fully in your context above (its messages are present) — read it there. task-detail only pulls back a task that was compacted to a summary.` };
+    }
+    const msgs = (t.archivedMessages?.length ? t.archivedMessages : t.messages) ?? [];
+    const head = `<task-detail id="${t.id}" tier="${t.tier ?? '?'}">\n  request: ${t.userRequest || '(none recorded)'}\n  summary: ${t.summary || '(none)'}`;
+    const body = msgs.length
+      ? '\n  --- recovered messages ---\n' + msgs.map((m) => `[${m.kind || m.role}] ${String(m.content || '').slice(0, 4000)}`).join('\n')
+      : '\n  (no messages were preserved for this task)';
+    return { ok: true, content: `${head}${body}\n</task-detail>` };
   }
   if (c.verb === 'search-tasks') {
-    const hits = await store.searchTasks(a.query ?? '');
-    if (!hits.length) return { ok: true, content: '(no matches)' };
-    const lines = hits.map((t) => {
-      const ur = t.userRequest ? ` ↳ ${t.userRequest.split('\n')[0].slice(0, 100)}` : '';
-      const sm = (t.summary ?? '').split('\n')[0].slice(0, 140);
-      return `${t.id}${ur} — ${sm}`;
-    });
-    return { ok: true, content: lines.join('\n') };
+    const query = String(a.query || '').trim();
+    const hits = await store.searchTasks(query);
+    const curId = store.currentId();
+    const keep = [];
+    for (const h of hits) {
+      const t = await loadTaskFull(store, h.id);
+      if (isRetrievableTask(t, curId)) keep.push(h);
+    }
+    if (!keep.length) {
+      return { ok: true, content: 'No compacted tasks matched. Any matching recent tasks are still in your context above — read them there.' };
+    }
+    return { ok: true, content: keep.map((h) => `<task-history id="${h.id}" tier="${h.tier ?? '?'}">${h.summary || '(no summary)'}</task-history>`).join('\n') };
   }
   return { ok: false, content: `unknown task op: ${c.verb}` };
 }
@@ -3314,7 +3506,9 @@ async function runPromptedAgent({
   if (!projectDir) throw new Error('projectDir required for task-scoped agent');
 
   const log = (m) => { try { onLog?.(m); } catch {} };
-  const emitChat = (ev) => { try { onChatEvent?.(ev); } catch (e) { log(`onChatEvent error: ${e.message}`); } };
+  // Returns the host's recorded event (with its id) so callers that need to
+  // re-tag an event later (e.g. message-refile) can capture it.
+  const emitChat = (ev) => { try { return onChatEvent?.(ev); } catch (e) { log(`onChatEvent error: ${e.message}`); return undefined; } };
   const emitPhase = (p) => { try { onPhase?.(p); } catch {} };
   const checkAbort = () => {
     if (signal?.aborted) {
@@ -3331,18 +3525,60 @@ async function runPromptedAgent({
   // Extract the user's new message (last user role in incoming).
   const lastUserMsg = [...(messages ?? [])].reverse().find((m) => m.role === 'user');
   const userText = flattenContent(lastUserMsg?.content);
+  // Track the just-arrived user message M so we can RE-ATTRIBUTE it if the task
+  // it landed in gets closed before any work is done for it (see
+  // maybeRelocateLeadingUserMsg). leadingUserMsg.taskId follows M as it moves.
+  let leadingUserMsg = null;
   if (userText) {
     await store.appendMessage({
       kind: 'user-message',
       role: 'user',
       content: userText,
     });
+    const mTaskId = store.currentId();
+    // Capture M's exact stored message object so it can be relocated by identity
+    // later (by relocation time the turn's assistant prose has been appended
+    // after it, so it is no longer the trailing message).
+    const curTask = await store.getCurrent();
+    const mRef = curTask?.messages?.[curTask.messages.length - 1] ?? null;
+    let mEventId = null;
     if (emitInitialUserMessage) {
-      emitChat({ type: 'user-message', taskId: store.currentId(), content: userText });
+      const ev = emitChat({ type: 'user-message', taskId: mTaskId, content: userText });
+      mEventId = ev?.id ?? null;
     }
+    leadingUserMsg = { taskId: mTaskId, eventId: mEventId, ref: mRef, anchored: false };
   }
 
   const stats = { turns: 0, toolCalls: 0, toolHistogram: {}, batches: [], loopBreaks: 0, taskOps: 0, autoClosed: 0 };
+
+  // Task-boundary attribution. If the just-arrived user message M is sitting in
+  // a task that gets CLOSED before any work is done for it — the model closes
+  // the prior unit as its first action, or Layer-1 auto-close fires at turn top
+  // — then M belongs to the NEW task, not the closed one. Move M's stored record
+  // into the new task AND re-tag its persisted chat event (a 'message-refile',
+  // which the host turns into a taskId patch) so the live UI and a reload both
+  // file M under the new task. The OPEN task gets no wrap, so M then renders flat
+  // below the closed task's box — exactly where a new request belongs. Called
+  // BEFORE the task-end event so the UI re-tags M before wrapping the closed task.
+  //
+  // ANCHORING: once any real work runs in M's task (this turn OR a previous turn
+  // of the run), M is "anchored" — that task genuinely handled M, so a later
+  // close (model <next-task> on a subsequent turn, or Layer-1 auto-close of a
+  // long single task) must NOT rip M out of it. Without this, a work-in-turn-1 /
+  // close-in-turn-2 flow, or auto-close after a long worked run, mis-filed M.
+  async function maybeRelocateLeadingUserMsg(closedId, newTaskId) {
+    if (!leadingUserMsg || leadingUserMsg.anchored || leadingUserMsg.taskId !== closedId || !newTaskId) return;
+    try {
+      const moved = await store.relocateMessageRef(closedId, newTaskId, leadingUserMsg.ref);
+      if (moved) {
+        if (leadingUserMsg.eventId) {
+          emitChat({ type: 'message-refile', eventId: leadingUserMsg.eventId, toTaskId: newTaskId });
+        }
+        leadingUserMsg.taskId = newTaskId;   // follow M in case the new task closes immediately too
+        log(`attribution: moved leading user message from ${closedId} to ${newTaskId}`);
+      }
+    } catch (e) { log(`relocate leading user msg error: ${e.message}`); }
+  }
 
   // LAYER 1 — deterministic auto-close. A model that won't emit <next-task>
   // (the soft budget nudge in the prompt is ignored) grows one task past the
@@ -3367,14 +3603,30 @@ async function runPromptedAgent({
       } catch (e) { log(`auto-close onTaskClose error: ${e.message}`); }
     }
     if (commitHash && r.closedId) { try { await store.attachToTask(r.closedId, { commitHash }); } catch { /* */ } }
+    // Auto-close fires at turn TOP, before any work for M this turn — so M (if
+    // it just arrived into the now-closed task) belongs to the fresh task.
+    await maybeRelocateLeadingUserMsg(r.closedId, r.newTask.id);
     emitChat({ type: 'task-end', taskId: r.closedId, userRequest, summary, commitHash, commits, auto: true });
     // Demote the just-closed task right away so THIS turn's prompt is bounded.
     try { await maybeCompact({ store, adapter, model, log, emitChat }); } catch { /* */ }
     return store.getCurrent();
   }
 
+  // Run-level: consecutive turns whose ONLY action was a refused <next-task> on
+  // an empty task. Breaks the open-empty-task / close-it / repeat churn that a
+  // stubborn model can otherwise spin until maxTurns.
+  let emptyCloseStreak = 0;
+
   for (let turn = 1; turn <= maxTurns; turn++) {
     stats.turns = turn;
+    // Per-turn attribution/loop flags (fresh each turn; read by runOneCall via
+    // closure). didRealWorkThisTurn anchors M + gates the empty-task close guard;
+    // didMutateThisTurn + sawEmptyClose/sawUnproductiveClose feed the
+    // unproductive-close streak that breaks task-churn.
+    let didRealWorkThisTurn = false;
+    let didMutateThisTurn = false;
+    let sawEmptyClose = false;
+    let sawUnproductiveClose = false;
 
     // Drain the steer channel at the TOP of the turn (a turn boundary — the
     // previous turn's streaming + tools have finished, nothing is mid-flight).
@@ -3440,108 +3692,145 @@ async function runPromptedAgent({
     // it remembers it does have the workspace tools. The priming messages
     // are NOT persisted to the task store and never appear in the UI;
     // they exist only in the prompt sent to the API.
+    // The priming is ONE short simulated work session, not a lecture about the
+    // rules. It DEMONSTRATES the whole rhythm by example — the developer gives a
+    // task and the assistant: (a) just does it without stopping to ask
+    // permission, (b) narrates in ONE tight sentence then batches its tool calls
+    // with NOTHING trailing after them, (c) ends every working turn with a
+    // <task-progress> signal, and (d) closes the finished unit with <next-task/>
+    // in the same reply once it's verified. Showing the behavior works far
+    // better than describing it (Sonnet does the work but skips the close, and
+    // adds chatty before-and-after narration, unless it has SEEN the pattern).
+    // The task is contrived — Java/WebLogic, app "memberportal", verified with
+    // `wl quickbuild` — and is NEVER persisted: it lives only in the prompt, not
+    // in the task store or the UI.
     const PRIMING = [
       {
         role: 'user',
         content:
-          "Hi! I'm working with you in a remote workspace where you interact " +
-          "with my project by returning XML commands inside <remote-workspace> " +
-          "tags — for example <remote-workspace><list path=\".\"/></remote-workspace> " +
-          "to see what's there, <read path=\"...\"/> to view a file, " +
-          "<write path=\"...\">contents</write> to create one, " +
-          "<powershell>...</powershell> to run a shell command. Anything you put " +
-          "inside <remote-workspace> runs on my machine and the results come back " +
-          "to you on the next turn. Sound good?",
+          "Hi! I'm working with you in a remote workspace — you interact with my " +
+          "project by returning XML commands inside <remote-workspace> tags: " +
+          "<list path=\".\"/> to see what's there, <read path=\"...\"/> to view a " +
+          "file, <write path=\"...\">contents</write> to create one, " +
+          "<edit path=\"...\"><find>old</find><replace>new</replace></edit> to " +
+          "change part of one, and <powershell>...</powershell> (or a tool like " +
+          "<wl args=\"...\"/>) to run commands. Anything inside <remote-workspace> " +
+          "runs on my machine and the results come back next turn. The workspace " +
+          "IS my project — you already have access, so never say you can't read my " +
+          "files. First task: add a `middleName` field to the Person entity.",
       },
       {
         role: 'assistant',
         content:
-          "Got it — I'll use <remote-workspace> XML commands to interact with your " +
-          "project files and run shell commands. I won't apologize for being " +
-          "unable to access files; the workspace IS the project. What would you " +
-          "like to work on?",
-      },
-      // Autonomy pair: DEMONSTRATE proceeding through the obvious next steps
-      // instead of stopping to ask the developer "would you like me to…?".
-      // Observed failure: the agent deferred on a clear task ("would you like me
-      // to inspect these files or proceed?") instead of just acting. Uses a
-      // different task shape (reproduce → locate → fix) than the greet.js
-      // rhythm example so the behavior generalizes. Tool-level approval gates
-      // (git branch, tracked docx edits) still pause separately — autonomy is
-      // about not stopping the CHAT to ask, not about skipping those gates.
-      {
-        role: 'user',
-        content:
-          "A working-style note first: once I give you a task, just DO it — work " +
-          "through the obvious next steps yourself and only stop to ask me if the " +
-          "request is genuinely ambiguous or an action is destructive and I didn't " +
-          "ask for it. Don't end a reply with \"would you like me to X or Y?\" when " +
-          "the next step is clear. For example if I said \"the build is failing, fix it\":",
-      },
-      {
-        role: 'assistant',
-        content:
-          "On it — I'll reproduce the failure first so the compiler tells me which file is wrong.\n" +
-          "<remote-workspace>\n<powershell>mvnw.cmd -q compile</powershell>\n</remote-workspace>\n" +
-          "Once I see the error I'll open the offending file and fix it directly — I won't stop to " +
-          "ask which file, the error names it.\n" +
-          "<task-progress percent=\"15\">reproducing the build failure to locate the broken file</task-progress>",
-      },
-      // Second priming pair: DEMONSTRATE the task rhythm — do a unit of work,
-      // then CLOSE it with <next-task/> in the same reply. Models (Sonnet
-      // especially) reliably do the work but skip the close unless they've
-      // seen the finish-and-close pattern by example. This is illustrative
-      // (greet.js is not real) and, like the pair above, is never persisted.
-      {
-        role: 'user',
-        content:
-          "One more thing about the rhythm: whenever you finish a discrete unit " +
-          "of work, CLOSE it with <next-task/> in that same reply — that's what " +
-          "records the work and triggers review. For example, if I asked you to " +
-          "\"add a hello() function to greet.js\", I'd expect:",
-      },
-      {
-        role: 'assistant',
-        content:
-          "Sure — I'll add it, verify it runs, then close the task.\n" +
+          "Reading the Person entity and its table DDL together so the new field " +
+          "matches the existing shape before I touch either.\n" +
           "<remote-workspace>\n" +
-          "<edit path=\"greet.js\"><find>module.exports = {};</find>" +
-          "<replace>function hello() {\n  return 'hi';\n}\n\nmodule.exports = { hello };</replace></edit>\n" +
-          "<powershell>node -e \"console.log(require('./greet').hello())\"</powershell>\n" +
+          "<read path=\"memberportal/src/main/java/mil/example/memberportal/model/Person.java\"/>\n" +
+          "<read path=\"memberportal/src/main/resources/sql/person.sql\"/>\n" +
           "</remote-workspace>\n" +
-          "Once I see that prints 'hi', hello() works and the unit is complete and verified, so I'll close it:\n" +
+          "<task-progress percent=\"25\">read the entity and its DDL to learn the field naming; still need to add the field + column, then build to verify</task-progress>",
+      },
+      {
+        role: 'user',
+        content:
+          "<remote-workspace-result op=\"read\" status=\"ok\" path=\"memberportal/src/main/java/mil/example/memberportal/model/Person.java\">\n" +
+          "package mil.example.memberportal.model;\n\n" +
+          "import javax.persistence.Column;\n" +
+          "import javax.persistence.Entity;\n" +
+          "import javax.persistence.Id;\n" +
+          "import javax.persistence.Table;\n\n" +
+          "@Entity\n" +
+          "@Table(name = \"PERSON\")\n" +
+          "public class Person {\n\n" +
+          "    @Id\n" +
+          "    @Column(name = \"PERSON_ID\")\n" +
+          "    private Long id;\n\n" +
+          "    @Column(name = \"FIRST_NAME\")\n" +
+          "    private String firstName;\n\n" +
+          "    @Column(name = \"LAST_NAME\")\n" +
+          "    private String lastName;\n\n" +
+          "    public Long getId() { return id; }\n" +
+          "    public void setId(Long id) { this.id = id; }\n\n" +
+          "    public String getFirstName() { return firstName; }\n" +
+          "    public void setFirstName(String firstName) { this.firstName = firstName; }\n\n" +
+          "    public String getLastName() { return lastName; }\n" +
+          "    public void setLastName(String lastName) { this.lastName = lastName; }\n" +
+          "}\n" +
+          "</remote-workspace-result>\n" +
+          "<remote-workspace-result op=\"read\" status=\"ok\" path=\"memberportal/src/main/resources/sql/person.sql\">\n" +
+          "CREATE TABLE PERSON (\n" +
+          "    PERSON_ID   NUMBER(19)    NOT NULL,\n" +
+          "    FIRST_NAME  VARCHAR2(100),\n" +
+          "    LAST_NAME   VARCHAR2(100),\n" +
+          "    CONSTRAINT PK_PERSON PRIMARY KEY (PERSON_ID)\n" +
+          ");\n" +
+          "</remote-workspace-result>",
+      },
+      {
+        role: 'assistant',
+        content:
+          "Adding the middleName field with its getter/setter to the entity and the " +
+          "matching MIDDLE_NAME column to the table, in one block.\n" +
           "<remote-workspace>\n" +
-          "<next-task user-request=\"add a hello() function to greet.js\" summary=\"added and exported hello() in greet.js; verified with node that it returns 'hi'\"/>\n" +
+          "<edit path=\"memberportal/src/main/java/mil/example/memberportal/model/Person.java\">" +
+          "<find>    @Column(name = \"LAST_NAME\")\n    private String lastName;</find>" +
+          "<replace>    @Column(name = \"MIDDLE_NAME\")\n    private String middleName;\n\n    @Column(name = \"LAST_NAME\")\n    private String lastName;</replace></edit>\n" +
+          "<edit path=\"memberportal/src/main/java/mil/example/memberportal/model/Person.java\">" +
+          "<find>    public String getLastName() { return lastName; }\n    public void setLastName(String lastName) { this.lastName = lastName; }</find>" +
+          "<replace>    public String getMiddleName() { return middleName; }\n    public void setMiddleName(String middleName) { this.middleName = middleName; }\n\n    public String getLastName() { return lastName; }\n    public void setLastName(String lastName) { this.lastName = lastName; }</replace></edit>\n" +
+          "<edit path=\"memberportal/src/main/resources/sql/person.sql\">" +
+          "<find>    FIRST_NAME  VARCHAR2(100),\n    LAST_NAME   VARCHAR2(100),</find>" +
+          "<replace>    FIRST_NAME  VARCHAR2(100),\n    MIDDLE_NAME VARCHAR2(100),\n    LAST_NAME   VARCHAR2(100),</replace></edit>\n" +
+          "</remote-workspace>\n" +
+          "<task-progress percent=\"60\">added middleName (field + getter/setter) to the entity and the MIDDLE_NAME column to the DDL; still need to build to confirm nothing broke</task-progress>",
+      },
+      {
+        role: 'user',
+        content:
+          "<remote-workspace-result op=\"edit\" status=\"ok\" path=\"memberportal/src/main/java/mil/example/memberportal/model/Person.java\">edit applied</remote-workspace-result>\n" +
+          "<remote-workspace-result op=\"edit\" status=\"ok\" path=\"memberportal/src/main/java/mil/example/memberportal/model/Person.java\">edit applied</remote-workspace-result>\n" +
+          "<remote-workspace-result op=\"edit\" status=\"ok\" path=\"memberportal/src/main/resources/sql/person.sql\">edit applied</remote-workspace-result>",
+      },
+      {
+        role: 'assistant',
+        content:
+          "All three edits applied — building memberportal to confirm it still " +
+          "compiles cleanly before I close. quickbuild skips the unit tests and the " +
+          "Angular front-end, so it's the fast check; I'm giving it a generous " +
+          "timeout since a build can take 10-15 minutes.\n" +
+          "<remote-workspace>\n" +
+          "<wl args=\"quickbuild memberportal\" timeout_ms=\"1200000\"/>\n" +
+          "</remote-workspace>\n" +
+          "<task-progress percent=\"85\">edits in; running wl quickbuild to verify the build is clean</task-progress>",
+      },
+      {
+        role: 'user',
+        content:
+          "<remote-workspace-result op=\"wl\" status=\"ok\">\n" +
+          "exit 0 in 548120ms  (workspace=D:\\work\\ws)\n" +
+          "[INFO] BUILD SUCCESS\n" +
+          "[INFO] Total time:  09:07 min\n" +
+          "</remote-workspace-result>",
+      },
+      {
+        role: 'assistant',
+        content:
+          "Build is clean, so middleName is wired through the entity, its accessors, " +
+          "and the table — the unit is complete and verified, so I'll close it.\n" +
+          "<remote-workspace>\n" +
+          "<next-task user-request=\"add a middleName field to the Person entity\" summary=\"added middleName field + getter/setter to Person.java and the MIDDLE_NAME column to person.sql; verified with wl quickbuild memberportal (BUILD SUCCESS)\"/>\n" +
           "</remote-workspace>",
       },
-      // Third pair: when a unit ISN'T finished yet, end the reply with a
-      // <task-progress> signal instead of closing. Required every turn.
       {
         role: 'user',
-        content:
-          "And whenever a unit ISN'T done yet, end that reply with a progress signal " +
-          "instead — a percentage and what still remains. For example, partway through a " +
-          "bigger change:",
+        content: "Now let's work on my actual project the same way.",
       },
       {
         role: 'assistant',
         content:
-          "Reading the two call sites before I change them.\n" +
-          "<remote-workspace>\n<read path=\"src/a.js\"/>\n<read path=\"src/b.js\"/>\n</remote-workspace>\n" +
-          "<task-progress percent=\"40\">read both call sites; still need to update them and run the tests</task-progress>",
-      },
-      {
-        role: 'user',
-        content:
-          "Exactly right — that's the rhythm: do the work, and END EVERY REPLY with either " +
-          "<next-task/> (if that unit is now complete) or <task-progress percent=\"N\">what remains</task-progress> " +
-          "(if not). Never omit both. Now let's work on my actual project the same way.",
-      },
-      {
-        role: 'assistant',
-        content:
-          "Understood. I'll do each piece of work and then close it with <next-task/> " +
-          "when it's complete, before moving on. What would you like to work on?",
+          "Got it — same rhythm on your project: I'll do each piece, keep the " +
+          "narration tight, and close each finished unit with <next-task/>. What " +
+          "would you like to start with?",
       },
     ];
     const baseConvo = [...PRIMING, ...fromStore];
@@ -3590,11 +3879,24 @@ async function runPromptedAgent({
         resultStatus = 'error';
       } else if (c.kind === 'task-op') {
         stats.taskOps++;
-        const r = await dispatchTaskOp(c, store);
+        const r = await dispatchTaskOp(c, store, { didRealWork: didRealWorkThisTurn });
         resultContent = r.content;
         resultStatus = r.ok ? 'ok' : 'error';
+        if (r.emptyClose) sawEmptyClose = true;
         log(`  ${c.verb}(${JSON.stringify(c.args)}) -> ${resultStatus}`);
         if (c.verb === 'next-task' && r.ok) {
+          // If M still belongs to the task being closed (it was never anchored by
+          // real work in that task), it belongs to the NEW task — move it (and
+          // re-tag its event) BEFORE the task-end event so the UI wraps the
+          // closed task WITHOUT it. The helper no-ops if M is anchored elsewhere.
+          await maybeRelocateLeadingUserMsg(r.closedId, r.newTaskId);
+          // Unproductive-close detection for the churn breaker: a close of a task
+          // that had no developer request (no user-message) and saw no mutating
+          // work this turn is spurious (e.g. a look-back read then close). A
+          // legitimate unit either closes M's own task (has a user-message) or
+          // mutated something.
+          const closingHadUserMsg = (cur?.messages ?? []).some((m) => m.kind === 'user-message');
+          if (!closingHadUserMsg && !didMutateThisTurn) sawUnproductiveClose = true;
           let commitHash = null;
           let commits = null;
           if (typeof onTaskClose === 'function') {
@@ -3636,6 +3938,11 @@ async function runPromptedAgent({
         log(`  ${c.verb} blocked (discuss mode)`);
       } else {
         stats.toolCalls++;
+        didRealWorkThisTurn = true;   // a non-task-op tool ran — real work for the current request
+        if (MUTATING_VERBS.has(c.verb)) didMutateThisTurn = true;
+        // Anchor M to the task this work ran in, so a later close of that task
+        // never relocates M away from the work that handled it.
+        if (leadingUserMsg && leadingUserMsg.taskId === ownerTaskId) leadingUserMsg.anchored = true;
         stats.toolHistogram[c.name] = (stats.toolHistogram[c.name] ?? 0) + 1;
         const raw = await execute(c.name, c.args, extraTools, {
           callId: c.id,
@@ -3877,6 +4184,26 @@ async function runPromptedAgent({
         content: '<remote-workspace-result op="task-status" status="error">\nRequired: end EVERY reply with either <next-task user-request="..." summary="..."/> (if the current unit is complete) or <task-progress percent="N">what still remains</task-progress> (if not). You provided neither. Include exactly one of these in your next reply.\n</remote-workspace-result>',
       }, cur?.id);
       log(`forcing: turn ${turn} had no next-task/progress signal — injected status reminder`);
+    }
+
+    // Task-churn breaker: count consecutive UNPRODUCTIVE close turns — either a
+    // refused close on a truly empty task (sawEmptyClose), or a spurious close of
+    // a request-less, non-mutating task (sawUnproductiveClose, e.g. a look-back
+    // read then close). A single trivial tool call no longer defeats this (the
+    // old guard reset on any real work). Any productive turn resets the streak.
+    // After a few in a row, end the run so the developer can send the next
+    // request rather than the model spinning to maxTurns with a trail of empty
+    // tasks. maxTurns remains the hard backstop; the EBUSY-safe writes mean this
+    // is no longer crash-prone, just wasteful.
+    if (sawEmptyClose || sawUnproductiveClose) {
+      emptyCloseStreak++;
+      if (emptyCloseStreak >= 3) {
+        log(`task churn (${emptyCloseStreak} unproductive closes) — ending run to wait for the developer`);
+        await maybeCompact({ store, adapter, model, log, emitChat });
+        return { content: '', stats, terminated: 'task-churn', store };
+      }
+    } else {
+      emptyCloseStreak = 0;
     }
 
     // Compact if total context is over budget. Cheap mechanical demotions
@@ -5513,60 +5840,53 @@ const WL_GIT_SERVER = 'https://git-oci.int.dmdc.osd.mil';
 const WL_DOCS_REPO  = 'incubator/sandbox/weblogicdesktopscripts';
 
 const WL_PROMPT = `
-The "wl" command is available in this environment. It is a developer wrapper
-around git + maven for WebLogic-deployable projects. wl MUST be run from the
-WORKSPACE directory — i.e. the active project (apps and shared libraries are
-subdirectories of the workspace). The wl tool below runs in the current
-project's directory automatically; you do not need to cd manually.
+The "wl" command is available — a developer wrapper around git + maven for
+WebLogic-deployable projects. It runs from the WORKSPACE directory (the active
+project IS the workspace; apps and shared libraries are subdirectories of it).
+The wl tool runs there automatically; do not cd. Pass everything after "wl " as
+the args string.
 
-Use the wl tool. Pass everything that would come after "wl " on the
-command line as the args string.
+Build / deploy / run actions — THIS is exactly what each does; do not assume:
+  quickbuild (qb)  build, SKIPPING unit tests AND the Angular front-end build. Your DEFAULT while iterating.
+  build (b)        FULL build INCLUDING unit tests and the Angular front-end. Use only when you need those.
+  projprops (pp)   deploy the project's proj props (app config). Run this after you change projprops.
+  deploy (d)       undeploy, then deploy.
+  run (r)          ONLY opens the app in a browser tab. It does NOT build, deploy, or start anything — "run" alone never deploys your changes.
+  all (a)          build, then projprops, then deploy, then run.
+  quickall (qa)    quickbuild, then projprops, then deploy, then run.
+  start / stop     start / stop the WebLogic SERVER itself.
 
-Actions (with their abbreviations):
-  clone, pull, clonepull, status, diff   git operations
-  clean, build (b), projprops (pp), deploy (d), run (r), all (a)
-  quickbuild (qb), quickall (qa)         skip tests
-  datasources (ds)
-  stop, start, undeploy
-  mvninstall (mi)                        mvn clean install (rarely needed)
+So to deploy your latest changes AND view them, use "quickall <app>" (or
+"all <app>" if you need unit tests / the front-end build) — NOT "run".
 
-Deployables: any app or sharedlib name (sharedlib ones start with "sharedlib-").
+Other actions: clone, pull, clonepull, status, diff (git); clean; undeploy;
+datasources (ds); mvninstall (mi, rarely needed).
 
-Chain different action/deployable groups with " . " — e.g.:
-  wl all teb . start milconnect
+Deployables: any app or sharedlib name (sharedlibs start with "sharedlib-").
+Chain different action/deployable groups with " . " — e.g. wl all teb . start.
 
 Examples:
-  <wl args="all milconnect"/>           full build + projprops + deploy + run
-  <wl args="quickbuild milconnect"/>    build skipping tests
-  <wl args="pull allportlets"/>         git pull
-  <wl args="all teb . start milconnect"/>  chain: build teb, then start milconnect
+  <wl args="quickall myapp"/>     quickbuild + projprops + deploy + open in browser
+  <wl args="quickbuild myapp"/>   fast build (skips tests + front-end)
+  <wl args="deploy myapp"/>       undeploy then deploy
+  <wl args="run myapp"/>          JUST open the app in a browser tab (no build/deploy)
+  <wl args="start"/>              start the WebLogic server
 
-Starting / stopping WebLogic (use these directly — do NOT test PowerShell with
-"Write-Output Hello" or similar; the shell works, just run the wl command):
-  <wl args="run milconnect"/>     build (as needed), deploy, and START the app on WebLogic
-  <wl args="start milconnect"/>   start an already-deployed app
-  <wl args="stop milconnect"/>    stop a running app
-  If the request is to start/stop the WebLogic SERVER itself (not a single app),
-  the exact invocation is in the wl user guide — read it with wl_read_doc first
-  rather than guessing.
-
-The tool can take many minutes — full builds especially. Prefer quickbuild
-over build when iterating, and pass a higher timeout_ms for slow operations.
-
-For help, run wl with no args:
-  <wl args=""/>           shows the wl usage screen
+Builds are SLOW, but the timeout is handled for you: quickbuild gets ~10 minutes,
+a full build (or any other command) gets ~20, capped at 30. You normally do NOT
+need to pass timeout_ms — only set it (up to 1800000 = 30 min) for an unusually
+long operation. If a command TIMES OUT, that is NOT a build failure — it only
+ran past the limit; re-run the same command with a larger timeout_ms if it needs
+to finish, and do not report the build as failed. Don't probe the shell first
+("Write-Output Hello"); it works — just run the wl command. For help: <wl args=""/>.
 
 Further reference, if you need it:
-  - User config (env, sync region, aliases): ${WL_CONFIG_PATH}
-    (use <read path="${WL_CONFIG_PATH}"/> to inspect)
-  - wl source + user guide live in a remote GitLab repo. Do NOT git clone
-    — use the dedicated docs tools below. They hit the GitLab API and
-    return only what you ask for:
+  - User config (env, sync region, aliases): ${WL_CONFIG_PATH}  (read with <read path="${WL_CONFIG_PATH}"/>)
+  - wl source + user guide live in a remote GitLab repo — do NOT git clone. Use the docs tools:
       <wl_list_docs path=""/>          list repo root
       <wl_list_docs path="docs"/>      list a subdir
       <wl_read_doc  path="README.md"/> read a single file
-    Binary docs (.docx user guide) come back as a saved temp file path
-    — pass that path to read_docx to extract text.
+    Binary docs (.docx) come back as a saved temp path — pass it to read_docx.
 `.trim();
 
 function buildGitLabClient(ctx) {
@@ -5615,7 +5935,7 @@ const wlPlugin = {
             },
             timeout_ms: {
               type: 'integer',
-              description: 'Timeout in ms. Default 5 minutes, max 10. Full builds may need 10+.',
+              description: 'Optional timeout in ms (cap 30 min / 1800000). Leave unset — the default adapts to the command (~10 min for quickbuild, ~20 min for a full build / anything else). Only set this for an unusually long operation.',
             },
           },
           required: ['args'],
@@ -5624,7 +5944,13 @@ const wlPlugin = {
       async impl({ args, timeout_ms }, ctx) {
         const safeArgs = (typeof args === 'string') ? args.trim() : '';
         const workspaceDir = process.cwd();
-        const timeout = Math.min(Math.max(1000, Number(timeout_ms) || 300000), 600000);
+        // Default timeout scales with the command: a quickbuild skips unit tests
+        // AND the Angular build, so ~10 min is enough; a full build (or any chain
+        // we can't positively identify as quick) gets the 20-min floor. Cap 30
+        // min. The agent can still override via timeout_ms (clamped to [1s, 30m]).
+        const isQuickBuild = /\b(?:quickbuild|qb)\b/i.test(safeArgs);
+        const defaultTimeout = isQuickBuild ? 600000 : 1200000;   // 10 min vs 20 min
+        const timeout = Math.min(Math.max(1000, Number(timeout_ms) || defaultTimeout), 1800000);
         const t0 = Date.now();
         return await new Promise((resolve) => {
           let stdout = '', stderr = '', timedOut = false, settled = false;
@@ -5667,7 +5993,18 @@ const wlPlugin = {
             if (progressTimer) { clearTimeout(progressTimer); flushProgress(); }
             const dur = Date.now() - t0;
             if (timedOut) {
-              resolve(`ERROR: wl ${safeArgs} timed out after ${timeout}ms (workspace=${workspaceDir})`);
+              // A timeout is NOT a build failure — the old "ERROR: ... timed out"
+              // message made the agent report the build as failed. Return it as a
+              // non-error result with a loud, actionable explanation AND the
+              // output captured so far (the tail may even show BUILD SUCCESS).
+              const mins = Math.round(timeout / 60000);
+              const raw = stdout + (stderr ? '\nSTDERR:\n' + stderr : '');
+              const tail = raw.length > 4000 ? '…(truncated; showing the end)…\n' + raw.slice(-4000) : raw;
+              resolve({ content:
+                `TIMEOUT: \`wl ${safeArgs}\` was stopped after ${mins} min (the time limit) — it did NOT report a result.\n` +
+                `This is NOT a build failure and NOT a success: a WebLogic build can simply run longer than the limit, and work it already started on the server may still be finishing. Do NOT tell the developer the build failed based on this alone.\n` +
+                `If it needs to finish, re-run the SAME command with a larger timeout_ms (up to 1800000 = 30 min). Output captured before the cutoff (check the end for BUILD SUCCESS or errors):\n` +
+                `${tail || '(no output was captured before the cutoff)'}\n(workspace=${workspaceDir})` });
               return;
             }
             const head = `exit ${code} in ${dur}ms  (workspace=${workspaceDir})`;
@@ -6026,6 +6363,22 @@ function locatePrebuiltHelper() {
 // no prebuilt jar is deployed. Per-user so it survives across runs.
 function helperWorkDir() { return path.join(homedir(), '.code_boss', 'docx-helper'); }
 
+// Content fingerprint of the embedded Java sources — dependency-free (no crypto
+// import). Stamped next to the compiled classes so a box that already compiled
+// an OLDER helper recompiles when an updated bundle changes the Java, instead of
+// silently running stale bytecode. Length + FNV-1a + position-weighted sum makes
+// accidental collisions across source edits effectively impossible.
+function docxSourceFingerprint(sources) {
+  const s = JSON.stringify(sources || {});
+  let h = 0x811c9dc5, acc = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    h = ((h ^ c) >>> 0); h = (Math.imul(h, 0x01000193) >>> 0);
+    acc = ((acc + c * (i + 1)) >>> 0);
+  }
+  return `${s.length.toString(36)}.${h.toString(16)}.${acc.toString(16)}`;
+}
+
 // Single-file deploy path: the production bundle embeds the helper's Java
 // source (DOCX_HELPER_SOURCES, injected by scripts/build.mjs). On first use we
 // write it out and `javac` it against user-supplied POI jars, so only ONE .mjs
@@ -6043,8 +6396,20 @@ function bootstrapFromSource() {
   const classpath = `${classesDir}${path.delimiter}${path.join(libDir, '*')}`;
   const mainClass = path.join(classesDir, 'com', 'codeboss', 'docx', 'DocxHelper.class');
 
-  // Already compiled on a previous run.
-  if (existsSync(mainClass)) return { classpath };
+  // Reuse a previous compile ONLY if it was built from the SAME embedded source.
+  // We stamp a fingerprint of the embedded sources next to the compiled classes.
+  // If the bundle's Java has since changed (a code_boss update was deployed), the
+  // fingerprint won't match — fall through and recompile (javac overwrites the
+  // stale .class files). Without this, an updated helper would NEVER take effect
+  // on a box that already compiled an older version: it only checked that
+  // DocxHelper.class EXISTED, so the old bytecode ran forever.
+  const fpFile = path.join(classesDir, '.source-fingerprint');
+  const fp = docxSourceFingerprint(DOCX_HELPER_SOURCES);
+  if (existsSync(mainClass) && existsSync(fpFile)) {
+    let prev = '';
+    try { prev = readFileSync(fpFile, 'utf8').trim(); } catch { /* */ }
+    if (prev === fp) return { classpath };
+  }
 
   // Write the embedded sources to disk (package-relative paths).
   const javaFiles = [];
@@ -6092,6 +6457,9 @@ function bootstrapFromSource() {
     e.code = 'docx-compile-failed';
     throw e;
   }
+  // Record which embedded source this compile was built from, so a later update
+  // that changes the Java triggers a recompile instead of reusing stale classes.
+  try { writeFileSync(fpFile, fp, 'utf8'); } catch { /* */ }
   return { classpath };
 }
 
@@ -6853,6 +7221,13 @@ function computeTileSize(tile, opts = {}) {
  */
 function packPage(tiles, cols, rows, opts = {}) {
   const maxMs = opts.maxMs ?? 200;
+  // Defense-in-depth: the grid is allocated as rows*cols cells below, so a
+  // non-positive / non-integer / runaway dimension would RangeError or OOM.
+  // Callers should clamp (the /api/queries handler caps at 32); bound it here
+  // too at 48 — past ~48x48 the anytime packer can't finish even one arrangement
+  // within its time budget and would return an empty layout.
+  cols = Math.max(1, Math.min(Math.trunc(Number(cols)) || 1, 48));
+  rows = Math.max(1, Math.min(Math.trunc(Number(rows)) || 1, 48));
   const startMs = Date.now();
   const sized = tiles.map((t) => {
     const w = Math.max(1, Math.min(t.sizeHint?.cols ?? 3, cols));
@@ -7436,6 +7811,25 @@ const QUERY_CATALOG = [
         body: `critical: ${crit}\nwarn:     ${warn}\ninfo:     ${by('info')}\nok:       ${by('ok')}` };
     },
   },
+  {
+    id: 25, name: 'Task store breakdown', category: 'findings',
+    description: 'The task-memory store as of the last turn: the OPEN task size vs the per-task auto-close ceiling (a runaway open task dragged every turn is the slow-turn/502 failure), how many tokens of FINISHED tasks are still in full context, and per-tier task counts (t1 full messages, t2 masked results, t3 summary-only, t4 rollup). Emitted by the agent each turn (the server cannot read the on-disk task store without blocking the event loop).',
+    sizeHint: { cols: 4, rows: 3 },
+    compute: (d) => {
+      const t = d.tasks;
+      if (!t) return { kind: 'text', severity: 'info', body: '(no turn has run yet)' };
+      const ceil = t.perTaskCeiling || 0;
+      const cur = t.currentTokens || 0;
+      const pct = ceil ? Math.round((cur / ceil) * 100) : 0;
+      const sev = ceil && cur >= ceil ? 'critical' : ceil && cur >= ceil * 0.75 ? 'warn' : 'ok';
+      const tc = t.tierCounts || {};
+      const age = t.at ? `\nas of ${new Date(t.at).toISOString().slice(11, 19)}Z` : '';
+      return { kind: 'text', severity: sev, body:
+        `open task ${t.currentId || '?'}: ${cur} tok` + (ceil ? ` (${pct}% of ${ceil} ceiling)` : '') + '\n' +
+        `finished-in-context: ${t.demotableTokens || 0} tok\n` +
+        `tasks: ${t.totalTasks || 0}  [t1:${tc[1] || 0} t2:${tc[2] || 0} t3:${tc[3] || 0} t4:${tc[4] || 0}]` + age };
+    },
+  },
 
   // ─── 30-39: SERVER STATE ────────────────────────────────────────────────
   {
@@ -7876,6 +8270,27 @@ const QUERY_CATALOG = [
       return { kind: 'text', severity: 'warn', body };
     },
   },
+  {
+    id: 72, name: 'Run terminations / churn', category: 'trends',
+    description: 'How each agent run ended, across the session (agent_run events): stop = converged normally; max-turns = never converged (bad); task-churn = the open/close-empty-task loop was broken; empty-close = ended on a refused empty close. Plus the total auto-closed count (Layer-1 force-close of a runaway task). Repeated max-turns / task-churn / many auto-closes are the task-loop pathologies.',
+    sizeHint: { cols: 4, rows: 3 },
+    compute: (d) => {
+      const runs = (d.transactions?.events ?? []).filter((e) => e.type === 'agent_run');
+      if (!runs.length) return { kind: 'text', severity: 'info', body: '(no agent runs yet)' };
+      const by = {};
+      let autoClosed = 0;
+      for (const r of runs) {
+        const k = r.terminated || 'unknown';
+        by[k] = (by[k] || 0) + 1;
+        autoClosed += Number(r.autoClosed || 0);
+      }
+      const bad = (by['max-turns'] || 0) + (by['task-churn'] || 0) + (by['empty-close'] || 0);
+      const sev = bad > 0 || autoClosed > 0 ? 'warn' : 'ok';
+      const lines = Object.entries(by).sort((a, b) => b[1] - a[1]).map(([k, n]) => `${k}: ${n}`);
+      lines.push(`auto-closed (runaway force-close): ${autoClosed}`);
+      return { kind: 'text', severity: sev, body: `${runs.length} run(s)\n` + lines.join('\n') };
+    },
+  },
 
   // ─── 99: META ───────────────────────────────────────────────────────────
   {
@@ -8000,7 +8415,7 @@ function runQueries(ids, diag) {
 // tab. Type query numbers (or use a preset) and it renders a grid of tiles
 // from /api/queries. Open directly at http://127.0.0.1:<port>/snapshot too.
 const SNAPSHOT_PAGE_HTML = `<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8"><title>code_boss diagnostics</title>
+<html lang="en"><head><meta charset="utf-8"><title>code_boss diagnostics</title><link rel="icon" href="data:,">
 <style>
   :root{--bg:#100e0b;--panel:#161410;--panel2:#1b1914;--border:#3a372f;--fg:#e6e2d6;--muted:#8c887b;--accent:#d97757;--mono:ui-monospace,Consolas,Menlo,monospace}
   *{box-sizing:border-box} html,body{margin:0;height:100%}
@@ -8561,7 +8976,7 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
     // Token counters maintained server-side (browser used to do this)
     chatTokens: { up: 0, down: 0 },
     // Server-enforced timeout for the current chat (settable per /api/extend-timeout)
-    chatTimeoutMs: 30 * 60 * 1000,
+    chatTimeoutMs: 60 * 60 * 1000,   // WebLogic full builds run 10-15 min; a run may chain several
     chatStartedAt: null,
     // Abort signal for the running agent loop (null when idle)
     abortController: null,
@@ -8670,6 +9085,14 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
   }
   // Append a new chat event. Assigns id + appendedAtVersion. Returns the event.
   function appendChatEvent(event) {
+    // A message-refile is a re-attribution, not a new row: re-tag an existing
+    // event's taskId (used when a just-arrived user message is moved to the task
+    // that actually handles it). Patch in place + broadcast — never append. The
+    // patch persists to conversation.json so a reload files the message
+    // correctly too.
+    if (event && event.type === 'message-refile') {
+      return patchChatEvent(event.eventId, { taskId: event.toTaskId });
+    }
     const id = `e${session.nextEventId++}`;
     const ev = { id, appendedAtVersion: session.version + 1, ...event };
     // Ephemeral events are broadcast for live UI updates but NOT persisted —
@@ -8687,6 +9110,9 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
     // <next-task>), the runaway-context failure that 502'd in production.
     if (event.type === 'context-fill') {
       session.lastContextFill = { totalTokens: event.totalTokens, budgetTokens: event.budgetTokens, budgetPct: event.budgetPct, at: Date.now() };
+      // Task-store breakdown rides along on the per-turn gauge (the server can't
+      // read the task store without blocking sync I/O). Stashed for the Snapshot.
+      if (event.taskStats) session.lastTaskStats = { ...event.taskStats, at: Date.now() };
     }
     if (!ephemeral) session.chatEvents.push(ev);
     broadcast({ type: 'event', version: bumpVersion(), event: ev });
@@ -8809,6 +9235,19 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
     if (file) {
       try { await unlink(file); fileLog(`conversation cleared: ${file}`); }
       catch (e) { if (e.code !== 'ENOENT') fileLog(`conversation delete failed: ${e.message}`); }
+    }
+    // ALSO wipe the task store — otherwise the prior session's (possibly
+    // over-budget) task stays "current", so the next message appends to that
+    // huge task, auto-closes it with a meaningless summary, and the context
+    // gauge is full on what should be a fresh chat. The worker's init()
+    // recreates a clean T-1 when the dir is empty.
+    if (session.activeProject) {
+      const tasksDir = path.join(session.activeProject, '.code_boss', 'tasks');
+      try {
+        const entries = await readdir(tasksDir);
+        await Promise.all(entries.map((f) => unlink(path.join(tasksDir, f)).catch(() => {})));
+        fileLog(`task store cleared: ${tasksDir} (${entries.length} file(s))`);
+      } catch (e) { if (e.code !== 'ENOENT') fileLog(`task store clear failed: ${e.message}`); }
     }
   }
   // Snapshot of chat state for /api/state.
@@ -9929,8 +10368,21 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
           ? DEFAULT_QUERY_IDS.slice()
           : raw.split(',').map((s) => parseInt(s, 10)).filter((n) => Number.isFinite(n));
         const tiles = runQueries(ids, diag);
-        const pageCols = Number(url.searchParams.get('cols')) || 12;
-        const pageRows = Number(url.searchParams.get('rows')) || 24;
+        // Clamp the grid dimensions to a sane positive-integer range. They come
+        // straight off the (unauthenticated) query string and feed
+        // `new Array(rows*cols)` in the layout engine: a bare Number()||N let
+        // through negatives and non-integers (-> RangeError 500) and unbounded
+        // values (cols=rows=99999 -> a ~10^10-cell allocation that OOM-aborts the
+        // whole process). Real clients send <= 12x24 (the snapshot page sends no
+        // dims at all and uses these defaults); 32 covers any real layout while
+        // staying well inside the packer's comfort zone (it degrades past ~48).
+        const MAX_DIM = 32;
+        const clampDim = (v, def) => {
+          const n = Math.trunc(Number(v));
+          return Number.isFinite(n) && n > 0 ? Math.min(n, MAX_DIM) : def;
+        };
+        const pageCols = clampDim(url.searchParams.get('cols'), 12);
+        const pageRows = clampDim(url.searchParams.get('rows'), 24);
         const layout = layoutMosaic(tiles, pageCols, pageRows, { maxMs: 250 });
         const catalog = QUERY_CATALOG.map((q) => ({
           id: q.id,
@@ -10023,6 +10475,10 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
           // Latest per-turn context-window fill (catalog 24). Large/over-budget
           // => a big open task dragged every turn (the runaway-context failure).
           context: session.lastContextFill || null,
+          // Latest per-turn task-store breakdown (catalog 25): current open task
+          // size, finished-task tokens, per-tier task counts. Emitted by the
+          // agent (the server can't read the task store without blocking I/O).
+          tasks: session.lastTaskStats || null,
           // Auth state — surfaced so the snapshot can show api-key + unlock
           // status as numbered queries (catalog 44–47). When pendingUnlock
           // is non-null, every LLM call is blocked waiting on the user.
@@ -10611,6 +11067,7 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
               toolCalls: lastAgentResult.stats.toolCalls,
               batches: lastAgentResult.stats.batches,
               terminated: lastAgentResult.terminated,
+              autoClosed: lastAgentResult.stats.autoClosed,
               reviewRounds: round + 1,
             });
             // Survey every tracked repo. Anything dirty AND not on a
@@ -10872,6 +11329,7 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
             toolCalls: result.stats.toolCalls,
             batches: result.stats.batches,
             terminated: result.terminated,
+            autoClosed: result.stats.autoClosed,
           });
         } catch (e) {
           logEvent('error', { message: e.message });
@@ -12475,6 +12933,13 @@ function computeTileSize(tile, opts = {}) {
  */
 function packPage(tiles, cols, rows, opts = {}) {
   const maxMs = opts.maxMs ?? 200;
+  // Defense-in-depth: the grid is allocated as rows*cols cells below, so a
+  // non-positive / non-integer / runaway dimension would RangeError or OOM.
+  // Callers should clamp (the /api/queries handler caps at 32); bound it here
+  // too at 48 — past ~48x48 the anytime packer can't finish even one arrangement
+  // within its time budget and would return an empty layout.
+  cols = Math.max(1, Math.min(Math.trunc(Number(cols)) || 1, 48));
+  rows = Math.max(1, Math.min(Math.trunc(Number(rows)) || 1, 48));
   const startMs = Date.now();
   const sized = tiles.map((t) => {
     const w = Math.max(1, Math.min(t.sizeHint?.cols ?? 3, cols));
@@ -12791,8 +13256,9 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     <div class="input-subbar">
       <span class="dirty-indicator" id="gitDirtyIndicator" title="" style="display:none;">⚠</span>
       <span class="proj-path" id="projectPath" title="">(no project)</span>
-      <label class="discuss-toggle" title="Read-only: the agent investigates and explains, but does not modify files or run shell commands this turn">
-        <input type="checkbox" id="discussToggle"> Discuss
+      <label class="discuss-toggle" title="Discuss OFF = normal mode: the agent edits files and runs commands. Discuss ON = read-only: it investigates and explains but does not modify files or run shell commands this turn.">
+        <input type="checkbox" id="discussToggle" onchange="document.getElementById('discussModeText').textContent = this.checked ? 'Discuss: on (read-only)' : 'Discuss: off (normal — edits &amp; runs)';">
+        <span id="discussModeText">Discuss: off (normal &mdash; edits &amp; runs)</span>
       </label>
       <button class="settings-btn" id="settingsBtn" onclick="openSettings()" title="Settings">⚙</button>
     </div>
