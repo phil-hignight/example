@@ -15,7 +15,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '179';
+const BUILD_VERSION = '180';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
@@ -6009,6 +6009,68 @@ function decodeText(buf) {
   return buf.toString('utf8');
 }
 
+// ====== agent/child-kill.mjs ======
+/**
+ * Shared child-process cancel/kill wiring for long-running tools.
+ *
+ * A tool that spawns a child (powershell build, wl build, …) must honor the
+ * worker's abort signal so pressing Escape / hitting /api/cancel actually stops
+ * the work instead of waiting out a multi-minute build. Two things are needed,
+ * both Windows-specific and easy to get wrong (the `wl` tool shipped without
+ * them — see why this module exists):
+ *
+ *   1. Kill the whole process TREE, not just the direct child. On Windows
+ *      `child.kill()` only stops the powershell wrapper and orphans the real
+ *      work (mvn.exe / java.exe), which keeps running and holding file locks.
+ *      `taskkill /F /T /PID` kills the wrapper AND its descendants.
+ *   2. A grace timer. `taskkill` can be blocked by AppLocker/EDR on locked-down
+ *      enterprise boxes, and a killed wrapper can suppress its own 'close'
+ *      event — so the caller's Promise could hang forever (wedging the whole
+ *      agent loop) even after a successful abort. The grace timer force-settles
+ *      the caller after a few seconds so the loop always recovers.
+ *
+ * The built-in `powershell` tool (src/agent/tools.mjs) implements this inline;
+ * this module is the canonical version used by plugin tools so they can't drift.
+ */
+
+/**
+ * Wire `child` to `signal` (an AbortSignal, or undefined). On abort, tree-kills
+ * the child and arms a grace timer that invokes `forceSettle()` if the child
+ * never emits 'close'. The caller MUST invoke the returned `cleanup()` from its
+ * own settle path (to clear the grace timer + drop the abort listener), and may
+ * call `killTree()` itself (e.g. from its timeout handler). `wasCancelled()`
+ * reports whether a user abort (not a timeout) triggered the kill, so the caller
+ * can render a "canceled" result instead of an exit-code error.
+ *
+ * @param {import('node:child_process').ChildProcess} child
+ * @param {AbortSignal | undefined | null} signal
+ * @param {() => void} forceSettle  - resolves the caller's Promise if 'close' never fires
+ * @param {{ graceMs?: number }} [opts]
+ */
+function killChildTreeOnAbort(child, signal, forceSettle, { graceMs = 5000 } = {}) {
+  let cancelled = false;
+  let graceTimer = null;
+  const armGrace = () => {
+    if (!graceTimer) graceTimer = setTimeout(() => { try { forceSettle(); } catch {} }, graceMs);
+  };
+  const killTree = () => {
+    if (child && child.pid) {
+      try { spawn('taskkill', ['/F', '/T', '/PID', String(child.pid)], { windowsHide: true }); } catch {}
+    }
+    armGrace();
+  };
+  const onAbort = () => { cancelled = true; killTree(); };
+  if (signal) {
+    if (signal.aborted) onAbort();
+    else signal.addEventListener('abort', onAbort, { once: true });
+  }
+  const cleanup = () => {
+    if (graceTimer) { clearTimeout(graceTimer); graceTimer = null; }
+    if (signal) { try { signal.removeEventListener('abort', onAbort); } catch {} }
+  };
+  return { killTree, cleanup, wasCancelled: () => cancelled };
+}
+
 // ====== plugins/wl.mjs ======
 /**
  * `wl` plugin — wraps the WebLogic developer command-line tool.
@@ -6312,9 +6374,16 @@ const wlPlugin = {
             ['-NoProfile', '-NonInteractive', '-Command', safeArgs ? `wl ${safeArgs}` : 'wl'],
             { cwd: workspaceDir, windowsHide: true },
           );
+          // Honor user-abort (Escape / /api/cancel) AND the timeout by killing the
+          // whole build process TREE (taskkill /F /T) — child.kill() alone only
+          // stops the powershell wrapper and orphans mvn/java. Without this, a
+          // build kept running for up to 20 min after Escape and the worker loop
+          // blocked on it. `settle` is declared just below; the grace-timer
+          // forceSettle is only invoked later, by which time settle exists.
+          const killer = killChildTreeOnAbort(child, ctx?.signal, () => settle(null));
           const tid = setTimeout(() => {
             timedOut = true;
-            try { child.kill(); } catch {}
+            killer.killTree();
           }, timeout);
           child.stdout.on('data', (d) => {
             const s = d.toString();
@@ -6330,8 +6399,21 @@ const wlPlugin = {
             if (settled) return;
             settled = true;
             clearTimeout(tid);
+            killer.cleanup();
             if (progressTimer) { clearTimeout(progressTimer); flushProgress(); }
             const dur = Date.now() - t0;
+            if (killer.wasCancelled()) {
+              // User pressed Escape / hit /api/cancel: the build tree was killed.
+              // Resolve promptly (a non-error result) so the worker loop unblocks
+              // and its next abort check unwinds the run.
+              const raw = stdout + (stderr ? '\nSTDERR:\n' + stderr : '');
+              const tail = raw.length > 4000 ? '…(showing the end)…\n' + raw.slice(-4000) : raw;
+              resolve({ content:
+                `CANCELED: \`wl ${safeArgs}\` was canceled by the user after ${dur}ms (the build process tree was killed).\n` +
+                `Partial work may have been written to disk or pushed to the server — do NOT assume it succeeded or failed.\n` +
+                `${tail ? 'Output captured before cancel:\n' + tail : '(no output was captured)'}\n(workspace=${workspaceDir})` });
+              return;
+            }
             if (timedOut) {
               // A timeout is NOT a build failure — the old "ERROR: ... timed out"
               // message made the agent report the build as failed. Return it as a
