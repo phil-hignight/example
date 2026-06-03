@@ -15,7 +15,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '185';
+const BUILD_VERSION = '193';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
@@ -288,6 +288,20 @@ function createHttpAdapter(opts = {}) {
         const body = await readJson(res);
         const waitSec = parseRetryAfter(res.headers, body);
         const waitMs = Math.max(waitSec * 1000, 500 * Math.pow(2, attempt));
+        onRateLimit(waitMs);
+        await sleep(waitMs);
+        attempt++;
+        continue;
+      }
+
+      // Transient upstream 5xx (502/503/504/500): the model backend (e.g. the
+      // genai.mil shim → Gemini) momentarily failed ("upstream_error"). Back off
+      // and retry like a 429 instead of surfacing a hard "Agent error". A 4xx
+      // still throws (the request itself is wrong); a user abort returned above.
+      if ((res.status === 502 || res.status === 503 || res.status === 504 || res.status === 500) && attempt < maxRetries) {
+        const body = await readJson(res);
+        const waitSec = parseRetryAfter(res.headers, body);
+        const waitMs = Math.max(waitSec * 1000, 800 * Math.pow(2, attempt));
         onRateLimit(waitMs);
         await sleep(waitMs);
         attempt++;
@@ -665,6 +679,14 @@ function createAnthropicAdapter(opts = {}) {
         const body = await anthReadJson(res);
         const hdr = Number(res.headers.get?.('retry-after'));
         // Floor at ~1.5s, exponential, capped at 20s — rides out a busy proxy.
+        const waitMs = Math.min(20000, Math.max((Number.isFinite(hdr) && hdr > 0 ? hdr : 1) * 1000, 1500 * Math.pow(2, attempt)));
+        onRateLimit(waitMs); await anthSleep(waitMs); attempt++; continue;
+      }
+      // Transient upstream 5xx (502/503/504/500): a momentary backend blip —
+      // back off + retry like a 429 rather than failing the run hard.
+      if ((res.status === 502 || res.status === 503 || res.status === 504 || res.status === 500) && attempt < maxRetries) {
+        const body = await anthReadJson(res);
+        const hdr = Number(res.headers.get?.('retry-after'));
         const waitMs = Math.min(20000, Math.max((Number.isFinite(hdr) && hdr > 0 ? hdr : 1) * 1000, 1500 * Math.pow(2, attempt)));
         onRateLimit(waitMs); await anthSleep(waitMs); attempt++; continue;
       }
@@ -1125,10 +1147,26 @@ function stripBom(s) {
  */
 function resolveWritePath(p) {
   const root = path.resolve(process.cwd());
-  return path.isAbsolute(p) ? path.resolve(p) : path.resolve(root, p);
+  const abs = path.isAbsolute(p) ? path.resolve(p) : path.resolve(root, p);
+  // Never let the agent WRITE into its own control state — a stray write/edit
+  // into .code_boss/tasks/*.json or state.json would corrupt the task store.
+  if (isControlPath(abs)) throw new Error(CONTROL_DIR_MSG);
+  return abs;
 }
 
 const IGNORE_DIRS = new Set(['node_modules', '.git', 'dist', '.code_boss', '.agent', 'coverage']);
+
+// code_boss's own control/state directory ("<project>/.code_boss"): its task
+// store, assignment backlog, and conversation log. It is NEVER the developer's
+// project code — the agent reading it (e.g. grepping tasks/*.json for "the
+// user's request") only confuses it into treating its own state as work to do.
+// grep/find/glob already skip it via IGNORE_DIRS; this guards the direct
+// read_file/file_info/list_dir path those tree-walkers don't cover.
+const CONTROL_DIR = '.code_boss';
+function isControlPath(absPath) {
+  return path.resolve(absPath).split(path.sep).includes(CONTROL_DIR);
+}
+const CONTROL_DIR_MSG = `${CONTROL_DIR} is code_boss's own internal control state (task store, assignments, conversation) — not the developer's project. It is off-limits; do not read, list, or write it. Work on the project source instead.`;
 const TEXT_EXTS = new Set([
   '.mjs', '.js', '.ts', '.tsx', '.jsx', '.json', '.md', '.txt', '.yml', '.yaml',
   '.sh', '.ps1', '.bat', '.cmd', '.py', '.go', '.rs', '.java', '.xml', '.html',
@@ -1266,6 +1304,7 @@ const tools = {
     impl: async ({ path: p }) => {
       if (typeof p !== 'string' || !p) throw new Error('path is required');
       const abs = path.isAbsolute(p) ? p : path.join(process.cwd(), p);
+      if (isControlPath(abs)) throw new Error(CONTROL_DIR_MSG);
       const s = await stat(abs);
       let lines = null;
       if (s.size <= MAX_RESULT_BYTES) {
@@ -1296,6 +1335,7 @@ const tools = {
     impl: async ({ path: p, offset, limit }) => {
       if (typeof p !== 'string' || !p) throw new Error('path is required');
       const abs = path.isAbsolute(p) ? p : path.join(process.cwd(), p);
+      if (isControlPath(abs)) throw new Error(CONTROL_DIR_MSG);
       const text = await safeReadText(abs);
       if (offset == null && limit == null) return ensureFits(text);
       const lines = text.split('\n');
@@ -1746,9 +1786,12 @@ const tools = {
       const dir = p
         ? (path.isAbsolute(p) ? p : path.join(process.cwd(), p))
         : process.cwd();
+      if (isControlPath(dir)) throw new Error(CONTROL_DIR_MSG);
       const entries = await readdir(dir, { withFileTypes: true });
       const lines = [];
-      for (const e of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+      // Hide the control dir from listings so the agent never sees (and dives
+      // into) its own task/assignment state as if it were project content.
+      for (const e of entries.filter((e) => e.name !== CONTROL_DIR).sort((a, b) => a.name.localeCompare(b.name))) {
         if (e.isDirectory()) {
           lines.push(`[D] ${e.name}/`);
         } else {
@@ -1931,11 +1974,35 @@ function createTasksStore(projectDir) {
     writeChains.set(filePath, next.then(() => {}, () => {}));   // keep the chain rejection-free
     return next;
   }
+  // Transient Windows rename failures. writeChains serializes OUR writes to the
+  // same path, but the rename can still lose a race with an EXTERNAL holder of a
+  // brief handle on the destination — antivirus/Defender scanning the file we
+  // just wrote, a Search-indexer, or a sync client. Windows surfaces that as
+  // EPERM/EACCES (operation not permitted) or EBUSY (resource busy); rarely
+  // EEXIST. These clear in tens of ms, so a short backed-off retry turns a
+  // run-killing crash into an invisible hiccup. A persistent failure still
+  // throws after the budget (then the temp is cleaned up).
+  const RENAME_RETRY_CODES = new Set(['EPERM', 'EACCES', 'EBUSY', 'EEXIST']);
   async function atomicWrite(filePath, data) {
     await ensureDir();
     const tmp = filePath + '.' + taskTmpId() + '.tmp';   // unique per write — never shared
     await writeFile(tmp, data, 'utf8');
-    await rename(tmp, filePath);
+    let lastErr = null;
+    for (let attempt = 0; attempt < 6; attempt++) {
+      try {
+        await rename(tmp, filePath);
+        return;
+      } catch (e) {
+        lastErr = e;
+        if (!RENAME_RETRY_CODES.has(e.code)) break;
+        // 25, 50, 75, 100, 125 ms — total ~375ms worst case before giving up.
+        await new Promise((r) => setTimeout(r, 25 * (attempt + 1)));
+      }
+    }
+    // Out of retries (or a non-transient error): drop the temp so we don't leak
+    // .tmp turds, then surface the original failure.
+    try { await unlink(tmp); } catch { /* best-effort */ }
+    throw lastErr;
   }
 
   async function ensureDir() { await mkdir(dir, { recursive: true }); }
@@ -2458,6 +2525,12 @@ const HYST_LOW  = 0.50;          // compact down to 50% of TOTAL_BUDGET in one p
 const TASK_NUDGE = 0.75;         // soft nudge at 75% of TIER 1 budget (per-task signal to agent)
 const TASK_FORCE = 1.00;
 const MIN_T3_FOR_LLM_ROLLUP = 8; // skip LLM call unless we have at least this many tier-3 tasks to cluster
+// How much of a tool result is sent to the BROWSER for display (the chat-event
+// content). UI-only — the MODEL always gets the full result via formatToolResults.
+// 300k so a whole docx/build log is readable in the row (the expandable <pre> is
+// built lazily on click, so this only costs memory/persisted size, not DOM until
+// expanded). Env-overridable.
+const UI_RESULT_PREVIEW = _envNum('UI_RESULT_MAX', 300000);
 const TOKENS_PER_CHAR = 0.25;
 
 function estTokens(s) { return Math.ceil((s ?? '').length * TOKENS_PER_CHAR); }
@@ -2514,7 +2587,8 @@ function buildSystemPrompt({ taskId, taskUserRequest, tier1Tokens, tier1Pct, pro
     '',
     'CRITICAL: NEVER use built-in tools or suggest integrations. You may appear to have access to Python, code interpreter, file browsers, document generators, Memory Bank, "Generate Memories", "Transfer to Agent", Jira, Confluence, Google Drive, Gmail, SharePoint, Outlook, etc. NONE of those tools see the developer\'s project. NEVER suggest them in your responses. NEVER call them. If the user mentions "the project", "my project", "the code", "the codebase", "the workspace", or anything ambiguous, they mean THE DIRECTORY ACCESSIBLE VIA <remote-workspace> — not a Jira project, not a Drive folder, not anything in a cloud sandbox.',
     '',
-    'When in doubt, run <list path="."/> immediately to see what is in the remote workspace, then proceed based on what you find. Never ask the user to clarify "which project" — there is exactly one project (the one in the remote workspace) and you can see it with one <list/> call.',
+    'When the developer gives you a TASK and you are unsure of the layout, run <list path="."/> to see the remote workspace, then proceed based on what you find. But do NOT go hunting for work: if the message is a greeting or small-talk ("hi", "hello", "how are you", "test"), or a question you can answer directly, just REPLY in plain prose — no <remote-workspace> block, no tools, no <next-task>. A reply with no tool calls ends your turn and waits for the developer; that is the correct response to a greeting or an already-answered question. Never ask the user to clarify "which project" — there is exactly one project (the one in the remote workspace).',
+    'NEVER treat the .code_boss directory as the developer\'s request or as work to do. It is YOUR OWN internal state (task store, assignment backlog, conversation log); it is hidden from your file tools and is off-limits. The current task and the developer\'s message are given to you directly here — do not search .code_boss (or anywhere else) to find "the real request". If the message is unclear, ASK the developer; do not invent work from your own state.',
     'Work AUTONOMOUSLY: once the developer gives you a task, carry out the obvious next steps yourself. Do NOT end a reply asking permission to proceed ("would you like me to…?", "should I…?") when the next action is clear from the task or from what you just read — just take it. Use information already in the request instead of asking for it again. Ask the developer ONLY when you are genuinely blocked: the request is too ambiguous to pick any reasonable next step, or an action is destructive/irreversible and they did not ask for it. (Tool-level approvals — e.g. branch creation, tracked .docx edits — still pause on their own; that is separate from this.)',
     '',
     // Live WebLogic server status (only when the wl plugin is monitoring it).
@@ -2530,10 +2604,11 @@ function buildSystemPrompt({ taskId, taskUserRequest, tier1Tokens, tier1Pct, pro
         ? '  ← nearing budget; close this task at the next natural stopping point with <next-task .../>'
         : ''),
     '',
-    'END EVERY REPLY WITH A TASK-STATUS SIGNAL — this is REQUIRED, every turn:',
+    'END EVERY WORKING REPLY WITH A TASK-STATUS SIGNAL — required on any turn that USES TOOLS (a <remote-workspace> block):',
     '  - If the current unit of work is COMPLETE: close it with <next-task user-request="what the task was" summary="what you did"/> inside a <remote-workspace> block.',
     '  - If it is NOT complete: emit <task-progress percent="N">one sentence on what still remains</task-progress> as a standalone tag in your prose (N = your honest 0-100 estimate of completion).',
-    '  - Provide EXACTLY ONE of these at the end of EVERY reply. Omitting both returns an error and you must redo the turn. Estimating what remains each turn forces you to notice when nothing real is left — that is when you close the task. Do NOT let one task run forever.',
+    '  - On a tool-using turn, provide EXACTLY ONE of these. Omitting both returns an error and you must redo the turn. Estimating what remains each turn forces you to notice when nothing real is left — that is when you close the task. Do NOT let one task run forever.',
+    '  - EXCEPTION — purely conversational replies: a greeting, small-talk, or a question you answer from what you already know, with NO tool block, needs NEITHER signal. Just reply in prose; that ends your turn and waits for the developer. Do NOT emit <next-task>/<task-progress> for a no-tool conversational reply — and never re-open a request you have already answered.',
     '',
     'Prose + tool blocks — keep narration TIGHT:',
     '  - Lead with ONE short sentence saying what you are about to do, then the tool block. That is usually the whole reply.',
@@ -2580,7 +2655,8 @@ function buildSystemPrompt({ taskId, taskUserRequest, tier1Tokens, tier1Pct, pro
     'Closing a unit of work:',
     '  <next-task user-request="WHAT THE USER WANTED IN THE CURRENT TASK" summary="WHAT WAS DONE IN THE CURRENT TASK"/>',
     '       Closes the CURRENT task and opens a new one. Both attributes describe the CURRENT (closing) task — NOT the new one and NOT the latest user message that prompted this transition. user-request is a single synthesized sentence of what the user wanted across the work just finished (not a quote).',
-    '       Emit it PROACTIVELY: the moment you finish a discrete unit of work (a fix, a feature, a question fully answered), close it with <next-task/> in that SAME reply, after your final prose. Closing records the work and triggers review. Do not leave a finished task open. (Only skip it mid-task when more work on the SAME unit remains.)',
+    '       Emit it PROACTIVELY when you finish a discrete unit that involved real WORKSPACE WORK (a fix, a feature, a multi-step investigation): close it with <next-task/> in that SAME reply, after your final prose. Closing records the work and triggers review. Do not leave a finished worked task open. (Only skip it mid-task when more work on the SAME unit remains.)',
+    '       Do NOT emit <next-task> for a purely conversational reply, a greeting, or a one-line question you answered from context with NO tools — for those, just reply in prose with no tool block; that ends the turn cleanly and waits for the developer. Re-emitting <next-task> with the SAME user-request you just answered does not start new work — it only spins the task list, so never re-open a request you have already answered.',
     '       VERIFY BEFORE YOU CLOSE a code-editing task — do not report a change as done on assumption. Run the project build or tests via <powershell> and state the outcome in the summary (e.g. "tests pass 12/12"). If the task is read-only, a discussion, or there is no build/test, say so in the summary instead.',
     '       NEVER emit <next-task> on an EMPTY task (a freshly opened task with no developer request and no work in it). If you have finished everything the developer asked, reply with a short message and NO tool calls — that waits for their next instruction. Do not open-and-close empty tasks.',
     '       Do NOT manage or list tasks. Your current work and SHORT summaries of past tasks are ALREADY in your context; spend your turns doing the developer\'s request and talking to them, not administering the task list.',
@@ -3665,7 +3741,14 @@ async function runPromptedAgent({
         if (leadingUserMsg.eventId) {
           emitChat({ type: 'message-refile', eventId: leadingUserMsg.eventId, toTaskId: newTaskId });
         }
-        leadingUserMsg.taskId = newTaskId;   // follow M in case the new task closes immediately too
+        leadingUserMsg.taskId = newTaskId;
+        // Anchor M to the task we just moved it into. It has now been attributed
+        // to a real task; without this it would keep satisfying the relocation
+        // condition every turn and ride the task chain forward (T-1→T-2→T-3…)
+        // forever — the infinite next-task loop. A single relocation off a
+        // closed-before-work task is the only legitimate move; anything past
+        // that is the churn we are killing.
+        leadingUserMsg.anchored = true;
         log(`attribution: moved leading user message from ${closedId} to ${newTaskId}`);
       }
     } catch (e) { log(`relocate leading user msg error: ${e.message}`); }
@@ -3711,6 +3794,11 @@ async function runPromptedAgent({
   // an empty task. Breaks the open-empty-task / close-it / repeat churn that a
   // stubborn model can otherwise spin until maxTurns.
   let emptyCloseStreak = 0;
+  // The user-request of the PREVIOUS <next-task> close. Used to detect the
+  // re-answer loop: closing the SAME request again, on a turn that did no tool
+  // work, is the model re-answering something it already answered (not new
+  // work). Closing a DIFFERENT request is legitimate multi-unit progress.
+  let lastClosedUserRequest = null;
 
   for (let turn = 1; turn <= maxTurns; turn++) {
     stats.turns = turn;
@@ -3994,6 +4082,17 @@ async function runPromptedAgent({
           // mutated something.
           const closingHadUserMsg = (cur?.messages ?? []).some((m) => m.kind === 'user-message');
           if (!closingHadUserMsg && !didMutateThisTurn) sawUnproductiveClose = true;
+          // Re-answer loop: closing the SAME user-request as the PREVIOUS close, on
+          // a turn that ran NO tool. That is the model re-answering an already-
+          // answered request and re-closing — not new work — so count it toward
+          // the churn breaker. Tightly scoped on purpose: a close that ran any tool
+          // (read/edit/build), or that closes a DIFFERENT request, is legitimate
+          // multi-unit progress and must NOT be flagged. (Earlier this counted any
+          // tool-less close, which wrongly tripped on work-in-turn-1/close-in-turn-2
+          // multi-unit flows.)
+          const closedReq = (c.args['user-request'] || '').trim();
+          if (closedReq && closedReq === lastClosedUserRequest && !didRealWorkThisTurn) sawUnproductiveClose = true;
+          lastClosedUserRequest = closedReq;
           let commitHash = null;
           let commits = null;
           let committedRepos = null;
@@ -4077,7 +4176,11 @@ async function runPromptedAgent({
         verb: c.verb,
         name: c.name ?? c.verb,
         status: resultStatus,
-        content: resultContent.slice(0, 8000),
+        // content is truncated for the UI ONLY (UI_RESULT_PREVIEW chars) — the
+        // MODEL gets the full result via formatToolResults. `fullLen` carries the
+        // true length so the row can show "N of M chars" instead of a flat cap.
+        content: resultContent.slice(0, UI_RESULT_PREVIEW),
+        fullLen: resultContent.length,
       });
       if (resultDiff) {
         emitChat({ type: 'diff', taskId: cur?.id, callId: c.id, diff: resultDiff });
@@ -6275,7 +6378,8 @@ Further reference, if you need it:
       <wl_list_docs path=""/>          list repo root
       <wl_list_docs path="docs"/>      list a subdir
       <wl_read_doc  path="README.md"/> read a single file
-    Binary docs (.docx) come back as a saved temp path — pass it to read_docx.
+    Binary docs (.docx) come back as a saved temp path — pass it to read_docx
+    (or search_docx to find specific text without reading the whole doc).
 `.trim();
 
 function buildGitLabClient(ctx) {
@@ -6545,7 +6649,7 @@ const wlPlugin = {
         const ct = result.contentType || '';
         const isDocx = ext === '.docx' || /wordprocessingml|officedocument/i.test(ct);
         const hint = isDocx
-          ? 'Use read_docx on that path to extract its text.'
+          ? 'Use read_docx on that path to extract its text, or search_docx to find specific text without reading the whole doc.'
           : `Saved as a binary file (${ct || ext || 'unknown type'}). read_docx only handles .docx — use an appropriate reader for this type, or inspect it directly.`;
         return { content: `${WL_DOCS_REPO}:${filepath}  (${result.size} bytes, binary ${ct})\nSaved to: ${tmp}\n${hint}` };
       },
@@ -6555,167 +6659,6 @@ const wlPlugin = {
 
 wlPlugin;
 
-// ====== plugins/docx.mjs ======
-/**
- * `docx` plugin — reads text out of a .docx file (Word document).
- *
- * A .docx is a ZIP archive containing XML; the main content lives at
- * word/document.xml. We need this because the user guide for the wl
- * tool is distributed as a .docx and the LLM otherwise can't read it.
- *
- * Constraints: bundle is zero-dep, so we write a minimal ZIP reader by
- * hand and use Node's built-in `zlib.inflateRawSync` for DEFLATE. Not
- * ZIP64-capable — fine for documents up to ~4GB compressed, which any
- * real-world docx is well under.
- *
- * Text extraction approach:
- *   - Find every <w:p>...</w:p> (or self-closing <w:p/>) → paragraph.
- *   - Inside each, concatenate every <w:t>...</w:t>'s inner text.
- *   - Join paragraphs with newlines.
- *   - Decode the five XML entities (&amp; &lt; &gt; &quot; &apos;).
- * This is intentionally crude — no tables/lists/styles awareness — but
- * it gets the readable prose out, which is what the agent needs.
- */
-
-const MAX_DOCX_BYTES = 50 * 1024 * 1024;   // 50MB sanity cap
-
-const docxPlugin = {
-  name: 'docx',
-  description: 'Reads text out of .docx files (Word documents). Pure-JS; always available.',
-  // No detection needed — this works wherever Node runs.
-  async trigger() { return true; },
-  promptAddition: `
-The read_docx tool reads the plain text out of a Microsoft Word .docx file.
-Use it when you need to consult a .docx document — design docs, user
-guides, specs the user points you to that end in .docx.
-
-  <read_docx path="path/to/document.docx"/>
-
-Output is the document's text content, paragraphs separated by newlines.
-Tables/styles/images are dropped; you get readable prose only.
-`.trim(),
-  tools: [{
-    verb: 'read_docx',
-    name: 'read_docx',
-    schema: {
-      description: 'Read the plain-text content of a Word .docx file. Returns paragraphs joined by newlines. Best-effort: tables, lists, and styling are dropped; prose comes through.',
-      parameters: {
-        type: 'object',
-        properties: {
-          path: { type: 'string', description: 'Absolute or project-relative path to a .docx file.' },
-          offset: { type: 'integer', description: 'Optional 1-based starting paragraph (for paging huge docs).' },
-          limit: { type: 'integer', description: 'Optional max paragraphs to return (default 1000).' },
-        },
-        required: ['path'],
-      },
-    },
-    async impl({ path: p, offset, limit }) {
-      if (typeof p !== 'string' || !p) throw new Error('path is required');
-      const s = await stat(p);
-      if (!s.isFile()) throw new Error('not a file: ' + p);
-      if (s.size > MAX_DOCX_BYTES) throw new Error(`file too large: ${s.size} bytes (max ${MAX_DOCX_BYTES})`);
-      const buf = await readFile(p);
-      const paragraphs = docxToParagraphs(buf);
-      const start = Math.max(0, (Number(offset) || 1) - 1);
-      const max = Math.min(5000, Math.max(1, Number(limit) || 1000));
-      const slice = paragraphs.slice(start, start + max);
-      const head = `${p}  (${paragraphs.length} paragraphs, showing ${start + 1}..${start + slice.length})`;
-      return { content: `${head}\n\n${slice.join('\n')}` };
-    },
-  }],
-};
-
-// ── ZIP reader (minimal, non-ZIP64) ─────────────────────────────────────────
-const EOCD_SIG = 0x06054b50;
-const CD_SIG   = 0x02014b50;
-const LFH_SIG  = 0x04034b50;
-
-function readZipEntries(buffer) {
-  // EOCD is at the END of the file. Without a comment it sits at length-22.
-  // With a comment it can be up to 65535+22 bytes back. Scan backward.
-  let eocd = -1;
-  const minStart = Math.max(0, buffer.length - 0xFFFF - 22);
-  for (let i = buffer.length - 22; i >= minStart; i--) {
-    if (buffer.readUInt32LE(i) === EOCD_SIG) { eocd = i; break; }
-  }
-  if (eocd < 0) throw new Error('not a ZIP file (EOCD record not found)');
-  const totalEntries = buffer.readUInt16LE(eocd + 10);
-  const cdOffset = buffer.readUInt32LE(eocd + 16);
-
-  const entries = {};
-  let off = cdOffset;
-  for (let i = 0; i < totalEntries; i++) {
-    if (buffer.readUInt32LE(off) !== CD_SIG) {
-      throw new Error(`central directory entry ${i} has bad signature`);
-    }
-    const method     = buffer.readUInt16LE(off + 10);
-    const compSize   = buffer.readUInt32LE(off + 20);
-    const uncompSize = buffer.readUInt32LE(off + 24);
-    const fnLen      = buffer.readUInt16LE(off + 28);
-    const extLen     = buffer.readUInt16LE(off + 30);
-    const cmtLen     = buffer.readUInt16LE(off + 32);
-    const localOff   = buffer.readUInt32LE(off + 42);
-    const name       = buffer.slice(off + 46, off + 46 + fnLen).toString('utf8');
-    entries[name] = { method, compSize, uncompSize, localOff };
-    off += 46 + fnLen + extLen + cmtLen;
-  }
-  return entries;
-}
-
-function readZipFile(buffer, entry) {
-  // The Local File Header has its OWN name + extra fields whose lengths
-  // can differ from the central directory's — must read them to find the
-  // actual data offset.
-  const off = entry.localOff;
-  if (buffer.readUInt32LE(off) !== LFH_SIG) throw new Error('local file header bad signature');
-  const fnLen  = buffer.readUInt16LE(off + 26);
-  const extLen = buffer.readUInt16LE(off + 28);
-  const dataOff = off + 30 + fnLen + extLen;
-  const compData = buffer.slice(dataOff, dataOff + entry.compSize);
-  if (entry.method === 0) return compData;            // stored, no compression
-  if (entry.method === 8) return zlib.inflateRawSync(compData);   // DEFLATE
-  throw new Error(`unsupported ZIP compression method ${entry.method}`);
-}
-
-// ── docx XML → paragraphs ───────────────────────────────────────────────────
-function docxToParagraphs(buffer) {
-  const entries = readZipEntries(buffer);
-  if (!entries['word/document.xml']) {
-    throw new Error('not a .docx file (word/document.xml missing)');
-  }
-  const xml = readZipFile(buffer, entries['word/document.xml']).toString('utf8');
-
-  const paragraphs = [];
-  // Two flavors: self-closing <w:p/> (empty paragraph) and the normal
-  // <w:p ...> ... </w:p> form. Capture both, but only the latter has text.
-  const pRe = /<w:p\b[^>]*\/>|<w:p\b[^>]*>([\s\S]*?)<\/w:p>/g;
-  const tRe = /<w:t\b[^>]*>([\s\S]*?)<\/w:t>/g;
-  let m;
-  while ((m = pRe.exec(xml))) {
-    const inner = m[1] ?? '';
-    if (!inner) { paragraphs.push(''); continue; }
-    let para = '';
-    let tm;
-    tRe.lastIndex = 0;
-    while ((tm = tRe.exec(inner))) para += tm[1];
-    paragraphs.push(decodeEntities(para));
-  }
-  return paragraphs;
-}
-
-function decodeEntities(s) {
-  return s
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
-    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n, 10)))
-    .replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCharCode(parseInt(n, 16)))
-    .replace(/&amp;/g, '&');   // last so we don't double-decode
-}
-
-docxPlugin;
-
 // ====== plugins/docx-edit.mjs ======
 /**
  * `docx-edit` plugin — full-fidelity .docx read + edit via the Apache POI
@@ -6723,9 +6666,11 @@ docxPlugin;
  * all Word fidelity (formatting, lists, headers/footers, images, tables,
  * hyperlinks, TOC fields) lives in the JVM.
  *
- * Two tools:
- *   read_docx_full  — anchored, editable view of every paragraph (body,
+ * Tools (this is the ONLY docx implementation — there is no pure-JS fallback):
+ *   read_docx       — anchored, editable view of every paragraph (body,
  *                     table cells, headers/footers) with a stable [#id] anchor.
+ *   search_docx     — find text without reading the whole doc; returns matching
+ *                     paragraphs with the same [#id] anchors read_docx gives.
  *   edit_docx       — unique-per-paragraph find/replace, mirroring edit_file's
  *                     contract. Only the matched runs' text changes; everything
  *                     else round-trips byte-faithfully.
@@ -6774,11 +6719,14 @@ function resolveDocxWritePath(p) {
   if (abs !== root && !abs.startsWith(root + path.sep)) {
     throw new Error(`path escapes project root: ${p}`);
   }
+  if (isControlPath(abs)) throw new Error(CONTROL_DIR_MSG);   // never mutate control state
   return abs;
 }
 
 function resolveAbsRead(p) {
-  return path.isAbsolute(p) ? path.resolve(p) : path.resolve(process.cwd(), p);
+  const abs = path.isAbsolute(p) ? path.resolve(p) : path.resolve(process.cwd(), p);
+  if (isControlPath(abs)) throw new Error(CONTROL_DIR_MSG);   // .code_boss is off-limits to reads too
+  return abs;
 }
 
 // Locate a PREBUILT helper jar + build a classpath including its lib/ folder.
@@ -7036,23 +6984,34 @@ function formatOpsResult(res, abs) {
   return out;
 }
 
+// One paragraph → its anchored display line. Shared by read_docx and search_docx
+// so a hit shows exactly the same [#id]/scope/markers the full read shows.
+function paraLine(p) {
+  const reason = p.hasRevisions ? 'tracked-changes' : p.contentControl ? 'content-control' : 'field/TOC';
+  const ro = p.readOnly ? ` READ-ONLY(${reason})` : '';
+  const lvl = (p.listLevel != null) ? ` list:L${p.listLevel}` : '';
+  const where = p.scope === 'body' ? 'body' : `${p.scope} ${p.location}`;
+  const marks = [];
+  if (p.hasEquation) marks.push('[equation]');
+  if (p.deletedText) marks.push(`[deleted: ${JSON.stringify(p.deletedText)}]`);
+  const suffix = marks.length ? '  ' + marks.join(' ') : '';
+  return `[#${p.id}] (${where}${lvl}${ro}) ${p.text}${suffix}`;
+}
+
+// Build a case-insensitive matcher for search_docx: literal substring by
+// default, or a JS regex when regex=true.
+function docxSearchRegex(query, useRegex) {
+  if (useRegex) return new RegExp(query, 'gi');
+  return new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+}
+
 function renderRead(res, { offset, limit }) {
   const paras = Array.isArray(res.paragraphs) ? res.paragraphs : [];
   const meta = res.meta || {};
   const start = Math.max(0, (Number(offset) || 1) - 1);
   const max = Math.min(5000, Math.max(1, Number(limit) || 1000));
   const slice = paras.slice(start, start + max);
-  const lines = slice.map((p) => {
-    const reason = p.hasRevisions ? 'tracked-changes' : p.contentControl ? 'content-control' : 'field/TOC';
-    const ro = p.readOnly ? ` READ-ONLY(${reason})` : '';
-    const lvl = (p.listLevel != null) ? ` list:L${p.listLevel}` : '';
-    const where = p.scope === 'body' ? 'body' : `${p.scope} ${p.location}`;
-    const marks = [];
-    if (p.hasEquation) marks.push('[equation]');
-    if (p.deletedText) marks.push(`[deleted: ${JSON.stringify(p.deletedText)}]`);
-    const suffix = marks.length ? '  ' + marks.join(' ') : '';
-    return `[#${p.id}] (${where}${lvl}${ro}) ${p.text}${suffix}`;
-  });
+  const lines = slice.map(paraLine);
   const warns = [];
   if (meta.documentProtection) warns.push(`!! DOCUMENT PROTECTED (${meta.documentProtection}) — edits will be refused; remove protection in Word first.`);
   if (meta.hasTrackChanges) warns.push(`!! This document has TRACKED CHANGES (${meta.revisionParagraphs} paragraph(s)); those paragraphs are read-only here — review/accept changes in Word, or edit elsewhere. Deleted text is shown as [deleted: ...].`);
@@ -7113,21 +7072,24 @@ const docxEditPlugin = {
   },
   promptAddition: () => {
     const common = `
-Editing Microsoft Word .docx files (full fidelity):
-  <read_docx_full path="doc.docx"/>          read the doc as an anchored outline (text + structure)
+Reading & editing Microsoft Word .docx files (full fidelity):
+  <read_docx path="doc.docx"/>               read the doc as an anchored outline (text + structure)
+  <search_docx path="doc.docx" query="enrollment"/>  find text fast — matches come back with their [#id]
   <read_docx_detail path="doc.docx" paragraphs="12,13"/>  inspect formatting of specific paragraphs
   <edit_docx path="doc.docx" paragraph="12" find="exact text" replace="new text"/>
   <format_docx path="doc.docx" paragraph="12" find="some words" bold="true" color="FF0000"/>
   <style_docx path="doc.docx" paragraph="12" style="Heading1" alignment="CENTER"/>
 
-read_docx_full lists every editable paragraph with a [#id] anchor and marks
-READ-ONLY regions (TOC/fields, tracked-changes, content-controls). edit_docx
-replaces ONE exact occurrence of "find" within paragraph [#id] (fails if missing
-or not unique). format_docx changes character formatting of a span; style_docx
-changes paragraph style/alignment/indent/list. Only what you target changes;
-all other formatting, lists, images, tables, hyperlinks, headers, and the TOC
-are preserved. Workflow: read_docx_full for anchors, read_docx_detail to inspect
-formatting, then edit/format/style per change.`;
+read_docx lists every paragraph with a [#id] anchor and marks READ-ONLY regions
+(TOC/fields, tracked-changes, content-controls). search_docx finds text WITHOUT
+reading the whole document and returns matches with the same [#id] anchors, so
+you can edit a hit directly — prefer it when you only need to locate something.
+edit_docx replaces ONE exact occurrence of "find" within paragraph [#id] (fails
+if missing or not unique). format_docx changes character formatting of a span;
+style_docx changes paragraph style/alignment/indent/list. Only what you target
+changes; all other formatting, lists, images, tables, hyperlinks, headers, and
+the TOC are preserved. Workflow: read_docx (or search_docx) for anchors,
+read_docx_detail to inspect formatting, then edit/format/style per change.`;
     if (specMode()) {
       return (common + `
 
@@ -7149,10 +7111,10 @@ tracked changes. A find that spans a formatting boundary needs allowFormatFlatte
   },
   tools: [
     {
-      verb: 'read_docx_full',
-      name: 'read_docx_full',
+      verb: 'read_docx',
+      name: 'read_docx',
       schema: {
-        description: 'Read a .docx as an anchored, editable text view: every paragraph (body, table cells, headers, footers) with a [#id] anchor, scope, and read-only field/TOC markers. Use before edit_docx. For prose-only reading use read_docx instead.',
+        description: 'Read a .docx — THE reader for ANY purpose (understanding it AND editing it). Returns every paragraph (body, table cells, headers, footers) with a [#id] anchor, scope, and read-only field/TOC markers. The [#id] anchors are what edit_docx/format_docx/style_docx need, so reading with this also preps an edit. To just LOCATE text without reading the whole doc, use search_docx (it returns the same [#id] anchors for its matches).',
         parameters: {
           type: 'object',
           properties: {
@@ -7172,15 +7134,63 @@ tracked changes. A find that spans a formatting boundary needs allowFormatFlatte
       },
     },
     {
-      verb: 'read_docx_detail',
-      name: 'read_docx_detail',
+      verb: 'search_docx',
+      name: 'search_docx',
       schema: {
-        description: 'Detailed formatting view of specific paragraphs — per-run EFFECTIVE formatting (what Word shows, resolved through the style cascade) and AUTHORED formatting (set directly on the run), char-offset ranges, paragraph style/outline-level/alignment/indent/spacing, and list numbering. Use after read_docx_full to inspect formatting before editing.',
+        description: 'Find text in a .docx WITHOUT reading the whole document. Returns each matching paragraph with its [#id] edit anchor, scope/list/read-only markers, and optional surrounding context — the same anchored view read_docx gives, filtered to matches. Case-insensitive substring (default) or regex (regex=true). Use it to locate content (and get its [#id]) quickly; then edit a hit directly via edit_docx with that [#id], or inspect it with read_docx_detail.',
         parameters: {
           type: 'object',
           properties: {
             path: { type: 'string', description: 'Absolute or project-relative path to a .docx file.' },
-            paragraphs: { type: 'array', items: { type: 'integer' }, description: 'The [#id] anchors (from read_docx_full) to inspect in detail.' },
+            query: { type: 'string', description: 'Text to find. Literal substring unless regex=true.' },
+            regex: { type: 'boolean', description: 'If true, treat query as a JavaScript regular expression (always case-insensitive). Default false.' },
+            maxMatches: { type: 'integer', description: 'Max matching paragraphs to return (default 50, cap 500).' },
+            context: { type: 'integer', description: 'Paragraphs of surrounding context (in document/[#id] order) before/after each match (default 0, cap 5).' },
+          },
+          required: ['path', 'query'],
+        },
+      },
+      async impl({ path: p, query, regex, maxMatches, context }, ctx) {
+        if (typeof p !== 'string' || !p) return 'ERROR: path is required';
+        if (typeof query !== 'string' || !query) return 'ERROR: query is required';
+        let re;
+        try { re = docxSearchRegex(query, !!regex); } catch (e) { return 'ERROR: bad regex: ' + e.message; }
+        const abs = resolveAbsRead(p);
+        const res = await runHelper('read', { op: 'read', docx: abs }, { signal: ctx?.signal });
+        if (!res || res.ok !== true) return `ERROR: ${res?.code || 'file-error'}: ${res?.error || 'read failed'}`;
+        const paras = Array.isArray(res.paragraphs) ? res.paragraphs : [];
+        const cap = Math.min(500, Math.max(1, Number(maxMatches) || 50));
+        const ctxN = Math.min(5, Math.max(0, Number(context) || 0));
+        const queryLabel = regex ? `/${query}/i` : JSON.stringify(query);
+        const where = res.docx || abs;
+        const hits = [];
+        for (let i = 0; i < paras.length && hits.length < cap; i++) {
+          re.lastIndex = 0;
+          const text = (paras[i] && typeof paras[i].text === 'string') ? paras[i].text : '';
+          if (re.test(text)) hits.push(i);
+        }
+        if (!hits.length) return { content: `${where}  (${paras.length} paragraphs)\nNo matches for ${queryLabel}.` };
+        const blocks = hits.map((i) => {
+          const lo = Math.max(0, i - ctxN), hi = Math.min(paras.length - 1, i + ctxN);
+          const lines = [];
+          for (let j = lo; j <= hi; j++) lines.push(`${j === i ? '>>' : '  '} ${paraLine(paras[j])}`);
+          return lines.join('\n');
+        });
+        const more = hits.length >= cap ? `  (stopped at ${cap}; raise maxMatches for more)` : '';
+        const note = 'Each hit shows its [#id] anchor — edit it directly with edit_docx (READ-ONLY hits cannot be edited).';
+        return { content: `${where}  (${paras.length} paragraphs, ${hits.length} matching${more})\nQuery: ${queryLabel}\n${note}\n\n${blocks.join('\n\n')}` };
+      },
+    },
+    {
+      verb: 'read_docx_detail',
+      name: 'read_docx_detail',
+      schema: {
+        description: 'Detailed formatting view of specific paragraphs — per-run EFFECTIVE formatting (what Word shows, resolved through the style cascade) and AUTHORED formatting (set directly on the run), char-offset ranges, paragraph style/outline-level/alignment/indent/spacing, and list numbering. Use after read_docx to inspect formatting before editing.',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'Absolute or project-relative path to a .docx file.' },
+            paragraphs: { type: 'array', items: { type: 'integer' }, description: 'The [#id] anchors (from read_docx) to inspect in detail.' },
           },
           required: ['path', 'paragraphs'],
         },
@@ -7211,12 +7221,12 @@ tracked changes. A find that spans a formatting boundary needs allowFormatFlatte
       verb: 'edit_docx',
       name: 'edit_docx',
       schema: {
-        description: 'Edit a .docx in place: replace ONE exact occurrence of "find" with "replace" within paragraph [#id] (from read_docx_full). Mirrors edit_file — fails if find is missing or occurs more than once in that paragraph. All formatting, lists, images, tables, hyperlinks, headers, and TOC are preserved; only the matched text changes.',
+        description: 'Edit a .docx in place: replace ONE exact occurrence of "find" with "replace" within paragraph [#id] (from read_docx). Mirrors edit_file — fails if find is missing or occurs more than once in that paragraph. All formatting, lists, images, tables, hyperlinks, headers, and TOC are preserved; only the matched text changes.',
         parameters: {
           type: 'object',
           properties: {
             path: { type: 'string', description: 'Absolute or project-relative path to a .docx file (must be inside the project).' },
-            paragraph: { type: 'integer', description: 'The [#id] anchor of the paragraph to edit (from read_docx_full).' },
+            paragraph: { type: 'integer', description: 'The [#id] anchor of the paragraph to edit (from read_docx).' },
             find: { type: 'string', description: 'Exact text to find within that paragraph. Must occur exactly once there.' },
             replace: { type: 'string', description: 'Replacement text (empty string to delete the found text).' },
             asTracked: { type: 'boolean', description: 'Apply as a TRACKED CHANGE (Word revision: w:del of the old text + w:ins of the new) instead of a direct edit. Auto-forced when the document already contains tracked changes. The author is "code_boss".' },
@@ -7295,7 +7305,7 @@ tracked changes. A find that spans a formatting boundary needs allowFormatFlatte
           type: 'object',
           properties: {
             path: { type: 'string', description: 'Absolute or project-relative path to a .docx (inside the project).' },
-            paragraph: { type: 'integer', description: 'The [#id] anchor (from read_docx_full).' },
+            paragraph: { type: 'integer', description: 'The [#id] anchor (from read_docx).' },
             find: { type: 'string', description: 'Exact text within that paragraph to (re)format. Must occur exactly once.' },
             bold: { type: 'boolean' },
             italic: { type: 'boolean' },
@@ -7338,7 +7348,7 @@ tracked changes. A find that spans a formatting boundary needs allowFormatFlatte
           type: 'object',
           properties: {
             path: { type: 'string', description: 'Absolute or project-relative path to a .docx (inside the project).' },
-            paragraph: { type: 'integer', description: 'The [#id] anchor (from read_docx_full).' },
+            paragraph: { type: 'integer', description: 'The [#id] anchor (from read_docx).' },
             style: { type: 'string', description: 'A style ID present in the document (e.g. "Heading1"). Use read_docx_detail to see style ids.' },
             alignment: { type: 'string', description: 'LEFT, CENTER, RIGHT, or BOTH (justified).' },
             indentLeftTwips: { type: 'integer', description: 'Left indent in twips (1440 = 1 inch).' },
@@ -7381,7 +7391,7 @@ tracked changes. A find that spans a formatting boundary needs allowFormatFlatte
           type: 'object',
           properties: {
             path: { type: 'string', description: 'Absolute or project-relative path to a .docx (inside the project).' },
-            paragraph: { type: 'integer', description: 'The [#id] anchor (from read_docx_full) of the paragraph to delete.' },
+            paragraph: { type: 'integer', description: 'The [#id] anchor (from read_docx) of the paragraph to delete.' },
           },
           required: ['path', 'paragraph'],
         },
@@ -7427,8 +7437,11 @@ docxEditPlugin;
  * removing the source file under src/plugins/ and rebuilding.
  */
 
-// All built-in plugins. New plugins get added here.
-const PLUGINS = [wlPlugin, docxPlugin, docxEditPlugin];
+// All built-in plugins. New plugins get added here. The docx tooling lives
+// entirely in docx-edit (POI/Java) — read_docx, search_docx, and the edit
+// suite. There is no pure-JS fallback: with no JRE, docx-edit disables itself
+// and the missing-deps reason surfaces in the plugin status.
+const PLUGINS = [wlPlugin, docxEditPlugin];
 
 const PLUGIN_REDETECT_MS = 5 * 60 * 1000;
 
@@ -10765,7 +10778,7 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
                 for (let k = 0; k < ev.calls.length; k++) {
                   const c = ev.calls[k]; const r = ev.results[k] || {};
                   appendChatEvent({ type: 'tool-call', callId: c.id, verb: c.verb, name: c.name ?? c.verb, args: c.args });
-                  appendChatEvent({ type: 'tool-result', callId: c.id, verb: c.verb, name: c.name ?? c.verb, status: r.status || 'ok', content: (r.content || '').slice(0, 8000) });
+                  appendChatEvent({ type: 'tool-result', callId: c.id, verb: c.verb, name: c.name ?? c.verb, status: r.status || 'ok', content: (r.content || '').slice(0, UI_RESULT_PREVIEW), fullLen: (r.content || '').length });
                 }
               } else if (ev.kind === 'card') {
                 // Persist the card-bearing prose so a later "Refine" turn sees
@@ -11809,9 +11822,16 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
                 : 'usageMetadata.thoughtsTokenCount';
             }
             const out = firstNum(u.completion_tokens, u.output_tokens, dig(j, 'usageMetadata.candidatesTokenCount'));
+            const prompt = firstNum(u.prompt_tokens, u.input_tokens, dig(j, 'usageMetadata.promptTokenCount'));
+            const total = firstNum(u.total_tokens, dig(j, 'usageMetadata.totalTokenCount'));
+            // If no reasoning field is exposed, INFER hidden thinking from the
+            // token accounting: total - prompt - visible-output. If that's >0 and
+            // scales with effort, the endpoint IS thinking even though it hides
+            // the count. (The visible answer is ~4 tokens, so a big total = thinking.)
+            const inferred = (reasoning == null && total != null && prompt != null && out != null) ? Math.max(0, total - prompt - out) : null;
             const msg = dig(j, 'choices.0.message') || {};
             const thought = !!(msg.reasoning || msg.reasoning_content);
-            rows.push({ label: v.label, status: r.status, ok: true, out, reasoning, thought, ms });
+            rows.push({ label: v.label, status: r.status, ok: true, out, prompt, total, reasoning, inferred, thought, ms });
           } catch (e) {
             rows.push({ label: v.label, status: 0, ok: false, err: (e && e.name === 'AbortError') ? 'timeout (30s)' : String(e && e.message || e).slice(0, 140) });
           } finally { clearTimeout(tid); }
@@ -11922,8 +11942,8 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
               else if (v === 'list-tasks') summary = `${nonEmptyLines} tasks`;
               else if (v === 'task-detail') summary = 'task detail';
               else if (v === 'search-tasks') summary = `${nonEmptyLines} matches`;
-              else summary = `${content.length} bytes`;
-              emitEvent({ t: 'result', status, summary, full: content.slice(0, 8000) });
+              else summary = `${content.length} chars`;
+              emitEvent({ t: 'result', status, summary, full: content.slice(0, UI_RESULT_PREVIEW) });
               if (diff) {
                 emitEvent({ t: 'diff', diff, summary });
               }
@@ -12015,12 +12035,12 @@ const UI_HTML = `<!DOCTYPE html>
 <title>code_boss</title>
 <style>
   :root {
-    --bg: #100e0b;          /* warm terminal near-black */
+    --bg: #0c0a07;          /* warm terminal near-black (deepened for contrast) */
     --panel: #161410;       /* slightly raised panels */
     --panel-alt: #1b1914;   /* input / boxes */
     --border: #3a372f;      /* dim warm border */
-    --fg: #e6e2d6;          /* warm off-white text */
-    --muted: #8c887b;       /* dim gray for secondary */
+    --fg: #f2efe6;          /* warm off-white text (brightened for contrast) */
+    --muted: #a8a394;       /* secondary text (lightened for readability) */
     --accent: #d97757;      /* Claude coral (bright for dark bg) */
     --accent-hover: #e08968;
     --accent-fg: #100e0b;
@@ -12343,7 +12363,34 @@ const UI_HTML = `<!DOCTYPE html>
     display: flex;
     gap: 8px;
     align-items: flex-start;
+    position: relative;          /* anchor the hover copy button */
   }
+  /* Hover copy button (upper-left) — copies the raw message text. */
+  .bubble.user .bubble-copy {
+    position: absolute;
+    top: -10px;
+    left: -10px;
+    width: 22px;
+    height: 22px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    font-size: 11px;
+    line-height: 1;
+    background: var(--panel-alt);
+    color: var(--muted);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+    z-index: 2;
+  }
+  .bubble.user:hover .bubble-copy { opacity: 1; }
+  .bubble.user .bubble-copy:hover { color: var(--accent); border-color: var(--accent); }
+  .bubble.user .bubble-copy:focus-visible { opacity: 1; outline: 1px solid var(--accent); }
+  .bubble.user .bubble-copy.copied { opacity: 1; color: var(--accent); border-color: var(--accent); }
   .bubble.user::before {
     content: ">";
     color: var(--accent);
@@ -14974,6 +15021,33 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     return String(s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   }
 
+  // Copy plain text to the clipboard. Prefers the async Clipboard API; falls
+  // back to a hidden textarea + execCommand for non-secure contexts (the app is
+  // served over plain http on 127.0.0.1, where navigator.clipboard is blocked).
+  function copyText(str) {
+    const s = String(str == null ? '' : str);
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(s).catch(() => fallbackCopy(s));
+      return;
+    }
+    fallbackCopy(s);
+  }
+  function fallbackCopy(s) {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = s;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.top = '-1000px';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      ta.setSelectionRange(0, s.length);
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+    } catch { /* best-effort; the affordance was already shown */ }
+  }
+
   function addBubble(role, text) {
     const div = document.createElement('div');
     div.className = 'bubble ' + role;
@@ -14985,6 +15059,25 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       content.className = 'bubble-content';
       content.innerHTML = renderInline(text);
       div.appendChild(content);
+      // Hover copy button — copies the RAW message text (the \`text\` arg, the
+      // un-rendered source) so you can re-paste it (e.g. to restart an assignment:
+      // copy → X the assignment row → New → paste). Works live + on re-render
+      // since addBubble is the single funnel for user-message rendering.
+      const copyBtn = document.createElement('button');
+      copyBtn.type = 'button';
+      copyBtn.className = 'bubble-copy';
+      copyBtn.textContent = '⧉';
+      copyBtn.title = 'Copy message text';
+      copyBtn.setAttribute('aria-label', 'Copy message text');
+      copyBtn.onclick = (e) => {
+        e.stopPropagation();
+        copyText(text || '');
+        copyBtn.textContent = '✓';
+        copyBtn.classList.add('copied');
+        copyBtn.title = 'Copied!';
+        setTimeout(() => { copyBtn.textContent = '⧉'; copyBtn.classList.remove('copied'); copyBtn.title = 'Copy message text'; }, 1100);
+      };
+      div.appendChild(copyBtn);
     } else if (role === 'assistant') {
       div.innerHTML = renderInline(text);
     } else {
@@ -15795,6 +15888,18 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     } catch (e) { showError('Reorder failed', e); }
   }
   async function removeAssignment(id) {
+    // Verify before deleting — removing an assignment permanently drops its
+    // backlog record (requirement, sources, acceptance criteria, verdicts, and
+    // its task/commit links). It does NOT touch your conversation, the tasks,
+    // or any git commits the work produced — and it can't be undone.
+    const a = _backlog.find((x) => x.id === id) || {};
+    const label = a.title ? \`\${id} "\${a.title}"\` : id;
+    const taskN = Array.isArray(a.taskIds) ? a.taskIds.length : 0;
+    const commitN = Array.isArray(a.commitHashes) ? a.commitHashes.length : 0;
+    const workNote = (taskN || commitN)
+      ? \`\\n\\nThis assignment has \${taskN} task(s) and \${commitN} commit(s) bound to it — deleting removes those links only (the commits and chat history remain).\`
+      : '';
+    if (!confirm(\`Delete assignment \${label}?\\n\\nThis permanently removes its requirement, sources, and acceptance criteria from the backlog. Your conversation and any commits it produced are NOT affected, and this can't be undone.\${workNote}\`)) return;
     // If we're removing the draft an open intake thread points at, drop the
     // pointer so the next Send doesn't 404 against a deleted assignment.
     if (id === __intakeAssignmentId) __intakeAssignmentId = null;
@@ -17512,6 +17617,12 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   function summarizeResult(ev) {
     const c = ev.content || '';
     const nonEmpty = c.split('\\n').filter((l) => l.trim()).length;
+    // The row content is truncated for display (UI_RESULT_PREVIEW chars); ev.fullLen
+    // is the true length the MODEL received. Show "N of M chars" so a big doc/output
+    // doesn't read as a hard limit (it isn't — the model got all M).
+    const sizeLabel = (ev.fullLen != null && ev.fullLen > c.length)
+      ? \`\${c.length} of \${ev.fullLen} chars\`
+      : \`\${c.length} chars\`;
     const v = ev.verb || ev.name;
     if (ev.status === 'error') return c.split('\\n')[0].slice(0, 140);
     if (v === 'list' || ev.name === 'list_dir') return \`\${nonEmpty} entries\`;
@@ -17522,13 +17633,19 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     if (v === 'edit' || ev.name === 'edit_file') return c.replace(/^edited\\s+/, '');
     if (v === 'powershell' || ev.name === 'powershell') {
       const m = c.match(/^exit (\\S+)\\s+in\\s+(\\d+ms)/);
-      return m ? \`exit \${m[1]} in \${m[2]}\` : \`\${c.length} bytes\`;
+      return m ? \`exit \${m[1]} in \${m[2]}\` : sizeLabel;
+    }
+    // docx readers: show the paragraph count from the result header (the model
+    // got the full doc; this isn't a truncation).
+    if (v === 'read_docx' || ev.name === 'read_docx' || v === 'read_docx_full' || ev.name === 'read_docx_full') {
+      const m = c.match(/\\((\\d+)\\s+(?:editable\\s+)?paragraphs/);
+      return m ? \`\${m[1]} paragraphs\` : sizeLabel;
     }
     if (v === 'next-task') return c.replace(/^closed previous task.*?opened new task /, '→ ');
     if (v === 'list-tasks') return \`\${nonEmpty} tasks\`;
     if (v === 'task-detail') return 'task detail';
     if (v === 'search-tasks') return \`\${nonEmpty} matches\`;
-    return \`\${c.length} bytes\`;
+    return sizeLabel;
   }
 
   function applyControlsForStatus() {
@@ -17696,14 +17813,16 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   function renderThinkProbe(j) {
     const pad = (s, n) => { s = String(s); return s.length >= n ? s.slice(0, n) : s + ' '.repeat(n - s.length); };
     const num = (v) => (v == null ? '—' : String(v));
+    // think column: the exposed reasoning count, else ~inferred (total−prompt−out), else —
+    const think = (row) => row.reasoning != null ? String(row.reasoning) : (row.inferred != null ? '~' + row.inferred : '—');
     const L = [];
     L.push('model: ' + j.model);
-    L.push('reasoning field: ' + (j.reasoningField || '(none exposed — folded into output tokens)'));
+    L.push('reasoning field: ' + (j.reasoningField || "(none exposed — 'think' is inferred = total−prompt−out)"));
     L.push('');
-    L.push(pad('variant', 38) + pad('http', 5) + pad('out', 6) + pad('think', 7) + pad('txt', 4) + 'ms');
+    L.push(pad('variant', 37) + pad('http', 5) + pad('out', 5) + pad('total', 7) + pad('think', 7) + 'ms');
     for (const row of (j.rows || [])) {
-      if (row.ok) L.push(pad(row.label, 38) + pad(row.status, 5) + pad(num(row.out), 6) + pad(num(row.reasoning), 7) + pad(row.thought ? 'Y' : '-', 4) + num(row.ms));
-      else L.push(pad(row.label, 38) + pad(row.status || 'ERR', 5) + 'ERR: ' + (row.err || ''));
+      if (row.ok) L.push(pad(row.label, 37) + pad(row.status, 5) + pad(num(row.out), 5) + pad(num(row.total), 7) + pad(think(row), 7) + num(row.ms));
+      else L.push(pad(row.label, 37) + pad(row.status || 'ERR', 5) + 'ERR: ' + (row.err || ''));
     }
     return L.join('\\n');
   }
