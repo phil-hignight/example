@@ -15,7 +15,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '193';
+const BUILD_VERSION = '206';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
@@ -30,13 +30,13 @@ import { createServer } from 'node:http';
 import net from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { homedir, tmpdir } from 'node:os';
-import { readFile as _readFile, writeFile as _writeFile, mkdir as _mkdir, stat as _stat, readdir as _readdir, unlink as _unlink, rename as _rename, copyFile as _copyFile } from 'node:fs/promises';
+import { readFile as _readFile, writeFile as _writeFile, mkdir as _mkdir, stat as _stat, readdir as _readdir, unlink as _unlink, rename as _rename, copyFile as _copyFile, rm as _rm } from 'node:fs/promises';
 import { existsSync, appendFileSync, mkdirSync, statSync, readFileSync, writeFileSync, renameSync, copyFileSync, readdirSync, openSync, readSync, closeSync } from 'node:fs';
 import { randomUUID as _randomUUID } from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
 import path from 'node:path';
 import zlib from 'node:zlib';
-const readFile = _readFile, writeFile = _writeFile, mkdir = _mkdir, stat = _stat, readdir = _readdir, unlink = _unlink, rename = _rename, copyFile = _copyFile;
+const readFile = _readFile, writeFile = _writeFile, mkdir = _mkdir, stat = _stat, readdir = _readdir, unlink = _unlink, rename = _rename, copyFile = _copyFile, rm = _rm;
 const randomUUID = _randomUUID;
 
 
@@ -5621,6 +5621,173 @@ function createAssignmentsStore(projectDir) {
   };
 }
 
+// ====== package-cmd.mjs ======
+/**
+ * `node code-boss.mjs package --jars <dir> [--helper <jar>] [--out <dir>] [--node <dir>]`
+ *
+ * Lets the SINGLE copied bundle package ITSELF into an extract-and-run zip,
+ * using the POI jars present wherever it's run (e.g. the production box) — no
+ * repo, no build tools needed. Produces:
+ *   <out>/code_boss/code-boss.mjs
+ *                  /tools/codeboss-docx-helper.jar   (if found)
+ *                  /tools/lib/*.jar                   (the POI deps from --jars)
+ *                  /run.bat  /run.sh  /README.txt
+ *   <out>/code-boss-v<NNN>.zip
+ *
+ * --jars <dir>   folder holding the .docx jars (searched: <dir>, <dir>/lib,
+ *                <dir>/target, <dir>/target/lib). The codeboss-docx-helper.jar
+ *                (if present) becomes tools/<helper>; all other *.jar → tools/lib/.
+ * --helper <jar> explicit path to codeboss-docx-helper.jar (overrides auto-find).
+ * --out <dir>    where to write (default: ./release).
+ * --node <dir>   bundle a portable Node (its node.exe / bin/node) into node/ so
+ *                the target needs nothing pre-installed but Java (for .docx).
+ *
+ * Imports are stripped by the bundler; at runtime these names come from the
+ * bundle HEADER (path, spawnSync, existsSync, readFile/writeFile/mkdir/readdir/
+ * copyFile/stat/rm-via-... ). Everything here is pkg*-prefixed to stay unique in
+ * the flat bundle scope.
+ */
+
+const PKG_HELPER_JAR = 'codeboss-docx-helper.jar';
+
+const PKG_RUN_BAT = `@echo off
+setlocal
+set "HERE=%~dp0"
+if exist "%HERE%node\\node.exe" (
+  "%HERE%node\\node.exe" "%HERE%code-boss.mjs" %*
+) else (
+  where node >nul 2>nul || (echo Node.js 20+ was not found. Install it from https://nodejs.org ^(or drop a portable Node into a "node" folder next to this file^), then run again.& pause & exit /b 1)
+  node "%HERE%code-boss.mjs" %*
+)
+`;
+
+const PKG_RUN_SH = `#!/bin/sh
+HERE="$(cd "$(dirname "$0")" && pwd)"
+if [ -x "$HERE/node/bin/node" ]; then NODE="$HERE/node/bin/node"; else NODE=node; fi
+command -v "$NODE" >/dev/null 2>&1 || { echo "Node.js 20+ not found. Install it (https://nodejs.org) or bundle a portable Node in ./node."; exit 1; }
+exec "$NODE" "$HERE/code-boss.mjs" "$@"
+`;
+
+function pkgReadme(version, docxNote, bundledNode) {
+  return `code_boss v${version} - single-folder deployment
+======================================================
+
+WHAT THIS IS
+  A local coding-assistant web app. It runs entirely on your machine and serves
+  a UI at http://127.0.0.1:18888 (a browser opens automatically).
+
+REQUIREMENTS (on the machine that runs it)
+  - Node.js 20 or newer.${bundledNode ? '  (A portable Node is bundled in ./node - nothing to install.)' : '  Get it from https://nodejs.org'}
+  - A Java runtime (JRE 11+) - ONLY for Microsoft Word (.docx) editing.
+    Everything else works without Java.
+  The LLM endpoint and model are already configured inside the app.
+
+RUN
+  Windows       : double-click run.bat        (or:  node code-boss.mjs)
+  macOS / Linux : ./run.sh                     (or:  node code-boss.mjs)
+  Different port:  Windows  set PORT=18999 && node code-boss.mjs
+                   Unix     PORT=18999 node code-boss.mjs
+
+FIRST RUN
+  The UI asks for your API key (and GitLab credentials). They are saved under
+  your home folder in .code_boss/ and reused on later runs.
+
+FOLDER CONTENTS
+  code-boss.mjs   the app - one self-contained file, no install step
+  tools/          the .docx helper (Apache POI). Keep it next to code-boss.mjs.
+  run.bat / run.sh  launchers
+${bundledNode ? '  node/           bundled Node runtime\n' : ''}.docx editing: ${docxNote}
+
+OFFLINE / AIR-GAPPED
+  Nothing is downloaded at runtime. This folder + Node (+ Java for .docx) is all
+  that is needed. Extract anywhere and run.
+`;
+}
+
+function pkgArg(argv, name) { const i = argv.indexOf(name); return i >= 0 ? argv[i + 1] : null; }
+
+// Recursive dir copy (the HEADER doesn't expose fs.cp, so do it by hand).
+async function pkgCopyDir(src, dest) {
+  await mkdir(dest, { recursive: true });
+  for (const e of await readdir(src, { withFileTypes: true })) {
+    const s = path.join(src, e.name), d = path.join(dest, e.name);
+    if (e.isDirectory()) await pkgCopyDir(s, d);
+    else if (e.isFile()) await copyFile(s, d);
+  }
+}
+
+async function runPackageCommand({ argv, bundlePath, version }) {
+  if (!bundlePath || !existsSync(bundlePath)) { console.error('package: cannot locate the bundle file (code-boss.mjs).'); return 1; }
+  const jarsDir = pkgArg(argv, '--jars');
+  const helperArg = pkgArg(argv, '--helper');
+  const outDir = path.resolve(pkgArg(argv, '--out') || path.join(process.cwd(), 'release'));
+  const nodeDir = pkgArg(argv, '--node');
+
+  const stage = path.join(outDir, 'code_boss');
+  await rm(stage, { recursive: true, force: true });
+  await mkdir(path.join(stage, 'tools', 'lib'), { recursive: true });
+  await copyFile(bundlePath, path.join(stage, 'code-boss.mjs'));
+
+  // Gather jars. Search a few common layouts under --jars.
+  let helper = (helperArg && existsSync(helperArg)) ? helperArg : null;
+  const depJars = [];
+  if (jarsDir && existsSync(jarsDir)) {
+    const dirs = [jarsDir, path.join(jarsDir, 'lib'), path.join(jarsDir, 'target'), path.join(jarsDir, 'target', 'lib')].filter((d) => existsSync(d));
+    const seen = new Set();
+    for (const dir of dirs) {
+      for (const f of await readdir(dir)) {
+        if (!f.endsWith('.jar')) continue;
+        if (f === PKG_HELPER_JAR) { if (!helper) helper = path.join(dir, f); continue; }
+        if (seen.has(f)) continue;
+        seen.add(f);
+        depJars.push(path.join(dir, f));
+      }
+    }
+  }
+  for (const j of depJars) await copyFile(j, path.join(stage, 'tools', 'lib', path.basename(j)));
+
+  let docxNote;
+  if (helper) {
+    await copyFile(helper, path.join(stage, 'tools', PKG_HELPER_JAR));
+    docxNote = `included (helper jar + ${depJars.length} POI deps) - runs with just a JRE on the target.`;
+  } else if (depJars.length) {
+    docxNote = `POI deps only (${depJars.length}); no prebuilt ${PKG_HELPER_JAR} found, so the target compiles it from the embedded source on first run (needs a JDK there).`;
+  } else {
+    docxNote = `not included (pass --jars <dir> with the POI jars to enable it).`;
+  }
+
+  let bundledNode = false;
+  if (nodeDir) {
+    if (!existsSync(nodeDir)) { console.error('--node dir not found: ' + nodeDir); return 1; }
+    await pkgCopyDir(nodeDir, path.join(stage, 'node'));
+    bundledNode = true;
+  }
+
+  await writeFile(path.join(stage, 'run.bat'), PKG_RUN_BAT.replace(/\n/g, '\r\n'), 'utf8');
+  await writeFile(path.join(stage, 'run.sh'), PKG_RUN_SH, 'utf8');
+  await writeFile(path.join(stage, 'README.txt'), pkgReadme(version, docxNote, bundledNode), 'utf8');
+
+  // Zip the staging folder (Windows: PowerShell Compress-Archive; else `zip`).
+  const zip = path.join(outDir, `code-boss-v${version}.zip`);
+  await rm(zip, { force: true });
+  let zipped = false;
+  if (process.platform === 'win32') {
+    const r = spawnSync('powershell', ['-NoProfile', '-Command', `Compress-Archive -Path '${stage}' -DestinationPath '${zip}' -Force`], { stdio: 'inherit' });
+    zipped = r.status === 0;
+  } else {
+    const r = spawnSync('zip', ['-r', '-q', zip, 'code_boss'], { cwd: outDir, stdio: 'inherit' });
+    zipped = r.status === 0;
+  }
+
+  console.error('');
+  console.error('staged: ' + stage);
+  if (zipped) { const kb = Math.round((await stat(zip)).size / 1024); console.error(`zip:    ${zip}  (${kb} KB)`); }
+  else console.error(`zip step failed - the staged folder is ready; zip ${stage} manually.`);
+  console.error('docx:   ' + docxNote);
+  console.error('node:   ' + (bundledNode ? 'bundled (./node)' : 'target must have Node 20+ on PATH'));
+  return 0;
+}
+
 // ====== agent/git-workflow.mjs ======
 /**
  * Git workflow helpers — used by server.mjs to:
@@ -7844,6 +8011,8 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
 // Inside the request handler `path` gets shadowed by `const path = url.pathname`,
 // so callers in that scope use `nodePath` for the actual path module.
 const nodePath = path;
+// Imported so the bundler includes it; the `package` subcommand is dispatched
+// from the bundle launcher (see scripts/build.mjs buildFooter), not here.
 // Layout primitives live in mosaic-layout.mjs. Imported here so runQueries
 // can call computeTileSize directly. Re-exported so tests + tools can
 // import from server.mjs. In the production bundle, the build's
@@ -10811,6 +10980,56 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
         if (session.intakeAbort) { try { session.intakeAbort.abort(); } catch {} }
         return sendJson(res, 200, { ok: true });
       }
+      // Two-pane intake (the New-assignment modal): synchronous, NOT persisted and
+      // NOT streamed into the main chat. Takes the running mini-chat + the current
+      // editable field values (+ a slice of the main thread for relevance) and
+      // returns the manager's reply and, when ready, a refined card to fill the
+      // fields. The developer's field edits are sent each turn so the agent
+      // refines from them rather than clobbering.
+      if (req.method === 'POST' && path === '/api/intake-chat') {
+        if (!session.activeProject) return sendJson(res, 409, { error: 'no project open' });
+        const raw = await readBody(req);
+        let body; try { body = JSON.parse(raw); } catch { return sendJson(res, 400, { error: 'invalid JSON' }); }
+        const msgs = (Array.isArray(body?.messages) ? body.messages : [])
+          .filter((m) => m && typeof m.content === 'string' && (m.role === 'user' || m.role === 'assistant'))
+          .map((m) => ({ role: m.role, content: String(m.content) }));
+        if (!msgs.length) return sendJson(res, 400, { error: 'messages required' });
+        const f = body?.fields || {};
+        const recent = session.chatEvents
+          .filter((e) => e.type === 'user-message' || e.type === 'assistant-text')
+          .slice(-8)
+          .map((e) => `${e.type === 'user-message' ? 'Developer' : 'Agent'}: ${String(e.content || '').replace(/\s+/g, ' ').slice(0, 400)}`)
+          .join('\n');
+        const ctx = [
+          'CONTEXT (do not echo this back). The developer is drafting a new assignment. Current editable field values (treat the developer\'s edits as authoritative — refine FROM them):',
+          `  title: ${(f.title || '').trim() || '(empty)'}`,
+          `  requirement: ${(f.requirement || '').trim() || '(empty)'}`,
+          `  acceptance criteria: ${(f.acceptanceCriteria || '').trim() || '(empty)'}`,
+          recent ? ('\nRecent main-chat activity (for relevance only, may be unrelated):\n' + recent) : '',
+          '\nWhen the requirement is clear, emit the <requirement-card>; otherwise ask one focused question.',
+        ].join('\n');
+        const intakeMessages = [{ role: 'user', content: ctx }, ...msgs];
+        const intakeModel = body?.model ?? session.defaultModel;
+        const ac = new AbortController();
+        const entered = enterProjectCwd(session.activeProject);
+        try {
+          const result = await runIntake({ adapter, model: intakeModel, messages: intakeMessages, signal: ac.signal, onLog: fileLog, repoRoots: session.git?.repoList || [] });
+          let reply = '', card = null;
+          if (result.complete && result.card) {
+            card = { title: result.card.title || '', requirement: result.card.requirement || '', acceptanceCriteria: result.card.acceptanceCriteria || '' };
+            reply = String(result.prose || '').replace(/<requirement-card>[\s\S]*?<\/requirement-card>/i, '').trim()
+              || 'Drafted the fields on the left — review and Add, or keep refining.';
+          } else if (result.reason === 'awaiting-user') {
+            reply = result.assistantText || '';
+          } else {
+            reply = 'I could not fully structure this within my turn budget — edit the fields on the left and Add.';
+          }
+          return sendJson(res, 200, { ok: true, reply, card });
+        } catch (e) {
+          fileLog(`intake-chat error: ${e?.message ?? e}`);
+          return sendJson(res, 200, { ok: false, reply: 'Intake error: ' + (e?.message ?? String(e)), card: null });
+        } finally { exitProjectCwd(entered); }
+      }
       // Capture-from-card: freeze the (possibly user-edited) card into the
       // assignment. patch(status:'ready') auto-stamps readyAt — THAT is the
       // freeze. Reuses the unchanged store; the draft already sits at the end
@@ -11831,7 +12050,14 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
             const inferred = (reasoning == null && total != null && prompt != null && out != null) ? Math.max(0, total - prompt - out) : null;
             const msg = dig(j, 'choices.0.message') || {};
             const thought = !!(msg.reasoning || msg.reasoning_content);
-            rows.push({ label: v.label, status: r.status, ok: true, out, prompt, total, reasoning, inferred, thought, ms });
+            // The MODEL'S ANSWER. The prompt is the bat-and-ball CRT: the reasoned
+            // answer is $0.05, the intuitive-but-wrong one is $0.10. When token
+            // accounting is identical/hidden across variants (the genai.mil case),
+            // the answer is the ONLY observable signal of whether reasoning_effort
+            // actually changes anything — if low/none give $0.10 but high gives
+            // $0.05, reasoning IS being modulated despite hidden tokens.
+            const answer = String(msg.content || '').replace(/\s+/g, ' ').trim().slice(0, 48);
+            rows.push({ label: v.label, status: r.status, ok: true, out, prompt, total, reasoning, inferred, thought, ms, answer });
           } catch (e) {
             rows.push({ label: v.label, status: 0, ok: false, err: (e && e.name === 'AbortError') ? 'timeout (30s)' : String(e && e.message || e).slice(0, 140) });
           } finally { clearTimeout(tid); }
@@ -12324,7 +12550,105 @@ const UI_HTML = `<!DOCTYPE html>
     white-space: nowrap;
     cursor: help;
   }
-  #chat { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+  /* IDE layout: collapsible side panel (left) + chat column (right). */
+  #chat { flex: 1; display: flex; flex-direction: row; min-height: 0; overflow: hidden; }
+  /* min-width:0 lets the chat column shrink to the remaining width instead of
+     forcing a page-wide horizontal scrollbar (flex items default min-width:auto). */
+  #chatMain { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; min-height: 0; position: relative; }
+  #sidePanel { width: 300px; flex-shrink: 0; display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--border); background: var(--panel-alt); transition: width 0.12s ease; }
+  #sidePanel.collapsed { width: 0; border-right: none; overflow: hidden; }
+  /* The backlog panel fills the side panel instead of being a top strip. */
+  #sidePanel .backlog-panel { max-height: none; border-bottom: none; flex: 1 1 auto; min-height: 0; overflow: auto; background: transparent; }
+  /* Collapse control lives INSIDE the tab bar; a reopen pip appears at the chat's
+     left edge only while the panel is collapsed. */
+  .side-collapse { flex: 0 0 auto; width: 24px; background: none; border: none; border-bottom: 2px solid transparent; color: var(--muted); cursor: pointer; font-size: 14px; padding: 0; }
+  .side-collapse:hover { color: var(--accent); }
+  #sideReopen { position: absolute; top: 8px; left: 0; z-index: 30; width: 18px; height: 26px; border: 1px solid var(--border); border-left: none; border-radius: 0 5px 5px 0; background: var(--panel); color: var(--muted); cursor: pointer; font-size: 12px; line-height: 24px; padding: 0; display: none; }
+  #sideReopen:hover { color: var(--accent); border-color: var(--accent); }
+  #sidePanel.collapsed + #chatMain #sideReopen { display: block; }
+  /* Side-panel tabs + panes */
+  .side-tabs { display: flex; flex-shrink: 0; border-bottom: 1px solid var(--border); }
+  .side-tab { flex: 1; background: none; border: none; border-bottom: 2px solid transparent; color: var(--muted); cursor: pointer; padding: 8px 4px; font: inherit; font-size: 12px; white-space: nowrap; }
+  .side-tab:hover { color: var(--fg); }
+  .side-tab.active { color: var(--fg); border-bottom-color: var(--accent); background: var(--panel); }
+  .side-tab-count { color: var(--muted); font-size: 11px; }
+  .side-panes { flex: 1 1 auto; min-height: 0; overflow: auto; font-size: 12px; }
+  .side-pane { padding: 6px; }
+  .side-pane.hidden { display: none; }
+  .pane-actions { display: flex; gap: 6px; margin-bottom: 6px; }
+  .pane-actions button { flex: 1; background: none; border: 1px solid var(--border); color: var(--fg); border-radius: 4px; cursor: pointer; padding: 4px 6px; font: inherit; font-size: 12px; }
+  .pane-actions button:hover { border-color: var(--accent); color: var(--accent); }
+  .pane-actions button.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+  .pane-empty { color: var(--muted); font-size: 12px; padding: 10px 4px; line-height: 1.6; }
+  /* The queue stack fills the pane (not the centered 860px chat width). */
+  #pane-queue .queue-stack { max-width: none; margin: 0; }
+  /* Single compact "+" to start a new assignment. */
+  .pane-actions .pane-add { flex: 0 0 auto; width: 28px; text-align: center; font-size: 15px; line-height: 1; }
+  .pane-hint { color: var(--muted); font-size: 11px; line-height: 1.5; margin-bottom: 8px; }
+  /* Memory: per-category headers; under each, a box styled like ONE textarea
+     (edge-to-edge) whose lines are forced bullets. Each bullet is its own
+     invisible auto-growing input; nav between bullets feels like a textarea. */
+  #pane-memory { position: relative; padding: 6px 0 10px; }
+  .mem-cat { margin-bottom: 10px; }
+  .mem-cat-label { color: var(--muted); font-size: 11px; margin: 0 0 3px 10px; }
+  .bullet-box { background: var(--panel); border: 1px solid var(--border); border-radius: 4px; padding: 4px 0; }
+  .bullet-box:focus-within { border-color: var(--accent); }
+  .bullet { display: flex; align-items: flex-start; gap: 6px; padding: 1px 8px 1px 10px; }
+  .bullet .dash { color: var(--muted); flex-shrink: 0; line-height: 1.55; user-select: none; }
+  .bullet .b-input { flex: 1; min-width: 0; background: transparent; border: none; outline: none; color: var(--fg); font: inherit; font-size: 12px; line-height: 1.55; resize: none; overflow: hidden; padding: 0; }
+  .mem-saved { position: absolute; top: 2px; right: 10px; z-index: 5; color: #3fb950; font-size: 11px; opacity: 0; pointer-events: none; transition: opacity 0.3s ease; }
+  .mem-saved.show { opacity: 1; }
+  /* Auto-hiding side-panel scrollbar: invisible until hover/scroll so it never
+     sits over the edge-to-edge memory boxes. */
+  .side-panes { scrollbar-width: thin; scrollbar-color: transparent transparent; }
+  .side-panes:hover, .side-panes:focus-within { scrollbar-color: #3a3830 transparent; }
+  .side-panes::-webkit-scrollbar { width: 8px; }
+  .side-panes::-webkit-scrollbar-thumb { background: transparent; border-radius: 4px; }
+  .side-panes:hover::-webkit-scrollbar-thumb, .side-panes:focus-within::-webkit-scrollbar-thumb { background: #3a3830; }
+  .side-panes::-webkit-scrollbar-thumb:hover { background: #4d4a3f; }
+  /* Gutter so chat content doesn't touch the panel. Left is wider because the
+     .task-wrap bracket overhangs -16px into the gutter — it must clear the panel. */
+  #logScroll { padding: 0 20px 0 36px; }
+  /* Bottom-left chrome. Flat flex-wrap: in the PANEL it wraps to two lines
+     (path+version / weblogic·edit·gear); DOCKED under the chat input when the
+     panel is collapsed it's a single line (path left, controls right). */
+  .side-chrome { flex-shrink: 0; border-top: 1px solid var(--border); padding: 6px 8px; font-size: 11px; display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; }
+  .side-chrome .proj-path { flex: 1 1 auto; min-width: 0; color: var(--muted); cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); }
+  .side-chrome .proj-path:hover { color: var(--accent); }
+  .chrome-version { flex-shrink: 0; color: var(--muted); }
+  .chrome-break { flex-basis: 100%; height: 0; margin: 0; }   /* forces line 2 in the panel */
+  .wl-chip { flex-shrink: 0; cursor: help; color: var(--muted); }
+  .wl-chip.up { color: #3fb950; }
+  .wl-chip.down { color: #d9534f; }
+  .edit-toggle { flex-shrink: 0; cursor: pointer; color: #58a6ff; }
+  .edit-toggle:hover { opacity: 0.8; }
+  .edit-toggle.off { color: var(--muted); text-decoration: line-through; }
+  .side-chrome .dirty-indicator { flex-shrink: 0; color: #c9a227; cursor: help; }
+  .side-chrome .settings-btn { flex-shrink: 0; margin-left: auto; background: none; border: none; color: var(--muted); cursor: pointer; font-size: 14px; padding: 0; line-height: 1; }
+  .side-chrome .settings-btn:hover { color: var(--accent); }
+  /* Docked under the input (panel collapsed): single line, no version, and
+     constrained to the chat input's width (max-width:860px, centered). */
+  .side-chrome.docked { border-top: none; flex-wrap: nowrap; padding: 4px 2px 0; max-width: 860px; margin: 0 auto; width: 100%; box-sizing: border-box; }
+  .side-chrome.docked .chrome-break { display: none; }
+  .side-chrome.docked .chrome-version { display: none; }
+  /* New-assignment intake modal: fields (left) + mini-chat (right). */
+  .intake-modal { max-width: 880px; width: 94%; }
+  .intake-two-pane { display: flex; min-height: 0; height: 58vh; }
+  .intake-fields { flex: 0 0 42%; padding: 12px 16px; border-right: 1px solid var(--border); overflow-y: auto; display: flex; flex-direction: column; gap: 3px; }
+  .intake-fields label { font-size: 12px; color: var(--muted); margin-top: 8px; }
+  .intake-fields .im-sub { color: var(--muted); opacity: 0.8; }
+  .intake-fields input, .intake-fields textarea { background: var(--panel-alt); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 6px 8px; font: inherit; font-size: 13px; resize: vertical; }
+  .intake-fields input:focus, .intake-fields textarea:focus { border-color: var(--accent); outline: none; }
+  .intake-chat { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  .im-log { flex: 1; overflow-y: auto; padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; }
+  .im-msg { font-size: 13px; line-height: 1.45; white-space: pre-wrap; word-wrap: break-word; }
+  .im-msg.user::before { content: 'you '; color: var(--accent); font-weight: 700; }
+  .im-msg.manager { border-left: 3px solid #6a8db0; padding-left: 8px; }
+  .im-msg.manager.thinking { color: var(--muted); font-style: italic; border-left-color: var(--muted); }
+  .im-inputrow { display: flex; gap: 8px; padding: 8px 14px; border-top: 1px solid var(--border); }
+  .im-inputrow textarea { flex: 1; background: var(--panel-alt); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; font: inherit; font-size: 13px; resize: none; }
+  .im-inputrow textarea:focus { border-color: var(--accent); outline: none; }
+  .im-hint { font-size: 11px; color: var(--muted); max-width: 60%; }
 
   /* Header removed in build 7 — controls moved to the settings modal,
      project path is shown below the input bar. */
@@ -12994,6 +13318,8 @@ const UI_HTML = `<!DOCTYPE html>
     transition: border-color 0.1s, color 0.1s;
   }
   .queue-item:hover { border-color: var(--accent); color: var(--fg); }
+  .queue-item.selected { border-color: var(--accent); }
+  .queue-item:focus, .queue-item:focus-visible { outline: none; border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
   .queue-item .queue-preview {
     flex: 1 1 auto;
     min-width: 0;
@@ -13797,7 +14123,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
 <!-- Floating build-version badge, top-right. Translucent so it doesn't
      compete with content but stays visible enough to read in a screenshot.
      pointer-events: none so it can never block a click. -->
-<div id="versionBadge"></div>
+<!-- version moved into the side-panel chrome (#chromeVersion) -->
 
 <div id="landing">
   <h1>code_boss</h1>
@@ -13901,32 +14227,62 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     .row.assignment-gate .gate-line.drift { color: var(--muted); }
     .row.assignment-gate .gate-actions { display: flex; gap: 6px; margin-top: 6px; }
   </style>
-  <div id="backlogPanel" class="backlog-panel hidden">
-    <div class="backlog-head">
-      <span class="backlog-title">Assignments</span>
-      <span class="backlog-count" id="backlogCount"></span>
-      <button class="backlog-mem-btn" onclick="openMemory()" title="View and curate what the agent has learned about this codebase">🧠 Memory</button>
-      <button class="backlog-chat-btn" onclick="openIntake()" title="Capture a NEW backlog requirement by chatting with the intake manager — it reads code read-only and drafts a requirement card. This is NOT the main chat: it does not run the worker agent or edit files. (Use the box at the bottom for that.)">🗩 Capture</button>
-      <button class="backlog-new-btn" onclick="toggleAssignmentForm()" title="Add a backlog assignment by filling in a title + requirement yourself (no chat)">＋ New</button>
+  <aside id="sidePanel">
+    <div class="side-tabs" role="tablist">
+      <button class="side-tab active" id="tabbtn-assignments" onclick="selectSideTab('assignments')">Assignments<span class="side-tab-count" id="backlogCount"></span></button>
+      <button class="side-tab" id="tabbtn-queue" onclick="selectSideTab('queue')">Queue<span class="side-tab-count" id="queueCount"></span></button>
+      <button class="side-tab" id="tabbtn-memory" onclick="selectSideTab('memory')">Memory</button>
+      <button id="sideToggle" class="side-collapse" onclick="toggleSidePanel()" title="Collapse the side panel">«</button>
     </div>
-    <div class="backlog-form hidden" id="backlogForm">
-      <input id="asgTitle" placeholder="Assignment title" />
-      <textarea id="asgReq" placeholder="Requirement — the definition of done (leave blank to capture later)…" rows="2"></textarea>
-      <div class="backlog-form-actions">
-        <button class="btn" onclick="toggleAssignmentForm()">Cancel</button>
-        <button class="btn primary" onclick="createAssignmentFromForm()">Capture</button>
+    <div class="side-panes">
+      <!-- ASSIGNMENTS -->
+      <div class="side-pane" id="pane-assignments">
+        <div class="pane-actions">
+          <button class="pane-add" onclick="openIntakeModal()" title="New assignment — describe it and the intake manager drafts the requirement (you can edit it)">+</button>
+        </div>
+        <div class="backlog-form hidden" id="backlogForm">
+          <input id="asgTitle" placeholder="Assignment title" />
+          <textarea id="asgReq" placeholder="Requirement — the definition of done (leave blank to capture later)…" rows="2"></textarea>
+          <div class="backlog-form-actions">
+            <button class="btn" onclick="toggleAssignmentForm()">Cancel</button>
+            <button class="btn primary" onclick="createAssignmentFromForm()">Capture</button>
+          </div>
+        </div>
+        <div class="backlog-form hidden" id="intakeForm">
+          <textarea id="intakeText" placeholder="Paste the email / ticket / spec / notes. The intake manager will ask questions, read the code read-only, and draft a requirement card you can edit and capture…" rows="3"></textarea>
+          <div class="backlog-form-actions">
+            <span id="intakeStatus" class="intake-status"></span>
+            <button class="btn" onclick="closeIntake()">Cancel</button>
+            <button class="btn primary" id="intakeSendBtn" onclick="sendIntake()">Send</button>
+          </div>
+        </div>
+        <div class="backlog-list" id="backlogList"></div>
+      </div>
+      <!-- QUEUE -->
+      <div class="side-pane hidden" id="pane-queue">
+        <div class="queue-stack" id="queueStack"></div>
+        <div class="pane-empty" id="queueEmpty">No queued messages.<br>In the chat box, press <b>⇧←</b> to queue your current draft. Click a queued item and press <b>⇧→</b> to pull it back into the box.</div>
+      </div>
+      <!-- MEMORY -->
+      <div class="side-pane hidden" id="pane-memory">
+        <div class="mem-saved" id="memSaved">✓ saved</div>
+        <div class="pane-hint">Durable facts about this codebase, grouped by type. One fact per line — edits autosave.</div>
+        <div id="memoryList"></div>
       </div>
     </div>
-    <div class="backlog-form hidden" id="intakeForm">
-      <textarea id="intakeText" placeholder="Paste the email / ticket / spec / notes. The intake manager will ask questions, read the code read-only, and draft a requirement card you can edit and capture…" rows="3"></textarea>
-      <div class="backlog-form-actions">
-        <span id="intakeStatus" class="intake-status"></span>
-        <button class="btn" onclick="closeIntake()">Cancel</button>
-        <button class="btn primary" id="intakeSendBtn" onclick="sendIntake()">Send</button>
-      </div>
+    <div class="side-chrome" id="sideChrome">
+      <span class="proj-path" id="projectPath" title="Click to switch project" onclick="changeProject()">(no project)</span>
+      <span class="chrome-version" id="chromeVersion"></span>
+      <span class="chrome-break"></span>
+      <span class="wl-chip" id="wlIndicator" title="" style="display:none;">weblogic</span>
+      <span class="edit-toggle" id="editToggle" onclick="toggleEditAllowed()" title="Edit allowed — the agent edits files and runs commands. Click to switch to read-only (discuss): it investigates and explains but won't modify files or run shell commands.">edit allowed</span>
+      <input type="checkbox" id="discussToggle" style="display:none;">
+      <span class="dirty-indicator" id="gitDirtyIndicator" title="" style="display:none;">⚠</span>
+      <button class="settings-btn" id="settingsBtn" onclick="openSettings()" title="Settings — model, API key, GitLab, timeout, Snapshot, Log, Clear conversation, Probe">⚙</button>
     </div>
-    <div class="backlog-list" id="backlogList"></div>
-  </div>
+  </aside>
+  <div id="chatMain">
+  <button id="sideReopen" onclick="toggleSidePanel()" title="Show the side panel">»</button>
   <main id="logScroll">
     <div class="log" id="log">
       <div class="bubble system">Type a question and press Enter (Shift+Enter for newline).</div>
@@ -13934,11 +14290,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   </main>
 
   <footer>
-    <!-- Pending messages. Items only appear when the user pressed Enter
-         or clicked the queue button while the agent was busy. Each row
-         is a one-line preview + play (▶) + delete (×). Click the row to
-         swap with the input box. -->
-    <div class="queue-stack" id="queueStack"></div>
+    <!-- The pending-message queue now lives in the side panel's Queue tab. -->
     <div class="input-row">
       <textarea id="input" placeholder="Ask…" rows="1"></textarea>
       <button id="queueBtn"
@@ -13966,17 +14318,8 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
         </svg>
       </button>
     </div>
-    <div class="input-subbar">
-      <span class="dirty-indicator" id="gitDirtyIndicator" title="" style="display:none;">⚠</span>
-      <span class="wl-indicator" id="wlIndicator" title="" style="display:none;"><span class="wl-dot"></span><span id="wlIndicatorText">WebLogic</span></span>
-      <span class="proj-path" id="projectPath" title="">(no project)</span>
-      <label class="discuss-toggle" title="Discuss OFF = normal mode: the agent edits files and runs commands. Discuss ON = read-only: it investigates and explains but does not modify files or run shell commands this turn.">
-        <input type="checkbox" id="discussToggle" onchange="document.getElementById('discussModeText').textContent = this.checked ? 'Discuss: on (read-only)' : 'Discuss: off (normal — edits &amp; runs)';">
-        <span id="discussModeText">Discuss: off (normal &mdash; edits &amp; runs)</span>
-      </label>
-      <button class="settings-btn" id="settingsBtn" onclick="openSettings()" title="Settings">⚙</button>
-    </div>
   </footer>
+  </div>
 </div>
 
 <!-- Settings modal: model, project, timeout, tokens display + action buttons. -->
@@ -14033,21 +14376,37 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
 <!-- Codebase memory: the agent-maintained Tier-1 facts about this codebase.
      The developer can edit/prune them here; the agent reads them every run and
      maintains them with <remember>/<forget>. -->
-<div class="modal-bg" id="memoryModalBg" onclick="if (event.target === this) closeMemory()">
-  <div class="modal" id="memoryModal" style="max-width: 640px; width: 92%;">
+<!-- Codebase memory now lives in the side panel's Memory tab (no modal). -->
+
+<!-- New-assignment intake: fields (left) + a read-only mini-chat manager (right). -->
+<div class="modal-bg" id="intakeModalBg" onclick="if (event.target === this) closeIntakeModal()">
+  <div class="modal intake-modal">
     <div class="modal-header">
-      <h2>Codebase memory</h2>
-      <button class="modal-close" onclick="closeMemory()">&times;</button>
+      <h2>New assignment</h2>
+      <button class="modal-close" onclick="closeIntakeModal()">&times;</button>
     </div>
-    <div class="modal-body" style="padding: 12px 16px;">
-      <div class="muted" style="font-size: 12px; margin-bottom: 8px;">Durable facts the agent has learned about this codebase. It reads these every run and updates them as it works — you can correct or prune them here.</div>
-      <div id="memoryList"></div>
+    <div class="intake-two-pane">
+      <div class="intake-fields">
+        <label for="im-title">Title</label>
+        <input id="im-title" placeholder="Short title" />
+        <label for="im-req">Requirement <span class="im-sub">— the definition of done</span></label>
+        <textarea id="im-req" rows="6" placeholder="What does done look like?"></textarea>
+        <label for="im-acc">Acceptance criteria <span class="im-sub">— optional checklist</span></label>
+        <textarea id="im-acc" rows="4" placeholder="What the acceptance check should verify"></textarea>
+      </div>
+      <div class="intake-chat">
+        <div class="im-log" id="im-log"></div>
+        <div class="im-inputrow">
+          <textarea id="im-input" rows="2" placeholder="Describe it or paste a ticket/email… (Enter to send)"></textarea>
+          <button class="btn primary" id="im-send" onclick="sendIntakeChat()">Send</button>
+        </div>
+      </div>
     </div>
     <div class="modal-footer">
-      <button class="btn" onclick="addMemoryRow()">＋ Add fact</button>
+      <span class="im-hint">The fields are yours to edit; the manager reads the code (read-only) and refines them as you chat. No worker runs here.</span>
       <span style="flex:1"></span>
-      <button class="btn" onclick="closeMemory()">Cancel</button>
-      <button class="btn primary" onclick="saveMemory()">Save</button>
+      <button class="btn" onclick="closeIntakeModal()">Cancel</button>
+      <button class="btn primary" onclick="addFromIntake()">Add assignment</button>
     </div>
   </div>
 </div>
@@ -14126,8 +14485,10 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   // server didn't pass it), the badge stays empty (CSS hides it).
   {
     const v = SERVER.buildVersion;
-    const $vb = document.getElementById('versionBadge');
-    if ($vb && v) $vb.textContent = 'v' + v;
+    const $vb = document.getElementById('chromeVersion');
+    if ($vb) $vb.textContent = v ? ('code_boss v' + v) : 'code_boss';
+    syncEditToggle();   // initialise the edit-allowed label
+    try { if (localStorage.getItem('cb-side-collapsed') === '1') setSidePanelCollapsed(true); } catch {}
   }
   // Server-as-source-of-truth state mirror. Local UI state is kept minimal.
   let session = null;             // { version, status, phase, tokens, timeoutMs, events, ... }
@@ -14813,15 +15174,17 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     conversation = [];
     totalTokens = 0;
     if ($settingsTokens) $settingsTokens.textContent = '0';
-    const model = $model.value || SERVER.defaultModel || '(model)';
+    // No chat header (project lives in the side panel, model in settings) —
+    // just a faint one-line hint so an empty chat isn't blank.
     $log.innerHTML =
       '<div class="welcome">' +
-        '<div class="wt">✻ Welcome to code_boss</div>' +
-        '<div class="wl">project: ' + escapeHtml(projectPath) + '</div>' +
-        '<div class="wl">model: ' + escapeHtml(model) + '</div>' +
         '<div class="wl">Ask a question below. ⏎ to send, shift+⏎ for newline, esc to interrupt.</div>' +
       '</div>';
     if ($model.options.length === 0 || $model.value === '') loadModels();
+    // The assignment side panel belongs to the project, not the conversation —
+    // load it whenever the project view is shown (incl. a fresh/empty project,
+    // which used to fall through this path without ever loading the backlog).
+    loadBacklog();
     $input.focus();
     // Drop the previous project's dirty-indicator state synchronously
     // so the tooltip doesn't flash with stale repo names while the
@@ -14829,6 +15192,41 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     const $gd = document.getElementById('gitDirtyIndicator');
     if ($gd) { $gd.style.display = 'none'; $gd.title = ''; }
     refreshGitDirty();
+  }
+
+  // Side-panel tabs: Assignments | Queue | Memory. Clicking a tab marks it
+  // active and shows its pane; Memory/Queue refresh their content on open.
+  const SIDE_TABS = ['assignments', 'queue', 'memory'];
+  function selectSideTab(name) {
+    for (const t of SIDE_TABS) {
+      const btn = document.getElementById('tabbtn-' + t);
+      const pane = document.getElementById('pane-' + t);
+      const on = (t === name);
+      if (btn) btn.classList.toggle('active', on);
+      if (pane) pane.classList.toggle('hidden', !on);
+    }
+    if (name === 'memory') loadMemory();
+    if (name === 'queue') renderQueue();
+  }
+
+  // Collapse / expand the left side panel (chat reclaims the width).
+  // Collapse/expand the side panel. When collapsed, the chrome (path/weblogic/
+  // edit/gear) DOCKS under the chat input; expanding moves it back into the panel.
+  function setSidePanelCollapsed(collapsed) {
+    const p = document.getElementById('sidePanel');
+    if (!p) return;
+    p.classList.toggle('collapsed', collapsed);
+    const chrome = document.getElementById('sideChrome');
+    const footer = document.querySelector('#chatMain footer');
+    if (chrome && footer) {
+      chrome.classList.toggle('docked', collapsed);
+      (collapsed ? footer : p).appendChild(chrome);   // dock under input / back into panel
+    }
+    try { localStorage.setItem('cb-side-collapsed', collapsed ? '1' : '0'); } catch {}
+  }
+  function toggleSidePanel() {
+    const p = document.getElementById('sidePanel');
+    setSidePanelCollapsed(!(p && p.classList.contains('collapsed')));   // « (in panel) collapses; » pip reopens
   }
 
   // ── In-UI file browser (landing) ────────────────────────────────────────
@@ -15795,16 +16193,13 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     } catch { /* offline / no project */ }
   }
   function renderBacklog(activeId) {
-    const panel = document.getElementById('backlogPanel');
     const list = document.getElementById('backlogList');
     const count = document.getElementById('backlogCount');
-    if (!panel || !list) return;
-    // The panel is shown whenever a project is open (so the "+ New" form is
-    // always reachable, including to capture the very first assignment). It is
-    // only hidden when there is no project at all.
-    if (!activeProject) { panel.classList.add('hidden'); list.innerHTML = ''; return; }
-    panel.classList.remove('hidden');
-    count.textContent = _backlog.length ? \`(\${_backlog.length})\` : '';
+    if (!list) return;
+    // The side panel owns its own visibility (shown with the project view); here
+    // we only populate the Assignments tab list + its tab-count badge.
+    if (count) count.textContent = _backlog.length ? \` (\${_backlog.length})\` : '';
+    if (!activeProject) { list.innerHTML = ''; return; }
     list.innerHTML = '';
     if (!_backlog.length) {
       const empty = document.createElement('div');
@@ -15864,6 +16259,76 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       toggleAssignmentForm();
       loadBacklog();
     } catch (e) { showError('Create assignment failed', e); }
+  }
+
+  // ── New-assignment intake modal (the "+" button) ──────────────────────────
+  // Two panes: editable fields (left) + a read-only mini-chat manager (right)
+  // that refines those fields. Not the worker; no files edited, no run.
+  let _intakeMessages = [];
+  function openIntakeModal() {
+    _intakeMessages = [];
+    for (const id of ['im-title', 'im-req', 'im-acc', 'im-input']) { const el = document.getElementById(id); if (el) el.value = ''; }
+    const log = document.getElementById('im-log');
+    if (log) { log.innerHTML = ''; imAppend('manager', 'Tell me what you want done — paste a ticket/email or just describe it. I\\'ll read the code (read-only) and draft the fields on the left. You can also edit them yourself; hit Add when it looks right.'); }
+    document.getElementById('intakeModalBg').classList.add('show');
+    setTimeout(() => document.getElementById('im-input')?.focus(), 50);
+  }
+  function closeIntakeModal() { document.getElementById('intakeModalBg')?.classList.remove('show'); }
+  function imAppend(role, text) {
+    const log = document.getElementById('im-log'); if (!log) return null;
+    const d = document.createElement('div'); d.className = 'im-msg ' + role; d.textContent = text;
+    log.appendChild(d); log.scrollTop = log.scrollHeight; return d;
+  }
+  async function sendIntakeChat() {
+    const inp = document.getElementById('im-input');
+    const text = (inp.value || '').trim();
+    if (!text) return;
+    inp.value = '';
+    imAppend('user', text);
+    _intakeMessages.push({ role: 'user', content: text });
+    const sendBtn = document.getElementById('im-send'); if (sendBtn) { sendBtn.disabled = true; sendBtn.textContent = '…'; }
+    const thinking = imAppend('manager thinking', 'Reading the code & drafting…');
+    try {
+      const fields = {
+        title: document.getElementById('im-title').value,
+        requirement: document.getElementById('im-req').value,
+        acceptanceCriteria: document.getElementById('im-acc').value,
+      };
+      const r = await fetch('/api/intake-chat', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: _intakeMessages, fields, model: $model.value }),
+      });
+      const d = await r.json();
+      if (thinking) thinking.remove();
+      if (d.reply) { imAppend('manager', d.reply); _intakeMessages.push({ role: 'assistant', content: d.reply }); }
+      if (d.card) {
+        // Fill the fields from the refined card (it already incorporates the
+        // developer's current edits, which were sent as context).
+        if (d.card.title) document.getElementById('im-title').value = d.card.title;
+        if (d.card.requirement) document.getElementById('im-req').value = d.card.requirement;
+        if (d.card.acceptanceCriteria) document.getElementById('im-acc').value = d.card.acceptanceCriteria;
+      }
+    } catch (e) { if (thinking) thinking.remove(); imAppend('manager', 'Error: ' + (e?.message || e)); }
+    finally { if (sendBtn) { sendBtn.disabled = false; sendBtn.textContent = 'Send'; } }
+  }
+  async function addFromIntake() {
+    const requirement = (document.getElementById('im-req').value || '').trim();
+    if (!requirement) { showError('Add assignment', new Error('a requirement is required — describe it or let the manager draft it')); return; }
+    try {
+      const r = await fetch('/api/assignments/create', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          title: (document.getElementById('im-title').value || '').trim() || 'Untitled assignment',
+          requirement,
+          acceptanceCriteria: (document.getElementById('im-acc').value || '').trim() || null,
+          status: 'ready',
+        }),
+      });
+      if (!r.ok) { const er = await r.json().catch(() => ({})); throw new Error(er.error || ('HTTP ' + r.status)); }
+      closeIntakeModal();
+      selectSideTab('assignments');
+      loadBacklog();
+    } catch (e) { showError('Add assignment failed', e); }
   }
   async function startAssignment(id, resume) {
     if (session?.status === 'running') { showError('Start assignment', new Error('a chat is already running')); return; }
@@ -16170,54 +16635,114 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
 
   // ── Codebase memory (Tier-1) viewer / editor ──────────────────────────────
   const MEM_CATEGORIES = ['architecture', 'conventions', 'gotchas', 'where-things-live', 'build-deploy', 'general'];
-  async function openMemory() {
-    let entries = [];
-    try { const r = await fetch('/api/memory'); entries = (await r.json()).entries || []; }
-    catch (e) { showError('Load memory failed', e); }
-    renderMemoryEditor(entries);
-    const bg = document.getElementById('memoryModalBg');
-    if (bg) bg.classList.add('show');
+  // Memory renders into the side panel's Memory tab (no modal).
+  function loadMemory() {
+    fetch('/api/memory')
+      .then((r) => r.json())
+      .then((d) => renderMemoryEditor(d.entries || []))
+      .catch((e) => showError('Load memory failed', e));
   }
-  function closeMemory() { const bg = document.getElementById('memoryModalBg'); if (bg) bg.classList.remove('show'); }
+  function openMemory() { selectSideTab('memory'); }   // legacy callers → open the tab
+  function closeMemory() { /* no modal anymore — no-op */ }
+  // Per category: a box styled like ONE textarea whose lines are forced bullets.
+  // Each bullet is its own invisible auto-growing input = one memory entry.
+  // Enter → new bullet; Backspace at start → merge up; arrows hop between
+  // bullets at the edges; everything debounce-autosaves. No buttons.
   function renderMemoryEditor(entries) {
     const list = document.getElementById('memoryList');
     if (!list) return;
-    list.innerHTML = '';
-    if (!entries.length) {
-      const e = document.createElement('div'); e.className = 'memory-empty';
-      e.textContent = 'No facts yet. The agent records these with <remember> as it works; you can also add one here.';
-      list.appendChild(e);
-      return;
+    const byCat = {};
+    for (const c of MEM_CATEGORIES) byCat[c] = [];
+    for (const e of (entries || [])) {
+      const c = MEM_CATEGORIES.includes(e.category) ? e.category : 'general';
+      const note = (e.note || '').trim();
+      if (note) byCat[c].push(note);
     }
-    for (const en of entries) addMemoryRow(en);
+    list.innerHTML = '';
+    for (const c of MEM_CATEGORIES) {
+      const sec = document.createElement('div'); sec.className = 'mem-cat';
+      const lab = document.createElement('div'); lab.className = 'mem-cat-label'; lab.textContent = c;
+      const box = document.createElement('div'); box.className = 'bullet-box'; box.dataset.cat = c;
+      const notes = byCat[c].length ? byCat[c] : [''];   // always one (empty) bullet to type into
+      for (const n of notes) box.appendChild(makeBullet(n));
+      sec.appendChild(lab); sec.appendChild(box);
+      list.appendChild(sec);
+    }
+    list.querySelectorAll('.b-input').forEach(autogrowBullet);
+    // Delegated handlers (the #memoryList element persists across renders).
+    if (!list._memWired) {
+      list.addEventListener('input', (e) => { if (e.target.classList.contains('b-input')) { autogrowBullet(e.target); scheduleMemorySave(); } });
+      list.addEventListener('keydown', onBulletKeydown);
+      list._memWired = true;
+    }
   }
-  function addMemoryRow(entry) {
-    const list = document.getElementById('memoryList');
-    if (!list) return;
-    const empty = list.querySelector('.memory-empty'); if (empty) empty.remove();
-    const row = document.createElement('div'); row.className = 'memory-entry';
-    const sel = document.createElement('select');
-    for (const c of MEM_CATEGORIES) { const o = document.createElement('option'); o.value = c; o.textContent = c; sel.appendChild(o); }
-    sel.value = (entry && MEM_CATEGORIES.includes(entry.category)) ? entry.category : 'general';
-    const ta = document.createElement('textarea'); ta.rows = 2; ta.value = (entry && entry.note) || '';
-    const del = document.createElement('button'); del.className = 'mem-del'; del.textContent = '✕'; del.title = 'Remove'; del.onclick = () => row.remove();
-    row.appendChild(sel); row.appendChild(ta); row.appendChild(del);
-    list.appendChild(row);
-    if (!entry) ta.focus();
+  function makeBullet(text) {
+    const row = document.createElement('div'); row.className = 'bullet';
+    const dash = document.createElement('span'); dash.className = 'dash'; dash.textContent = '–';
+    const ta = document.createElement('textarea'); ta.className = 'b-input'; ta.rows = 1; ta.value = text || '';
+    row.appendChild(dash); row.appendChild(ta);
+    return row;
+  }
+  function autogrowBullet(ta) { ta.style.height = 'auto'; ta.style.height = ta.scrollHeight + 'px'; }
+  function focusBullet(ta, pos) { if (!ta) return; ta.focus(); const p = (pos == null) ? ta.value.length : pos; try { ta.setSelectionRange(p, p); } catch {} }
+  function onBulletKeydown(e) {
+    const ta = e.target;
+    if (!ta.classList || !ta.classList.contains('b-input')) return;
+    const box = ta.closest('.bullet-box');
+    const row = ta.closest('.bullet');
+    const inputs = Array.from(box.querySelectorAll('.b-input'));
+    const idx = inputs.indexOf(ta);
+    const atStart = ta.selectionStart === 0 && ta.selectionEnd === 0;
+    const atEnd = ta.selectionStart === ta.value.length && ta.selectionEnd === ta.value.length;
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();                                  // Enter = new bullet (shift+Enter = newline within a bullet)
+      const after = ta.value.slice(ta.selectionStart);
+      ta.value = ta.value.slice(0, ta.selectionStart); autogrowBullet(ta);
+      const nb = makeBullet(after); row.after(nb);
+      const ni = nb.querySelector('.b-input'); autogrowBullet(ni); focusBullet(ni, 0);
+      scheduleMemorySave();
+    } else if (e.key === 'Backspace' && atStart && idx > 0) {
+      e.preventDefault();                                  // merge into the previous bullet
+      const prev = inputs[idx - 1]; const joinAt = prev.value.length;
+      prev.value = prev.value + ta.value; row.remove();
+      autogrowBullet(prev); focusBullet(prev, joinAt);
+      scheduleMemorySave();
+    } else if ((e.key === 'ArrowRight' || e.key === 'ArrowDown') && atEnd && idx < inputs.length - 1) {
+      e.preventDefault(); focusBullet(inputs[idx + 1], 0);
+    } else if ((e.key === 'ArrowLeft' || e.key === 'ArrowUp') && atStart && idx > 0) {
+      e.preventDefault(); focusBullet(inputs[idx - 1]);
+    }
+  }
+  let _memSaveTimer = null;
+  function scheduleMemorySave() {
+    clearTimeout(_memSaveTimer);
+    _memSaveTimer = setTimeout(saveMemory, 800);   // debounce while typing
   }
   async function saveMemory() {
     const list = document.getElementById('memoryList');
-    const rows = list ? Array.from(list.querySelectorAll('.memory-entry')) : [];
-    const entries = rows
-      .map((r) => ({ category: r.querySelector('select').value, note: (r.querySelector('textarea').value || '').trim() }))
-      .filter((e) => e.note);
+    if (!list) return;
+    const entries = [];
+    for (const box of list.querySelectorAll('.bullet-box[data-cat]')) {
+      const cat = box.dataset.cat;
+      for (const ta of box.querySelectorAll('.b-input')) {
+        const note = ta.value.trim();
+        if (note) entries.push({ category: cat, note });
+      }
+    }
     try {
       const r = await fetch('/api/memory/replace', {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ entries }),
       });
       if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.error || ('HTTP ' + r.status)); }
-      closeMemory();
+      flashMemSaved();
     } catch (e) { showError('Save memory failed', e); }
+  }
+  function flashMemSaved() {
+    const el = document.getElementById('memSaved');
+    if (!el) return;
+    el.classList.add('show');
+    clearTimeout(el._fadeT);
+    el._fadeT = setTimeout(() => el.classList.remove('show'), 1300);
   }
 
   // Minimal markdown rendering for assistant text. Supports:
@@ -16843,17 +17368,33 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   // WebLogic server indicator in the footer. running: true=up (green+lit),
   // false=down (red), null=not monitored (wl plugin inactive) → hidden.
   function setWeblogicStatus(running) {
+    // "weblogic" chip in the chrome — green when up, red when down, hidden when
+    // unknown (no wl plugin). No bullet; hover shows the status.
     const el = document.getElementById('wlIndicator');
-    const txt = document.getElementById('wlIndicatorText');
     if (!el) return;
     if (running == null) { el.style.display = 'none'; el.classList.remove('up', 'down'); return; }
     el.style.display = '';
     el.classList.toggle('up', running === true);
     el.classList.toggle('down', running === false);
-    if (txt) txt.textContent = running ? 'WebLogic up' : 'WebLogic down';
     el.title = running
-      ? 'WebLogic server is RUNNING (port 7101).'
-      : 'WebLogic server is STOPPED (nothing on port 7101). The agent can start it with "wl startWebLogic".';
+      ? 'WebLogic is RUNNING (port 7101).'
+      : 'WebLogic is STOPPED (nothing on port 7101). The agent can start it with "wl startWebLogic".';
+  }
+  // "edit allowed" (blue) ↔ "no edit allowed" (gray, struck). Backs the hidden
+  // #discussToggle the send path reads (checked = read-only/discuss = NO edits).
+  function syncEditToggle() {
+    const cb = document.getElementById('discussToggle');
+    const el = document.getElementById('editToggle');
+    if (!cb || !el) return;
+    const noEdit = cb.checked;
+    el.textContent = noEdit ? 'no edit allowed' : 'edit allowed';
+    el.classList.toggle('off', noEdit);
+  }
+  function toggleEditAllowed() {
+    const cb = document.getElementById('discussToggle');
+    if (!cb) return;
+    cb.checked = !cb.checked;
+    syncEditToggle();
   }
 
   // ── Tab leadership (single live SSE) ────────────────────────────────────
@@ -17678,6 +18219,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   const $steerBtn   = document.getElementById('steerBtn');
   let _inputQueue = [];     // [{ id, text }]
   let _queueIdCounter = 0;
+  let _selectedQueueId = null;   // highlighted queue item (for ⇧→ pull-back)
 
   function enqueueText(text) {
     text = (text ?? '').trim();
@@ -17723,15 +18265,44 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     renderQueue();
     $input.focus();
   }
+  // Highlight a queued item (so ⇧→ pulls it back). Click selects + focuses it.
+  function selectQueueItem(id) {
+    _selectedQueueId = id;
+    renderQueue();
+    const row = $queueStack?.querySelector(\`.queue-item[data-qid="\${id}"]\`);
+    if (row) row.focus();
+  }
+  // Pull a queued item back into the input box (editable), removing it from the
+  // queue — the inverse of ⇧← (enqueue). Used by ⇧→ on a highlighted item.
+  function pullQueueItem(id) {
+    const item = _inputQueue.find((q) => q.id === id);
+    if (!item) return;
+    removeFromQueue(id);
+    if (_selectedQueueId === id) _selectedQueueId = null;
+    $input.value = item.text;
+    autoGrowInput();
+    $input.focus();
+  }
   function renderQueue() {
+    const count = document.getElementById('queueCount');
+    if (count) count.textContent = _inputQueue.length ? \` (\${_inputQueue.length})\` : '';
+    const empty = document.getElementById('queueEmpty');
+    if (empty) empty.style.display = _inputQueue.length ? 'none' : '';
     if (!$queueStack) return;
+    if (_selectedQueueId != null && !_inputQueue.some((q) => q.id === _selectedQueueId)) _selectedQueueId = null;
     $queueStack.innerHTML = '';
     const running = session?.status === 'running';
     for (const item of _inputQueue) {
       const row = document.createElement('div');
-      row.className = 'queue-item';
+      row.className = 'queue-item' + (item.id === _selectedQueueId ? ' selected' : '');
       row.title = item.text;
-      row.onclick = () => swapQueueWithInput(item.id);
+      row.dataset.qid = item.id;
+      row.tabIndex = 0;
+      row.onclick = () => selectQueueItem(item.id);   // click highlights; ⇧→ pulls it back
+      row.onkeydown = (e) => {
+        if (e.shiftKey && e.key === 'ArrowRight') { e.preventDefault(); pullQueueItem(item.id); }
+        else if (e.key === 'Enter') { e.preventDefault(); pullQueueItem(item.id); }
+      };
 
       const preview = document.createElement('span');
       preview.className = 'queue-preview';
@@ -17818,10 +18389,12 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     const L = [];
     L.push('model: ' + j.model);
     L.push('reasoning field: ' + (j.reasoningField || "(none exposed — 'think' is inferred = total−prompt−out)"));
+    L.push("prompt: bat-and-ball CRT — reasoned answer is $0.05, intuitive-but-WRONG is $0.10.");
+    L.push("→ if effort variants give different answers, reasoning IS modulated even when tokens look identical.");
     L.push('');
-    L.push(pad('variant', 37) + pad('http', 5) + pad('out', 5) + pad('total', 7) + pad('think', 7) + 'ms');
+    L.push(pad('variant', 37) + pad('http', 5) + pad('out', 5) + pad('total', 7) + pad('think', 7) + pad('ms', 7) + 'answer');
     for (const row of (j.rows || [])) {
-      if (row.ok) L.push(pad(row.label, 37) + pad(row.status, 5) + pad(num(row.out), 5) + pad(num(row.total), 7) + pad(think(row), 7) + num(row.ms));
+      if (row.ok) L.push(pad(row.label, 37) + pad(row.status, 5) + pad(num(row.out), 5) + pad(num(row.total), 7) + pad(think(row), 7) + pad(num(row.ms), 7) + (row.answer || ''));
       else L.push(pad(row.label, 37) + pad(row.status || 'ERR', 5) + 'ERR: ' + (row.err || ''));
     }
     return L.join('\\n');
@@ -17837,6 +18410,12 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       } else {
         send();
       }
+    } else if (e.shiftKey && e.key === 'ArrowLeft') {
+      // ⇧← → move the current draft into the Queue tab.
+      if ($input.value.trim()) { e.preventDefault(); enqueueCurrentInput(); }
+    } else if (e.shiftKey && e.key === 'ArrowRight') {
+      // ⇧→ → pull the highlighted queue item back into the input.
+      if (_selectedQueueId != null) { e.preventDefault(); pullQueueItem(_selectedQueueId); }
     }
   });
   // Auto-grow textarea: start at one line, grow with content up to its CSS
@@ -17850,6 +18429,11 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     $input.style.overflowY = sh > max ? 'auto' : 'hidden';
   }
   $input.addEventListener('input', autoGrowInput);
+  // Intake modal: Enter sends, shift+Enter newline.
+  {
+    const im = document.getElementById('im-input');
+    if (im) im.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendIntakeChat(); } });
+  }
   document.addEventListener('keydown', (e) => {
     // F1 → open snapshot. Works even if every UI click is being eaten by
     // an invisible overlay — handy when the page seems "frozen" and the
@@ -17981,7 +18565,18 @@ const htmlWithConfig = UI_HTML.replace(
 // Boot: no CLI picker — the browser shows an in-UI file browser on the
 // landing view and the user picks a project there. Server starts with
 // no active project; /api/open-project drives the transition.
+//
+// Subcommand: `node code-boss.mjs package --jars <dir> ...` packages THIS
+// bundle (+ the supplied jars) into an extract-and-run zip, then exits. Lets a
+// single copied .mjs build its own deployable on the production box.
 (async () => {
+  if (process.argv[2] === 'package') {
+    try {
+      const code = await runPackageCommand({ argv: process.argv.slice(3), bundlePath: fileURLToPath(import.meta.url), version: BUILD_VERSION });
+      process.exit(code || 0);
+    } catch (e) { console.error('[code_boss] package failed:', e?.stack || e?.message || e); process.exit(1); }
+    return;
+  }
   try {
     const { port } = await startServer({
       html: htmlWithConfig,
