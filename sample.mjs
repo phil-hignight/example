@@ -15,7 +15,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '184';
+const BUILD_VERSION = '185';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
@@ -14109,6 +14109,8 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   // Context-window fill gauge (item A): { totalTokens, budgetTokens, budgetPct } or null when unknown.
   let contextFill = null;
   let taskProgress = null;       // latest <task-progress> signal: { percent, note }
+  let _unlockPending = false;    // an unlock is awaiting the user (gates the models-fetch abort)
+  let _modelsTimer = null;       // loadModels' abort timer — cancelled while parked on an unlock
   // Diff collapse state keyed by event id (item K) — survives the clearLog()
   // + full re-render that an event-patch triggers (the DOM is wiped, so the
   // state can't live on the element).
@@ -14512,55 +14514,60 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       [u, t].forEach((el) => el.addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); }));
     });
   }
-  // Browser-side unlock flow. Shown when the LLM endpoint returns 401 with
-  // an unlock_url. The user opens the URL (we don't auto-open it — keeps
-  // the user in control), unlocks the key in their browser, then clicks
-  // "I've unlocked" to retry whatever request was in flight.
+  // Browser-side unlock flow. Shown when the LLM endpoint returns 401 with an
+  // unlock_url. TWO stages: (1) just "Open unlock page" (primary/orange). After
+  // it's opened, (2) "I'm finished" (primary/orange) + "Reopen" (gray). The
+  // in-flight request is parked server-side until the user clicks "I'm finished".
   function showUnlockModal(url) {
+    _unlockPending = true;
+    // The models fetch (and any other parked adapter call) is legitimately
+    // WAITING on this unlock, not hung — so cancel its abort timer. Otherwise a
+    // slow human unlock (the user took ~90s last time) trips the timeout and we
+    // wrongly show "Failed to load models: signal is aborted". unlock-done
+    // retries loadModels if the parked fetch didn't resolve on its own.
+    if (_modelsTimer) { clearTimeout(_modelsTimer); _modelsTimer = null; }
     $initModalTitle.textContent = 'API key locked';
     $initModalBody.innerHTML = \`
-      <p style="margin: 0 0 8px; color: var(--fg); font-size: 13px;">
-        The endpoint is asking us to unlock the API key in your browser before
-        we can talk to the model. The request in flight is paused — we'll
-        resume it the moment you tell us you're done.
-      </p>
-      <p style="margin: 0 0 12px; color: var(--muted); font-size: 12px;">
-        Click <strong>Open unlock page</strong>, sign in / approve, then come
-        back to this tab and click <strong>I've unlocked</strong>.
+      <p style="margin: 0 0 10px; color: var(--fg); font-size: 13px;">
+        The endpoint needs you to unlock the API key in your browser. The request
+        in flight is paused — it resumes the moment you click <strong>I'm finished</strong>.
       </p>
       <div style="margin: 0 0 12px; padding: 6px 8px; background: var(--panel-alt);
                   border: 1px solid var(--border); border-radius: 4px;
                   font-family: var(--mono); font-size: 11px; color: var(--muted);
                   word-break: break-all;">\${escapeHtml(url)}</div>
-      <div style="display: flex; gap: 8px; justify-content: flex-end;">
-        <button id="unlockOpen" class="btn">Open unlock page</button>
-        <button id="unlockDone" class="btn primary">I've unlocked</button>
+      <div id="unlockStage1" style="display: flex; gap: 8px; justify-content: flex-end;">
+        <button id="unlockOpen" class="btn primary">Open unlock page</button>
+      </div>
+      <div id="unlockStage2" style="display: none; gap: 8px; justify-content: flex-end;">
+        <button id="unlockReopen" class="btn">Reopen</button>
+        <button id="unlockDone" class="btn primary">I'm finished</button>
       </div>
       <p id="unlockMsg" style="margin: 8px 0 0; color: var(--muted); font-size: 11px; min-height: 14px;"></p>
     \`;
     $initModalBg.classList.add('show');
+    const openPage = () => { window.open(url, '_blank', 'noopener'); };
     document.getElementById('unlockOpen').onclick = () => {
-      window.open(url, '_blank', 'noopener');
-      document.getElementById('unlockMsg').textContent = 'Opened in a new tab. Come back here and click "I\\'ve unlocked" when done.';
+      openPage();
+      document.getElementById('unlockStage1').style.display = 'none';
+      document.getElementById('unlockStage2').style.display = 'flex';
+      document.getElementById('unlockMsg').textContent = 'Opened in a new tab. Sign in / approve there, then click "I\\'m finished". (Didn\\'t open? Use Reopen.)';
     };
+    document.getElementById('unlockReopen').onclick = openPage;
     document.getElementById('unlockDone').onclick = async () => {
       const btn = document.getElementById('unlockDone');
-      const msg = document.getElementById('unlockMsg');
       btn.disabled = true;
-      msg.textContent = 'Telling server you unlocked, retrying request…';
-      console.log('[unlock] user clicked done, posting /api/unlock-done');
-      // Close the modal OPTIMISTICALLY and don't block it on the fetch
-      // resolving. The server resolves the pending unlock the instant it
-      // RECEIVES this POST (the in-flight request retries on its own); waiting
-      // for the 200 to come back left the modal stuck on "retrying request…"
-      // when the response was slow/queued. A bounded fetch with a timeout
-      // fires the signal without ever hanging the UI.
+      document.getElementById('unlockMsg').textContent = 'Resuming the paused request…';
+      console.log('[unlock] user clicked finished, posting /api/unlock-done');
+      // Close the modal OPTIMISTICALLY — the server resolves the parked request
+      // the instant it RECEIVES this POST; a bounded fetch never hangs the UI.
       const ctrl = new AbortController();
       const tid = setTimeout(() => { try { ctrl.abort(); } catch {} }, 8000);
       fetch('/api/unlock-done', { method: 'POST', signal: ctrl.signal })
         .then(() => console.log('[unlock] /api/unlock-done returned'))
         .catch((e) => console.log('[unlock] /api/unlock-done signal error (non-fatal):', e?.message))
         .finally(() => clearTimeout(tid));
+      _unlockPending = false;
       $initModalBg.classList.remove('show');
     };
   }
@@ -15006,16 +15013,18 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   }
 
   async function loadModels() {
-    // 90s upper bound. If the server-side adapter is hung (waiting on a
-    // pending unlock the user never acknowledged, or some hung connection)
-    // we surface a clear error instead of appearing frozen on the init
-    // view forever.
+    // Bounded so a genuinely HUNG connection surfaces an error instead of a
+    // frozen init view. But if an unlock is needed, showUnlockModal CANCELS
+    // this timer (the call is parked, not hung) and unlock-done retries — so a
+    // slow human unlock never aborts it. The timer lives at module scope
+    // (_modelsTimer) so the unlock flow can reach it.
     console.log('[loadModels] fetching /api/models');
     const _ac = new AbortController();
-    const _to = setTimeout(() => _ac.abort(), 90_000);
+    if (_modelsTimer) clearTimeout(_modelsTimer);
+    _modelsTimer = setTimeout(() => _ac.abort(), 120_000);
     try {
       const r = await fetch('/api/models', { signal: _ac.signal });
-      clearTimeout(_to);
+      clearTimeout(_modelsTimer); _modelsTimer = null;
       console.log('[loadModels] response', r.status);
       if (!r.ok) {
         const body = await r.text();
@@ -15036,7 +15045,17 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
         if (id === SERVER.defaultModel) opt.selected = true;
         $model.appendChild(opt);
       }
+      // Success → clear any leftover "Failed to load models" error box (e.g. a
+      // retry after the unlock dance finished).
+      if ($modalBg.classList.contains('show') && $modalTitle.textContent === 'Failed to load models') closeModal();
     } catch (e) {
+      clearTimeout(_modelsTimer); _modelsTimer = null;
+      // Aborted while an unlock is still pending? That's not a failure — the
+      // call was parked waiting on the user. Stay quiet; unlock-done retries.
+      if (e?.name === 'AbortError' && _unlockPending) {
+        $model.innerHTML = '<option>(waiting for unlock…)</option>';
+        return;
+      }
       $model.innerHTML = '<option>(load failed)</option>';
       showError('Failed to load models', e);
     }
@@ -17014,11 +17033,20 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
         break;
       case 'unlock-done':
         console.log('[sse] unlock-done');
+        _unlockPending = false;
         // Server signals the unlock dance is complete. Close the init
         // modal if it's still on the unlock screen (could have been
         // closed already by the local click handler).
         if ($initModalBg.classList.contains('show') && $initModalTitle.textContent === 'API key locked') {
           $initModalBg.classList.remove('show');
+        }
+        // If the models fetch aborted/failed while we waited on the unlock,
+        // retry it now (the key is unlocked, so it succeeds fast and clears the
+        // "Failed to load models" error). Skip if the list is already populated.
+        {
+          const opts = Array.from($model?.options || []).map((o) => o.value);
+          const loaded = opts.length && !opts.some((v) => /waiting for unlock|load failed|no models/i.test(v));
+          if (!loaded) loadModels();
         }
         break;
       case 'git-needs-branch':
