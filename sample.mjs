@@ -15,7 +15,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '180';
+const BUILD_VERSION = '184';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
@@ -1717,14 +1717,13 @@ const tools = {
             `--- stderr ---\n${errBody || '(no stderr)'}`,
             hint,
           ].filter(Boolean).join('\n').trim();
-          // Timeout is a failure mode the agent should see as an error
-          // (status=error, red row in chat) — without the ERROR prefix
-          // it falls through to status=ok with the timeout text buried
-          // in the body, which is too easy to miss on the collapsed
-          // result row. Non-zero exit codes are left as-is: many
-          // commands (git diff --exit-code, grep, etc.) intentionally
-          // return non-zero for normal outcomes.
-          resolve((timedOut || signal === 'killfail') ? 'ERROR: ' + text : text);
+          // Timeout / killfail / user-cancel are non-success outcomes the agent
+          // (and the UI) should see as an error (status=error, red row) — without
+          // the ERROR prefix they fall through to status=ok with a misleading
+          // GREEN dot even though the command was aborted. Plain non-zero exit
+          // codes are left as-is: many commands (git diff --exit-code, grep, etc.)
+          // intentionally return non-zero for normal outcomes.
+          resolve((cancelled || timedOut || signal === 'killfail') ? 'ERROR: ' + text : text);
         }
         child.on('close', finish);
       });
@@ -4641,8 +4640,13 @@ async function runReviewer({ adapter, model, tasks, signal, onLog, onDiag, repoR
           ? '<review-pass/>\nOR\n<review-fail>specific, actionable concerns</review-fail>'
           : unruled.map((id) => `<review task="${id}" pass/>   (or)   <review task="${id}" fail>concerns</review>`).join('\n');
         const correction = `Your last turn did not include a parseable verdict tag for ${unruled.length} task(s): ${unruled.join(', ')}. A Markdown report or "Final Verdict" prose is NOT read — only the literal tag is. Reply with ONLY the verdict tag(s) below and nothing else:\n${tagHelp}`;
-        log(`reviewer turn ${turn}: no verdict tag; corrective re-prompt ${corrections}/${REVIEWER_MAX_CORRECTIONS} for ${unruled.join(', ')}`);
-        emitDiag(onDiag, 'reviewer', `reviewer reply had no <review-pass>/<review-fail> tag for ${unruled.length} task(s) (${unruled.join(', ')}); sent a corrective re-prompt (retry ${corrections}/${REVIEWER_MAX_CORRECTIONS})`, proseOnly);
+        // LOG-ONLY (no emitDiag): the corrective re-prompt is routine self-healing.
+        // If the retry SUCCEEDS, surfacing a warning is misleading — it lingers in
+        // the chat and looks like a second/failed review. Only the genuine
+        // outcomes after the budget is spent (prose-inference / default-pass /
+        // max-turns below) emit a user-facing diagnostic. The raw prose is kept
+        // in the file log for triage.
+        log(`reviewer turn ${turn}: no verdict tag; corrective re-prompt ${corrections}/${REVIEWER_MAX_CORRECTIONS} for ${unruled.join(', ')} — raw: ${proseOnly.slice(0, 200).replace(/\s+/g, ' ')}`);
         messages.push({ role: 'assistant', content: text });
         messages.push({ role: 'user', content: correction });
         continue;
@@ -6237,6 +6241,11 @@ succeeded. Only use "run" if the user EXPLICITLY asks you to open the app. If th
 WebLogic status below says STOPPED and your task needs the server, run
 "startWebLogic" first and wait for it to come up.
 
+When a build/deploy SUCCEEDS, report it in ONE short sentence (e.g. "Deployed
+opsconnect successfully."). Do NOT reproduce the build log or render a
+Markdown summary table — the full output already streamed live and the UI shows
+an "Open" button + a committed checkmark, so a long recap is just noise.
+
 Other actions: clone, pull, clonepull, status, diff (git); clean; undeploy;
 datasources (ds); mvninstall (mi, rarely needed).
 
@@ -6431,11 +6440,25 @@ const wlPlugin = {
             }
             const head = `exit ${code} in ${dur}ms  (workspace=${workspaceDir})`;
             const body = stdout + (stderr ? '\nSTDERR:\n' + stderr : '');
+            // Cap any returned log to a head/tail tail (the success/error markers
+            // live at the end) so an unbounded build log never floods context.
+            const cap = (s) => s.length > 4000 ? '…(truncated; showing the end)…\n' + s.slice(-4000) : s;
             if (code !== 0 && code != null) {
-              resolve(`ERROR: ${head}\n${body}`);
-            } else {
-              resolve({ content: `${head}\n${body}` });
+              resolve(`ERROR: ${head}\n${cap(body)}`);
+              return;
             }
+            // SUCCESS (exit 0): return a TERSE result, NOT the whole build log.
+            // The full output already streamed live to the UI (onProgress); feeding
+            // the entire log back is what made the model re-narrate it as a big
+            // "DEPLOYMENT SUMMARY" table. Keep just the outcome lines so there is
+            // nothing verbose to tabulate. Fall back to a capped tail only if no
+            // recognizable success line is found (so an odd exit-0 still shows output).
+            const successLines = body.split(/\r?\n/)
+              .map((l) => l.trim())
+              .filter((l) => l && /\b(BUILD SUCCESS|successfully|deployed|redeploy(ed)?|installed|projprops|completed)\b/i.test(l) && !/\b(error|fail(ed|ure)?)\b/i.test(l))
+              .slice(-8);
+            const terse = successLines.length ? successLines.join('\n') : cap(body);
+            resolve({ content: `${head}\nSUCCESS — \`wl ${safeArgs}\` completed.\n${terse}` });
           };
           child.on('close', settle);
           child.on('error', (e) => { stderr += '\n' + e.message; settle(-1); });
@@ -11282,9 +11305,13 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
             // can see it happened (mirrors the auto-commit git rows).
             const emitAutoBranch = (repoDir, branchName, parent) => {
               const rel = nodePath.relative(session.activeProject, repoDir) || '.';
-              const callId = randomUUID();
-              chatState.appendChatEvent({ type: 'tool-call', callId, verb: 'git', name: 'git', args: { command: `[${rel}] git checkout -b ${branchName} (auto)` } });
-              chatState.appendChatEvent({ type: 'tool-result', callId, verb: 'git', name: 'git', status: 'ok', content: `forked from ${parent} — your changes ride on the new branch` });
+              // LOG-ONLY (no chat row): auto-branching onto a CODE_BOSS branch is
+              // internal git plumbing. It used to emit a tool-call/result pair that
+              // — being untagged — floated OUTSIDE the task wrap (visible as a lone
+              // "git checkout -b CODE_BOSS… (auto)" row below the task). That's
+              // exactly the git noise we're removing now that a successful commit
+              // shows as a "✓ committed" footer badge. Keep a file-log breadcrumb.
+              fileLog(`git: auto-branched ${rel} to ${branchName} (forked from ${parent}; changes ride on the new branch)`);
             };
             // Bring a repo onto a CODE_BOSS_* branch so the agent's change is
             // recoverable. Three outcomes:
@@ -11720,6 +11747,76 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
           return sendJson(res, 200, { ok: true, version: session.version });
         }
         return sendJson(res, 200, { ok: true, version: session.version, note: 'no chat in progress' });
+      }
+      if (req.method === 'POST' && path === '/api/probe-thinking') {
+        // Diagnostic: fire a battery of "thinking/effort" param shapes at the
+        // configured OpenAI-compatible endpoint (the Gemini shim) and report,
+        // CONCISELY, which ones the shim honors + whether reasoning tokens are
+        // exposed. Runs against ${baseURL}/chat/completions with the same Bearer
+        // auth the app uses. Results are for a human to read (screenshot), not a
+        // gate. (Gemini 3.1 Pro: thinking is always-on; thinkingLevel/
+        // reasoning_effort = low|medium|high; native counts in thoughtsTokenCount,
+        // OpenAI-compat in usage.completion_tokens_details.reasoning_tokens.)
+        const raw = await readBody(req);
+        let body = {}; try { body = raw ? JSON.parse(raw) : {}; } catch {}
+        const model = String(body?.model || session.defaultModel || '').trim();
+        const base = String(session.baseURL || '').replace(/\/+$/, '');
+        if (!base || base === '(dev)') return sendJson(res, 400, { ok: false, error: 'no baseURL configured' });
+        if (!model) return sendJson(res, 400, { ok: false, error: 'no model selected' });
+        if (!session.apiKey) return sendJson(res, 400, { ok: false, error: 'no API key set (Settings → API key)' });
+        // A small multi-step question that reliably induces measurable thinking.
+        const PROMPT = 'A bat and a ball cost $1.10 total. The bat costs $1.00 more than the ball. How much does the ball cost? Reply with ONLY the dollar amount.';
+        const variants = [
+          { label: 'baseline (no param)', extra: {} },
+          { label: 'reasoning_effort=low', extra: { reasoning_effort: 'low' } },
+          { label: 'reasoning_effort=high', extra: { reasoning_effort: 'high' } },
+          { label: 'reasoning_effort=none', extra: { reasoning_effort: 'none' } },
+          { label: 'google.thinking_config(high)+thoughts', extra: { google: { thinking_config: { thinking_level: 'high', include_thoughts: true } } } },
+          { label: 'thinking_level=high (top-level)', extra: { thinking_level: 'high' } },
+        ];
+        const dig = (o, p) => { let v = o; for (const k of p.split('.')) v = (v == null ? undefined : v[k]); return v; };
+        const firstNum = (...vals) => { for (const v of vals) if (typeof v === 'number') return v; return null; };
+        const rows = [];
+        let reasoningField = null;
+        for (const v of variants) {
+          const ac = new AbortController();
+          const tid = setTimeout(() => ac.abort(), 30000);
+          const t0 = Date.now();
+          try {
+            const r = await fetch(`${base}/chat/completions`, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json', authorization: `Bearer ${session.apiKey}` },
+              body: JSON.stringify({ model, messages: [{ role: 'user', content: PROMPT }], max_tokens: 2048, ...v.extra }),
+              signal: ac.signal,
+            });
+            const ms = Date.now() - t0;
+            const text = await r.text();
+            let j = null; try { j = JSON.parse(text); } catch {}
+            if (!r.ok) {
+              rows.push({ label: v.label, status: r.status, ok: false, err: String(dig(j, 'error.message') || text || '').replace(/\s+/g, ' ').slice(0, 140) });
+              continue;
+            }
+            const u = (j && j.usage) || {};
+            const reasoning = firstNum(
+              dig(u, 'completion_tokens_details.reasoning_tokens'),
+              u.reasoning_tokens, u.thoughts_token_count, u.thoughtsTokenCount,
+              dig(j, 'usageMetadata.thoughtsTokenCount'), dig(j, 'usage_metadata.thoughts_token_count'),
+            );
+            if (reasoning != null && !reasoningField) {
+              reasoningField = dig(u, 'completion_tokens_details.reasoning_tokens') != null ? 'usage.completion_tokens_details.reasoning_tokens'
+                : u.reasoning_tokens != null ? 'usage.reasoning_tokens'
+                : (u.thoughts_token_count != null || u.thoughtsTokenCount != null) ? 'usage.thoughts_token_count'
+                : 'usageMetadata.thoughtsTokenCount';
+            }
+            const out = firstNum(u.completion_tokens, u.output_tokens, dig(j, 'usageMetadata.candidatesTokenCount'));
+            const msg = dig(j, 'choices.0.message') || {};
+            const thought = !!(msg.reasoning || msg.reasoning_content);
+            rows.push({ label: v.label, status: r.status, ok: true, out, reasoning, thought, ms });
+          } catch (e) {
+            rows.push({ label: v.label, status: 0, ok: false, err: (e && e.name === 'AbortError') ? 'timeout (30s)' : String(e && e.message || e).slice(0, 140) });
+          } finally { clearTimeout(tid); }
+        }
+        return sendJson(res, 200, { ok: true, model, baseURL: base, reasoningField, rows });
       }
       if (req.method === 'POST' && path === '/api/extend-timeout') {
         const raw = await readBody(req);
@@ -12275,6 +12372,7 @@ const UI_HTML = `<!DOCTYPE html>
   .row .dot { flex-shrink: 0; line-height: 1.55; }
   .row.assistant .dot { color: var(--fg); }
   .row.tool .dot { color: #6cc46c; }
+  .row.tool.tool-err .dot { color: var(--error); }   /* failed/cancelled tool */
   /* Blink the green dot while a tool call is in flight (no matching
      tool-result yet). Added when the tool-call row renders, removed
      when its tool-result event arrives. */
@@ -12457,12 +12555,13 @@ const UI_HTML = `<!DOCTYPE html>
      it's a sideways \`(\` connecting the two text rows. */
   .task-wrap {
     position: relative;
-    margin: 14px 0;
+    margin: 6px 0;             /* tight — header/summary are hidden when expanded */
     padding: 0;                /* no inner indent — events stay aligned */
     border: none;
     background: transparent;
     overflow: visible;
   }
+  .task-wrap.collapsed { margin: 10px 0; }   /* the header+summary view gets a little room */
   /* Bracket overhangs to the LEFT of the wrap so wrapping a task doesn't
      shift its content — events sit at the same x whether inside a task
      or outside. The 16px overhang lives in the gutter to the left of the
@@ -12471,17 +12570,19 @@ const UI_HTML = `<!DOCTYPE html>
     content: '';
     position: absolute;
     left: -16px;
-    top: 0.72em;               /* ~ vertical middle of the request line */
-    bottom: 0.65em;            /* ~ vertical middle of the summary line  */
+    top: 0.4em;                /* near the top of the body (expanded) / header (collapsed) */
+    bottom: 0.65em;            /* turns right at the bottom status row */
     width: 10px;
-    border-left: 1.5px solid var(--accent);
-    border-top: 1.5px solid var(--accent);
-    border-bottom: 1.5px solid var(--accent);
+    border-left: 1px solid var(--muted);
+    border-top: 1px solid var(--muted);
+    border-bottom: 1px solid var(--muted);
     border-radius: 8px 0 0 8px;
     pointer-events: none;
-    opacity: 0.55;
+    opacity: 0.5;
   }
-  .task-wrap .task-head,
+  /* Foot (the bottom status row) is ALWAYS shown; the head (user-request) is
+     shown ONLY when collapsed. Split into two rules (not a shared selector) so
+     the head's display:none reliably wins over the collapsed override. */
   .task-wrap .task-foot {
     display: flex;
     align-items: baseline;
@@ -12490,16 +12591,23 @@ const UI_HTML = `<!DOCTYPE html>
     background: transparent;
     border: none;
     overflow: hidden;
-  }
-  .task-wrap .task-head .toggle {
-    cursor: pointer;
-    user-select: none;
+    font-size: 11.5px;
     color: var(--muted);
-    font-size: 10px;
-    flex-shrink: 0;
-    opacity: 0.5;
+    font-style: italic;
+    white-space: normal;
+    line-height: 1.45;
   }
-  .task-wrap .task-head .toggle:hover { opacity: 1; }
+  .task-wrap .task-head {
+    display: none;             /* expanded (default): no header */
+    align-items: baseline;
+    gap: 8px;
+    padding: 0;
+    background: transparent;
+    border: none;
+    overflow: hidden;
+    cursor: pointer;           /* click the header to expand (only visible when collapsed) */
+  }
+  .task-wrap.collapsed .task-head { display: flex; }
   .task-wrap .task-head .ur {
     color: var(--accent);
     font-weight: 700;
@@ -12524,59 +12632,62 @@ const UI_HTML = `<!DOCTYPE html>
   .task-wrap .task-body {
     padding: 4px 0 6px 0;
   }
-  .task-wrap .task-foot {
-    font-size: 11.5px;
+  /* Summary text shown ONLY when collapsed (the old "SUMMARY" label is gone). */
+  .task-wrap:not(.collapsed) .task-foot-summary { display: none; }
+  /* Small collapse/expand chevron — lives in the foot status row, always visible. */
+  .task-foot-toggle {
+    cursor: pointer;
+    user-select: none;
     color: var(--muted);
-    font-style: italic;
-    white-space: normal;
-    line-height: 1.45;
-  }
-  .task-wrap .task-foot::before {
-    content: 'summary';
+    opacity: 0.5;
+    font-size: 10px;
     font-style: normal;
-    text-transform: uppercase;
-    letter-spacing: 0.6px;
-    font-size: 9.5px;
-    color: var(--accent);
-    opacity: 0.7;
-    font-weight: 600;
-    margin-right: 8px;
     flex-shrink: 0;
-    align-self: baseline;
   }
-  /* Per-task review verdict badge in the task footer (✓ reviewed / ✗ issues). */
+  /* Thinking-probe results (settings modal): tight monospace table for a screenshot. */
+  .think-probe-out {
+    margin: 2px 16px 10px;
+    padding: 8px 10px;
+    background: var(--panel-alt);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 10.5px;
+    line-height: 1.45;
+    color: var(--fg);
+    white-space: pre;
+    overflow-x: auto;
+    max-height: 280px;
+  }
+  .task-foot-toggle:hover { opacity: 1; }
+  /* Per-task status checks. Success = the muted bracket color; failure = error. */
   .task-foot-review {
     margin-left: 10px;
     font-style: normal;
     font-weight: 600;
     font-size: 11px;
   }
-  .task-foot-review.review-pass { color: #6cc46c; }
+  .task-foot-review.review-pass { color: var(--muted); }
   .task-foot-review.review-fail { color: var(--error); }
   .task-foot-review.review-escalate, .task-foot-review.review-error { color: var(--error); }
   .task-foot-review.review-pending { color: var(--muted); }
-  /* "✓ Committed" badge — sits next to the review badge to the right of the
-     summary. Replaces the per-commit chat row (git noise reduction). */
-  .task-foot-commit { margin-left: 10px; font-weight: 600; font-size: 11px; }
-  .task-foot-commit.commit-ok { color: #6cc46c; }
+  .task-foot-commit { margin-left: 10px; font-style: normal; font-weight: 600; font-size: 11px; }
+  .task-foot-commit.commit-ok { color: var(--muted); }
   .task-foot-commit.commit-error { color: var(--error); }
-  /* Project (tier-4) rollup: same shape, brighter bracket. */
+  /* Project (tier-4) rollup: a slightly stronger muted bracket. */
   .task-wrap.project::before {
-    opacity: 0.85;
-    border-left-width: 2px;
-    border-top-width: 2px;
-    border-bottom-width: 2px;
+    opacity: 0.7;
+    border-left-width: 1.5px;
+    border-top-width: 1.5px;
+    border-bottom-width: 1.5px;
   }
-  /* Collapsed: hide body only — keep the summary so the bracket still
-     has both endpoints to span. */
+  /* Collapsed: hide the body (the header + summary show instead). */
   .task-wrap.collapsed .task-body { display: none; }
 
   /* A closed task with no body rows still renders as a real .task-wrap (so its
-     review verdict + late git/diff rows can nest), just styled tighter. Use
-     :empty so the padding collapses ONLY while the body is genuinely empty —
-     if a late git/diff row gets relocated in, normal padding returns. */
+     review verdict + late git/diff rows can nest). :empty collapses the padding
+     only while the body is genuinely empty. */
   .task-wrap .task-body:empty { padding: 0; min-height: 0; }
-  .task-wrap.empty .task-head { border-bottom: none; }
+  .task-wrap.empty { margin: 4px 0; }
 
   /* "Open in browser" button shown after a successful wl deploy. Clearly an
      action that opens a new tab — distinct from the plain '⎿' result text. */
@@ -13856,6 +13967,12 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
         <label>Tokens this session</label>
         <span class="value" id="settingsTokens">0</span>
       </div>
+      <div class="settings-row">
+        <label>Thinking</label>
+        <span class="value" style="font-size: 11px; color: var(--muted);">Probe which reasoning/effort knobs this endpoint honors</span>
+        <button class="btn" id="thinkProbeBtn" onclick="probeThinking()">Probe</button>
+      </div>
+      <pre id="thinkProbeOut" class="think-probe-out" style="display: none;"></pre>
       <div class="settings-actions">
         <button class="btn" onclick="openSnapshot()">Snapshot</button>
         <button class="btn" onclick="openLog()">Log</button>
@@ -13996,6 +14113,10 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   // + full re-render that an event-patch triggers (the DOM is wiped, so the
   // state can't live on the element).
   const _diffCollapsed = new Map();
+  // Task-wrap collapse state keyed by taskId. Lives off-DOM so it survives the
+  // clearLog() + full re-render cycle (which rebuilds every wrap from scratch),
+  // mirroring _diffCollapsed. Without this, collapse is lost on every re-render.
+  const _taskCollapsed = new Map();
   const STALL_MS = 1500;   // no traffic this long → switch to THINKING (blinking)
 
   function ensureStatusRow() {
@@ -16971,15 +17092,6 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
 
     const head = document.createElement('div');
     head.className = 'task-head';
-    const toggle = document.createElement('span');
-    toggle.className = 'toggle';
-    toggle.textContent = '▼';
-    toggle.onclick = () => {
-      const collapsed = project.classList.toggle('collapsed');
-      toggle.textContent = collapsed ? '▶' : '▼';
-    };
-    head.appendChild(toggle);
-
     const tag = document.createElement('span');
     tag.className = 'tag';
     tag.textContent = 'project';
@@ -17003,11 +17115,24 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     // Move all child wraps into the project body.
     for (const c of children) body.appendChild(c);
 
-    // Footer carries the project summary (NOT muted — this is what the LLM sees).
+    // Footer: chevron + the project summary. The summary is the rollup's primary
+    // content (the LLM sees only it), so it uses its OWN class (.task-foot-project)
+    // that stays visible in BOTH states — unlike a leaf .task-foot-summary.
     const foot = document.createElement('div');
     foot.className = 'task-foot';
-    foot.textContent = ev.summary || '(no summary)';
+    const chev = document.createElement('span');
+    chev.className = 'task-foot-toggle';
+    chev.title = 'Collapse / expand';
+    chev.onclick = (e) => { e.stopPropagation(); setTaskCollapsed(project, foot, !project.classList.contains('collapsed')); };
+    foot.appendChild(chev);
+    const sum = document.createElement('span');
+    sum.className = 'task-foot-project';
+    sum.textContent = ev.summary || '(no summary)';
+    foot.appendChild(sum);
     project.appendChild(foot);
+
+    head.onclick = () => setTaskCollapsed(project, foot, false);
+    setTaskCollapsed(project, foot, _taskCollapsed.get(String(ev.parentTaskId)) || false);
 
     scrollToBottom();
   }
@@ -17166,7 +17291,13 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
         if (ev.callId) {
           const cid = CSS.escape(ev.callId);
           const callRow = $log.querySelector(\`.row.tool[data-call-id="\${cid}"]\`);
-          if (callRow) callRow.classList.remove('tool-running');
+          if (callRow) {
+            callRow.classList.remove('tool-running');
+            // Reflect a failed/cancelled result on the CALL row's dot too, so a
+            // tool that errored (or was cancelled via Escape) doesn't keep a
+            // green "success" bullet next to a red result line.
+            callRow.classList.toggle('tool-err', ev.status === 'error');
+          }
           // Drop the running placeholder and its live-output buffer —
           // the proper result row below carries the full final content.
           const placeholder = $log.querySelector(\`.row-result.running[data-call-id="\${cid}"]\`);
@@ -17262,17 +17393,11 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     wrap.className = 'task-wrap' + (rows.length === 0 ? ' empty' : '');
     wrap.dataset.taskId = taskId;
 
-    // Header
+    // Header (user-request) — shown ONLY when collapsed (CSS); clicking it
+    // expands. No toggle glyph here anymore; the chevron lives in the foot so
+    // it's reachable in the expanded view where the header is hidden.
     const head = document.createElement('div');
     head.className = 'task-head';
-    const toggle = document.createElement('span');
-    toggle.className = 'toggle';
-    toggle.textContent = '▼';
-    toggle.onclick = () => {
-      const collapsed = wrap.classList.toggle('collapsed');
-      toggle.textContent = collapsed ? '▶' : '▼';
-    };
-    head.appendChild(toggle);
     if (ev.userRequest) {
       const ur = document.createElement('span');
       ur.className = 'ur';
@@ -17294,26 +17419,44 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     // Move rows into the body (no-op for an empty task)
     for (const r of rows) body.appendChild(r);
 
-    // Footer — the summary is click-to-edit (item D); it feeds the tier rollup
-    // (future context), so the developer can correct a vague/wrong one. Held in
-    // its own span so the review badge appended later (renderReviewIntoFooter)
-    // coexists with it.
+    // Footer — the bottom status row. ALWAYS shows: a small collapse/expand
+    // chevron + the status checks (✓ committed / ✓ reviewed). The summary text
+    // is here too but CSS hides it unless collapsed (and it stays click-to-edit).
     const foot = document.createElement('div');
     foot.className = 'task-foot';
     if (ev.id) foot.dataset.eventId = String(ev.id);
+    const chev = document.createElement('span');
+    chev.className = 'task-foot-toggle';
+    chev.title = 'Collapse / expand';
+    chev.onclick = (e) => { e.stopPropagation(); setTaskCollapsed(wrap, foot, !wrap.classList.contains('collapsed')); };
+    foot.appendChild(chev);
     const summarySpan = document.createElement('span');
     summarySpan.className = 'task-foot-summary';
     summarySpan.textContent = ev.summary || '(no summary)';
     summarySpan.title = 'Click to edit this summary';
     summarySpan.addEventListener('click', () => beginEditTaskSummary(foot, summarySpan, ev));
     foot.appendChild(summarySpan);
-    // "✓ Committed" badge (or "⚠ commit issue") to the right of the summary,
-    // next to the review badge. Derives purely from the persisted task-end
-    // fields so it survives full re-renders. Replaces the per-commit git row.
+    // "✓ Committed" badge (or "⚠ commit issue") in the status row. Derives purely
+    // from the persisted task-end fields so it survives full re-renders.
     renderCommitIntoFooter(foot, ev);
     wrap.appendChild(foot);
 
+    // Clicking the (collapsed-only) header expands the task.
+    head.onclick = () => setTaskCollapsed(wrap, foot, false);
+    // Restore persisted collapse state (lost otherwise on the re-render cycle).
+    setTaskCollapsed(wrap, foot, _taskCollapsed.get(String(taskId)) || false);
+
     scrollToBottom();
+  }
+
+  // Toggle a task wrap's collapse state, sync the foot chevron glyph, and
+  // remember it (keyed by taskId) so it survives the clearLog() re-render.
+  function setTaskCollapsed(wrap, foot, collapsed) {
+    wrap.classList.toggle('collapsed', collapsed);
+    const ch = foot && foot.querySelector('.task-foot-toggle');
+    if (ch) ch.textContent = collapsed ? '▶' : '▼';
+    const id = wrap.dataset.taskId;
+    if (id) _taskCollapsed.set(String(id), collapsed);
   }
 
   // Render the commit status into a task footer from the task-end event's
@@ -17499,6 +17642,42 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
         body: JSON.stringify({ ms: Math.round(mins * 60 * 1000) }),
       });
     } catch (e) { showError('Update timeout failed', e); }
+  }
+
+  // Thinking/effort probe: fire the candidate reasoning-param shapes at the
+  // configured endpoint and render a tight table (which shapes the shim honors,
+  // whether reasoning tokens are exposed, and how they vary by effort).
+  async function probeThinking() {
+    const btn = document.getElementById('thinkProbeBtn');
+    const out = document.getElementById('thinkProbeOut');
+    if (!out) return;
+    const model = (document.getElementById('model')?.value) || '';
+    out.style.display = 'block';
+    out.textContent = 'Probing ' + (model || '(model)') + ' … 6 requests, ~10–30s';
+    if (btn) { btn.disabled = true; btn.textContent = 'Probing…'; }
+    try {
+      const r = await fetch('/api/probe-thinking', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model }) });
+      const j = await r.json();
+      out.textContent = j.ok ? renderThinkProbe(j) : ('Probe failed: ' + (j.error || ('HTTP ' + r.status)));
+    } catch (e) {
+      out.textContent = 'Probe error: ' + (e?.message || e);
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = 'Probe'; }
+    }
+  }
+  function renderThinkProbe(j) {
+    const pad = (s, n) => { s = String(s); return s.length >= n ? s.slice(0, n) : s + ' '.repeat(n - s.length); };
+    const num = (v) => (v == null ? '—' : String(v));
+    const L = [];
+    L.push('model: ' + j.model);
+    L.push('reasoning field: ' + (j.reasoningField || '(none exposed — folded into output tokens)'));
+    L.push('');
+    L.push(pad('variant', 38) + pad('http', 5) + pad('out', 6) + pad('think', 7) + pad('txt', 4) + 'ms');
+    for (const row of (j.rows || [])) {
+      if (row.ok) L.push(pad(row.label, 38) + pad(row.status, 5) + pad(num(row.out), 6) + pad(num(row.reasoning), 7) + pad(row.thought ? 'Y' : '-', 4) + num(row.ms));
+      else L.push(pad(row.label, 38) + pad(row.status || 'ERR', 5) + 'ERR: ' + (row.err || ''));
+    }
+    return L.join('\\n');
   }
 
   $input.addEventListener('keydown', (e) => {
