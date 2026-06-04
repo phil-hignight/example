@@ -15,7 +15,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '230';
+const BUILD_VERSION = '232';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
@@ -5742,14 +5742,25 @@ command -v "$NODE" >/dev/null 2>&1 || { echo "Node.js 20+ not found. Install it 
 exec "$NODE" "$HERE/code-boss.mjs" "$@"
 `;
 
-// PowerShell launcher (for envs where .bat is blocked): right-click → Run with PowerShell.
-const PKG_RUN_PS1 = `$here = $PSScriptRoot; if (-not $here) { $here = Split-Path -Parent $MyInvocation.MyCommand.Path }
-$node = Join-Path $here 'node\\node.exe'
+// The day-to-day RUNNER (run.ps1, lives inside the extracted package). The
+// installer points a desktop shortcut at a thin wrapper that calls this. Launches
+// node with its startup/diagnostic STDERR redirected to launch.log at the OS level
+// (clean UTF-8, reliable for a long-running process) and keeps the window open.
+const PKG_RUN_PS1 = `$app = $PSScriptRoot; if (-not $app) { $app = Split-Path -Parent $MyInvocation.MyCommand.Path }
+$log = Join-Path $app 'launch.log'
+$node = Join-Path $app 'node\\node.exe'
 if (-not (Test-Path $node)) {
   if (-not (Get-Command node -ErrorAction SilentlyContinue)) { Write-Host 'Node.js 20+ was not found. Install it from https://nodejs.org (or drop a portable Node into a "node" folder next to this file), then run again.'; Read-Host 'Press Enter to exit'; exit 1 }
   $node = 'node'
 }
-& $node (Join-Path $here 'code-boss.mjs') @args
+$ErrorActionPreference = 'Continue'
+Write-Host 'Starting code_boss - a browser tab opens automatically.'
+Write-Host "Output is logged to $log. Close this window to stop code_boss."
+$proc = Start-Process -FilePath $node -ArgumentList 'code-boss.mjs' -WorkingDirectory $app -NoNewWindow -PassThru -RedirectStandardError $log
+$proc.WaitForExit()
+Write-Host ''
+Write-Host "code_boss exited - see $log."
+Read-Host 'Press Enter to exit'
 `;
 
 function pkgReadme(version, docxNote, bundledNode) {
@@ -5790,16 +5801,19 @@ OFFLINE / AIR-GAPPED
 
 function pkgArg(argv, name) { const i = argv.indexOf(name); return i >= 0 ? argv[i + 1] : null; }
 
-// A self-extracting, click-to-run Windows installer .ps1 with the zip embedded as
-// a base64 here-string (NOT a comment/marker: PowerShell parses the WHOLE file as
-// code first, so the payload must be a string literal). Built-in PowerShell only.
-// Behavior the developer asked for:
-//   - FIRST run: extract into the .ps1's own folder → <here>\code_boss_v<ver>\, then run.
-//   - LATER runs of the SAME .ps1: folder already there → skip extract, just run.
-//   - A NEW version's .ps1: different code_boss_v<ver> folder → installs alongside + runs that one.
-// Console output (boot/crash messages a launch would otherwise lose) is teed to
-// <here>\code_boss_v<ver>-launch.log; the app's per-project log stays at
-// <project>\.code_boss\code-boss.log.
+// A self-extracting Windows INSTALLER .ps1 with the zip embedded as a base64
+// here-string (NOT a comment/marker: PowerShell parses the WHOLE file as code
+// first, so the payload must be a string literal). Built-in PowerShell only.
+// Run it once via right-click → Run with PowerShell (a .ps1 can't be double-
+// clicked). It:
+//   - FIRST run: extracts into its own folder → <here>\code_boss_v<ver>\.
+//     (A re-run / later version skips extraction if that folder already exists.)
+//   - writes a stable RUNNER <here>\code_boss-run.ps1 (thin wrapper → this
+//     version's run.ps1) and creates a Desktop shortcut "code_boss" pointing at
+//     it — so day-to-day launching is a double-click on the shortcut (which CAN
+//     run a .ps1), not on a .ps1 directly.
+//   - launches code_boss once (first run). Boot/diagnostic output is captured to
+//     <app>\launch.log; the app's per-project log stays at <project>\.code_boss\code-boss.log.
 function pkgInstallerPs1(version, base64) {
   // base64 on ONE line inside a single-quoted here-string: literal, no
   // interpolation, and base64 has no quote so it can't terminate early. The
@@ -5812,9 +5826,8 @@ function pkgInstallerPs1(version, base64) {
     '$here = $PSScriptRoot; if (-not $here) { $here = Split-Path -Parent $MyInvocation.MyCommand.Path }',
     `$ver = '${version}'`,
     '$app = Join-Path $here "code_boss_v$ver"',
-    '$log = Join-Path $here "code_boss_v$ver-launch.log"',
     '',
-    '# First run: decode the embedded zip + extract code_boss_v$ver\\. Later runs skip to launch.',
+    '# First run: decode the embedded zip + extract code_boss_v$ver\\. Later runs skip straight to setup+launch.',
     "if (-not (Test-Path (Join-Path $app 'code-boss.mjs'))) {",
     '  Write-Host "Installing code_boss v$ver into $app ..."',
     '  try {',
@@ -5828,27 +5841,37 @@ function pkgInstallerPs1(version, base64) {
     '  }',
     '}',
     '',
-    "$node = Join-Path $app 'node\\node.exe'",
-    'if (-not (Test-Path $node)) {',
-    '  if (-not (Get-Command node -ErrorAction SilentlyContinue)) {',
-    "    Write-Host 'Node.js 20+ was not found on PATH. Install it from https://nodejs.org then run this again.'",
-    "    Read-Host 'Press Enter to exit'; exit 1",
-    '  }',
-    "  $node = 'node'",
+    "# Drop a stable RUNNER at the install root (a thin wrapper that calls THIS",
+    "# version's run.ps1) and point a desktop shortcut at it. Windows won't let you",
+    "# double-click a .ps1, but a .lnk shortcut launches one fine - so from now on",
+    "# you start code_boss from the desktop shortcut. A new version's installer",
+    "# rewrites this runner + shortcut to point at the newer folder.",
+    "$runner = Join-Path $here 'code_boss-run.ps1'",
+    "$rsrc = @'",
+    "$ErrorActionPreference = 'Continue'",
+    "& (Join-Path $PSScriptRoot 'code_boss_v__VER__/run.ps1')",
+    "'@",
+    "[IO.File]::WriteAllText($runner, ($rsrc -replace '__VER__', $ver))",
+    'try {',
+    "  $desktop = [Environment]::GetFolderPath('Desktop')",
+    "  $psexe = Join-Path $env:WINDIR 'System32/WindowsPowerShell/v1.0/powershell.exe'",
+    '  $ws = New-Object -ComObject WScript.Shell',
+    "  $sc = $ws.CreateShortcut((Join-Path $desktop 'code_boss.lnk'))",
+    '  $sc.TargetPath = $psexe',
+    `  $sc.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $runner + '"'`,
+    '  $sc.WorkingDirectory = $app',
+    '  $sc.IconLocation = "$psexe,0"',
+    '  $sc.Description = "code_boss v$ver"',
+    '  $sc.Save()',
+    `  Write-Host "Desktop shortcut 'code_boss' created - double-click it to launch from now on."`,
+    '} catch {',
+    '  Write-Host ("Could not create the desktop shortcut: " + $_.Exception.Message)',
+    '  Write-Host ("You can launch it directly by right-clicking " + $runner + " (Run with PowerShell).")',
     '}',
     '',
-    "$ErrorActionPreference = 'Continue'",
-    'Write-Host "Starting code_boss v$ver - a browser tab opens automatically."',
-    'Write-Host "Running; output is logged to $log. Close this window to stop code_boss."',
-    '# Launch node with its STDERR (where code_boss writes its startup/diagnostic',
-    '# log) redirected to the log file at the OS level: clean UTF-8, no PowerShell',
-    '# stderr-as-error wrapping, and reliable for a long-running process (a PS pipe',
-    '# would buffer + mangle the encoding). stdout stays on the console.',
-    '$proc = Start-Process -FilePath $node -ArgumentList "code-boss.mjs" -WorkingDirectory $app -NoNewWindow -PassThru -RedirectStandardError $log',
-    '$proc.WaitForExit()',
     'Write-Host ""',
-    'Write-Host "code_boss exited - see $log for details."',
-    "Read-Host 'Press Enter to exit'",
+    'Write-Host "Launching code_boss v$ver ..."',
+    "& (Join-Path $app 'run.ps1')",
     '',
   ].join('\r\n');
 }
@@ -6010,7 +6033,7 @@ async function runPackageCommand({ argv, bundlePath, version }) {
   if (installer) {
     const kb = Math.round((await stat(installer)).size / 1024);
     console.error(`installer: ${installer}  (${kb} KB)`);
-    console.error(`           Right-click → Run with PowerShell. First run installs to .\\code_boss_v${version}\\ + launches; later runs just launch; a new version makes its own folder.`);
+    console.error(`           Run once via right-click → Run with PowerShell: it extracts .\\code_boss_v${version}\\, writes code_boss-run.ps1, adds a "code_boss" Desktop shortcut, and launches. After that, double-click the Desktop shortcut.`);
     if (keepBuild) console.error(`build:     ${workDir}  (staged folder + zip kept via --keep-build)`);
   } else if (!zipped) {
     console.error(`zip step failed - staged folder left at ${stage} for inspection.`);
