@@ -15,7 +15,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '223';
+const BUILD_VERSION = '226';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
@@ -12872,9 +12872,9 @@ const UI_HTML = `<!DOCTYPE html>
   .side-panes::-webkit-scrollbar-thumb:hover { background: #4d4a3f; }
   /* Gutter so chat content doesn't touch the panel. Left is wider because the
      .task-wrap bracket overhangs -16px into the gutter — it must clear the panel. */
-  /* Bottom padding clears the 36px footer gradient so the last message isn't
-     covered by the fade as it scrolls to the bottom. */
-  #logScroll { padding: 0 20px 48px 36px; }
+  /* Top padding gives the first message breathing room; bottom padding clears the
+     36px footer gradient so the last message isn't covered by the fade. */
+  #logScroll { padding: 16px 20px 48px 36px; }
   /* Bottom-left chrome. Flat flex-wrap: in the PANEL it wraps to two lines
      (path+version / weblogic·edit·gear); DOCKED under the chat input when the
      panel is collapsed it's a single line (path left, controls right). */
@@ -12886,7 +12886,7 @@ const UI_HTML = `<!DOCTYPE html>
   .wl-chip { flex-shrink: 0; cursor: help; color: var(--muted); }
   .wl-chip.up { color: #3fb950; }
   .wl-chip.down { color: #d9534f; }
-  .edit-toggle { flex-shrink: 0; cursor: pointer; color: #58a6ff; }
+  .edit-toggle { flex-shrink: 0; cursor: pointer; color: #3fb950; }
   .edit-toggle:hover { opacity: 0.8; }
   .edit-toggle.off { color: var(--muted); text-decoration: line-through; }
   .side-chrome .dirty-indicator { flex-shrink: 0; color: #c9a227; cursor: help; }
@@ -12898,8 +12898,13 @@ const UI_HTML = `<!DOCTYPE html>
   .side-chrome.docked .chrome-break { display: none; }
   .side-chrome.docked .chrome-version { display: none; }
   /* New-assignment intake modal: fields (left) + mini-chat (right). */
-  .intake-modal { max-width: 880px; width: 94%; }
-  .intake-two-pane { display: flex; min-height: 0; height: 58vh; }
+  /* The new-assignment modal takes as much room as the screen allows, with a
+     comfortable margin around it so it's clearly a modal. Flex column so the
+     two-pane (and within it the chat + requirement field) fills the height. */
+  #intakeModalBg { align-items: center; padding: 4vh 4vw; }
+  .modal.intake-modal { width: 100%; max-width: 1500px; height: 92vh; display: flex; flex-direction: column; }
+  .intake-two-pane { display: flex; min-height: 0; flex: 1; }
+  #im-req { flex: 1 1 auto; min-height: 100px; }
   .intake-fields { flex: 0 0 42%; padding: 12px 16px; border-right: 1px solid var(--border); overflow-y: auto; display: flex; flex-direction: column; gap: 3px; }
   .intake-fields label { font-size: 12px; color: var(--muted); margin-top: 8px; }
   .intake-fields .im-sub { color: var(--muted); opacity: 0.8; }
@@ -12956,11 +12961,15 @@ const UI_HTML = `<!DOCTYPE html>
     align-items: flex-start;
     position: relative;          /* anchor the hover copy button */
   }
-  /* Hover copy button (upper-left) — copies the raw message text. */
+  /* Hover copy button: upper-RIGHT corner, and STICKY so on a long message it
+     stays in view near the top of the bubble as you scroll past it. It's a flex
+     item (margin-left:auto pushes it right); position:sticky pins it vertically. */
   .bubble.user .bubble-copy {
-    position: absolute;
-    top: -10px;
-    left: -10px;
+    position: sticky;
+    top: 10px;
+    align-self: flex-start;
+    margin-left: auto;
+    flex: 0 0 auto;
     width: 22px;
     height: 22px;
     display: flex;
@@ -13433,8 +13442,8 @@ const UI_HTML = `<!DOCTYPE html>
   .welcome {
     border: 1px solid var(--border);
     border-radius: 8px;
-    padding: 12px 16px;
-    margin: 4px 0 20px;
+    padding: 14px 18px;
+    margin: 12px 0 28px;
   }
   .welcome .wt { color: var(--accent); font-weight: 700; }
   .welcome .wl { color: var(--muted); font-size: 12.5px; margin-top: 3px; }
@@ -13464,7 +13473,9 @@ const UI_HTML = `<!DOCTYPE html>
        separator and gives a fade as chat content scrolls toward the
        input. */
     background: var(--bg);
-    padding: 10px 16px 8px;
+    /* Horizontal padding MATCHES #logScroll (36 left / 20 right) so the centered
+       .input-row lines up exactly with the centered .log user bubbles above. */
+    padding: 10px 20px 8px 36px;
     flex-shrink: 0;
     position: relative;
   }
@@ -13491,7 +13502,8 @@ const UI_HTML = `<!DOCTYPE html>
     border: 1px solid var(--border);
     border-radius: 8px;
     background: var(--panel-alt);
-    padding: 4px 8px;
+    /* 6px 10px matches the user bubble's padding so the input is the same height. */
+    padding: 6px 10px;
   }
   .input-row:focus-within { border-color: var(--accent); }
   /* Queue button in the right gutter of the input. Visible only while the
@@ -14512,14 +14524,14 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   </style>
   <aside id="sidePanel">
     <div class="side-tabs" role="tablist">
-      <button class="side-tab active" id="tabbtn-assignments" onclick="selectSideTab('assignments')">Assignments<span class="side-tab-count" id="backlogCount"></span></button>
-      <button class="side-tab" id="tabbtn-queue" onclick="selectSideTab('queue')">Queue<span class="side-tab-count" id="queueCount"></span></button>
+      <button class="side-tab active" id="tabbtn-queue" onclick="selectSideTab('queue')">Queue<span class="side-tab-count" id="queueCount"></span></button>
+      <button class="side-tab" id="tabbtn-assignments" onclick="selectSideTab('assignments')">Assignments<span class="side-tab-count" id="backlogCount"></span></button>
       <button class="side-tab" id="tabbtn-memory" onclick="selectSideTab('memory')">Memory</button>
       <button id="sideToggle" class="side-collapse" onclick="toggleSidePanel()" title="Collapse the side panel">«</button>
     </div>
     <div class="side-panes">
       <!-- ASSIGNMENTS -->
-      <div class="side-pane" id="pane-assignments">
+      <div class="side-pane hidden" id="pane-assignments">
         <div class="pane-actions">
           <button class="pane-add" onclick="openIntakeModal()" title="New assignment — describe it and the intake manager drafts the requirement (you can edit it)">+</button>
         </div>
@@ -14542,7 +14554,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
         <div class="backlog-list" id="backlogList"></div>
       </div>
       <!-- QUEUE -->
-      <div class="side-pane hidden" id="pane-queue">
+      <div class="side-pane" id="pane-queue">
         <div class="queue-stack" id="queueStack"></div>
         <div class="pane-empty" id="queueEmpty">No queued messages.<br>In the chat box, press <b>⇧←</b> to queue your current draft. Click a queued item and press <b>⇧→</b> to pull it back into the box.</div>
       </div>
@@ -14558,7 +14570,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       <span class="chrome-version" id="chromeVersion"></span>
       <span class="chrome-break"></span>
       <span class="wl-chip" id="wlIndicator" title="" style="display:none;">weblogic</span>
-      <span class="edit-toggle" id="editToggle" onclick="toggleEditAllowed()" title="Edit allowed — the agent edits files and runs commands. Click to switch to read-only (discuss): it investigates and explains but won't modify files or run shell commands.">edit allowed</span>
+      <span class="edit-toggle" id="editToggle" onclick="toggleEditAllowed()" title="edit — the agent edits files and runs commands. Click to switch to read-only (discuss): it investigates and explains but won't modify files or run shell commands.">edit</span>
       <input type="checkbox" id="discussToggle" style="display:none;">
       <span class="dirty-indicator" id="gitDirtyIndicator" title="" style="display:none;">⚠</span>
       <button class="settings-btn" id="settingsBtn" onclick="openSettings()" title="Settings — model, API key, GitLab, timeout, Snapshot, Log, Clear conversation, Probe">⚙</button>
@@ -14576,19 +14588,6 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     <!-- The pending-message queue now lives in the side panel's Queue tab. -->
     <div class="input-row">
       <textarea id="input" placeholder="Ask…" rows="1"></textarea>
-      <button id="queueBtn"
-              class="queue-btn"
-              title="Queue this message for later — stack up several and send each with ▶ when you're ready"
-              onclick="enqueueCurrentInput()"
-              style="display: none;">
-        <svg width="14" height="14" viewBox="0 0 14 14" fill="none"
-             stroke="currentColor" stroke-width="1.3"
-             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-          <path d="M7 1.5 L7 6 M4.5 3.8 L7 6.3 L9.5 3.8"/>
-          <rect x="2" y="8.4" width="10" height="1.5" rx="0.4"/>
-          <rect x="2" y="11.1" width="10" height="1.5" rx="0.4"/>
-        </svg>
-      </button>
       <button id="steerBtn"
               class="queue-btn steer-btn"
               title="Send now — steers the running agent at its next step (no restart, no lost work)"
@@ -15496,7 +15495,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
 
   // Side-panel tabs: Assignments | Queue | Memory. Clicking a tab marks it
   // active and shows its pane; Memory/Queue refresh their content on open.
-  const SIDE_TABS = ['assignments', 'queue', 'memory'];
+  const SIDE_TABS = ['queue', 'assignments', 'memory'];
   function selectSideTab(name) {
     for (const t of SIDE_TABS) {
       const btn = document.getElementById('tabbtn-' + t);
@@ -17746,7 +17745,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     const el = document.getElementById('editToggle');
     if (!cb || !el) return;
     const noEdit = cb.checked;
-    el.textContent = noEdit ? 'no edit allowed' : 'edit allowed';
+    el.textContent = noEdit ? 'no edit' : 'edit';
     el.classList.toggle('off', noEdit);
   }
   function toggleEditAllowed() {
@@ -18556,7 +18555,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     $input.disabled = false;
     $input.placeholder = running
       ? 'Agent running — Enter to queue, Esc to stop'
-      : 'Ask… (Enter to send, ⤓ to queue for later)';
+      : 'Ask… (Enter to send · Shift+← to queue · Shift+Space toggles the panel)';
     if (!running) {
       try { $input.focus(); } catch {}
     }
@@ -18589,10 +18588,26 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   function enqueueCurrentInput() {
     const text = $input.value;
     if (!text.trim()) return;
-    enqueueText(text);
     $input.value = '';
     autoGrowInput();
     $input.focus();
+    revealQueueThenAdd(text);
+  }
+  // Surface the Queue when something is queued: open the side panel if collapsed,
+  // switch to the Queue tab, then add the item — waiting ~1s after OPENING so the
+  // panel is fully visible (and the new item draws the eye) instead of appearing
+  // mid-animation. If the panel is already open, add immediately.
+  function revealQueueThenAdd(text) {
+    const p = document.getElementById('sidePanel');
+    const wasCollapsed = p && p.classList.contains('collapsed');
+    selectSideTab('queue');
+    if (wasCollapsed) {
+      // Open the panel, let it become visible, THEN add (so the item draws the eye).
+      setSidePanelCollapsed(false);
+      setTimeout(() => enqueueText(text), 1000);
+    } else {
+      enqueueText(text);   // already open → add immediately (synchronous, no deferral)
+    }
   }
   function removeFromQueue(id) {
     _inputQueue = _inputQueue.filter((q) => q.id !== id);
@@ -18798,6 +18813,13 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     // an invisible overlay — handy when the page seems "frozen" and the
     // user needs to capture diagnostics anyway.
     if (e.key === 'F1') { e.preventDefault(); openSnapshot(); return; }
+    // Shift+Space → collapse/expand the left side panel. Skip when typing in a
+    // text field OTHER than the main chat input (so modals/forms keep their space).
+    if (e.shiftKey && e.code === 'Space') {
+      const t = e.target;
+      const otherField = t && t !== $input && (t.tagName === 'TEXTAREA' || t.tagName === 'INPUT' || t.isContentEditable);
+      if (!otherField) { e.preventDefault(); toggleSidePanel(); return; }
+    }
     if (e.key === 'Escape') {
       // Layered modals: snapshot closes first, then settings, then we cancel
       // the running chat as a last resort.
