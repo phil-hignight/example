@@ -15,7 +15,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '226';
+const BUILD_VERSION = '230';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
@@ -5742,6 +5742,16 @@ command -v "$NODE" >/dev/null 2>&1 || { echo "Node.js 20+ not found. Install it 
 exec "$NODE" "$HERE/code-boss.mjs" "$@"
 `;
 
+// PowerShell launcher (for envs where .bat is blocked): right-click → Run with PowerShell.
+const PKG_RUN_PS1 = `$here = $PSScriptRoot; if (-not $here) { $here = Split-Path -Parent $MyInvocation.MyCommand.Path }
+$node = Join-Path $here 'node\\node.exe'
+if (-not (Test-Path $node)) {
+  if (-not (Get-Command node -ErrorAction SilentlyContinue)) { Write-Host 'Node.js 20+ was not found. Install it from https://nodejs.org (or drop a portable Node into a "node" folder next to this file), then run again.'; Read-Host 'Press Enter to exit'; exit 1 }
+  $node = 'node'
+}
+& $node (Join-Path $here 'code-boss.mjs') @args
+`;
+
 function pkgReadme(version, docxNote, bundledNode) {
   return `code_boss v${version} - single-folder deployment
 ======================================================
@@ -5757,9 +5767,9 @@ REQUIREMENTS (on the machine that runs it)
   The LLM endpoint and model are already configured inside the app.
 
 RUN
-  Windows       : double-click run.bat        (or:  node code-boss.mjs)
+  Windows       : right-click run.ps1 → Run with PowerShell   (or run.bat, or:  node code-boss.mjs)
   macOS / Linux : ./run.sh                     (or:  node code-boss.mjs)
-  Different port:  Windows  set PORT=18999 && node code-boss.mjs
+  Different port:  Windows  $env:PORT=18999; node code-boss.mjs
                    Unix     PORT=18999 node code-boss.mjs
 
 FIRST RUN
@@ -5769,7 +5779,7 @@ FIRST RUN
 FOLDER CONTENTS
   code-boss.mjs   the app - one self-contained file, no install step
   tools/          the .docx helper (Apache POI). Keep it next to code-boss.mjs.
-  run.bat / run.sh  launchers
+  run.ps1 / run.bat / run.sh  launchers
 ${bundledNode ? '  node/           bundled Node runtime\n' : ''}.docx editing: ${docxNote}
 
 OFFLINE / AIR-GAPPED
@@ -5780,63 +5790,67 @@ OFFLINE / AIR-GAPPED
 
 function pkgArg(argv, name) { const i = argv.indexOf(name); return i >= 0 ? argv[i + 1] : null; }
 
-// A self-extracting, click-to-run Windows installer .bat with the zip embedded
-// (base64 after a marker; decoded by built-in PowerShell — no extra tools).
+// A self-extracting, click-to-run Windows installer .ps1 with the zip embedded as
+// a base64 here-string (NOT a comment/marker: PowerShell parses the WHOLE file as
+// code first, so the payload must be a string literal). Built-in PowerShell only.
 // Behavior the developer asked for:
-//   - FIRST run: extract into the .bat's own folder → <here>\code_boss_v<ver>\, then run.
-//   - LATER runs of the SAME .bat: folder already there → skip extract, just run.
-//   - A NEW version's .bat: different code_boss_v<ver> folder → installs alongside + runs that one.
-// All console output (boot/crash messages that a double-click would otherwise
-// lose) is captured to <here>\code_boss_v<ver>-launch.log; the app's own
-// per-project log stays at <project>\.code_boss\code-boss.log.
-const PKG_INSTALL_MARKER = '__CODE_BOSS_ZIP_PAYLOAD__';
-function pkgInstallerBat(version, base64) {
-  const lines = [
-    '@echo off',
-    'setlocal',
-    'set "HERE=%~dp0"',
-    `set "VER=${version}"`,
-    'set "APP=%HERE%code_boss_v%VER%"',
-    'set "LOG=%HERE%code_boss_v%VER%-launch.log"',
-    '',
-    'rem First run installs (decodes the embedded zip and extracts code_boss_v%VER%\\);',
-    'rem later runs of this same file skip straight to launching it.',
-    'if exist "%APP%\\code-boss.mjs" goto :havenode',
-    'echo Installing code_boss v%VER% into "%APP%" ...',
-    `powershell -NoProfile -ExecutionPolicy Bypass -Command "try { $s=[IO.File]::ReadAllText('%~f0'); $m='${PKG_INSTALL_MARKER}'; $i=$s.LastIndexOf($m); $b64=$s.Substring($i+$m.Length).Trim(); $zip=Join-Path $env:TEMP ('cbv'+[guid]::NewGuid().ToString('N')+'.zip'); [IO.File]::WriteAllBytes($zip,[Convert]::FromBase64String($b64)); Expand-Archive -LiteralPath $zip -DestinationPath '%HERE%' -Force; Remove-Item -LiteralPath $zip -Force; exit 0 } catch { Write-Host ('extract failed: '+$_.Exception.Message); exit 1 }"`,
-    'if errorlevel 1 goto :installfail',
-    '',
-    ':havenode',
-    'set "NODEEXE=%APP%\\node\\node.exe"',
-    'if exist "%NODEEXE%" goto :launch',
-    'where node >nul 2>nul && set "NODEEXE=node" && goto :launch',
-    'echo.',
-    'echo Node.js 20+ was not found on PATH. Install it from https://nodejs.org then run this again.',
-    'pause',
-    'exit /b 1',
-    '',
-    ':launch',
-    'echo ===== run %DATE% %TIME% =====>> "%LOG%"',
-    'echo Starting code_boss v%VER%.  A browser tab opens automatically.',
-    'echo Output is logged to "%LOG%"  - keep this window open; close it to stop code_boss.',
-    'cd /d "%APP%"',
-    '"%NODEEXE%" code-boss.mjs >> "%LOG%" 2>&1',
-    'echo.',
-    'echo code_boss exited - see "%LOG%" for details.',
-    'pause',
-    'exit /b',
-    '',
-    ':installfail',
-    'echo.',
-    'echo Install failed - see the message above.',
-    'pause',
-    'exit /b 1',
-    '',
-    PKG_INSTALL_MARKER,
+//   - FIRST run: extract into the .ps1's own folder → <here>\code_boss_v<ver>\, then run.
+//   - LATER runs of the SAME .ps1: folder already there → skip extract, just run.
+//   - A NEW version's .ps1: different code_boss_v<ver> folder → installs alongside + runs that one.
+// Console output (boot/crash messages a launch would otherwise lose) is teed to
+// <here>\code_boss_v<ver>-launch.log; the app's per-project log stays at
+// <project>\.code_boss\code-boss.log.
+function pkgInstallerPs1(version, base64) {
+  // base64 on ONE line inside a single-quoted here-string: literal, no
+  // interpolation, and base64 has no quote so it can't terminate early. The
+  // closing '@ must sit at column 0.
+  return [
+    "$b64 = @'",
     base64,
+    "'@",
+    "$ErrorActionPreference = 'Stop'",
+    '$here = $PSScriptRoot; if (-not $here) { $here = Split-Path -Parent $MyInvocation.MyCommand.Path }',
+    `$ver = '${version}'`,
+    '$app = Join-Path $here "code_boss_v$ver"',
+    '$log = Join-Path $here "code_boss_v$ver-launch.log"',
     '',
-  ];
-  return lines.join('\n').replace(/\n/g, '\r\n');
+    '# First run: decode the embedded zip + extract code_boss_v$ver\\. Later runs skip to launch.',
+    "if (-not (Test-Path (Join-Path $app 'code-boss.mjs'))) {",
+    '  Write-Host "Installing code_boss v$ver into $app ..."',
+    '  try {',
+    "    $zip = Join-Path $env:TEMP ('cbv' + [guid]::NewGuid().ToString('N') + '.zip')",
+    '    [IO.File]::WriteAllBytes($zip, [Convert]::FromBase64String($b64.Trim()))',
+    '    Expand-Archive -LiteralPath $zip -DestinationPath $here -Force',
+    '    Remove-Item -LiteralPath $zip -Force',
+    '  } catch {',
+    '    Write-Host ("Install failed: " + $_.Exception.Message)',
+    "    Read-Host 'Press Enter to exit'; exit 1",
+    '  }',
+    '}',
+    '',
+    "$node = Join-Path $app 'node\\node.exe'",
+    'if (-not (Test-Path $node)) {',
+    '  if (-not (Get-Command node -ErrorAction SilentlyContinue)) {',
+    "    Write-Host 'Node.js 20+ was not found on PATH. Install it from https://nodejs.org then run this again.'",
+    "    Read-Host 'Press Enter to exit'; exit 1",
+    '  }',
+    "  $node = 'node'",
+    '}',
+    '',
+    "$ErrorActionPreference = 'Continue'",
+    'Write-Host "Starting code_boss v$ver - a browser tab opens automatically."',
+    'Write-Host "Running; output is logged to $log. Close this window to stop code_boss."',
+    '# Launch node with its STDERR (where code_boss writes its startup/diagnostic',
+    '# log) redirected to the log file at the OS level: clean UTF-8, no PowerShell',
+    '# stderr-as-error wrapping, and reliable for a long-running process (a PS pipe',
+    '# would buffer + mangle the encoding). stdout stays on the console.',
+    '$proc = Start-Process -FilePath $node -ArgumentList "code-boss.mjs" -WorkingDirectory $app -NoNewWindow -PassThru -RedirectStandardError $log',
+    '$proc.WaitForExit()',
+    'Write-Host ""',
+    'Write-Host "code_boss exited - see $log for details."',
+    "Read-Host 'Press Enter to exit'",
+    '',
+  ].join('\r\n');
 }
 
 // Recursive dir copy (the HEADER doesn't expose fs.cp, so do it by hand).
@@ -5899,11 +5913,20 @@ async function runPackageCommand({ argv, bundlePath, version }) {
   const outDir = path.resolve(pkgArg(argv, '--out') || path.join(process.cwd(), 'release'));
   const nodeDir = pkgArg(argv, '--node');
 
-  // The zip's single top-level folder is code_boss_v<version>, so a Windows
-  // "Extract All" into D:\code_boss lands the files at D:\code_boss\code_boss_v<version>\.
+  // Build the staging folder + zip in a TEMP dir so release/ ends up holding ONLY
+  // the single .ps1 installer. The zip's top-level folder is code_boss_v<version>,
+  // so a manual "Extract All" still lands files at <dest>\code_boss_v<version>\.
   const stageName = `code_boss_v${version}`;
-  const stage = path.join(outDir, stageName);
-  await rm(stage, { recursive: true, force: true });
+  const workDir = path.join(outDir, '.cb-build');
+  const stage = path.join(workDir, stageName);
+  await mkdir(outDir, { recursive: true });
+  // Clear prior code_boss artifacts (old zips / version folders / .bat|.ps1
+  // installers + a stale build dir) so the release dir is left with just the new .ps1.
+  try {
+    for (const e of await readdir(outDir)) {
+      if (/^code[-_]boss[-_]v/i.test(e) || e === '.cb-build') await rm(path.join(outDir, e), { recursive: true, force: true });
+    }
+  } catch { /* */ }
   await mkdir(path.join(stage, 'tools', 'lib'), { recursive: true });
   await copyFile(bundlePath, path.join(stage, 'code-boss.mjs'));
 
@@ -5935,7 +5958,7 @@ async function runPackageCommand({ argv, bundlePath, version }) {
   if (helper) {
     await copyFile(helper, helperDest);
     docxNote = `included (prebuilt helper jar + ${depJars.length} POI deps) - runs with just a JRE on the target.`;
-  } else if (depJars.length && await pkgCompileHelper(stagedLib, helperDest, outDir)) {
+  } else if (depJars.length && await pkgCompileHelper(stagedLib, helperDest, workDir)) {
     docxNote = `compiled here from embedded source (helper jar + ${depJars.length} POI deps) - runs with just a JRE on the target.`;
   } else if (depJars.length) {
     docxNote = `POI deps only (${depJars.length}); no prebuilt ${PKG_HELPER_JAR} and no JDK here to prebuild one, so the target compiles it from embedded source on first run (needs a JDK there).`;
@@ -5951,39 +5974,52 @@ async function runPackageCommand({ argv, bundlePath, version }) {
   }
 
   await writeFile(path.join(stage, 'run.bat'), PKG_RUN_BAT.replace(/\n/g, '\r\n'), 'utf8');
+  await writeFile(path.join(stage, 'run.ps1'), PKG_RUN_PS1.replace(/\n/g, '\r\n'), 'utf8');
   await writeFile(path.join(stage, 'run.sh'), PKG_RUN_SH, 'utf8');
   await writeFile(path.join(stage, 'README.txt'), pkgReadme(version, docxNote, bundledNode), 'utf8');
 
   // Zip the staging folder (Windows: PowerShell Compress-Archive; else `zip`).
-  const zip = path.join(outDir, `code-boss-v${version}.zip`);
+  const zip = path.join(workDir, `code-boss-v${version}.zip`);
   await rm(zip, { force: true });
   let zipped = false;
   if (process.platform === 'win32') {
     const r = spawnSync('powershell', ['-NoProfile', '-Command', `Compress-Archive -Path '${stage}' -DestinationPath '${zip}' -Force`], { stdio: 'inherit' });
     zipped = r.status === 0;
   } else {
-    const r = spawnSync('zip', ['-r', '-q', zip, stageName], { cwd: outDir, stdio: 'inherit' });
+    const r = spawnSync('zip', ['-r', '-q', zip, stageName], { cwd: workDir, stdio: 'inherit' });
     zipped = r.status === 0;
   }
 
-  // Self-extracting click-to-run installer (Windows): embed the zip we just made.
+  // The single deliverable: a self-extracting .ps1 installer (the zip embedded).
   let installer = null;
-  if (zipped && pkgArg(argv, '--no-installer') === null) {
+  if (zipped) {
     try {
       const b64 = (await readFile(zip)).toString('base64');
-      installer = path.join(outDir, `code_boss_v${version}-installer.bat`);
-      await writeFile(installer, pkgInstallerBat(version, b64), 'utf8');
-    } catch (e) { console.error('package: installer .bat generation failed: ' + (e?.message || e)); installer = null; }
+      installer = path.join(outDir, `code_boss_v${version}.ps1`);
+      await rm(installer, { force: true });
+      await writeFile(installer, pkgInstallerPs1(version, b64), 'utf8');
+    } catch (e) { console.error('package: .ps1 installer generation failed: ' + (e?.message || e)); installer = null; }
   }
 
+  // Clean the temp build dir → release/ holds ONLY the .ps1. Pass --keep-build to
+  // retain the staged folder + zip for inspection.
+  const keepBuild = pkgArg(argv, '--keep-build') !== null;
+  if (installer && !keepBuild) { try { await rm(workDir, { recursive: true, force: true }); } catch { /* */ } }
+
   console.error('');
-  console.error('staged: ' + stage);
-  if (zipped) { const kb = Math.round((await stat(zip)).size / 1024); console.error(`zip:      ${zip}  (${kb} KB)`); }
-  else console.error(`zip step failed - the staged folder is ready; zip ${stage} manually.`);
-  if (installer) { const kb = Math.round((await stat(installer)).size / 1024); console.error(`installer: ${installer}  (${kb} KB)  - double-click: installs to .\\code_boss_v${version}\\ on first run, just launches after`); }
-  console.error('docx:     ' + docxNote);
-  console.error('node:     ' + (bundledNode ? 'bundled (./node)' : 'target must have Node 20+ on PATH'));
-  return 0;
+  if (installer) {
+    const kb = Math.round((await stat(installer)).size / 1024);
+    console.error(`installer: ${installer}  (${kb} KB)`);
+    console.error(`           Right-click → Run with PowerShell. First run installs to .\\code_boss_v${version}\\ + launches; later runs just launch; a new version makes its own folder.`);
+    if (keepBuild) console.error(`build:     ${workDir}  (staged folder + zip kept via --keep-build)`);
+  } else if (!zipped) {
+    console.error(`zip step failed - staged folder left at ${stage} for inspection.`);
+  } else {
+    console.error('installer generation failed - see the error above.');
+  }
+  console.error('docx:  ' + docxNote);
+  console.error('node:  ' + (bundledNode ? 'bundled (./node)' : 'target must have Node 20+ on PATH'));
+  return installer ? 0 : 1;
 }
 
 // ====== agent/git-workflow.mjs ======
