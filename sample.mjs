@@ -15,7 +15,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '219';
+const BUILD_VERSION = '223';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
@@ -5013,9 +5013,10 @@ const INTAKE_MAX_TURNS = 8;
 
 const INTAKE_SYSTEM_PROMPT = `You are an intake manager for a software-maintenance team. A developer pastes you raw material — emails, tickets, specs, notes — describing work they need done. Your job is to turn it into ONE clear, frozen REQUIREMENT that a coding agent and an acceptance checker can both act on. You do NOT do the work yourself and you MUST NOT modify anything.
 
-You may ground yourself by reading the repository READ-ONLY (same tools as a reviewer; emit calls inside a <remote-workspace> block):
+The developer's PROJECT is open and available to you READ-ONLY (same tools as a reviewer; emit calls inside a <remote-workspace> block):
   <read path="FILE"/>  <list path="DIR"/>  <search pattern="REGEX" path="DIR"/>  <find pattern="GLOB"/>  <info path="FILE"/>
   <powershell>git log --oneline -n 5</powershell>   (read-only commands only)
+Paths are relative to the PROJECT ROOT — start with <list path="."/> to see it. If the developer points at a file, folder, or document (e.g. "the spec is in the specs folder", "see docs/X"), LIST and READ it to ground the requirement — do NOT claim the workspace is empty without checking with <list path="."/> first.
 
 How to behave:
 - BIAS STRONGLY TOWARD EMITTING THE CARD. The card is editable — the developer refines or corrects it after you emit it — so a good-enough card beats another question. Do NOT hold the card back waiting for perfect certainty.
@@ -5062,16 +5063,22 @@ function parseRequirementCard(prose) {
  *   { complete:false, reason:'awaiting-user', assistantText }  — a clarifying turn; user replies next
  *   { complete:false, reason:'max-turns' }                     — ran out of turns with no card
  */
-async function runIntake({ adapter, model, messages = [], signal, onLog, onTurn, onDiag, repoRoots = [] }) {
+async function runIntake({ adapter, model, messages = [], signal, onLog, onTurn, onDiag, repoRoots = [], projectDir = null }) {
   const log = (m) => { try { onLog?.(m); } catch {} };
   // Awaited so a callback that persists state (e.g. addSource) completes before
   // the next turn — prevents floating promises AND torn concurrent writes.
   const emit = async (ev) => { try { await onTurn?.(ev); } catch {} };
+  // Resolve a relative tool path against the active PROJECT first — CWD-INDEPENDENT
+  // so the planning agent always sees the developer's files (e.g. a specs/ folder),
+  // not whatever process.cwd() happens to be. Falls back to cwd, then git repo
+  // roots; an unmatched relative path still targets the project (so it lists/reads
+  // the project root, never an unrelated dir — the "workspace is empty" bug).
   const resolveAgainstRepos = (p) => {
     if (typeof p !== 'string' || !p || path.isAbsolute(p)) return p;
+    try { if (projectDir && existsSync(path.join(projectDir, p))) return path.join(projectDir, p); } catch {}
     try { if (existsSync(path.join(process.cwd(), p))) return p; } catch {}
     for (const root of repoRoots) { try { if (existsSync(path.join(root, p))) return path.join(root, p); } catch {} }
-    return p;
+    return projectDir ? path.join(projectDir, p) : p;
   };
   const convo = [{ role: 'system', content: INTAKE_SYSTEM_PROMPT }, ...(Array.isArray(messages) ? messages : [])];
 
@@ -11173,7 +11180,7 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
             };
             const result = await runIntake({
               adapter, model: intakeModel, messages: convoMessages, signal,
-              onLog: fileLog, onTurn, repoRoots: session.git?.repoList || [],
+              onLog: fileLog, onTurn, repoRoots: session.git?.repoList || [], projectDir: session.activeProject,
               onDiag: (d) => appendChatEvent({ type: 'manager-diagnostic', assignmentId, ...d }),
             });
             if (!result.complete && result.reason === 'max-turns') {
@@ -11227,23 +11234,48 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
         const intakeModel = body?.model ?? session.defaultModel;
         const ac = new AbortController();
         const entered = enterProjectCwd(session.activeProject);
+        // STREAM the planning agent's turns as the SAME event shapes the main
+        // chat renders (tool-call / tool-result / assistant-text), one JSON object
+        // per line (NDJSON), so the intake modal reuses renderEvent live.
+        res.writeHead(200, { 'Content-Type': 'application/x-ndjson; charset=utf-8', 'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no' });
+        res.on('close', () => { try { ac.abort(); } catch {} });
+        const emit = (ev) => { try { res.write(JSON.stringify(ev) + '\n'); } catch {} };
+        let nextCallId = 0;
+        const stripCard = (s) => String(s || '').replace(/<requirement-card>[\s\S]*?<\/requirement-card>/i, '').trim();
+        const onTurn = (t) => {
+          if (!t) return;
+          if (t.kind === 'tools') {
+            const calls = t.calls || [], results = t.results || [];
+            for (let i = 0; i < calls.length; i++) {
+              const c = calls[i], cid = 'intake-' + (nextCallId++);
+              emit({ type: 'tool-call', verb: c.verb, name: c.name, args: c.args, callId: cid });
+              const r = results[i];
+              if (r) emit({ type: 'tool-result', status: r.status, content: r.content, fullLen: (r.content || '').length, callId: cid, verb: c.verb, name: c.name });
+            }
+            for (let i = calls.length; i < results.length; i++) emit({ type: 'assistant-text', content: results[i].content || '' });
+          } else if (t.kind === 'message') {
+            emit({ type: 'assistant-text', content: t.content || '' });
+          } else if (t.kind === 'card') {
+            const p = stripCard(t.prose);
+            if (p) emit({ type: 'assistant-text', content: p });
+          }
+        };
         try {
-          const result = await runIntake({ adapter, model: intakeModel, messages: intakeMessages, signal: ac.signal, onLog: fileLog, repoRoots: session.git?.repoList || [] });
-          let reply = '', card = null;
+          const result = await runIntake({ adapter, model: intakeModel, messages: intakeMessages, signal: ac.signal, onLog: fileLog, onTurn, repoRoots: session.git?.repoList || [], projectDir: session.activeProject });
+          let card = null;
           if (result.complete && result.card) {
             card = { title: result.card.title || '', requirement: result.card.requirement || '', acceptanceCriteria: result.card.acceptanceCriteria || '' };
-            reply = String(result.prose || '').replace(/<requirement-card>[\s\S]*?<\/requirement-card>/i, '').trim()
-              || 'Drafted the fields on the left — review and Add, or keep refining.';
-          } else if (result.reason === 'awaiting-user') {
-            reply = result.assistantText || '';
-          } else {
-            reply = 'I could not fully structure this within my turn budget — edit the fields on the left and Add.';
+            // A card with no surrounding prose left nothing on screen — confirm it.
+            if (!stripCard(result.prose)) emit({ type: 'assistant-text', content: 'Drafted the fields on the left — review and Add, or keep refining.' });
           }
-          return sendJson(res, 200, { ok: true, reply, card });
+          // awaiting-user and max-turns already streamed their message via onTurn.
+          emit({ type: 'intake-done', card });
         } catch (e) {
           fileLog(`intake-chat error: ${e?.message ?? e}`);
-          return sendJson(res, 200, { ok: false, reply: 'Intake error: ' + (e?.message ?? String(e)), card: null });
-        } finally { exitProjectCwd(entered); }
+          emit({ type: 'assistant-text', content: 'Intake error: ' + (e?.message ?? String(e)) });
+          emit({ type: 'intake-done', card: null });
+        } finally { try { res.end(); } catch {} exitProjectCwd(entered); }
+        return;
       }
       // Capture-from-card: freeze the (possibly user-edited) card into the
       // assignment. patch(status:'ready') auto-stamps readyAt — THAT is the
@@ -12874,11 +12906,12 @@ const UI_HTML = `<!DOCTYPE html>
   .intake-fields input, .intake-fields textarea { background: var(--panel-alt); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 6px 8px; font: inherit; font-size: 13px; resize: vertical; }
   .intake-fields input:focus, .intake-fields textarea:focus { border-color: var(--accent); outline: none; }
   .intake-chat { flex: 1; display: flex; flex-direction: column; min-width: 0; }
-  .im-log { flex: 1; overflow-y: auto; padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; }
-  .im-msg { font-size: 13px; line-height: 1.45; white-space: pre-wrap; word-wrap: break-word; }
-  .im-msg.user::before { content: 'you '; color: var(--accent); font-weight: 700; }
-  .im-msg.manager { border-left: 3px solid #6a8db0; padding-left: 8px; }
-  .im-msg.manager.thinking { color: var(--muted); font-style: italic; border-left-color: var(--muted); }
+  /* The intake mini-chat reuses the MAIN chat renderer (renderInto → renderEvent),
+     so #im-log holds the same .row/.bubble/.row-result rows. Block layout (the
+     rows carry their own margins); full width in the narrow pane. */
+  .im-log { flex: 1; overflow-y: auto; padding: 8px 14px; display: block; }
+  #im-log .row, #im-log .bubble, #im-log .row-result, #im-log .diff-block, #im-log .log { max-width: none; }
+  .im-spin { color: var(--muted); font-size: 12px; padding: 4px 2px; }
   .im-inputrow { display: flex; gap: 8px; padding: 8px 14px; border-top: 1px solid var(--border); }
   .im-inputrow textarea { flex: 1; background: var(--panel-alt); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; font: inherit; font-size: 13px; resize: none; }
   .im-inputrow textarea:focus { border-color: var(--accent); outline: none; }
@@ -14720,8 +14753,14 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   const $browserStatus = document.getElementById('browserStatus');
   const $openHereBtn = document.getElementById('openHereBtn');
   const $projectPath = document.getElementById('projectPath');
-  const $log = document.getElementById('log');
-  const $logScroll = document.getElementById('logScroll');
+  const _logEl = document.getElementById('log');
+  const _logScrollEl = document.getElementById('logScroll');
+  // Render context: every chat-log row is built into RC.log and scrolled via
+  // RC.scroll. Defaults to the MAIN chat; renderInto() swaps it SYNCHRONOUSLY so
+  // the SAME renderEvent + row builders render into the intake modal's #im-log.
+  // isIntake gates main-chat-only chrome (the status spinner / context-fill bar).
+  let RC = { log: _logEl, scroll: _logScrollEl, isIntake: false };
+  function renderInto(rc, fn) { const prev = RC; RC = rc; try { return fn(); } finally { RC = prev; } }
   const $input = document.getElementById('input');
   const $model = document.getElementById('model');
   const $settingsModalBg = document.getElementById('settingsModalBg');
@@ -14790,16 +14829,17 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   const STALL_MS = 1500;   // no traffic this long → switch to THINKING (blinking)
 
   function ensureStatusRow() {
-    if (statusRow && statusRow.parentNode === $log) return statusRow;
+    if (statusRow && statusRow.parentNode === RC.log) return statusRow;
     statusRow = document.createElement('div');
     statusRow.className = 'status';
-    $log.appendChild(statusRow);
+    RC.log.appendChild(statusRow);
     scrollToBottom();
     return statusRow;
   }
   function pinStatusToBottom() {
-    if (statusRow && statusRow.parentNode === $log && statusRow !== $log.lastChild) {
-      $log.appendChild(statusRow);
+    if (RC.isIntake) return;   // the status spinner is main-chat-only
+    if (statusRow && statusRow.parentNode === RC.log && statusRow !== RC.log.lastChild) {
+      RC.log.appendChild(statusRow);
     }
   }
   function startSpinner() {
@@ -15436,7 +15476,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     if ($settingsTokens) $settingsTokens.textContent = '0';
     // No chat header (project lives in the side panel, model in settings) —
     // just a faint one-line hint so an empty chat isn't blank.
-    $log.innerHTML =
+    RC.log.innerHTML =
       '<div class="welcome">' +
         '<div class="wl">Ask a question below. ⏎ to send, shift+⏎ for newline, esc to interrupt.</div>' +
       '</div>';
@@ -15774,7 +15814,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     } else {
       div.textContent = text;
     }
-    $log.appendChild(div);
+    RC.log.appendChild(div);
     // If the status row already exists (SSE 'status: running' often arrives
     // BEFORE the user-message event), keep it pinned to the bottom — without
     // this the spinner can end up above the first user bubble.
@@ -15783,7 +15823,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     return div;
   }
   function scrollToBottom() {
-    $logScroll.scrollTop = $logScroll.scrollHeight;
+    RC.scroll.scrollTop = RC.scroll.scrollHeight;
   }
   // Render assistant text with Claude Code line styling: ⏺ tool calls in
   // coral, ⎿ results dimmed, prose plain.
@@ -15859,7 +15899,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     if (initial != null) body.textContent = initial;
     row.appendChild(dot);
     row.appendChild(body);
-    $log.appendChild(row);
+    RC.log.appendChild(row);
     pinStatusToBottom();
     scrollToBottom();
     return body;
@@ -15901,7 +15941,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
         pre.style.display = 'none';
       }
     });
-    $log.appendChild(row);
+    RC.log.appendChild(row);
     pinStatusToBottom();
     scrollToBottom();
     return row;
@@ -15918,7 +15958,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       next = '… [earlier output trimmed] …\\n' + next.slice(-PROGRESS_MAX_BYTES);
     }
     _progressBuffers.set(callId, next);
-    const placeholder = $log.querySelector(\`.row-result.running[data-call-id="\${CSS.escape(callId)}"]\`);
+    const placeholder = RC.log.querySelector(\`.row-result.running[data-call-id="\${CSS.escape(callId)}"]\`);
     if (!placeholder) return;
     const sum = placeholder.querySelector('.run-sum');
     if (sum) sum.textContent = \`⎿ Running… \${fmtBytes(next.length)}\`;
@@ -15967,13 +16007,13 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     // multi-block replies where calls fire interleaved with prose.
     let inserted = false;
     if (callId) {
-      const callRow = $log.querySelector(\`.row.tool[data-call-id="\${CSS.escape(callId)}"]\`);
+      const callRow = RC.log.querySelector(\`.row.tool[data-call-id="\${CSS.escape(callId)}"]\`);
       if (callRow) {
         callRow.insertAdjacentElement('afterend', row);
         inserted = true;
       }
     }
-    if (!inserted) $log.appendChild(row);
+    if (!inserted) RC.log.appendChild(row);
     pinStatusToBottom();
     scrollToBottom();
     return row;
@@ -16041,7 +16081,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     row.className = 'compaction-row';
     const pct = ev.budgetPct != null ? \` (\${ev.budgetPct}% of window)\` : '';
     row.textContent = \`↔ Context window full\${pct} — compacting: older tasks are being summarized/archived to free room.\`;
-    $log.appendChild(row);
+    RC.log.appendChild(row);
     pinStatusToBottom();
     scrollToBottom();
     return row;
@@ -16065,7 +16105,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       list.textContent = r.map((x) => \`\${basename(x.repoDir || '') || 'repo'}: \${x.status}\` + (x.message ? \` — \${x.message}\` : (x.reason ? \` — \${x.reason}\` : ''))).join('\\n');
       row.appendChild(list);
     }
-    $log.appendChild(row);
+    RC.log.appendChild(row);
     pinStatusToBottom();
     scrollToBottom();
     return row;
@@ -16198,7 +16238,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
 
     block.appendChild(hdr);
     block.appendChild(body);
-    $log.appendChild(block);
+    RC.log.appendChild(block);
     pinStatusToBottom();
     scrollToBottom();
     return block;
@@ -16245,7 +16285,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       row.appendChild(concerns);
     }
 
-    $log.appendChild(row);
+    RC.log.appendChild(row);
     pinStatusToBottom();
     scrollToBottom();
     return row;
@@ -16255,7 +16295,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   // expects to see on the task box). Returns false if no matching task-wrap is
   // present, so the caller can fall back to a standalone row.
   function renderReviewIntoFooter(ev) {
-    const wrap = $log.querySelector(\`.task-wrap[data-task-id="\${CSS.escape(String(ev.reviewTaskId))}"]\`);
+    const wrap = RC.log.querySelector(\`.task-wrap[data-task-id="\${CSS.escape(String(ev.reviewTaskId))}"]\`);
     if (!wrap) return false;
     const foot = wrap.querySelector('.task-foot');
     if (!foot) return false;
@@ -16326,7 +16366,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       list.textContent = ev.repos.map((r) => \`\${r.relDir} (\${r.branch}) — \${r.changeCount} change(s)\`).join('\\n');
       row.appendChild(list);
     }
-    $log.appendChild(row);
+    RC.log.appendChild(row);
     pinStatusToBottom();
     scrollToBottom();
     return row;
@@ -16558,29 +16598,33 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   // Two panes: editable fields (left) + a read-only mini-chat manager (right)
   // that refines those fields. Not the worker; no files edited, no run.
   let _intakeMessages = [];
+  // The intake mini-chat reuses the MAIN chat renderer: #im-log is its own
+  // render context (its own scroll container), so renderInto(imRC(), …) builds
+  // the same bubbles / tool-call / tool-result rows the main chat uses.
+  function imRC() { const el = document.getElementById('im-log'); return { log: el, scroll: el, isIntake: true }; }
+  function imRender(ev) { renderInto(imRC(), () => renderEvent(ev)); }
   function openIntakeModal() {
     _intakeMessages = [];
     for (const id of ['im-title', 'im-req', 'im-acc', 'im-input']) { const el = document.getElementById(id); if (el) el.value = ''; }
     const log = document.getElementById('im-log');
-    if (log) { log.innerHTML = ''; imAppend('manager', 'Tell me what you want done — paste a ticket/email or just describe it. I\\'ll read the code (read-only) and draft the fields on the left. You can also edit them yourself; hit Add when it looks right.'); }
+    if (log) log.innerHTML = '';
+    imRender({ type: 'assistant-text', content: 'Tell me what you want done — paste a ticket/email or just describe it. I\\'ll read the project (read-only) and draft the fields on the left. You can also edit them yourself; hit Add when it looks right.' });
     document.getElementById('intakeModalBg').classList.add('show');
     setTimeout(() => document.getElementById('im-input')?.focus(), 50);
   }
   function closeIntakeModal() { document.getElementById('intakeModalBg')?.classList.remove('show'); }
-  function imAppend(role, text) {
-    const log = document.getElementById('im-log'); if (!log) return null;
-    const d = document.createElement('div'); d.className = 'im-msg ' + role; d.textContent = text;
-    log.appendChild(d); log.scrollTop = log.scrollHeight; return d;
-  }
   async function sendIntakeChat() {
     const inp = document.getElementById('im-input');
     const text = (inp.value || '').trim();
     if (!text) return;
     inp.value = '';
-    imAppend('user', text);
+    imRender({ type: 'user-message', content: text });
     _intakeMessages.push({ role: 'user', content: text });
     const sendBtn = document.getElementById('im-send'); if (sendBtn) { sendBtn.disabled = true; sendBtn.textContent = '…'; }
-    const thinking = imAppend('manager thinking', 'Reading the code & drafting…');
+    const log = document.getElementById('im-log');
+    const spin = document.createElement('div'); spin.className = 'im-spin'; spin.innerHTML = '<span class="spin">⠋</span> working…';
+    log.appendChild(spin); log.scrollTop = log.scrollHeight;
+    const assistantParts = [];
     try {
       const fields = {
         title: document.getElementById('im-title').value,
@@ -16591,18 +16635,40 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
         method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ messages: _intakeMessages, fields, model: $model.value }),
       });
-      const d = await r.json();
-      if (thinking) thinking.remove();
-      if (d.reply) { imAppend('manager', d.reply); _intakeMessages.push({ role: 'assistant', content: d.reply }); }
-      if (d.card) {
-        // Fill the fields from the refined card (it already incorporates the
-        // developer's current edits, which were sent as context).
-        if (d.card.title) document.getElementById('im-title').value = d.card.title;
-        if (d.card.requirement) document.getElementById('im-req').value = d.card.requirement;
-        if (d.card.acceptanceCriteria) document.getElementById('im-acc').value = d.card.acceptanceCriteria;
+      // NDJSON stream: one event per line, rendered live through the shared renderer.
+      const reader = r.body.getReader(); const dec = new TextDecoder(); let buf = '';
+      const handle = (ev) => {
+        if (ev.type === 'intake-done') {
+          if (ev.card) {
+            if (ev.card.title) document.getElementById('im-title').value = ev.card.title;
+            if (ev.card.requirement) document.getElementById('im-req').value = ev.card.requirement;
+            if (ev.card.acceptanceCriteria) document.getElementById('im-acc').value = ev.card.acceptanceCriteria;
+          }
+          return;
+        }
+        if (ev.type === 'assistant-text') assistantParts.push(ev.content || '');
+        imRender(ev);
+        log.appendChild(spin); log.scrollTop = log.scrollHeight;   // keep the spinner last
+      };
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let nl;
+        while ((nl = buf.indexOf('\\n')) >= 0) {
+          const line = buf.slice(0, nl).trim(); buf = buf.slice(nl + 1);
+          if (!line) continue;
+          let ev; try { ev = JSON.parse(line); } catch { continue; }
+          handle(ev);
+        }
       }
-    } catch (e) { if (thinking) thinking.remove(); imAppend('manager', 'Error: ' + (e?.message || e)); }
-    finally { if (sendBtn) { sendBtn.disabled = false; sendBtn.textContent = 'Send'; } }
+      if (assistantParts.length) _intakeMessages.push({ role: 'assistant', content: assistantParts.join('\\n\\n') });
+    } catch (e) {
+      imRender({ type: 'assistant-text', content: 'Error: ' + (e?.message || e) });
+    } finally {
+      spin.remove();
+      if (sendBtn) { sendBtn.disabled = false; sendBtn.textContent = 'Send'; }
+    }
   }
   async function addFromIntake() {
     const requirement = (document.getElementById('im-req').value || '').trim();
@@ -16743,7 +16809,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     const park = document.createElement('button'); park.className = 'btn'; park.textContent = 'Pause'; park.onclick = () => parkAssignment(ev.assignmentId, row);
     actions.appendChild(accept); actions.appendChild(park);
     row.appendChild(actions);
-    $log.appendChild(row);
+    RC.log.appendChild(row);
     return row;
   }
   async function sendFixToWorker(id, node) {
@@ -16767,7 +16833,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     const row = document.createElement('div');
     row.className = 'row assignment-banner';
     row.textContent = \`▸ Working assignment \${ev.assignmentId}\${ev.title ? ': ' + ev.title : ''}\`;
-    $log.appendChild(row);
+    RC.log.appendChild(row);
     scrollToBottom();
     return row;
   }
@@ -16786,7 +16852,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     pre.textContent = ev.raw || '(empty)';
     det.appendChild(pre);
     row.appendChild(det);
-    $log.appendChild(row);
+    RC.log.appendChild(row);
     scrollToBottom();
     return row;
   }
@@ -16804,7 +16870,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       line.textContent = \`[\${f.category || 'general'}] \${f.note}\`;
       row.appendChild(line);
     }
-    $log.appendChild(row);
+    RC.log.appendChild(row);
     scrollToBottom();
     return row;
   }
@@ -16921,7 +16987,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     };
     actions.appendChild(capture); actions.appendChild(refine); actions.appendChild(discard);
     row.appendChild(actions);
-    $log.appendChild(row);
+    RC.log.appendChild(row);
     scrollToBottom();
     return row;
   }
@@ -17889,13 +17955,13 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
           stopSpinTick();
           // Defensive: any tool row still marked running (e.g., agent
           // aborted mid-tool) should stop blinking now.
-          $log.querySelectorAll('.row.tool.tool-running').forEach((r) => r.classList.remove('tool-running'));
+          RC.log.querySelectorAll('.row.tool.tool-running').forEach((r) => r.classList.remove('tool-running'));
           // Sweep ORPHANED streaming bubbles: a prose segment that sanitized to
           // empty (pure tool-tag noise like "<read ...args/>") never gets its
           // finalize event, so its data-streaming row is never replaced/removed.
           // On terminal status, drop any such row whose content is ONLY tool-tag
           // noise (real prose leaves visible text and is kept).
-          $log.querySelectorAll('.row.assistant[data-streaming="true"]').forEach((r) => {
+          RC.log.querySelectorAll('.row.assistant[data-streaming="true"]').forEach((r) => {
             const stripped = (r.textContent || '')
               .replace(/<remote-workspace\\b[\\s\\S]*?<\\/remote-workspace>/gi, '')
               .replace(/<\\/?(?:remote-workspace|read|write|edit|list|find|search|info|powershell|next-task|list-tasks|task-detail|search-tasks|remember|forget)\\b[^>]*>/gi, '')
@@ -18022,7 +18088,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     }
     if (ev.type === 'task-archived') {
       // Mute the whole wrap heavily as an "archived" indicator
-      const wrap = $log.querySelector(\`.task-wrap[data-task-id="\${ev.taskId}"]\`);
+      const wrap = RC.log.querySelector(\`.task-wrap[data-task-id="\${ev.taskId}"]\`);
       if (wrap) wrap.classList.add('muted');
       return true;
     }
@@ -18030,7 +18096,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   }
 
   function muteTaskRows(taskId, mode) {
-    const rows = $log.querySelectorAll(\`[data-task-id="\${taskId}"]\`);
+    const rows = RC.log.querySelectorAll(\`[data-task-id="\${taskId}"]\`);
     rows.forEach((r) => {
       if (mode === 'results') {
         if (r.classList.contains('row-result') || r.classList.contains('diff-block')) {
@@ -18045,7 +18111,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   function wrapRollup(ev) {
     // Find the existing task-wraps for the child task IDs.
     const children = (ev.childTaskIds || [])
-      .map((id) => $log.querySelector(\`.task-wrap[data-task-id="\${id}"]\`))
+      .map((id) => RC.log.querySelector(\`.task-wrap[data-task-id="\${id}"]\`))
       .filter(Boolean);
     if (children.length === 0) return;
 
@@ -18078,7 +18144,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
 
     // Insert the project wrap at the position of the FIRST child wrap.
     const firstChild = children[0];
-    $log.insertBefore(project, firstChild);
+    RC.log.insertBefore(project, firstChild);
     // Move all child wraps into the project body.
     for (const c of children) body.appendChild(c);
 
@@ -18105,7 +18171,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   }
 
   function clearLog() {
-    $log.innerHTML = '';
+    RC.log.innerHTML = '';
     statusRow = null;
   }
 
@@ -18133,7 +18199,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
         // canonical (sanitized + renderInline'd) version instead of
         // duplicating it. \`turn\` is required: segmentIndex resets per turn.
         const segKey = (ev.taskId || '') + ':' + (ev.turn ?? 0) + ':' + (ev.segmentIndex ?? 0);
-        const existing = $log.querySelector(\`.row.assistant[data-streaming="true"][data-segment-key="\${CSS.escape(segKey)}"]\`);
+        const existing = RC.log.querySelector(\`.row.assistant[data-streaming="true"][data-segment-key="\${CSS.escape(segKey)}"]\`);
         if (existing) {
           const body = existing.querySelector('.body');
           if (body) body.innerHTML = renderInline(ev.content || '');
@@ -18153,7 +18219,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
         // finalize it. \`turn\` prevents turn N+1 from appending onto a
         // dangling turn-N bubble (segmentIndex resets to 0 each turn).
         const segKey = (ev.taskId || '') + ':' + (ev.turn ?? 0) + ':' + (ev.segmentIndex ?? 0);
-        let row = $log.querySelector(\`.row.assistant[data-streaming="true"][data-segment-key="\${CSS.escape(segKey)}"]\`);
+        let row = RC.log.querySelector(\`.row.assistant[data-streaming="true"][data-segment-key="\${CSS.escape(segKey)}"]\`);
         const incoming = ev.content || '';
         if (!row) {
           // Defer creating the bubble until there is NON-whitespace content. A
@@ -18257,7 +18323,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
         // The matching tool-call row's blinking dot should stop now.
         if (ev.callId) {
           const cid = CSS.escape(ev.callId);
-          const callRow = $log.querySelector(\`.row.tool[data-call-id="\${cid}"]\`);
+          const callRow = RC.log.querySelector(\`.row.tool[data-call-id="\${cid}"]\`);
           if (callRow) {
             callRow.classList.remove('tool-running');
             // Reflect a failed/cancelled result on the CALL row's dot too, so a
@@ -18267,7 +18333,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
           }
           // Drop the running placeholder and its live-output buffer —
           // the proper result row below carries the full final content.
-          const placeholder = $log.querySelector(\`.row-result.running[data-call-id="\${cid}"]\`);
+          const placeholder = RC.log.querySelector(\`.row-result.running[data-call-id="\${cid}"]\`);
           if (placeholder) placeholder.remove();
           _progressBuffers.delete(ev.callId);
         }
@@ -18332,7 +18398,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       // belong to. If the wrap already exists, move the row into its body so
       // it nests correctly (review verdicts use renderReviewIntoFooter above).
       if (!node.closest('.task-wrap')) {
-        const wrap = $log.querySelector(\`.task-wrap[data-task-id="\${CSS.escape(String(ev.taskId))}"]\`);
+        const wrap = RC.log.querySelector(\`.task-wrap[data-task-id="\${CSS.escape(String(ev.taskId))}"]\`);
         const body = wrap && wrap.querySelector('.task-body');
         if (body) { body.appendChild(node); scrollToBottom(); }
       }
@@ -18346,7 +18412,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     const taskId = ev.taskId;
     if (!taskId) return;
     // Find all rows for this task that are NOT already inside a wrap.
-    const rows = Array.from($log.querySelectorAll(\`[data-task-id="\${taskId}"]\`))
+    const rows = Array.from(RC.log.querySelectorAll(\`[data-task-id="\${taskId}"]\`))
       .filter((r) => !r.closest('.task-wrap'));
     // NOTE: a 0-row task (e.g. the last/thinnest task, whose only rows were
     // already consumed, or a task with no standalone body rows) STILL gets a
@@ -18382,7 +18448,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     // undefined → insertBefore(wrap, null) appends at end-of-log, which is the
     // correct spot for a freshly-closed task.
     const firstRow = rows[0];
-    $log.insertBefore(wrap, firstRow || null);
+    RC.log.insertBefore(wrap, firstRow || null);
     // Move rows into the body (no-op for an empty task)
     for (const r of rows) body.appendChild(r);
 
@@ -18782,12 +18848,12 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     if (_loadingOlder || _noMoreOlder) return;
     if (!session || !session.events || session.events.length === 0) return;
     // Trigger when scrolled within 120px of the top
-    if ($logScroll.scrollTop > 120) return;
+    if (RC.scroll.scrollTop > 120) return;
     _loadingOlder = true;
     const oldestId = session.events[0].id;
     // Save scroll metrics so we can preserve position after prepending
-    const prevScrollHeight = $logScroll.scrollHeight;
-    const prevScrollTop = $logScroll.scrollTop;
+    const prevScrollHeight = RC.scroll.scrollHeight;
+    const prevScrollTop = RC.scroll.scrollTop;
     try {
       const r = await fetch(\`/api/events?before=\${encodeURIComponent(oldestId)}&limit=50\`);
       if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -18803,8 +18869,8 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       clearLog();
       for (const ev of session.events) renderEvent(ev);
       // Restore scroll position so the user's current view doesn't jump
-      const newScrollHeight = $logScroll.scrollHeight;
-      $logScroll.scrollTop = prevScrollTop + (newScrollHeight - prevScrollHeight);
+      const newScrollHeight = RC.scroll.scrollHeight;
+      RC.scroll.scrollTop = prevScrollTop + (newScrollHeight - prevScrollHeight);
       if (!data.hasMoreOlder) _noMoreOlder = true;
     } catch (e) {
       console.error('load older failed:', e);
@@ -18814,7 +18880,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   }
   // Throttled scroll handler
   let _scrollT = null;
-  $logScroll.addEventListener('scroll', () => {
+  RC.scroll.addEventListener('scroll', () => {
     if (_scrollT) return;
     _scrollT = setTimeout(() => { _scrollT = null; maybeLoadOlder(); }, 150);
   });
