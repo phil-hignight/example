@@ -15,7 +15,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '207';
+const BUILD_VERSION = '216';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
@@ -2525,6 +2525,17 @@ const HYST_LOW  = 0.50;          // compact down to 50% of TOTAL_BUDGET in one p
 const TASK_NUDGE = 0.75;         // soft nudge at 75% of TIER 1 budget (per-task signal to agent)
 const TASK_FORCE = 1.00;
 const MIN_T3_FOR_LLM_ROLLUP = 8; // skip LLM call unless we have at least this many tier-3 tasks to cluster
+// Minimum task size before the model may CLOSE a free-conversation task, so
+// several small related exchanges bundle into ONE task instead of
+// one-task-per-exchange (an over-budget close, or one the model marks
+// new-topic="true" for genuinely unrelated work, always passes). Bigger tasks are
+// what make compaction worthwhile — we still summarize small tasks when we
+// compact (a small saving is better than none), we just don't WANT a pile of
+// tiny tasks in the first place. Env-overridable; set to 0 to DISABLE (tests that
+// drive the loop with tiny budgets). _envNum can't express 0 (it treats 0 as
+// "unset"), so this reads the env directly to allow an explicit 0.
+const _envNumZ = (name, def) => { const v = process.env[name]; if (v == null || v === '') return def; const n = Number(v); return Number.isFinite(n) && n >= 0 ? n : def; };
+const MIN_TASK_TOKENS = _envNumZ('MIN_TASK_TOKENS', 8000);
 // How much of a tool result is sent to the BROWSER for display (the chat-event
 // content). UI-only — the MODEL always gets the full result via formatToolResults.
 // 300k so a whole docx/build log is readable in the row (the expandable <pre> is
@@ -2581,7 +2592,7 @@ const DEFAULT_MAX_TURNS = 20;
 const REPEAT_LIMIT = 3;
 
 // ── System prompt ───────────────────────────────────────────────────────────
-function buildSystemPrompt({ taskId, taskUserRequest, tier1Tokens, tier1Pct, promptAdditions = [], projectContext = '', codebaseMemory = '', discussMode = false, weblogicStatus = null }) {
+function buildSystemPrompt({ taskId, taskUserRequest, tier1Tokens, tier1Pct, promptAdditions = [], projectContext = '', codebaseMemory = '', discussMode = false, weblogicStatus = null, enforceMinTaskSize = false }) {
   const lines = [
     'You are code_boss, a coding agent. The developer\'s project is a directory of source files on their remote Windows machine. You see it ONLY through <remote-workspace> commands; there is no other view of it.',
     '',
@@ -2598,16 +2609,26 @@ function buildSystemPrompt({ taskId, taskUserRequest, tier1Tokens, tier1Pct, pro
         ? 'WebLogic server: STOPPED (nothing on port 7101). If this task needs the server (deploy / run / start an app), start it FIRST with `wl startWebLogic` — it launches in the background (~1-2 min) and this line will switch to RUNNING when it is up. Do not deploy/run before then.'
         : ''),
     `Current task: ${taskId}` + (taskUserRequest ? `  ↳ ${taskUserRequest}` : ''),
-    `Task budget: ${tier1Tokens} / ${TIER_1_BUDGET} tokens (${tier1Pct}%)` + (tier1Pct >= TASK_FORCE * 100
+    `Task size: ${tier1Tokens} / ${TIER_1_BUDGET} tokens (${tier1Pct}%)` + (enforceMinTaskSize && MIN_TASK_TOKENS > 0 ? `  [min ~${MIN_TASK_TOKENS} tokens before this task is worth closing]` : '') + (tier1Pct >= TASK_FORCE * 100
       ? '  ← OVER BUDGET. Close this task NOW: emit <next-task user-request="..." summary="..."/> in this reply. If you do not, the system will auto-close it for you and you lose control of the summary.'
       : tier1Pct >= TASK_NUDGE * 100
         ? '  ← nearing budget; close this task at the next natural stopping point with <next-task .../>'
-        : ''),
+        : (enforceMinTaskSize && MIN_TASK_TOKENS > 0)
+          ? (tier1Tokens < MIN_TASK_TOKENS
+            ? '  ← still small; keep bundling related exchanges into THIS task. Do NOT close it yet (use <task-progress>) unless your next work is genuinely unrelated.'
+            : '  ← past the minimum; you may close at a natural stopping point.')
+          : ''),
     '',
     'END EVERY WORKING REPLY WITH A TASK-STATUS SIGNAL — required on any turn that USES TOOLS (a <remote-workspace> block):',
-    '  - If the current unit of work is COMPLETE: close it with <next-task user-request="what the task was" summary="what you did"/> inside a <remote-workspace> block.',
-    '  - If it is NOT complete: emit <task-progress percent="N">one sentence on what still remains</task-progress> as a standalone tag in your prose (N = your honest 0-100 estimate of completion).',
-    '  - On a tool-using turn, provide EXACTLY ONE of these. Omitting both returns an error and you must redo the turn. Estimating what remains each turn forces you to notice when nothing real is left — that is when you close the task. Do NOT let one task run forever.',
+    ...(enforceMinTaskSize ? [
+      '  - DEFAULT: the work stays in THIS task. Emit <task-progress percent="N">one sentence on where things stand</task-progress> as a standalone tag in your prose (N = your honest 0-100 estimate). A task should BUNDLE several related exchanges — do NOT open a new task for every small fix or reply.',
+      '  - CLOSE the task with <next-task user-request="what THIS task covered" summary="what you did"/> ONLY when one of these holds: (a) your NEXT work is genuinely UNRELATED to what this task has been about — a real topic change (add new-topic="true" to bypass the minimum-size hold); (b) the size line above shows no "still small" warning (the task is past its minimum) AND you have reached a natural stopping point; or (c) the size line says you are over/nearing budget. A single completed exchange is NOT by itself a reason to close.',
+      '  - On a tool-using turn, provide EXACTLY ONE of these (a <task-progress> OR a <next-task>). Omitting both returns an error and you must redo the turn.',
+    ] : [
+      '  - If the current unit of work is COMPLETE: close it with <next-task user-request="what the task was" summary="what you did"/> inside a <remote-workspace> block.',
+      '  - If it is NOT complete: emit <task-progress percent="N">one sentence on what still remains</task-progress> as a standalone tag in your prose (N = your honest 0-100 estimate of completion).',
+      '  - On a tool-using turn, provide EXACTLY ONE of these. Omitting both returns an error and you must redo the turn. Estimating what remains each turn forces you to notice when nothing real is left — that is when you close the task. Do NOT let one task run forever.',
+    ]),
     '  - EXCEPTION — purely conversational replies: a greeting, small-talk, or a question you answer from what you already know, with NO tool block, needs NEITHER signal. Just reply in prose; that ends your turn and waits for the developer. Do NOT emit <next-task>/<task-progress> for a no-tool conversational reply — and never re-open a request you have already answered.',
     '',
     'Prose + tool blocks — keep narration TIGHT:',
@@ -2654,8 +2675,12 @@ function buildSystemPrompt({ taskId, taskUserRequest, tier1Tokens, tier1Pct, pro
     '',
     'Closing a unit of work:',
     '  <next-task user-request="WHAT THE USER WANTED IN THE CURRENT TASK" summary="WHAT WAS DONE IN THE CURRENT TASK"/>',
-    '       Closes the CURRENT task and opens a new one. Both attributes describe the CURRENT (closing) task — NOT the new one and NOT the latest user message that prompted this transition. user-request is a single synthesized sentence of what the user wanted across the work just finished (not a quote).',
-    '       Emit it PROACTIVELY when you finish a discrete unit that involved real WORKSPACE WORK (a fix, a feature, a multi-step investigation): close it with <next-task/> in that SAME reply, after your final prose. Closing records the work and triggers review. Do not leave a finished worked task open. (Only skip it mid-task when more work on the SAME unit remains.)',
+    '       Closes the CURRENT task and opens a new one. Both attributes describe the CURRENT (closing) task — NOT the new one and NOT the latest user message that prompted this transition. user-request is a single synthesized sentence of what the user wanted across the work just finished (not a quote).' + (enforceMinTaskSize ? ' Optional new-topic="true": set it ONLY when you are deliberately closing a still-small task because your next work is genuinely unrelated — it bypasses the minimum-size hold.' : ''),
+    ...(enforceMinTaskSize ? [
+      '       Emit it when the task is a worthwhile unit to record — it has covered enough related WORKSPACE WORK to be worth a summary (see the size line), OR your next work is a genuinely different topic (then add new-topic="true"). BUNDLE several related exchanges into one task rather than closing after every small fix. While more work on the same thread remains, or the task is still small, keep it open and report <task-progress> instead. Closing records the work and triggers review.',
+    ] : [
+      '       Emit it PROACTIVELY when you finish a discrete unit that involved real WORKSPACE WORK (a fix, a feature, a multi-step investigation): close it with <next-task/> in that SAME reply, after your final prose. Closing records the work and triggers review. Do not leave a finished worked task open. (Only skip it mid-task when more work on the SAME unit remains.)',
+    ]),
     '       Do NOT emit <next-task> for a purely conversational reply, a greeting, or a one-line question you answered from context with NO tools — for those, just reply in prose with no tool block; that ends the turn cleanly and waits for the developer. Re-emitting <next-task> with the SAME user-request you just answered does not start new work — it only spins the task list, so never re-open a request you have already answered.',
     '       VERIFY BEFORE YOU CLOSE a code-editing task — do not report a change as done on assumption. Run the project build or tests via <powershell> and state the outcome in the summary (e.g. "tests pass 12/12"). If the task is read-only, a discussion, or there is no build/test, say so in the summary instead.',
     '       NEVER emit <next-task> on an EMPTY task (a freshly opened task with no developer request and no work in it). If you have finished everything the developer asked, reply with a short message and NO tool calls — that waits for their next instruction. Do not open-and-close empty tasks.',
@@ -3318,6 +3343,10 @@ async function maybeCompact({ store, adapter, model, log, emitChat }) {
   if (total <= LOW) { log?.(`compact: done after T1→T2 (total=${total})`); return; }
 
   // Step 2: T2 → T3 drop (cheap). Emit task-tier-change so UI can mute all rows.
+  // Summarize the oldest finished tasks unconditionally — even small ones save a
+  // little, and once compaction is firing a small saving beats none. (Effective
+  // compaction comes from tasks being BIG in the first place — the close gate —
+  // not from skipping small ones here.)
   while (total > LOW) {
     const id = await store.findOldestDemotionCandidate(2);
     if (!id) break;
@@ -3541,6 +3570,25 @@ async function dispatchTaskOp(c, store, opts = {}) {
         content: 'Nothing to close — this task has no developer request and no work in it. Do NOT emit <next-task> on an empty task. If you have finished everything the developer asked, reply with a short message and NO tool calls to wait for their next instruction.',
       };
     }
+    // MINIMUM-size gate: keep a small task OPEN so several related exchanges bundle
+    // into one (a one-exchange task's summary saves almost nothing). A model close
+    // of a sub-MIN task is refused UNLESS it is over budget (opts.overBudget) or the
+    // model marks the next work as a different topic (new-topic="true"). tooSmall is
+    // ok:false so it skips ALL close side effects and does NOT feed the churn breaker
+    // — it is the system asking the model to keep working, not a spurious close. The
+    // deterministic over-budget close runs through Layer-1 auto-close (transitionTo
+    // directly), which is NOT gated, so a task can never get stuck below MIN.
+    if (opts.enforceMinTaskSize && MIN_TASK_TOKENS > 0 && !opts.overBudget && a['new-topic'] !== 'true' && !isEmptyTask(cur)) {
+      let curTokens = 0;
+      for (const m of cur.messages ?? []) curTokens += estTokens(m.content);
+      if (curTokens < MIN_TASK_TOKENS) {
+        return {
+          ok: false,
+          tooSmall: true,
+          content: `This task is only ~${curTokens} tokens; keep working in it (it should reach ~${MIN_TASK_TOKENS} before closing, so its summary is worth keeping). Emit <task-progress percent="N"> this turn instead of <next-task>. If your NEXT work is genuinely unrelated to what this task has covered, close now by adding new-topic="true" to the <next-task> tag.`,
+        };
+      }
+    }
     // user-request and summary describe the task being CLOSED (the current one),
     // not the new one being opened. See system prompt.
     const r = await store.transitionTo({
@@ -3669,6 +3717,13 @@ async function runPromptedAgent({
   // unknown/not monitored). A function is re-evaluated per turn (the poll may
   // flip mid-run, e.g. after `wl startWebLogic` comes up).
   weblogicStatus = null,
+  // Enforce the minimum-task-size CLOSE gate (MIN_TASK_TOKENS) for THIS run.
+  // ON only for free conversational turns (the main thread the developer chats
+  // in), where one-exchange-per-task fragmentation is the problem. OFF for
+  // assignment-worker / reviewer / intake / all direct test callers, where a
+  // task closes on completion as a lifecycle SIGNAL regardless of size — gating
+  // those would stall review/acceptance/commit.
+  enforceMinTaskSize = false,
 }) {
   if (!projectDir) throw new Error('projectDir required for task-scoped agent');
 
@@ -3810,6 +3865,12 @@ async function runPromptedAgent({
     let didMutateThisTurn = false;
     let sawEmptyClose = false;
     let sawUnproductiveClose = false;
+    // A <next-task> that was ACCEPTED (r.ok) this turn — distinct from merely
+    // emitting the tag. A refused close (emptyClose / tooSmall size gate) leaves
+    // this false so the Layer-3 forcing function still nudges the model to emit a
+    // <task-progress> signal instead of silently treating the refused close as
+    // satisfying the per-turn status requirement.
+    let closedSuccessfullyThisTurn = false;
 
     // Drain the steer channel at the TOP of the turn (a turn boundary — the
     // previous turn's streaming + tools have finished, nothing is mid-flight).
@@ -3852,6 +3913,7 @@ async function runPromptedAgent({
       codebaseMemory,
       discussMode,
       weblogicStatus: wlStatus,
+      enforceMinTaskSize,
     });
 
     // Build the convo from the store. The system reminder is NOT stored —
@@ -4064,12 +4126,13 @@ async function runPromptedAgent({
         resultStatus = 'error';
       } else if (c.kind === 'task-op') {
         stats.taskOps++;
-        const r = await dispatchTaskOp(c, store, { didRealWork: didRealWorkThisTurn });
+        const r = await dispatchTaskOp(c, store, { didRealWork: didRealWorkThisTurn, overBudget: tier1Pct >= TASK_FORCE * 100, enforceMinTaskSize });
         resultContent = r.content;
         resultStatus = r.ok ? 'ok' : 'error';
         if (r.emptyClose) sawEmptyClose = true;
         log(`  ${c.verb}(${JSON.stringify(c.args)}) -> ${resultStatus}`);
         if (c.verb === 'next-task' && r.ok) {
+          closedSuccessfullyThisTurn = true;
           // If M still belongs to the task being closed (it was never anchored by
           // real work in that task), it belongs to the NEW task — move it (and
           // re-tag its event) BEFORE the task-end event so the UI wraps the
@@ -4383,7 +4446,11 @@ async function runPromptedAgent({
     // tools already ran (real work — never discarded); the NEXT turn is the
     // "retry" the developer asked for. Auto-close (Layer 1) is the hard
     // guarantee if the model keeps ignoring this.
-    const closedThisTurn = allCalls.some((c) => c.verb === 'next-task');
+    // A REFUSED close (emptyClose / tooSmall) does not satisfy the per-turn
+    // status requirement — only an accepted close does. Otherwise a model that
+    // does real work + a refused <next-task> would never be nudged to emit a
+    // <task-progress> signal and could keep retrying the refused close.
+    const closedThisTurn = closedSuccessfullyThisTurn;
     if (!closedThisTurn && !hasProgressSignal) {
       await store.appendMessage({
         kind: 'tool-result', role: 'user',
@@ -9625,7 +9692,7 @@ process.stderr.write = function (chunk, ...rest) {
 // When running src/ directly (dev/tests), it's undefined — fall back to '(dev)'.
 const BUILD_VERSION_RUNTIME = (typeof BUILD_VERSION !== 'undefined') ? BUILD_VERSION : '(dev)';
 
-async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, port = 18888, adapter: providedAdapter, modelsList, initialProject = null, apiFormat = null }) {
+async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, port = 18888, adapter: providedAdapter, modelsList, initialProject = null, apiFormat = null, bundleConversation = false }) {
   // Migrate legacy ~/.code-boss/ → ~/.code_boss/ (hyphen → underscore) if a
   // user is upgrading from an older bundle. Best-effort; falls through if
   // the legacy dir is absent or permissions block the rename.
@@ -11791,6 +11858,13 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
                 // latest poll) — injected into the system reminder so the agent
                 // knows whether the server is up before it deploys/runs.
                 weblogicStatus: () => session.weblogicRunning,
+                // Bundle small FREE-CONVERSATION exchanges into one task (the
+                // developer's main thread fragments one-task-per-message). Gated by
+                // the bundleConversation server option (the production launcher sets
+                // it; tests leave it off so close-triggered behavior stays per-task).
+                // Always OFF while an assignment is being worked: that task must
+                // close on completion to trigger review/acceptance/commit.
+                enforceMinTaskSize: bundleConversation && !session.activeAssignment,
               });
               lastAgentResult = result;
               const turnDur = Date.now() - chatStart;
@@ -12629,9 +12703,19 @@ const UI_HTML = `<!DOCTYPE html>
   #chat { flex: 1; display: flex; flex-direction: row; min-height: 0; overflow: hidden; }
   /* min-width:0 lets the chat column shrink to the remaining width instead of
      forcing a page-wide horizontal scrollbar (flex items default min-width:auto). */
-  #chatMain { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; min-height: 0; position: relative; }
-  #sidePanel { width: 300px; flex-shrink: 0; display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--border); background: var(--panel-alt); transition: width 0.12s ease; }
-  #sidePanel.collapsed { width: 0; border-right: none; overflow: hidden; }
+  /* Basis ~= chat max (860) + the logScroll padding (36+20); grow:1 so it fills
+     the full width when the sidebar is collapsed, but its low grow vs the sidebar's
+     means the sidebar wins the slack while present. Shrinks on narrow screens. */
+  #chatMain { flex: 1 1 880px; min-width: 0; display: flex; flex-direction: column; min-height: 0; position: relative; }
+  /* Wide-screen behavior: the CHAT keeps a max width (860, set on .log/.input-row)
+     and the SIDEBAR absorbs the extra width instead of leaving black gutters
+     around the chat. Priorities: the sidebar has a high flex-grow (50) so it eats
+     the slack first (up to a 600 max so it never sprawls absurdly), but shrink:0 +
+     min-width:300 so on a NARROW screen it holds 300 and the chat (grow:1, shrink:1)
+     gives up width instead. Sized via flex-basis/max-width (not width) so the
+     collapse animation still works — width:0 would lose to flex-basis. */
+  #sidePanel { flex: 50 0 300px; min-width: 300px; max-width: 600px; display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--border); background: var(--panel-alt); transition: flex-basis 0.12s ease, min-width 0.12s ease, max-width 0.12s ease; }
+  #sidePanel.collapsed { flex-grow: 0; flex-basis: 0; min-width: 0; max-width: 0; border-right: none; overflow: hidden; }
   /* The backlog panel fills the side panel instead of being a top strip. */
   #sidePanel .backlog-panel { max-height: none; border-bottom: none; flex: 1 1 auto; min-height: 0; overflow: auto; background: transparent; }
   /* Collapse control lives INSIDE the tab bar; a reopen pip appears at the chat's
@@ -12683,7 +12767,9 @@ const UI_HTML = `<!DOCTYPE html>
   .side-panes::-webkit-scrollbar-thumb:hover { background: #4d4a3f; }
   /* Gutter so chat content doesn't touch the panel. Left is wider because the
      .task-wrap bracket overhangs -16px into the gutter — it must clear the panel. */
-  #logScroll { padding: 0 20px 0 36px; }
+  /* Bottom padding clears the 36px footer gradient so the last message isn't
+     covered by the fade as it scrolls to the bottom. */
+  #logScroll { padding: 0 20px 48px 36px; }
   /* Bottom-left chrome. Flat flex-wrap: in the PANEL it wraps to two lines
      (path+version / weblogic·edit·gear); DOCKED under the chat input when the
      panel is collapsed it's a single line (path left, controls right). */
@@ -13552,7 +13638,24 @@ const UI_HTML = `<!DOCTYPE html>
     max-width: 720px;
     width: 100%;
     overflow: hidden;
+    position: relative;   /* anchor the bottom-right snapshot fab */
   }
+  /* Snapshot: ONE consistent affordance — a subtle icon in the bottom-right.
+     Fixed to the viewport on the landing/init screens; re-docked into the
+     bottom-right of whatever modal is open (see dockSnapFab). The main chat
+     reaches Snapshot via the Settings gear, so the fab hides there. */
+  .snap-fab {
+    position: fixed; bottom: 12px; right: 14px; z-index: 95;
+    display: flex; align-items: center; justify-content: center;
+    width: 24px; height: 24px; padding: 0; line-height: 0;
+    color: var(--muted); opacity: 0.45; cursor: pointer;
+    background: none; border: none;
+    transition: opacity 0.15s ease, color 0.15s ease;
+  }
+  .snap-fab:hover { opacity: 1; color: var(--accent); }
+  .snap-fab.in-modal { position: absolute; bottom: 8px; right: 10px; z-index: 5; }
+  .snap-fab.hidden { display: none; }
+  .snap-fab svg { display: block; }
   /* Snapshot is a full-screen programmable mosaic. The user activates a set
      of numbered queries (catalog of ~38). Server runs them, packs the
      resulting tiles onto one or more 12×8 grid pages, and returns positions.
@@ -14244,7 +14347,6 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   <p class="init-status" id="initStatusLine"><span class="spin" id="initSpin">⠋</span> <span id="initStatus">Initializing…</span></p>
   <div style="display: flex; gap: 8px; margin-top: 12px;">
     <button id="initRetryBtn" class="btn primary hidden" onclick="initialize()">Retry</button>
-    <button class="btn" onclick="openSnapshot()" title="Open snapshot (diagnostics)">⚙ Snapshot</button>
   </div>
 </div>
 
@@ -14495,7 +14597,6 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   <div class="modal" id="initModal">
     <div class="modal-header">
       <h2 id="initModalTitle">Setup</h2>
-      <button class="settings-btn" onclick="openSnapshot()" title="Open snapshot (diagnostics)">⚙</button>
     </div>
     <div class="modal-body" id="initModalBody"></div>
   </div>
@@ -14523,6 +14624,17 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     </div>
     <div class="modal-body" id="modalBody"></div>
   </div>
+</div>
+
+<!-- Single snapshot affordance. dockSnapFab() positions it: viewport bottom-right
+     on the landing/init screens, or the bottom-right of whatever modal is open. -->
+<div id="snapFab" class="snap-fab hidden" role="button" tabindex="0"
+     title="Snapshot (diagnostics) — F1" aria-label="Snapshot" onclick="openSnapshot()">
+  <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor"
+       stroke-width="1.2" aria-hidden="true">
+    <rect x="1" y="1" width="5" height="5" rx="1"/><rect x="8" y="1" width="5" height="5" rx="1"/>
+    <rect x="1" y="8" width="5" height="5" rx="1"/><rect x="8" y="8" width="5" height="5" rx="1"/>
+  </svg>
 </div>
 
 <script>
@@ -15303,6 +15415,39 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     const p = document.getElementById('sidePanel');
     setSidePanelCollapsed(!(p && p.classList.contains('collapsed')));   // « (in panel) collapses; » pip reopens
   }
+
+  // ── Snapshot fab: one consistent bottom-right icon ───────────────────────
+  // Re-parents #snapFab so Snapshot is reachable the same way everywhere:
+  //  - a modal is open → dock it into that modal's bottom-right corner
+  //  - no modal, on the landing/init screen → fixed viewport bottom-right
+  //  - main chat (no modal) → hidden (Snapshot lives behind the Settings gear)
+  //  - the Settings modal keeps its own labeled "Snapshot" button → fab hidden
+  //  - the Snapshot view itself is open → hidden (you're already in it)
+  function dockSnapFab() {
+    const fab = document.getElementById('snapFab');
+    if (!fab) return;
+    if (document.getElementById('modalBg')?.classList.contains('show')) { fab.classList.add('hidden'); return; }
+    const open = [...document.querySelectorAll('.modal-bg.show')]
+      .filter((m) => m.id !== 'modalBg')
+      .sort((a, b) => (parseInt(getComputedStyle(a).zIndex, 10) || 0) - (parseInt(getComputedStyle(b).zIndex, 10) || 0));
+    const top = open[open.length - 1];
+    if (top) {
+      if (top.id === 'settingsModalBg') { fab.classList.add('hidden'); return; }   // settings has its own button
+      const box = top.querySelector('.modal');
+      if (box) { fab.classList.add('in-modal'); fab.classList.remove('hidden'); box.appendChild(fab); return; }
+    }
+    fab.classList.remove('in-modal');
+    document.body.appendChild(fab);
+    const chat = document.getElementById('chat');
+    fab.classList.toggle('hidden', !!(chat && !chat.classList.contains('hidden')));
+  }
+  // Re-dock whenever a screen or modal toggles visibility (class/style changes).
+  try {
+    const _snapObs = new MutationObserver(() => dockSnapFab());
+    ['landing', 'initView', 'chat', 'settingsModalBg', 'intakeModalBg', 'initModalBg', 'gitWizardBg', 'folderModalBg', 'modalBg']
+      .forEach((id) => { const el = document.getElementById(id); if (el) _snapObs.observe(el, { attributes: true, attributeFilter: ['class', 'style'] }); });
+    dockSnapFab();
+  } catch { /* observer unsupported — fab stays on the viewport */ }
 
   // ── In-UI file browser (landing) ────────────────────────────────────────
   // Replaces the native PowerShell folder-dialog flow. Server returns subdirs
@@ -18660,6 +18805,10 @@ const htmlWithConfig = UI_HTML.replace(
       defaultModel: MODEL,
       port: PORT,
       initialProject: null,
+      // Production: bundle small free-conversation exchanges into one task so the
+      // main chat thread stops fragmenting one-task-per-message. Tests call
+      // startServer without this, so their close-triggered assertions are unchanged.
+      bundleConversation: true,
     });
     const url = 'http://127.0.0.1:' + port + '/';
     console.error('[code_boss] listening on ' + url);
