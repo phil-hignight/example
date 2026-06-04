@@ -15,7 +15,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '216';
+const BUILD_VERSION = '219';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
@@ -5773,6 +5773,65 @@ OFFLINE / AIR-GAPPED
 
 function pkgArg(argv, name) { const i = argv.indexOf(name); return i >= 0 ? argv[i + 1] : null; }
 
+// A self-extracting, click-to-run Windows installer .bat with the zip embedded
+// (base64 after a marker; decoded by built-in PowerShell — no extra tools).
+// Behavior the developer asked for:
+//   - FIRST run: extract into the .bat's own folder → <here>\code_boss_v<ver>\, then run.
+//   - LATER runs of the SAME .bat: folder already there → skip extract, just run.
+//   - A NEW version's .bat: different code_boss_v<ver> folder → installs alongside + runs that one.
+// All console output (boot/crash messages that a double-click would otherwise
+// lose) is captured to <here>\code_boss_v<ver>-launch.log; the app's own
+// per-project log stays at <project>\.code_boss\code-boss.log.
+const PKG_INSTALL_MARKER = '__CODE_BOSS_ZIP_PAYLOAD__';
+function pkgInstallerBat(version, base64) {
+  const lines = [
+    '@echo off',
+    'setlocal',
+    'set "HERE=%~dp0"',
+    `set "VER=${version}"`,
+    'set "APP=%HERE%code_boss_v%VER%"',
+    'set "LOG=%HERE%code_boss_v%VER%-launch.log"',
+    '',
+    'rem First run installs (decodes the embedded zip and extracts code_boss_v%VER%\\);',
+    'rem later runs of this same file skip straight to launching it.',
+    'if exist "%APP%\\code-boss.mjs" goto :havenode',
+    'echo Installing code_boss v%VER% into "%APP%" ...',
+    `powershell -NoProfile -ExecutionPolicy Bypass -Command "try { $s=[IO.File]::ReadAllText('%~f0'); $m='${PKG_INSTALL_MARKER}'; $i=$s.LastIndexOf($m); $b64=$s.Substring($i+$m.Length).Trim(); $zip=Join-Path $env:TEMP ('cbv'+[guid]::NewGuid().ToString('N')+'.zip'); [IO.File]::WriteAllBytes($zip,[Convert]::FromBase64String($b64)); Expand-Archive -LiteralPath $zip -DestinationPath '%HERE%' -Force; Remove-Item -LiteralPath $zip -Force; exit 0 } catch { Write-Host ('extract failed: '+$_.Exception.Message); exit 1 }"`,
+    'if errorlevel 1 goto :installfail',
+    '',
+    ':havenode',
+    'set "NODEEXE=%APP%\\node\\node.exe"',
+    'if exist "%NODEEXE%" goto :launch',
+    'where node >nul 2>nul && set "NODEEXE=node" && goto :launch',
+    'echo.',
+    'echo Node.js 20+ was not found on PATH. Install it from https://nodejs.org then run this again.',
+    'pause',
+    'exit /b 1',
+    '',
+    ':launch',
+    'echo ===== run %DATE% %TIME% =====>> "%LOG%"',
+    'echo Starting code_boss v%VER%.  A browser tab opens automatically.',
+    'echo Output is logged to "%LOG%"  - keep this window open; close it to stop code_boss.',
+    'cd /d "%APP%"',
+    '"%NODEEXE%" code-boss.mjs >> "%LOG%" 2>&1',
+    'echo.',
+    'echo code_boss exited - see "%LOG%" for details.',
+    'pause',
+    'exit /b',
+    '',
+    ':installfail',
+    'echo.',
+    'echo Install failed - see the message above.',
+    'pause',
+    'exit /b 1',
+    '',
+    PKG_INSTALL_MARKER,
+    base64,
+    '',
+  ];
+  return lines.join('\n').replace(/\n/g, '\r\n');
+}
+
 // Recursive dir copy (the HEADER doesn't expose fs.cp, so do it by hand).
 async function pkgCopyDir(src, dest) {
   await mkdir(dest, { recursive: true });
@@ -5833,7 +5892,10 @@ async function runPackageCommand({ argv, bundlePath, version }) {
   const outDir = path.resolve(pkgArg(argv, '--out') || path.join(process.cwd(), 'release'));
   const nodeDir = pkgArg(argv, '--node');
 
-  const stage = path.join(outDir, 'code_boss');
+  // The zip's single top-level folder is code_boss_v<version>, so a Windows
+  // "Extract All" into D:\code_boss lands the files at D:\code_boss\code_boss_v<version>\.
+  const stageName = `code_boss_v${version}`;
+  const stage = path.join(outDir, stageName);
   await rm(stage, { recursive: true, force: true });
   await mkdir(path.join(stage, 'tools', 'lib'), { recursive: true });
   await copyFile(bundlePath, path.join(stage, 'code-boss.mjs'));
@@ -5893,16 +5955,27 @@ async function runPackageCommand({ argv, bundlePath, version }) {
     const r = spawnSync('powershell', ['-NoProfile', '-Command', `Compress-Archive -Path '${stage}' -DestinationPath '${zip}' -Force`], { stdio: 'inherit' });
     zipped = r.status === 0;
   } else {
-    const r = spawnSync('zip', ['-r', '-q', zip, 'code_boss'], { cwd: outDir, stdio: 'inherit' });
+    const r = spawnSync('zip', ['-r', '-q', zip, stageName], { cwd: outDir, stdio: 'inherit' });
     zipped = r.status === 0;
+  }
+
+  // Self-extracting click-to-run installer (Windows): embed the zip we just made.
+  let installer = null;
+  if (zipped && pkgArg(argv, '--no-installer') === null) {
+    try {
+      const b64 = (await readFile(zip)).toString('base64');
+      installer = path.join(outDir, `code_boss_v${version}-installer.bat`);
+      await writeFile(installer, pkgInstallerBat(version, b64), 'utf8');
+    } catch (e) { console.error('package: installer .bat generation failed: ' + (e?.message || e)); installer = null; }
   }
 
   console.error('');
   console.error('staged: ' + stage);
-  if (zipped) { const kb = Math.round((await stat(zip)).size / 1024); console.error(`zip:    ${zip}  (${kb} KB)`); }
+  if (zipped) { const kb = Math.round((await stat(zip)).size / 1024); console.error(`zip:      ${zip}  (${kb} KB)`); }
   else console.error(`zip step failed - the staged folder is ready; zip ${stage} manually.`);
-  console.error('docx:   ' + docxNote);
-  console.error('node:   ' + (bundledNode ? 'bundled (./node)' : 'target must have Node 20+ on PATH'));
+  if (installer) { const kb = Math.round((await stat(installer)).size / 1024); console.error(`installer: ${installer}  (${kb} KB)  - double-click: installs to .\\code_boss_v${version}\\ on first run, just launches after`); }
+  console.error('docx:     ' + docxNote);
+  console.error('node:     ' + (bundledNode ? 'bundled (./node)' : 'target must have Node 20+ on PATH'));
   return 0;
 }
 
@@ -14673,7 +14746,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   {
     const v = SERVER.buildVersion;
     const $vb = document.getElementById('chromeVersion');
-    if ($vb) $vb.textContent = v ? ('code_boss v' + v) : 'code_boss';
+    if ($vb) $vb.textContent = v ? ('v' + v) : '';
     syncEditToggle();   // initialise the edit-allowed label
     try { if (localStorage.getItem('cb-side-collapsed') === '1') setSidePanelCollapsed(true); } catch {}
   }
