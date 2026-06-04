@@ -15,7 +15,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '206';
+const BUILD_VERSION = '207';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
@@ -5716,6 +5716,49 @@ async function pkgCopyDir(src, dest) {
   }
 }
 
+// When --jars has the POI deps but NOT a prebuilt codeboss-docx-helper.jar, and
+// a JDK is available HERE, compile the helper now (from the source embedded in
+// this bundle) against the staged deps and write it to `helperDest`. Result:
+// the zip ships a ready jar, so the TARGET needs only a JRE — no first-run
+// javac. `--release 11` keeps the bytecode loadable on a JRE 11 even when built
+// with a newer JDK. Returns true on success; false (with a reason logged) when
+// there's no JDK or the build fails — caller then ships a deps-only package.
+async function pkgCompileHelper(libDir, helperDest, outDir) {
+  if (typeof DOCX_HELPER_SOURCES === 'undefined' || !DOCX_HELPER_SOURCES) return false;
+  const tmp = path.join(outDir, '.docx-compile');
+  const srcDir = path.join(tmp, 'src');
+  const classesDir = path.join(tmp, 'classes');
+  try {
+    await rm(tmp, { recursive: true, force: true });
+    const javaFiles = [];
+    for (const [rel, src] of Object.entries(DOCX_HELPER_SOURCES)) {
+      const dest = path.join(srcDir, rel);
+      await mkdir(path.dirname(dest), { recursive: true });
+      await writeFile(dest, src, 'utf8');
+      javaFiles.push(dest);
+    }
+    await mkdir(classesDir, { recursive: true });
+    const jc = spawnSync('javac', ['--release', '11', '-cp', path.join(libDir, '*'), '-d', classesDir, ...javaFiles], { encoding: 'utf8' });
+    if (jc.error || jc.status !== 0) {
+      console.error(jc.error && jc.error.code === 'ENOENT'
+        ? 'package: no JDK (javac) here to prebuild the helper — shipping deps-only (the target will compile on first run, needs a JDK there).'
+        : 'package: helper compile failed — shipping deps-only:\n' + String(jc.stderr || jc.stdout || '').slice(0, 400));
+      return false;
+    }
+    const jr = spawnSync('jar', ['cf', helperDest, '-C', classesDir, '.'], { encoding: 'utf8' });
+    if (jr.error || jr.status !== 0) {
+      console.error('package: compiled OK but the `jar` step failed — shipping deps-only:\n' + String((jr.error && jr.error.message) || jr.stderr || jr.stdout || '').slice(0, 400));
+      return false;
+    }
+    return existsSync(helperDest);
+  } catch (e) {
+    console.error('package: helper prebuild error — shipping deps-only: ' + (e?.message || e));
+    return false;
+  } finally {
+    try { await rm(tmp, { recursive: true, force: true }); } catch { /* */ }
+  }
+}
+
 async function runPackageCommand({ argv, bundlePath, version }) {
   if (!bundlePath || !existsSync(bundlePath)) { console.error('package: cannot locate the bundle file (code-boss.mjs).'); return 1; }
   const jarsDir = pkgArg(argv, '--jars');
@@ -5746,12 +5789,20 @@ async function runPackageCommand({ argv, bundlePath, version }) {
   }
   for (const j of depJars) await copyFile(j, path.join(stage, 'tools', 'lib', path.basename(j)));
 
+  // Resolve the helper jar:
+  //  1. a prebuilt one (explicit --helper, or codeboss-docx-helper.jar in --jars) → copy it.
+  //  2. else, if a JDK is on THIS box → compile it now from embedded source (zip is JRE-only).
+  //  3. else ship deps-only → the target compiles on first run (needs a JDK there).
+  const helperDest = path.join(stage, 'tools', PKG_HELPER_JAR);
+  const stagedLib = path.join(stage, 'tools', 'lib');
   let docxNote;
   if (helper) {
-    await copyFile(helper, path.join(stage, 'tools', PKG_HELPER_JAR));
-    docxNote = `included (helper jar + ${depJars.length} POI deps) - runs with just a JRE on the target.`;
+    await copyFile(helper, helperDest);
+    docxNote = `included (prebuilt helper jar + ${depJars.length} POI deps) - runs with just a JRE on the target.`;
+  } else if (depJars.length && await pkgCompileHelper(stagedLib, helperDest, outDir)) {
+    docxNote = `compiled here from embedded source (helper jar + ${depJars.length} POI deps) - runs with just a JRE on the target.`;
   } else if (depJars.length) {
-    docxNote = `POI deps only (${depJars.length}); no prebuilt ${PKG_HELPER_JAR} found, so the target compiles it from the embedded source on first run (needs a JDK there).`;
+    docxNote = `POI deps only (${depJars.length}); no prebuilt ${PKG_HELPER_JAR} and no JDK here to prebuild one, so the target compiles it from embedded source on first run (needs a JDK there).`;
   } else {
     docxNote = `not included (pass --jars <dir> with the POI jars to enable it).`;
   }
@@ -6923,6 +6974,30 @@ function locatePrebuiltHelper() {
 // no prebuilt jar is deployed. Per-user so it survives across runs.
 function helperWorkDir() { return path.join(homedir(), '.code_boss', 'docx-helper'); }
 
+// Find the POI dependency jars for a compile-from-source. Priority:
+//   CODEBOSS_DOCX_LIB  → explicit override
+//   <bundleDir>/tools/lib  → the deps a `package` run shipped NEXT TO the bundle
+//                            (a deps-only package — no prebuilt helper jar)
+//   ~/.code_boss/docx-helper/lib  → the legacy per-user drop folder
+// First candidate that actually holds .jar files wins. Without the tools/lib
+// entry, a deps-only deployment was broken: the package put the jars in
+// tools/lib but the compile step only ever looked under ~/.code_boss, so it
+// reported "copy the 13 jars" even though they were sitting right there.
+function resolveDocxLibDir() {
+  let moduleDir = '';
+  try { moduleDir = path.dirname(fileURLToPath(import.meta.url)); } catch { moduleDir = process.cwd(); }
+  const cands = [];
+  if (process.env.CODEBOSS_DOCX_LIB) cands.push(process.env.CODEBOSS_DOCX_LIB);
+  cands.push(path.join(moduleDir, 'tools', 'lib'));
+  cands.push(path.join(moduleDir, '..', 'tools', 'lib'));
+  const home = path.join(helperWorkDir(), 'lib');
+  cands.push(home);
+  for (const d of cands) {
+    try { if (existsSync(d) && readdirSync(d).some((f) => f.toLowerCase().endsWith('.jar'))) return d; } catch { /* */ }
+  }
+  return home; // default target for the "copy the jars here" message
+}
+
 // Content fingerprint of the embedded Java sources — dependency-free (no crypto
 // import). Stamped next to the compiled classes so a box that already compiled
 // an OLDER helper recompiles when an updated bundle changes the Java, instead of
@@ -6952,7 +7027,7 @@ function bootstrapFromSource() {
   const workDir = helperWorkDir();
   const srcDir = path.join(workDir, 'src');
   const classesDir = path.join(workDir, 'classes');
-  const libDir = process.env.CODEBOSS_DOCX_LIB || path.join(workDir, 'lib');
+  const libDir = resolveDocxLibDir();
   const classpath = `${classesDir}${path.delimiter}${path.join(libDir, '*')}`;
   const mainClass = path.join(classesDir, 'com', 'codeboss', 'docx', 'DocxHelper.class');
 
