@@ -15,7 +15,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '232';
+const BUILD_VERSION = '234';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
@@ -5016,9 +5016,11 @@ const INTAKE_SYSTEM_PROMPT = `You are an intake manager for a software-maintenan
 The developer's PROJECT is open and available to you READ-ONLY (same tools as a reviewer; emit calls inside a <remote-workspace> block):
   <read path="FILE"/>  <list path="DIR"/>  <search pattern="REGEX" path="DIR"/>  <find pattern="GLOB"/>  <info path="FILE"/>
   <powershell>git log --oneline -n 5</powershell>   (read-only commands only)
+You have NO shell and NO local filesystem of your own — these <remote-workspace> commands are the ONLY way to see anything. They run on the developer's machine and the results come back the next turn. NEVER say you'll "look on your system", run a local/Linux command, or that you "don't have access" or "can't see the files" — the project IS available to you through these tags, nothing else is.
 Paths are relative to the PROJECT ROOT — start with <list path="."/> to see it. If the developer points at a file, folder, or document (e.g. "the spec is in the specs folder", "see docs/X"), LIST and READ it to ground the requirement — do NOT claim the workspace is empty without checking with <list path="."/> first.
 
 How to behave:
+- YOUR ONLY JOB IS TO FILL OUT THE REQUIREMENT FORM (title, requirement/definition-of-done, acceptance criteria, sources). You are NOT the coding agent. NEVER offer to implement, fix, write, refactor, or "help with" the work, and never produce code, a patch, or a step-by-step plan for doing it — a separate agent does the work later from your card. Your entire output on any turn is exactly one of: read-only <remote-workspace> calls to ground the requirement, a brief clarifying question, or the card.
 - BIAS STRONGLY TOWARD EMITTING THE CARD. The card is editable — the developer refines or corrects it after you emit it — so a good-enough card beats another question. Do NOT hold the card back waiting for perfect certainty.
 - Ask clarifying questions ONLY when the material is genuinely too ambiguous to write any definition of done, and then ask AT MOST one short round. The moment the developer answers (or says "that's the whole requirement" / "go ahead" / confirms), emit the card immediately — do not ask again.
 - If the material is already clear enough to state a definition of done, emit the card on your FIRST turn (after at most a quick read to ground it). Don't ask a question you can answer by reading the code or by making a reasonable, editable assumption.
@@ -5034,7 +5036,42 @@ When you can state an unambiguous definition of done — which is usually now �
 <sources>where this came from (e.g. "ticket OPS-1421; email from Pat 2026-05-29"); or leave empty</sources>
 </requirement-card>
 
-Until you emit the card, just talk to the developer. After you emit the card, stop.`;
+Until you emit the card, ask only what you need to write it. After you emit the card, stop.`;
+
+// A hidden priming exchange (never persisted, never shown) that makes the model
+// COMMIT to the remote-workspace tools + the form-filling role before the real
+// request arrives — mirrors runPromptedAgent's PRIMING. Without it, Gemini's first
+// turn tends to (a) claim it "can't see the files" / offer to look on its own
+// system, and (b) offer to DO the work instead of writing a card. One short,
+// complete example demonstrates: read read-only via <remote-workspace>, then emit
+// ONE card — no offering to implement anything.
+const INTAKE_PRIMING = [
+  {
+    role: 'user',
+    content:
+      "Quick orientation before we start: you're my intake manager in a REMOTE workspace. You have no shell or local files — the ONLY way to look at my project is to return XML inside a <remote-workspace> block (<list path=\".\"/>, <read path=\"...\"/>, <search .../>, <find .../>); those run on MY machine and results come back next turn. The workspace IS my project, so never say you can't see my files. And your job is only to write ONE requirement card (title, definition of done, acceptance criteria, sources) — you never implement or offer to do the work yourself. First one: the login page 500s when a password has a '%' in it; see docs/login.md.",
+  },
+  {
+    role: 'assistant',
+    content:
+      "Let me read that note and confirm where the page lives before I write the requirement.\n" +
+      "<remote-workspace>\n<read path=\"docs/login.md\"/>\n<list path=\"src/pages\"/>\n</remote-workspace>",
+  },
+  {
+    role: 'user',
+    content:
+      "<remote-workspace-result op=\"read\" status=\"ok\" path=\"docs/login.md\">Login returns HTTP 500 when the password contains a '%'. It should validate and escape special characters instead.</remote-workspace-result>\n" +
+      "<remote-workspace-result op=\"list\" status=\"ok\" path=\"src/pages\">Login.tsx\nHome.tsx</remote-workspace-result>",
+  },
+  {
+    role: 'assistant',
+    content:
+      "<requirement-card>\n<title>Fix login 500 on '%' in password</title>\n" +
+      "<requirement>The login flow (src/pages/Login.tsx) must accept passwords containing '%' and other special characters: the value is validated and properly escaped so authentication proceeds normally instead of returning HTTP 500.</requirement>\n" +
+      "<acceptance-criteria>Logging in with a password containing '%' succeeds with no 500.\nOther special characters in the password authenticate without error.</acceptance-criteria>\n" +
+      "<sources>docs/login.md</sources>\n</requirement-card>",
+  },
+];
 
 /**
  * Parse the manager's requirement card out of a prose turn. Returns
@@ -5080,13 +5117,17 @@ async function runIntake({ adapter, model, messages = [], signal, onLog, onTurn,
     for (const root of repoRoots) { try { if (existsSync(path.join(root, p))) return path.join(root, p); } catch {} }
     return projectDir ? path.join(projectDir, p) : p;
   };
-  const convo = [{ role: 'system', content: INTAKE_SYSTEM_PROMPT }, ...(Array.isArray(messages) ? messages : [])];
+  const convo = [{ role: 'system', content: INTAKE_SYSTEM_PROMPT }, ...INTAKE_PRIMING, ...(Array.isArray(messages) ? messages : [])];
+  let cumTokens = 0;   // running token total across this exchange's turns (for the UI spinner)
 
   for (let turn = 1; turn <= INTAKE_MAX_TURNS; turn++) {
     if (signal?.aborted) { const e = new Error('aborted'); e.name = 'AbortError'; throw e; }
     const t0 = Date.now();
     const response = await adapter.complete({ model, messages: convo, signal });
     const text = response?.choices?.[0]?.message?.content ?? '';
+    const u = response?.usage || {};
+    cumTokens += (u.total_tokens || ((u.prompt_tokens || 0) + (u.completion_tokens || 0)) || 0);
+    await emit({ kind: 'tokens', total: cumTokens });
     log(`intake turn ${turn}: ${text.length} chars in ${Date.now() - t0}ms`);
 
     const calls = parseToolCalls(text);
@@ -5748,13 +5789,25 @@ exec "$NODE" "$HERE/code-boss.mjs" "$@"
 // (clean UTF-8, reliable for a long-running process) and keeps the window open.
 const PKG_RUN_PS1 = `$app = $PSScriptRoot; if (-not $app) { $app = Split-Path -Parent $MyInvocation.MyCommand.Path }
 $log = Join-Path $app 'launch.log'
+$port = if ($env:PORT) { [int]$env:PORT } else { 18888 }
 $node = Join-Path $app 'node\\node.exe'
 if (-not (Test-Path $node)) {
   if (-not (Get-Command node -ErrorAction SilentlyContinue)) { Write-Host 'Node.js 20+ was not found. Install it from https://nodejs.org (or drop a portable Node into a "node" folder next to this file), then run again.'; Read-Host 'Press Enter to exit'; exit 1 }
   $node = 'node'
 }
 $ErrorActionPreference = 'Continue'
-Write-Host 'Starting code_boss - a browser tab opens automatically.'
+function Test-CbPort { param($p) [bool](Get-NetTCPConnection -LocalPort $p -State Listen -ErrorAction SilentlyContinue) }
+function Clear-CbPort { param($p) try { Get-NetTCPConnection -LocalPort $p -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue } } catch {} }
+# A previous instance may be holding the port. Kill everything on it, then launch;
+# if it stays busy (something keeps re-grabbing it), retry every 10s for 2 minutes.
+$deadline = (Get-Date).AddMinutes(2)
+while ($true) {
+  if (Test-CbPort $port) { Write-Host "Port $port is in use - stopping the existing instance..."; Clear-CbPort $port; Start-Sleep -Milliseconds 800 }
+  if (-not (Test-CbPort $port)) { break }
+  if ((Get-Date) -ge $deadline) { Write-Host "Port $port is still in use after 2 minutes - giving up."; Read-Host 'Press Enter to exit'; exit 1 }
+  Write-Host "Port $port still busy; retrying in 10s..."; Start-Sleep -Seconds 10
+}
+Write-Host "Starting code_boss on port $port - a browser tab opens automatically."
 Write-Host "Output is logged to $log. Close this window to stop code_boss."
 $proc = Start-Process -FilePath $node -ArgumentList 'code-boss.mjs' -WorkingDirectory $app -NoNewWindow -PassThru -RedirectStandardError $log
 $proc.WaitForExit()
@@ -5805,35 +5858,41 @@ function pkgArg(argv, name) { const i = argv.indexOf(name); return i >= 0 ? argv
 // here-string (NOT a comment/marker: PowerShell parses the WHOLE file as code
 // first, so the payload must be a string literal). Built-in PowerShell only.
 // Run it once via right-click → Run with PowerShell (a .ps1 can't be double-
-// clicked). It:
-//   - FIRST run: extracts into its own folder → <here>\code_boss_v<ver>\.
-//     (A re-run / later version skips extraction if that folder already exists.)
-//   - writes a stable RUNNER <here>\code_boss-run.ps1 (thin wrapper → this
-//     version's run.ps1) and creates a Desktop shortcut "code_boss" pointing at
-//     it — so day-to-day launching is a double-click on the shortcut (which CAN
-//     run a .ps1), not on a .ps1 directly.
-//   - launches code_boss once (first run). Boot/diagnostic output is captured to
-//     <app>\launch.log; the app's per-project log stays at <project>\.code_boss\code-boss.log.
+// clicked). Wherever it's run from, it:
+//   - installs to a FIXED root: D:\code_boss\code_boss_v<ver>\  (override the root
+//     with the CODE_BOSS_HOME env var). A re-run / existing version skips extract.
+//   - creates a VERSION-NAMED shortcut "code_boss_v<ver>.lnk" → THIS version's
+//     run.ps1, in BOTH the install root AND the Desktop (a .lnk launches a .ps1
+//     fine; each version keeps its own shortcut, so the shortcut always runs the
+//     version it was made for).
+//   - launches code_boss once (first run) via run.ps1, which first frees the port
+//     (kills any running instance, retrying up to 2 min). Boot/diagnostic output
+//     → <app>\launch.log; the app's per-project log stays at <project>\.code_boss\.
 function pkgInstallerPs1(version, base64) {
   // base64 on ONE line inside a single-quoted here-string: literal, no
   // interpolation, and base64 has no quote so it can't terminate early. The
-  // closing '@ must sit at column 0.
+  // closing '@ must sit at column 0. Forward slashes in PS paths avoid having to
+  // double-escape backslashes through this JS string layer.
   return [
     "$b64 = @'",
     base64,
     "'@",
     "$ErrorActionPreference = 'Stop'",
-    '$here = $PSScriptRoot; if (-not $here) { $here = Split-Path -Parent $MyInvocation.MyCommand.Path }',
     `$ver = '${version}'`,
-    '$app = Join-Path $here "code_boss_v$ver"',
+    '# Fixed install root, independent of where this installer is run from',
+    '# (override with the CODE_BOSS_HOME env var).',
+    "$base = if ($env:CODE_BOSS_HOME) { $env:CODE_BOSS_HOME } else { 'D:/code_boss' }",
+    '$app = Join-Path $base "code_boss_v$ver"',
+    'New-Item -ItemType Directory -Force -Path $base | Out-Null',
     '',
-    '# First run: decode the embedded zip + extract code_boss_v$ver\\. Later runs skip straight to setup+launch.',
+    '# First run: decode the embedded zip + extract to $base (its top-level folder',
+    '# is code_boss_v$ver). A re-run / existing version skips extraction.',
     "if (-not (Test-Path (Join-Path $app 'code-boss.mjs'))) {",
     '  Write-Host "Installing code_boss v$ver into $app ..."',
     '  try {',
     "    $zip = Join-Path $env:TEMP ('cbv' + [guid]::NewGuid().ToString('N') + '.zip')",
     '    [IO.File]::WriteAllBytes($zip, [Convert]::FromBase64String($b64.Trim()))',
-    '    Expand-Archive -LiteralPath $zip -DestinationPath $here -Force',
+    '    Expand-Archive -LiteralPath $zip -DestinationPath $base -Force',
     '    Remove-Item -LiteralPath $zip -Force',
     '  } catch {',
     '    Write-Host ("Install failed: " + $_.Exception.Message)',
@@ -5841,37 +5900,32 @@ function pkgInstallerPs1(version, base64) {
     '  }',
     '}',
     '',
-    "# Drop a stable RUNNER at the install root (a thin wrapper that calls THIS",
-    "# version's run.ps1) and point a desktop shortcut at it. Windows won't let you",
-    "# double-click a .ps1, but a .lnk shortcut launches one fine - so from now on",
-    "# you start code_boss from the desktop shortcut. A new version's installer",
-    "# rewrites this runner + shortcut to point at the newer folder.",
-    "$runner = Join-Path $here 'code_boss-run.ps1'",
-    "$rsrc = @'",
-    "$ErrorActionPreference = 'Continue'",
-    "& (Join-Path $PSScriptRoot 'code_boss_v__VER__/run.ps1')",
-    "'@",
-    "[IO.File]::WriteAllText($runner, ($rsrc -replace '__VER__', $ver))",
-    'try {',
-    "  $desktop = [Environment]::GetFolderPath('Desktop')",
-    "  $psexe = Join-Path $env:WINDIR 'System32/WindowsPowerShell/v1.0/powershell.exe'",
-    '  $ws = New-Object -ComObject WScript.Shell',
-    "  $sc = $ws.CreateShortcut((Join-Path $desktop 'code_boss.lnk'))",
-    '  $sc.TargetPath = $psexe',
-    `  $sc.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $runner + '"'`,
-    '  $sc.WorkingDirectory = $app',
-    '  $sc.IconLocation = "$psexe,0"',
-    '  $sc.Description = "code_boss v$ver"',
-    '  $sc.Save()',
-    `  Write-Host "Desktop shortcut 'code_boss' created - double-click it to launch from now on."`,
-    '} catch {',
-    '  Write-Host ("Could not create the desktop shortcut: " + $_.Exception.Message)',
-    '  Write-Host ("You can launch it directly by right-clicking " + $runner + " (Run with PowerShell).")',
+    '# Version-named shortcuts → THIS version run.ps1, in the install root AND the',
+    "# Desktop. Windows opens a .ps1 in Notepad on double-click, but a .lnk runs it.",
+    "$runps1 = Join-Path $app 'run.ps1'",
+    "$psexe = Join-Path $env:WINDIR 'System32/WindowsPowerShell/v1.0/powershell.exe'",
+    'function New-CbShortcut { param($lnkPath)',
+    '  try {',
+    '    $ws = New-Object -ComObject WScript.Shell',
+    '    $sc = $ws.CreateShortcut($lnkPath)',
+    '    $sc.TargetPath = $psexe',
+    `    $sc.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $runps1 + '"'`,
+    '    $sc.WorkingDirectory = $app',
+    '    $sc.IconLocation = "$psexe,0"',
+    '    $sc.Description = "code_boss v$ver"',
+    '    $sc.Save()',
+    '    Write-Host ("  shortcut: " + $lnkPath)',
+    '  } catch { Write-Host ("  shortcut failed (" + $lnkPath + "): " + $_.Exception.Message) }',
     '}',
+    '$lnkName = "code_boss_v$ver.lnk"',
+    'New-CbShortcut (Join-Path $base $lnkName)',
+    "$desktop = [Environment]::GetFolderPath('Desktop')",
+    'if ($desktop) { New-CbShortcut (Join-Path $desktop $lnkName) }',
     '',
     'Write-Host ""',
+    'Write-Host "Installed code_boss v$ver. Double-click the code_boss_v$ver shortcut (Desktop or $base) to run it."',
     'Write-Host "Launching code_boss v$ver ..."',
-    "& (Join-Path $app 'run.ps1')",
+    '& $runps1',
     '',
   ].join('\r\n');
 }
@@ -6033,7 +6087,7 @@ async function runPackageCommand({ argv, bundlePath, version }) {
   if (installer) {
     const kb = Math.round((await stat(installer)).size / 1024);
     console.error(`installer: ${installer}  (${kb} KB)`);
-    console.error(`           Run once via right-click → Run with PowerShell: it extracts .\\code_boss_v${version}\\, writes code_boss-run.ps1, adds a "code_boss" Desktop shortcut, and launches. After that, double-click the Desktop shortcut.`);
+    console.error(`           Run once via right-click → Run with PowerShell (from anywhere): installs to D:\\code_boss\\code_boss_v${version}\\, drops a code_boss_v${version} shortcut on the Desktop + in that root, and launches. After that, double-click the shortcut. (Override the root with CODE_BOSS_HOME.)`);
     if (keepBuild) console.error(`build:     ${workDir}  (staged folder + zip kept via --keep-build)`);
   } else if (!zipped) {
     console.error(`zip step failed - staged folder left at ${stage} for inspection.`);
@@ -11314,6 +11368,8 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
             for (let i = calls.length; i < results.length; i++) emit({ type: 'assistant-text', content: results[i].content || '' });
           } else if (t.kind === 'message') {
             emit({ type: 'assistant-text', content: t.content || '' });
+          } else if (t.kind === 'tokens') {
+            emit({ type: 'tokens', total: t.total });
           } else if (t.kind === 'card') {
             const p = stripCard(t.prose);
             if (p) emit({ type: 'assistant-text', content: p });
@@ -12975,10 +13031,15 @@ const UI_HTML = `<!DOCTYPE html>
      rows carry their own margins); full width in the narrow pane. */
   .im-log { flex: 1; overflow-y: auto; padding: 8px 14px; display: block; }
   #im-log .row, #im-log .bubble, #im-log .row-result, #im-log .diff-block, #im-log .log { max-width: none; }
-  .im-spin { color: var(--muted); font-size: 12px; padding: 4px 2px; }
-  .im-inputrow { display: flex; gap: 8px; padding: 8px 14px; border-top: 1px solid var(--border); }
-  .im-inputrow textarea { flex: 1; background: var(--panel-alt); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; font: inherit; font-size: 13px; resize: none; }
-  .im-inputrow textarea:focus { border-color: var(--accent); outline: none; }
+  /* Intake input reuses the MAIN chat input (.input-row + the generic textarea
+     rule) so it matches exactly: a borderless auto-growing textarea inside a
+     rounded bordered row with the ">" prompt + focus-within accent. .im-footer
+     gives it the same gradient fade above the input that footer::before gives the
+     main chat. The working indicator reuses the main .status row (animated). */
+  .im-footer { position: relative; padding: 8px 14px 10px; flex-shrink: 0; }
+  .im-footer::before { content: ''; position: absolute; left: 0; right: 0; top: -28px; height: 28px; background: linear-gradient(to bottom, transparent, var(--bg)); pointer-events: none; }
+  .im-input-row { max-width: none; margin: 0; }
+  #im-log .status { margin: 6px 2px; }
   .im-hint { font-size: 11px; color: var(--muted); max-width: 60%; }
 
   /* Header removed in build 7 — controls moved to the settings modal,
@@ -13175,6 +13236,11 @@ const UI_HTML = `<!DOCTYPE html>
   }
   .body table.md tr:nth-child(even) td,
   .bubble.user .bubble-content table.md tr:nth-child(even) td { background: rgba(255,255,255,0.02); }
+  /* Streaming prose: createStreamingMd wraps paragraph lines in .md-p divs while
+     a message streams (the finalize event then swaps in renderInline()). Inherits
+     the body's pre-wrap; the inter-paragraph gap approximates the blank line. */
+  .body .md-p { white-space: pre-wrap; }
+  .body .md-p:not(:first-child) { margin-top: 0.5em; }
 
   /* Result row — "⎿ summary" sits under the body text of the tool row
      above (one char + gap to the right of the bullet column). Hanging
@@ -14737,9 +14803,10 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       </div>
       <div class="intake-chat">
         <div class="im-log" id="im-log"></div>
-        <div class="im-inputrow">
-          <textarea id="im-input" rows="2" placeholder="Describe it or paste a ticket/email… (Enter to send)"></textarea>
-          <button class="btn primary" id="im-send" onclick="sendIntakeChat()">Send</button>
+        <div class="im-footer">
+          <div class="input-row im-input-row">
+            <textarea id="im-input" rows="1" placeholder="Describe it or paste a ticket/email…"></textarea>
+          </div>
         </div>
       </div>
     </div>
@@ -16675,13 +16742,11 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     const inp = document.getElementById('im-input');
     const text = (inp.value || '').trim();
     if (!text) return;
-    inp.value = '';
+    inp.value = ''; autoGrowEl(inp);
     imRender({ type: 'user-message', content: text });
     _intakeMessages.push({ role: 'user', content: text });
-    const sendBtn = document.getElementById('im-send'); if (sendBtn) { sendBtn.disabled = true; sendBtn.textContent = '…'; }
     const log = document.getElementById('im-log');
-    const spin = document.createElement('div'); spin.className = 'im-spin'; spin.innerHTML = '<span class="spin">⠋</span> working…';
-    log.appendChild(spin); log.scrollTop = log.scrollHeight;
+    imStartSpinner();
     const assistantParts = [];
     try {
       const fields = {
@@ -16704,9 +16769,10 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
           }
           return;
         }
+        if (ev.type === 'tokens') { imSetTokens(ev.total); return; }
         if (ev.type === 'assistant-text') assistantParts.push(ev.content || '');
         imRender(ev);
-        log.appendChild(spin); log.scrollTop = log.scrollHeight;   // keep the spinner last
+        imSpinnerToBottom();   // keep the working indicator last
       };
       for (;;) {
         const { done, value } = await reader.read();
@@ -16724,9 +16790,42 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     } catch (e) {
       imRender({ type: 'assistant-text', content: 'Error: ' + (e?.message || e) });
     } finally {
-      spin.remove();
-      if (sendBtn) { sendBtn.disabled = false; sendBtn.textContent = 'Send'; }
+      imStopSpinner();
     }
+  }
+  // Animated working indicator for the intake mini-chat — reuses the main chat's
+  // .status row (braille spinner + token count + elapsed) and ANIMATES it (the old
+  // static one was frozen on frame 1). Tokens come from the stream's {type:'tokens'}
+  // events (per-turn cumulative — the intake LLM call is non-streaming).
+  let _imSpin = { timer: null, row: null, start: 0, frame: 0, tokens: 0 };
+  function imStartSpinner() {
+    imStopSpinner();
+    const log = document.getElementById('im-log'); if (!log) return;
+    const row = document.createElement('div'); row.className = 'status'; log.appendChild(row);
+    _imSpin = { timer: null, row, start: Date.now(), frame: 0, tokens: 0 };
+    const fmt = (n) => (n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n));
+    const tick = () => {
+      if (!_imSpin.row) return;
+      const sp = SPINNER[_imSpin.frame++ % SPINNER.length];
+      const secs = Math.floor((Date.now() - _imSpin.start) / 1000);
+      const toks = _imSpin.tokens
+        ? '<span class="arrow">↕</span> <span class="count">' + fmt(_imSpin.tokens) + '</span> <span class="dim">tokens · ' + secs + 's</span>'
+        : '<span class="dim">' + secs + 's</span>';
+      _imSpin.row.innerHTML = '<span class="spin">' + sp + '</span> Working… ' + toks;
+      log.scrollTop = log.scrollHeight;
+    };
+    tick();
+    _imSpin.timer = setInterval(tick, 120);
+  }
+  function imSpinnerToBottom() {
+    const log = document.getElementById('im-log');
+    if (log && _imSpin.row && _imSpin.row.parentNode === log && _imSpin.row !== log.lastChild) log.appendChild(_imSpin.row);
+  }
+  function imSetTokens(n) { if (typeof n === 'number') _imSpin.tokens = n; }
+  function imStopSpinner() {
+    if (_imSpin.timer) clearInterval(_imSpin.timer);
+    if (_imSpin.row) _imSpin.row.remove();
+    _imSpin = { timer: null, row: null, start: 0, frame: 0, tokens: 0 };
   }
   async function addFromIntake() {
     const requirement = (document.getElementById('im-req').value || '').trim();
@@ -17273,6 +17372,146 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     // HTML-escaped at capture time, so they render literally).
     out = out.replace(/\\u0000(\\d+)\\u0000/g, (m, i) => codeStore[Number(i)] || '');
     return out;
+  }
+
+  // ── Streaming markdown (incremental emit) ───────────────────────────────
+  // Inline-only markdown (escape + inline \`code\` + **bold**) for the streaming
+  // renderer below, which emits blocks element-by-element and only needs inline
+  // formatting per cell / item / line. Mirrors renderInline's inline pass; no
+  // block parsing.
+  function mdInline(text) {
+    const codeStore = [];
+    let work = String(text == null ? '' : text);
+    work = work.replace(/(\`+)([\\s\\S]+?)\\1/g, (m, t, body) => {
+      const i = codeStore.length; codeStore.push('<code>' + escapeHtml(body.trim()) + '</code>'); return ' ' + i + ' ';
+    });
+    let out = escapeHtml(work).replace(/\\*\\*([^*]+)\\*\\*/g, '<strong>$1</strong>');
+    return out.replace(/ (\\d+) /g, (m, i) => codeStore[Number(i)] || '');
+  }
+
+  // Streaming markdown renderer: feed text chunks; it emits/patches DOM block-by-
+  // block as lines complete — a true incremental emit, not a re-parse of the whole
+  // buffer. A fenced block opens a <pre><code> and appends each line (renders even
+  // while still unclosed); a table emits <thead> on the header+delimiter then one
+  // <tr> per row line; a list appends <li>s; headings are one element each. The
+  // in-progress trailing line renders live so prose still streams token-by-token;
+  // a |-line that might open a table is held one line for the delimiter lookahead.
+  // Mirrors renderInline's feature set. finish() flushes the last partial line.
+  function createStreamingMd(container) {
+    let pending = '';            // received text not yet ending in a newline
+    const lineQ = [];            // complete lines awaiting processing (1-line table lookahead)
+    let state = 'none';          // none | code | table | list
+    let codeEl = null, codeText = '';
+    let tbody = null, aligns = [], ncol = 0;
+    let ul = null;
+    let para = null, paraText = '';
+    let live = null;             // transient element for the trailing partial line
+
+    const clearLive = () => { if (live) { live.remove(); live = null; } };
+    const endPara = () => { para = null; paraText = ''; };
+    const endText = () => { endPara(); ul = null; tbody = null; aligns = []; ncol = 0; if (state !== 'code') state = 'none'; };
+
+    function startTable(headerLine, delimLine) {
+      endPara(); ul = null;
+      const headers = _mdSplitRow(headerLine);
+      aligns = _mdSplitRow(delimLine).map(_mdAlign);
+      ncol = headers.length;
+      const table = document.createElement('table'); table.className = 'md';
+      const thead = document.createElement('thead'); const tr = document.createElement('tr');
+      headers.forEach((h, ci) => { const th = document.createElement('th'); if (aligns[ci]) th.style.textAlign = aligns[ci]; th.innerHTML = mdInline(h); tr.appendChild(th); });
+      thead.appendChild(tr); table.appendChild(thead);
+      tbody = document.createElement('tbody'); table.appendChild(tbody);
+      container.appendChild(table); state = 'table';
+    }
+    function addTableRow(line) {
+      const cells = _mdSplitRow(line);
+      const tr = document.createElement('tr');
+      for (let ci = 0; ci < ncol; ci++) { const td = document.createElement('td'); if (aligns[ci]) td.style.textAlign = aligns[ci]; td.innerHTML = mdInline(cells[ci] != null ? cells[ci] : ''); tr.appendChild(td); }
+      tbody.appendChild(tr);
+    }
+    function addListItem(text) {
+      if (state !== 'list' || !ul) { endPara(); tbody = null; ul = document.createElement('ul'); ul.className = 'md'; container.appendChild(ul); state = 'list'; }
+      const li = document.createElement('li'); li.innerHTML = mdInline(text); ul.appendChild(li);
+    }
+    function addHeading(level, text) {
+      endText();
+      const h = document.createElement('h' + level); h.className = 'md'; h.innerHTML = mdInline(text); container.appendChild(h);
+    }
+    function appendParaLine(text) {
+      if (state !== 'none' || !para) { ul = null; tbody = null; para = document.createElement('div'); para.className = 'md-p'; container.appendChild(para); state = 'none'; paraText = ''; }
+      paraText += (paraText ? '\\n' : '') + text;
+      para.innerHTML = mdInline(paraText);
+    }
+
+    // Process one COMPLETE line (no trailing newline).
+    function commitLine(ln) {
+      if (state === 'code') {
+        if (/^\\s*\`\`\`/.test(ln)) { codeEl = null; codeText = ''; state = 'none'; return; }
+        codeText += (codeText ? '\\n' : '') + ln; if (codeEl) codeEl.textContent = codeText; return;
+      }
+      if (/^\\s*\`\`\`/.test(ln)) {
+        endText();
+        const pre = document.createElement('pre'); pre.className = 'md';
+        codeEl = document.createElement('code'); pre.appendChild(codeEl); container.appendChild(pre);
+        codeText = ''; state = 'code'; return;
+      }
+      if (state === 'table') {
+        if (ln.indexOf('|') !== -1 && ln.trim()) { addTableRow(ln); return; }
+        tbody = null; aligns = []; ncol = 0; state = 'none';   // table ended; handle ln below
+      }
+      if (!ln.trim()) { endText(); return; }
+      const h = ln.match(/^(#{1,3})\\s+(.+)$/);
+      if (h) { addHeading(h[1].length + 2, h[2]); return; }
+      const b = ln.match(/^\\s*[-*]\\s+(.+)$/);
+      if (b) { addListItem(b[1]); return; }
+      if (state === 'list') ul = null;
+      appendParaLine(ln);
+    }
+
+    // Drain complete lines. A |-line that could open a table needs the NEXT line
+    // (a delimiter?) to decide → if it's the last buffered line, hold it (unless
+    // finishing).
+    function drainLines(isFinal) {
+      while (lineQ.length) {
+        const ln = lineQ[0];
+        const maybeHeader = state !== 'code' && state !== 'table'
+          && ln.indexOf('|') !== -1 && ln.trim()
+          && !/^(#{1,3})\\s+/.test(ln) && !/^\\s*[-*]\\s+/.test(ln) && !/^\\s*\`\`\`/.test(ln);
+        if (maybeHeader) {
+          if (lineQ.length >= 2) {
+            if (_mdIsDelimRow(lineQ[1])) { startTable(lineQ[0], lineQ[1]); lineQ.splice(0, 2); continue; }
+          } else if (!isFinal) { break; }   // hold one line; wait for the delimiter lookahead
+        }
+        commitLine(lineQ.shift());
+      }
+    }
+
+    // The trailing in-progress partial line, rendered live where natural (inside
+    // the open code block, else as a provisional paragraph).
+    function renderLive() {
+      if (state === 'code' && codeEl) { codeEl.textContent = codeText + (codeText && pending ? '\\n' : '') + (pending || ''); return; }
+      clearLive();
+      const tail = [lineQ.join('\\n'), pending].filter(Boolean).join('\\n');
+      if (!tail.trim()) return;
+      live = document.createElement('div'); live.className = 'md-p'; live.innerHTML = mdInline(tail);
+      container.appendChild(live);
+    }
+
+    function feed(text) {
+      if (!text) return;
+      clearLive();
+      pending += text;
+      let nl;
+      while ((nl = pending.indexOf('\\n')) >= 0) { lineQ.push(pending.slice(0, nl)); pending = pending.slice(nl + 1); }
+      drainLines(false);
+      renderLive();
+    }
+    function finish() {
+      clearLive();
+      if (pending.length) { lineQ.push(pending); pending = ''; }
+      drainLines(true);
+    }
+    return { feed, finish };
   }
 
   // ── Mosaic snapshot ─────────────────────────────────────────────────────
@@ -18020,6 +18259,10 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
           // On terminal status, drop any such row whose content is ONLY tool-tag
           // noise (real prose leaves visible text and is kept).
           RC.log.querySelectorAll('.row.assistant[data-streaming="true"]').forEach((r) => {
+            // No finalize event will come for these — flush the streaming
+            // renderer's last partial line so the kept rows show their full text.
+            try { r._smd?.finish(); } catch {}
+            r._smd = null;
             const stripped = (r.textContent || '')
               .replace(/<remote-workspace\\b[\\s\\S]*?<\\/remote-workspace>/gi, '')
               .replace(/<\\/?(?:remote-workspace|read|write|edit|list|find|search|info|powershell|next-task|list-tasks|task-detail|search-tasks|remember|forget)\\b[^>]*>/gi, '')
@@ -18261,6 +18504,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
         if (existing) {
           const body = existing.querySelector('.body');
           if (body) body.innerHTML = renderInline(ev.content || '');
+          existing._smd = null;   // streaming renderer done; canonical render now owns the body
           existing.removeAttribute('data-streaming');
           node = existing;
           break;
@@ -18293,7 +18537,15 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
           row.setAttribute('data-segment-key', segKey);
         }
         const body = row.querySelector('.body');
-        if (body) body.textContent = (body.textContent || '') + incoming;
+        if (body) {
+          // Incremental markdown: feed each chunk to a per-bubble streaming
+          // renderer that emits blocks (tables/lists/code/headings) element-by-
+          // element as lines complete, instead of showing raw markdown until the
+          // finalize event snaps it to renderInline(). The final assistant-text
+          // still replaces with renderInline() as the authoritative end state.
+          if (!row._smd) { body.textContent = ''; row._smd = createStreamingMd(body); }
+          row._smd.feed(incoming);
+        }
         node = row;
         scrollToBottom();
         break;
@@ -18854,18 +19106,23 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   // Auto-grow textarea: start at one line, grow with content up to its CSS
   // max-height. The overflow-y: hidden on the textarea is flipped to auto
   // only when content exceeds the cap.
-  function autoGrowInput() {
-    $input.style.height = 'auto';
-    const sh = $input.scrollHeight;
-    const max = 220;
-    $input.style.height = Math.min(sh, max) + 'px';
-    $input.style.overflowY = sh > max ? 'auto' : 'hidden';
+  function autoGrowEl(el) {
+    if (!el) return;
+    el.style.height = 'auto';
+    const sh = el.scrollHeight, max = 220;
+    el.style.height = Math.min(sh, max) + 'px';
+    el.style.overflowY = sh > max ? 'auto' : 'hidden';
   }
+  function autoGrowInput() { autoGrowEl($input); }
   $input.addEventListener('input', autoGrowInput);
-  // Intake modal: Enter sends, shift+Enter newline.
+  // Intake modal: same input behavior as the main chat — auto-grow on input,
+  // Enter sends, shift+Enter newline.
   {
     const im = document.getElementById('im-input');
-    if (im) im.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendIntakeChat(); } });
+    if (im) {
+      im.addEventListener('input', () => autoGrowEl(im));
+      im.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendIntakeChat(); } });
+    }
   }
   document.addEventListener('keydown', (e) => {
     // F1 → open snapshot. Works even if every UI click is being eaten by
