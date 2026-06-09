@@ -15,7 +15,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '234';
+const BUILD_VERSION = '376';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
@@ -1138,15 +1138,31 @@ function stripBom(s) {
 }
 
 /**
- * Resolve a WRITE path. Relative paths resolve under the project root (cwd is
- * chdir'd to the active project during a chat); absolute paths are honored as-is.
+ * The root that relative tool paths resolve against. Defaults to process.cwd()
+ * (the server chdir's into the active project), so existing single-thread
+ * behavior is unchanged. A caller may instead pass an explicit `cwd` in the
+ * tool execution context (ctx.cwd) — this is the per-call cwd seam that lets
+ * concurrent threads target different repos WITHOUT a global process.chdir.
+ */
+function toolRoot(ctx) {
+  return ctx && ctx.cwd ? path.resolve(ctx.cwd) : process.cwd();
+}
+
+// Mutation isolation is provided by git WORKTREES per sub-agent (see ORCHESTRATOR.md):
+// each sub-agent runs with its own worktree as cwd, so concurrent writes can't collide
+// and a merge-back conflict is the deny-on-stale signal. Tools therefore write directly;
+// there is no in-process write lock here.
+
+/**
+ * Resolve a WRITE path. Relative paths resolve under the tool root (ctx.cwd, or
+ * process.cwd() by default); absolute paths are honored as-is.
  * We do NOT contain writes to the project: the agent legitimately edits files
  * OUTSIDE it (e.g. ~/myWlSetup.bat to clear MY_WL_SERVER before a deploy), and
  * since it can already write anywhere via PowerShell, blocking the write/edit
  * tool only pushed it onto a worse path. (Reads were already ungated.)
  */
-function resolveWritePath(p) {
-  const root = path.resolve(process.cwd());
+function resolveWritePath(p, ctx) {
+  const root = toolRoot(ctx);
   const abs = path.isAbsolute(p) ? path.resolve(p) : path.resolve(root, p);
   // Never let the agent WRITE into its own control state — a stray write/edit
   // into .code_boss/tasks/*.json or state.json would corrupt the task store.
@@ -1154,7 +1170,21 @@ function resolveWritePath(p) {
   return abs;
 }
 
-const IGNORE_DIRS = new Set(['node_modules', '.git', 'dist', '.code_boss', '.agent', 'coverage']);
+// Directories NEVER descended into during recursive sweeps (find/glob AND
+// search/grep). Dependency, build-output, VCS and cache dirs — huge and never what
+// a code search is after; crawling them (esp. node_modules) is what makes a search
+// "take forever". The agent can still <read>/<list>/<info> a specific path inside
+// them; only the recursive walk skips them. Keep find + grep on this ONE list.
+const IGNORE_DIRS = new Set([
+  'node_modules', 'bower_components', 'vendor',
+  '.git', '.hg', '.svn',
+  'dist', 'build', 'out', 'target', '.output',
+  '.next', '.nuxt', '.svelte-kit', '.gradle',
+  '.idea', '.vs', '.vscode',
+  'coverage', '.cache', '.parcel-cache', '.turbo',
+  '__pycache__', '.venv', 'venv', '.tox', '.mypy_cache', '.pytest_cache',
+  '.code_boss', '.agent',
+]);
 
 // code_boss's own control/state directory ("<project>/.code_boss"): its task
 // store, assignment backlog, and conversation log. It is NEVER the developer's
@@ -1270,8 +1300,8 @@ async function walkDir(root, { maxDepth = 12 } = {}) {
   return out;
 }
 
-function relForDisplay(p) {
-  return path.relative(process.cwd(), p).split(path.sep).join('/');
+function relForDisplay(p, ctx) {
+  return path.relative(toolRoot(ctx), p).split(path.sep).join('/');
 }
 
 async function safeReadText(p) {
@@ -1301,9 +1331,9 @@ const tools = {
         additionalProperties: false,
       },
     },
-    impl: async ({ path: p }) => {
+    impl: async ({ path: p }, ctx) => {
       if (typeof p !== 'string' || !p) throw new Error('path is required');
-      const abs = path.isAbsolute(p) ? p : path.join(process.cwd(), p);
+      const abs = path.isAbsolute(p) ? p : path.join(toolRoot(ctx), p);
       if (isControlPath(abs)) throw new Error(CONTROL_DIR_MSG);
       const s = await stat(abs);
       let lines = null;
@@ -1314,7 +1344,7 @@ const tools = {
         for (let i = 0; i < sample.length; i++) if (sample[i] === 0) { isBinary = true; break; }
         lines = isBinary ? null : buf.toString('utf8').split('\n').length;
       }
-      return JSON.stringify({ path: relForDisplay(abs), bytes: s.size, lines });
+      return JSON.stringify({ path: relForDisplay(abs, ctx), bytes: s.size, lines });
     },
   },
 
@@ -1332,9 +1362,9 @@ const tools = {
         additionalProperties: false,
       },
     },
-    impl: async ({ path: p, offset, limit }) => {
+    impl: async ({ path: p, offset, limit }, ctx) => {
       if (typeof p !== 'string' || !p) throw new Error('path is required');
-      const abs = path.isAbsolute(p) ? p : path.join(process.cwd(), p);
+      const abs = path.isAbsolute(p) ? p : path.join(toolRoot(ctx), p);
       if (isControlPath(abs)) throw new Error(CONTROL_DIR_MSG);
       const text = await safeReadText(abs);
       if (offset == null && limit == null) return ensureFits(text);
@@ -1361,7 +1391,7 @@ const tools = {
         additionalProperties: false,
       },
     },
-    impl: async ({ pattern, path: subPath, glob, flags }) => {
+    impl: async ({ pattern, path: subPath, glob, flags }, ctx) => {
       if (typeof pattern !== 'string' || !pattern) throw new Error('pattern is required');
       // Pure Node implementation — no external `grep` binary needed (DoD
       // Windows machines often lack Git for Windows / WSL so spawn('grep')
@@ -1377,8 +1407,9 @@ const tools = {
         return `ERROR: invalid pattern: ${e.message}`;
       }
       const globRe = glob ? globToRegex(glob) : null;
-      const exclude = new Set(['.git', 'node_modules', 'dist', 'target', '.code_boss', '.agent', '.idea', '.gradle', 'build', 'coverage']);
-      const rootAbs = subPath ? path.resolve(process.cwd(), subPath) : process.cwd();
+      const exclude = IGNORE_DIRS;   // one shared list with find/glob — see IGNORE_DIRS
+      const root = toolRoot(ctx);
+      const rootAbs = subPath ? path.resolve(root, subPath) : root;
 
       // Walk inline so we can short-circuit when MAX_GREP_MATCHES is hit.
       const out = [];
@@ -1399,7 +1430,7 @@ const tools = {
           const full = path.join(dir, e.name);
           // Glob filter applies to the path RELATIVE to cwd (forward slashes).
           if (globRe) {
-            const rel = path.relative(process.cwd(), full).replace(/\\/g, '/');
+            const rel = path.relative(root, full).replace(/\\/g, '/');
             if (!globRe.test(rel) && !globRe.test(e.name)) continue;
           }
           // Skip files that are obviously binary by extension. Cheap heuristic
@@ -1420,7 +1451,7 @@ const tools = {
           const lines = text.split(/\r?\n/);
           for (let i = 0; i < lines.length; i++) {
             if (re.test(lines[i])) {
-              const relPath = path.relative(process.cwd(), full).replace(/\\/g, '/') || full.replace(/\\/g, '/');
+              const relPath = path.relative(root, full).replace(/\\/g, '/') || full.replace(/\\/g, '/');
               const line = lines[i].length > 500 ? lines[i].slice(0, 500) + '…' : lines[i];
               out.push(`${relPath}:${i + 1}:${line}`);
               if (out.length >= MAX_GREP_MATCHES) {
@@ -1450,13 +1481,13 @@ const tools = {
         additionalProperties: false,
       },
     },
-    impl: async ({ pattern }) => {
+    impl: async ({ pattern }, ctx) => {
       if (typeof pattern !== 'string' || !pattern) throw new Error('pattern is required');
       const re = globToRegex(pattern);
-      const files = await walkDir(process.cwd());
+      const files = await walkDir(toolRoot(ctx));
       const out = [];
       for (const f of files) {
-        const rel = relForDisplay(f).replace(/\\/g, '/');
+        const rel = relForDisplay(f, ctx).replace(/\\/g, '/');
         if (re.test(rel)) {
           out.push(rel);
           if (out.length >= MAX_GLOB_RESULTS) {
@@ -1483,9 +1514,21 @@ const tools = {
       },
     },
     impl: async ({ path: p, content }, ctx) => {
+      // Robustness: some models (e.g. Claude/Sonnet) emit the write body as nested
+      // <path>…</path><content>…</content> instead of the path="…" attribute. Recover that
+      // shape so the write succeeds instead of erroring + flailing. Only fires when `path` is
+      // absent (the broken case), so a correctly-formed write is byte-identical.
+      if ((typeof p !== 'string' || !p) && typeof content === 'string') {
+        const pm = content.match(/<path>([\s\S]*?)<\/path>/i);
+        if (pm) {
+          p = pm[1].trim();
+          const cm = content.match(/<content>([\s\S]*?)<\/content>/i);
+          content = cm ? cm[1] : content.replace(/<path>[\s\S]*?<\/path>/i, '').replace(/^\s*\n/, '');
+        }
+      }
       if (typeof p !== 'string' || !p) throw new Error('path is required');
       if (typeof content !== 'string') throw new Error('content is required');
-      const abs = resolveWritePath(p);
+      const abs = resolveWritePath(p, ctx);
       // Pre-write hook: server may insist the containing git repo be on
       // a CODE_BOSS_* branch before we modify any file under it. If the
       // hook throws or returns 'aborted', the user declined and the
@@ -1499,7 +1542,7 @@ const tools = {
       try { oldText = await readFile(abs, 'utf8'); existed = true; } catch {}
       await mkdir(path.dirname(abs), { recursive: true });
       await writeFile(abs, content, 'utf8');
-      const rel = relForDisplay(abs);
+      const rel = relForDisplay(abs, ctx);
       const summary = existed ? shortDiffSummary(oldText, content) : `(new file, ${content.split('\n').length} lines)`;
       const diff = existed
         ? renderUnifiedDiff(oldText, content, { pathLabel: rel, context: 2 })
@@ -1530,7 +1573,7 @@ const tools = {
       if (typeof p !== 'string' || !p) throw new Error('path is required');
       if (typeof find !== 'string') throw new Error('find is required');
       if (typeof replace !== 'string') throw new Error('replace is required');
-      const abs = resolveWritePath(p);
+      const abs = resolveWritePath(p, ctx);
       // Same pre-write hook as write_file — see comment there.
       if (typeof ctx?.requireBranch === 'function') {
         const status = await ctx.requireBranch(abs);
@@ -1566,12 +1609,12 @@ const tools = {
         }
       }
 
-      if (first === -1) throw new Error(`find string not found in ${relForDisplay(abs)}`);
+      if (first === -1) throw new Error(`find string not found in ${relForDisplay(abs, ctx)}`);
       const second = oldText.indexOf(findToUse, first + 1);
-      if (second !== -1) throw new Error(`find string occurs more than once in ${relForDisplay(abs)} — make it more specific`);
+      if (second !== -1) throw new Error(`find string occurs more than once in ${relForDisplay(abs, ctx)} — make it more specific`);
       const newText = oldText.slice(0, first) + replaceToUse + oldText.slice(first + findToUse.length);
       await writeFile(abs, newText, 'utf8');
-      const rel = relForDisplay(abs);
+      const rel = relForDisplay(abs, ctx);
       const note = fallback ? `  (matched after normalizing line endings to ${fallback})` : '';
       return {
         content: `edited ${rel}  ${shortDiffSummary(oldText, newText)}${note}`,
@@ -1596,6 +1639,32 @@ const tools = {
     },
     impl: async ({ command, timeout_ms }, ctx) => {
       if (typeof command !== 'string' || !command.trim()) throw new Error('command is required');
+      // SAFETY: refuse to kill processes BY NAME (or by name-based selection). These sweep up
+      // UNRELATED processes — including the code_boss server itself, which is a node process.
+      // (Killing node by name is a classic, infuriating way an agent takes down its own host.)
+      // Stop ONLY the process you started, by PID or as a job. Killing by -Id is always allowed.
+      // Covers: pkill/killall; taskkill /IM; Stop-Process/spps/kill -Name (and -Na/-Nam/-ProcessName);
+      // Get-Process/gps …→ kill (pipe, ForEach, .Kill()); Stop-Process -InputObject (Get-Process …);
+      // and CIM/WMI process termination by name (Win32_Process…Terminate, wmic process … delete).
+      const KILL_BY_NAME = new RegExp([
+        '\\b(?:pkill|killall)\\b',
+        'taskkill\\b[^\\n]*\\/im\\b',
+        '\\b(?:stop-process|spps|kill)\\b[^\\n]*-(?:processname|na(?:me?)?)\\b',          // by -Name / -Na / -Nam / -ProcessName (+ aliases)
+        '\\b(?:get-process|gps)\\b[^\\n]*\\b(?:stop-process|spps|kill)\\b',               // Get-Process … | … kill  (pipe / ForEach / Where)
+        '\\b(?:stop-process|spps|kill)\\b[^\\n]*\\b(?:get-process|gps)\\b',               // Stop-Process -InputObject (Get-Process …)  (reverse order)
+        '\\b(?:get-process|gps)\\b[^\\n]*\\.kill\\(',                                     // (gps node).Kill()
+        'win32_process\\b[^\\n]*\\b(?:terminate|delete)\\b',                              // CIM/WMI terminate by name
+        '\\bterminate\\b[^\\n]*\\bwin32_process\\b',
+        '\\bwmic\\b[^\\n]*\\bprocess\\b[^\\n]*\\bdelete\\b',
+      ].join('|'), 'i');
+      // Don't fire on a kill-phrase that is merely inside a QUOTED STRING — a commit message, an
+      // echo, a grep pattern (`git commit -m "...Stop-Process..."`, `Select-String -Pattern "pkill"`).
+      // Blank quoted contents first, so we match an actual command, not text *about* one. A real
+      // kill keeps its structure outside the quotes (e.g. Stop-Process -Name "node") and still fires.
+      const screened = command.replace(/"(?:[^"\\]|\\.)*"/g, '""').replace(/'[^']*'/g, "''");
+      if (KILL_BY_NAME.test(screened)) {
+        throw new Error('Refused: do not kill processes by NAME or name-based selection (Stop-Process -Name / taskkill /IM / pkill / killall / Get-Process|Stop-Process / -InputObject / Win32_Process Terminate / wmic process delete) — it can kill unrelated processes, including the code_boss server itself (it runs on node). Stop only the process YOU started, by its PID or as a job: `$p = Start-Process node -ArgumentList app.js -PassThru; ...; Stop-Process -Id $p.Id`  OR  `$j = Start-Job { node app.js }; ...; Stop-Job $j; Remove-Job $j`.');
+      }
       const timeout = Math.min(Math.max(1000, Number(timeout_ms) || BASH_DEFAULT_TIMEOUT_MS), BASH_MAX_TIMEOUT_MS);
 
       const t0 = Date.now();
@@ -1642,7 +1711,7 @@ const tools = {
         // PowerShell-only deployment. cmd.exe is often blocked by enterprise
         // policy and lacks the unix aliases the agent expects (ls, cat, etc.).
         const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', command], {
-          cwd: process.cwd(),
+          cwd: toolRoot(ctx),
           windowsHide: true,
           env: process.env,
         });
@@ -1652,21 +1721,22 @@ const tools = {
         // would hang forever — taking the whole agent loop with it. This
         // grace timer force-settles so the loop always recovers.
         let killGraceTimer = null;
-        const armGrace = () => { if (!killGraceTimer) killGraceTimer = setTimeout(() => finish(null, 'killfail'), 5000); };
-        const killTree = () => {
+        // On a USER cancel we want control back fast; on a timeout, give a stuck kill a moment.
+        const armGrace = (ms = 5000) => { if (!killGraceTimer) killGraceTimer = setTimeout(() => finish(null, 'killfail'), ms); };
+        const killTree = (graceMs) => {
           // taskkill /F /T is the Windows-correct whole-tree kill; child.kill()
           // only stops the powershell wrapper (and can suppress the 'close'
           // event), so we rely on taskkill + the grace timer as the fallback.
           if (child.pid) {
             try { spawn('taskkill', ['/F', '/T', '/PID', String(child.pid)], { windowsHide: true }); } catch {}
           }
-          armGrace();
+          armGrace(graceMs);
         };
         const timer = setTimeout(() => {
           timedOut = true;
           // taskkill /T kills the whole process tree (child.kill() only stops
           // the powershell wrapper, leaving e.g. mvn.exe orphaned).
-          killTree();
+          killTree(5000);
         }, timeout);
 
         // User-initiated cancel (esc / /api/cancel) — kill the child
@@ -1676,7 +1746,7 @@ const tools = {
         let cancelled = false;
         const onAbort = () => {
           cancelled = true;
-          killTree();
+          killTree(2000);   // user pressed cancel — give control back fast (2s), don't wait 5s
         };
         if (ctx?.signal) {
           if (ctx.signal.aborted) onAbort();
@@ -1782,10 +1852,11 @@ const tools = {
         additionalProperties: false,
       },
     },
-    impl: async ({ path: p }) => {
+    impl: async ({ path: p }, ctx) => {
+      const root = toolRoot(ctx);
       const dir = p
-        ? (path.isAbsolute(p) ? p : path.join(process.cwd(), p))
-        : process.cwd();
+        ? (path.isAbsolute(p) ? p : path.join(root, p))
+        : root;
       if (isControlPath(dir)) throw new Error(CONTROL_DIR_MSG);
       const entries = await readdir(dir, { withFileTypes: true });
       const lines = [];
@@ -1820,8 +1891,8 @@ const tools = {
         additionalProperties: false,
       },
     },
-    impl: async ({ note, category }) => {
-      const r = await rememberFact(process.cwd(), { note, category });
+    impl: async ({ note, category }, ctx) => {
+      const r = await rememberFact(toolRoot(ctx), { note, category });
       if (r.full) return `ERROR: codebase memory is full (${r.total} entries); ask the developer to prune it before adding more.`;
       if (!r.added) return `Already remembered (${r.entry?.id || 'existing'}): "${r.entry?.note || ''}". No change.`;
       return `Remembered [${r.entry.category}] ${r.entry.id}: "${r.entry.note}". Codebase memory now has ${r.total} fact(s).`;
@@ -1841,8 +1912,8 @@ const tools = {
         additionalProperties: false,
       },
     },
-    impl: async ({ id, note }) => {
-      const r = await forgetFact(process.cwd(), { id, note });
+    impl: async ({ id, note }, ctx) => {
+      const r = await forgetFact(toolRoot(ctx), { id, note });
       return r.removed ? `Forgot ${r.removed} fact(s).` : 'No matching fact found; nothing removed.';
     },
   },
@@ -1911,9 +1982,18 @@ function extractDiff(r) {
  *
  * Storage layout (per project):
  *   <project>/.code_boss/tasks/
- *     state.json                  { nextId, currentId, rootId, allTaskIds: [...] }
+ *     state.json                  v2: { version:2, nextId, currentId, rootId,
+ *                                   allTaskIds, threads:{...}, activeThreadIds,
+ *                                   focusedThreadId, rootThreadId, nextThreadId }
  *     T-1.json                    full task record (see TaskRecord shape below)
  *     T-2.json
+ *
+ * THREADS (v2): a "thread" is a concurrent line of work — a lineage of tasks
+ * with an open HEAD. Multiple threads may be active at once. `currentId` is a
+ * derived mirror of the FOCUSED thread's head, kept for the single-thread API
+ * (currentId/getCurrent/transitionTo) the serial worker still uses. Thread
+ * lifecycle (active/dormant/blocked/done) is ORTHOGONAL to the compaction tiers
+ * below (tiers are about context size, not concurrency).
  *
  * TaskRecord:
  *   {
@@ -2043,6 +2123,24 @@ function createTasksStore(projectDir) {
     state.nextId++;
     return id;
   }
+  function newThreadId() {
+    const id = `TH-${state.nextThreadId}`;
+    state.nextThreadId++;
+    return id;
+  }
+  // The thread the legacy single-thread API targets (currentId / getCurrent /
+  // transitionTo / appendMessage). Its head IS state.currentId.
+  function focusedThread() { return state?.threads?.[state.focusedThreadId] ?? null; }
+  // A task is an "active head" iff it is the open head of some ACTIVE thread.
+  // Active heads are never demoted/rolled up. Single-thread → exactly currentId.
+  function isActiveHead(taskId) {
+    for (const tid of state?.activeThreadIds ?? []) {
+      if (state.threads?.[tid]?.headId === taskId) return true;
+    }
+    return false;
+  }
+  // Tasks created before v2 have no threadId → they belong to the root thread.
+  function taskThreadId(t) { return t?.threadId ?? state.rootThreadId; }
 
   /**
    * Initialize the store. If no state exists, creates a root task and makes it current.
@@ -2052,10 +2150,17 @@ function createTasksStore(projectDir) {
     await ensureDir();
     state = await loadState();
     if (!state) {
-      state = { nextId: 1, currentId: null, rootId: null, allTaskIds: [] };
+      // Fresh store: a root TASK that is the head of a root THREAD.
+      state = {
+        version: 2,
+        nextId: 1, currentId: null, rootId: null, allTaskIds: [],
+        nextThreadId: 1, threads: {}, activeThreadIds: [], focusedThreadId: null, rootThreadId: null,
+      };
       const rootId = newId();
+      const tid = newThreadId();
       const root = {
         id: rootId,
+        threadId: tid,
         userRequest: null,         // agent fills this in when the task closes
         parentId: null,
         childIds: [],
@@ -2069,6 +2174,22 @@ function createTasksStore(projectDir) {
       state.currentId = rootId;
       state.rootId = rootId;
       state.allTaskIds.push(rootId);
+      state.threads[tid] = { id: tid, headId: rootId, state: 'active', topic: null, blockedOn: null, parentThreadId: null, openedAt: nowMs(), lastTouchedAt: nowMs() };
+      state.activeThreadIds = [tid];
+      state.focusedThreadId = tid;
+      state.rootThreadId = tid;
+      await saveState();
+    } else if (state.version !== 2) {
+      // Migrate a v1 store forward: wrap the existing current task as the head
+      // of a single active root thread. No task files are rewritten — pre-v2
+      // tasks resolve to the root thread via taskThreadId().
+      const tid = 'TH-1';
+      state.version = 2;
+      state.nextThreadId = 2;
+      state.threads = { [tid]: { id: tid, headId: state.currentId, state: 'active', topic: null, blockedOn: null, parentThreadId: null, openedAt: nowMs(), lastTouchedAt: nowMs() } };
+      state.activeThreadIds = [tid];
+      state.focusedThreadId = tid;
+      state.rootThreadId = tid;
       await saveState();
     }
     return state;
@@ -2091,9 +2212,10 @@ function createTasksStore(projectDir) {
    *
    * Returns the new task record.
    */
-  async function transitionTo({ summary, userRequest }) {
-    if (!state?.currentId) throw new Error('store not initialized');
-    const cur = await loadTask(state.currentId);
+  async function transitionThread(threadId, { summary, userRequest }) {
+    const th = state?.threads?.[threadId];
+    if (!th || !th.headId) throw new Error(`thread ${threadId} not initialized`);
+    const cur = await loadTask(th.headId);
     cur.summary = summary ?? cur.summary ?? '(no summary provided)';
     cur.userRequest = userRequest ?? cur.userRequest ?? null;
     cur.ended = nowMs();
@@ -2110,6 +2232,7 @@ function createTasksStore(projectDir) {
     const id = newId();
     const t = {
       id,
+      threadId,
       userRequest: null,
       parentId: realParentId,
       childIds: [],
@@ -2130,10 +2253,18 @@ function createTasksStore(projectDir) {
       }
     }
 
-    state.currentId = id;
+    th.headId = id;
+    th.lastTouchedAt = nowMs();
+    if (threadId === state.focusedThreadId) state.currentId = id;   // keep the legacy mirror in sync
     state.allTaskIds.push(id);
     await saveState();
     return { newTask: t, closedId };
+  }
+
+  // Single-thread wrapper: transition the FOCUSED thread (currentId === its head).
+  async function transitionTo(args) {
+    if (!state?.focusedThreadId) throw new Error('store not initialized');
+    return transitionThread(state.focusedThreadId, args);
   }
 
   /**
@@ -2245,7 +2376,8 @@ function createTasksStore(projectDir) {
     return {
       id: t.id, userRequest: t.userRequest, parentId: t.parentId,
       childIds: t.childIds, started: t.started, ended: t.ended,
-      tier: t.tier, summary: t.summary,
+      tier: t.tier, summary: t.summary, threadId: t.threadId,
+      ...(t.subagentId ? { subagentId: t.subagentId } : {}),   // provenance: which sub-agent produced this
       messageCount: (t.messages ?? []).length,
     };
   }
@@ -2325,7 +2457,7 @@ function createTasksStore(projectDir) {
   async function findOldestDemotionCandidate(tier) {
     const tasks = await listTasks({ tier });
     const eligible = tasks.filter((t) => {
-      if (t.id === state.currentId) return false;
+      if (isActiveHead(t.id)) return false;   // never demote the open head of an active thread
       if (t.archived) return false;
       if (t.rolledUpInto) return false;
       if ((tier === 1 || tier === 2) && t.ended == null) return false;
@@ -2380,6 +2512,7 @@ function createTasksStore(projectDir) {
     const id = newId();
     const t = {
       id,
+      threadId: taskThreadId(children[0]),
       userRequest,
       parentId: children[0].parentId ?? null,
       childIds: children.map((c) => c.id),
@@ -2430,11 +2563,182 @@ function createTasksStore(projectDir) {
     return out;
   }
 
+  // ── Thread layer (first-class concurrent lines of work) ────────────────────
+  // The single-thread API above operates on the FOCUSED thread; these expose and
+  // manipulate threads directly. Unused by the serial worker (which has exactly
+  // one active thread = parity with v1); the Phase-2 second thread uses them.
+  function listThreads() { return Object.values(state?.threads ?? {}).map((th) => ({ ...th })); }
+  function getThread(id) { const th = state?.threads?.[id]; return th ? { ...th } : null; }
+  function focusedThreadId() { return state?.focusedThreadId ?? null; }
+  function rootThreadId() { return state?.rootThreadId ?? null; }
+  function activeThreadIds() { return [...(state?.activeThreadIds ?? [])]; }
+  function threadHead(id) { return state?.threads?.[id]?.headId ?? null; }
+
+  /** Point the legacy single-thread API at another thread (its head becomes
+   *  state.currentId). */
+  async function focusThread(id) {
+    const th = state?.threads?.[id];
+    if (!th) return null;
+    state.focusedThreadId = id;
+    state.currentId = th.headId;
+    await saveState();
+    return id;
+  }
+
+  /** Open a NEW active thread with a fresh head task (a child of root by
+   *  default). Does NOT change focus. Returns { thread, headTask }. */
+  async function spawnThread({ topic = null, parentThreadId = null, parentTaskId = undefined } = {}) {
+    if (!state) throw new Error('store not initialized');
+    const headId = newId();
+    const parentId = parentTaskId !== undefined ? parentTaskId : state.rootId;
+    const tid = newThreadId();
+    const head = {
+      id: headId, threadId: tid,
+      userRequest: null, parentId, childIds: [],
+      started: nowMs(), ended: null, tier: 1, summary: null, messages: [],
+    };
+    await saveTask(head);
+    if (parentId) {
+      const parent = await loadTask(parentId);
+      if (parent) { parent.childIds = [...(parent.childIds ?? []), headId]; await saveTask(parent); }
+    }
+    const th = { id: tid, headId, state: 'active', topic, blockedOn: null, parentThreadId, openedAt: nowMs(), lastTouchedAt: nowMs() };
+    state.threads[tid] = th;
+    if (!state.activeThreadIds.includes(tid)) state.activeThreadIds.push(tid);
+    state.allTaskIds.push(headId);
+    await saveState();
+    return { thread: { ...th }, headTask: head };
+  }
+
+  /** Set a thread's lifecycle ('active' | 'dormant' | 'blocked' | 'done') and
+   *  maintain the active set. */
+  async function setThreadState(id, lifecycle, { blockedOn = null } = {}) {
+    const th = state?.threads?.[id];
+    if (!th) return null;
+    th.state = lifecycle;
+    th.blockedOn = lifecycle === 'blocked' ? blockedOn : null;
+    th.lastTouchedAt = nowMs();
+    const active = new Set(state.activeThreadIds);
+    if (lifecycle === 'active') active.add(id); else active.delete(id);
+    state.activeThreadIds = [...active];
+    await saveState();
+    return { ...th };
+  }
+
+  /** Append a message to a specific thread's head task. */
+  async function appendToThread(threadId, msg) {
+    const head = state?.threads?.[threadId]?.headId;
+    if (!head) throw new Error(`thread ${threadId} not found`);
+    return appendMessage(msg, head);
+  }
+
+  /**
+   * Bulk-import a FINISHED sub-agent's tasks (with messages) as ONE provenance-tagged,
+   * DONE thread — so its work persists + is searchable in this (the parent/manager) store
+   * without ever entering the foreground's prompt (it's a sibling thread, not the focused
+   * lineage; "transcripts stay put, results flow up"). `sourceTasks` are plain records read
+   * from the sub-agent's own store: { userRequest, summary, messages, started, ended }.
+   * Imported at tier 2 (finished, off the active tier-1 budget). Returns { threadId, taskIds }.
+   */
+  async function importThread(sourceTasks, { subagentId = null, topic = null } = {}) {
+    if (!state) throw new Error('store not initialized');
+    const tid = newThreadId();
+    const taskIds = [];
+    for (const src of (sourceTasks || [])) {
+      const id = newId();
+      const t = {
+        id, threadId: tid,
+        userRequest: src.userRequest ?? null,
+        parentId: state.rootId,
+        childIds: [],
+        started: src.started ?? nowMs(),
+        ended: src.ended ?? nowMs(),
+        tier: 2,
+        summary: src.summary ?? null,
+        messages: Array.isArray(src.messages) ? src.messages.map((m) => ({ ...m })) : [],
+        subagentId,                                  // provenance: which sub-agent produced this
+      };
+      await saveTask(t);
+      state.allTaskIds.push(id);
+      taskIds.push(id);
+    }
+    if (state.rootId) {                              // link under root so tree walks find them
+      const root = await loadTask(state.rootId);
+      if (root) { root.childIds = [...(root.childIds ?? []), ...taskIds]; await saveTask(root); }
+    }
+    state.threads[tid] = {
+      id: tid, headId: taskIds[taskIds.length - 1] || null,
+      state: 'done', topic, subagentId, blockedOn: null,
+      parentThreadId: state.rootThreadId ?? null,
+      openedAt: nowMs(), lastTouchedAt: nowMs(), imported: true,
+    };
+    // a DONE thread is intentionally NOT added to activeThreadIds
+    await saveState();
+    return { threadId: tid, taskIds };
+  }
+
+  /**
+   * Export this store's tasks as plain records (WITH messages) for importThread() into
+   * another store — the read side of a sub-agent → manager hand-up. Skips the empty root
+   * head (the bare container). Order follows allTaskIds (chronological).
+   */
+  async function exportTasks() {
+    const out = [];
+    for (const id of (state?.allTaskIds ?? [])) {
+      const t = await loadTask(id);
+      if (!t) continue;
+      // include the root iff it carries real work (in a fresh store the FIRST task IS the
+      // root); skip only genuinely empty container tasks.
+      const hasContent = (t.messages && t.messages.length) || t.summary || t.userRequest;
+      if (!hasContent) continue;
+      out.push({
+        userRequest: t.userRequest ?? null,
+        summary: t.summary ?? null,
+        started: t.started ?? null,
+        ended: t.ended ?? null,
+        messages: Array.isArray(t.messages) ? t.messages.map((m) => ({ ...m })) : [],
+      });
+    }
+    return out;
+  }
+
+  // Re-open a CLOSED task as the focused thread's head — used by the reviewer loop to fold a
+  // review-fix back INTO the task being reviewed (instead of a separate task). Drops the empty
+  // placeholder that the closing <next-task> created. Returns false (no-op) unless the current
+  // head IS that empty placeholder, so it can never scramble mid-run state.
+  async function reopenTask(id) {
+    if (!state) return false;
+    const target = await loadTask(id);
+    const th = focusedThread();
+    if (!target || !th) return false;
+    const placeholderId = th.headId;
+    if (placeholderId === id) return true;              // already the head — nothing to do
+    const placeholder = await loadTask(placeholderId);
+    // Only proceed when the placeholder is genuinely empty (no work since the close).
+    if (placeholder && ((placeholder.messages && placeholder.messages.length) || placeholder.summary || placeholder.userRequest)) return false;
+    if (placeholder) {                                   // detach + delete the empty placeholder
+      if (placeholder.parentId) {
+        const parent = await loadTask(placeholder.parentId);
+        if (parent) { parent.childIds = (parent.childIds ?? []).filter((c) => c !== placeholderId); await saveTask(parent); }
+      }
+      state.allTaskIds = (state.allTaskIds ?? []).filter((t) => t !== placeholderId);
+      cache.delete(placeholderId);
+      try { await unlink(path.join(dir, TASK_FILE(placeholderId))); } catch { /* best-effort */ }
+    }
+    target.ended = null;                                 // re-open
+    await saveTask(target);
+    th.headId = id;
+    th.lastTouchedAt = nowMs();
+    if (th.id === state.focusedThreadId) state.currentId = id;
+    await saveState();
+    return true;
+  }
+
   return {
     init,
     currentId, rootId,
     getCurrent,
-    transitionTo,
+    transitionTo, reopenTask,
     attachToTask,
     appendMessage,
     relocateMessageRef,
@@ -2443,8 +2747,323 @@ function createTasksStore(projectDir) {
     rollupTier3Tasks, archiveTask,
     findOldestDemotionCandidate,
     tierTokens,
+    // thread layer (first-class concurrency)
+    listThreads, getThread, focusedThreadId, rootThreadId, activeThreadIds,
+    threadHead, focusThread, spawnThread, setThreadState, transitionThread, appendToThread, importThread, exportTasks,
     _state: () => state,                     // for tests
     _dir: () => dir,
+  };
+}
+
+// ====== agent/engine.mjs ======
+/**
+ * engine.mjs — the shared, store-free TURN ENGINE layer for code_boss agents.
+ *
+ * Foundation of the layered agent architecture: every pass — the worker, intake,
+ * reviewer, acceptance, consolidation, summarizer — assembles its request the SAME
+ * way and (progressively, across the migration phases) runs the SAME turn loop.
+ * The TASK LIFECYCLE is a capability layered on top via hooks; this module must
+ * NEVER import tasks.mjs.
+ *
+ * Phase 1 provides assembleConvo (the single Gemini-safe request assembler).
+ * Later phases add the streaming turn loop (runEngine) here.
+ */
+
+/**
+ * Build the messages array to send to the model, the Gemini-safe way.
+ *
+ * genai.mil / Gemini IGNORES role:'system' messages — the openai-http adapter
+ * passes `messages` through untouched, so a role:'system' entry reaches the wire
+ * verbatim and is dropped. The system prompt must therefore ride INSIDE a user
+ * message: we prepend it as a <system-reminder> block into the LATEST user message
+ * (the freshest one the model is answering), never as a role:'system' entry.
+ * `priming` is an optional hidden few-shot prepended before the conversation.
+ *
+ *   assembleConvo({ systemPrompt, priming?, messages }) -> messages[]
+ *
+ * Pure: never mutates its inputs; never emits role:'system'. This is the ONE
+ * assembly path shared by every pass — extracted verbatim from the worker loop so
+ * the same fix covers every agent at once.
+ */
+function assembleConvo({ systemPrompt, priming = [], messages = [] }) {
+  const sys = String(systemPrompt == null ? '' : systemPrompt);
+  const baseConvo = [...(priming || []), ...(messages || [])];
+  let latestUserIdx = -1;
+  for (let i = baseConvo.length - 1; i >= 0; i--) {
+    if (baseConvo[i].role === 'user') { latestUserIdx = i; break; }
+  }
+  const convo = baseConvo.map((m, i) => {
+    if (i !== latestUserIdx) return m;
+    return { role: 'user', content: `<system-reminder>\n${sys}\n</system-reminder>\n\n${m.content}` };
+  });
+  if (latestUserIdx === -1) {
+    // No user message at all — send the reminder as the only message.
+    convo.push({ role: 'user', content: `<system-reminder>\n${sys}\n</system-reminder>` });
+  }
+  return convo;
+}
+
+// ====== agent/inspector.mjs ======
+// Inspector — the ONE observability vocabulary for the continuous-cognition
+// engine (Phase-0 spine). Every subsystem the RuntimeKernel will orchestrate
+// (governor, conductor, arbiter, threads) emits into THIS schema, so a single
+// Thread Inspector can render the parallel mental model and EVERY control
+// decision is REPLAYABLE. The project's signature production failure is a SILENT
+// "frozen / no errors" hang, so the bar is: if you can't see why it chose or
+// looped, it's unshippable. Defining the shapes now (per NORTH-STAR.md "shared
+// spine before subsystems") means the kernel emits into a fixed vocabulary from
+// line one — no per-subsystem ad-hoc logging to reconcile later.
+//
+// Pure data + an in-memory recorder; no I/O of its own (a sink is injected — the
+// server will broadcast records over SSE). NOT wired yet; Phase 1 emits into it.
+
+// ── Canonical event factories (the schema) ──────────────────────────────────
+
+// decision: one governor/conductor "keep thinking? / which move?" decision, with
+// EVERYTHING needed to replay it — the soft value-of-computation inputs
+// (salience, cost, floor), the resulting P(continue), and the drawn u. Given a
+// record, `pContinue` and `decision` are reproducible from (salience,cost,floor,
+// tau) + u, which is what makes a loop/stop diagnosable offline.
+function decisionEvent({
+  threadId, tick = 0, move = null, question = null,
+  salience = null, cost = 0, floor = 0, pContinue = null, u = null,
+  decision, tokensThisStream = 0,
+}) {
+  return {
+    type: 'decision', threadId, tick,
+    move, question,
+    salience: normSalience(salience),
+    cost, floor, pContinue, u,
+    decision,                       // 'continue' | 'stop'
+    tokensThisStream,
+  };
+}
+
+// route: the arbiter's broadcast decision for a finished contribution — ACT
+// (mutate), SAY (surface to the user), or STORE (file silently) — plus the
+// losing candidates and why, so "why did it stay silent?" answers itself.
+function routeEvent({ threadId, contributionId = null, kind = null, routeScore = null, route, candidates = [], reason = null }) {
+  return { type: 'route', threadId, contributionId, kind, routeScore, route, candidates, reason };
+}
+
+// thread: a thread lifecycle transition (maps 1:1 onto tasks v2 thread states).
+function threadEvent({ threadId, state, topic = null, blockedOn = null }) {
+  return { type: 'thread', threadId, state, topic, blockedOn };   // spawned|active|dormant|blocked|done
+}
+
+function normSalience(s) {
+  if (s == null) return null;
+  if (typeof s === 'number') return { novelty: null, uncertainty: null, score: s };
+  return { novelty: s.novelty ?? null, uncertainty: s.uncertainty ?? null, score: s.score ?? null };
+}
+
+const EVENT_TYPES = new Set(['decision', 'route', 'thread']);
+
+// ── Recorder ────────────────────────────────────────────────────────────────
+// Bounded in-memory ring buffer (idle sessions never grow unbounded). Stamps a
+// monotonic seq + timestamp, validates the shape, and forwards to an optional
+// sink. Query helpers drive the Thread Inspector (per-thread timeline, the
+// decision replay table, current thread states).
+function createInspector({ capacity = 2000, onEvent = null, now = Date.now } = {}) {
+  const buf = [];
+  let seq = 0;
+  let dropped = 0;
+
+  function record(ev) {
+    if (!ev || !EVENT_TYPES.has(ev.type)) throw new Error(`inspector: unknown event type ${ev && ev.type}`);
+    if (!ev.threadId) throw new Error('inspector: event missing threadId');
+    const rec = { seq: seq++, t: now(), ...ev };
+    buf.push(rec);
+    if (buf.length > capacity) { buf.shift(); dropped++; }
+    if (onEvent) { try { onEvent(rec); } catch {} }
+    return rec;
+  }
+
+  const all = () => buf.slice();
+  const recent = (n = 50) => buf.slice(-n);
+  const byThread = (threadId) => buf.filter((e) => e.threadId === threadId);
+  const decisions = () => buf.filter((e) => e.type === 'decision');
+  const routes = () => buf.filter((e) => e.type === 'route');
+
+  // Current state per thread, derived from the latest thread event for each.
+  function threadStates() {
+    const m = new Map();
+    for (const e of buf) {
+      if (e.type === 'thread') m.set(e.threadId, { threadId: e.threadId, state: e.state, topic: e.topic, blockedOn: e.blockedOn, t: e.t });
+    }
+    return [...m.values()];
+  }
+
+  function snapshot() {
+    return { events: buf.length, dropped, nextSeq: seq, threads: threadStates() };
+  }
+
+  function clear() { buf.length = 0; dropped = 0; }
+
+  return { record, all, recent, byThread, decisions, routes, threadStates, snapshot, clear };
+}
+
+// ====== agent/kernel.mjs ======
+// RuntimeKernel — the agent control loop (continuous-cognition Phase 1→2).
+//
+// runKernel SCHEDULES N concurrent threads, advancing one tick at a time. Each
+// tick runs ONE turn of the chosen thread; the (optional) governor decides, just
+// before a tick, whether that thread keeps thinking (soft value-of-computation);
+// every decision + the result is recorded to the (optional) Inspector. A thread
+// whose tick returns a terminal result is done; the run ends when all threads
+// are done or the global tick budget is exhausted.
+//
+// For the SERIAL worker this is exactly the old `for (turn…)` loop: ONE thread,
+// no governor (its tick owns the stop decision via converge / task-churn), no
+// Inspector — see runTurnLoop, the one-thread wrapper, which is byte-identical to
+// the in-line loop it replaced (gated by test-engine-characterization).
+// NORTH-STAR.md: "serial is a config of the kernel, not a fork."
+
+// thread: { id, tick(turn) -> result | undefined, ... }
+//   tick returns a terminal RESULT (stop this thread) or undefined (continue).
+// schedule(readyStates, ticks) -> the state to advance next (default: first ready).
+// governor(thread, turn) -> { decision:'continue'|'stop', salience, cost, floor,
+//   pContinue, u, tokensThisStream, move? } | null  (null/absent → always run).
+async function runKernel({ threads, schedule = (ready) => ready[0], governor = null, inspector = null, maxTicks }) {
+  const states = threads.map((t) => ({ t, turn: 0, done: false, result: undefined }));
+  let ticks = 0;
+  while (ticks < maxTicks) {
+    const ready = states.filter((s) => !s.done);
+    if (ready.length === 0) break;
+    const s = schedule(ready, ticks);
+    if (!s) break;
+    s.turn++;
+    if (governor) {
+      const g = governor(s.t, s.turn);
+      if (g && inspector) {
+        inspector.record(decisionEvent({
+          threadId: s.t.id, tick: s.turn, move: g.move ?? null,
+          salience: g.salience, cost: g.cost, floor: g.floor,
+          pContinue: g.pContinue, u: g.u, decision: g.decision,
+          tokensThisStream: g.tokensThisStream ?? 0,
+        }));
+      }
+      if (g && g.decision === 'stop') { s.done = true; continue; }
+    }
+    const r = await s.t.tick(s.turn);
+    ticks++;
+    if (r !== undefined) { s.done = true; s.result = r; }
+  }
+  return states.map((s) => ({ id: s.t.id, result: s.result, turns: s.turn, done: s.done }));
+}
+
+// Single-thread driver (the serial worker): runKernel with one thread, no
+// governor, no Inspector — byte-identical to the old `for (turn=1..maxTurns)`
+// loop. Returns the tick's terminal result, or undefined if maxTurns is hit.
+async function runTurnLoop({ maxTurns, tick }) {
+  const [main] = await runKernel({ threads: [{ id: 'main', tick }], maxTicks: maxTurns });
+  return main.result;
+}
+
+// ====== agent/cognition.mjs ======
+/**
+ * The pure cognition controller — NO LLM, NO I/O. This is the deterministic core of adaptive
+ * cognition: the ASSESS turn emits an EVALUATION (metrics); the policy maps metrics → an
+ * ordered set of composable pipeline LAYERS; the controller governs how long the thinking
+ * tree may spend via a salience×budget inequality that guarantees termination on its own.
+ *
+ * THE CONTINUE RULE (the whole termination guarantee, no hard ceiling):
+ *
+ *     continue while   salience  >=  k * (spent / budget)
+ *
+ *  - `salience` is bounded in [0,1] (self-reported per node).
+ *  - the right side rises without bound as `spent` grows.
+ *  - so the bar eventually exceeds any salience → the tree stops in FINITE steps. The
+ *    effective stop point is spent ≈ budget/k (e.g. k=0.8 → ~1.25×budget — that's the
+ *    salience "overrun flex"). `budget` is a FACTOR, not a ceiling.
+ *
+ * OVERHEAD is tracked on a SEPARATE line and NOT charged to budget, so decomposition is
+ * never penalized for its plumbing (assess/brief/fold). A small per-node floor `epsilon`
+ * is charged to budget so even work-free recursion still terminates.
+ *
+ * Pure functions only — exhaustively unit-tested in test/test-cognition-core.mjs.
+ */
+
+const COGNITION_ENUMS = {
+  complexity: ['low', 'medium', 'high'],
+  creativity: ['low', 'high'],
+  accuracy: ['normal', 'critical'],
+  size: ['small', 'large'],
+  mode: ['build', 'debug', 'research', 'explain'],
+};
+const COGNITION_DEFAULTS = { complexity: 'low', creativity: 'low', accuracy: 'normal', size: 'small', mode: 'build' };
+
+/**
+ * Coerce a raw (LLM-emitted) evaluation into valid metrics. Anything missing or off-rubric
+ * falls back to the conservative default — the programmatic robustness that keeps routing
+ * consistent no matter what the model returns.
+ */
+function normalizeCognitionMetrics(raw = {}) {
+  const m = {};
+  for (const key of Object.keys(COGNITION_DEFAULTS)) {
+    const v = raw && typeof raw[key] === 'string' ? raw[key].toLowerCase().trim() : null;
+    m[key] = COGNITION_ENUMS[key].includes(v) ? v : COGNITION_DEFAULTS[key];
+  }
+  return m;
+}
+
+/**
+ * THE POLICY (pure, programmatic — never the LLM's call). Metrics → ordered, composable
+ * pipeline layers. Layers are NOT either/or; they stack in a fixed canonical order so e.g.
+ * high-complexity + high-creativity engages BOTH and they compose:
+ *
+ *   explore (creativity:high) → decompose (complexity:high) → single | debug (execution)
+ *
+ * accuracy:critical wraps the execution in heavier verification (verify:true). When a gap
+ * appears, the fix is a NEW metric/flag here — never an LLM-suggested pattern.
+ */
+function selectCognitionLayers(metrics) {
+  const m = normalizeCognitionMetrics(metrics);
+  const layers = [];
+  if (m.creativity === 'high') layers.push('explore');
+  if (m.complexity === 'high') layers.push('decompose');
+  layers.push(m.mode === 'debug' ? 'debug' : 'single');   // the execution layer (always exactly one)
+  return { layers, verify: m.accuracy === 'critical', metrics: m };
+}
+
+/**
+ * Work budget from assessed complexity — computed ONCE at the first assess, before
+ * exploration. A factor in the continue rule, NOT a ceiling. Returned in abstract "work
+ * units"; the wiring layer maps units → tokens / agent-invocations.
+ */
+const COGNITION_BUDGET_SCALE = { low: 1, medium: 3, high: 9 };
+function cognitionBudget(complexity, { base = 100, scale = COGNITION_BUDGET_SCALE } = {}) {
+  const c = COGNITION_ENUMS.complexity.includes(complexity) ? complexity : 'low';
+  return base * (scale[c] != null ? scale[c] : scale.low);
+}
+
+/**
+ * The shared controller for ONE thinking tree. EVERY node — at any recursion depth — consults
+ * the same instance: one global `spent` against one `budget`, so the inequality governs the
+ * whole tree (no per-node shares, no depth limit, no ceiling).
+ *
+ *  - shouldContinue(salience): the gate (salience clamped to [0,1]).
+ *  - enterNode(): charge the per-node floor `epsilon` — guarantees even work-free recursion ends.
+ *  - chargeWork(cost): useful problem-solving spend (counts against budget).
+ *  - chargeOverhead(cost): mechanical plumbing (assess/fold/brief) — tracked, NOT charged.
+ *  - state(): the full snapshot for the transparency view (spent/overhead/nodes/fraction/ceiling).
+ */
+function createCognitionController({ budget, k = 0.8, epsilon = null } = {}) {
+  if (!(budget > 0)) throw new Error('cognition: budget must be > 0');
+  if (!(k > 0)) throw new Error('cognition: k must be > 0');
+  const eps = epsilon != null ? epsilon : budget * 0.01;   // default per-node floor = 1% of budget
+  let spent = 0, overhead = 0, nodes = 0;
+  return {
+    shouldContinue(salience) {
+      const s = typeof salience === 'number' && isFinite(salience) ? Math.max(0, Math.min(1, salience)) : 0;
+      return s >= k * (spent / budget);
+    },
+    enterNode() { nodes += 1; spent += eps; },
+    chargeWork(cost) { spent += Math.max(0, Number(cost) || 0); },
+    chargeOverhead(cost) { overhead += Math.max(0, Number(cost) || 0); },
+    state() {
+      return { spent, overhead, nodes, budget, k, epsilon: eps, fraction: spent / budget, ceiling: budget / k };
+    },
   };
 }
 
@@ -2592,7 +3211,7 @@ const DEFAULT_MAX_TURNS = 20;
 const REPEAT_LIMIT = 3;
 
 // ── System prompt ───────────────────────────────────────────────────────────
-function buildSystemPrompt({ taskId, taskUserRequest, tier1Tokens, tier1Pct, promptAdditions = [], projectContext = '', codebaseMemory = '', discussMode = false, weblogicStatus = null, enforceMinTaskSize = false }) {
+function buildSystemPrompt({ taskId, taskUserRequest, tier1Tokens, tier1Pct, promptAdditions = [], projectContext = '', codebaseMemory = '', discussMode = false, reviewMode = false, activeChecklist = null, weblogicStatus = null, enforceMinTaskSize = false }) {
   const lines = [
     'You are code_boss, a coding agent. The developer\'s project is a directory of source files on their remote Windows machine. You see it ONLY through <remote-workspace> commands; there is no other view of it.',
     '',
@@ -2601,6 +3220,16 @@ function buildSystemPrompt({ taskId, taskUserRequest, tier1Tokens, tier1Pct, pro
     'When the developer gives you a TASK and you are unsure of the layout, run <list path="."/> to see the remote workspace, then proceed based on what you find. But do NOT go hunting for work: if the message is a greeting or small-talk ("hi", "hello", "how are you", "test"), or a question you can answer directly, just REPLY in plain prose — no <remote-workspace> block, no tools, no <next-task>. A reply with no tool calls ends your turn and waits for the developer; that is the correct response to a greeting or an already-answered question. Never ask the user to clarify "which project" — there is exactly one project (the one in the remote workspace).',
     'NEVER treat the .code_boss directory as the developer\'s request or as work to do. It is YOUR OWN internal state (task store, assignment backlog, conversation log); it is hidden from your file tools and is off-limits. The current task and the developer\'s message are given to you directly here — do not search .code_boss (or anywhere else) to find "the real request". If the message is unclear, ASK the developer; do not invent work from your own state.',
     'Work AUTONOMOUSLY: once the developer gives you a task, carry out the obvious next steps yourself. Do NOT end a reply asking permission to proceed ("would you like me to…?", "should I…?") when the next action is clear from the task or from what you just read — just take it. Use information already in the request instead of asking for it again. Ask the developer ONLY when you are genuinely blocked: the request is too ambiguous to pick any reasonable next step, or an action is destructive/irreversible and they did not ask for it. (Tool-level approvals — e.g. branch creation, tracked .docx edits — still pause on their own; that is separate from this.)',
+    'THINK BEFORE YOU ACT — plan your strategy, then do it. For any non-trivial request, FIRST state a short plan in prose: the goal and how you will approach it. The plan covers whatever the task is — not just edits: for an INVESTIGATION or question, what you will look at and WHY (so you read only what is needed, not everything); for a REFACTOR or design, the strategy, the sequence, and what must be preserved; for a change, the specific files/edits you intend. THEN carry it out (you may do both in one reply when the plan is obvious). Do not dive into reading files or editing without a plan, and read ONLY what the current step needs.',
+    'CHECKLIST for multi-step work: when the work is a SEQUENCE OF CONCRETE STEPS, emit a <checklist> (a standalone signal like <task-progress>) listing them as markdown items, then re-emit the FULL list each turn with finished items checked so the developer sees live progress — e.g. `<checklist>\n- [x] read the entity + DDL\n- [ ] add the field\n- [ ] build to verify\n</checklist>`. Use it ONLY for genuinely multi-step concrete work — NOT for a one-step change, a question, or open-ended strategy (reason those through in prose). It renders as a live panel, not chat text. In Review mode the proposal\'s checklist IS this <checklist>.',
+    'UNDO / ROLLBACK: if the developer says they used Undo to revert your last run\'s changes, acknowledge briefly and ask what to adjust or try differently — do NOT silently re-apply the same changes. And if YOU realize the last run\'s changes were wrong or harmful, you may suggest reverting them by emitting a standalone <rollback reason="why">…</rollback> signal; the developer will choose Allow or Cancel.',
+    // Pin the active checklist back in each turn — it is stripped from the visible history, so this
+    // is the ONLY way the agent sees its own current list (and the approved plan after implement).
+    ...((Array.isArray(activeChecklist) && activeChecklist.length) ? [
+      'YOUR ACTIVE CHECKLIST (the plan you are working, carried across approval — keep going until every item is done). Mark progress EITHER by re-emitting the full <checklist> with [x] on the completed steps, OR with the shorthand <tick>N</tick> using the item NUMBER below (e.g. <tick>2</tick>, or <tick>1,3</tick>). Do this AS you finish each step — alongside your <task-progress>, not only at the very end — so the live panel ticks off in real time. The live panel updates either way:',
+      ...activeChecklist.map((i, n) => `  ${n + 1}. [${i && i.done ? 'x' : ' '}] ${String((i && i.text) || '').slice(0, 200)}`),
+    ] : []),
+    'DESIGN vs IMPLEMENT — respect "show me first". If the developer asks you to DESIGN, PLAN, PROPOSE, or PREVIEW changes, or says NOT to implement them yet / not without approval / that they just want to see them first — produce the plan and the proposed changes AS TEXT ONLY. Do NOT use write/edit (or a file-modifying <powershell>) to change anything; leave their files untouched. End your turn with the plan and wait for them to approve before you implement. When they only asked to design/preview, stopping at the plan IS the correct, complete answer — this overrides "work autonomously", and it is NOT the "asking permission" you should avoid.',
     '',
     // Live WebLogic server status (only when the wl plugin is monitoring it).
     (weblogicStatus === true
@@ -2630,6 +3259,7 @@ function buildSystemPrompt({ taskId, taskUserRequest, tier1Tokens, tier1Pct, pro
       '  - On a tool-using turn, provide EXACTLY ONE of these. Omitting both returns an error and you must redo the turn. Estimating what remains each turn forces you to notice when nothing real is left — that is when you close the task. Do NOT let one task run forever.',
     ]),
     '  - EXCEPTION — purely conversational replies: a greeting, small-talk, or a question you answer from what you already know, with NO tool block, needs NEITHER signal. Just reply in prose; that ends your turn and waits for the developer. Do NOT emit <next-task>/<task-progress> for a no-tool conversational reply — and never re-open a request you have already answered.',
+    '  - DO NOT DOUBLE-ASK at task close: the <next-task> summary captures what you did, so in that SAME closing reply do NOT also write a "what would you like to do next?" / "let me know how to proceed" line. Ask for direction (if you genuinely need it) exactly ONCE, in your FOLLOWING reply after the close — never both in the closing turn and again right after.',
     '',
     'Prose + tool blocks — keep narration TIGHT:',
     '  - Lead with ONE short sentence saying what you are about to do, then the tool block. That is usually the whole reply.',
@@ -2650,12 +3280,14 @@ function buildSystemPrompt({ taskId, taskUserRequest, tier1Tokens, tier1Pct, pro
     'Read commands (self-closing):',
     '  <list path="DIR"/>',
     '  <read path="FILE" offset="N" limit="N"/>',
-    '  <search pattern="REGEX" path="DIR" glob="GLOB" flags="i"/>      backed by real grep; bare "*.java" works recursively',
-    '  <find pattern="GLOB"/>                                          bare patterns also work recursively',
+    '  <search pattern="REGEX" path="DIR" glob="GLOB" flags="i"/>      fast content search; skips node_modules/build dirs; bare "*.java" works recursively',
+    '  <find pattern="GLOB"/>                                          fast filename search; skips node_modules/build dirs; bare patterns work recursively',
     '  <info path="FILE"/>',
     '',
-    ...(discussMode ? [
-      'DISCUSS (read-only) mode is ON: investigate and explain, but do NOT modify anything. The write, edit, and shell (PowerShell) commands are DISABLED this session and will return an error if you use them. Read/list/search/find/info, codebase memory (remember/forget), and task management still work. If the developer asks for a change, describe precisely WHAT you would change and in WHICH files; they will switch Discuss mode off to let you make it.',
+    ...((discussMode || reviewMode) ? [
+      reviewMode
+        ? 'REVIEW (propose-first) mode is ON: do NOT modify anything yet — write, edit, and shell are DISABLED this turn and will error. Investigate read-only (read the actual code you would touch), then present a DETAILED PROPOSAL that the developer — and an adversarial reviewer — can scrutinize BEFORE you implement. A vague one-line plan is NOT acceptable and cannot be reviewed. Include: (1) GOAL + your APPROACH and WHY this way (the reasoning, alternatives rejected); (2) the SPECIFIC CHANGES file-by-file — the actual edits as DIFFS or new content in fenced ```diff (or language) code blocks, not a description; (3) EDGE CASES, risks, and which existing BUSINESS RULES / tests are affected; (4) a <checklist> of the concrete steps. Be substantive and concrete. (ONLY a genuinely trivial one-line edit may get a short proposal.) Make NO edits — end your turn with the proposal and wait for approval. When they approve, review turns off and you implement exactly what you proposed.'
+        : 'DISCUSS (read-only) mode is ON: investigate and explain, but do NOT modify anything. The write, edit, and shell (PowerShell) commands are DISABLED this session and will return an error if you use them. Read/list/search/find/info, codebase memory (remember/forget), and task management still work. If the developer asks for a change, describe precisely WHAT you would change and in WHICH files; they will switch Discuss mode off to let you make it.',
     ] : [
       'Write commands (body holds the content, not attributes):',
       '  <write path="FILE">',
@@ -2671,6 +3303,8 @@ function buildSystemPrompt({ taskId, taskUserRequest, tier1Tokens, tier1Pct, pro
       '  <powershell>git status</powershell>',
       '  <powershell timeout_ms="600000">mvnw.cmd -q clean install</powershell>',
       '  Use PowerShell syntax (Get-ChildItem, Get-Content, $env:VAR). The `ls`, `cat`, `pwd` aliases also work. To run a maven wrapper script use `mvnw.cmd` — not `./mvnw`.',
+      '  To start AND later stop a server/process you launch for testing, capture its handle and stop THAT one: `$p = Start-Process node -ArgumentList app.js -PassThru; ...; Stop-Process -Id $p.Id` (or `Start-Job`/`Stop-Job`). NEVER kill by name (Stop-Process -Name node / taskkill /IM node / pkill node) — it kills unrelated processes, including the code_boss server itself (it runs on node). Killing by name is refused.',
+      '  PowerShell is for builds, tests and git — NOT for finding files or searching code. Use <find>/<search> for that: they are fast and skip node_modules/build dirs. Do NOT run Get-ChildItem -Recurse / Select-String / dir /s / findstr /s over the tree — they crawl node_modules and take forever.',
     ]),
     '',
     'Closing a unit of work:',
@@ -2795,6 +3429,12 @@ function sanitizeAssistantProse(text, opts = {}) {
   // <task-progress> is a per-turn status SIGNAL, not chat content — strip it
   // from the visible prose (it is surfaced as a 'task-progress' event instead).
   text = text.replace(/<task-progress\b[\s\S]*?<\/task-progress>/gi, '').replace(/<task-progress\b[^>]*\/>/gi, '');
+  // <checklist> is a live-panel signal, not chat content — strip it (surfaced as a 'checklist' event).
+  text = text.replace(/<checklist\b[\s\S]*?<\/checklist>/gi, '');
+  // <rollback> is a suggestion signal — strip it (surfaced as a 'rollback-suggested' event).
+  text = text.replace(/<rollback\b[\s\S]*?<\/rollback>/gi, '').replace(/<rollback\b[^>]*\/>/gi, '');
+  // <tick> is a shorthand mark-done signal — strip it (folded into the 'checklist' event).
+  text = text.replace(/<tick\b[\s\S]*?<\/tick>/gi, '').replace(/<tick\b[^>]*\/>/gi, '');
   // Also strip tool-call-looking XML tags from the prose. The model
   // sometimes "previews" what it's about to do by writing the tag in
   // its narration before the actual <remote-workspace> block — so the
@@ -3410,8 +4050,9 @@ const HOLDBACK = '<remote-workspace>'.length + 2;
  * and any post-stream work — that pass owns the hallucinated-result-tag
  * defense, so this streamer can stay simple.
  */
-async function runTurnStreaming(adapter, opts, { onProseChunk, onProseSegmentEnd, onBlockReady } = {}) {
+async function runTurnStreaming(adapter, opts, { onProseChunk, onProseSegmentEnd, onBlockReady, onUsage, suppressTags = [] } = {}) {
   let text = '';
+  let usage = null;   // captured from the final stream chunk / the complete fallback (token counts)
   let state = 'prose';
   let segmentIndex = 0;
   let proseStart = 0;       // start of the current prose segment (for content slicing on end)
@@ -3427,32 +4068,34 @@ async function runTurnStreaming(adapter, opts, { onProseChunk, onProseSegmentEnd
   const findFrom = (re, from) => { re.lastIndex = from; const m = re.exec(text); return m ? m.index : -1; };
   const OPEN_RE = /<remote-workspace/gi;
   const CLOSE_RE = /<\/remote-workspace>/gi;
-  const PROG_OPEN_RE = /<task-progress/gi;
-  const PROG_CLOSE_RE = /<\/task-progress>/gi;
+  // Tag spans suppressed from the prose STREAM — SIGNALS, not display text. The
+  // model emits one inline and the final prose strips it; suppressing it from the
+  // stream too keeps the live bubble from ballooning to the raw multi-line tag and
+  // snapping down on finalize. <task-progress> always (the worker's per-turn
+  // signal); callers add more via suppressTags (e.g. the intake's <requirement-card>,
+  // which is parsed into the form, not shown as streamed prose). proseStart is not
+  // moved, so the sanitized final segment is unaffected.
+  const SUPPRESS = ['task-progress', 'checklist', 'rollback', 'tick', ...(suppressTags || [])].map((t) => ({
+    open: new RegExp('<' + t, 'gi'), close: new RegExp('</' + t + '>', 'gi'), closeLen: t.length + 3,
+  }));
   const pump = () => {
     while (true) {
       if (state === 'prose') {
         const openIdx = findFrom(OPEN_RE, proseSent);
-        const progIdx = findFrom(PROG_OPEN_RE, proseSent);
-        // <task-progress …>…</task-progress> is a SIGNAL, not a tool block and
-        // not a segment break: the model emits one on most turns and the final
-        // prose is sanitized to remove it. Suppress the whole span from the
-        // STREAM too — otherwise the live bubble balloons to the raw multi-line
-        // tag and then snaps down to the stripped size when the segment
-        // finalizes. (The post-stream task-progress event/chip is extracted from
-        // the full text separately, so it is unaffected; proseStart is not moved,
-        // so the sanitized final segment is unchanged.)
-        if (progIdx !== -1 && (openIdx === -1 || progIdx < openIdx)) {
-          if (progIdx > proseSent) {
-            onProseChunk?.({ segmentIndex, content: text.slice(proseSent, progIdx) });
-            proseSent = progIdx;
+        // Earliest suppressed-tag open at/after proseSent.
+        let supIdx = -1, sup = null;
+        for (const s of SUPPRESS) { const i = findFrom(s.open, proseSent); if (i !== -1 && (supIdx === -1 || i < supIdx)) { supIdx = i; sup = s; } }
+        if (supIdx !== -1 && (openIdx === -1 || supIdx < openIdx)) {
+          if (supIdx > proseSent) {
+            onProseChunk?.({ segmentIndex, content: text.slice(proseSent, supIdx) });
+            proseSent = supIdx;
           }
-          const tagCloseIdx = text.indexOf('>', progIdx);
+          const tagCloseIdx = text.indexOf('>', supIdx);
           if (tagCloseIdx === -1) return;                            // opening tag still arriving — hold back
-          if (text[tagCloseIdx - 1] === '/') { proseSent = tagCloseIdx + 1; continue; }  // <task-progress …/>
-          const endIdx = findFrom(PROG_CLOSE_RE, tagCloseIdx + 1);
+          if (text[tagCloseIdx - 1] === '/') { proseSent = tagCloseIdx + 1; continue; }  // self-closing <tag …/>
+          const endIdx = findFrom(sup.close, tagCloseIdx + 1);
           if (endIdx === -1) return;                                 // close not here yet — emit nothing
-          proseSent = endIdx + '</task-progress>'.length;            // skip the span; no emit, no segment break
+          proseSent = endIdx + sup.closeLen;                         // skip the span; no emit, no segment break
           continue;
         }
         if (openIdx === -1) {
@@ -3509,16 +4152,25 @@ async function runTurnStreaming(adapter, opts, { onProseChunk, onProseSegmentEnd
     }
   };
 
+  let aborted = false;
   if (typeof adapter.completeStream === 'function') {
     for await (const chunk of adapter.completeStream(opts)) {
+      // Bail IMMEDIATELY on cancel — don't keep draining the stream if the upstream proxy
+      // ignores the client abort and keeps sending (that was the 10-20s "cancel lag"). BREAK
+      // (don't throw here) so the final flush below still closes the streaming prose segment —
+      // throwing mid-stream left an orphan "streaming" bubble in the UI.
+      if (opts.signal?.aborted) { aborted = true; break; }
       const d = chunk?.choices?.[0]?.delta?.content;
       if (d) { text += d; pump(); }
+      if (chunk?.usage) usage = chunk.usage;   // many APIs send usage on the final chunk
     }
   } else {
     const res = await adapter.complete(opts);
     text = res?.choices?.[0]?.message?.content ?? '';
+    usage = res?.usage ?? null;
     pump();
   }
+  if (onUsage) { try { await onUsage(usage); } catch {} }
   // Final flush: any trailing prose still inside HOLDBACK gets emitted,
   // and the final prose segment is closed out so the UI can finalize it.
   if (state === 'prose') {
@@ -3529,6 +4181,8 @@ async function runTurnStreaming(adapter, opts, { onProseChunk, onProseSegmentEnd
     const finalProse = text.slice(proseStart);
     if (finalProse.length) onProseSegmentEnd?.({ segmentIndex, content: finalProse });
   }
+  // Cancelled mid-stream: the segment is now closed (flush above), so no orphan bubble — NOW bail.
+  if (aborted) { const e = new Error('aborted'); e.name = 'AbortError'; throw e; }
   return text;
 }
 
@@ -3647,6 +4301,78 @@ async function dispatchTaskOp(c, store, opts = {}) {
   return { ok: false, content: `unknown task op: ${c.verb}` };
 }
 
+// ── Shared streaming engine: run ONE model turn ─────────────────────────────
+// The streaming core every chat shares (worker + mini-chats). It streams the
+// model's reply, emits each <remote-workspace> block's tool-calls the moment the
+// block closes (mid-turn, in segment order), schedules their execution (parallel,
+// with a serial barrier for task-op / mutating blocks so a <next-task> sees prior
+// writes and approval prompts never overlap), waits for all of them, and returns
+// the tool results in canonical SEGMENT order (not wall-clock order). The PER-CALL
+// execution is INJECTED via runCall(call, perBlockState) → result, so the worker
+// runs task-ops + writes while a mini-chat runs read-only — both get IDENTICAL
+// streaming, ordering, and <task-progress> handling. There is exactly one of these.
+//
+// Returns { text, cleanText, segments, orderedResults, progressMatch, hasProgressSignal }.
+async function runStreamingTurn({
+  adapter, model, convo, signal, extraVerbs = {}, serialVerbs = MUTATING_VERBS, suppressTags = [],
+  onProseChunk, onProseSegmentEnd, onToolCall, onUsage, runCall,
+}) {
+  const blockResultsByIdx = new Map();
+  const blockPromisesByIdx = new Map();
+  const allBlockPromises = [];
+  let serialBarrier = Promise.resolve();   // resolves after the last serial (task-op/mutating) block
+  const handleBlockReady = ({ segmentIndex, body }) => {
+    if (signal?.aborted) return;   // cancelled mid-stream — don't dispatch a block that just closed
+    const calls = parseToolCalls(`<remote-workspace>${body}</remote-workspace>`, { extraVerbs });
+    for (const c of calls) onToolCall?.(c);
+    // A task-op or mutating block must run AFTER all prior blocks (so it sees their
+    // effects + never races the single approval slot); a normal block waits only
+    // for the last serial block, otherwise overlapping with sibling read/write blocks.
+    const needsSerial = calls.some((c) => c.kind === 'task-op' || serialVerbs.has(c.verb));
+    const startAfter = needsSerial ? Promise.allSettled(allBlockPromises.slice()) : serialBarrier;
+    const perBlockState = { lastKey: null, repeat: 0 };
+    const p = startAfter.then(async () => {
+      const out = [];
+      for (const c of calls) out.push(await runCall(c, perBlockState));
+      return out;
+    }).then((r) => { blockResultsByIdx.set(segmentIndex, r); return r; });
+    p.catch(() => {});   // handler so a mid-stream abort isn't an unhandled rejection
+    blockPromisesByIdx.set(segmentIndex, p);
+    allBlockPromises.push(p);
+    if (needsSerial) serialBarrier = p;
+  };
+  const text = await runTurnStreaming(
+    adapter, { model, messages: convo, signal },
+    { onProseChunk, onProseSegmentEnd, onBlockReady: handleBlockReady, onUsage, suppressTags },
+  );
+  // LAYER 3 signal: pull the per-turn <task-progress> out + strip it before parsing.
+  const progressMatch = text.match(/<task-progress\b[^>]*\bpercent\s*=\s*["']?(\d{1,3})["']?[^>]*>([\s\S]*?)<\/task-progress>/i);
+  // If the model emits more than one <checklist> in a turn (e.g. a draft then a corrected one),
+  // the LAST one is the current state — take it, not the first.
+  const _clAll = [...text.matchAll(/<checklist\b[^>]*>([\s\S]*?)<\/checklist>/gi)];
+  const checklistMatch = _clAll.length ? _clAll[_clAll.length - 1] : null;
+  // <rollback reason="…">…</rollback> (or self-closing): the agent suggests reverting the last run.
+  const rollbackReason = /<rollback\b/i.test(text)
+    ? ((text.match(/<rollback\b[^>]*\breason\s*=\s*["']([^"']*)["']/i) || [])[1]
+       || ((text.match(/<rollback\b[^>]*>([\s\S]*?)<\/rollback>/i) || [])[1] || '').replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim()
+       || 'the last run\'s changes look wrong')
+    : null;
+  // <tick>N</tick> (or <tick>1,3</tick>): mark items done by their number in the active checklist.
+  const tickIndices = [...text.matchAll(/<tick\b[^>]*>([\s\S]*?)<\/tick>/gi)]
+    .flatMap((m) => String(m[1] || '').split(/[,\s]+/).map((s) => parseInt(s, 10)).filter((n) => Number.isInteger(n) && n > 0));
+  const cleanText = text.replace(/<task-progress\b[\s\S]*?<\/task-progress>/gi, '').replace(/<task-progress\b[^>]*\/>/gi, '').replace(/<checklist\b[\s\S]*?<\/checklist>/gi, '').replace(/<rollback\b[\s\S]*?<\/rollback>/gi, '').replace(/<rollback\b[^>]*\/>/gi, '').replace(/<tick\b[\s\S]*?<\/tick>/gi, '').replace(/<tick\b[^>]*\/>/gi, '');
+  const segments = parseResponseSegments(cleanText, { extraVerbs });
+  // Wait for every block's tools to finish (their tool-result events already fired
+  // inside runCall), then gather results in canonical segment order.
+  await Promise.allSettled([...blockPromisesByIdx.values()]);
+  const orderedResults = [];
+  for (let i = 0; i < segments.length; i++) {
+    if (segments[i].type !== 'tool-block') continue;
+    for (const r of (blockResultsByIdx.get(i) || [])) if (r) orderedResults.push(r);   // runCall may return null (e.g. a read-only pass dropping a disallowed verb)
+  }
+  return { text, cleanText, segments, orderedResults, progressMatch, checklistMatch, tickIndices, rollbackReason, hasProgressSignal: !!progressMatch };
+}
+
 // ── Main agent loop ────────────────────────────────────────────────────────
 async function runPromptedAgent({
   adapter,
@@ -3706,6 +4432,13 @@ async function runPromptedAgent({
   // docs (see buildSystemPrompt). Lets the developer plan/ask safely without
   // the agent touching the project.
   discussMode = false,
+  // REVIEW (propose-first) mode: read-only like discuss, but the prompt asks for a PROPOSAL
+  // (summary + checklist + diffs) the developer approves before implementing. Shares the
+  // read-only tool gate; gets a different system prompt.
+  reviewMode = false,
+  // Getter for the active checklist (the latest <checklist> items, or null) — pinned into the
+  // system prompt each turn so the agent reliably maintains it (the tag is stripped from history).
+  getActiveChecklist = null,
   // Mid-run "steer": a function that returns (and clears) any user messages
   // queued via the steer channel while this run was in flight. Drained at the
   // TOP of each turn — the queued text becomes a fresh user message for the
@@ -3724,6 +4457,12 @@ async function runPromptedAgent({
   // task closes on completion as a lifecycle SIGNAL regardless of size — gating
   // those would stall review/acceptance/commit.
   enforceMinTaskSize = false,
+  // Optional shared tasks-v2 store. Default null → create + init a private one (today's
+  // byte-identical path). When the server is in orchestrator mode it passes the SINGLE
+  // long-lived session.store so the foreground worker + the sub-agent import share ONE
+  // instance (one nextId, one in-memory state) — eliminating the two-instance task-id
+  // collision + state.json lost-update on the same .code_boss.
+  store: providedStore = null,
 }) {
   if (!projectDir) throw new Error('projectDir required for task-scoped agent');
 
@@ -3741,8 +4480,10 @@ async function runPromptedAgent({
   };
 
   // Initialize tasks store; this either loads existing state or creates a root task.
-  const store = createTasksStore(projectDir);
-  await store.init();
+  // A shared instance (providedStore) is already inited + must NOT be re-inited (that would
+  // reload from disk + discard a concurrent import's in-memory state).
+  const store = providedStore || createTasksStore(projectDir);
+  if (!providedStore) await store.init();
 
   // Extract the user's new message (last user role in incoming).
   const lastUserMsg = [...(messages ?? [])].reverse().find((m) => m.role === 'user');
@@ -3855,7 +4596,14 @@ async function runPromptedAgent({
   // work). Closing a DIFFERENT request is legitimate multi-unit progress.
   let lastClosedUserRequest = null;
 
-  for (let turn = 1; turn <= maxTurns; turn++) {
+  // The control loop is owned by the RuntimeKernel (kernel.mjs). For the serial
+  // worker it drives exactly one thread; each tick runs ONE turn and either
+  // returns a terminal result (converge / task-churn) or falls through to the
+  // next turn. Body below is unchanged from the old in-line `for (turn…)` loop —
+  // only the loop framing moved (subsume, not bolt; parity-gated by
+  // test-engine-characterization). Phase 2 generalizes the kernel to schedule
+  // multiple threads.
+  const kResult = await runTurnLoop({ maxTurns, tick: async (turn) => {
     stats.turns = turn;
     // Per-turn attribution/loop flags (fresh each turn; read by runOneCall via
     // closure). didRealWorkThisTurn anchors M + gates the empty-task close guard;
@@ -3912,6 +4660,8 @@ async function runPromptedAgent({
       projectContext,
       codebaseMemory,
       discussMode,
+      reviewMode,
+      activeChecklist: (() => { try { return getActiveChecklist ? getActiveChecklist() : null; } catch { return null; } })(),
       weblogicStatus: wlStatus,
       enforceMinTaskSize,
     });
@@ -4080,22 +4830,10 @@ async function runPromptedAgent({
           "would you like to start with?",
       },
     ];
-    const baseConvo = [...PRIMING, ...fromStore];
-    let latestUserIdx = -1;
-    for (let i = baseConvo.length - 1; i >= 0; i--) {
-      if (baseConvo[i].role === 'user') { latestUserIdx = i; break; }
-    }
-    const convo = baseConvo.map((m, i) => {
-      if (i !== latestUserIdx) return m;
-      return {
-        role: 'user',
-        content: `<system-reminder>\n${sys}\n</system-reminder>\n\n${m.content}`,
-      };
-    });
-    if (latestUserIdx === -1) {
-      // No user messages at all — send the reminder as the only message.
-      convo.push({ role: 'user', content: `<system-reminder>\n${sys}\n</system-reminder>` });
-    }
+    // Gemini-safe request assembly (system reminder prepended into the latest
+    // user message; never a role:'system' entry) — shared with every other pass
+    // via assembleConvo (engine.mjs). PRIMING is the hidden worker few-shot.
+    const convo = assembleConvo({ systemPrompt: sys, priming: PRIMING, messages: fromStore });
 
     log(`turn ${turn}: ${convo.length} msgs · current=${cur?.id} · t1=${t1Tokens}/${TIER_1_BUDGET}`);
 
@@ -4197,10 +4935,12 @@ async function runPromptedAgent({
             commitError,
           });
         }
-      } else if (discussMode && !WORKER_READONLY_VERBS.has(c.verb)) {
-        resultContent = `ERROR: '${c.verb}' is disabled in Discuss (read-only) mode. Describe what you would change and in which files instead; the developer will turn Discuss mode off to let you apply it.`;
+      } else if ((discussMode || reviewMode) && !WORKER_READONLY_VERBS.has(c.verb)) {
+        resultContent = reviewMode
+          ? `ERROR: '${c.verb}' is disabled in Review (propose-first) mode. Present your PROPOSAL — summary + checklist + the changes as diffs/new content in code blocks — and wait for approval; on approval, review turns off and you implement it.`
+          : `ERROR: '${c.verb}' is disabled in Discuss (read-only) mode. Describe what you would change and in which files instead; the developer will turn Discuss mode off to let you apply it.`;
         resultStatus = 'error';
-        log(`  ${c.verb} blocked (discuss mode)`);
+        log(`  ${c.verb} blocked (${reviewMode ? 'review' : 'discuss'} mode)`);
       } else {
         stats.toolCalls++;
         didRealWorkThisTurn = true;   // a non-task-op tool ran — real work for the current request
@@ -4216,6 +4956,7 @@ async function runPromptedAgent({
           requireApproval,
           signal,
           getGitLabCredentials,
+          cwd: projectDir,   // per-call cwd — the worker's tools resolve against its OWN project, not the global process.cwd() (de-singleton)
         });
         if (typeof raw === 'string' && raw.startsWith('ERROR:')) {
           resultContent = raw;
@@ -4250,126 +4991,33 @@ async function runPromptedAgent({
       }
       return { call: c, status: resultStatus, content: resultContent, diff: resultDiff, ownerTaskId };
     }
-    async function executeBlock(calls) {
-      const perBlockState = { lastKey: null, repeat: 0 };
-      const out = [];
-      for (const c of calls) out.push(await runOneCall(c, perBlockState));
-      return out;
-    }
-
-    // Mid-stream block dispatch. Each <remote-workspace> block, as soon as
-    // its closing tag is parsed, gets its tool-call events emitted (in
-    // segment order — so the chat log interleaves with the surrounding
-    // prose bubbles) and its execution scheduled.
-    // Ordering rules:
-    //   - A block containing a TASK-OP (<next-task>) must observe the effects
-    //     of ALL prior blocks this turn — e.g. a write block before it must
-    //     finish (and auto-commit on close must see the written file). So a
-    //     task-op block waits for every prior block.
-    //   - A normal block waits only for the last task-op (serialBarrier), so
-    //     it runs against the correct task context but otherwise overlaps with
-    //     sibling read/write blocks.
-    const blockResultsByIdx = new Map();
-    const blockPromisesByIdx = new Map();
-    const allBlockPromises = [];
-    let serialBarrier = Promise.resolve();   // resolves after the last task-op block
-    const handleBlockReady = ({ segmentIndex, body }) => {
-      const calls = parseToolCalls(`<remote-workspace>${body}</remote-workspace>`, { extraVerbs });
-      for (const c of calls) {
-        if (onToolCalls) onToolCalls([c]);
-        emitChat({
-          type: 'tool-call',
-          taskId: cur?.id,
-          callId: c.id,
-          verb: c.verb,
-          name: c.name ?? c.verb,
-          args: c.args,
-        });
-      }
-      const hasTaskOp = calls.some((c) => c.kind === 'task-op');
-      // A block that mutates files / needs developer approval must also run
-      // serially: two such blocks in parallel race the single approval slot
-      // and same-file writes. Treat them like task-op blocks for ordering.
-      const needsSerial = hasTaskOp || calls.some((c) => MUTATING_VERBS.has(c.verb));
-      const startAfter = needsSerial
-        ? Promise.allSettled(allBlockPromises.slice())   // wait for ALL prior blocks
-        : serialBarrier;                                  // wait for the last serial block only
-      const p = startAfter.then(() => executeBlock(calls)).then((r) => {
-        blockResultsByIdx.set(segmentIndex, r);
-        return r;
-      });
-      // Mark the promise as having a handler so a rejection mid-stream
-      // (e.g. user-triggered abort throws AbortError inside runOneCall)
-      // doesn't bubble up as an unhandled rejection BEFORE the agent
-      // loop's allSettled has a chance to await it. The agent loop's
-      // outer await will still surface the rejection via allSettled.
-      p.catch(() => {});
-      blockPromisesByIdx.set(segmentIndex, p);
-      allBlockPromises.push(p);
-      if (needsSerial) {
-        // Future blocks must wait for this one to finish — so a task-op sees
-        // the new task context, and a file edit / approval prompt never
-        // overlaps the next one.
-        serialBarrier = p;
-      }
-    };
-
-    // Stream the model's response.
-    //   onProseChunk      → ephemeral 'assistant-text-chunk' events that
-    //                       build up a streaming bubble in the UI
-    //   onProseSegmentEnd → persisted 'assistant-text' event with the
-    //                       sanitized final version (replaces the bubble's
-    //                       content); fires when prose transitions to a
-    //                       block OR at end of stream
-    //   onBlockReady      → tool-call events for each call in the block,
-    //                       PLUS scheduling the block's actual execution
-    //                       (parallel unless a task-op forces serial)
-    // The order events fire in is the persisted order, so a reload replays
-    // a coherent prose → calls → prose → calls timeline.
-    const text = await runTurnStreaming(
-      adapter,
-      { model, messages: convo, signal },
-      {
-        onProseChunk: ({ segmentIndex, content }) => {
-          onText?.(content);
-          emitPhase('downloading');
-          emitChat({
-            type: 'assistant-text-chunk',
-            taskId: cur?.id,
-            // `turn` namespaces the streaming-bubble key. segmentIndex resets
-            // to 0 every turn while taskId is constant, so without turn two
-            // turns collide on 't:0' and the UI appends turn N+1's prose onto
-            // a dangling turn-N bubble (which is never finalized when its
-            // prose sanitizes to empty — e.g. a previewed tool tag).
-            turn,
-            segmentIndex,
-            content,
-          });
-        },
-        onProseSegmentEnd: ({ segmentIndex, content }) => {
-          const cleaned = sanitizeAssistantProse(content, { extraVerbs });
-          if (cleaned) emitChat({
-            type: 'assistant-text',
-            taskId: cur?.id,
-            turn,
-            segmentIndex,
-            content: cleaned,
-          });
-        },
-        onBlockReady: handleBlockReady,
+    // Stream this turn through the SHARED engine (runStreamingTurn): prose +
+    // tool-calls stream live, each block's tools run via runOneCall under the
+    // serial barrier (task-op/mutating blocks serialize), and results come back in
+    // canonical segment order. The worker injects runOneCall (task-aware) as
+    // runCall + its event emitters; a mini-chat injects a read-only runCall.
+    const { text, segments, orderedResults, progressMatch, checklistMatch, tickIndices, rollbackReason, hasProgressSignal } = await runStreamingTurn({
+      adapter, model, convo, signal, extraVerbs, serialVerbs: MUTATING_VERBS,
+      onProseChunk: ({ segmentIndex, content }) => {
+        onText?.(content);
+        emitPhase('downloading');
+        // `turn` namespaces the streaming-bubble key (segmentIndex resets each turn).
+        emitChat({ type: 'assistant-text-chunk', taskId: cur?.id, turn, segmentIndex, content });
       },
-    );
+      onProseSegmentEnd: ({ segmentIndex, content }) => {
+        const cleaned = sanitizeAssistantProse(content, { extraVerbs });
+        if (cleaned) emitChat({ type: 'assistant-text', taskId: cur?.id, turn, segmentIndex, content: cleaned });
+      },
+      onToolCall: (c) => {
+        if (onToolCalls) onToolCalls([c]);
+        emitChat({ type: 'tool-call', taskId: cur?.id, callId: c.id, verb: c.verb, name: c.name ?? c.verb, args: c.args });
+      },
+      runCall: runOneCall,
+    });
     emitPhase('thinking');
     checkAbort();
-    // Parse the response into ordered segments. The model is encouraged
-    // (system prompt) to interleave prose with multiple <remote-workspace>
-    // blocks, e.g. prose → block A → prose → block B → final prose.
-    // LAYER 3: pull the per-turn task-status signal out of the response.
-    // <task-progress percent="N">why not done</task-progress> is a SIGNAL, not a
-    // tool — surface it as a progress event and strip it BEFORE parsing so it
-    // never becomes a bogus call or bloats the stored transcript.
-    const progressMatch = text.match(/<task-progress\b[^>]*\bpercent\s*=\s*["']?(\d{1,3})["']?[^>]*>([\s\S]*?)<\/task-progress>/i);
-    const hasProgressSignal = !!progressMatch;
+    // LAYER 3 signal — surface the per-turn <task-progress> (runStreamingTurn
+    // already stripped it before parsing the segments).
     if (progressMatch) {
       emitChat({
         type: 'task-progress', taskId: cur?.id,
@@ -4377,8 +5025,29 @@ async function runPromptedAgent({
         note: progressMatch[2].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim().slice(0, 300),
       });
     }
-    const cleanText = text.replace(/<task-progress\b[\s\S]*?<\/task-progress>/gi, '').replace(/<task-progress\b[^>]*\/>/gi, '');
-    const segments = parseResponseSegments(cleanText, { extraVerbs });
+    // LIVE CHECKLIST — surface the per-turn <checklist> (markdown `- [ ]` / `- [x]` items) as a
+    // 'checklist' event the UI pins as a panel that ticks off in place. The agent re-emits the
+    // full list each turn; the latest replaces the prior (ephemeral, like task-progress).
+    if (checklistMatch) {
+      const items = checklistMatch[1].split('\n')
+        .map((l) => l.match(/^\s*[-*]\s*\[\s*([ xX])\s*\]\s*(.+?)\s*$/))
+        .filter(Boolean)
+        .map((m) => ({ done: m[1].toLowerCase() === 'x', text: m[2].replace(/<[^>]+>/g, '').trim().slice(0, 200) }))
+        .filter((i) => i.text)
+        .slice(0, 50);   // cap: a runaway list shouldn't bloat the panel, broadcast, or the re-pinned prompt
+      if (items.length) emitChat({ type: 'checklist', taskId: cur?.id, items });
+    } else if (tickIndices.length) {
+      // <tick>N</tick> shorthand (additive — re-emit above is still primary): mark items by their
+      // number in the ALREADY-PINNED active checklist, then emit the updated list.
+      let active = null;
+      try { active = getActiveChecklist ? getActiveChecklist() : null; } catch { active = null; }
+      if (Array.isArray(active) && active.length) {
+        const items = active.map((it, i) => ({ text: it && it.text, done: !!(it && it.done) || tickIndices.includes(i + 1) }));
+        emitChat({ type: 'checklist', taskId: cur?.id, items });
+      }
+    }
+    // ROLLBACK SUGGESTION — the agent proposes reverting the last run; the UI offers Allow/Cancel.
+    if (rollbackReason) emitChat({ type: 'rollback-suggested', taskId: cur?.id, reason: String(rollbackReason).slice(0, 300) });
     const allCalls = segments.flatMap((s) => s.type === 'tool-block' ? s.calls : []);
     log(`turn ${turn}: ${text.length} chars in ${Date.now() - t0}ms, ${allCalls.length} call(s) across ${segments.filter((s) => s.type === 'tool-block').length} block(s)${hasProgressSignal ? ` · progress=${Math.min(100, parseInt(progressMatch[1], 10))}%` : ''}`);
 
@@ -4399,45 +5068,40 @@ async function runPromptedAgent({
     }
     stats.batches.push(allCalls.length);
 
-    // Store the assistant message as a single unit reconstructed from
-    // the segments — keeps multi-block content intact while dropping
-    // any hallucinated trailer (the segment parser already dropped that).
+    // Store the assistant message as a single unit reconstructed from the
+    // segments — keeps multi-block content intact while dropping any hallucinated
+    // trailer (the segment parser already dropped that). File it into the task that
+    // was current at TURN START (cur.id): runStreamingTurn has already run this
+    // turn's blocks, so a <next-task> in them already moved store.currentId to the
+    // NEW task — but this assistant reply (which contains that next-task) belongs to
+    // the task it CLOSED. (The old loop relied on a microtask race to persist before
+    // the transition; the explicit owner makes it deterministic + correct.)
     const assistantText = segments.map((s) =>
       s.type === 'prose'
         ? s.content
         : `<remote-workspace>${s.body}</remote-workspace>`
     ).join('');
-    await store.appendMessage({ kind: 'assistant', role: 'assistant', content: assistantText });
+    await store.appendMessage({ kind: 'assistant', role: 'assistant', content: assistantText }, cur?.id);
 
-    // Prose and tool-call events were already emitted mid-stream by
-    // onProseSegmentEnd / handleBlockReady. Now wait for every block's
-    // tools to finish so tool-result events have fired before we move on.
-    await Promise.allSettled([...blockPromisesByIdx.values()]);
     checkAbort();
-
-    // Now persist tool messages in canonical segment order so the next
-    // LLM turn sees them in the order the model wrote them — even if
-    // parallel execution interleaved their wall-clock completion.
+    // Persist tool messages in canonical segment order — runStreamingTurn already
+    // awaited every block's tools (their tool-result events fired inside runOneCall)
+    // and ordered the results. File each into the task that was current when it RAN
+    // (r.ownerTaskId), not store.currentId() now — a <next-task> earlier this turn
+    // may have moved the current task out from under us.
     const results = [];
-    for (let i = 0; i < segments.length; i++) {
-      if (segments[i].type !== 'tool-block') continue;
-      const blockResults = blockResultsByIdx.get(i) || [];
-      for (const r of blockResults) {
-        // File into the task that was current when this call RAN (r.ownerTaskId),
-        // not store.currentId() now — a <next-task> earlier in this turn may
-        // have moved the current task out from under us.
-        await store.appendMessage({
-          kind: 'tool-call', role: 'assistant',
-          content: `<${r.call.verb} ...args/>`,
-          toolName: r.call.name ?? r.call.verb, toolArgs: r.call.args,
-        }, r.ownerTaskId);
-        await store.appendMessage({
-          kind: 'tool-result', role: 'user',
-          content: `<remote-workspace-result op="${r.call.verb}" status="${r.status}">\n${r.content}\n</remote-workspace-result>`,
-          toolName: r.call.name ?? r.call.verb, toolStatus: r.status,
-        }, r.ownerTaskId);
-        results.push({ verb: r.call.verb, status: r.status, content: r.content });
-      }
+    for (const r of orderedResults) {
+      await store.appendMessage({
+        kind: 'tool-call', role: 'assistant',
+        content: `<${r.call.verb} ...args/>`,
+        toolName: r.call.name ?? r.call.verb, toolArgs: r.call.args,
+      }, r.ownerTaskId);
+      await store.appendMessage({
+        kind: 'tool-result', role: 'user',
+        content: `<remote-workspace-result op="${r.call.verb}" status="${r.status}">\n${r.content}\n</remote-workspace-result>`,
+        toolName: r.call.name ?? r.call.verb, toolStatus: r.status,
+      }, r.ownerTaskId);
+      results.push({ verb: r.call.verb, status: r.status, content: r.content });
     }
 
     // LAYER 3 (forcing function): a WORKING turn must declare task status —
@@ -4482,8 +5146,9 @@ async function runPromptedAgent({
     // Compact if total context is over budget. Cheap mechanical demotions
     // first; LLM clustering only if tier 3 still over after that.
     await maybeCompact({ store, adapter, model, log, emitChat });
-  }
+  } });   // tick falls through with no return → undefined → the kernel runs the next turn
 
+  if (kResult !== undefined) return kResult;
   log(`done: max turns (${maxTurns}) reached without converging`);
   return { content: '[MAX TURNS REACHED — agent did not converge]', stats, terminated: 'max-turns', store };
 }
@@ -4746,7 +5411,185 @@ function screenReadOnlyShell(command) {
  * Returns { verdicts: [{ taskId, pass, concerns }] } — one per task (a task
  * the reviewer never ruled on defaults to pass, so the user isn't blocked).
  */
-async function runReviewer({ adapter, model, tasks, signal, onLog, onDiag, repoRoots = [] }) {
+// ── Shared read-only agent turn loop ───────────────────────────────────────
+// The common spine of every read-only pass (reviewer / acceptance / intake /
+// consolidation): assemble the request the Gemini-safe way (assembleConvo — the
+// system prompt rides the LATEST user message as a <system-reminder>, re-applied
+// each turn; NEVER role:'system'), call the model, parse <remote-workspace> tool
+// blocks, run the read-only allowlist (with the shell screen + path resolution),
+// format results, and loop. Per-pass behavior is supplied via hooks:
+//   interpret({text, prose, allowed, blocked, turn, transcript})
+//       -> { finish:true, result }   terminal (verdict/card/facts found)
+//        | { inject: [msgs] }        push messages + loop (e.g. reviewer re-prompt)
+//        | {}                        run the allowed tools + loop (default)
+//     MUST finish-or-inject when allowed.length === 0 (no executable tools).
+//   onTokens(totalTokens)            per-turn cumulative usage (intake spinner)
+//   onTools({calls, results, turn})  after tools run (intake live streaming)
+//   onMaxTurns({transcript}) -> result   when the turn budget is exhausted
+// This is the (read-only) turn engine; the worker's task lifecycle layers onto a
+// fuller engine in a later phase.
+async function runEngine({
+  adapter, model, signal, onLog, label = 'pass',
+  systemPrompt, priming = [], seedMessages = [],
+  allowedVerbs, maxTurns, resolvePath = (p) => p, suppressTags = [], cwd = null,
+  toolCtx = null,           // (call) -> the ctx passed to execute(); default = read-only { signal, cwd }
+  extraTools = {},          // plugin tools available to execute()
+  shellScreen = null,       // (command) -> error|null; the read-only powershell screen (null = unscreened, e.g. a write-capable sub-agent)
+  serialVerbs = new Set(),  // verbs whose blocks serialize (MUTATING_VERBS for a write-capable engine; empty for read-only)
+  interpret, onTokens = null, onTools = null, onProse = null, onProseEnd = null, onMaxTurns = null,
+}) {
+  const log = (m) => { try { onLog?.(m); } catch {} };
+  const mkCtx = toolCtx || (() => ({ signal, cwd }));   // default: the read-only execute ctx
+  const transcript = [...seedMessages];   // canonical history (no system reminder)
+  let cumTokens = 0;
+  for (let turn = 1; turn <= maxTurns; turn++) {
+    if (signal?.aborted) { const e = new Error('aborted'); e.name = 'AbortError'; throw e; }
+    const convo = assembleConvo({ systemPrompt, priming, messages: transcript });
+    const t0 = Date.now();
+    const allowed = [];   // allowed calls that ran this turn (for interpret)
+    const blocked = [];   // disallowed calls dropped this turn
+    // Read-only per-call execution, injected into the SHARED streaming engine —
+    // the same runStreamingTurn the worker uses, so a mini-chat streams its tool
+    // activity live, mid-turn, exactly like the main chat. Returns null for a
+    // disallowed verb (dropped, not run) so it doesn't reach the model as a result.
+    const runCall = async (c) => {
+      if (!allowedVerbs.has(c.verb)) { blocked.push(c); return null; }
+      allowed.push(c);
+      let status, content;
+      const shellErr = (shellScreen && c.verb === 'powershell') ? shellScreen(c.args?.command) : null;
+      if (shellErr) { status = 'error'; content = shellErr; }
+      else {
+        try {
+          if (c.args && typeof c.args.path === 'string') c.args.path = resolvePath(c.args.path);
+          const raw = await execute(c.name, c.args, extraTools, mkCtx(c));   // toolCtx: read-only {signal,cwd} by default, or a write-capable ctx (worktree cwd) for a sub-agent
+          content = (typeof raw === 'string' && raw.startsWith('ERROR:')) ? raw : extractContent(raw);
+          status = (typeof raw === 'string' && raw.startsWith('ERROR:')) ? 'error' : 'ok';
+          log(`${label} turn ${turn}: ${c.verb}(${JSON.stringify(c.args).slice(0, 80)}) -> ${status} ${content.length}b`);
+        } catch (e) { status = 'error'; content = 'ERROR: ' + (e?.message ?? String(e)); }
+      }
+      // Stream this call's call+result live (one per call) for the mini-chat UI.
+      if (onTools) await onTools({ calls: [c], results: [{ verb: c.verb, status, content }], turn });
+      return { call: c, verb: c.verb, status, content };
+    };
+
+    const { text, orderedResults } = await runStreamingTurn({
+      adapter, model, convo, signal,
+      serialVerbs,              // empty (read-only) or MUTATING_VERBS (write-capable sub-agent)
+      suppressTags,             // e.g. the intake suppresses <requirement-card> from the prose stream
+      onProseChunk: onProse ? ({ segmentIndex, content }) => onProse({ turn, segmentIndex, content }) : undefined,
+      onProseSegmentEnd: onProseEnd ? ({ segmentIndex, content }) => onProseEnd({ turn, segmentIndex, content }) : undefined,
+      onUsage: onTokens
+        ? (u) => { const uu = u || {}; cumTokens += (uu.total_tokens || ((uu.prompt_tokens || 0) + (uu.completion_tokens || 0)) || 0); return onTokens(cumTokens); }
+        : undefined,
+      runCall,
+    });
+    log(`${label} turn ${turn}: ${text.length} chars in ${Date.now() - t0}ms`);
+
+    const results = orderedResults.map((r) => ({ verb: r.verb, status: r.status, content: r.content }));
+    if (blocked.length > 0) {
+      results.push({ verb: 'system', status: 'error', content: `${label} is read-only — dropped ${blocked.length} call(s): ${blocked.map((c) => c.verb).join(', ')}.` });
+    }
+    const prose = text.replace(/<remote-workspace\b[^>]*>[\s\S]*?<\/remote-workspace>/gi, '').trim();
+    // interpret runs AFTER the turn's tools have streamed: { finish } terminal,
+    // { inject } pushes messages + loops, anything else loops with the results.
+    const decision = (await interpret({ text, prose, allowed, blocked, results, turn, transcript })) || {};
+    if (decision.finish) return decision.result;
+    if (decision.inject) { transcript.push(...decision.inject); continue; }
+    transcript.push({ role: 'assistant', content: text });
+    transcript.push({ role: 'user', content: formatToolResults(results) });
+  }
+  return onMaxTurns ? await onMaxTurns({ transcript }) : null;
+}
+
+// runReadonlyPass — the READ-ONLY configuration of runEngine, used by every manager
+// pass (reviewer / acceptance / intake / consolidation): powershell is screened to
+// read-only, tools run with the bare { signal, cwd } ctx, and nothing serializes. A thin
+// wrapper so those call sites are unchanged; a write-capable sub-agent is the inverse
+// config (full tool ctx with the worktree cwd, no shellScreen, serialVerbs = MUTATING_VERBS).
+function runReadonlyPass(opts) {
+  return runEngine({ ...opts, shellScreen: screenReadOnlyShell });
+}
+
+// ── Sub-agent runner (the orchestrator's runWorker) ────────────────────────────
+// The WRITE configuration of runEngine: a store-free, seed-driven worker that does
+// ONE focused task to completion with the full tool set (read/write/edit/shell),
+// isolated by its git WORKTREE (the caller passes the worktree as projectDir/cwd), and
+// returns its final prose as a bounded { content } result. No tasks-v2 store, no task-op
+// lifecycle — a sub-agent is ephemeral: do the task, return the result, drop its context.
+// The orchestrator forks/spawns these; the server/bridge supplies adapter+model+worktree.
+const SUBAGENT_SYSTEM_PROMPT = `You are a focused sub-agent working ONE task to completion. Ground every change by reading the file first. When the task is DONE, reply with a concise summary of what you changed and issue NO tool calls — that ends your run and returns the summary to the manager.
+
+Use <remote-workspace> tool blocks with EXACTLY these formats (read commands are self-closing; write/edit hold the content in the BODY, not in attributes):
+  <list path="DIR"/>
+  <read path="FILE" offset="N" limit="N"/>
+  <search pattern="REGEX" path="DIR" glob="GLOB" flags="i"/>
+  <find pattern="GLOB"/>
+  <info path="FILE"/>
+  <write path="FILE">
+  full file content goes here
+  </write>
+  <edit path="FILE">
+  <find>exact string to find (must occur exactly once)</find>
+  <replace>replacement string</replace>
+  </edit>
+  <powershell>git status</powershell>
+The workspace replies with <remote-workspace-result> blocks — read real results before continuing, and never invent file or directory names you have not seen.`;
+const SUBAGENT_VERBS = new Set(['read', 'write', 'edit', 'list', 'search', 'find', 'info', 'powershell']);
+
+async function runSubAgent({
+  adapter, model, signal, projectDir, seedMessages, topic = 'sub-agent',
+  systemPrompt = SUBAGENT_SYSTEM_PROMPT,
+  requireBranch, requireApproval, getGitLabCredentials,
+  maxTurns = DEFAULT_MAX_TURNS, onLog = null, onChatEvent = null,
+}) {
+  if (!projectDir) throw new Error('runSubAgent: projectDir required');
+  // Isolation is the caller's git WORKTREE: projectDir is the sub-agent's own worktree
+  // (its own dir + branch), so writes are physically isolated and integrate-time merge
+  // conflicts are the deny-on-stale signal. Tool writes resolve under projectDir via cwd.
+  return await runEngine({
+    adapter, model, signal, label: topic, systemPrompt, seedMessages,
+    allowedVerbs: SUBAGENT_VERBS, serialVerbs: MUTATING_VERBS, shellScreen: null,
+    maxTurns, cwd: projectDir,
+    toolCtx: (c) => ({
+      callId: c.id,
+      onProgress: (chunk) => { try { onChatEvent?.({ type: 'tool-progress', callId: c.id, chunk }); } catch {} },
+      requireBranch, requireApproval, getGitLabCredentials,
+      signal, cwd: projectDir,
+    }),
+    // Surface the sub-agent's live activity (tool calls + prose) so the caller can show
+    // "what it's doing" on a side channel. onChatEvent is the only sink; no-op without it.
+    onTools: onChatEvent ? ({ calls, results }) => {
+      for (let i = 0; i < (calls || []).length; i++) {
+        const c = calls[i]; const r = (results && results[i]) || {};
+        const a = c.args || {};
+        try {
+          onChatEvent({ type: 'tool-call', name: c.verb || c.name, verb: c.verb || c.name, callId: c.id, summary: a.path || a.pattern || a.query || a.cmd || '' });
+          onChatEvent({ type: 'tool-result', name: c.verb || c.name, callId: c.id, status: r.status, content: typeof r.content === 'string' ? r.content : '' });
+        } catch {}
+      }
+    } : undefined,
+    onProseEnd: onChatEvent ? ({ content }) => { if (content && content.trim()) { try { onChatEvent({ type: 'assistant-text', content }); } catch {} } } : undefined,
+    // a sub-agent finishes when a turn issues NO tools; its bounded result is the
+    // final prose (as { content } so it reads cleanly through the orchestrator card).
+    interpret: ({ allowed, prose, text }) => (allowed.length === 0 ? { finish: true, result: { content: prose || text } } : {}),
+    onLog,
+  });
+}
+
+// A repo-relative path resolver: try the project root first, then each changed
+// sub-repo root. Returns an ABSOLUTE path when found (so the tool resolves it
+// regardless of process.cwd() — these read-only passes are cwd-independent), and
+// the original relative path if nothing matches.
+function makeRepoResolver(projectDir, repoRoots = []) {
+  return (p) => {
+    if (typeof p !== 'string' || !p || path.isAbsolute(p)) return p;
+    try { if (projectDir && existsSync(path.join(projectDir, p))) return path.join(projectDir, p); } catch {}
+    for (const root of repoRoots) { try { if (existsSync(path.join(root, p))) return path.join(root, p); } catch {} }
+    return p;
+  };
+}
+
+async function runReviewer({ adapter, model, tasks, signal, onLog, onDiag, repoRoots = [], projectDir = null }) {
   const taskList = Array.isArray(tasks) ? tasks : [];
   const taskIds = taskList.map((t) => t.taskId);
   const verdicts = new Map();
@@ -4756,53 +5599,30 @@ async function runReviewer({ adapter, model, tasks, signal, onLog, onDiag, repoR
   };
   if (taskList.length === 0) return { verdicts: [] };
 
-  // In a multi-repo workspace, resolve repo-relative read paths against the
-  // changed sub-repos (cwd is the workspace root).
-  const resolveAgainstRepos = (p) => {
-    if (typeof p !== 'string' || !p || path.isAbsolute(p)) return p;
-    try { if (existsSync(path.join(process.cwd(), p))) return p; } catch {}
-    for (const root of repoRoots) {
-      try { if (existsSync(path.join(root, p))) return path.join(root, p); } catch {}
-    }
-    return p;
-  };
   const log = (m) => { try { onLog?.(m); } catch {} };
   const userBlock = ['<review-target>', buildBudgetedReviewInput(taskList), '</review-target>'].join('\n');
-  const messages = [
-    { role: 'system', content: REVIEWER_SYSTEM_PROMPT },
-    { role: 'user', content: userBlock },
-  ];
-  // Cumulative corrective re-prompts issued across the whole review (NOT reset
-  // per turn) so the retry budget is hard-bounded.
+  // Cumulative corrective re-prompts across the whole review (NOT reset per turn)
+  // so the retry budget is hard-bounded.
   let corrections = 0;
-
-  for (let turn = 1; turn <= REVIEWER_MAX_TURNS; turn++) {
-    if (signal?.aborted) {
-      const e = new Error('aborted');
-      e.name = 'AbortError';
-      throw e;
-    }
-    const t0 = Date.now();
-    const response = await adapter.complete({ model, messages, signal });
-    const text = response?.choices?.[0]?.message?.content ?? '';
-    log(`reviewer turn ${turn}: ${text.length} chars in ${Date.now() - t0}ms`);
-
-    // Tool calls FIRST: a verdict is only honored in a turn with no executable
-    // tool calls (so a tentative verdict + verification reads in the same turn
-    // doesn't short-circuit the reads).
-    const calls = parseToolCalls(text);
-    const allowed = calls.filter((c) => REVIEWER_TOOL_VERBS.has(c.verb));
-    const blocked = calls.filter((c) => !REVIEWER_TOOL_VERBS.has(c.verb));
-
-    if (allowed.length === 0) {
+  return runReadonlyPass({
+    adapter, model, signal, onLog, label: 'reviewer',
+    systemPrompt: REVIEWER_SYSTEM_PROMPT,
+    seedMessages: [{ role: 'user', content: userBlock }],
+    allowedVerbs: REVIEWER_TOOL_VERBS, maxTurns: REVIEWER_MAX_TURNS,
+    resolvePath: makeRepoResolver(projectDir, repoRoots),
+    cwd: projectDir,
+    interpret: ({ text, allowed, turn }) => {
+      // Tool calls FIRST: a verdict is only honored in a turn with no executable
+      // tool calls (so a tentative verdict + verification reads in the same turn
+      // doesn't short-circuit the reads).
+      if (allowed.length > 0) return {};
       const proseOnly = text.replace(/<remote-workspace\b[^>]*>[\s\S]*?<\/remote-workspace>/gi, '');
       parseReviewVerdicts(proseOnly, taskIds, verdicts);
-      if (taskIds.every((id) => verdicts.has(id))) return finalize();
-      // No parseable tag for some task(s). FIRST try: re-prompt the reviewer to
-      // emit the tag (some models reply with a Markdown "Final Verdict" report
-      // instead). Only after the correction budget is spent do we guess from
-      // prose / default to pass. The guard `turn < REVIEWER_MAX_TURNS` avoids
-      // burning the final turn on a re-prompt that has no turn left to answer.
+      if (taskIds.every((id) => verdicts.has(id))) return { finish: true, result: finalize() };
+      // No parseable tag for some task(s). FIRST try: re-prompt for the tag (some
+      // models reply with a Markdown "Final Verdict" report instead). Only after
+      // the correction budget is spent do we infer from prose / default to pass.
+      // `turn < REVIEWER_MAX_TURNS` avoids burning the final turn on a re-prompt.
       const unruled = taskIds.filter((id) => !verdicts.has(id));
       if (corrections < REVIEWER_MAX_CORRECTIONS && turn < REVIEWER_MAX_TURNS) {
         corrections++;
@@ -4810,59 +5630,30 @@ async function runReviewer({ adapter, model, tasks, signal, onLog, onDiag, repoR
           ? '<review-pass/>\nOR\n<review-fail>specific, actionable concerns</review-fail>'
           : unruled.map((id) => `<review task="${id}" pass/>   (or)   <review task="${id}" fail>concerns</review>`).join('\n');
         const correction = `Your last turn did not include a parseable verdict tag for ${unruled.length} task(s): ${unruled.join(', ')}. A Markdown report or "Final Verdict" prose is NOT read — only the literal tag is. Reply with ONLY the verdict tag(s) below and nothing else:\n${tagHelp}`;
-        // LOG-ONLY (no emitDiag): the corrective re-prompt is routine self-healing.
-        // If the retry SUCCEEDS, surfacing a warning is misleading — it lingers in
-        // the chat and looks like a second/failed review. Only the genuine
-        // outcomes after the budget is spent (prose-inference / default-pass /
-        // max-turns below) emit a user-facing diagnostic. The raw prose is kept
-        // in the file log for triage.
+        // LOG-ONLY (no emitDiag): the corrective re-prompt is routine self-healing;
+        // surfacing it would look like a failed second review if the retry succeeds.
         log(`reviewer turn ${turn}: no verdict tag; corrective re-prompt ${corrections}/${REVIEWER_MAX_CORRECTIONS} for ${unruled.join(', ')} — raw: ${proseOnly.slice(0, 200).replace(/\s+/g, ' ')}`);
-        messages.push({ role: 'assistant', content: text });
-        messages.push({ role: 'user', content: correction });
-        continue;
+        return { inject: [{ role: 'assistant', content: text }, { role: 'user', content: correction }] };
       }
-      // Correction budget spent. Before defaulting to pass, try to INFER
-      // pass/fail from the reviewer's prose. A prose FAIL must NOT be silently
-      // turned into a pass.
+      // Budget spent. Try to INFER pass/fail from prose (a prose FAIL must NOT
+      // become a silent pass); else default the rest to pass so the user isn't blocked.
       const inferred = inferVerdictFromProse(proseOnly);
       if (inferred) {
         let n = 0;
         for (const id of taskIds) if (!verdicts.has(id)) { verdicts.set(id, { ...inferred, inferredFromProse: true }); n++; }
         emitDiag(onDiag, 'reviewer', `reviewer emitted a PROSE verdict instead of a <review-${inferred.pass ? 'pass' : 'fail'}> tag for ${n} task(s); inferred ${inferred.pass ? 'PASS' : 'FAIL'} from the text (low confidence — verify)`, proseOnly);
-        if (taskIds.every((id) => verdicts.has(id))) return finalize();
+        if (taskIds.every((id) => verdicts.has(id))) return { finish: true, result: finalize() };
       }
-      // Still unruled with no signal at all → default to pass so the user isn't blocked.
       log(`reviewer turn ${turn}: no tool calls; ${verdicts.size}/${taskIds.length} tasks ruled on — defaulting the rest to pass`);
       emitDiag(onDiag, 'reviewer', `no <review-pass>/<review-fail> verdict for ${taskIds.length - verdicts.size} of ${taskIds.length} task(s); defaulted them to pass`, proseOnly);
+      return { finish: true, result: finalize() };
+    },
+    onMaxTurns: ({ transcript }) => {
+      log(`reviewer: hit max turns (${REVIEWER_MAX_TURNS}); ${verdicts.size}/${taskIds.length} ruled on — rest default to pass.`);
+      if (verdicts.size < taskIds.length) emitDiag(onDiag, 'reviewer', `hit ${REVIEWER_MAX_TURNS}-turn budget with ${taskIds.length - verdicts.size} task(s) unruled; defaulted them to pass`, lastAssistantText(transcript));
       return finalize();
-    }
-
-    // Execute the allowed (read-only) tools.
-    const results = [];
-    for (const c of allowed) {
-      const shellBlock = c.verb === 'powershell' ? screenReadOnlyShell(c.args?.command) : null;
-      if (shellBlock) { results.push({ verb: c.verb, status: 'error', content: shellBlock }); continue; }
-      try {
-        if (c.args && typeof c.args.path === 'string') c.args.path = resolveAgainstRepos(c.args.path);
-        const raw = await execute(c.name, c.args, {}, { signal });
-        const content = (typeof raw === 'string' && raw.startsWith('ERROR:')) ? raw : extractContent(raw);
-        const status = (typeof raw === 'string' && raw.startsWith('ERROR:')) ? 'error' : 'ok';
-        results.push({ verb: c.verb, status, content });
-        log(`reviewer turn ${turn}: ${c.verb}(${JSON.stringify(c.args).slice(0, 80)}) -> ${status} ${content.length}b`);
-      } catch (e) {
-        results.push({ verb: c.verb, status: 'error', content: 'ERROR: ' + (e?.message ?? String(e)) });
-      }
-    }
-    if (blocked.length > 0) {
-      results.push({ verb: 'system', status: 'error', content: `Reviewer is read-only — dropped ${blocked.length} call(s): ${blocked.map((c) => c.verb).join(', ')}.` });
-    }
-    messages.push({ role: 'assistant', content: text });
-    messages.push({ role: 'user', content: formatToolResults(results) });
-  }
-
-  log(`reviewer: hit max turns (${REVIEWER_MAX_TURNS}); ${verdicts.size}/${taskIds.length} ruled on — rest default to pass.`);
-  if (verdicts.size < taskIds.length) emitDiag(onDiag, 'reviewer', `hit ${REVIEWER_MAX_TURNS}-turn budget with ${taskIds.length - verdicts.size} task(s) unruled; defaulted them to pass`, lastAssistantText(messages));
-  return finalize();
+    },
+  });
 }
 
 // ── Acceptance check (assignment-level requirement fulfilment) ──────────────
@@ -4936,67 +5727,403 @@ function parseAcceptanceVerdict(prose) {
  * Returns { fulfilled, missing, drift, rationale, autoVerifyFailed? }. Fails
  * safe to fulfilled:false when it can't reach a verdict.
  */
-async function runAcceptance({ adapter, model, assignment, tasks = [], signal, onLog, onDiag, repoRoots = [] }) {
+async function runAcceptance({ adapter, model, assignment, tasks = [], signal, onLog, onDiag, repoRoots = [], projectDir = null }) {
   const log = (m) => { try { onLog?.(m); } catch {} };
-  const resolveAgainstRepos = (p) => {
-    if (typeof p !== 'string' || !p || path.isAbsolute(p)) return p;
-    try { if (existsSync(path.join(process.cwd(), p))) return p; } catch {}
-    for (const root of repoRoots) { try { if (existsSync(path.join(root, p))) return path.join(root, p); } catch {} }
-    return p;
-  };
   const NOT_VERIFIED = (why) => ({ fulfilled: false, missing: 'could not auto-verify', drift: '', rationale: why, autoVerifyFailed: true });
-
   const userBlock = ['<acceptance-target>', buildAcceptanceInput(assignment || {}, tasks), '</acceptance-target>'].join('\n');
-  const messages = [
-    { role: 'system', content: ACCEPTANCE_SYSTEM_PROMPT },
-    { role: 'user', content: userBlock },
-  ];
-
-  for (let turn = 1; turn <= REVIEWER_MAX_TURNS; turn++) {
-    if (signal?.aborted) { const e = new Error('aborted'); e.name = 'AbortError'; throw e; }
-    const t0 = Date.now();
-    const response = await adapter.complete({ model, messages, signal });
-    const text = response?.choices?.[0]?.message?.content ?? '';
-    log(`acceptance turn ${turn}: ${text.length} chars in ${Date.now() - t0}ms`);
-
-    const calls = parseToolCalls(text);
-    const allowed = calls.filter((c) => REVIEWER_TOOL_VERBS.has(c.verb));
-    const blocked = calls.filter((c) => !REVIEWER_TOOL_VERBS.has(c.verb));
-
-    if (allowed.length === 0) {
-      const prose = text.replace(/<remote-workspace\b[^>]*>[\s\S]*?<\/remote-workspace>/gi, '');
+  return runReadonlyPass({
+    adapter, model, signal, onLog, label: 'acceptance',
+    systemPrompt: ACCEPTANCE_SYSTEM_PROMPT,
+    seedMessages: [{ role: 'user', content: userBlock }],
+    allowedVerbs: REVIEWER_TOOL_VERBS, maxTurns: REVIEWER_MAX_TURNS,
+    resolvePath: makeRepoResolver(projectDir, repoRoots),
+    cwd: projectDir,
+    interpret: ({ prose, allowed, turn }) => {
+      if (allowed.length > 0) return {};   // run tools, loop
       const v = parseAcceptanceVerdict(prose);
-      if (v) return v;
+      if (v) return { finish: true, result: v };
       log(`acceptance turn ${turn}: no parseable verdict — failing safe to not-fulfilled`);
       emitDiag(onDiag, 'acceptance', 'no <accept-fulfilled>/<accept-unfulfilled> verdict — failed safe to not-fulfilled', prose);
-      return NOT_VERIFIED('The acceptance check produced no clear verdict; review the work manually.');
-    }
+      return { finish: true, result: NOT_VERIFIED('The acceptance check produced no clear verdict; review the work manually.') };
+    },
+    onMaxTurns: ({ transcript }) => {
+      log(`acceptance: hit max turns (${REVIEWER_MAX_TURNS}) without a verdict — failing safe to not-fulfilled.`);
+      emitDiag(onDiag, 'acceptance', `hit ${REVIEWER_MAX_TURNS}-turn budget without a verdict — failed safe to not-fulfilled`, lastAssistantText(transcript));
+      return NOT_VERIFIED('Acceptance ran out of verification turns without a verdict; review the work manually.');
+    },
+  });
+}
 
-    const results = [];
-    for (const c of allowed) {
-      const shellBlock = c.verb === 'powershell' ? screenReadOnlyShell(c.args?.command) : null;
-      if (shellBlock) { results.push({ verb: c.verb, status: 'error', content: shellBlock }); continue; }
-      try {
-        if (c.args && typeof c.args.path === 'string') c.args.path = resolveAgainstRepos(c.args.path);
-        const raw = await execute(c.name, c.args, {}, { signal });
-        const content = (typeof raw === 'string' && raw.startsWith('ERROR:')) ? raw : extractContent(raw);
-        const status = (typeof raw === 'string' && raw.startsWith('ERROR:')) ? 'error' : 'ok';
-        results.push({ verb: c.verb, status, content });
-        log(`acceptance turn ${turn}: ${c.verb}(${JSON.stringify(c.args).slice(0, 80)}) -> ${status} ${content.length}b`);
-      } catch (e) {
-        results.push({ verb: c.verb, status: 'error', content: 'ERROR: ' + (e?.message ?? String(e)) });
+// ── Sub-agent acceptance (orchestrator review loop, ORCHESTRATOR.md R4) ─────
+// The Acceptance AGENT for a delegated sub-agent: a read-only reviewer that decides
+// whether to APPROVE the sub-agent's worktree work or REJECT it with feedback. The
+// manager never reads the sub-agent's transcript — this agent reads the work via
+// read-only tools (the worktree IS its project root) + a seeded rollup of the sub-agent's
+// tasks, and returns ONLY a verdict. FAILS SAFE TO REJECT (a wrong auto-approve
+// integrates+despawns — the expensive error), the same conservatism as runAcceptance.
+const SA_ACCEPT_MAX_TURNS = REVIEWER_MAX_TURNS;
+const SA_ACCEPTANCE_SYSTEM_PROMPT = `You are an acceptance reviewer for ONE sub-agent's work. A manager handed a sub-agent a request; the sub-agent worked in an isolated checkout (which is now YOUR read-only project root) and reported a result. Decide whether to APPROVE its work or REJECT it with actionable feedback.
+
+You are given:
+  <user-intent> — what the user actually wants (an excerpt of the manager's conversation)
+  <original-request> — the exact brief the sub-agent was given
+  <subagent-work> — the sub-agent's tasks + summaries (a read-only rollup)
+
+VERIFY read-only (emit calls inside a <remote-workspace> block; the worktree is your project root):
+  <list path="."/>  <read path="FILE"/>  <search pattern="REGEX" path="DIR"/>  <find pattern="GLOB"/>  <info path="FILE"/>
+  <powershell>git log --oneline</powershell> to see ALL the sub-agent's commits (it may have revised across rounds — do NOT assume one commit), then read the changed files directly and/or <powershell>git show <hash></powershell> per commit to see the cumulative change.
+You may inspect, diff, and run read-only checks; you MUST NOT modify anything (write/edit are unavailable; only read-only git commands run).
+
+Judge against the request + the user's intent:
+- COMPLETENESS — is everything the request asked for actually done? Name anything missing or partial.
+- CORRECTNESS-AT-LARGE — does the change actually achieve what was asked (not just compile)?
+- DRIFT — did it change things outside the request?
+
+When you have enough information, emit ONE verdict in a turn with NO tool calls:
+  <sa-approve>one-line rationale</sa-approve>
+OR
+  <sa-reject>specific, actionable feedback: name the files, the gap, and what to do — the sub-agent will act on this verbatim</sa-reject>
+
+Be conservative: APPROVE only when you are confident the request is met. If you cannot verify it from what you can read, REJECT and say what to check. Reject is cheap (the sub-agent resumes); a wrong approve is not.`;
+
+function parseSaVerdict(prose) {
+  // REJECT WINS (fail-safe): a reject tag anywhere → rejection, even alongside an approve
+  // tag (a confused dual-tag response) or when the approve tag is merely MENTIONED inside
+  // the reject feedback. A wrong auto-approve integrates + despawns; reject is cheap.
+  const rm = prose.match(/<sa-reject>([\s\S]*?)<\/sa-reject>/i);
+  if (rm) return { approved: false, feedback: rm[1].trim() || 'rejected — re-examine the work against the request' };
+  const am = prose.match(/<sa-approve>([\s\S]*?)<\/sa-approve>/i);
+  if (am) return { approved: true, feedback: am[1].trim() };
+  if (/<sa-approve\s*\/>/i.test(prose)) return { approved: true, feedback: '' };
+  return null;
+}
+
+/**
+ * Acceptance review of a sub-agent's worktree work (the orchestrator's review loop).
+ *   request:           the original brief handed to the sub-agent (string)
+ *   conversationChunk: an excerpt of the manager conversation (string — what the user wants)
+ *   workRollup:        a read-only rollup of the sub-agent's tasks/summaries (string; the
+ *                      store under <worktree>/.code_boss is tool-blocked, so it's seeded)
+ *   worktreePath:      the sub-agent's worktree = the read-only project root (cwd)
+ * Returns { approved, feedback }. Fails SAFE to REJECT when it can't reach a verdict.
+ */
+async function runSubAgentAcceptance({ adapter, model, signal, onLog, onDiag, request = '', conversationChunk = '', workRollup = '', worktreePath, repoRoots = [] }) {
+  const log = (m) => { try { onLog?.(m); } catch {} };
+  const REJECT_SAFE = (why) => ({ approved: false, feedback: why });
+  const userBlock = [
+    '<user-intent note="what the user actually wants (manager conversation excerpt)">', clip(String(conversationChunk || '(none)'), 12000), '</user-intent>',
+    '<original-request note="the exact brief handed to the sub-agent">', clip(String(request || '(none)'), 4000), '</original-request>',
+    '<subagent-work note="the sub-agent\'s tasks + summaries (read-only rollup)">', clip(String(workRollup || '(none)'), 12000), '</subagent-work>',
+    'The sub-agent\'s worktree is your project root — start with <list path="."/> and `git log --oneline` (it may have revised across rounds — review ALL its commits, not just the last), then read the changed files + verify against the request.',
+  ].join('\n');
+  return runReadonlyPass({
+    adapter, model, signal, onLog, label: 'sa-acceptance',
+    systemPrompt: SA_ACCEPTANCE_SYSTEM_PROMPT,
+    seedMessages: [{ role: 'user', content: userBlock }],
+    allowedVerbs: REVIEWER_TOOL_VERBS, maxTurns: SA_ACCEPT_MAX_TURNS,
+    resolvePath: makeRepoResolver(worktreePath, repoRoots),
+    cwd: worktreePath,
+    interpret: ({ prose, allowed, turn }) => {
+      if (allowed.length > 0) return {};   // tools ran — loop; verdict only on a no-tool turn
+      const v = parseSaVerdict(prose);
+      if (v && v.approved === false) return { finish: true, result: v };   // a REJECT is always safe to honor
+      // For an APPROVE (or no verdict): if the prose shows tool INTENT (a malformed/unclosed
+      // <remote-workspace> block that parsed as prose → allowed=[]), the agent didn't mean to
+      // give a final verdict this turn — loop, so a tentative <sa-approve/> can't short-circuit
+      // before the reads run (bounded by maxTurns → fail-safe reject).
+      if (turn < SA_ACCEPT_MAX_TURNS && /<remote-workspace|<(read|write|edit|list|search|find|info|powershell)[\s/>]/i.test(prose)) {
+        log(`sa-acceptance turn ${turn}: tool-intent without a clean verdict — looping for a clean verdict`);
+        return {};
       }
-    }
-    if (blocked.length > 0) {
-      results.push({ verb: 'system', status: 'error', content: `Acceptance is read-only — dropped ${blocked.length} call(s): ${blocked.map((c) => c.verb).join(', ')}.` });
-    }
-    messages.push({ role: 'assistant', content: text });
-    messages.push({ role: 'user', content: formatToolResults(results) });
-  }
+      if (v) return { finish: true, result: v };   // a clean APPROVE with no tool-intent
+      log(`sa-acceptance turn ${turn}: no parseable verdict — failing safe to REJECT`);
+      emitDiag(onDiag, 'sa-acceptance', 'no <sa-approve>/<sa-reject> verdict — failed safe to reject', prose);
+      return { finish: true, result: REJECT_SAFE('The acceptance check produced no clear verdict; the sub-agent should re-examine its work against the request.') };
+    },
+    onMaxTurns: ({ transcript }) => {
+      log(`sa-acceptance: hit max turns (${SA_ACCEPT_MAX_TURNS}) without a verdict — failing safe to REJECT.`);
+      emitDiag(onDiag, 'sa-acceptance', `hit ${SA_ACCEPT_MAX_TURNS}-turn budget without a verdict — failed safe to reject`, lastAssistantText(transcript));
+      return REJECT_SAFE('Acceptance ran out of verification turns; the sub-agent should re-examine its work.');
+    },
+  });
+}
 
-  log(`acceptance: hit max turns (${REVIEWER_MAX_TURNS}) without a verdict — failing safe to not-fulfilled.`);
-  emitDiag(onDiag, 'acceptance', `hit ${REVIEWER_MAX_TURNS}-turn budget without a verdict — failed safe to not-fulfilled`, lastAssistantText(messages));
-  return NOT_VERIFIED('Acceptance ran out of verification turns without a verdict; review the work manually.');
+// ── Manager turn (the one-call router, ORCHESTRATOR.md) ─────────────────────
+// When the foreground forks (a task is running as a background sub-agent), the freed
+// manager answers the user in ONE read-only turn — OR hands a real task to a sub-agent by
+// emitting <delegate>brief</delegate>. No separate classifier call: the manager's own turn
+// IS the router; the harness ratifies (prose → reply; <delegate> → spawn). Read-only is
+// structural (write/edit not in the allowlist; powershell screened) so the manager can
+// never touch the main dir — only delegation produces writes. Fails safe to DELEGATE.
+const MANAGER_SYSTEM_PROMPT = `You are the MANAGER of a coding session. One or more focused tasks are already running as BACKGROUND sub-agents (each in its own isolated checkout) — do NOT touch their files or redo their work. The user just sent you a message. In ONE reply do exactly ONE of:
+
+  • ANSWER it directly — for a question, a status check, a clarification, or conversation. You may inspect the repo READ-ONLY (<read>, <list>, <search>, <find>, <info>, and read-only git via <powershell>) to answer well. Write your reply as normal prose (NO <delegate> tag).
+
+  • DELEGATE it — if it asks for real work (a code change, build, fix, or feature). Do NOT do the work yourself. Emit ONE block:
+      <delegate>a SELF-CONTAINED brief for a sub-agent: the goal, the relevant files/areas, and what "done" looks like. The sub-agent receives ONLY this brief (not our conversation), so include the context it needs.</delegate>
+    You may add a one-line note that you've started it.
+
+You MUST NOT write, edit, or run mutating commands yourself — delegation is the only way work happens. When unsure whether it is a task, DELEGATE (a question handled as a task is cheap; a task mistaken for a question never gets done).`;
+const MANAGER_PRIMING = [
+  { role: 'user', content: 'is it almost done?' },
+  { role: 'assistant', content: 'The background task is still on its first step; I\'ll surface the result here as soon as it lands.' },
+  { role: 'user', content: 'also add a /health endpoint' },
+  { role: 'assistant', content: 'On it.\n<delegate>Add a GET /health endpoint that returns HTTP 200 with body {status:"ok"}. Find the HTTP server/route setup (e.g. server.js / app.js), add the route next to the existing ones, keep them working. Done = GET /health returns 200 {status:"ok"}.</delegate>' },
+];
+
+function parseDelegate(prose) {
+  const m = String(prose || '').match(/<delegate>([\s\S]*?)<\/delegate>/i);
+  if (!m) return null;
+  return m[1].trim() || null;
+}
+
+/**
+ * The MANAGER turn: one read-only pass over a COPY of the conversation + the new user
+ * message. Returns { action:'answer', text } (already streamed via onProse/onProseEnd) or
+ * { action:'delegate', brief }. Fails safe to DELEGATE on no-verdict / max-turns.
+ */
+async function runManagerTurn({ adapter, model, signal, onLog, onDiag, messages = [], newMessage, subagentStatus = '', projectDir = null, repoRoots = [], onProse, onProseEnd, onTokens }) {
+  const log = (m) => { try { onLog?.(m); } catch {} };
+  const status = subagentStatus ? `\n\n<background-sub-agents note="running now — you manage them, never touch their files">\n${clip(String(subagentStatus), 2000)}\n</background-sub-agents>` : '';
+  const seed = [...(Array.isArray(messages) ? messages : []), { role: 'user', content: String(newMessage || '') }];
+  return runReadonlyPass({
+    adapter, model, signal, onLog, label: 'manager',
+    systemPrompt: MANAGER_SYSTEM_PROMPT + status, priming: MANAGER_PRIMING,
+    seedMessages: seed,
+    allowedVerbs: REVIEWER_TOOL_VERBS, maxTurns: REVIEWER_MAX_TURNS,
+    resolvePath: makeRepoResolver(projectDir, repoRoots),
+    cwd: projectDir,
+    suppressTags: ['delegate'],   // the brief is parsed, not shown as streamed prose
+    onTokens: onTokens ? (t) => onTokens(t) : undefined,
+    onProse: onProse ? ({ turn, segmentIndex, content }) => onProse({ turn, segmentIndex, content }) : undefined,
+    onProseEnd: onProseEnd ? ({ turn, segmentIndex, content }) => { const c = content.replace(/<delegate>[\s\S]*?<\/delegate>/i, '').trim(); if (c) onProseEnd({ turn, segmentIndex, content: c }); } : undefined,
+    interpret: ({ prose, allowed }) => {
+      // DELEGATE WINS — parse FIRST, even if the model also ran read-only tools this turn
+      // (so a read-then-delegate reply delegates instead of looping forever).
+      const brief = parseDelegate(prose);
+      if (brief) return { finish: true, result: { action: 'delegate', brief } };
+      if (allowed.length > 0) return {};   // read-only tools ran → loop, then answer/delegate
+      return { finish: true, result: { action: 'answer', text: String(prose || '').trim() } };
+    },
+    onMaxTurns: ({ transcript }) => {
+      log(`manager: hit max turns (${REVIEWER_MAX_TURNS}) — failing safe to DELEGATE the request`);
+      emitDiag(onDiag, 'manager', `hit ${REVIEWER_MAX_TURNS}-turn budget without a clean answer/delegate — delegating`, lastAssistantText(transcript));
+      return { action: 'delegate', brief: String(newMessage || '') };
+    },
+  });
+}
+
+// ── Adaptive cognition: the ASSESS turn (cognition.mjs is the controller) ────
+// One read-only turn that either ANSWERS a trivial/conversational request directly OR emits
+// an <evaluation> characterizing the problem (complexity/creativity/accuracy/size/mode +
+// salience) so the deterministic policy can choose how hard to think. It does NOT solve the
+// problem — it sizes it. Read-only is structural (write/edit not in the allowlist).
+const ASSESS_SYSTEM_PROMPT = `You are the ASSESS step of an adaptive cognition system. Read the request and do EXACTLY ONE of:
+
+  • ANSWER it directly — if it is trivial, conversational, or a quick factual/status question. Write your reply as normal prose (NO <evaluation> tag).
+
+  • EVALUATE it — if it needs real work or real thought. Do NOT solve it; CHARACTERIZE it so the system can decide how hard to think and which strategy to use. Emit ONE block:
+      <evaluation complexity="low|medium|high" creativity="low|high" accuracy="normal|critical" size="small|large" mode="build|debug|research|explain" salience="0.0-1.0">
+        a SELF-CONTAINED brief: what needs doing / what to think about, with the context a fresh agent would need (it won't see this conversation).
+      </evaluation>
+
+RUBRIC (be honest — over-rating wastes effort, under-rating ships sloppy work):
+  complexity — low: one file or one obvious change (the DEFAULT for an iterative edit/feature on an existing file). medium: a few related files/steps. high: ONLY genuinely separable work that spans multiple INDEPENDENT components. A vague or under-specified request is NOT "high" — it is under-specified: rate it by the SMALLEST sensible interpretation. Never inflate complexity because a request is ambiguous.
+  creativity — low: one right answer (a known fix/change). high: a real design space with multiple viable approaches (architecture, refactor strategy, API design).
+  accuracy   — critical: correctness/security-sensitive, hard to undo, or must be exactly right. normal: otherwise.
+  size       — large: substantial output expected (many edits / long generation). small: otherwise.
+  mode       — debug: finding a fault. research: gathering/understanding. explain: teaching. build: making changes (the default).
+  salience   — how important/promising it is to spend effort here NOW (1.0 = clearly worth deep effort; lower = marginal/uncertain).
+
+When a request is AMBIGUOUS, take the smallest on-task interpretation and do the obvious minimal thing — do NOT invent unrelated scope (e.g. never turn "let it run commands safely" into building an auth system). If it is too vague to act on at all, ANSWER asking one clarifying question instead of guessing a large build.
+
+You MAY read the repo READ-ONLY (<read>/<list>/<search>/<find>/<info>) to assess accurately, but you MUST NOT change anything — assessment only.`;
+const ASSESS_PRIMING = [
+  { role: 'user', content: 'what does the auth middleware do?' },
+  { role: 'assistant', content: 'It validates the JWT on each request and attaches the decoded user to req.user; requests without a valid token get a 401.' },
+  { role: 'user', content: 'redesign how we handle auth across the app' },
+  { role: 'assistant', content: '<evaluation complexity="high" creativity="high" accuracy="critical" size="large" mode="build" salience="0.9">\nRedesign the application\'s authentication. Survey the current approach (middleware, session/token flow, where user identity is read), weigh alternative designs, then propose and implement a coherent scheme. Security-sensitive and spans many files.\n</evaluation>' },
+];
+
+function parseEvaluation(prose) {
+  const s = String(prose || '');
+  let m = s.match(/<evaluation\b([^>]*)>([\s\S]*?)<\/evaluation>/i);
+  let attrs, brief;
+  if (m) { attrs = m[1]; brief = m[2].trim(); }
+  else { m = s.match(/<evaluation\b([^>]*?)\/>/i); if (!m) return null; attrs = m[1]; brief = ''; }
+  const attr = (name) => { const a = attrs.match(new RegExp(name + '\\s*=\\s*"([^"]*)"', 'i')); return a ? a[1].trim() : null; };
+  const metrics = normalizeCognitionMetrics({ complexity: attr('complexity'), creativity: attr('creativity'), accuracy: attr('accuracy'), size: attr('size'), mode: attr('mode') });
+  let salience = parseFloat(attr('salience'));
+  salience = isFinite(salience) ? Math.max(0, Math.min(1, salience)) : 0.7;   // unspecified → assume worth doing
+  return { metrics, salience, brief };
+}
+
+/**
+ * The ASSESS turn: one read-only pass over the request → { action:'answer', text } (the model
+ * answered) or { action:'evaluate', metrics, salience, brief } (hand to the cognition policy).
+ * EVALUATION WINS (parsed before the tool-loop check). Fails safe to a single-worker evaluation.
+ */
+async function runCognitiveAssess({ adapter, model, signal, onLog, onDiag, messages = [], request, projectDir = null, repoRoots = [], onProse, onProseEnd, onTokens }) {
+  const log = (m) => { try { onLog?.(m); } catch {} };
+  const seed = [...(Array.isArray(messages) ? messages : []), { role: 'user', content: String(request || '') }];
+  return runReadonlyPass({
+    adapter, model, signal, onLog, label: 'assess',
+    systemPrompt: ASSESS_SYSTEM_PROMPT, priming: ASSESS_PRIMING,
+    seedMessages: seed,
+    allowedVerbs: REVIEWER_TOOL_VERBS, maxTurns: REVIEWER_MAX_TURNS,
+    resolvePath: makeRepoResolver(projectDir, repoRoots),
+    cwd: projectDir,
+    suppressTags: ['evaluation'],
+    onTokens: onTokens ? (t) => onTokens(t) : undefined,
+    onProse: onProse ? ({ turn, segmentIndex, content }) => onProse({ turn, segmentIndex, content }) : undefined,
+    onProseEnd: onProseEnd ? ({ turn, segmentIndex, content }) => { const c = content.replace(/<evaluation\b[\s\S]*?(?:<\/evaluation>|\/>)/i, '').trim(); if (c) onProseEnd({ turn, segmentIndex, content: c }); } : undefined,
+    interpret: ({ prose, allowed }) => {
+      const ev = parseEvaluation(prose);                       // EVALUATION WINS (even alongside a read this turn)
+      if (ev) return { finish: true, result: { action: 'evaluate', ...ev } };
+      if (allowed.length > 0) return {};                       // read-only tools ran → loop, then answer/evaluate
+      return { finish: true, result: { action: 'answer', text: String(prose || '').trim() } };
+    },
+    onMaxTurns: ({ transcript }) => {
+      log(`assess: hit max turns (${REVIEWER_MAX_TURNS}) — failing safe to a single-worker evaluation`);
+      emitDiag(onDiag, 'assess', `hit ${REVIEWER_MAX_TURNS}-turn budget without an evaluation`, lastAssistantText(transcript));
+      return { action: 'evaluate', metrics: normalizeCognitionMetrics({}), salience: 0.6, brief: String(request || '') };
+    },
+  });
+}
+
+// ── Cognition thinking passes: decompose / explore / synthesize ──────────────
+// Read-only LLM passes the scheduler composes (the WORKER is the only writer). Each degrades
+// safely so the pipeline never dead-ends.
+
+const DECOMPOSE_SYSTEM_PROMPT = `You are the DECOMPOSE step. Break the task into the SMALLEST set of self-contained steps that together complete it. For each step emit ONE block:
+   <step id="short-id" after="comma,separated ids it depends on, or empty">a self-contained brief for that step — what to do and what "done" looks like; a fresh agent executes it with NO other context</step>
+Use \`after\` only for REAL dependencies, so independent steps can run in parallel. Prefer 2-6 steps. You MAY read the repo READ-ONLY to scope the steps; do NOT change anything.`;
+
+function parseSteps(prose) {
+  const steps = [];
+  const re = /<step\b([^>]*)>([\s\S]*?)<\/step>/gi;
+  let m;
+  while ((m = re.exec(String(prose || '')))) {
+    const attrs = m[1]; const brief = m[2].trim();
+    const idM = attrs.match(/id\s*=\s*"([^"]*)"/i);
+    const afterM = attrs.match(/after\s*=\s*"([^"]*)"/i);
+    if (!brief) continue;
+    steps.push({ id: idM ? idM[1].trim() : `s${steps.length + 1}`, brief, after: afterM ? afterM[1].split(',').map((s) => s.trim()).filter(Boolean) : [] });
+  }
+  return steps;
+}
+
+/** DECOMPOSE: brief → { steps:[{id, brief, after}] }. Empty → caller falls back to one worker. */
+async function runDecompose({ adapter, model, signal, onLog, messages = [], brief, projectDir = null, repoRoots = [], onTokens }) {
+  return runReadonlyPass({
+    adapter, model, signal, onLog, label: 'decompose',
+    systemPrompt: DECOMPOSE_SYSTEM_PROMPT, priming: [],
+    seedMessages: [...(Array.isArray(messages) ? messages : []), { role: 'user', content: String(brief || '') }],
+    allowedVerbs: REVIEWER_TOOL_VERBS, maxTurns: REVIEWER_MAX_TURNS,
+    resolvePath: makeRepoResolver(projectDir, repoRoots), cwd: projectDir, suppressTags: ['step'],
+    onTokens: onTokens ? (t) => onTokens(t) : undefined,
+    interpret: ({ prose, allowed }) => {
+      const steps = parseSteps(prose);
+      if (steps.length) return { finish: true, result: { steps } };
+      if (allowed.length > 0) return {};
+      return { finish: true, result: { steps: [] } };
+    },
+    onMaxTurns: () => ({ steps: [] }),
+  });
+}
+
+const EXPLORE_SYSTEM_PROMPT = `You are the EXPLORE step for an open-ended / creative task. Briefly weigh 2-4 DISTINCT approaches (different strategies, not variations), then COMMIT to the best. Emit exactly:
+   <approach>a refined, self-contained brief describing the chosen approach concretely enough to execute, with a one-line note on why it beats the alternatives</approach>
+You MAY read the repo READ-ONLY to ground the approaches; do NOT change anything.`;
+
+function parseApproach(prose) {
+  const m = String(prose || '').match(/<approach>([\s\S]*?)<\/approach>/i);
+  return m ? m[1].trim() : null;
+}
+
+/** EXPLORE: brief → { brief: chosen approach }. Falls back to the original brief. */
+async function runExplore({ adapter, model, signal, onLog, messages = [], brief, projectDir = null, repoRoots = [], onTokens }) {
+  return runReadonlyPass({
+    adapter, model, signal, onLog, label: 'explore',
+    systemPrompt: EXPLORE_SYSTEM_PROMPT, priming: [],
+    seedMessages: [...(Array.isArray(messages) ? messages : []), { role: 'user', content: String(brief || '') }],
+    allowedVerbs: REVIEWER_TOOL_VERBS, maxTurns: REVIEWER_MAX_TURNS,
+    resolvePath: makeRepoResolver(projectDir, repoRoots), cwd: projectDir, suppressTags: ['approach'],
+    onTokens: onTokens ? (t) => onTokens(t) : undefined,
+    interpret: ({ prose, allowed }) => {
+      const approach = parseApproach(prose);
+      if (approach) return { finish: true, result: { brief: approach } };
+      if (allowed.length > 0) return {};
+      return { finish: true, result: { brief: String(brief || '') } };
+    },
+    onMaxTurns: () => ({ brief: String(brief || '') }),
+  });
+}
+
+// EXPLORE, the richer way: N INDEPENDENT proposers (each commits to one approach, optionally
+// through a distinct lens for diversity) → a JUDGE that picks/synthesizes the best. The
+// scheduler's explore primitive fans these out in parallel; this beats one agent listing
+// options (which anchors on the first idea it has).
+const PROPOSER_SYSTEM_PROMPT = `You are ONE of several INDEPENDENT proposers for an open-ended task. Propose a SINGLE concrete approach — the best one given your guidance. Be specific and self-contained (an executor will follow it). Do NOT hedge or list alternatives — COMMIT to one. Emit exactly:
+   <approach>your single concrete approach: what to do and why it fits</approach>
+You MAY read the repo READ-ONLY to ground it; do NOT change anything.`;
+
+/** One proposer: brief (+ optional lens) → { approach }. */
+async function runProposer({ adapter, model, signal, onLog, brief, lens = '', projectDir = null, repoRoots = [], onTokens }) {
+  const systemPrompt = lens ? `${PROPOSER_SYSTEM_PROMPT}\n\nYour guidance for this proposal: ${lens}.` : PROPOSER_SYSTEM_PROMPT;
+  return runReadonlyPass({
+    adapter, model, signal, onLog, label: 'proposer', systemPrompt, priming: [],
+    seedMessages: [{ role: 'user', content: String(brief || '') }],
+    allowedVerbs: REVIEWER_TOOL_VERBS, maxTurns: REVIEWER_MAX_TURNS,
+    resolvePath: makeRepoResolver(projectDir, repoRoots), cwd: projectDir, suppressTags: ['approach'],
+    onTokens: onTokens ? (t) => onTokens(t) : undefined,
+    interpret: ({ prose, allowed }) => {
+      const a = parseApproach(prose);
+      if (a) return { finish: true, result: { approach: a } };
+      if (allowed.length > 0) return {};
+      return { finish: true, result: { approach: String(prose || '').trim() } };
+    },
+    onMaxTurns: ({ transcript }) => ({ approach: lastAssistantText(transcript) || '' }),
+  });
+}
+
+const EXPLORE_JUDGE_SYSTEM_PROMPT = `You are the JUDGE for an open-ended task, given several INDEPENDENT proposed approaches. Compare them on fit, simplicity, risk, and how well they solve the task, then produce the BEST plan — pick one outright OR synthesize the strongest elements of several. Emit exactly:
+   <approach>the chosen/synthesized approach as a refined, self-contained brief to execute, with a one-line note on why it wins</approach>
+You MAY read the repo READ-ONLY to judge; do NOT change anything.`;
+
+/** Judge: brief + proposals[] → { brief: chosen/synthesized approach }. Falls back to the original brief. */
+async function runExploreJudge({ adapter, model, signal, onLog, brief, proposals = [], projectDir = null, repoRoots = [], onTokens }) {
+  const list = (Array.isArray(proposals) ? proposals : []).map((p, i) => `Approach ${i + 1}:\n${(p && p.approach) || String(p || '')}`).join('\n\n---\n\n');
+  return runReadonlyPass({
+    adapter, model, signal, onLog, label: 'explore-judge', systemPrompt: EXPLORE_JUDGE_SYSTEM_PROMPT, priming: [],
+    seedMessages: [{ role: 'user', content: `Task:\n${String(brief || '')}\n\nProposed approaches:\n\n${list}` }],
+    allowedVerbs: REVIEWER_TOOL_VERBS, maxTurns: REVIEWER_MAX_TURNS,
+    resolvePath: makeRepoResolver(projectDir, repoRoots), cwd: projectDir, suppressTags: ['approach'],
+    onTokens: onTokens ? (t) => onTokens(t) : undefined,
+    interpret: ({ prose, allowed }) => {
+      const a = parseApproach(prose);
+      if (a) return { finish: true, result: { brief: a } };
+      if (allowed.length > 0) return {};
+      return { finish: true, result: { brief: String(prose || '').trim() || String(brief || '') } };
+    },
+    onMaxTurns: () => ({ brief: String(brief || '') }),
+  });
+}
+
+const SYNTHESIZE_SYSTEM_PROMPT = `You are the SYNTHESIZE step. You are given a task and the results of the steps it was split into. Produce ONE coherent summary: what was accomplished overall, anything that did not complete, and the net outcome — concise and useful to the person who asked. Plain prose, no tags.`;
+
+/** SYNTHESIZE: fold step results into one. Falls back to concatenated step content. */
+async function runSynthesize({ adapter, model, signal, onLog, brief, stepResults = [], onTokens }) {
+  const summary = (Array.isArray(stepResults) ? stepResults : []).map((s, i) => `Step ${s.id || i + 1}: ${s.stopped ? '(stopped — budget exhausted)' : String((s && s.content) || '').slice(0, 600)}`).join('\n\n');
+  return runReadonlyPass({
+    adapter, model, signal, onLog, label: 'synthesize',
+    systemPrompt: SYNTHESIZE_SYSTEM_PROMPT, priming: [],
+    seedMessages: [{ role: 'user', content: `Task:\n${String(brief || '')}\n\nStep results:\n${summary}` }],
+    allowedVerbs: new Set(), maxTurns: 1,
+    onTokens: onTokens ? (t) => onTokens(t) : undefined,
+    interpret: ({ prose }) => ({ finish: true, result: { content: String(prose || '').trim() } }),
+    onMaxTurns: ({ transcript }) => ({ content: lastAssistantText(transcript) || summary }),
+  });
 }
 
 // ── Conversational intake (requirement capture) ─────────────────────────────
@@ -5011,7 +6138,7 @@ async function runAcceptance({ adapter, model, assignment, tasks = [], signal, o
 const INTAKE_TOOL_VERBS = REVIEWER_TOOL_VERBS;   // identical read-only allowlist
 const INTAKE_MAX_TURNS = 8;
 
-const INTAKE_SYSTEM_PROMPT = `You are an intake manager for a software-maintenance team. A developer pastes you raw material — emails, tickets, specs, notes — describing work they need done. Your job is to turn it into ONE clear, frozen REQUIREMENT that a coding agent and an acceptance checker can both act on. You do NOT do the work yourself and you MUST NOT modify anything.
+const INTAKE_SYSTEM_PROMPT = `You are an intake manager for a software-maintenance team. A developer DESCRIBES a piece of work they need done — in their own words — and MAY also paste raw material (an email, ticket, spec, or notes); treat anything pasted as supporting context, not a requirement. Your job is to turn what they tell you into ONE clear, frozen REQUIREMENT that a coding agent and an acceptance checker can both act on, GROUNDED in the actual project: when the developer references the code, a file, or a folder, READ it (read-only, via the tools below) instead of assuming. You do NOT do the work yourself and you MUST NOT modify anything.
 
 The developer's PROJECT is open and available to you READ-ONLY (same tools as a reviewer; emit calls inside a <remote-workspace> block):
   <read path="FILE"/>  <list path="DIR"/>  <search pattern="REGEX" path="DIR"/>  <find pattern="GLOB"/>  <info path="FILE"/>
@@ -5100,82 +6227,65 @@ function parseRequirementCard(prose) {
  *   { complete:false, reason:'awaiting-user', assistantText }  — a clarifying turn; user replies next
  *   { complete:false, reason:'max-turns' }                     — ran out of turns with no card
  */
-async function runIntake({ adapter, model, messages = [], signal, onLog, onTurn, onDiag, repoRoots = [], projectDir = null }) {
+async function runIntake({ adapter, model, messages = [], signal, onLog, onTurn, onDiag, repoRoots = [], projectDir = null, contextNote = '' }) {
   const log = (m) => { try { onLog?.(m); } catch {} };
   // Awaited so a callback that persists state (e.g. addSource) completes before
   // the next turn — prevents floating promises AND torn concurrent writes.
   const emit = async (ev) => { try { await onTurn?.(ev); } catch {} };
   // Resolve a relative tool path against the active PROJECT first — CWD-INDEPENDENT
   // so the planning agent always sees the developer's files (e.g. a specs/ folder),
-  // not whatever process.cwd() happens to be. Falls back to cwd, then git repo
+  // not whatever process.cwd() happens to be. Falls back to the changed git repo
   // roots; an unmatched relative path still targets the project (so it lists/reads
   // the project root, never an unrelated dir — the "workspace is empty" bug).
-  const resolveAgainstRepos = (p) => {
+  const resolveProjectPath = (p) => {
     if (typeof p !== 'string' || !p || path.isAbsolute(p)) return p;
     try { if (projectDir && existsSync(path.join(projectDir, p))) return path.join(projectDir, p); } catch {}
-    try { if (existsSync(path.join(process.cwd(), p))) return p; } catch {}
     for (const root of repoRoots) { try { if (existsSync(path.join(root, p))) return path.join(root, p); } catch {} }
     return projectDir ? path.join(projectDir, p) : p;
   };
-  const convo = [{ role: 'system', content: INTAKE_SYSTEM_PROMPT }, ...INTAKE_PRIMING, ...(Array.isArray(messages) ? messages : [])];
-  let cumTokens = 0;   // running token total across this exchange's turns (for the UI spinner)
-
-  for (let turn = 1; turn <= INTAKE_MAX_TURNS; turn++) {
-    if (signal?.aborted) { const e = new Error('aborted'); e.name = 'AbortError'; throw e; }
-    const t0 = Date.now();
-    const response = await adapter.complete({ model, messages: convo, signal });
-    const text = response?.choices?.[0]?.message?.content ?? '';
-    const u = response?.usage || {};
-    cumTokens += (u.total_tokens || ((u.prompt_tokens || 0) + (u.completion_tokens || 0)) || 0);
-    await emit({ kind: 'tokens', total: cumTokens });
-    log(`intake turn ${turn}: ${text.length} chars in ${Date.now() - t0}ms`);
-
-    const calls = parseToolCalls(text);
-    const allowed = calls.filter((c) => INTAKE_TOOL_VERBS.has(c.verb));
-    const blocked = calls.filter((c) => !INTAKE_TOOL_VERBS.has(c.verb));
-    const prose = text.replace(/<remote-workspace\b[^>]*>[\s\S]*?<\/remote-workspace>/gi, '').trim();
-
-    // A requirement-card WINS even if the model also grounded with read-only
-    // tools in the SAME reply (it commits to the card; the card is editable).
-    // Without this, a card emitted alongside e.g. <list/> is silently dropped
-    // and intake dead-ends — the model then claims it "already emitted the card"
-    // while nothing was captured.
-    const card = parseRequirementCard(prose);
-    if (card) { await emit({ kind: 'card', card, prose }); return { complete: true, card, prose, transcript: convo }; }
-
-    if (allowed.length === 0) {
-      // No tools and no card -> a clarifying/manager turn; return control to the user.
-      await emit({ kind: 'message', content: prose });
-      return { complete: false, reason: 'awaiting-user', assistantText: prose, transcript: convo };
-    }
-
-    const results = [];
-    for (const c of allowed) {
-      const shellBlock = c.verb === 'powershell' ? screenReadOnlyShell(c.args?.command) : null;
-      if (shellBlock) { results.push({ verb: c.verb, status: 'error', content: shellBlock }); continue; }
-      try {
-        if (c.args && typeof c.args.path === 'string') c.args.path = resolveAgainstRepos(c.args.path);
-        const raw = await execute(c.name, c.args, {}, { signal });
-        const content = (typeof raw === 'string' && raw.startsWith('ERROR:')) ? raw : extractContent(raw);
-        const status = (typeof raw === 'string' && raw.startsWith('ERROR:')) ? 'error' : 'ok';
-        results.push({ verb: c.verb, status, content });
-        log(`intake turn ${turn}: ${c.verb}(${JSON.stringify(c.args).slice(0, 80)}) -> ${status} ${content.length}b`);
-      } catch (e) {
-        results.push({ verb: c.verb, status: 'error', content: 'ERROR: ' + (e?.message ?? String(e)) });
+  // Per-request CONTEXT (current field values, recent activity) is folded into the
+  // system prompt — NOT prepended as a separate user message (which would put two
+  // user turns in a row). The system prompt itself rides the latest user message
+  // via assembleConvo (so genai.mil/Gemini actually sees it).
+  const systemPrompt = contextNote ? `${INTAKE_SYSTEM_PROMPT}\n\n${contextNote}` : INTAKE_SYSTEM_PROMPT;
+  return runReadonlyPass({
+    adapter, model, signal, onLog, label: 'intake',
+    systemPrompt, priming: INTAKE_PRIMING,
+    seedMessages: Array.isArray(messages) ? messages : [],
+    allowedVerbs: INTAKE_TOOL_VERBS, maxTurns: INTAKE_MAX_TURNS,
+    resolvePath: resolveProjectPath,
+    cwd: projectDir,   // path-less tools resolve against the project, not process.cwd()
+    suppressTags: ['requirement-card'],   // the card is parsed into the form, not shown as streamed prose
+    onTokens: (total) => emit({ kind: 'tokens', total }),
+    onTools: ({ calls, results }) => emit({ kind: 'tools', calls, results }),
+    // Live prose streaming (the streaming transport renders these as a
+    // streaming bubble; the legacy transport ignores them + uses {kind:'message'}).
+    onProse: ({ turn, segmentIndex, content }) => emit({ kind: 'prose-chunk', turn, segmentIndex, content }),
+    onProseEnd: ({ turn, segmentIndex, content }) => {
+      const cleaned = content.replace(/<requirement-card>[\s\S]*?<\/requirement-card>/i, '').trim();
+      if (cleaned) emit({ kind: 'prose-end', turn, segmentIndex, content: cleaned });
+    },
+    interpret: async ({ prose, allowed, transcript }) => {
+      // A requirement-card WINS even if the model also grounded with read-only
+      // tools in the SAME reply (it commits to the card; the card is editable).
+      // Without this, a card emitted alongside e.g. <list/> is silently dropped
+      // and intake dead-ends — the model then claims it "already emitted the card".
+      const card = parseRequirementCard(prose);
+      if (card) { await emit({ kind: 'card', card, prose }); return { finish: true, result: { complete: true, card, prose, transcript } }; }
+      if (allowed.length === 0) {
+        // No tools and no card -> a clarifying/manager turn; return control to the user.
+        await emit({ kind: 'message', content: prose });
+        return { finish: true, result: { complete: false, reason: 'awaiting-user', assistantText: prose, transcript } };
       }
-    }
-    if (blocked.length > 0) {
-      results.push({ verb: 'system', status: 'error', content: `Intake is read-only — dropped ${blocked.length} call(s): ${blocked.map((c) => c.verb).join(', ')}.` });
-    }
-    await emit({ kind: 'tools', calls: allowed, results });
-    convo.push({ role: 'assistant', content: text });
-    convo.push({ role: 'user', content: formatToolResults(results) });
-  }
-
-  log(`intake: hit max turns (${INTAKE_MAX_TURNS}) without a card.`);
-  emitDiag(onDiag, 'intake', `hit ${INTAKE_MAX_TURNS}-turn budget without a <requirement-card>`, lastAssistantText(convo));
-  await emit({ kind: 'message', content: 'I could not fully structure this within my turn budget. Please edit the card fields directly and capture.' });
-  return { complete: false, reason: 'max-turns', transcript: convo };
+      return {};   // run the read-only tools, loop
+    },
+    onMaxTurns: async ({ transcript }) => {
+      log(`intake: hit max turns (${INTAKE_MAX_TURNS}) without a card.`);
+      emitDiag(onDiag, 'intake', `hit ${INTAKE_MAX_TURNS}-turn budget without a <requirement-card>`, lastAssistantText(transcript));
+      await emit({ kind: 'message', content: 'I could not fully structure this within my turn budget. Please edit the card fields directly and capture.' });
+      return { complete: false, reason: 'max-turns', transcript };
+    },
+  });
 }
 
 // ── Memory consolidation (post-acceptance fact extraction) ──────────────────
@@ -5224,66 +6334,32 @@ function parseFacts(prose) {
  *   existingMemory: rendered current memory (so it won't restate facts)
  * Returns { facts: [{ category, note }] }. Fails safe to { facts: [] }.
  */
-async function runConsolidation({ adapter, model, assignment, tasks = [], existingMemory = '', signal, onLog, onDiag, repoRoots = [] }) {
+async function runConsolidation({ adapter, model, assignment, tasks = [], existingMemory = '', signal, onLog, onDiag, repoRoots = [], projectDir = null }) {
   const log = (m) => { try { onLog?.(m); } catch {} };
-  const resolveAgainstRepos = (p) => {
-    if (typeof p !== 'string' || !p || path.isAbsolute(p)) return p;
-    try { if (existsSync(path.join(process.cwd(), p))) return p; } catch {}
-    for (const root of repoRoots) { try { if (existsSync(path.join(root, p))) return path.join(root, p); } catch {} }
-    return p;
-  };
   const parts = ['<assignment-requirement>', clip(String(assignment?.requirement || '(none)'), 2000), '</assignment-requirement>'];
   if (existingMemory) parts.push('<existing-memory note="do NOT restate any of these">', clip(String(existingMemory), 6000), '</existing-memory>');
   parts.push('<work note="what was just completed and accepted">', buildBudgetedReviewInput(tasks || [], { budgetChars: 20000 }), '</work>');
-  const messages = [
-    { role: 'system', content: CONSOLIDATION_SYSTEM_PROMPT },
-    { role: 'user', content: parts.join('\n') },
-  ];
-
-  for (let turn = 1; turn <= REVIEWER_MAX_TURNS; turn++) {
-    if (signal?.aborted) { const e = new Error('aborted'); e.name = 'AbortError'; throw e; }
-    const t0 = Date.now();
-    const response = await adapter.complete({ model, messages, signal });
-    const text = response?.choices?.[0]?.message?.content ?? '';
-    log(`consolidation turn ${turn}: ${text.length} chars in ${Date.now() - t0}ms`);
-
-    const calls = parseToolCalls(text);
-    const allowed = calls.filter((c) => REVIEWER_TOOL_VERBS.has(c.verb));
-    const blocked = calls.filter((c) => !REVIEWER_TOOL_VERBS.has(c.verb));
-
-    if (allowed.length === 0) {
-      const prose = text.replace(/<remote-workspace\b[^>]*>[\s\S]*?<\/remote-workspace>/gi, '');
+  return runReadonlyPass({
+    adapter, model, signal, onLog, label: 'consolidation',
+    systemPrompt: CONSOLIDATION_SYSTEM_PROMPT,
+    seedMessages: [{ role: 'user', content: parts.join('\n') }],
+    allowedVerbs: REVIEWER_TOOL_VERBS, maxTurns: REVIEWER_MAX_TURNS,
+    resolvePath: makeRepoResolver(projectDir, repoRoots),
+    cwd: projectDir,
+    interpret: ({ prose, allowed }) => {
+      if (allowed.length > 0) return {};   // run tools, loop
       const facts = parseFacts(prose);
-      if (facts) return { facts };
+      if (facts) return { finish: true, result: { facts } };
       log('consolidation: no facts block — recording nothing');
       emitDiag(onDiag, 'consolidation', 'no <facts> block emitted — recorded nothing', prose);
+      return { finish: true, result: { facts: [] } };
+    },
+    onMaxTurns: ({ transcript }) => {
+      log('consolidation: hit max turns without a facts block — recording nothing.');
+      emitDiag(onDiag, 'consolidation', `hit ${REVIEWER_MAX_TURNS}-turn budget without a <facts> block`, lastAssistantText(transcript));
       return { facts: [] };
-    }
-
-    const results = [];
-    for (const c of allowed) {
-      const shellBlock = c.verb === 'powershell' ? screenReadOnlyShell(c.args?.command) : null;
-      if (shellBlock) { results.push({ verb: c.verb, status: 'error', content: shellBlock }); continue; }
-      try {
-        if (c.args && typeof c.args.path === 'string') c.args.path = resolveAgainstRepos(c.args.path);
-        const raw = await execute(c.name, c.args, {}, { signal });
-        const content = (typeof raw === 'string' && raw.startsWith('ERROR:')) ? raw : extractContent(raw);
-        const status = (typeof raw === 'string' && raw.startsWith('ERROR:')) ? 'error' : 'ok';
-        results.push({ verb: c.verb, status, content });
-      } catch (e) {
-        results.push({ verb: c.verb, status: 'error', content: 'ERROR: ' + (e?.message ?? String(e)) });
-      }
-    }
-    if (blocked.length > 0) {
-      results.push({ verb: 'system', status: 'error', content: `Consolidation is read-only — dropped ${blocked.length} call(s): ${blocked.map((c) => c.verb).join(', ')}.` });
-    }
-    messages.push({ role: 'assistant', content: text });
-    messages.push({ role: 'user', content: formatToolResults(results) });
-  }
-
-  log('consolidation: hit max turns without a facts block — recording nothing.');
-  emitDiag(onDiag, 'consolidation', `hit ${REVIEWER_MAX_TURNS}-turn budget without a <facts> block`, lastAssistantText(messages));
-  return { facts: [] };
+    },
+  });
 }
 
 // ── Task summary backfill (when the agent closed a task with a blank summary) ─
@@ -5301,10 +6377,11 @@ async function runSummarizer({ adapter, model, task, signal, onLog }) {
       buildBudgetedReviewInput(task ? [task] : [], { budgetChars: 12000 }),
       '</task>',
     ].filter(Boolean).join('\n');
-    const messages = [
-      { role: 'system', content: SUMMARIZER_SYSTEM_PROMPT },
-      { role: 'user', content: `Summarize what this task accomplished, in one sentence (two at most):\n${input}` },
-    ];
+    // Gemini-safe assembly (system reminder rides a user message) — see engine.mjs.
+    const messages = assembleConvo({
+      systemPrompt: SUMMARIZER_SYSTEM_PROMPT,
+      messages: [{ role: 'user', content: `Summarize what this task accomplished, in one sentence (two at most):\n${input}` }],
+    });
     const t0 = Date.now();
     const response = await adapter.complete({ model, messages, signal });
     const text = response?.choices?.[0]?.message?.content ?? '';
@@ -5356,6 +6433,994 @@ function buildReviewTrajectory(events) {
 function clip(s, n) {
   if (typeof s !== 'string') return String(s ?? '');
   return s.length > n ? s.slice(0, n) + ' … [truncated]' : s;
+}
+
+// ====== agent/cognition-scheduler.mjs ======
+/**
+ * The adaptive-cognition SCHEDULER — the recursive loop that ties the pure core (cognition.mjs)
+ * to the actual thinking. It is DEPENDENCY-INJECTED: all the "real" work is supplied as
+ * `primitives` (assess / explore / decompose / runWorker / verify / synthesize), so the
+ * orchestration logic — layer composition, recursion, DAG step deps, budget-gated termination —
+ * is fully testable with mocks before any LLM or sub-agent is wired in (that's the next step).
+ *
+ * THE LOOP:  assess → (answer | evaluate) → policy picks composable layers →
+ *            explore (refine approach) → decompose (split into a DAG) → execute steps
+ *            (each step is RE-ASSESSED → recursion) → single|debug worker → verify (+ re-run).
+ * ALL of it shares ONE controller; the salience×budget rule guarantees the whole tree ends.
+ *
+ * Budget gating is done at a single ADMISSION point (`admit`): shouldContinue + charge the
+ * per-node ε floor, SEQUENTIALLY (even before a parallel step batch) so concurrent siblings
+ * see each other's reservation — that bounds parallel overshoot and bounds the node count to
+ * ~ceiling/ε, which is the structural termination guarantee.
+ *
+ * primitives (each async, returns its payload + a `cost` in work-units):
+ *   assess(brief, ctx)      → { action:'answer', text, cost } | { action:'evaluate', metrics, salience, brief, cost }
+ *   explore(brief, ctx)     → { brief, cost }                  (N proposers → synthesized approach)
+ *   decompose(brief, ctx)   → { steps:[{id, brief, salience?, after?:[id]}], cost }
+ *   runWorker(brief, ctx)   → { content, cost }                (a worker sub-agent)
+ *   verify(brief, res, ctx) → { ok, feedback?, cost }          (acceptance / adversarial verifiers)
+ *   synthesize(brief, results, ctx) → { content, cost }        (OPTIONAL: fold step results into one)
+ */
+
+// Single admission gate: the ONLY place that decides "may this node run?" + reserves its ε.
+function admit(controller, salience, emit, depth) {
+  if (!controller.shouldContinue(salience)) { emit({ type: 'stopped', depth, reason: 'budget', salience, ...controller.state() }); return false; }
+  controller.enterNode();   // reserve the per-node floor NOW (sequential → siblings see it)
+  return true;
+}
+
+async function runCognition({ request, primitives, k = 0.8, budgetOpts = {}, controller = null, maxRerun = 1, inlineSingle = false, allowDecompose = true, onEvent = () => {}, signal } = {}) {
+  const emit = (ev) => { try { onEvent(ev); } catch {} };
+  const p = primitives;
+
+  const a0 = await p.assess(request, { depth: 0, signal });
+  if (a0.action === 'answer') { emit({ type: 'answer', depth: 0, text: a0.text }); return { answer: a0.text, controller: null }; }
+
+  // ROUTING (inlineSingle): the multi-agent machinery (worktree sub-agents, decompose) only
+  // earns its overhead for GENUINELY decomposable work. A single coherent task — however
+  // "complex" — is handled better + cheaper by the plain inline worker (the strong baseline),
+  // so signal the caller to run it inline rather than spawning sub-agents that lose coherence
+  // or invent scope. With decomposition DISABLED (allowDecompose=false, the default in prod),
+  // EVERYTHING non-answer routes inline → the plain worker, no fan-out ever.
+  if (inlineSingle && (!allowDecompose || !selectCognitionLayers(a0.metrics).layers.includes('decompose'))) {
+    emit({ type: 'inline', complexity: a0.metrics.complexity, metrics: a0.metrics });
+    return { inline: true, evaluation: a0 };
+  }
+
+  const ctrl = controller || createCognitionController({ budget: cognitionBudget(a0.metrics.complexity, budgetOpts), k });
+  ctrl.chargeOverhead(a0.cost || 0);
+  emit({ type: 'budget', complexity: a0.metrics.complexity, ...ctrl.state() });
+
+  const ctx = { controller: ctrl, depth: 0, p, emit, signal, maxRerun, allowDecompose };
+  if (!admit(ctrl, a0.salience, emit, 0)) return { result: { stopped: true }, controller: ctrl, state: ctrl.state() };
+  const result = await executeNode(a0, ctx);
+  emit({ type: 'done', ...ctrl.state() });
+  return { result, controller: ctrl, state: ctrl.state() };
+}
+
+// Re-assess an arbitrary brief, then execute it — THE recursion point (a decompose step that
+// turns out complex will itself decompose). The caller has ALREADY admitted this node.
+async function processBrief(brief, ctx) {
+  const { controller, depth, p, signal, emit } = ctx;
+  const a = await p.assess(brief, { depth, signal });
+  controller.chargeOverhead(a.cost || 0);
+  if (a.action === 'answer') { emit({ type: 'answer', depth, text: a.text }); return { content: a.text }; }
+  return executeNode(a, ctx);
+}
+
+// Execute an already-admitted evaluation node (no gating here — admission happened upstream).
+async function executeNode(evaluation, ctx) {
+  const { controller, depth, p, emit, signal, maxRerun, allowDecompose = true } = ctx;
+  const { layers, verify } = selectCognitionLayers(evaluation.metrics);
+  emit({ type: 'node', depth, metrics: evaluation.metrics, layers, verify, salience: evaluation.salience, ...controller.state() });
+  let brief = evaluation.brief;
+
+  // EXPLORE — refine the approach (N proposals → synthesis) before committing.
+  if (layers.includes('explore')) {
+    const ex = await p.explore(brief, { depth, signal });
+    controller.chargeWork(ex.cost || 0);
+    if (ex.brief) brief = ex.brief;
+    emit({ type: 'explore', depth, ...controller.state() });
+  }
+
+  let result;
+  if (allowDecompose && layers.includes('decompose')) {
+    // DECOMPOSE — split into a DAG of steps; each step is re-assessed (recursion) under the
+    // same controller; independent steps run in parallel, dependents wait for their deps.
+    const dec = await p.decompose(brief, { depth, signal });
+    controller.chargeWork(dec.cost || 0);
+    const steps = Array.isArray(dec.steps) ? dec.steps : [];
+    emit({ type: 'decompose', depth, steps: steps.map((s) => ({ id: s.id, after: s.after || [] })), ...controller.state() });
+    if (steps.length <= 1) {
+      // decompose found no genuine separation (0 or 1 step) → run ONE worker on the brief
+      // (do NOT synthesize over an empty/degenerate step set — that produced a meaningless
+      // "summary of nothing" and did no work). This is also the "1 task → top-level handles it"
+      // case: a cohesive task that slipped past the gate collapses back to a single worker.
+      const w = await p.runWorker((steps[0] && steps[0].brief) || brief, { depth, mode: 'single', signal });
+      controller.chargeWork(w.cost || 0);
+      emit({ type: 'worker', depth, mode: 'single', collapsed: true, ...controller.state() });
+      result = { content: w.content, mode: 'single', collapsed: true };
+    } else {
+      const stepResults = await runSteps(steps, { ...ctx, depth: depth + 1 });
+      result = p.synthesize
+        ? await (async () => { const sy = await p.synthesize(brief, stepResults, { depth, signal }); controller.chargeOverhead(sy.cost || 0); return { content: sy.content, steps: stepResults }; })()
+        : { steps: stepResults };
+    }
+  } else {
+    // EXECUTION — a single worker (or debug worker) actually does the work.
+    const mode = layers.includes('debug') ? 'debug' : 'single';
+    const w = await p.runWorker(brief, { depth, mode, signal });
+    controller.chargeWork(w.cost || 0);
+    result = { content: w.content, mode };
+    emit({ type: 'worker', depth, mode, ...controller.state() });
+  }
+
+  // VERIFY — wrap the execution with checks; bounded re-run on failure (wide, not deep).
+  if (verify) {
+    for (let reruns = 0; ; ) {
+      const v = await p.verify(brief, result, { depth, signal });
+      controller.chargeWork(v.cost || 0);
+      emit({ type: 'verify', depth, ok: !!v.ok, ...controller.state() });
+      if (v.ok || reruns >= maxRerun || !controller.shouldContinue(evaluation.salience)) break;
+      reruns += 1;
+      const w = await p.runWorker(`${brief}\n\nReviewer feedback: ${v.feedback || ''}`, { depth, mode: 'single', signal });
+      controller.chargeWork(w.cost || 0);
+      result = { content: w.content, rerun: reruns };
+      emit({ type: 'rerun', depth, round: reruns, ...controller.state() });
+    }
+  }
+  return result;
+}
+
+// DAG executor: admit every ready step SEQUENTIALLY (so the budget can't be blown by a wide
+// parallel wave), then execute the admitted ones in parallel. A cycle / unmet dep can't
+// deadlock — if nothing is structurally ready, the remaining steps become ready.
+async function runSteps(steps, ctx) {
+  const { controller, emit, depth } = ctx;
+  const byId = new Map(steps.map((s) => [s.id, s]));
+  const done = new Map();
+  const pending = new Set(steps.map((s) => s.id));
+  while (pending.size) {
+    let ready = [...pending].filter((id) => (byId.get(id).after || []).every((d) => done.has(d) || !byId.has(d)));
+    if (!ready.length) ready = [...pending];
+    const admitted = [];
+    for (const id of ready) {                 // SEQUENTIAL admission (reserve ε each, in order)
+      const s = byId.get(id);
+      if (admit(controller, s.salience != null ? s.salience : 0.7, emit, depth)) admitted.push(id);
+      else { done.set(id, { stopped: true }); pending.delete(id); }
+    }
+    if (!admitted.length) { for (const id of pending) done.set(id, { stopped: true }); break; }
+    const batch = await Promise.all(admitted.map(async (id) => [id, await processBrief(byId.get(id).brief, ctx)]));
+    for (const [id, r] of batch) { done.set(id, r); pending.delete(id); }
+  }
+  return steps.map((s) => ({ id: s.id, ...(done.get(s.id) || {}) }));
+}
+
+// ====== agent/git-workflow.mjs ======
+/**
+ * Git workflow helpers — used by server.mjs to:
+ *   - Detect whether the active project is a git repo.
+ *   - Branch automatically onto CODE_BOSS_<timestamp> when first opening
+ *     so the agent's changes never land directly on the user's working
+ *     branch.
+ *   - Auto-commit at the end of each task (next-task) with the task's
+ *     summary as the commit message.
+ *   - Check `git status --porcelain` before running the reviewer so we
+ *     skip the LLM call when nothing actually changed (Q&A turns, pure
+ *     read flows).
+ *
+ * The shape: each call returns a result object you can pass directly to
+ * a tool-call/tool-result chat event pair, so the git operations are
+ * visible in the chat history just like any other tool the agent runs.
+ *
+ *   { command: 'git ...', exitCode, stdout, stderr, durationMs }
+ *
+ * The caller decides whether to emit a chat event; this module just
+ * runs commands.
+ */
+
+const GIT_DEFAULT_TIMEOUT_MS = 30000;
+
+/** Run a single `git <args>` invocation. Resolves with the result object. */
+function runGit(cwd, args, { timeoutMs = GIT_DEFAULT_TIMEOUT_MS, input } = {}) {
+  return new Promise((resolve) => {
+    const t0 = Date.now();
+    let stdout = '', stderr = '', timedOut = false, settled = false;
+    const child = spawn('git', args, { cwd, windowsHide: true, env: process.env });
+    const tid = setTimeout(() => {
+      timedOut = true;
+      try { child.kill(); } catch {}
+    }, timeoutMs);
+    child.stdout.on('data', (d) => { stdout += d.toString('utf8'); });
+    child.stderr.on('data', (d) => { stderr += d.toString('utf8'); });
+    if (input != null) {
+      try { child.stdin.write(input); child.stdin.end(); } catch {}
+    }
+    const settle = (code, signal) => {
+      if (settled) return; settled = true;
+      clearTimeout(tid);
+      resolve({
+        command: 'git ' + args.join(' '),
+        cwd,
+        exitCode: timedOut ? null : (code ?? null),
+        signal: signal ?? null,
+        timedOut,
+        stdout,
+        stderr,
+        durationMs: Date.now() - t0,
+      });
+    };
+    child.on('close', settle);
+    child.on('error', (e) => { stderr += '\n' + e.message; settle(-1, null); });
+  });
+}
+
+/** True if `dir/.git` exists (file or directory — git worktrees use a file). */
+async function isGitRepo(dir) {
+  if (!dir) return false;
+  try {
+    await stat(path.join(dir, '.git'));
+    return true;
+  } catch { return false; }
+}
+
+// Directories we never recurse into when looking for nested git repos.
+// Same list the AGENTS.md scanner uses, plus the obvious build outputs
+// where a vendored dependency might keep its own .git as a footgun.
+const GIT_SCAN_SKIP_DIRS = new Set([
+  '.git', '.hg', '.svn', '.code_boss', '.agent',
+  '.vs', '.idea', '.vscode',
+  'node_modules', 'bower_components',
+  'target', 'dist', 'build', 'out', 'bin', 'obj',
+  '__pycache__', '.gradle', '.mvn',
+]);
+
+/**
+ * Walk `rootDir` looking for git repositories. Returns an array of
+ * absolute repo paths. The root itself counts if it has a `.git`.
+ * Otherwise we descend until we hit one (recurses no deeper into a
+ * directory tree that contains its own `.git`).
+ *
+ * Bounded so a generated tree can't stall project open:
+ *   - max depth 5 below rootDir
+ *   - max 30 repos returned
+ */
+async function discoverGitRepos(rootDir, { maxDepth = 5, maxRepos = 30 } = {}) {
+  if (!rootDir) return [];
+  const { readdir } = await import('node:fs/promises');
+  const found = [];
+  async function walk(dir, depth) {
+    if (depth > maxDepth) return;
+    if (found.length >= maxRepos) return;
+    if (await isGitRepo(dir)) {
+      found.push(dir);
+      return;             // don't descend into a repo's subdirs for more repos
+    }
+    let entries;
+    try { entries = await readdir(dir, { withFileTypes: true }); }
+    catch { return; }
+    for (const e of entries) {
+      if (!e.isDirectory()) continue;
+      if (e.name.startsWith('.')) continue;
+      if (GIT_SCAN_SKIP_DIRS.has(e.name)) continue;
+      await walk(path.join(dir, e.name), depth + 1);
+      if (found.length >= maxRepos) return;
+    }
+  }
+  await walk(rootDir, 0);
+  return found;
+}
+
+/**
+ * Walk up from `filepath` looking for the containing git repo's root.
+ * Returns the repo's absolute path or null if no .git was found before
+ * reaching the filesystem root.
+ */
+async function findContainingRepo(filepath) {
+  if (!filepath) return null;
+  let dir = path.dirname(path.resolve(filepath));
+  while (true) {
+    if (await isGitRepo(dir)) return dir;
+    const parent = path.dirname(dir);
+    if (parent === dir) return null;   // hit fs root
+    dir = parent;
+  }
+}
+
+/**
+ * Append a pattern to .git/info/exclude (git's local-only ignore file —
+ * unlike .gitignore, this never gets committed). Used to make code_boss
+ * internal state (.code_boss/, conversation.json, etc.) invisible to git
+ * status without modifying the user's project files.
+ *
+ * No-op if the pattern is already there.
+ */
+async function ensureExcluded(dir, ...patterns) {
+  // Resolve the REAL info/exclude path. In a git worktree, <dir>/.git is a
+  // FILE ('gitdir: …'), not a directory, so hardcoding <dir>/.git/info/exclude
+  // throws and .code_boss/ is never excluded → it shows up dirty and gets
+  // swept into the user's commit by `git add -A`. `rev-parse --git-path`
+  // returns the correct location for both normal repos and worktrees.
+  let file;
+  const r = await runGit(dir, ['rev-parse', '--git-path', 'info/exclude']);
+  if (r.exitCode === 0 && r.stdout.trim()) {
+    file = r.stdout.trim();
+    if (!path.isAbsolute(file)) file = path.resolve(dir, file);
+  } else {
+    file = path.join(dir, '.git', 'info', 'exclude'); // best-effort fallback
+  }
+  let { readFile, writeFile, mkdir } = await import('node:fs/promises');
+  let existing = '';
+  try { existing = await readFile(file, 'utf8'); }
+  catch { /* file doesn't exist yet; will create */ }
+  const have = new Set(existing.split('\n').map((s) => s.trim()).filter(Boolean));
+  const toAdd = patterns.filter((p) => !have.has(p));
+  if (toAdd.length === 0) return false;
+  try { await mkdir(path.dirname(file), { recursive: true }); } catch {}
+  const next = (existing.endsWith('\n') || existing === '') ? existing : existing + '\n';
+  await writeFile(file, next + toAdd.join('\n') + '\n', 'utf8');
+  return true;
+}
+
+/** Get current branch name (or null if genuinely detached / non-git / error). */
+async function getCurrentBranch(dir) {
+  const r = await runGit(dir, ['rev-parse', '--abbrev-ref', 'HEAD']);
+  const name = r.exitCode === 0 ? r.stdout.trim() : '';
+  if (name && name !== 'HEAD') return name;
+  // `HEAD` (or exit!=0) can mean genuine detached HEAD, but ALSO an
+  // interrupted rebase or an unborn branch — where we ARE conceptually on a
+  // branch. Misreporting null there makes isCodeBossBranch(null) false, so a
+  // CODE_BOSS branch mid-rebase wrongly triggers the branch-needed pause and
+  // the auto-commit silently skips. Recover the branch from the rebase state
+  // or symbolic-ref before giving up.
+  // (a) Mid-rebase: git stores the original branch name here.
+  for (const p of ['rebase-merge/head-name', 'rebase-apply/head-name']) {
+    const hn = await runGit(dir, ['rev-parse', '--git-path', p]);
+    if (hn.exitCode === 0 && hn.stdout.trim()) {
+      try {
+        const { readFile } = await import('node:fs/promises');
+        let f = hn.stdout.trim();
+        if (!path.isAbsolute(f)) f = path.resolve(dir, f);
+        const ref = (await readFile(f, 'utf8')).trim();           // e.g. refs/heads/CODE_BOSS_x
+        const m = ref.match(/^refs\/heads\/(.+)$/);
+        if (m) return m[1];
+      } catch { /* fall through */ }
+    }
+  }
+  // (b) Unborn branch (fresh repo, no commits): symbolic-ref still knows it.
+  const sym = await runGit(dir, ['symbolic-ref', '--short', '-q', 'HEAD']);
+  if (sym.exitCode === 0 && sym.stdout.trim()) return sym.stdout.trim();
+  return null;
+}
+
+/** Return short HEAD hash, or null if anything goes wrong. */
+async function getHeadHash(dir) {
+  const r = await runGit(dir, ['rev-parse', '--short', 'HEAD']);
+  if (r.exitCode !== 0) return null;
+  const h = r.stdout.trim();
+  return h || null;
+}
+
+/**
+ * Read the porcelain status. Returns:
+ *   { dirty: bool, lines: [{ status, path }] }
+ * Empty `lines` ⇒ working tree clean. We use this both for the
+ * project-open dirty-check AND for the reviewer-skip check.
+ */
+async function getStatus(dir) {
+  // -z: NUL-terminated records with NO path quoting/octal-escaping, so
+  // paths with spaces, backslashes, or non-ASCII (the production norm on
+  // Windows) come through verbatim. core.quotePath=false belt-and-suspenders.
+  const r = await runGit(dir, ['-c', 'core.quotePath=false', 'status', '--porcelain', '-z']);
+  if (r.exitCode !== 0) {
+    // CONTRACT: dirty===null means "status failed / unknown" — distinct from
+    // dirty===false ("confirmed clean"). Callers MUST NOT treat a failure as
+    // clean (which would silently skip auto-commit / the reviewer). A stale
+    // .git/index.lock during a long build is the common trigger.
+    return { dirty: null, failed: true, lines: [], error: r.stderr.trim() };
+  }
+  // Records are NUL-separated. A rename/copy entry (status starts with R or C)
+  // emits TWO NUL-separated fields: "<XY> <new>\0<old>\0". We surface the NEW
+  // path (the post-rename name) and consume the trailing old-name field.
+  const records = r.stdout.split('\0');
+  const lines = [];
+  for (let i = 0; i < records.length; i++) {
+    const rec = records[i];
+    if (!rec) continue;
+    const status = rec.slice(0, 2);
+    const p = rec.slice(3);
+    if (/^[RC]/.test(status)) {
+      // The very next NUL field is the old name; skip it.
+      i++;
+    }
+    lines.push({ status, path: p });
+  }
+  return { dirty: lines.length > 0, lines };
+}
+
+/**
+ * Create + checkout a new branch from HEAD. Fails (exitCode !== 0) if
+ * the branch already exists. Branch name is generated when not provided.
+ */
+async function createBranch(dir, name) {
+  const branch = name || generateBranchName();
+  const r = await runGit(dir, ['checkout', '-b', branch]);
+  return { ...r, branch };
+}
+
+/**
+ * CODE_BOSS_<YYYYMMDD-HHMMSS>-<rand>. Sortable + human-readable. The 4-char
+ * random suffix prevents collisions when two branches are created in the same
+ * wall-clock second (e.g. a multi-repo resolve batch, or rapid re-resolves) —
+ * without it the second `git checkout -b` fails 'branch already exists' and
+ * the protective-branch operation aborts.
+ */
+function generateBranchName() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  const ts = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+  const rand = Math.random().toString(36).slice(2, 6);
+  return `CODE_BOSS_${ts}-${rand}`;
+}
+
+/** True if a name matches the CODE_BOSS_<timestamp> pattern. */
+function isCodeBossBranch(name) {
+  return typeof name === 'string' && /^CODE_BOSS_/.test(name);
+}
+
+/**
+ * Stage everything then commit with the given message. If there's
+ * nothing to commit (working tree clean), returns `{ skipped: true }`
+ * instead of a failed commit. Otherwise resolves with the commit's
+ * short hash on success.
+ */
+async function commitAll(dir, message) {
+  const status = await getStatus(dir);
+  if (!status.dirty) return { skipped: true, reason: 'working tree clean' };
+  const add = await runGit(dir, ['add', '-A']);
+  if (add.exitCode !== 0) {
+    return { committed: false, error: 'git add failed: ' + (add.stderr.trim() || `exit ${add.exitCode}`), add };
+  }
+  // -F - reads message from stdin so multi-line + special chars round-trip cleanly.
+  const commit = await runGit(dir, ['commit', '-F', '-'], { input: message });
+  if (commit.exitCode !== 0) {
+    return { committed: false, error: 'git commit failed: ' + (commit.stderr.trim() || `exit ${commit.exitCode}`), add, commit };
+  }
+  const hash = await getHeadHash(dir);
+  return { committed: true, hash, add, commit };
+}
+
+/**
+ * Strip Markdown / report formatting from a summary down to a clean one-line
+ * commit subject. The worker's <next-task summary> sometimes pastes the
+ * reviewer's Markdown verdict ("### Final Verdict\n- ✅ looks good"), which
+ * makes for an ugly commit log. Take the first meaningful line, drop heading
+ * hashes, leading bullets/numbering, surrounding emphasis, and emoji.
+ */
+function sanitizeSummary(summary) {
+  const lines = String(summary || '').replace(/\r\n/g, '\n').split('\n');
+  for (let raw of lines) {
+    let s = raw
+      .replace(/^[#>\s]+/, '')              // heading hashes / blockquote markers / indent
+      .replace(/^[-*+•]\s+/, '')            // bullet markers
+      .replace(/^\d+[.)]\s+/, '')           // numbered list "1." / "1)"
+      .replace(/[*_`]+/g, '')               // emphasis / code ticks
+      // strip a leading emoji + optional separator (✅ 🚀 etc.)
+      .replace(/^[\u{1F000}-\u{1FFFF}\u{2190}-\u{27BF}\u{2B00}-\u{2BFF}️‍]+[\s:–—-]*/u, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    // Skip pure-formatting lines (e.g. a "---" rule or an empty heading).
+    if (s && !/^[-=_*\s]+$/.test(s)) return s;
+  }
+  return '';
+}
+
+/**
+ * Build a commit message from the next-task attributes. Subject is the
+ * summary (truncated to fit a normal git log column); body has the
+ * user-request that prompted the work.
+ */
+function buildCommitMessage({ summary, userRequest, assignmentId }) {
+  const tag = assignmentId ? `[${assignmentId}] ` : '';
+  // Prefer the agent's summary (sanitized of any pasted Markdown); if it's
+  // blank, fall back to the user-request (the one-line "what was wanted")
+  // before the generic 'task', so a task closed with an empty <next-task>
+  // summary doesn't produce a bare "task" commit.
+  const base = sanitizeSummary(summary) || String(userRequest || '').replace(/\s+/g, ' ').trim() || 'task';
+  const subject = (tag + base.replace(/\s+/g, ' ').trim()).slice(0, 72) || 'task';
+  const body = userRequest ? `\n\nUser request: ${String(userRequest).trim()}` : '';
+  const asg = assignmentId ? `\nAssignment: ${assignmentId}` : '';
+  return subject + body + asg + '\n\n[code_boss auto-commit]\n';
+}
+
+// ── Git worktrees — orchestrator sub-agent isolation (ORCHESTRATOR.md) ──────────
+// Each concurrent sub-agent runs in its OWN worktree (own dir + branch), so their writes
+// are physically isolated and a merge-back conflict IS the deny-on-stale signal.
+// Worktrees live OUTSIDE the project under the OS temp dir — NOT under the repo's
+// `.code_boss/` (that segment is tool-blocked as control state) and NOT inside the project
+// (so repo-discovery never mistakes them for sub-repos). Concurrent worktree/branch/merge
+// ops on ONE repo touch the shared .git/index.lock, so git plumbing is serialized per repo.
+const _repoGitLocks = new Map();   // repoDir -> tail Promise (per-repo git-op mutex)
+
+// A short, stable key for a repo path (so two repos with the same basename don't collide).
+function _repoKey(repoDir) {
+  let h = 2166136261; const s = path.resolve(repoDir);
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return (h >>> 0).toString(36);
+}
+
+/** Serialize git plumbing per repoRoot (worktrees isolate working dirs, NOT .git/index.lock). */
+function withRepoGitLock(repoDir, fn) {
+  const prev = _repoGitLocks.get(repoDir) || Promise.resolve();
+  const next = prev.then(fn, fn);                 // run regardless of the prior op's outcome
+  _repoGitLocks.set(repoDir, next.then(() => {}, () => {}));
+  return next;
+}
+
+function worktreePathFor(repoDir, id) {
+  return path.join(tmpdir(), 'cb-worktrees', `${path.basename(repoDir)}-${_repoKey(repoDir)}`, String(id));
+}
+
+/** Add a worktree at .code_boss/worktrees/<id> on a fresh branch off baseRef. */
+async function addWorktree(repoDir, id, baseRef = 'HEAD') {
+  return withRepoGitLock(repoDir, async () => {
+    const wtPath = worktreePathFor(repoDir, id);
+    await mkdir(path.dirname(wtPath), { recursive: true });
+    let branch = `cb-sub/${id}`;
+    let activePath = wtPath;
+    let r = await runGit(repoDir, ['worktree', 'add', '--quiet', activePath, '-b', branch, baseRef]);
+    if (r.exitCode !== 0 && /already (exists|used|checked out)|already exists/i.test(r.stderr)) {
+      // Crash residue: a stale branch AND/OR a leftover dir at wtPath (git's metadata was pruned but
+      // the directory survived — common after an EBUSY removal on Windows). A fresh branch alone
+      // can't recover if the PATH is what's blocking, so also prune dangling metadata and remove the
+      // residue dir — guarded to the cb-worktrees temp root so we can never delete anything else.
+      try { await runGit(repoDir, ['worktree', 'prune']); } catch {}
+      try {
+        if (activePath.includes(`${path.sep}cb-worktrees${path.sep}`) && existsSync(activePath)) {
+          await rm(activePath, { recursive: true, force: true });
+        }
+      } catch {}
+      branch = `cb-sub/${id}-${Math.random().toString(36).slice(2, 6)}`;
+      r = await runGit(repoDir, ['worktree', 'add', '--quiet', activePath, '-b', branch, baseRef]);
+      if (r.exitCode !== 0) {
+        // The path still won't take (e.g. a locked dir we couldn't remove). A BRAND-NEW path can
+        // never be blocked by the old residue, so the id is never a permanent dead-end.
+        activePath = `${wtPath}-${Math.random().toString(36).slice(2, 6)}`;
+        r = await runGit(repoDir, ['worktree', 'add', '--quiet', activePath, '-b', branch, baseRef]);
+      }
+    }
+    if (r.exitCode !== 0) return { ok: false, error: r.stderr.trim() || `worktree add exit ${r.exitCode}`, path: activePath };
+    const wtPathFinal = activePath;
+    // Exclude the sub-agent's own control store from the worktree so `git add -A` (commitAll)
+    // NEVER commits .code_boss onto the branch — otherwise it collides with the manager's
+    // .code_boss at integrate (an empty-files "merge failed", not a real content conflict).
+    try { await ensureExcluded(wtPathFinal, '.code_boss/'); } catch {}
+    return { ok: true, path: wtPathFinal, branch };
+  });
+}
+
+/** Force-remove a worktree (incl. untracked scratch) + prune; optionally delete its branch. */
+async function removeWorktree(repoDir, wtPath, { deleteBranch = null } = {}) {
+  return withRepoGitLock(repoDir, async () => {
+    const rm = await runGit(repoDir, ['worktree', 'remove', '--force', wtPath]);
+    await runGit(repoDir, ['worktree', 'prune']);
+    if (deleteBranch) await runGit(repoDir, ['branch', '-D', deleteBranch]);
+    return { ok: rm.exitCode === 0, removed: wtPath, stderr: rm.stderr };
+  });
+}
+
+/**
+ * List recoverable sub-agent leftovers (crash-resume, R6): every cb-sub/* branch, paired
+ * with its worktree dir if one still exists. After a crash these persist on disk (the work
+ * is durable on the branch), so on project open we can surface them to re-review or discard.
+ * Returns [{ id, branch, worktree|null, head|null }], newest-id first.
+ */
+async function listOrphanSubagents(repoDir) {
+  const wtByBranch = new Map();
+  for (const w of await listWorktrees(repoDir)) {
+    if (w.branch && /^cb-sub\//.test(w.branch)) wtByBranch.set(w.branch, w);
+  }
+  const br = await runGit(repoDir, ['for-each-ref', '--format=%(refname:short)', 'refs/heads/cb-sub/']);
+  const branches = br.exitCode === 0 ? br.stdout.split('\n').map((s) => s.trim()).filter(Boolean) : [];
+  return branches
+    .map((branch) => {
+      const w = wtByBranch.get(branch) || null;
+      return { id: branch.replace(/^cb-sub\//, ''), branch, worktree: w ? w.path : null, head: w ? w.head : null };
+    })
+    .sort((a, b) => (a.branch < b.branch ? 1 : -1));
+}
+
+/** Parse `git worktree list --porcelain` → [{ path, head, branch, detached }]. */
+async function listWorktrees(repoDir) {
+  const r = await runGit(repoDir, ['worktree', 'list', '--porcelain']);
+  if (r.exitCode !== 0) return [];
+  const trees = []; let cur = null;
+  for (const line of r.stdout.split('\n')) {
+    if (line.startsWith('worktree ')) { cur = { path: line.slice(9).trim() }; trees.push(cur); }
+    else if (cur && line.startsWith('HEAD ')) cur.head = line.slice(5).trim();
+    else if (cur && line.startsWith('branch ')) cur.branch = line.slice(7).trim().replace(/^refs\/heads\//, '');
+    else if (cur && line.trim() === 'detached') cur.detached = true;
+  }
+  return trees;
+}
+
+/**
+ * Merge a sub-agent `branch` back into the foreground branch in `repoDir`. The base may
+ * have advanced (the foreground commits inline), so a conflict is EXPECTED and is the
+ * deny-on-stale signal: capture the conflicted files, ABORT the merge (keep base clean),
+ * and return them so the manager re-grounds. NEVER auto-resolve; the branch+worktree
+ * persist for the re-ground. Returns { merged:true } | { merged:false, conflict:true, files }.
+ */
+async function integrate(repoDir, branch) {
+  return withRepoGitLock(repoDir, async () => {
+    const m = await runGit(repoDir, ['merge', '--no-ff', '--no-edit', branch]);
+    if (m.exitCode === 0) return { merged: true };
+    const u = await runGit(repoDir, ['diff', '--name-only', '--diff-filter=U']);
+    const files = u.stdout.split('\n').map((s) => s.trim()).filter(Boolean);
+    await runGit(repoDir, ['merge', '--abort']);   // restore base to clean; branch+worktree persist
+    return { merged: false, conflict: true, files };
+  });
+}
+
+// ====== agent/subagent-worktree.mjs ======
+// Worktree-wrapped sub-agent runner — the orchestrator's runWorker for git projects.
+//
+// Composes the git-worktree substrate (git-workflow.mjs) with a sub-agent worker. A
+// sub-agent runs in its OWN worktree (own dir + branch), so its writes are physically
+// isolated. Two modes:
+//
+//  • HELD (R1, the orchestrator path) — runs the FULL worker (runPromptedAgent, its own
+//    tasks-v2 store at <worktree>/.code_boss) and HOLDS on finish: commit the branch, then
+//    return { ...content, store, storeDir, branch, worktree, awaitingReview:true } WITHOUT
+//    integrating/removing. integrate + removeWorktree happen ONLY on ACCEPT (the caller's
+//    onApprove). resumeWorktreeSubAgent re-runs the worker in the SAME worktree on reject.
+//
+//  • AUTO-INTEGRATE (legacy, store-free) — runSubAgent → commit → integrate → remove. Kept
+//    byte-for-byte as the default until CB_ORCHESTRATOR flips on.
+//
+// Out-of-repo writes + external shell effects are NOT isolated/rolled back (best-effort).
+// Crash: the worktree dir + branch are git-durable (listWorktrees + cb-sub/* → re-attach).
+
+
+const asResult = (r) => (r && typeof r === 'object' ? { ...r } : { content: String(r ?? '') });
+const storeDirOf = (wtPath) => path.join(wtPath, '.code_boss', 'tasks');
+// commitAll → { skipped:true } | { committed:true, hash } | { committed:false, error }
+const commitFailed = (c) => c.committed === false;
+
+async function runWorktreeSubAgent({ repoDir, id, topic = id, baseRef = 'HEAD', commitMessage = null, held = false, ...opts }) {
+  if (!repoDir) throw new Error('runWorktreeSubAgent: repoDir required');
+  if (!id) throw new Error('runWorktreeSubAgent: id required');
+  const wt = await addWorktree(repoDir, id, baseRef);
+  if (!wt.ok) throw new Error(`runWorktreeSubAgent: worktree add failed: ${wt.error}`);
+
+  let result;
+  try {
+    result = held
+      ? asResult(await runPromptedAgent({ ...opts, projectDir: wt.path, requireBranch: () => 'ok' }))
+      : asResult(await runSubAgent({ ...opts, topic, projectDir: wt.path }));
+  } catch (e) {
+    // the sub-agent crashed — preserve its worktree + branch for inspection/resume
+    return { content: `(sub-agent failed: ${e && e.message ? e.message : String(e)})`, error: true, branch: wt.branch, worktree: wt.path };
+  }
+
+  const committed = await commitAll(wt.path, commitMessage || `sub-agent ${topic}`);
+
+  // ── HELD (R1): seal the branch + hold for review; integrate/remove only on accept ──
+  if (held) {
+    if (commitFailed(committed)) {
+      return { content: result.content, error: true, commitError: committed.error, branch: wt.branch, worktree: wt.path };
+    }
+    return {
+      content: result.content, store: result.store, storeDir: storeDirOf(wt.path),
+      branch: wt.branch, worktree: wt.path, commit: committed.hash, empty: !!committed.skipped,
+      awaitingReview: true,
+    };
+  }
+
+  // ── AUTO-INTEGRATE (legacy, store-free, unchanged) ──────────────────────────────
+  if (committed.skipped) {                                   // read-only sub-agent — nothing to merge
+    await removeWorktree(repoDir, wt.path, { deleteBranch: wt.branch });
+    return { ...result, integrated: true, empty: true };
+  }
+  if (commitFailed(committed)) {                             // couldn't commit — preserve for inspection
+    return { ...result, error: true, commitError: committed.error, branch: wt.branch, worktree: wt.path };
+  }
+  const merge = await integrate(repoDir, wt.branch);
+  if (merge.merged) {
+    await removeWorktree(repoDir, wt.path, { deleteBranch: wt.branch });
+    return { ...result, integrated: true, commit: committed.hash };
+  }
+  const files = merge.files || [];
+  const note = `\n\n⚠ Could not auto-merge back — conflict in: ${files.join(', ') || '(unknown)'}. The work is preserved on branch ${wt.branch}; it needs re-grounding before it can land.`;
+  return { ...result, content: (result.content || '') + note, conflict: true, files, branch: wt.branch, worktree: wt.path };
+}
+
+// Resume a HELD sub-agent in its EXISTING worktree (NO addWorktree — it persists) with the
+// reviewer's feedback as the new task. The worker reloads its store from disk so prior
+// turns are intact. Re-seals the branch + returns the same held shape for re-review.
+async function resumeWorktreeSubAgent({ worktree, branch, feedback, topic = 'sub-agent', commitMessage = null, ...opts }) {
+  if (!worktree || !branch) throw new Error('resumeWorktreeSubAgent: worktree + branch required');
+  let result;
+  try {
+    result = asResult(await runPromptedAgent({
+      ...opts,
+      messages: [{ role: 'user', content: String(feedback || 'Please revise your work per the review feedback.') }],
+      projectDir: worktree, requireBranch: () => 'ok',
+    }));
+  } catch (e) {
+    return { content: `(sub-agent resume failed: ${e && e.message ? e.message : String(e)})`, error: true, branch, worktree };
+  }
+  const committed = await commitAll(worktree, commitMessage || `sub-agent ${topic} (revision)`);
+  if (commitFailed(committed)) {
+    return { content: result.content, error: true, commitError: committed.error, branch, worktree };
+  }
+  return {
+    content: result.content, store: result.store, storeDir: storeDirOf(worktree),
+    branch, worktree, commit: committed.hash, empty: !!committed.skipped, awaitingReview: true,
+  };
+}
+
+// ====== agent/orchestrator.mjs ======
+// Orchestrator — the top-level agent's delegate-don't-juggle lifecycle (see ORCHESTRATOR.md).
+//
+// ONE continuous foreground conversation whose ROLE oscillates (dev ⇄ manager). It does no
+// heavy work itself once concurrency appears — it DELEGATES to sub-agents in isolated
+// contexts and folds back only their BOUNDED results. A delegated sub-agent is a FULL worker
+// in its own git worktree; on finish it is HELD awaiting-review, and a dedicated ACCEPTANCE
+// agent (injected runAcceptance) decides approve (integrate + import + despawn, via onApprove)
+// or reject (feedback → the sub-agent RESUMES → new result → re-review), hard-capped at
+// MAX_REVIEW_ROUNDS. The manager never ingests the sub-agent's transcript — only a result
+// card + the acceptance verdict (the both-sides bridge) enter the foreground.
+//
+// Pure + deterministic: runWorker / runAcceptance / onApprove / onReject / onCard / onEvent
+// are injected, so it's unit-testable with mocks. COPY DISCIPLINE: message objects are
+// CLONED at every boundary (the real worker rewrites .content/.role in place).
+
+const DEFAULT_NOTES = {
+  worker: (topic) => `You are now a sub-agent. Continue working ONLY on this task: ${topic}. The parent agent has taken on a separate concern — ignore unrelated discussion above. When done, report your result concisely.`,
+  manager: (topic, id) => `You handed task "${topic}" to background sub-agent ${id} because a new concern arrived. You are now the MANAGER for it: track it, do NOT touch its files; its result will fold back in when it finishes. Continue with the user.`,
+  card: (topic, id, result) => `Background sub-agent ${id} finished task "${topic}":\n${result}`,
+  result: (topic, id, text) => `Background sub-agent ${id} reported a result for "${topic}" (awaiting review):\n${text}`,
+  approved: (topic, id, text, fb) => `Background sub-agent ${id} finished task "${topic}" — approved${fb ? ` (${fb})` : ''}:\n${text}`,
+  exhausted: (topic, id, rounds) => `Background sub-agent ${id} task "${topic}" was REJECTED after ${rounds} review rounds; its work is preserved on its branch for manual follow-up.`,
+  unmergeable: (topic, id, rounds) => `Background sub-agent ${id} task "${topic}" was APPROVED but could not be merged after ${rounds} re-ground attempts (the base kept moving); its work is preserved on its branch for manual integration.`,
+  feedback: (fb) => `Review feedback — revise your work accordingly, then report the result:\n${fb}`,
+};
+
+const MAX_REVIEW_ROUNDS = 3;   // bounds the reject→resume loop
+
+function createOrchestrator({ runWorker, runAcceptance = null, onApprove = null, onReject = null, onDespawn = null, autoReview = true, onCard = null, onEvent = null, notes = {}, subagentTimeoutMs = 30 * 60 * 1000 } = {}) {
+  if (typeof runWorker !== 'function') throw new Error('createOrchestrator: runWorker(seed, ctx) is required');
+  const note = { ...DEFAULT_NOTES, ...notes };
+
+  const fg = { messages: [], mode: 'inline' };   // the ONE continuous foreground (role oscillates)
+  const subagents = new Map();                    // id -> entry
+  const cleanups = [];                            // best-effort despawn-cleanup promises (settled() awaits)
+  let nextId = 1;
+
+  const emit = (e) => { try { onEvent?.(e); } catch {} };
+  const cloneMsgs = (arr) => (arr || []).map((m) => { try { return structuredClone(m); } catch { return { ...m }; } });
+
+  function resultText(result, err) {
+    if (err) return err.aborted ? '(aborted)' : `(failed: ${err && err.message ? err.message : String(err)})`;
+    if (result == null) return '';
+    if (typeof result === 'string') return result;
+    if (typeof result.content === 'string') return result.content;
+    try { return JSON.stringify(result); } catch { return String(result); }
+  }
+
+  // Despawn: fold the FINAL card, de-escalate when empty. The terminal transition.
+  function finalize(id, finalCard) {
+    const e = subagents.get(id);
+    if (!e) return null;
+    const handle = e.handle;
+    if (e.timer) { clearTimeout(e.timer); e.timer = null; }   // disarm the wall-clock guard
+    subagents.delete(id);
+    fg.messages.push(finalCard);
+    if (subagents.size === 0) fg.mode = 'inline';
+    emit({ type: 'subagent-done', id, topic: finalCard.topic, status: finalCard.status, deEscalated: fg.mode === 'inline' });
+    try { onCard?.(finalCard); } catch {}
+    // Despawn cleanup: a non-'done' terminal (aborted/error/rejected/exhausted/conflict)
+    // leaves the held worktree behind — onApprove already cleaned up the 'done' path. Fire
+    // the injected cleanup best-effort; settled() awaits it so tests + shutdown can wait.
+    if (onDespawn && finalCard.status !== 'done' && handle && handle.worktree) {
+      try { cleanups.push(Promise.resolve(onDespawn({ id, status: finalCard.status, handle })).catch(() => {})); } catch {}
+    }
+    return finalCard;
+  }
+
+  function exhaustedCard(e) {
+    return { role: 'user', meta: 'completion-card', subagentId: e.id, topic: e.topic, status: 'rejected', content: note.exhausted(e.topic, e.id, MAX_REVIEW_ROUNDS) };
+  }
+  function unmergeableCard(e) {   // APPROVED but never merged (distinct from quality-rejected)
+    return { role: 'user', meta: 'completion-card', subagentId: e.id, topic: e.topic, status: 'unmergeable', content: note.unmergeable(e.topic, e.id, MAX_REVIEW_ROUNDS) };
+  }
+
+  // A worker run settled. Aborted / hard error / unmergeable → finalize now (nothing clean
+  // to review). Otherwise HOLD awaiting-review (fold a result card; do NOT delete/de-escalate)
+  // and, if autoReview, kick the acceptance review.
+  function settle(id, result, err) {
+    const e = subagents.get(id);
+    if (!e) return null;                            // already reaped (aborted, then the worker also settled)
+    if (err || (result && (result.error || result.conflict))) {
+      const status = err ? (err.aborted ? 'aborted' : 'error') : (result.conflict ? 'conflict' : 'error');
+      return finalize(id, { role: 'user', meta: 'completion-card', subagentId: id, topic: e.topic, status, content: note.card(e.topic, id, resultText(result, err)) });
+    }
+    // No acceptance configured → fire-and-forget (the delegate-only model): finalize with a
+    // done card immediately, exactly as before the review loop existed.
+    if (typeof runAcceptance !== 'function') {
+      return finalize(id, { role: 'user', meta: 'completion-card', subagentId: id, topic: e.topic, status: 'done', content: note.card(e.topic, id, resultText(result, null)) });
+    }
+    e.status = 'awaiting-review';
+    e.result = result;
+    e.resultText = resultText(result, null);
+    e.handle = { branch: result && result.branch, worktree: result && result.worktree, storeDir: result && result.storeDir, store: result && result.store };
+    const card = { role: 'user', meta: 'result-card', subagentId: id, topic: e.topic, status: 'awaiting-review', content: note.result(e.topic, id, e.resultText) };
+    fg.messages.push(card);
+    emit({ type: 'subagent-result', id, topic: e.topic, status: 'awaiting-review' });
+    try { onCard?.(card); } catch {}
+    if (autoReview && typeof runAcceptance === 'function') review(id);
+    return card;
+  }
+
+  function launch(id, topic, seed) {
+    const abort = new AbortController();
+    const entry = { id, topic, status: 'working', abort, promise: null, reviewPromise: null, round: 1, handle: null, result: null, resultText: '', feedback: [], seed, timer: null };
+    subagents.set(id, entry);
+    // Wall-clock guard: a hung sub-agent (e.g. a stalled adapter socket that never responds) would
+    // otherwise sit in a non-terminal state forever, keeping the manager escalated. Abort it after
+    // a generous timeout → settle → finalize ('aborted'), de-escalating. unref so it never holds the
+    // process open; cleared in finalize. Covers the full lifetime including review resumes.
+    if (subagentTimeoutMs > 0) {
+      entry.timer = setTimeout(() => { try { emit({ type: 'subagent-timeout', id, topic }); } catch {} try { abort.abort(); } catch {} }, subagentTimeoutMs);
+      entry.timer?.unref?.();
+    }
+    emit({ type: 'subagent-spawned', id, topic });
+    let p;
+    try { p = Promise.resolve(runWorker(seed, { id, topic, signal: abort.signal })); }
+    catch (e) { p = Promise.reject(e); }
+    entry.promise = p.then((result) => settle(id, result, null), (err) => settle(id, null, err));
+    return entry;
+  }
+
+  // Re-run the worker in the SAME worktree (resume:true + handle) with reviewer feedback.
+  function resumeLaunch(entry, feedback) {
+    const seed = [{ role: 'user', meta: 'review-feedback', content: note.feedback(feedback) }];
+    entry.status = 'working';
+    let p;
+    try { p = Promise.resolve(runWorker(seed, { id: entry.id, topic: entry.topic, signal: entry.abort.signal, resume: true, handle: entry.handle })); }
+    catch (e) { p = Promise.reject(e); }
+    entry.promise = p.then((result) => settle(entry.id, result, null), (err) => settle(entry.id, null, err));
+  }
+
+  // Spawn the Acceptance agent for an awaiting-review sub-agent.
+  function review(id) {
+    const e = subagents.get(id);
+    if (!e || e.status !== 'awaiting-review' || typeof runAcceptance !== 'function') return false;
+    e.status = 'reviewing';
+    emit({ type: 'subagent-reviewing', id, topic: e.topic, round: e.round });
+    const ctx = { id, topic: e.topic, originalRequest: e.seed, conversationChunk: cloneMsgs(fg.messages), handle: e.handle, result: e.result, round: e.round, signal: e.abort.signal };
+    e.reviewPromise = Promise.resolve(runAcceptance(ctx)).then(
+      (v) => resolveReview(id, v),
+      (err) => resolveReview(id, { approved: false, feedback: `(acceptance failed: ${err && err.message ? err.message : String(err)})` }),
+    );
+    return true;
+  }
+
+  async function resolveReview(id, verdict) {
+    const e = subagents.get(id);
+    if (!e) return false;                           // aborted mid-review
+    const approved = verdict === true || (verdict && verdict.approved === true);
+    const feedback = typeof verdict === 'string' ? verdict : ((verdict && verdict.feedback) || '');
+    emit({ type: 'subagent-verdict', id, topic: e.topic, approved, feedback, round: e.round });
+    if (approved) {
+      let outcome;
+      try { outcome = onApprove ? await onApprove({ id, topic: e.topic, handle: e.handle, result: e.result }) : { integrated: true }; }
+      catch (err) { outcome = { error: (err && err.message) || String(err) }; }
+      // The user may have aborted DURING the await — the entry is gone (finalized). Do not
+      // resume a zombie worker or double-finalize; the integrate already happened, so just stop.
+      if (!subagents.has(id)) return false;
+      if (outcome && outcome.conflict) {            // approve-time integration conflict → re-ground
+        emit({ type: 'subagent-verdict-conflict', id, files: outcome.files || [] });
+        e.round++;
+        if (e.round > MAX_REVIEW_ROUNDS) { emit({ type: 'subagent-review-exhausted', id, topic: e.topic, reason: 'unmergeable' }); return finalize(id, unmergeableCard(e)); }
+        resumeLaunch(e, `Your change no longer merges cleanly — conflict in: ${(outcome.files || []).join(', ') || '(unknown)'}. Re-ground against the latest base and resolve, then report.`);
+        return true;
+      }
+      return finalize(id, { role: 'user', meta: 'completion-card', subagentId: id, topic: e.topic, status: 'done', content: note.approved(e.topic, id, e.resultText, feedback) });
+    }
+    // reject → resume with feedback, capped
+    e.round++;
+    if (e.round > MAX_REVIEW_ROUNDS) {
+      emit({ type: 'subagent-review-exhausted', id, topic: e.topic });
+      return finalize(id, exhaustedCard(e));
+    }
+    e.feedback.push(feedback);
+    try { if (onReject) await onReject({ id, topic: e.topic, handle: e.handle, feedback, round: e.round }); } catch {}
+    if (!subagents.has(id)) return false;           // aborted during onReject → don't resume a zombie
+    emit({ type: 'subagent-resume', id, topic: e.topic, round: e.round, feedback });
+    resumeLaunch(e, feedback);
+    return true;
+  }
+
+  // ── vanilla delegate (3rd+ task): a FRESH sub-agent, no context copy ───────────
+  function delegate(topic, brief) {
+    const id = `sa-${nextId++}`;
+    const seed = [{ role: 'user', meta: 'task-brief', topic, content: brief }];
+    fg.mode = 'managing';
+    launch(id, topic, seed);
+    return { subagentId: id, seed };
+  }
+
+  // ── crash-resume (R6): re-attach a leftover sub-agent worktree as an awaiting-review
+  // entry (no worker run — its work is already committed on the branch). The user then
+  // re-reviews it (review(id) → the acceptance loop, handle.store falls back to disk) or
+  // discards it (abort(id) → onDespawn removes the worktree + branch). Surfaced, not auto-run.
+  function adopt({ id, topic = id, handle }) {
+    if (!id || !handle || subagents.has(id)) return null;
+    const abort = new AbortController();
+    const entry = { id, topic, status: 'awaiting-review', abort, promise: null, reviewPromise: null, round: 1, handle, result: { content: '(recovered from a previous session)' }, resultText: '(recovered from a previous session)', feedback: [], seed: [{ role: 'user', content: topic }], recovered: true };
+    subagents.set(id, entry);
+    if (fg.mode === 'inline') fg.mode = 'managing';
+    emit({ type: 'subagent-recovered', id, topic, handle });
+    return { subagentId: id };
+  }
+
+  // ── THE FORK (1→2) — deferred (R5); for now degrades to delegate ───────────────
+  function escalate(topic, brief) {
+    if (fg.mode === 'managing' || subagents.size > 0) {
+      emit({ type: 'escalate-degraded-to-delegate', topic });
+      return delegate(topic, brief != null ? brief : note.worker(topic));
+    }
+    const id = `sa-${nextId++}`;
+    const seed = [...cloneMsgs(fg.messages), { role: 'user', meta: 'worker-note', content: note.worker(topic) }];
+    fg.messages.push({ role: 'user', meta: 'manager-note', subagentId: id, topic, content: note.manager(topic, id) });
+    fg.mode = 'managing';
+    launch(id, topic, seed);
+    return { subagentId: id, seed };
+  }
+
+  // per-sub-agent abort: signal + finalize from ANY state (working/awaiting-review/reviewing).
+  // A later settle / resolveReview of its own promise is a no-op (entry gone).
+  function abort(id) {
+    const e = subagents.get(id);
+    if (!e) return false;
+    e.status = 'aborting';
+    try { e.abort.abort(); } catch {}
+    const ae = new Error('aborted'); ae.aborted = true;
+    finalize(id, { role: 'user', meta: 'completion-card', subagentId: id, topic: e.topic, status: 'aborted', content: note.card(e.topic, id, resultText(null, ae)) });
+    return true;
+  }
+
+  function seedForeground(messages) {
+    if (subagents.size > 0) throw new Error('orchestrator: cannot reset the foreground while sub-agents are in flight');
+    fg.messages = cloneMsgs(messages);
+  }
+
+  async function settled() {
+    // Drain through the FULL review loop: each round can REPLACE e.promise (resume) or ADD
+    // e.reviewPromise. Await the current promises, then stop when the set is STABLE — empty
+    // (all despawned) OR unchanged (held awaiting-review with autoReview off, nothing pending).
+    const snap = () => [...subagents.values()].flatMap((e) => [e.promise, e.reviewPromise]).filter(Boolean);
+    for (let i = 0; i < (MAX_REVIEW_ROUNDS + 3) * 4 + 8; i++) {
+      const before = snap();
+      if (before.length === 0) break;
+      await Promise.allSettled(before);
+      const after = snap();
+      if (after.length === 0 || !after.some((p) => !before.includes(p))) break;   // empty or no new promise
+    }
+    if (cleanups.length) await Promise.allSettled(cleanups.splice(0));   // drain best-effort despawn cleanups
+  }
+
+  return {
+    seedForeground,
+    appendUser(content) { fg.messages.push(cloneMsgs([{ role: 'user', content }])[0]); },
+    foreground() { return { mode: fg.mode, messages: cloneMsgs(fg.messages) }; },
+    escalate, delegate, abort, adopt,
+    review, resolveReview,                          // exposed for manual/test drive (autoReview:false)
+    subagents() { return [...subagents.values()].map((e) => ({ id: e.id, topic: e.topic, status: e.status, round: e.round, awaitingReview: e.status === 'awaiting-review', recovered: !!e.recovered })); },
+    settled,
+  };
 }
 
 // ====== agent/project-context.mjs ======
@@ -6099,341 +8164,133 @@ async function runPackageCommand({ argv, bundlePath, version }) {
   return installer ? 0 : 1;
 }
 
-// ====== agent/git-workflow.mjs ======
-/**
- * Git workflow helpers — used by server.mjs to:
- *   - Detect whether the active project is a git repo.
- *   - Branch automatically onto CODE_BOSS_<timestamp> when first opening
- *     so the agent's changes never land directly on the user's working
- *     branch.
- *   - Auto-commit at the end of each task (next-task) with the task's
- *     summary as the commit message.
- *   - Check `git status --porcelain` before running the reviewer so we
- *     skip the LLM call when nothing actually changed (Q&A turns, pure
- *     read flows).
- *
- * The shape: each call returns a result object you can pass directly to
- * a tool-call/tool-result chat event pair, so the git operations are
- * visible in the chat history just like any other tool the agent runs.
- *
- *   { command: 'git ...', exitCode, stdout, stderr, durationMs }
- *
- * The caller decides whether to emit a chat event; this module just
- * runs commands.
- */
+// ====== agent/shadow-git.mjs ======
+// ── Shadow git — an internal revert safety net for NON-repo edit targets ─────
+// code_boss can edit folders that aren't a git project; without this, edits to a
+// one-off file or a non-repo folder are IRREVERSIBLE. The shadow repo keeps its
+// metadata under <project>/.code_boss/shadow.git with the work-tree pointed at the
+// project, so it tracks the project's files WITHOUT a visible .git polluting the
+// user's folder. The SYSTEM snapshots before each editing run; the developer can
+// undo the last run. The AGENT never touches this — normal git commands don't even
+// see it (the --git-dir/--work-tree live only here), and the point is for the
+// developer to undo the agent, not for the agent to undo itself.
 
-const GIT_DEFAULT_TIMEOUT_MS = 30000;
+const shadowGitDir = (projectDir) => path.join(projectDir, '.code_boss', 'shadow.git');
+// Every shadow invocation: git --git-dir=<shadow> --work-tree=<project> ...
+const shadowGit = (projectDir, args, opts) =>
+  runGit(projectDir, ['--git-dir', shadowGitDir(projectDir), '--work-tree', projectDir, ...args], opts);
 
-/** Run a single `git <args>` invocation. Resolves with the result object. */
-function runGit(cwd, args, { timeoutMs = GIT_DEFAULT_TIMEOUT_MS, input } = {}) {
-  return new Promise((resolve) => {
-    const t0 = Date.now();
-    let stdout = '', stderr = '', timedOut = false, settled = false;
-    const child = spawn('git', args, { cwd, windowsHide: true, env: process.env });
-    const tid = setTimeout(() => {
-      timedOut = true;
-      try { child.kill(); } catch {}
-    }, timeoutMs);
-    child.stdout.on('data', (d) => { stdout += d.toString('utf8'); });
-    child.stderr.on('data', (d) => { stderr += d.toString('utf8'); });
-    if (input != null) {
-      try { child.stdin.write(input); child.stdin.end(); } catch {}
-    }
-    const settle = (code, signal) => {
-      if (settled) return; settled = true;
-      clearTimeout(tid);
-      resolve({
-        command: 'git ' + args.join(' '),
-        cwd,
-        exitCode: timedOut ? null : (code ?? null),
-        signal: signal ?? null,
-        timedOut,
-        stdout,
-        stderr,
-        durationMs: Date.now() - t0,
-      });
-    };
-    child.on('close', settle);
-    child.on('error', (e) => { stderr += '\n' + e.message; settle(-1, null); });
-  });
-}
-
-/** True if `dir/.git` exists (file or directory — git worktrees use a file). */
-async function isGitRepo(dir) {
-  if (!dir) return false;
+// Initialise the shadow repo once (idempotent). Excludes our own state dir, any real
+// nested .git, and node_modules so we never snapshot huge/irrelevant trees.
+async function shadowEnsureRepo(projectDir) {
+  if (!projectDir) return false;
+  const gd = shadowGitDir(projectDir);
+  if (existsSync(path.join(gd, 'HEAD'))) return true;   // already initialised
   try {
-    await stat(path.join(dir, '.git'));
+    await mkdir(gd, { recursive: true });
+    const init = await shadowGit(projectDir, ['init', '-q']);
+    if (init.exitCode !== 0) return false;
+    await shadowGit(projectDir, ['config', 'user.email', 'shadow@code-boss']);
+    await shadowGit(projectDir, ['config', 'user.name', 'code_boss shadow']);
+    await shadowGit(projectDir, ['config', 'commit.gpgsign', 'false']);
+    await writeFile(path.join(gd, 'info', 'exclude'), '.code_boss/\n.git/\nnode_modules/\n', 'utf8');
+    await shadowGit(projectDir, ['add', '-A']);
+    await shadowGit(projectDir, ['commit', '-q', '--allow-empty', '-m', 'shadow: initial']);
     return true;
   } catch { return false; }
 }
 
-// Directories we never recurse into when looking for nested git repos.
-// Same list the AGENTS.md scanner uses, plus the obvious build outputs
-// where a vendored dependency might keep its own .git as a footgun.
-const GIT_SCAN_SKIP_DIRS = new Set([
-  '.git', '.hg', '.svn', '.code_boss', '.agent',
-  '.vs', '.idea', '.vscode',
-  'node_modules', 'bower_components',
-  'target', 'dist', 'build', 'out', 'bin', 'obj',
-  '__pycache__', '.gradle', '.mvn',
-]);
-
-/**
- * Walk `rootDir` looking for git repositories. Returns an array of
- * absolute repo paths. The root itself counts if it has a `.git`.
- * Otherwise we descend until we hit one (recurses no deeper into a
- * directory tree that contains its own `.git`).
- *
- * Bounded so a generated tree can't stall project open:
- *   - max depth 5 below rootDir
- *   - max 30 repos returned
- */
-async function discoverGitRepos(rootDir, { maxDepth = 5, maxRepos = 30 } = {}) {
-  if (!rootDir) return [];
-  const { readdir } = await import('node:fs/promises');
-  const found = [];
-  async function walk(dir, depth) {
-    if (depth > maxDepth) return;
-    if (found.length >= maxRepos) return;
-    if (await isGitRepo(dir)) {
-      found.push(dir);
-      return;             // don't descend into a repo's subdirs for more repos
+// Commit the CURRENT project state as the pre-run baseline. Returns the commit hash
+// to roll back to (or null on failure). Skips a no-op commit (reuses the current HEAD).
+async function shadowSnapshot(projectDir, message = 'snapshot') {
+  if (!(await shadowEnsureRepo(projectDir))) return null;
+  try {
+    await shadowGit(projectDir, ['add', '-A']);
+    const st = await shadowGit(projectDir, ['status', '--porcelain']);
+    if ((st.stdout || '').trim()) {
+      await shadowGit(projectDir, ['commit', '-q', '-m', `shadow: ${String(message).replace(/\s+/g, ' ').slice(0, 120)}`]);
     }
-    let entries;
-    try { entries = await readdir(dir, { withFileTypes: true }); }
-    catch { return; }
-    for (const e of entries) {
-      if (!e.isDirectory()) continue;
-      if (e.name.startsWith('.')) continue;
-      if (GIT_SCAN_SKIP_DIRS.has(e.name)) continue;
-      await walk(path.join(dir, e.name), depth + 1);
-      if (found.length >= maxRepos) return;
+    const h = await shadowGit(projectDir, ['rev-parse', 'HEAD']);
+    return h.exitCode === 0 ? (h.stdout || '').trim() : null;
+  } catch { return null; }
+}
+
+// Roll the project back to the pre-run snapshot. When a post-run snapshot is given, undo ONLY
+// what the run changed (the pre→post delta): restore the pre version of modified/deleted paths
+// and delete paths the run added. Files the USER created AFTER the run (not in the pre..post
+// diff) are left untouched — a blanket `clean -fd` would have deleted them (data loss). Falls
+// back to the old reset+clean only when no post snapshot is available.
+async function shadowRestore(projectDir, commit, postCommit) {
+  if (!commit || !existsSync(path.join(shadowGitDir(projectDir), 'HEAD'))) return false;
+  try {
+    if (postCommit) {
+      const names = await shadowGit(projectDir, ['diff', '--name-only', '--no-renames', commit, postCommit]);
+      const paths = (names.stdout || '').split('\n').map((s) => s.trim()).filter(Boolean);
+      if (!paths.length) return true;   // the run changed nothing on disk
+      const added = await shadowGit(projectDir, ['diff', '--name-only', '--no-renames', '--diff-filter=A', commit, postCommit]);
+      const addedSet = new Set((added.stdout || '').split('\n').map((s) => s.trim()).filter(Boolean));
+      const restore = paths.filter((p) => !addedSet.has(p));   // run-modified / run-deleted → restore pre version
+      if (restore.length) await shadowGit(projectDir, ['checkout', commit, '--', ...restore]);
+      for (const p of addedSet) { try { await rm(path.join(projectDir, p), { force: true }); } catch {} }   // run-added → remove
+      await shadowGit(projectDir, ['add', '-A']);   // resync the shadow index to the reverted tree
+      return true;
     }
-  }
-  await walk(rootDir, 0);
-  return found;
+    const r = await shadowGit(projectDir, ['reset', '-q', '--hard', commit]);
+    await shadowGit(projectDir, ['clean', '-fd']);
+    return r.exitCode === 0;
+  } catch { return false; }
 }
 
-/**
- * Walk up from `filepath` looking for the containing git repo's root.
- * Returns the repo's absolute path or null if no .git was found before
- * reaching the filesystem root.
- */
-async function findContainingRepo(filepath) {
-  if (!filepath) return null;
-  let dir = path.dirname(path.resolve(filepath));
-  while (true) {
-    if (await isGitRepo(dir)) return dir;
-    const parent = path.dirname(dir);
-    if (parent === dir) return null;   // hit fs root
-    dir = parent;
-  }
+// ====== agent/plan-review.mjs ======
+// Adversarial plan-review (#7): after the agent produces a propose-first PLAN, fan out a few
+// READ-ONLY critics — each with file-reading tools but no ability to mutate — to poke holes in
+// the plan against the actual code. Their concerns are fed back to the source agent for ONE
+// revision before the developer is asked to approve. Pure + injectable (runCritic is supplied by
+// the server, wrapping a read-only worker) so it unit-tests with mocks. Best-effort: a critic
+// that errors contributes no concerns; the caller degrades to the un-hardened plan on any failure.
+
+const PLAN_REVIEW_LENSES = [
+  { key: 'correctness', focus: 'CORRECTNESS bugs in the plan: logic errors, wrong assumptions about how the code works, missed steps, off-by-one / order-of-operations mistakes.' },
+  { key: 'rules', focus: 'MISSED or BROKEN business rules, existing behavior, invariants, and edge cases the plan does not account for. Read the relevant code AND its tests.' },
+  { key: 'breakage', focus: 'what the plan could BREAK: existing callers, tests, public interfaces, the build, or unrelated features that depend on what it changes.' },
+];
+
+const NO_CONCERNS = /^\s*(no concerns?|none\b|nothing\b|looks good|lgtm|no issues?|n\/a)\b/i;
+
+// runCritic(lens) → Promise<string>  — runs ONE read-only critic and returns its concerns text.
+// Returns the list of REAL concerns: [{ lens, concerns }]. Emits plan-review-start / plan-review-done.
+async function runAdversarialPlanReview({ runCritic, lenses = PLAN_REVIEW_LENSES, emit = () => {}, signal = null } = {}) {
+  if (typeof runCritic !== 'function' || !Array.isArray(lenses) || lenses.length === 0) return [];
+  try { emit({ type: 'plan-review-start', count: lenses.length }); } catch {}
+  const results = await Promise.all(lenses.map(async (lens) => {
+    if (signal && signal.aborted) return { lens: lens.key, concerns: '' };
+    try { const c = await runCritic(lens); return { lens: lens.key, concerns: String(c || '').trim() }; }
+    catch (e) { return { lens: lens.key, concerns: '', error: (e && e.message) || String(e) }; }
+  }));
+  const real = results.filter((r) => r.concerns && !NO_CONCERNS.test(r.concerns));
+  try { emit({ type: 'plan-review-done', findings: real.map((r) => ({ lens: r.lens, concerns: r.concerns })), dismissed: results.length - real.length }); } catch {}
+  return real;
 }
 
-/**
- * Append a pattern to .git/info/exclude (git's local-only ignore file —
- * unlike .gitignore, this never gets committed). Used to make code_boss
- * internal state (.code_boss/, conversation.json, etc.) invisible to git
- * status without modifying the user's project files.
- *
- * No-op if the pattern is already there.
- */
-async function ensureExcluded(dir, ...patterns) {
-  // Resolve the REAL info/exclude path. In a git worktree, <dir>/.git is a
-  // FILE ('gitdir: …'), not a directory, so hardcoding <dir>/.git/info/exclude
-  // throws and .code_boss/ is never excluded → it shows up dirty and gets
-  // swept into the user's commit by `git add -A`. `rev-parse --git-path`
-  // returns the correct location for both normal repos and worktrees.
-  let file;
-  const r = await runGit(dir, ['rev-parse', '--git-path', 'info/exclude']);
-  if (r.exitCode === 0 && r.stdout.trim()) {
-    file = r.stdout.trim();
-    if (!path.isAbsolute(file)) file = path.resolve(dir, file);
-  } else {
-    file = path.join(dir, '.git', 'info', 'exclude'); // best-effort fallback
-  }
-  let { readFile, writeFile, mkdir } = await import('node:fs/promises');
-  let existing = '';
-  try { existing = await readFile(file, 'utf8'); }
-  catch { /* file doesn't exist yet; will create */ }
-  const have = new Set(existing.split('\n').map((s) => s.trim()).filter(Boolean));
-  const toAdd = patterns.filter((p) => !have.has(p));
-  if (toAdd.length === 0) return false;
-  try { await mkdir(path.dirname(file), { recursive: true }); } catch {}
-  const next = (existing.endsWith('\n') || existing === '') ? existing : existing + '\n';
-  await writeFile(file, next + toAdd.join('\n') + '\n', 'utf8');
-  return true;
+// Build the synthetic revision message handed back to the SOURCE agent (still in propose mode):
+// it must produce a REVISED plan addressing the concerns, not implement anything.
+function planRevisionMessage(originalPlan, concerns) {
+  const block = (concerns || []).map((c) => `[${c.lens}] ${c.concerns}`).join('\n\n');
+  return 'Adversarial reviewers examined your proposed plan against the actual code and raised the '
+    + 'concerns below. Revise your plan to address them (or briefly justify dismissing one), then '
+    + 'present the REVISED plan in the same detailed format. Still propose only — do NOT implement.\n\n'
+    + `CONCERNS:\n${block}\n\nYOUR ORIGINAL PLAN:\n${originalPlan}`;
 }
 
-/** Get current branch name (or null if genuinely detached / non-git / error). */
-async function getCurrentBranch(dir) {
-  const r = await runGit(dir, ['rev-parse', '--abbrev-ref', 'HEAD']);
-  const name = r.exitCode === 0 ? r.stdout.trim() : '';
-  if (name && name !== 'HEAD') return name;
-  // `HEAD` (or exit!=0) can mean genuine detached HEAD, but ALSO an
-  // interrupted rebase or an unborn branch — where we ARE conceptually on a
-  // branch. Misreporting null there makes isCodeBossBranch(null) false, so a
-  // CODE_BOSS branch mid-rebase wrongly triggers the branch-needed pause and
-  // the auto-commit silently skips. Recover the branch from the rebase state
-  // or symbolic-ref before giving up.
-  // (a) Mid-rebase: git stores the original branch name here.
-  for (const p of ['rebase-merge/head-name', 'rebase-apply/head-name']) {
-    const hn = await runGit(dir, ['rev-parse', '--git-path', p]);
-    if (hn.exitCode === 0 && hn.stdout.trim()) {
-      try {
-        const { readFile } = await import('node:fs/promises');
-        let f = hn.stdout.trim();
-        if (!path.isAbsolute(f)) f = path.resolve(dir, f);
-        const ref = (await readFile(f, 'utf8')).trim();           // e.g. refs/heads/CODE_BOSS_x
-        const m = ref.match(/^refs\/heads\/(.+)$/);
-        if (m) return m[1];
-      } catch { /* fall through */ }
-    }
-  }
-  // (b) Unborn branch (fresh repo, no commits): symbolic-ref still knows it.
-  const sym = await runGit(dir, ['symbolic-ref', '--short', '-q', 'HEAD']);
-  if (sym.exitCode === 0 && sym.stdout.trim()) return sym.stdout.trim();
-  return null;
-}
-
-/** Return short HEAD hash, or null if anything goes wrong. */
-async function getHeadHash(dir) {
-  const r = await runGit(dir, ['rev-parse', '--short', 'HEAD']);
-  if (r.exitCode !== 0) return null;
-  const h = r.stdout.trim();
-  return h || null;
-}
-
-/**
- * Read the porcelain status. Returns:
- *   { dirty: bool, lines: [{ status, path }] }
- * Empty `lines` ⇒ working tree clean. We use this both for the
- * project-open dirty-check AND for the reviewer-skip check.
- */
-async function getStatus(dir) {
-  // -z: NUL-terminated records with NO path quoting/octal-escaping, so
-  // paths with spaces, backslashes, or non-ASCII (the production norm on
-  // Windows) come through verbatim. core.quotePath=false belt-and-suspenders.
-  const r = await runGit(dir, ['-c', 'core.quotePath=false', 'status', '--porcelain', '-z']);
-  if (r.exitCode !== 0) {
-    // CONTRACT: dirty===null means "status failed / unknown" — distinct from
-    // dirty===false ("confirmed clean"). Callers MUST NOT treat a failure as
-    // clean (which would silently skip auto-commit / the reviewer). A stale
-    // .git/index.lock during a long build is the common trigger.
-    return { dirty: null, failed: true, lines: [], error: r.stderr.trim() };
-  }
-  // Records are NUL-separated. A rename/copy entry (status starts with R or C)
-  // emits TWO NUL-separated fields: "<XY> <new>\0<old>\0". We surface the NEW
-  // path (the post-rename name) and consume the trailing old-name field.
-  const records = r.stdout.split('\0');
-  const lines = [];
-  for (let i = 0; i < records.length; i++) {
-    const rec = records[i];
-    if (!rec) continue;
-    const status = rec.slice(0, 2);
-    const p = rec.slice(3);
-    if (/^[RC]/.test(status)) {
-      // The very next NUL field is the old name; skip it.
-      i++;
-    }
-    lines.push({ status, path: p });
-  }
-  return { dirty: lines.length > 0, lines };
-}
-
-/**
- * Create + checkout a new branch from HEAD. Fails (exitCode !== 0) if
- * the branch already exists. Branch name is generated when not provided.
- */
-async function createBranch(dir, name) {
-  const branch = name || generateBranchName();
-  const r = await runGit(dir, ['checkout', '-b', branch]);
-  return { ...r, branch };
-}
-
-/**
- * CODE_BOSS_<YYYYMMDD-HHMMSS>-<rand>. Sortable + human-readable. The 4-char
- * random suffix prevents collisions when two branches are created in the same
- * wall-clock second (e.g. a multi-repo resolve batch, or rapid re-resolves) —
- * without it the second `git checkout -b` fails 'branch already exists' and
- * the protective-branch operation aborts.
- */
-function generateBranchName() {
-  const d = new Date();
-  const p = (n) => String(n).padStart(2, '0');
-  const ts = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
-  const rand = Math.random().toString(36).slice(2, 6);
-  return `CODE_BOSS_${ts}-${rand}`;
-}
-
-/** True if a name matches the CODE_BOSS_<timestamp> pattern. */
-function isCodeBossBranch(name) {
-  return typeof name === 'string' && /^CODE_BOSS_/.test(name);
-}
-
-/**
- * Stage everything then commit with the given message. If there's
- * nothing to commit (working tree clean), returns `{ skipped: true }`
- * instead of a failed commit. Otherwise resolves with the commit's
- * short hash on success.
- */
-async function commitAll(dir, message) {
-  const status = await getStatus(dir);
-  if (!status.dirty) return { skipped: true, reason: 'working tree clean' };
-  const add = await runGit(dir, ['add', '-A']);
-  if (add.exitCode !== 0) {
-    return { committed: false, error: 'git add failed: ' + (add.stderr.trim() || `exit ${add.exitCode}`), add };
-  }
-  // -F - reads message from stdin so multi-line + special chars round-trip cleanly.
-  const commit = await runGit(dir, ['commit', '-F', '-'], { input: message });
-  if (commit.exitCode !== 0) {
-    return { committed: false, error: 'git commit failed: ' + (commit.stderr.trim() || `exit ${commit.exitCode}`), add, commit };
-  }
-  const hash = await getHeadHash(dir);
-  return { committed: true, hash, add, commit };
-}
-
-/**
- * Strip Markdown / report formatting from a summary down to a clean one-line
- * commit subject. The worker's <next-task summary> sometimes pastes the
- * reviewer's Markdown verdict ("### Final Verdict\n- ✅ looks good"), which
- * makes for an ugly commit log. Take the first meaningful line, drop heading
- * hashes, leading bullets/numbering, surrounding emphasis, and emoji.
- */
-function sanitizeSummary(summary) {
-  const lines = String(summary || '').replace(/\r\n/g, '\n').split('\n');
-  for (let raw of lines) {
-    let s = raw
-      .replace(/^[#>\s]+/, '')              // heading hashes / blockquote markers / indent
-      .replace(/^[-*+•]\s+/, '')            // bullet markers
-      .replace(/^\d+[.)]\s+/, '')           // numbered list "1." / "1)"
-      .replace(/[*_`]+/g, '')               // emphasis / code ticks
-      // strip a leading emoji + optional separator (✅ 🚀 etc.)
-      .replace(/^[\u{1F000}-\u{1FFFF}\u{2190}-\u{27BF}\u{2B00}-\u{2BFF}️‍]+[\s:–—-]*/u, '')
-      .replace(/\s+/g, ' ')
-      .trim();
-    // Skip pure-formatting lines (e.g. a "---" rule or an empty heading).
-    if (s && !/^[-=_*\s]+$/.test(s)) return s;
-  }
-  return '';
-}
-
-/**
- * Build a commit message from the next-task attributes. Subject is the
- * summary (truncated to fit a normal git log column); body has the
- * user-request that prompted the work.
- */
-function buildCommitMessage({ summary, userRequest, assignmentId }) {
-  const tag = assignmentId ? `[${assignmentId}] ` : '';
-  // Prefer the agent's summary (sanitized of any pasted Markdown); if it's
-  // blank, fall back to the user-request (the one-line "what was wanted")
-  // before the generic 'task', so a task closed with an empty <next-task>
-  // summary doesn't produce a bare "task" commit.
-  const base = sanitizeSummary(summary) || String(userRequest || '').replace(/\s+/g, ' ').trim() || 'task';
-  const subject = (tag + base.replace(/\s+/g, ' ').trim()).slice(0, 72) || 'task';
-  const body = userRequest ? `\n\nUser request: ${String(userRequest).trim()}` : '';
-  const asg = assignmentId ? `\nAssignment: ${assignmentId}` : '';
-  return subject + body + asg + '\n\n[code_boss auto-commit]\n';
+// The critic's instruction (combined with the lens focus + the plan) for the read-only worker.
+function planCriticMessage(focus, plan) {
+  return 'You are an ADVERSARIAL reviewer of another agent\'s IMPLEMENTATION PLAN. You have READ-ONLY '
+    + 'tools — read/list/search/find — use them to check the plan against the ACTUAL code; do not trust '
+    + 'the plan\'s claims. Do NOT modify anything.\n\n'
+    + `FOCUS specifically on: ${focus}\n\n`
+    + 'Report ONLY concrete, specific concerns grounded in what you read (cite file:line where you can). '
+    + 'If after reading you find nothing real, reply exactly "no concerns". Do not invent problems.\n\n'
+    + `THE PROPOSED PLAN:\n${plan}`;
 }
 
 // ====== git-api/gitlab.mjs ======
@@ -6914,7 +8771,7 @@ const wlPlugin = {
       },
       async impl({ args, timeout_ms }, ctx) {
         const safeArgs = (typeof args === 'string') ? args.trim() : '';
-        const workspaceDir = process.cwd();
+        const workspaceDir = ctx?.cwd || process.cwd();   // per-call cwd (no global process.chdir)
         // `startWebLogic` (alias sw) starts the WebLogic SERVER itself — a
         // long-lived JVM that never exits — so we DON'T run it through the normal
         // path (which blocks until the process ends or times out). Spawn the
@@ -7191,8 +9048,8 @@ const DOCX_DEP_JARS = [
 
 // Same root-containment guard as the built-in write tools (resolveDocxWritePath in
 // src/agent/tools.mjs — not exported, so replicated here). Reads are NOT gated.
-function resolveDocxWritePath(p) {
-  const root = path.resolve(process.cwd());
+function resolveDocxWritePath(p, cwd) {
+  const root = path.resolve(cwd || process.cwd());   // per-call cwd (no global process.chdir)
   const abs = path.isAbsolute(p) ? path.resolve(p) : path.resolve(root, p);
   if (abs !== root && !abs.startsWith(root + path.sep)) {
     throw new Error(`path escapes project root: ${p}`);
@@ -7201,8 +9058,8 @@ function resolveDocxWritePath(p) {
   return abs;
 }
 
-function resolveAbsRead(p) {
-  const abs = path.isAbsolute(p) ? path.resolve(p) : path.resolve(process.cwd(), p);
+function resolveAbsRead(p, cwd) {
+  const abs = path.isAbsolute(p) ? path.resolve(p) : path.resolve(cwd || process.cwd(), p);
   if (isControlPath(abs)) throw new Error(CONTROL_DIR_MSG);   // .code_boss is off-limits to reads too
   return abs;
 }
@@ -7372,7 +9229,7 @@ function ensureHelper() {
 
 // Spawn `java ... DocxHelper <op>`, feed the JSON spec on stdin, parse the one
 // JSON document on stdout. Returns the parsed object (may be { ok:false, ... }).
-function runHelper(op, spec, { signal, timeoutMs = 60000 } = {}) {
+function runHelper(op, spec, { signal, timeoutMs = 60000, cwd } = {}) {
   let loc;
   try { loc = ensureHelper(); }
   catch (e) { return Promise.resolve({ ok: false, code: 'file-error', error: e.message }); }
@@ -7382,7 +9239,7 @@ function runHelper(op, spec, { signal, timeoutMs = 60000 } = {}) {
     const errDec = new StringDecoder('utf8');
     let stdout = '', stderr = '', settled = false;
     const child = spawn('java', ['-Dfile.encoding=UTF-8', '-cp', loc.classpath, HELPER_MAIN, op], {
-      cwd: process.cwd(), windowsHide: true,
+      cwd: cwd || process.cwd(), windowsHide: true,
     });
     const onAbort = () => { try { child.kill(); } catch {} };
     if (signal) {
@@ -7454,17 +9311,17 @@ async function applyOps(abs, ops, ctx) {
     if (typeof ctx?.requireApproval !== 'function') {
       return { error: 'spec-maintenance mode requires explicit developer approval, which is not available in this context' };
     }
-    const dry = await runHelper('edit', { ...base, dryRun: true, tracked: true }, { signal: ctx?.signal });
+    const dry = await runHelper('edit', { ...base, dryRun: true, tracked: true }, { signal: ctx?.signal, cwd: ctx?.cwd });
     if (!dry || dry.ok !== true) return { res: dry };   // surface validation error (not-found, straddle, …)
     const approved = await ctx.requireApproval({ kind: 'docx-change', message: describeChange(ops, dry) });
     if (!approved) return { error: 'change not approved by developer' };
-    return { res: await runHelper('edit', { ...base, dryRun: false, tracked: true }, { signal: ctx?.signal }) };
+    return { res: await runHelper('edit', { ...base, dryRun: false, tracked: true }, { signal: ctx?.signal, cwd: ctx?.cwd }) };
   }
-  return { res: await runHelper('edit', { ...base, dryRun: false }, { signal: ctx?.signal }) };
+  return { res: await runHelper('edit', { ...base, dryRun: false }, { signal: ctx?.signal, cwd: ctx?.cwd }) };
 }
 
-function formatOpsResult(res, abs) {
-  const rel = path.relative(process.cwd(), abs) || abs;
+function formatOpsResult(res, abs, cwd) {
+  const rel = path.relative(cwd || process.cwd(), abs) || abs;
   const o = (res.ops && res.ops[0]) || {};
   const trk = res.trackChanges ? '  [tracked change — shows as a Word revision]' : '';
   const field = res.updateFieldsOnOpen ? '  (TOC/fields refresh when opened in Word)' : '';
@@ -7629,8 +9486,8 @@ tracked changes. A find that spans a formatting boundary needs allowFormatFlatte
       },
       async impl({ path: p, offset, limit }, ctx) {
         if (typeof p !== 'string' || !p) return 'ERROR: path is required';
-        const abs = resolveAbsRead(p);
-        const res = await runHelper('read', { op: 'read', docx: abs }, { signal: ctx?.signal });
+        const abs = resolveAbsRead(p, ctx?.cwd);
+        const res = await runHelper('read', { op: 'read', docx: abs }, { signal: ctx?.signal, cwd: ctx?.cwd });
         if (!res || res.ok !== true) return `ERROR: ${res?.code || 'file-error'}: ${res?.error || 'read failed'}`;
         return { content: renderRead(res, { offset, limit }) };
       },
@@ -7657,8 +9514,8 @@ tracked changes. A find that spans a formatting boundary needs allowFormatFlatte
         if (typeof query !== 'string' || !query) return 'ERROR: query is required';
         let re;
         try { re = docxSearchRegex(query, !!regex); } catch (e) { return 'ERROR: bad regex: ' + e.message; }
-        const abs = resolveAbsRead(p);
-        const res = await runHelper('read', { op: 'read', docx: abs }, { signal: ctx?.signal });
+        const abs = resolveAbsRead(p, ctx?.cwd);
+        const res = await runHelper('read', { op: 'read', docx: abs }, { signal: ctx?.signal, cwd: ctx?.cwd });
         if (!res || res.ok !== true) return `ERROR: ${res?.code || 'file-error'}: ${res?.error || 'read failed'}`;
         const paras = Array.isArray(res.paragraphs) ? res.paragraphs : [];
         const cap = Math.min(500, Math.max(1, Number(maxMatches) || 50));
@@ -7699,7 +9556,7 @@ tracked changes. A find that spans a formatting boundary needs allowFormatFlatte
       },
       async impl({ path: p, paragraphs }, ctx) {
         if (typeof p !== 'string' || !p) return 'ERROR: path is required';
-        const abs = resolveAbsRead(p);
+        const abs = resolveAbsRead(p, ctx?.cwd);
         // The prose <...> protocol passes attributes as STRINGS, so `paragraphs`
         // arrives as "0,2,8,23" (or a single "0"), not a JSON array. Accept
         // both: a real array, or a comma/space-separated string of [#id]s.
@@ -7714,7 +9571,7 @@ tracked changes. A find that spans a formatting boundary needs allowFormatFlatte
           .map(Number)
           .filter((n) => !Number.isNaN(n));
         if (!anchors.length) return 'ERROR: paragraphs ([#id] list) is required';
-        const res = await runHelper('detail', { op: 'detail', docx: abs, anchors }, { signal: ctx?.signal });
+        const res = await runHelper('detail', { op: 'detail', docx: abs, anchors }, { signal: ctx?.signal, cwd: ctx?.cwd });
         if (!res || res.ok !== true) return `ERROR: ${res?.code || 'file-error'}: ${res?.error || 'detail failed'}`;
         return { content: renderDetail(res) };
       },
@@ -7743,7 +9600,7 @@ tracked changes. A find that spans a formatting boundary needs allowFormatFlatte
         if (typeof find !== 'string' || !find) return 'ERROR: find is required';
         if (typeof replace !== 'string') return 'ERROR: replace is required';
         let abs;
-        try { abs = resolveDocxWritePath(p); } catch (e) { return `ERROR: ${e.message}`; }
+        try { abs = resolveDocxWritePath(p, ctx?.cwd); } catch (e) { return `ERROR: ${e.message}`; }
 
         const op = { id: Number(paragraph), find, replace };
         if (asTracked) op.asTracked = true;
@@ -7755,7 +9612,7 @@ tracked changes. A find that spans a formatting boundary needs allowFormatFlatte
           const { res, error } = await applyOps(abs, [op], ctx);
           if (error) return 'ERROR: ' + error;
           if (!res || res.ok !== true) return `ERROR: ${res?.code || 'file-error'}: ${res?.error || 'edit failed'}`;
-          return formatOpsResult(res, abs);
+          return formatOpsResult(res, abs, ctx?.cwd);
         }
 
         // ===== GENERAL MODE (direct edits; flatten gated separately) =====
@@ -7771,7 +9628,7 @@ tracked changes. A find that spans a formatting boundary needs allowFormatFlatte
         // it can never happen silently.
         if (allowFormatFlatten) {
           if (typeof ctx?.requireApproval === 'function') {
-            const preview = await runHelper('edit', { op: 'edit', docx: abs, dryRun: true, ops: [{ ...op, allowFormatFlatten: true }] }, { signal: ctx?.signal });
+            const preview = await runHelper('edit', { op: 'edit', docx: abs, dryRun: true, ops: [{ ...op, allowFormatFlatten: true }] }, { signal: ctx?.signal, cwd: ctx?.cwd });
             const previewText = preview?.ops?.[0] ? `"${preview.ops[0].before}" -> "${preview.ops[0].after}"` : `${find} -> ${replace}`;
             const ok = await ctx.requireApproval({
               kind: 'docx-flatten',
@@ -7784,10 +9641,10 @@ tracked changes. A find that spans a formatting boundary needs allowFormatFlatte
           }
         }
 
-        const res = await runHelper('edit', { op: 'edit', docx: abs, dryRun: false, ops: [op], author: 'code_boss', date: new Date().toISOString() }, { signal: ctx?.signal });
+        const res = await runHelper('edit', { op: 'edit', docx: abs, dryRun: false, ops: [op], author: 'code_boss', date: new Date().toISOString() }, { signal: ctx?.signal, cwd: ctx?.cwd });
         if (!res || res.ok !== true) return `ERROR: ${res?.code || 'file-error'}: ${res?.error || 'edit failed'}`;
         const o = (res.ops && res.ops[0]) || { before: '', after: '', flattened: false };
-        const rel = path.relative(process.cwd(), abs) || abs;
+        const rel = path.relative(ctx?.cwd || process.cwd(), abs) || abs;
         const flat = o.flattened ? '  [FORMAT FLATTENED — review/fix formatting manually]' : '';
         const fieldNote = res.updateFieldsOnOpen ? '  (TOC/fields will refresh when opened in Word)' : '';
         const trk = (asTracked || res.trackChanges) ? '  [tracked change — shows as a Word revision]' : '';
@@ -7834,11 +9691,11 @@ tracked changes. A find that spans a formatting boundary needs allowFormatFlatte
         if (color !== undefined) format.color = color;
         if (!Object.keys(format).length) return 'ERROR: provide at least one of bold/italic/underline/strike/font/sizePt/color';
         let abs;
-        try { abs = resolveDocxWritePath(p); } catch (e) { return `ERROR: ${e.message}`; }
+        try { abs = resolveDocxWritePath(p, ctx?.cwd); } catch (e) { return `ERROR: ${e.message}`; }
         const { res, error } = await applyOps(abs, [{ op: 'setRunFormat', id: Number(paragraph), find, format }], ctx);
         if (error) return 'ERROR: ' + error;
         if (!res || res.ok !== true) return `ERROR: ${res?.code || 'file-error'}: ${res?.error || 'format failed'}`;
-        return formatOpsResult(res, abs);
+        return formatOpsResult(res, abs, ctx?.cwd);
       },
     },
     {
@@ -7877,11 +9734,11 @@ tracked changes. A find that spans a formatting boundary needs allowFormatFlatte
         if (numId !== undefined && numId !== null) ops.push({ op: 'setListMembership', id, numId, ...(ilvl !== undefined ? { ilvl } : {}) });
         if (!ops.length) return 'ERROR: provide a style, and/or alignment/indent/spacing, and/or numId';
         let abs;
-        try { abs = resolveDocxWritePath(p); } catch (e) { return `ERROR: ${e.message}`; }
+        try { abs = resolveDocxWritePath(p, ctx?.cwd); } catch (e) { return `ERROR: ${e.message}`; }
         const { res, error } = await applyOps(abs, ops, ctx);
         if (error) return 'ERROR: ' + error;
         if (!res || res.ok !== true) return `ERROR: ${res?.code || 'file-error'}: ${res?.error || 'style edit failed'}`;
-        return formatOpsResult(res, abs);
+        return formatOpsResult(res, abs, ctx?.cwd);
       },
     },
     {
@@ -7902,11 +9759,11 @@ tracked changes. A find that spans a formatting boundary needs allowFormatFlatte
         if (typeof p !== 'string' || !p) return 'ERROR: path is required';
         if (paragraph == null) return 'ERROR: paragraph ([#id]) is required';
         let abs;
-        try { abs = resolveDocxWritePath(p); } catch (e) { return `ERROR: ${e.message}`; }
+        try { abs = resolveDocxWritePath(p, ctx?.cwd); } catch (e) { return `ERROR: ${e.message}`; }
         const { res, error } = await applyOps(abs, [{ op: 'deleteParagraph', id: Number(paragraph) }], ctx);
         if (error) return 'ERROR: ' + error;
         if (!res || res.ok !== true) return `ERROR: ${res?.code || 'file-error'}: ${res?.error || 'delete failed'}`;
-        return formatOpsResult(res, abs);
+        return formatOpsResult(res, abs, ctx?.cwd);
       },
     },
   ],
@@ -8362,6 +10219,26 @@ const RECENT_FILE      = path.join(USER_CONFIG_DIR, 'recent.json');
 const API_KEY_FILE     = path.join(USER_CONFIG_DIR, 'api-key.txt');
 const GITLAB_CREDS_FILE = path.join(USER_CONFIG_DIR, 'gitlab-creds.json');
 const LEGACY_USER_DIR  = path.join(homedir(), '.code-boss');
+
+// Always-responsive orchestrator (continuous-cognition). ON by default — a message that
+// arrives while the foreground is busy is DELEGATED to a background sub-agent isolated in its
+// OWN git worktree (no 409, no queue), so the agent you're talking to is always available.
+// Requires a git repo (worktree isolation); a non-repo busy target still 409s. Set
+// CB_ORCHESTRATOR=0 (or false/off/no) to fall back to the strict serial worker.
+const CB_ORCHESTRATOR = !/^(0|false|off|no)$/i.test(process.env.CB_ORCHESTRATOR ?? '');
+// Adversarial plan-review (#7): after a propose-first PLAN, read-only critics poke holes, then the
+// source agent revises once before approval. ON by default; CB_PLAN_REVIEW=0 disables it.
+const CB_PLAN_REVIEW = !/^(0|false|off|no)$/i.test(process.env.CB_PLAN_REVIEW ?? '');
+// Adaptive cognition (the "make it smarter" mode): a message runs through the cognition
+// scheduler (assess → policy → explore/decompose/recurse/worker/verify, budget-bounded) instead
+// of the plain inline worker. Default off → production unchanged.
+const CB_COGNITION = /^(1|true|on|yes)$/i.test(process.env.CB_COGNITION || '');
+// Decomposition (one task → many parallel worktree sub-agents) is DISABLED by default: the E2E
+// showed it drifts/over-engineers cohesive work and never beat the plain worker. It's gated off
+// (not deleted) so it can be re-enabled for a future genuine-parallel-work experiment. With it
+// off, cognition mode routes every non-answer task to the plain inline worker. The orchestrator's
+// fork+delegate multitasking (CB_ORCHESTRATOR) is independent and unaffected.
+const CB_DECOMPOSE = /^(1|true|on|yes)$/i.test(process.env.CB_DECOMPOSE || '');
 
 async function migrateLegacyUserDir() {
   try {
@@ -9982,30 +11859,17 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
     consolidationAbort: null,
   };
 
-  // ── Single-owner project cwd (refcounted) ──────────────────────────────────
-  // process.cwd() is global, but the worker run AND the fire-and-forget intake
-  // / consolidation passes all need cwd = the active project, and they can
-  // overlap (intake/consolidation take no running-lock). A naive per-site
-  // chdir + restore lets one pass restore cwd out from under another, silently
-  // redirecting a live worker's file/shell/git tools to the wrong directory.
-  // Refcount it: the FIRST entrant chdirs in, the LAST to leave restores. Every
-  // entrant targets the same activeProject, so the directory is stable for as
-  // long as ANY cwd-dependent work is in flight.
-  let _cwdRef = 0, _cwdPrev = null;
-  function enterProjectCwd(project) {
-    if (!project) return false;
-    if (_cwdRef === 0) {
-      _cwdPrev = process.cwd();
-      try { process.chdir(project); } catch { _cwdPrev = null; return false; }
-    }
-    _cwdRef++;
-    return true;
-  }
-  function exitProjectCwd(entered) {
-    if (!entered) return;
-    _cwdRef = Math.max(0, _cwdRef - 1);
-    if (_cwdRef === 0 && _cwdPrev) { try { process.chdir(_cwdPrev); } catch {} _cwdPrev = null; }
-  }
+  // ── Project cwd: RETIRED (the global process.chdir is gone). ────────────────
+  // We no longer mutate the process-wide cwd. Every cwd-dependent path now
+  // resolves against an EXPLICIT per-call directory: the worker passes
+  // ctx.cwd=projectDir into the tools (toolRoot(ctx) in tools.mjs), the read-only
+  // passes thread projectDir (makeRepoResolver + ctx.cwd), the docx/wl plugins
+  // read ctx.cwd, and git-workflow's runGit(cwd,…) was always explicit. This is
+  // what lets concurrent agent threads target different repos. enterProjectCwd/
+  // exitProjectCwd are now no-op stubs so their (vestigial) call sites stay valid
+  // — they MUST NOT touch process.cwd(); remove the call sites in a follow-up.
+  function enterProjectCwd(project) { return !!project; }
+  function exitProjectCwd(_entered) { /* no-op: cwd is per-call now */ }
 
   // Bumps version, returns the new value. Used by all chat-state setters.
   function bumpVersion() { session.version += 1; return session.version; }
@@ -10070,7 +11934,13 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
     // 'context-fill' is a per-turn gauge update (window fill %): broadcast it
     // live but never persist — it fires every turn and would bloat the file.
     // ('compacting-started' IS persisted — it's a rare, meaningful transcript marker.)
-    const ephemeral = event.type === 'tool-progress' || event.type === 'assistant-text-chunk' || event.type === 'context-fill' || event.type === 'task-progress';
+    // Sub-agent activity (tagged subagentChannel) is broadcast live to that sub-agent's
+    // detail drawer but never persisted to the main chat log — it would pollute the
+    // foreground transcript + the reviewer/attribution filters. The completion CARD
+    // (type:'subagent-card', untagged) IS persisted.
+    // subagentChannel-tagged events are drawer-routed + ephemeral (live-only) EXCEPT 'review'
+    // rows, which must persist so a forked task's pending→pass/fail patch can find them.
+    const ephemeral = event.type === 'tool-progress' || event.type === 'assistant-text-chunk' || event.type === 'context-fill' || event.type === 'task-progress' || event.type === 'checklist' || event.type === 'rollback-suggested' || event.type === 'cognition-event' || (!!event.subagentChannel && event.type !== 'review');
     // Stash the latest context-window fill so /api/diagnostics (Snapshot query
     // 24) can surface it — a large/over-budget prompt means the agent is
     // dragging a huge open task each turn (e.g. a model that never emits
@@ -10080,6 +11950,15 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
       // Task-store breakdown rides along on the per-turn gauge (the server can't
       // read the task store without blocking sync I/O). Stashed for the Snapshot.
       if (event.taskStats) session.lastTaskStats = { ...event.taskStats, at: Date.now() };
+    }
+    // Track the ACTIVE checklist (main chat only) so it auto-drives the live panel: it carries
+    // across the propose→approve→implement boundary AND is pinned back into the worker's context
+    // each turn (the <checklist> tag is stripped from history, so the agent can't otherwise see
+    // its own prior list — without this it would drop/restate it inconsistently). Cleared once
+    // every item is done.
+    if (event.type === 'checklist' && !event.subagentChannel) {
+      const items = Array.isArray(event.items) ? event.items : [];
+      session.lastChecklist = (items.length && items.some((i) => !i.done)) ? items : null;
     }
     if (!ephemeral) session.chatEvents.push(ev);
     broadcast({ type: 'event', version: bumpVersion(), event: ev });
@@ -10099,6 +11978,12 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
   function resetChatState() {
     session.chatEvents = [];
     session.nextEventId = 1;
+    session.lastChecklist = null;   // drop any active checklist on reset/clear
+    // Drop the in-memory task store so the NEXT run recreates it (clear deletes the store on disk;
+    // with the orchestrator default-on the store is created eagerly, so without this the stale
+    // in-memory store would suppress recreation and state.json would never come back).
+    session.store = null;
+    session.storeReady = null;
     session.status = 'idle';
     session.phase = 'idle';
     session.error = null;
@@ -10150,6 +12035,7 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
         savedAt: new Date().toISOString(),
         nextEventId: session.nextEventId,
         chatEvents: session.chatEvents,
+        lastChecklist: session.lastChecklist || null,   // so a server restart restores the live panel + the pin
       };
       // ATOMIC write: serialize to a temp sibling, keep the last-good file as
       // .bak, then rename temp onto the live file. rename is atomic, so a
@@ -10192,6 +12078,8 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
     if (data) {
       session.chatEvents = data.chatEvents;
       session.nextEventId = nextIdFor(data);
+      // Restore the active checklist so a server restart re-pins it + the UI re-shows the panel.
+      session.lastChecklist = (Array.isArray(data.lastChecklist) && data.lastChecklist.length) ? data.lastChecklist : null;
       fileLog(`loaded conversation: ${data.chatEvents.length} event(s) from ${file}${recoveredFrom ? ' (recovered from .bak)' : ''}`);
     }
   }
@@ -10232,6 +12120,10 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
       error: session.error,
       activeProject: session.activeProject,
       defaultModel: session.defaultModel,
+      // Always-responsive: when on (+ git repo), a message sent while the foreground is
+      // busy is delegated to a background sub-agent instead of queued/409'd. The client
+      // uses this to route Enter-while-running to send() rather than the queue.
+      orchestrator: CB_ORCHESTRATOR,
       recent: session.recent,
       events,
       hasMoreOlder: !!(eventLimit && eventLimit < session.chatEvents.length),
@@ -10250,11 +12142,12 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
       gitPending: session.gitPending
         ? Object.fromEntries(Object.entries(session.gitPending).map(([k, v]) => [k, { repoDir: k, currentBranch: v.currentBranch }]))
         : null,
-      // A tool asked for explicit developer approval (e.g. edit_docx format
-      // flatten). Bare metadata only — the resolver Promise isn't serializable.
-      approvalPending: session.approvalPending
-        ? { id: session.approvalPending.id, kind: session.approvalPending.kind, message: session.approvalPending.message }
-        : null,
+      // The active checklist, so a reload/reconnect restores the live panel (the server is still
+      // pinning it into the worker each turn — without this the panel goes blank until the next turn).
+      lastChecklist: session.lastChecklist || null,
+      // Shadow-git undo availability (non-repo targets): drives the "undo last run" button.
+      canUndo: !!(session.shadowUndo && session.shadowUndo.commit),
+      undoRequest: (session.shadowUndo && session.shadowUndo.request) || null,
     };
   }
   // Expose helpers so we can use them from /api/chat and from new endpoints later.
@@ -10359,6 +12252,9 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
     // the tree is dirty, set a pending-wizard flag and skip the
     // branch creation — the user resolves via the wizard modal.
     await initGitWorkflow();
+    // Crash-resume (R6): surface any leftover sub-agent worktrees/branches from a previous
+    // session so they're never silently dropped (orchestrator mode only; no-op otherwise).
+    try { await recoverSubagents(session); } catch (e) { fileLog(`recover: ${e.message}`); }
   }
   async function initGitWorkflow() {
     // Phase B: discover EVERY git repo under the active project (the
@@ -10555,6 +12451,269 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
     ? 'anthropic' : 'openai';
   const _makeAdapter = resolvedApiFormat === 'anthropic' ? createAnthropicAdapter : createHttpAdapter;
   const adapter = providedAdapter ?? _makeAdapter(_adapterOpts);
+
+  // ── Always-responsive orchestrator (CB_ORCHESTRATOR) ─────────────────────────
+  // A sub-agent runs as a full worker in its OWN git worktree (subagent-worktree.mjs):
+  // physically isolated writes, merged back on completion; a merge conflict surfaces on
+  // the completion card (the manager re-grounds). The orchestrator creates the per-sub-
+  // agent AbortController + passes its signal here; the shared `adapter` is the transport.
+  const _seedText = (seed) => (Array.isArray(seed) ? seed.map((m) => (m && m.content) || '').join('\n').trim() : String(seed || ''));
+  const _renderConvo = (msgs) => (Array.isArray(msgs)
+    ? msgs.slice(-40).map((m) => `${m.role || 'user'}: ${typeof m.content === 'string' ? m.content : JSON.stringify(m.content)}`).join('\n')
+    : String(msgs || ''));
+
+  // The sub-agent runWorker: a FULL worker (runPromptedAgent) HELD in its own git worktree
+  // (R1). On resume (reject feedback) it re-runs in the SAME worktree. Same shared adapter +
+  // plugin tools as the foreground; tool activity tagged onto the sub-agent's own channel.
+  function makeWorktreeRunWorker(session) {
+    const workerOpts = (id) => ({
+      adapter, model: session.defaultModel,
+      getGitLabCredentials: () => session.gitlabCreds,
+      extraTools: pluginManager.enabledTools(),
+      extraVerbs: pluginManager.enabledVerbs(),
+      promptAdditions: pluginManager.promptAdditions(),
+      projectContext: session.projectContext || '',
+      // Sub-agents run autonomously in the background (their output is gated by the acceptance/review
+      // loop, not per-edit prompts), so auto-approve consequential ops — without this, a tool that
+      // calls ctx.requireApproval (e.g. edit_docx format-flatten) would silently error in a sub-agent.
+      requireApproval: async () => true,
+      onChatEvent: (ev) => { try { chatState.appendChatEvent({ ...ev, subagentChannel: id }); } catch {} },
+      onLog: (m) => fileLog(`[${id}] ${m}`),
+    });
+    return (seed, { id, topic, signal, resume, handle }) => {
+      if (resume && handle) {
+        const feedback = (seed && seed[seed.length - 1] && seed[seed.length - 1].content) || 'Revise per the review feedback.';
+        return resumeWorktreeSubAgent({ worktree: handle.worktree, branch: handle.branch, feedback, topic, signal, ...workerOpts(id) });
+      }
+      return runWorktreeSubAgent({ repoDir: session.activeProject, id, topic, held: true, signal, messages: seed, ...workerOpts(id) });
+    };
+  }
+
+  // ── Adaptive cognition (CB_COGNITION) ──────────────────────────────────────
+  // Map the cognition scheduler's injected primitives onto real agents over the orchestrator.
+  // Cost is NOMINAL work-units per primitive type (matches the abstract complexity-budget;
+  // real-token costing is a later refinement). Workers run isolated in git worktrees + appear
+  // in the existing sub-agents panel/drawer; the cognition TREE streams via onEvent.
+  const COGNITION_COSTS = { assess: 1, proposer: 3, judge: 4, decompose: 3, worker: 10, verify: 4, synthesize: 2 };
+  const COGNITION_PROPOSERS = 3;
+  const COGNITION_LENSES = ['favor the simplest thing that works', 'favor long-term extensibility and clean design', 'favor minimal risk to existing behavior'];
+  function createCognitionPrimitives(session, { signal, onEvent = () => {} } = {}) {
+    const model = session.defaultModel;
+    const repoRoots = session.git?.repoList || [];
+    const projectDir = session.activeProject;
+    let seq = 0;
+    const workerCfg = (id) => ({
+      adapter, model,
+      getGitLabCredentials: () => session.gitlabCreds,
+      extraTools: pluginManager.enabledTools(), extraVerbs: pluginManager.enabledVerbs(), promptAdditions: pluginManager.promptAdditions(),
+      projectContext: session.projectContext || '',
+      onChatEvent: (ev) => { try { chatState.appendChatEvent({ ...ev, subagentChannel: id }); } catch {} },
+      onLog: (m) => fileLog(`[${id}] ${m}`),
+    });
+    return {
+      async assess(brief) { const r = await runCognitiveAssess({ adapter, model, signal, request: brief, projectDir, repoRoots, onLog: (m) => fileLog(`[cog assess] ${m}`) }); return { ...r, cost: COGNITION_COSTS.assess }; },
+      async explore(brief) {
+        // N INDEPENDENT proposers (each via a distinct lens, in parallel) → a JUDGE that
+        // picks/synthesizes. Beats one agent listing options. Falls back to the single-agent
+        // runExplore if every proposer fails.
+        const N = COGNITION_PROPOSERS;
+        onEvent({ type: 'explore-start', n: N });
+        const proposals = (await Promise.all(Array.from({ length: N }, (_, i) => {
+          onEvent({ type: 'proposer', i: i + 1, lens: COGNITION_LENSES[i % COGNITION_LENSES.length] });
+          return runProposer({ adapter, model, signal, brief, lens: COGNITION_LENSES[i % COGNITION_LENSES.length], projectDir, repoRoots }).catch(() => null);
+        }))).filter((p) => p && p.approach);
+        if (!proposals.length) { const r = await runExplore({ adapter, model, signal, brief, projectDir, repoRoots }); return { ...r, cost: COGNITION_COSTS.judge }; }
+        onEvent({ type: 'judge', proposals: proposals.length });
+        const j = await runExploreJudge({ adapter, model, signal, brief, proposals, projectDir, repoRoots });
+        return { brief: j.brief, cost: proposals.length * COGNITION_COSTS.proposer + COGNITION_COSTS.judge };
+      },
+      async decompose(brief) { const r = await runDecompose({ adapter, model, signal, brief, projectDir, repoRoots }); return { ...r, cost: COGNITION_COSTS.decompose }; },
+      async runWorker(brief) {
+        const id = `cog-${++seq}`;
+        const topic = String(brief).slice(0, 60).replace(/\s+/g, ' ').trim() || 'task';
+        onEvent({ type: 'worker-start', id, topic });
+        chatState.broadcast({ type: 'subagent-event', version: chatState.bumpVersion(), event: { type: 'subagent-spawned', id, topic } });
+        let r;
+        try { r = await runWorktreeSubAgent({ repoDir: projectDir, id, topic, held: false, signal, seedMessages: [{ role: 'user', content: String(brief) }], ...workerCfg(id) }); }
+        catch (e) { r = { content: `(worker failed: ${e && e.message ? e.message : String(e)})`, error: true }; }
+        chatState.broadcast({ type: 'subagent-event', version: chatState.bumpVersion(), event: { type: 'subagent-done', id, status: r.error ? 'error' : 'done' } });
+        chatState.appendChatEvent({ type: 'subagent-card', subagentId: id, topic, status: r.error ? 'error' : 'done', content: r.content || '' });
+        return { content: r.content || '', cost: COGNITION_COSTS.worker, integrated: !!r.integrated };
+      },
+      async verify(brief, result) { const r = await runSubAgentAcceptance({ adapter, model, signal, request: brief, conversationChunk: '', workRollup: (result && result.content) || '', worktreePath: projectDir, repoRoots }); return { ok: !!r.approved, feedback: r.feedback, cost: COGNITION_COSTS.verify }; },
+      async synthesize(brief, stepResults) { const r = await runSynthesize({ adapter, model, signal, brief, stepResults }); return { content: r.content, cost: COGNITION_COSTS.synthesize }; },
+    };
+  }
+  async function runCognitionForMessage(session, text, signal) {
+    const onEvent = (cog) => { try { chatState.appendChatEvent({ type: 'cognition-event', cog }); } catch {} };
+    const primitives = createCognitionPrimitives(session, { signal, onEvent });
+    const out = await runCognition({ request: text, primitives, k: 0.8, budgetOpts: { base: 30 }, inlineSingle: true, allowDecompose: CB_DECOMPOSE, onEvent, signal });
+    if (out.inline) return { inline: true };   // single coherent task → the caller runs the plain inline worker
+    let answer;
+    if (out.answer != null) answer = out.answer;
+    else if (out.result && out.result.content) answer = out.result.content;
+    else if (out.result && Array.isArray(out.result.steps)) answer = out.result.steps.map((s) => (s && s.content) || '').filter(Boolean).join('\n\n') || '(completed the decomposed steps)';
+    else answer = '(cognition produced no direct answer)';
+    return { answer, state: out.state };
+  }
+
+  // Lazy per-session orchestrator (built only when CB_ORCHESTRATOR is on). The review loop
+  // is engaged because runAcceptance is injected: a held sub-agent → Acceptance agent →
+  // approve (import into the MANAGER's single store + integrate + remove) | reject (feedback
+  // → resume). session.store is the single-writer import target (the foreground worker keeps
+  // its own private store untouched). Verdict + feedback are visible on BOTH sides.
+  // The SINGLE long-lived session store (orchestrator mode only). The foreground worker AND
+  // the sub-agent import share this ONE instance so there is one nextId + one in-memory state
+  // → no two-instance task-id collision / state.json lost-update on the same .code_boss.
+  // Returns a promise that resolves once init() completes (root exists before any importThread).
+  function ensureSessionStore(session) {
+    if (!session.store) { session.store = createTasksStore(session.activeProject); session.storeReady = session.store.init(); }
+    return session.storeReady;
+  }
+  // Crash-resume (R6): re-attach leftover sub-agent worktrees as recovered (awaiting-review)
+  // entries so the user can re-review or discard them. Branch-only leftovers (worktree gone)
+  // are logged but not adopted (no worktree to review; the branch is kept for manual merge).
+  async function recoverSubagents(session) {
+    if (!CB_ORCHESTRATOR || !session.git || !session.git.isRepo || !session.activeProject) return;
+    const orphans = await listOrphanSubagents(session.activeProject);
+    if (!orphans.length) return;
+    const orch = ensureOrchestrator(session);
+    let adopted = 0, branchOnly = 0;
+    for (const o of orphans) {
+      if (!o.worktree) { branchOnly++; continue; }
+      const r = orch.adopt({ id: o.id, topic: `recovered: ${o.id}`, handle: { branch: o.branch, worktree: o.worktree, storeDir: nodePath.join(o.worktree, '.code_boss', 'tasks'), store: null } });
+      if (r) adopted++;
+    }
+    fileLog(`recover: surfaced ${adopted} recovered sub-agent(s)${branchOnly ? ` (+${branchOnly} branch-only leftover(s) kept for manual merge)` : ''} from a previous session`);
+  }
+  // The MANAGER TURN (the freed foreground answers inline OR delegates, one read-only LLM
+  // call). SINGLE-FLIGHT: messages are queued + drained SERIALLY so two messages fired in
+  // quick succession run their manager turns one-at-a-time (each answered/delegated in order,
+  // no interleaved prose) rather than concurrently. /api/message returns 200 immediately; the
+  // drain runs async, concurrent with the forked task's in-flight tool.
+  function runManagerTurnAsync(session, text) {
+    session.managerQueue = session.managerQueue || [];
+    session.managerQueue.push(text);
+    if (session.managerDraining) return;                 // a drain is already processing the queue
+    session.managerDraining = true;
+    (async () => {
+      try { while (session.managerQueue.length) await runOneManagerTurn(session, session.managerQueue.shift()); }
+      finally { session.managerDraining = false; session.managerBusy = false; }
+    })().catch((e) => { session.managerDraining = false; session.managerBusy = false; fileLog(`[manager] drain leaked: ${e && e.message}`); });
+  }
+  async function runOneManagerTurn(session, text) {
+    const orch = ensureOrchestrator(session);
+    // History = the visible foreground transcript (NOT session.store — the forked worker is
+    // writing that). Drawer-tagged (sub-agent) events are excluded by design.
+    const history = (session.chatEvents || [])
+      .filter((e) => (e.type === 'user-message' || e.type === 'assistant-text') && !e.subagentChannel && typeof e.content === 'string')
+      .slice(-40)
+      .map((e) => ({ role: e.type === 'user-message' ? 'user' : 'assistant', content: e.content }));
+    chatState.appendChatEvent({ type: 'user-message', content: text });   // the manager's own foreground row
+    const subagentStatus = orch.subagents().map((s) => `${s.id} (${s.topic}): ${s.status}`).join('\n');
+    const ac = new AbortController();
+    session.managerAbort = ac;   // so /api/cancel can stop an in-flight manager turn (it has its own controller)
+    session.managerBusy = true;
+    try {
+      const result = await runManagerTurn({
+        adapter, model: session.defaultModel, signal: ac.signal,
+        onLog: (m) => fileLog(`[manager] ${m}`),
+        messages: history, newMessage: text, subagentStatus,
+        projectDir: session.activeProject, repoRoots: session.git?.repoList || [],
+        onProse: ({ turn, segmentIndex, content }) => chatState.appendChatEvent({ type: 'assistant-text-chunk', turn, segmentIndex, content }),
+        onProseEnd: ({ turn, segmentIndex, content }) => { if (content && content.trim()) chatState.appendChatEvent({ type: 'assistant-text', turn, segmentIndex, content }); },
+      });
+      if (result && result.action === 'delegate' && result.brief) {
+        const topic = result.brief.slice(0, 60).replace(/\s+/g, ' ').trim() || 'task';
+        const { subagentId } = orch.delegate(topic, result.brief);
+        chatState.appendChatEvent({ type: 'assistant-text', content: `◇ Delegated to a sub-agent: ${topic}` });
+        fileLog(`[manager] delegated to ${subagentId}: "${topic}"`);
+      }
+    } catch (e) {
+      const aborted = e && e.name === 'AbortError';
+      chatState.appendChatEvent({ type: 'assistant-text', content: `(manager turn ${aborted ? 'canceled' : 'failed'}: ${e.message})` });
+      fileLog(`[manager] turn error: ${e.message}`);
+    } finally {
+      if (session.managerAbort === ac) session.managerAbort = null;
+    }
+  }
+  function ensureOrchestrator(session) {
+    if (!session.orchestrator) {
+      const storeReady = ensureSessionStore(session);   // ready before the first importThread (root must exist)
+      session.orchestrator = createOrchestrator({
+        runWorker: makeWorktreeRunWorker(session),
+        runAcceptance: async (ctx) => {
+          const h = ctx.handle || {};
+          let rollup = '';
+          try {
+            const sub = createTasksStore(h.worktree); await sub.init();
+            const tasks = await sub.exportTasks();
+            rollup = tasks.map((t, i) => `#${i + 1} ${t.userRequest || '(no request)'}\n  summary: ${t.summary || '(none)'}`).join('\n');
+          } catch (e) { fileLog(`[acceptance ${ctx.id}] rollup read failed: ${e.message}`); }
+          return runSubAgentAcceptance({
+            adapter, model: session.defaultModel, signal: ctx.signal,
+            onLog: (m) => fileLog(`[acceptance ${ctx.id}] ${m}`),
+            request: _seedText(ctx.originalRequest),
+            conversationChunk: _renderConvo(ctx.conversationChunk),
+            workRollup: rollup,
+            worktreePath: h.worktree,
+          });
+        },
+        onApprove: async ({ id, topic, handle }) => {
+          await storeReady;
+          // INTEGRATE FIRST: a conflict re-grounds with NOTHING imported (so a conflict
+          // re-ground loop can't duplicate the thread); the single import below runs only
+          // once, on the eventually-clean merge.
+          const merged = await integrate(session.activeProject, handle.branch);
+          if (!merged.merged) return { conflict: true, files: merged.files || [] };
+          let imported = true;
+          try {
+            const sub = handle.store || createTasksStore(handle.worktree);
+            if (typeof sub.init === 'function') await sub.init();
+            const exported = await sub.exportTasks();
+            if (exported.length) await session.store.importThread(exported, { subagentId: id, topic });
+          } catch (e) { imported = false; fileLog(`subagent import failed for ${id}: ${e.message} — preserving worktree ${handle.worktree} for recovery`); }
+          // Only tear down the worktree if the transcript was safely imported; on import
+          // failure keep it so the work is recoverable (the code already merged).
+          if (imported) await removeWorktree(session.activeProject, handle.worktree, { deleteBranch: handle.branch });
+          return { integrated: true };
+        },
+        onReject: ({ id, feedback }) => {
+          // feedback is visible on BOTH sides: a persisted main-chat row + an ephemeral drawer copy
+          try {
+            chatState.appendChatEvent({ type: 'acceptance-feedback', subagentId: id, feedback });
+            chatState.appendChatEvent({ type: 'acceptance-feedback', subagentId: id, feedback, subagentChannel: id });
+          } catch {}
+        },
+        // despawn cleanup for NON-approve terminals (approve already cleaned up): free the
+        // worktree dir; delete the branch only on abort (cancelled) — keep it on
+        // error/rejected/exhausted so the work is recoverable for manual follow-up.
+        onDespawn: async ({ id, status, handle }) => {
+          if (!handle || !handle.worktree) return;
+          try {
+            await removeWorktree(session.activeProject, handle.worktree, { deleteBranch: status === 'aborted' ? handle.branch : null });
+            fileLog(`[onDespawn ${id}] cleaned worktree (status=${status}; branch ${status === 'aborted' ? 'deleted' : 'kept'})`);
+          } catch (e) { fileLog(`[onDespawn ${id}] cleanup failed: ${e.message}`); }
+        },
+        onEvent: (e) => {
+          try {
+            chatState.broadcast({ type: 'subagent-event', version: chatState.bumpVersion(), event: e });
+            if (e.type === 'subagent-verdict') {   // the both-sides bridge: a main-chat row + a drawer copy
+              const row = { type: 'acceptance-verdict', subagentId: e.id, topic: e.topic, verdict: e.approved ? 'approve' : 'reject', rationale: e.feedback || '' };
+              chatState.appendChatEvent(row);
+              chatState.appendChatEvent({ ...row, subagentChannel: e.id });
+            }
+          } catch {}
+        },
+        onCard: (card) => {
+          try {
+            chatState.appendChatEvent({ type: 'subagent-card', subagentId: card.subagentId, topic: card.topic, status: card.status, content: card.content });
+          } catch {}
+        },
+      });
+    }
+    return session.orchestrator;
+  }
 
   async function readBody(req) {
     const chunks = [];
@@ -10834,23 +12993,6 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
         delete session.gitPending[repoDir];
         return sendJson(res, 200, { repoDir, branch: newBranchRes.branch, result: 'ok' });
       }
-      if (req.method === 'POST' && path === '/api/approval-resolve') {
-        // Resolve a pending developer-approval gate (e.g. edit_docx flatten).
-        // Body: { id?, approved: bool }. id is optional but, if given, must
-        // match the current pending request (guards against a stale click
-        // resolving a newer prompt).
-        const raw = await readBody(req);
-        let body; try { body = JSON.parse(raw); }
-        catch { return sendJson(res, 400, { error: 'invalid JSON' }); }
-        const pending = session.approvalPending;
-        if (!pending) return sendJson(res, 400, { error: 'no pending approval' });
-        if (body.id && body.id !== pending.id) return sendJson(res, 409, { error: 'approval id mismatch (stale)' });
-        const approved = body.approved === true;
-        fileLog(`approval ${pending.kind} (${pending.id}): ${approved ? 'APPROVED' : 'denied'}`);
-        try { pending.resolve(approved); } catch {}
-        session.approvalPending = null;
-        return sendJson(res, 200, { ok: true, approved, version: session.version });
-      }
       if (req.method === 'POST' && path === '/api/git-resolve-batch') {
         // End-of-chat resolution: process one decision per repo listed
         // in a git-pending-resolution event. Body:
@@ -11018,6 +13160,19 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
         await chatState.clearConversation();
         return sendJson(res, 200, { ok: true, version: session.version });
       }
+      // Undo the last write-mode run on a NON-repo target (the shadow-git safety net).
+      if (req.method === 'POST' && path === '/api/undo-last-run') {
+        if (session.status === 'running') return sendJson(res, 409, { error: 'agent is running; cancel first' });
+        const u = session.shadowUndo;
+        if (!u || !u.commit) return sendJson(res, 200, { ok: false, note: 'nothing to undo' });
+        const reverted = await shadowRestore(u.dir, u.commit, u.postCommit);
+        if (reverted) {
+          session.shadowUndo = null;   // single-level undo for now (re-running re-snapshots)
+          fileLog(`undo-last-run: reverted "${u.request}" via shadow-git`);
+          return sendJson(res, 200, { ok: true, request: u.request });
+        }
+        return sendJson(res, 500, { ok: false, error: 'undo failed' });
+      }
 
       // ── New chat-state endpoints ───────────────────────────────────────
       if (req.method === 'GET' && path === '/api/state') {
@@ -11129,7 +13284,7 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
               const { facts } = await runConsolidation({
                 adapter, model: session.defaultModel,
                 assignment: { id: a.id, requirement: a.requirement },
-                tasks, existingMemory, signal: consAbort.signal, onLog: fileLog, repoRoots: session.git?.repoList || [],
+                tasks, existingMemory, signal: consAbort.signal, onLog: fileLog, repoRoots: session.git?.repoList || [], projectDir: projectAtAccept,
                 onDiag: (d) => appendChatEvent({ type: 'manager-diagnostic', assignmentId: a.id, ...d }),
               });
               const added = [];
@@ -11343,7 +13498,6 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
           recent ? ('\nRecent main-chat activity (for relevance only, may be unrelated):\n' + recent) : '',
           '\nWhen the requirement is clear, emit the <requirement-card>; otherwise ask one focused question.',
         ].join('\n');
-        const intakeMessages = [{ role: 'user', content: ctx }, ...msgs];
         const intakeModel = body?.model ?? session.defaultModel;
         const ac = new AbortController();
         const entered = enterProjectCwd(session.activeProject);
@@ -11361,22 +13515,24 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
             const calls = t.calls || [], results = t.results || [];
             for (let i = 0; i < calls.length; i++) {
               const c = calls[i], cid = 'intake-' + (nextCallId++);
-              emit({ type: 'tool-call', verb: c.verb, name: c.name, args: c.args, callId: cid });
+              emit({ type: 'tool-call', taskId: 'intake', verb: c.verb, name: c.name, args: c.args, callId: cid });
               const r = results[i];
-              if (r) emit({ type: 'tool-result', status: r.status, content: r.content, fullLen: (r.content || '').length, callId: cid, verb: c.verb, name: c.name });
+              if (r) emit({ type: 'tool-result', taskId: 'intake', status: r.status, content: r.content, fullLen: (r.content || '').length, callId: cid, verb: c.verb, name: c.name });
             }
-            for (let i = calls.length; i < results.length; i++) emit({ type: 'assistant-text', content: results[i].content || '' });
-          } else if (t.kind === 'message') {
-            emit({ type: 'assistant-text', content: t.content || '' });
+          } else if (t.kind === 'prose-chunk') {
+            // Live prose: stream into a bubble exactly like the main chat.
+            emit({ type: 'assistant-text-chunk', taskId: 'intake', turn: t.turn, segmentIndex: t.segmentIndex, content: t.content });
+          } else if (t.kind === 'prose-end') {
+            emit({ type: 'assistant-text', taskId: 'intake', turn: t.turn, segmentIndex: t.segmentIndex, content: t.content });
           } else if (t.kind === 'tokens') {
             emit({ type: 'tokens', total: t.total });
-          } else if (t.kind === 'card') {
-            const p = stripCard(t.prose);
-            if (p) emit({ type: 'assistant-text', content: p });
           }
+          // {kind:'message'} / {kind:'card'} prose is intentionally ignored here —
+          // the streaming transport already rendered it via prose-chunk/prose-end,
+          // and the card itself fills the form via the final intake-done payload.
         };
         try {
-          const result = await runIntake({ adapter, model: intakeModel, messages: intakeMessages, signal: ac.signal, onLog: fileLog, onTurn, repoRoots: session.git?.repoList || [], projectDir: session.activeProject });
+          const result = await runIntake({ adapter, model: intakeModel, messages: msgs, contextNote: ctx, signal: ac.signal, onLog: fileLog, onTurn, repoRoots: session.git?.repoList || [], projectDir: session.activeProject });
           let card = null;
           if (result.complete && result.card) {
             card = { title: result.card.title || '', requirement: result.card.requirement || '', acceptanceCriteria: result.card.acceptanceCriteria || '' };
@@ -11732,9 +13888,52 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
         // Read-only "Discuss" mode: the worker may read/search but not write/
         // edit/run shell (enforced in runPromptedAgent's dispatch + prompt).
         const discussMode = body?.mode === 'discuss';
+        // "Review before applying" (per-message, default off): when on, the worker runs read-only
+        // and PROPOSES first. Kept as a LOCAL until we commit to a fresh run — assigning
+        // session.reviewBeforeApply here would mutate a CURRENTLY-RUNNING worker's approval gate.
+        const reviewBeforeApply = !!body?.review;
         if (!text.trim()) return sendJson(res, 400, { error: 'text is required' });
         if (!session.activeProject) return sendJson(res, 400, { error: 'no project open' });
-        if (session.status === 'running') return sendJson(res, 409, { error: 'chat is already running' });
+        if (session.status === 'running') {
+          // A cancel is in flight — the run hasn't unwound to idle/error yet. Don't fork/manage a
+          // dying run; ask the caller to retry once it settles.
+          if (session.abortController?.signal?.aborted) return sendJson(res, 409, { error: 'cancelling — retry in a moment' });
+          // Review (propose-first) is interactive (propose → approve → implement) and needs the
+          // FOREGROUND. Never fork a review-on message to a background write-mode sub-agent — that
+          // would skip the proposal and change files unapproved.
+          if (reviewBeforeApply) return sendJson(res, 409, { error: 'agent is busy — finish or cancel the current task before a review-mode (propose-first) request' });
+          // ALWAYS-RESPONSIVE (CB_ORCHESTRATOR): the foreground is busy, but instead of
+          // rejecting, delegate this message to a background sub-agent isolated in its own
+          // git worktree. Off / non-git → today's 409. (discuss + assignment seeds run the
+          // foreground inline, so they keep the 409 lock too.)
+          if (CB_ORCHESTRATOR && session.git?.isRepo && !discussMode) {
+            const orch = ensureOrchestrator(session);
+            // THE FORK (R5, once per inline run): the FIRST concurrent message backgrounds the
+            // running inline task as a sub-agent — its worker output redirects to a drawer, it
+            // folds a card on finish, and the foreground becomes a clean MANAGER. No handoff /
+            // WIP-commit: the same worker keeps running in the main dir; only its labeling +
+            // output channel change.
+            if (!session.fork && session.foregroundRequest != null) {
+              session.fork = { id: `fg-${(session.forkSeq = (session.forkSeq || 0) + 1)}`, topic: (session.foregroundRequest || 'current task').slice(0, 60).replace(/\s+/g, ' ').trim() };
+              chatState.broadcast({ type: 'subagent-event', version: chatState.bumpVersion(), event: { type: 'subagent-spawned', id: session.fork.id, topic: session.fork.topic } });
+              fileLog(`/api/message: FORK — backgrounded the running inline task as ${session.fork.id} ("${session.fork.topic}")`);
+            }
+            // THE MANAGER TURN (one-call router): instead of blindly delegating, the freed
+            // manager runs ONE read-only turn (seeded with the conversation) that either
+            // ANSWERS the user inline or emits <delegate> to hand a real task to a sub-agent.
+            // A fresh LLM call, concurrent with the forked task's in-flight tool → responds
+            // immediately (non-blocking). Returns 200 now; the answer/delegate streams via SSE.
+            runManagerTurnAsync(session, text);
+            return sendJson(res, 200, { managing: true, forked: !!session.fork });
+          }
+          return sendJson(res, 409, { error: 'chat is already running' });
+        }
+        // Fresh inline run (N=1). Record its request (so a later fork can label it) and clear
+        // any stale fork state from a prior run.
+        session.foregroundRequest = text;
+        session.fork = null;
+        session.runApproved = false;   // each run needs its own approval when review-before-applying is on
+        session.reviewBeforeApply = reviewBeforeApply;   // commit the per-message review flag now that we're starting a fresh run
         // Fresh run — drop any steer text left over from a prior run.
         session.steerBuffer = [];
         fileLog(`/api/message received: model=${body?.model ?? session.defaultModel} text="${text.slice(0, 100).replace(/\s+/g, ' ')}"`);
@@ -11767,10 +13966,37 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
           // Hoisted so the catch can finalize still-pending review row(s).
           // One combined reviewer call can leave several task footers pending.
           let pendingReviewEvs = [];
+          let shadowPre = null;   // this run's pre-edit shadow snapshot (non-repo only); a post snapshot is taken in finally
           try {
             entered = enterProjectCwd(session.activeProject);
             if (!entered) throw new Error('cannot enter project directory');
+            // SHADOW-GIT safety net: a NON-repo target has no CODE_BOSS branch to revert, so
+            // snapshot the project before this write-mode run edits anything — the developer can
+            // then undo the whole run. Repos already have the CODE_BOSS branch; read-only
+            // (discuss) and propose-first (review) runs don't edit, so skip them. Best-effort.
+            if (session.git && !session.git.isRepo && !discussMode && !reviewBeforeApply && session.activeProject) {
+              try {
+                const c = await shadowSnapshot(session.activeProject, text);
+                if (c) { shadowPre = c; session.shadowUndo = { dir: session.activeProject, commit: c, postCommit: null, request: text.slice(0, 80).replace(/\s+/g, ' ').trim(), at: Date.now() }; }
+              } catch (e) { fileLog(`shadow snapshot failed: ${e.message}`); }
+            }
             fileLog(`chat START: model=${model} q="${text.slice(0, 200).replace(/\s+/g, ' ')}"`);
+            // ADAPTIVE COGNITION (CB_COGNITION): route the message through the cognition
+            // scheduler (assess → policy → explore/decompose/recurse/worker/verify, budget-
+            // bounded) instead of the plain inline worker. Off / non-git / discuss → unchanged.
+            if (CB_COGNITION && session.git?.isRepo && !discussMode) {
+              await ensureSessionStore(session);
+              const cog = await runCognitionForMessage(session, text, signal);
+              if (!(cog && cog.inline)) {
+                if (cog.answer && cog.answer.trim()) chatState.appendChatEvent({ type: 'assistant-text', content: cog.answer });
+                chatState.setStatus('done');
+                fileLog(`cognition DONE: ${cog.state ? `spent ${Math.round(cog.state.spent)}/${Math.round(cog.state.ceiling)} (${cog.state.nodes} nodes)` : '(answered directly)'}`);
+                return;   // the finally still runs (cleanup: clearTimeout, abortController, phase idle)
+              }
+              // single coherent task — the assess router declined to decompose; fall through to
+              // the plain inline worker (the strong baseline), no sub-agent/worktree overhead.
+              fileLog('cognition: single coherent task → handling inline (plain worker)');
+            }
             // Auto-commit hook: fires from runPromptedAgent after every
             // <next-task> task-op. Only does anything when the project
             // is a git repo AND we're on a CODE_BOSS_* branch (set up
@@ -11786,6 +14012,14 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
             // they declined we won't have any uncommitted CODE_BOSS
             // work to commit on those).
             const gitAutoCommitHook = async ({ closedTaskId, userRequest, summary }) => {
+              // The unit of work ended — drop any active checklist AND hide the live panel.
+              // Broadcasting an empty checklist both clears session.lastChecklist (via the capture)
+              // and tells the UI to hide it, so a plan the agent finished-but-didn't-tick (it used
+              // <task-progress> instead of re-emitting the checklist) doesn't linger as a stale
+              // unticked panel. (A read-only propose run doesn't close a task, so the propose→
+              // implement carry-over is unaffected.)
+              if (session.lastChecklist) { try { chatState.appendChatEvent({ type: 'checklist', items: [] }); } catch {} }
+              session.lastChecklist = null;
               // Discuss (read-only) mode: a closed task is just a conversational
               // boundary — no writes happened, so do NOT bind it to the active
               // assignment or commit (and review/acceptance are skipped below).
@@ -11834,16 +14068,23 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
                   fileLog(`git: end-of-task auto-branch ${br.branch} on ${rel} (clean at open, dirtied via non-write_file path)`);
                   // fall through to add + commit on the new CODE_BOSS branch
                 }
-                const add = await runGit(repoDir, ['add', '-A']);
-                if (add.exitCode !== 0) { outcomes.push({ rel, status: 'add-error', detail: add.stderr?.trim() || `exit ${add.exitCode}` }); continue; }
-                const status = await getStatus(repoDir);
-                // Only skip on a CONFIRMED-clean tree. dirty===null means the
-                // status check failed (e.g. index.lock) — attempt the commit
-                // anyway rather than silently dropping the user's work.
-                if (status.dirty === false) continue;
-                const commit = await runGit(repoDir, ['commit', '-F', '-'], { input: msg });
-                if (commit.exitCode !== 0) { outcomes.push({ rel, status: 'commit-error', detail: commit.stderr?.trim() || `exit ${commit.exitCode}` }); continue; }
-                const hash = await getHeadHash(repoDir);
+                // Serialize the index-mutating add+commit through the SAME per-repo git lock
+                // the orchestrator's integrate/removeWorktree use, so a concurrent sub-agent
+                // approval can't collide on .git/index.lock (no-op overhead when uncontended).
+                const cr = await withRepoGitLock(repoDir, async () => {
+                  const add = await runGit(repoDir, ['add', '-A']);
+                  if (add.exitCode !== 0) return { err: 'add-error', detail: add.stderr?.trim() || `exit ${add.exitCode}` };
+                  const status = await getStatus(repoDir);
+                  // Only skip on a CONFIRMED-clean tree. dirty===null means the status check
+                  // failed (e.g. index.lock) — attempt the commit anyway rather than dropping work.
+                  if (status.dirty === false) return { skip: true };
+                  const commit = await runGit(repoDir, ['commit', '-F', '-'], { input: msg });
+                  if (commit.exitCode !== 0) return { err: 'commit-error', detail: commit.stderr?.trim() || `exit ${commit.exitCode}` };
+                  return { hash: await getHeadHash(repoDir) };
+                });
+                if (cr.skip) continue;
+                if (cr.err) { outcomes.push({ rel, status: cr.err, detail: cr.detail }); continue; }
+                const hash = cr.hash;
                 repo.head = hash;
                 commitsByRepo.push({ repoDir, hash });
                 outcomes.push({ rel, status: 'committed', hash, branch: repo.branch });
@@ -11986,36 +14227,21 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
               if (!repoDir || !session.git.repos[repoDir]) return 'ok'; // non-git / untracked write → let through
               return await ensureCodeBossBranch(repoDir);
             };
-            // Generic developer-approval gate handed to tools that need an
-            // explicit human OK before a consequential action (e.g. edit_docx
-            // flattening formatting). Mirrors pauseForBranch: register a
-            // resolver on session.approvalPending, broadcast so the UI shows an
-            // Approve/Deny modal, await /api/approval-resolve, and race the
-            // abort signal so a cancel can't deadlock. Returns boolean.
-            const requireApproval = async ({ kind, message } = {}) => {
-              if (signal?.aborted) return false;
-              const id = randomUUID();
-              const pending = { id, kind: kind || 'approval', message: String(message || 'Approve this action?') };
-              pending.promise = new Promise((resolve) => { pending.resolve = resolve; });
-              session.approvalPending = pending;
-              chatState.broadcast({ type: 'approval-needed', version: chatState.bumpVersion(), id, kind: pending.kind, message: pending.message });
-              chatState.setPhase('paused');
-              const onAbort = () => { try { pending.resolve(false); } catch {} };
-              if (signal) signal.addEventListener('abort', onAbort, { once: true });
-              try {
-                const result = await pending.promise;
-                chatState.setPhase('thinking');
-                return result === true;
-              } finally {
-                if (signal) signal.removeEventListener('abort', onAbort);
-                if (session.approvalPending?.id === id) session.approvalPending = null;
-              }
-            };
+            // The per-edit approval modal is RETIRED. Review-OFF (the default) auto-approves, and
+            // review-ON runs the worker read-only (propose-first), so a write never reaches here.
+            // Revert safety for applied changes now comes from git (the CODE_BOSS branch) and the
+            // shadow-git undo, not a per-edit prompt. Kept as a no-op gate for the tool contract.
+            const requireApproval = async () => !signal?.aborted;
             // Review loop: run agent → review → if fail, feed back as a
             // synthetic user message and re-run; max 2 rounds. If still
             // failing after round 2, surface the issue to the user.
             const REVIEW_MAX_ROUNDS = 2;
             let round = 0;
+            // Fork-aware foreground emit (R5): once this inline run is forked, its review-loop
+            // rows redirect to the backgrounded task's drawer + stop driving the foreground
+            // phase, so the manager foreground stays clean. No-op until/unless forked.
+            const fgAppend = (ev) => (session.fork ? chatState.appendChatEvent({ ...ev, subagentChannel: session.fork.id }) : chatState.appendChatEvent(ev));
+            const fgPhase = (p) => { if (!session.fork) chatState.setPhase(p); };
             let userMessage = text;
             let emitInitialUserMessage = true;
             let lastAgentResult = null;
@@ -12047,17 +14273,25 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
             // not-yet-resolved 'review' events so the outer catch can finalize
             // them. Otherwise an abort/throw mid-review leaves rows stuck on
             // state:'pending' forever (spinning "reviewing…" rows).
+            // Orchestrator mode: the foreground worker shares the SINGLE session store so it
+            // and any concurrent sub-agent import are one instance (no two-store race). Off → null.
+            let fgStore = null;
+            if (CB_ORCHESTRATOR) { await ensureSessionStore(session); fgStore = session.store; }
             while (true) {
               const turnStartIdx = session.chatEvents.length;
               const result = await runPromptedAgent({
                 adapter,
                 messages: [{ role: 'user', content: userMessage }],
                 model,
+                store: fgStore,
                 projectDir: session.activeProject,
                 maxTurns: 20,
                 signal,
-                onChatEvent: (ev) => chatState.appendChatEvent(ev),
-                onPhase: (p) => chatState.setPhase(p),
+                // If this inline run got FORKED (R5), its worker output redirects to the
+                // backgrounded task's drawer channel + stops driving the foreground phase, so
+                // the foreground reads as a clean manager. Until/unless forked → foreground.
+                onChatEvent: (ev) => (session.fork ? chatState.appendChatEvent({ ...ev, subagentChannel: session.fork.id }) : chatState.appendChatEvent(ev)),
+                onPhase: (p) => { if (!session.fork) chatState.setPhase(p); },
                 onLog: (msg) => fileLog(msg),
                 emitInitialUserMessage,
                 extraTools: pluginManager.enabledTools(),
@@ -12070,6 +14304,12 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
                 requireApproval,
                 getGitLabCredentials: () => session.gitlabCreds,
                 discussMode,
+                // REVIEW (propose-first): review-on (and not already discuss) runs the worker
+                // read-only and asks for a PROPOSAL the developer approves before implementing.
+                reviewMode: session.reviewBeforeApply && !discussMode,
+                // The active checklist, pinned into the prompt each turn so it auto-drives the
+                // live panel + carries across the approve→implement boundary (read fresh per turn).
+                getActiveChecklist: () => session.lastChecklist || null,
                 // Drain queued steer text at each turn boundary. splice(0) is
                 // atomic within a JS tick, so a concurrent /api/steer push
                 // either lands before the drain (this turn) or after (next).
@@ -12093,6 +14333,47 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
               // per-task review + acceptance gate entirely (one agent run, then stop).
               if (discussMode) { fileLog('discuss mode: skipping review + acceptance'); break; }
 
+              // #7 ADVERSARIAL PLAN-REVIEW: a propose-first (review) run produced a PLAN read-only
+              // (no task closed). Fan out read-only critics to poke holes at the plan against the
+              // actual code, feed any concerns back to the SOURCE agent for ONE revision, then let
+              // approval proceed on the hardened plan. Best-effort: any failure degrades to the
+              // un-hardened plan (the propose flow is never blocked). Skip if forked.
+              if (session.reviewBeforeApply && !session.fork) {
+                if (CB_PLAN_REVIEW && result.content && result.content.trim() && !signal?.aborted) {
+                  try {
+                    const proposal = result.content;
+                    const runCritic = (lens) => runPromptedAgent({
+                      adapter, model, store: null, projectDir: session.activeProject, signal,
+                      discussMode: true, maxTurns: 6,
+                      messages: [{ role: 'user', content: planCriticMessage(lens.focus, proposal) }],
+                      onChatEvent: () => {}, onPhase: () => {}, onLog: (m) => fileLog(m),
+                      codebaseMemory, projectContext: session.projectContext || '',
+                      requireBranch: async () => 'ok', requireApproval: async () => true,
+                      getGitLabCredentials: () => session.gitlabCreds,
+                    }).then((r) => (r && r.content) || '');
+                    const concerns = await runAdversarialPlanReview({ runCritic, emit: (e) => fgAppend(e), signal });
+                    if (concerns.length && !signal?.aborted) {
+                      fileLog(`plan-review: ${concerns.length} concern(s) → source revising the plan once`);
+                      fgPhase('thinking');
+                      await runPromptedAgent({
+                        adapter, model, store: fgStore, projectDir: session.activeProject, signal,
+                        messages: [{ role: 'user', content: planRevisionMessage(proposal, concerns) }],
+                        maxTurns: 20, reviewMode: true,
+                        onChatEvent: (ev) => fgAppend(ev), onPhase: (p) => fgPhase(p), onLog: (m) => fileLog(m),
+                        extraTools: pluginManager.enabledTools(), extraVerbs: pluginManager.enabledVerbs(),
+                        promptAdditions: [...pluginManager.promptAdditions(), ...assignmentPromptAdditions],
+                        codebaseMemory, projectContext: session.projectContext || '',
+                        requireBranch, requireApproval, getGitLabCredentials: () => session.gitlabCreds,
+                        getActiveChecklist: () => session.lastChecklist || null,
+                      });
+                    } else {
+                      fileLog('plan-review: no concerns — plan stands');
+                    }
+                  } catch (e) { fileLog(`plan-review failed (degrading to the un-hardened plan): ${e.message}`); }
+                }
+                break;   // propose run complete → the developer approves the (hardened) plan
+              }
+
               // PER-TASK REVIEW: the reviewer fires ONLY when the agent marked
               // a task done (<next-task> → a 'task-end' event this round), and
               // reviews the WHOLE task. A round that closes no task (pure Q&A /
@@ -12104,7 +14385,7 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
                 fileLog('reviewer skipped: no task closed this round');
                 break;
               }
-              chatState.setPhase('reviewing');
+              fgPhase('reviewing');
               // COMBINED REVIEW: ONE reviewer session per round for ALL tasks
               // closed this round. Each task gets its own footer row (pending),
               // and the single runReviewer call returns a per-task verdict that
@@ -12116,7 +14397,7 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
               const reviewTasks = [];     // runReviewer({ tasks }) input
               for (const te of closedTaskEnds) {
                 const reviewTaskId = te.taskId || null;
-                const reviewEv = chatState.appendChatEvent({
+                const reviewEv = fgAppend({
                   type: 'review',
                   state: 'pending',
                   round: round + 1,
@@ -12144,10 +14425,11 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
                 tasks: reviewTasks,
                 signal,
                 onLog: (msg) => fileLog(msg),
-                onDiag: (d) => chatState.appendChatEvent({ type: 'manager-diagnostic', ...d }),
+                onDiag: (d) => fgAppend({ type: 'manager-diagnostic', ...d }),
                 // Multi-repo: resolve the reviewer's repo-relative read paths
                 // against the actual sub-repos, not just the workspace root.
                 repoRoots: session.git?.repoList || [],
+                projectDir: session.activeProject,   // cwd-independent path resolution (no process.chdir)
               });
               const verdictById = new Map(verdicts.map((v) => [v.taskId, v]));
               // Map each verdict back to its footer row. Collect ALL failing
@@ -12197,13 +14479,25 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
                 ? failingConcerns[0].concerns
                 : failingConcerns.map((f) => `• Task ${f.taskId || ''}${f.summary ? ` (${f.summary})` : ''}:\n${f.concerns}`).join('\n\n');
               round++;
-              // Re-invoke with the reviewer's concerns as the next agent input.
-              // Suppress the user-message event since the review event itself
-              // already shows the feedback to the user.
-              const taskNoun = failingConcerns.length === 1 ? 'the task you just closed' : 'tasks you just closed';
-              userMessage = `The reviewer found issues with ${taskNoun}:\n\n${failedConcerns}\n\nPlease address these concerns, then close the task again with <next-task> when fixed.`;
+              // SINGLE flagged task → RE-OPEN it so the review-fix folds into the SAME task and they
+              // roll up together (instead of a wasteful separate task for work we already know is
+              // about this change). Multi-task rounds keep the combined-fix behavior (can't merge
+              // several into one). Needs the foreground store (orchestrator default-on provides it).
+              let reopened = false;
+              if (failingConcerns.length === 1 && failingConcerns[0].taskId && fgStore && typeof fgStore.reopenTask === 'function') {
+                try { reopened = await fgStore.reopenTask(failingConcerns[0].taskId); } catch (e) { fileLog(`reopenTask failed: ${e.message}`); }
+              }
+              // Re-invoke with the reviewer's concerns as the next agent input. Suppress the
+              // user-message event since the review event itself already shows the feedback.
+              if (reopened) {
+                fileLog(`reviewer: re-opened ${failingConcerns[0].taskId} so the fix folds into it`);
+                userMessage = `The reviewer found issues with the task you just closed — it has been RE-OPENED, so your fix lands in the SAME task. Address these concerns, then re-close it with <next-task> when fixed. Do NOT open a new task for this.\n\n${failedConcerns}`;
+              } else {
+                const taskNoun = failingConcerns.length === 1 ? 'the task you just closed' : 'tasks you just closed';
+                userMessage = `The reviewer found issues with ${taskNoun}:\n\n${failedConcerns}\n\nPlease address these concerns, then close the task again with <next-task> when fixed.`;
+              }
               emitInitialUserMessage = false;
-              chatState.setPhase('uploading');
+              fgPhase('uploading');
             }
             const dur = Date.now() - chatStart;
             fileLog(`chat DONE (with review): rounds=${round + 1} duration=${dur}ms`);
@@ -12278,6 +14572,7 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
                   onLog: (m) => fileLog(m),
                   onDiag: (d) => chatState.appendChatEvent({ type: 'manager-diagnostic', ...d }),
                   repoRoots: session.git?.repoList || [],
+                  projectDir: session.activeProject,   // cwd-independent path resolution (no process.chdir)
                 });
                 await session.assignments.setVerdict(asgNow.id, { round: round + 1, ...verdict });
                 // Surface per-task review state on the gate so the Accept
@@ -12303,7 +14598,16 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
                 fileLog(`acceptance check failed: ${e.message}`);
               }
             }
-            chatState.setStatus('done');
+            if (session.fork) {
+              // This inline run was forked into a background task — fold its result as a card
+              // (not the foreground 'done') and free the foreground (manager → inline again).
+              const fk = session.fork; session.fork = null;
+              chatState.appendChatEvent({ type: 'subagent-card', subagentId: fk.id, topic: fk.topic, status: 'done', content: (lastAgentResult && lastAgentResult.content) || 'done' });
+              chatState.broadcast({ type: 'subagent-event', version: chatState.bumpVersion(), event: { type: 'subagent-done', id: fk.id, status: 'done' } });
+              chatState.setStatus('idle');
+            } else {
+              chatState.setStatus('done');
+            }
           } catch (e) {
             const dur = Date.now() - chatStart;
             const aborted = e?.name === 'AbortError' || /aborted/i.test(e?.message ?? '');
@@ -12316,6 +14620,16 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
               }
               pendingReviewEvs = [];
             }
+            if (session.fork) {
+              // A forked (backgrounded) run errored — surface it as the sub-agent's card, not
+              // a foreground error; the foreground manager stays usable.
+              const fk = session.fork; session.fork = null;
+              chatState.appendChatEvent({ type: 'subagent-card', subagentId: fk.id, topic: fk.topic, status: aborted ? 'aborted' : 'error', content: `(${aborted ? 'aborted' : 'failed'}: ${e.message})` });
+              chatState.broadcast({ type: 'subagent-event', version: chatState.bumpVersion(), event: { type: 'subagent-done', id: fk.id, status: aborted ? 'aborted' : 'error' } });
+              chatState.setStatus('idle');
+              fileLog(`chat (forked ${fk.id}) ${aborted ? 'ABORTED' : 'ERROR'} after ${dur}ms: ${e.message}`);
+              return;   // skip the foreground error finalization; the finally still cleans up
+            }
             chatState.setError(aborted ? (session.error || 'aborted') : e.message);
             chatState.setStatus('error');
             fileLog(`chat ${aborted ? 'ABORTED' : 'ERROR'} after ${dur}ms: ${e.message}`);
@@ -12324,6 +14638,11 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
             }
             logEvent('error', { message: e.message });
           } finally {
+            // Capture a POST-run shadow snapshot so undo reverts only this run's pre→post delta,
+            // not files the user creates afterward (a blanket clean -fd would delete those).
+            if (shadowPre && session.shadowUndo && session.shadowUndo.commit === shadowPre && !session.shadowUndo.postCommit) {
+              try { const pc = await shadowSnapshot(session.activeProject, 'post-run'); if (pc && pc !== shadowPre) session.shadowUndo.postCommit = pc; } catch (e) { fileLog(`shadow post-snapshot failed: ${e.message}`); }
+            }
             clearTimeout(timeoutId);
             session.abortController = null;
             session.chatStartedAt = null;
@@ -12343,11 +14662,25 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
         return sendJson(res, 200, { ok: true, version: session.version });
       }
       if (req.method === 'POST' && path === '/api/cancel') {
-        if (session.abortController) {
-          try { session.abortController.abort(); } catch {}
-          return sendJson(res, 200, { ok: true, version: session.version });
-        }
-        return sendJson(res, 200, { ok: true, version: session.version, note: 'no chat in progress' });
+        // Cancel the foreground/forked worker AND an in-flight manager turn (separate controller).
+        let any = false;
+        if (session.managerAbort) { try { session.managerAbort.abort(); any = true; } catch {} }
+        if (session.abortController) { try { session.abortController.abort(); any = true; } catch {} }
+        return sendJson(res, 200, { ok: true, version: session.version, ...(any ? {} : { note: 'no chat in progress' }) });
+      }
+      // Act on a sub-agent (review loop / crash-resume): re-review or discard. The UI calls
+      // this for recovered or awaiting-review sub-agents.
+      if (req.method === 'POST' && path === '/api/subagent-action') {
+        const raw = await readBody(req);
+        let body; try { body = JSON.parse(raw); } catch { return sendJson(res, 400, { error: 'invalid JSON' }); }
+        const id = (body?.id || '').toString();
+        const action = (body?.action || '').toString();
+        const orch = session.orchestrator;
+        if (!orch) return sendJson(res, 409, { error: 'orchestrator not active' });
+        if (!id) return sendJson(res, 400, { error: 'id required' });
+        if (action === 'review') { const ok = orch.review(id); return sendJson(res, 200, { ok, action }); }
+        if (action === 'discard') { const ok = orch.abort(id); return sendJson(res, 200, { ok, action }); }
+        return sendJson(res, 400, { error: 'action must be review|discard' });
       }
       if (req.method === 'POST' && path === '/api/probe-thinking') {
         // Diagnostic: fire a battery of "thinking/effort" param shapes at the
@@ -12479,7 +14812,7 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
         const prevCwd = process.cwd();
         let cwdChanged = false;
         if (session.activeProject) {
-          try { process.chdir(session.activeProject); cwdChanged = true; }
+          try { cwdChanged = true; /* process.chdir removed — global cwd retired; this endpoint is dead (410) */ }
           catch (e) {
             emitText(`(error: cannot enter project directory: ${e.message})`);
             emitFinish('stop');
@@ -12565,7 +14898,7 @@ async function startServer({ html, baseURL, apiKey, gitlabCreds, defaultModel, p
           fileLog(`chat ERROR: ${e.message}`);
           send({ error: { message: e.message, stack: e.stack } });
         } finally {
-          if (cwdChanged) process.chdir(prevCwd);
+          void cwdChanged; void prevCwd;   /* process.chdir restore removed — global cwd retired (dead 410 path) */
           res.write('data: [DONE]\n\n');
           res.end();
         }
@@ -13317,6 +15650,26 @@ const UI_HTML = `<!DOCTYPE html>
   .diff-block .dl.del { background: rgba(220, 80, 80, 0.10); color: #f0a8a8; }
   .diff-block .dl.hunk { color: var(--muted); }
   .diff-block .dl.same { color: var(--muted); }
+  /* Grouped memory saves (consecutive <remember> calls). */
+  .remember-group { margin: 1px 0; }
+  .remember-group .rg-hdr { cursor: pointer; color: var(--muted); user-select: none; }
+  .remember-group .rg-hdr::before { content: '▾ '; display: inline-block; width: 1em; }
+  .remember-group.collapsed .rg-hdr::before { content: '▸ '; }
+  .remember-group .rg-hdr:hover { color: var(--accent); }
+  .remember-group.collapsed .rg-body { display: none; }
+  .remember-group .rg-body { padding: 2px 0 2px 18px; }
+  .remember-group .rg-item { color: var(--muted); font-size: 12px; white-space: pre-wrap; word-break: break-word; }
+  /* Tint the 🧠 emoji from its default pink toward our orange accent (kills the clash). The exact
+     shade is tunable via these filter values. */
+  .remember-group .rg-icon { display: inline-block; filter: grayscale(1) sepia(1) saturate(4) hue-rotate(-18deg) brightness(0.95); }
+  /* Adversarial plan-review (#7). */
+  .row.plan-review { font-style: italic; }
+  .row.plan-review .pr-hdr { color: var(--accent); font-style: normal; }
+  .row.plan-review .pr-findings { margin: 3px 0 2px 18px; }
+  .row.plan-review .pr-finding { color: var(--muted); font-size: 12px; font-style: normal; padding: 1px 0; white-space: pre-wrap; word-break: break-word; }
+  /* Checklists side-tab (scroll-synced). */
+  .checklist-tab { padding: 6px 8px; }
+  .checklist-empty { color: var(--muted); font-size: 12px; line-height: 1.5; padding: 4px 2px; }
 
   /* ── Task wraps ─────────────────────────────────────────────────────────
      Minimalist: no full box. The request sits at the top (orange + bold),
@@ -13411,8 +15764,10 @@ const UI_HTML = `<!DOCTYPE html>
     cursor: pointer;
     user-select: none;
     color: var(--muted);
-    opacity: 0.5;
-    font-size: 10px;
+    opacity: 0.6;
+    font-size: 15px;        /* bigger, easier to hit/see */
+    line-height: 1;
+    padding: 0 4px;
     font-style: normal;
     flex-shrink: 0;
   }
@@ -13517,8 +15872,8 @@ const UI_HTML = `<!DOCTYPE html>
     white-space: pre-wrap;
     word-wrap: break-word;
     background: var(--panel);
-    border-left: 2px solid currentColor;
-    border-radius: 3px;
+    border-left: 2px solid var(--muted);   /* square + light-gray left border, like the diff view */
+    border-radius: 0;
     padding: 6px 10px;
     margin-top: 2px;
     font-size: 12.5px;
@@ -13618,6 +15973,22 @@ const UI_HTML = `<!DOCTYPE html>
     pointer-events: none;
     z-index: 1;
   }
+  .checklist-panel {
+    max-width: 860px;
+    margin: 0 auto 6px;
+    padding: 7px 10px;
+    background: var(--panel, #1a1d23);
+    border: 1px solid var(--border, #2a2f3a);
+    border-radius: 8px;
+    font-size: 12.5px;
+    max-height: 30vh;
+    overflow-y: auto;
+  }
+  .checklist-panel .cl-title { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; margin-bottom: 4px; }
+  .checklist-item { display: flex; gap: 7px; align-items: baseline; padding: 2px 0; line-height: 1.35; }
+  .checklist-item .cl-box { flex: none; width: 1.1em; }
+  .checklist-item.done { color: var(--muted); }
+  .checklist-item.done .cl-text { text-decoration: line-through; }
   .input-row {
     max-width: 860px;
     margin: 0 auto;
@@ -14646,15 +17017,87 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     .row.assignment-gate .gate-line.missing { color: #c9a227; }
     .row.assignment-gate .gate-line.drift { color: var(--muted); }
     .row.assignment-gate .gate-actions { display: flex; gap: 6px; margin-top: 6px; }
+    /* ── Sub-agents (orchestrator delegation) ── */
+    .sa-list { display: flex; flex-direction: column; gap: 6px; padding: 6px; }
+    .sa-empty { color: var(--muted); font-size: 12px; padding: 10px 8px; line-height: 1.4; }
+    .sa-item { display: flex; align-items: center; gap: 8px; padding: 7px 9px; border: 1px solid var(--border); border-radius: 6px; cursor: pointer; background: var(--panel); }
+    .sa-item:hover { border-color: var(--accent); }
+    .sa-item .sa-dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; background: var(--muted); }
+    .sa-item.working .sa-dot, .sa-item.reviewing .sa-dot { background: var(--accent); animation: sa-pulse 1.1s ease-in-out infinite; }
+    .sa-item.awaiting-review .sa-dot { background: #c9a227; }
+    .sa-item.done .sa-dot { background: #4a9d4a; }
+    .sa-item.error .sa-dot, .sa-item.aborted .sa-dot, .sa-item.rejected .sa-dot { background: #c0524a; }
+    .sa-item.conflict .sa-dot, .sa-item.unmergeable .sa-dot { background: #c9a227; }
+    .sa-item.recovered .sa-dot { background: #c9a227; }
+    .cog-budget { padding: 6px 8px; }
+    .cog-budget:empty { display: none; }
+    .cog-bar { height: 6px; border-radius: 3px; background: var(--border); overflow: hidden; }
+    .cog-bar-fill { height: 100%; background: var(--accent); transition: width .2s; }
+    .cog-bar-label { font-size: 10px; color: var(--muted); margin-top: 3px; }
+    .cog-tree { font-family: var(--mono, monospace); font-size: 11px; line-height: 1.7; overflow-y: auto; }
+    .cog-row { white-space: nowrap; color: var(--fg); }
+    .cog-row.cog-node { color: var(--accent); }
+    .cog-row.cog-decompose, .cog-row.cog-explore { color: #c9a227; }
+    .cog-row.cog-stopped { color: #c0524a; }
+    .cog-row.cog-verify { color: var(--muted); }
+    .cog-row.cog-done { color: #4a9e6a; }
+    .sa-item .sa-act-btn { flex: 0 0 auto; font-size: 10px; padding: 2px 7px; border: 1px solid var(--border); border-radius: 4px; background: var(--panel); color: var(--fg); cursor: pointer; }
+    .sa-item .sa-act-btn:hover { border-color: var(--accent); }
+    .sa-item .sa-act-btn.danger:hover { border-color: #c0524a; color: #c0524a; }
+    /* acceptance verdict / feedback rows in the main chat */
+    .row.acceptance-verdict { border-left: 3px solid #4a9d4a; padding: 7px 10px; margin: 6px 0; cursor: pointer; }
+    .row.acceptance-verdict.reject { border-left-color: #c9a227; }
+    .row.acceptance-verdict .av-head { font-weight: 600; margin-bottom: 2px; }
+    .row.acceptance-verdict .av-body { color: var(--muted); font-size: 12px; }
+    .sa-act.sa-act-verdict { border-left: 2px solid #4a9d4a; padding-left: 8px; }
+    .sa-act.sa-act-verdict.reject { border-left-color: #c9a227; }
+    .sa-act.sa-act-feedback { border-left: 2px solid #c9a227; padding-left: 8px; color: var(--fg); }
+    .sa-item .sa-topic { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+    .sa-item .sa-state { font-size: 10px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); flex: 0 0 auto; }
+    @keyframes sa-pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+    /* collapsed-panel fallback list under the input */
+    .sa-fallback { display: none; border-top: 1px solid var(--border); max-height: 32vh; overflow-y: auto; background: var(--panel); }
+    .sa-fallback.show { display: block; }
+    .sa-fallback .sa-fallback-head { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); padding: 7px 12px 2px; }
+    /* right slide-out drawer: one sub-agent's live activity, covers most of the screen */
+    .sa-drawer-bg { position: fixed; inset: 0; background: rgba(0,0,0,.45); z-index: 120; display: none; justify-content: flex-end; }
+    .sa-drawer-bg.show { display: flex; }
+    .sa-drawer { width: 78vw; max-width: 1100px; height: 100%; background: var(--panel); border-left: 1px solid var(--border); display: flex; flex-direction: column; box-shadow: -8px 0 24px rgba(0,0,0,.35); transform: translateX(100%); transition: transform .18s ease; }
+    .sa-drawer-bg.show .sa-drawer { transform: translateX(0); }
+    .sa-drawer-head { display: flex; align-items: center; gap: 10px; padding: 12px 16px; border-bottom: 1px solid var(--border); }
+    .sa-drawer-head .sa-drawer-title { flex: 1; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .sa-drawer-head .sa-drawer-state { font-size: 11px; text-transform: uppercase; color: var(--muted); }
+    .sa-drawer-head button { background: none; border: none; color: var(--fg); font-size: 22px; cursor: pointer; line-height: 1; padding: 0 4px; }
+    .sa-drawer-body { flex: 1; overflow-y: auto; padding: 12px 16px; }
+    .sa-drawer-result { border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; margin-bottom: 12px; background: var(--bg, var(--panel)); }
+    .sa-act { font-family: ui-monospace, monospace; font-size: 12px; white-space: pre-wrap; word-break: break-word; padding: 4px 0; border-bottom: 1px solid var(--border); color: var(--fg); }
+    .sa-act .sa-act-verb { color: var(--accent); font-weight: 600; }
+    .sa-act-empty { color: var(--muted); font-size: 12px; padding: 8px 0; }
+    /* inline completion card in the main chat */
+    .row.subagent-card { border-left: 3px solid var(--accent); padding: 8px 10px; margin: 6px 0; }
+    .row.subagent-card.done { border-left-color: #4a9d4a; }
+    .row.subagent-card.error, .row.subagent-card.aborted { border-left-color: #c0524a; }
+    .row.subagent-card.conflict { border-left-color: #c9a227; }
+    .row.subagent-card .sa-card-head { font-weight: 600; margin-bottom: 3px; }
+    .row.subagent-card .sa-card-preview { color: var(--muted); font-size: 12px; }
   </style>
   <aside id="sidePanel">
     <div class="side-tabs" role="tablist">
-      <button class="side-tab active" id="tabbtn-queue" onclick="selectSideTab('queue')">Queue<span class="side-tab-count" id="queueCount"></span></button>
+      <!-- Order (left→right): Checklists, Assignments, Memory, Sub-agents. Cognition/Queue hidden. -->
+      <button class="side-tab active" id="tabbtn-checklists" onclick="selectSideTab('checklists')">Checklists<span class="side-tab-count" id="checklistCount"></span></button>
       <button class="side-tab" id="tabbtn-assignments" onclick="selectSideTab('assignments')">Assignments<span class="side-tab-count" id="backlogCount"></span></button>
       <button class="side-tab" id="tabbtn-memory" onclick="selectSideTab('memory')">Memory</button>
+      <button class="side-tab" id="tabbtn-subagents" onclick="selectSideTab('subagents')" style="display:none;">Sub-agents<span class="side-tab-count" id="subagentCount"></span></button>
+      <button class="side-tab" id="tabbtn-cognition" onclick="selectSideTab('cognition')" style="display:none;">Cognition<span class="side-tab-count" id="cognitionCount"></span></button>
+      <!-- Queue tab retired (#9): busy messages are delegated async by the orchestrator, not queued. -->
+      <button class="side-tab" id="tabbtn-queue" onclick="selectSideTab('queue')" style="display:none;">Queue<span class="side-tab-count" id="queueCount"></span></button>
       <button id="sideToggle" class="side-collapse" onclick="toggleSidePanel()" title="Collapse the side panel">«</button>
     </div>
     <div class="side-panes">
+      <!-- CHECKLISTS — scroll-synced: shows the checklist of the task in the viewport middle. -->
+      <div class="side-pane" id="pane-checklists">
+        <div id="checklistTab" class="checklist-tab"></div>
+      </div>
       <!-- ASSIGNMENTS -->
       <div class="side-pane hidden" id="pane-assignments">
         <div class="pane-actions">
@@ -14679,7 +17122,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
         <div class="backlog-list" id="backlogList"></div>
       </div>
       <!-- QUEUE -->
-      <div class="side-pane" id="pane-queue">
+      <div class="side-pane hidden" id="pane-queue">
         <div class="queue-stack" id="queueStack"></div>
         <div class="pane-empty" id="queueEmpty">No queued messages.<br>In the chat box, press <b>⇧←</b> to queue your current draft. Click a queued item and press <b>⇧→</b> to pull it back into the box.</div>
       </div>
@@ -14689,6 +17132,14 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
         <div class="pane-hint">Durable facts about this codebase, grouped by type. One fact per line — edits autosave.</div>
         <div id="memoryList"></div>
       </div>
+      <!-- SUB-AGENTS -->
+      <div class="side-pane hidden" id="pane-subagents">
+        <div class="sa-list" id="saList"></div>
+      </div>
+      <div class="side-pane hidden" id="pane-cognition">
+        <div class="cog-budget" id="cogBudget"></div>
+        <div class="cog-tree" id="cogTree"><div class="sa-empty">When a message runs in cognition mode, its thinking tree streams here — how it sized the problem, which strategies engaged, and how the budget was spent.</div></div>
+      </div>
     </div>
     <div class="side-chrome" id="sideChrome">
       <span class="proj-path" id="projectPath" title="Click to switch project" onclick="changeProject()">(no project)</span>
@@ -14697,7 +17148,11 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       <span class="wl-chip" id="wlIndicator" title="" style="display:none;">weblogic</span>
       <span class="edit-toggle" id="editToggle" onclick="toggleEditAllowed()" title="edit — the agent edits files and runs commands. Click to switch to read-only (discuss): it investigates and explains but won't modify files or run shell commands.">edit</span>
       <input type="checkbox" id="discussToggle" style="display:none;">
+      <span class="edit-toggle" id="reviewLabel" onclick="toggleReview()" title="Auto-approve ON — changes apply directly. Click to turn it OFF: the agent proposes a detailed plan + diffs first and waits for your approval.">Auto-approve</span>
+      <input type="checkbox" id="reviewToggle" style="display:none;">
+      <span class="edit-toggle" id="approveImplementBtn" onclick="approveImplement()" style="display:none;" title="Approve the proposal above and implement it — this one run applies the changes.">✓ approve &amp; implement</span>
       <span class="dirty-indicator" id="gitDirtyIndicator" title="" style="display:none;">⚠</span>
+      <span class="edit-toggle" id="undoRunBtn" onclick="undoLastRun()" style="display:none;" title="Undo the last run's file changes (this folder isn't a git project, so code_boss kept an internal snapshot).">⤺ undo last run</span>
       <button class="settings-btn" id="settingsBtn" onclick="openSettings()" title="Settings — model, API key, GitLab, timeout, Snapshot, Log, Clear conversation, Probe">⚙</button>
     </div>
   </aside>
@@ -14711,6 +17166,8 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
 
   <footer>
     <!-- The pending-message queue now lives in the side panel's Queue tab. -->
+    <!-- Live checklist: the agent's <checklist> for multi-step work, ticking off in place. -->
+    <div id="checklistPanel" class="checklist-panel" style="display:none;"></div>
     <div class="input-row">
       <textarea id="input" placeholder="Ask…" rows="1"></textarea>
       <button id="steerBtn"
@@ -14726,6 +17183,8 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       </button>
     </div>
   </footer>
+  <!-- Sub-agents fallback: shown under the input when the left panel is collapsed. -->
+  <div class="sa-fallback" id="saFallback"></div>
   </div>
 </div>
 
@@ -14819,6 +17278,19 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   </div>
 </div>
 
+<!-- Sub-agent detail: a right slide-out covering most of the screen with one sub-agent's live activity. -->
+<div class="sa-drawer-bg" id="saDrawerBg" onclick="if (event.target === this) closeSubagentDetail()">
+  <div class="sa-drawer">
+    <div class="sa-drawer-head">
+      <span class="sa-dot" id="saDrawerDot"></span>
+      <span class="sa-drawer-title" id="saDrawerTitle">Sub-agent</span>
+      <span class="sa-drawer-state" id="saDrawerState"></span>
+      <button onclick="closeSubagentDetail()" title="Close">&times;</button>
+    </div>
+    <div class="sa-drawer-body" id="saDrawerBody"></div>
+  </div>
+</div>
+
 <!-- Init modal: shown for set-api-key and unlock flows. Cannot be dismissed
      (no × close button, no backdrop-click handler) because there's nowhere
      to go from these states — the user must complete the action or close
@@ -14884,7 +17356,11 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   // RC.scroll. Defaults to the MAIN chat; renderInto() swaps it SYNCHRONOUSLY so
   // the SAME renderEvent + row builders render into the intake modal's #im-log.
   // isIntake gates main-chat-only chrome (the status spinner / context-fill bar).
-  let RC = { log: _logEl, scroll: _logScrollEl, isIntake: false };
+  // The ambient render context. \`renderInto\` swaps RC while rendering into a
+  // given chat; the shared render functions call RC.afterRow (pin the active
+  // chat's status row to the bottom) and RC.clearStatus (drop its row ref on
+  // clearLog). Those hooks are installed per-chat by createChatComponent.
+  let RC = { log: _logEl, scroll: _logScrollEl, isIntake: false, afterRow: null, clearStatus: null };
   function renderInto(rc, fn) { const prev = RC; RC = rc; try { return fn(); } finally { RC = prev; } }
   const $input = document.getElementById('input');
   const $model = document.getElementById('model');
@@ -14912,7 +17388,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     const $vb = document.getElementById('chromeVersion');
     if ($vb) $vb.textContent = v ? ('v' + v) : '';
     syncEditToggle();   // initialise the edit-allowed label
-    try { if (localStorage.getItem('cb-side-collapsed') === '1') setSidePanelCollapsed(true); } catch {}
+    try { if (localStorage.getItem('cb-side-collapsed') === '1') setSidePanelCollapsed(true); else updateChecklistViews(); } catch {}
   }
   // Server-as-source-of-truth state mirror. Local UI state is kept minimal.
   let session = null;             // { version, status, phase, tokens, timeoutMs, events, ... }
@@ -14925,22 +17401,8 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   // ---- Inline status row (spinner + verb + timer + tokens) ----
   const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
   const VERB = 'Working';
-  // The active status-row verb. Most phases read as "Working", but the manager
-  // phases (per-task review, assignment acceptance) relabel so the user can see
-  // WHO is busy — the worker vs the reviewer vs the acceptance manager.
-  let statusVerb = VERB;
   const PHASE = { UPLOADING: 'uploading', THINKING: 'thinking', DOWNLOADING: 'downloading', DONE: 'done', CANCELED: 'canceled' };
-  let statusTimer = null, upAnimTimer = null;
-  let statusStart = 0, statusFrame = 0;
-  let doneElapsed = 0;
-  let statusRow = null;
-  let phase = 'idle';
-  let lastDir = 'up';      // direction of the most recent activity (for THINKING arrow)
-  let lastDeltaTime = 0;   // timestamp of last content delta — for stall detection
-  let upTokens = 0, downTokens = 0;
-  // Context-window fill gauge (item A): { totalTokens, budgetTokens, budgetPct } or null when unknown.
-  let contextFill = null;
-  let taskProgress = null;       // latest <task-progress> signal: { percent, note }
+  const STALL_MS = 1500;   // no traffic this long → switch to THINKING (blinking)
   let _unlockPending = false;    // an unlock is awaiting the user (gates the models-fetch abort)
   let _modelsTimer = null;       // loadModels' abort timer — cancelled while parked on an unlock
   // Diff collapse state keyed by event id (item K) — survives the clearLog()
@@ -14951,148 +17413,241 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   // clearLog() + full re-render cycle (which rebuilds every wrap from scratch),
   // mirroring _diffCollapsed. Without this, collapse is lost on every re-render.
   const _taskCollapsed = new Map();
-  const STALL_MS = 1500;   // no traffic this long → switch to THINKING (blinking)
 
-  function ensureStatusRow() {
-    if (statusRow && statusRow.parentNode === RC.log) return statusRow;
-    statusRow = document.createElement('div');
-    statusRow.className = 'status';
-    RC.log.appendChild(statusRow);
-    scrollToBottom();
-    return statusRow;
-  }
-  function pinStatusToBottom() {
-    if (RC.isIntake) return;   // the status spinner is main-chat-only
-    if (statusRow && statusRow.parentNode === RC.log && statusRow !== RC.log.lastChild) {
-      RC.log.appendChild(statusRow);
+  // ── The chat status spinner — ONE implementation, instantiated per chat ──
+  // The braille spinner + token arrows + elapsed clock + (optionally) the
+  // context-fill bar and the <task-progress> chip. ALL state is per-INSTANCE,
+  // so the main chat and the intake mini-chat each drive their OWN status row
+  // in their OWN log without a shared global. \`getLog()\` returns the container
+  // to append the status row into; \`showExtras\` gates the context bar + the
+  // progress chip (main chat only — the intake has no server-pushed context /
+  // progress signals). The main chat keeps thin module-level wrappers
+  // (setUploading / renderStatus / …) over its instance so the SSE call sites
+  // below stay byte-identical; the intake drives its own instance directly.
+  function createStatusSpinner({ getLog, showExtras = false }) {
+    let statusVerb = VERB;   // "Working" / "Reviewing" / "Checking the assignment" / …
+    let statusTimer = null, upAnimTimer = null, tickTimer = null;
+    let statusStart = 0, statusFrame = 0;
+    let doneElapsed = 0;
+    let statusRow = null;
+    let phase = 'idle';
+    let lastDir = 'up';      // direction of the most recent activity (for THINKING arrow)
+    let lastDeltaTime = 0;   // timestamp of last content delta — for stall detection
+    let upTokens = 0, downTokens = 0;
+    let contextFill = null;        // { totalTokens, budgetTokens, budgetPct } or null
+    let taskProgress = null;       // latest <task-progress> signal: { percent, note }
+
+    function ensureRow() {
+      const log = getLog();
+      if (statusRow && statusRow.parentNode === log) return statusRow;
+      statusRow = document.createElement('div');
+      statusRow.className = 'status';
+      log.appendChild(statusRow);
+      scrollToBottom();
+      return statusRow;
     }
-  }
-  function startSpinner() {
-    statusStart = Date.now();
-    statusFrame = 0;
-    if (statusTimer) clearInterval(statusTimer);
-    statusTimer = setInterval(() => {
-      statusFrame++;
-      // Stall detection: if we've been "downloading" or "uploading" but no
-      // delta in a while, flip to THINKING (blinking arrow, same direction).
-      if ((phase === PHASE.DOWNLOADING || phase === PHASE.UPLOADING) && lastDeltaTime > 0
-          && Date.now() - lastDeltaTime > STALL_MS) {
-        phase = PHASE.THINKING;
-        if (statusRow) statusRow.classList.add('thinking');
+    function pinToBottom() {
+      const log = getLog();
+      if (statusRow && statusRow.parentNode === log && statusRow !== log.lastChild) {
+        log.appendChild(statusRow);
       }
+    }
+    function startSpinner() {
+      statusStart = Date.now();
+      statusFrame = 0;
+      if (statusTimer) clearInterval(statusTimer);
+      statusTimer = setInterval(() => {
+        statusFrame++;
+        // Stall detection: if we've been "downloading" or "uploading" but no
+        // delta in a while, flip to THINKING (blinking arrow, same direction).
+        if ((phase === PHASE.DOWNLOADING || phase === PHASE.UPLOADING) && lastDeltaTime > 0
+            && Date.now() - lastDeltaTime > STALL_MS) {
+          phase = PHASE.THINKING;
+          if (statusRow) statusRow.classList.add('thinking');
+        }
+        renderStatus();
+      }, 120);
+    }
+    function stopSpinnerOnly() {
+      if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
+      if (upAnimTimer) { cancelAnimationFrame(upAnimTimer); upAnimTimer = null; }
+    }
+    // The elapsed-clock re-render tick (separate from the 120ms glyph timer):
+    // keeps the "Ns" counter live while a turn runs.
+    function startTick() { if (tickTimer) return; tickTimer = setInterval(renderStatus, 100); }
+    function stopTick() { if (tickTimer) { clearInterval(tickTimer); tickTimer = null; } renderStatus(); }
+    function animateUpTo(target, ms) {
+      if (upAnimTimer) cancelAnimationFrame(upAnimTimer);
+      const from = upTokens;
+      const t0 = Date.now();
+      const tick = () => {
+        if (phase !== PHASE.UPLOADING) { upAnimTimer = null; return; }
+        const t = Math.min(1, (Date.now() - t0) / ms);
+        upTokens = Math.round(from + (target - from) * t);
+        renderStatus();
+        if (t < 1) upAnimTimer = requestAnimationFrame(tick);
+        else { upAnimTimer = null; setThinking(); }
+      };
+      upAnimTimer = requestAnimationFrame(tick);
+    }
+    function setUploading(target, ms) {
+      ensureRow();
+      if (!statusTimer) startSpinner();
+      phase = PHASE.UPLOADING;
+      statusVerb = VERB;   // a fresh turn always starts as the worker "Working"
+      lastDir = 'up';
+      lastDeltaTime = Date.now();
+      statusRow.classList.remove('thinking');
+      if (target == null || target <= upTokens) {
+        if (target != null) upTokens = Math.max(upTokens, target);
+        renderStatus();
+        setTimeout(() => { if (phase === PHASE.UPLOADING) setThinking(); }, 80);
+      } else {
+        animateUpTo(target, ms ?? 700);
+      }
+    }
+    function setThinking() {
+      phase = PHASE.THINKING;
+      if (statusRow) statusRow.classList.add('thinking');
       renderStatus();
-    }, 120);
-  }
-  function stopSpinnerOnly() {
-    if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
-    if (upAnimTimer) { cancelAnimationFrame(upAnimTimer); upAnimTimer = null; }
-  }
-  function animateUpTo(target, ms) {
-    if (upAnimTimer) cancelAnimationFrame(upAnimTimer);
-    const from = upTokens;
-    const t0 = Date.now();
-    const tick = () => {
-      if (phase !== PHASE.UPLOADING) { upAnimTimer = null; return; }
-      const t = Math.min(1, (Date.now() - t0) / ms);
-      upTokens = Math.round(from + (target - from) * t);
+    }
+    function setDownloading() {
+      if (phase !== PHASE.DOWNLOADING) downTokens = 0;
+      phase = PHASE.DOWNLOADING;
+      lastDir = 'down';
+      lastDeltaTime = Date.now();
+      if (statusRow) statusRow.classList.remove('thinking');
       renderStatus();
-      if (t < 1) upAnimTimer = requestAnimationFrame(tick);
-      else { upAnimTimer = null; setThinking(); }
+    }
+    function setDone() {
+      doneElapsed = Math.floor((Date.now() - statusStart) / 1000);
+      phase = PHASE.DONE;
+      stopSpinnerOnly();
+      if (statusRow) statusRow.classList.remove('thinking');
+      renderStatus();
+      // status row persists; do NOT remove
+    }
+    function setCanceled() {
+      doneElapsed = Math.floor((Date.now() - statusStart) / 1000);
+      phase = PHASE.CANCELED;
+      stopSpinnerOnly();
+      if (statusRow) statusRow.classList.remove('thinking');
+      renderStatus();
+      // Row persists until the user submits a new message; the next chat
+      // start reuses this same statusRow DOM element and replaces the
+      // canceled content with the fresh spinner via setUploading().
+    }
+    function renderStatus() {
+      if (!statusRow) return;
+      const fmt = (n) => (n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n));
+      if (phase === PHASE.DONE) {
+        statusRow.innerHTML =
+          '<span class="arrow">↓</span> <span class="count">' + fmt(downTokens) + '</span>' +
+          ' <span class="dim">tokens · ' + doneElapsed + 's</span>';
+        return;
+      }
+      if (phase === PHASE.CANCELED) {
+        statusRow.innerHTML =
+          '<span class="arrow">⊘</span> <span class="dim">canceled by user · ' + doneElapsed + 's</span>';
+        return;
+      }
+      const sp = SPINNER[statusFrame % SPINNER.length];
+      const secs = Math.floor((Date.now() - statusStart) / 1000);
+      // Arrow direction follows the most recent activity. During THINKING
+      // (stalled) it stays in that direction and blinks.
+      const isDown = (phase === PHASE.DOWNLOADING) || (phase === PHASE.THINKING && lastDir === 'down');
+      const arrow = isDown ? '↓' : '↑';
+      const count = isDown ? downTokens : upTokens;
+      statusRow.innerHTML =
+        '<span class="spin">' + sp + '</span> ' + statusVerb + '… ' +
+        '<span class="arrow">' + arrow + '</span> <span class="count">' + fmt(count) + '</span>' +
+        ' <span class="dim">tokens · ' + secs + 's · esc to interrupt</span>' +
+        contextBarHtml() + progressChipHtml();
+    }
+    // The agent's latest per-turn completion estimate (the <task-progress> signal).
+    function progressChipHtml() {
+      return '';   // task ~N% chip removed from the load line (kept as a no-op to avoid call-site churn)
+    }
+    // Context-window fill gauge: total context vs the agent's total budget (the
+    // binding constraint that triggers compaction). Hidden until the first
+    // context-fill arrives. Turns red as it approaches the compaction threshold.
+    function contextBarHtml() {
+      if (!showExtras || !contextFill || contextFill.budgetPct == null) return '';
+      const pct = Math.max(0, Math.min(100, contextFill.budgetPct));
+      const hot = pct >= 80 ? ' hot' : '';
+      const tip = \`context: \${contextFill.totalTokens} / \${contextFill.budgetTokens} tokens (\${pct}%)\`;
+      // Just the number, no bar: "• 49%" (full detail on hover).
+      return \` <span class="context-pct\${hot}" title="\${tip}">• \${pct}%</span>\`;
+    }
+    // Server-pushed signals, folded in so the SSE call sites stay thin.
+    function setVerb(v) { statusVerb = v; }
+    function applyTokens(up, down) {
+      // Infer DOWNLOADING from which side moved (phase events can lag/skip).
+      if (down > downTokens && phase !== PHASE.DOWNLOADING && phase !== PHASE.DONE) setDownloading();
+      upTokens = up; downTokens = down; lastDeltaTime = Date.now();
+    }
+    function setContextFill(cf) { contextFill = cf; }
+    function setTaskProgress(tp) { taskProgress = tp; }
+    // The log DOM was wiped (clearLog / full re-render) — drop the stale row ref
+    // so the next ensureRow() builds a fresh one.
+    function clearRow() { statusRow = null; }
+    function reset() {
+      stopSpinnerOnly(); if (tickTimer) { clearInterval(tickTimer); tickTimer = null; }
+      statusVerb = VERB; statusStart = 0; statusFrame = 0; doneElapsed = 0;
+      statusRow = null; phase = 'idle'; lastDir = 'up'; lastDeltaTime = 0;
+      upTokens = 0; downTokens = 0; contextFill = null; taskProgress = null;
+    }
+    return {
+      ensureRow, pinToBottom, startSpinner, stopSpinnerOnly, startTick, stopTick,
+      setUploading, setThinking, setDownloading, setDone, setCanceled, renderStatus,
+      setVerb, applyTokens, setContextFill, setTaskProgress, clearRow, reset,
+      get phase() { return phase; },
     };
-    upAnimTimer = requestAnimationFrame(tick);
   }
-  function setUploading(target, ms) {
-    ensureStatusRow();
-    if (!statusTimer) startSpinner();
-    phase = PHASE.UPLOADING;
-    statusVerb = VERB;   // a fresh turn always starts as the worker "Working"
-    lastDir = 'up';
-    lastDeltaTime = Date.now();
-    statusRow.classList.remove('thinking');
-    if (target == null || target <= upTokens) {
-      if (target != null) upTokens = Math.max(upTokens, target);
-      renderStatus();
-      setTimeout(() => { if (phase === PHASE.UPLOADING) setThinking(); }, 80);
-    } else {
-      animateUpTo(target, ms ?? 700);
+
+  // ── createChatComponent — the reusable chat SHELL, instantiated per chat ──
+  // The pieces every chat shares: its render context (the log + the per-chat
+  // afterRow/clearStatus hooks the shared render functions call), a status
+  // spinner instance, a render() that pipes an event through the shared
+  // renderEvent into THIS chat's log, and (optionally) the input behavior
+  // (auto-grow + Enter→submit). The TRANSPORT is NOT here — it's the injected
+  // adapter each caller wires up (the main chat's SSE / the intake's NDJSON)
+  // and feeds in via render()/spinner. The main chat passes inputEl:null and
+  // keeps its richer composer (queue/steer), so only the genuinely-shared core
+  // lives here; the intake passes its textarea and uses the whole shell.
+  function createChatComponent({ rc, inputEl = null, showContextBar = false, onSubmit = null }) {
+    const spinner = createStatusSpinner({ getLog: () => rc.log, showExtras: showContextBar });
+    // Per-chat hooks the shared render functions call (renderInto swaps the
+    // ambient RC to this rc, so addRow/addBubble pin + clear the RIGHT spinner).
+    rc.afterRow = () => spinner.pinToBottom();
+    rc.clearStatus = () => spinner.clearRow();
+    function render(ev) { renderInto(rc, () => renderEvent(ev)); }
+    if (inputEl) {
+      inputEl.addEventListener('input', () => autoGrowEl(inputEl));
+      inputEl.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); onSubmit?.(); }
+      });
     }
+    return { rc, spinner, render, focus: () => { try { inputEl?.focus(); } catch {} } };
   }
-  function setThinking() {
-    phase = PHASE.THINKING;
-    if (statusRow) statusRow.classList.add('thinking');
-    renderStatus();
-  }
-  function setDownloading() {
-    if (phase !== PHASE.DOWNLOADING) downTokens = 0;
-    phase = PHASE.DOWNLOADING;
-    lastDir = 'down';
-    lastDeltaTime = Date.now();
-    if (statusRow) statusRow.classList.remove('thinking');
-    renderStatus();
-  }
-  function setDone() {
-    doneElapsed = Math.floor((Date.now() - statusStart) / 1000);
-    phase = PHASE.DONE;
-    stopSpinnerOnly();
-    if (statusRow) statusRow.classList.remove('thinking');
-    renderStatus();
-    // status row persists; do NOT remove
-  }
-  function setCanceled() {
-    doneElapsed = Math.floor((Date.now() - statusStart) / 1000);
-    phase = PHASE.CANCELED;
-    stopSpinnerOnly();
-    if (statusRow) statusRow.classList.remove('thinking');
-    renderStatus();
-    // Row persists until the user submits a new message; the next chat
-    // start reuses this same statusRow DOM element and replaces the
-    // canceled content with the fresh spinner via setUploading().
-  }
-  function renderStatus() {
-    if (!statusRow) return;
-    const fmt = (n) => (n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n));
-    if (phase === PHASE.DONE) {
-      statusRow.innerHTML =
-        '<span class="arrow">↓</span> <span class="count">' + fmt(downTokens) + '</span>' +
-        ' <span class="dim">tokens · ' + doneElapsed + 's</span>';
-      return;
-    }
-    if (phase === PHASE.CANCELED) {
-      statusRow.innerHTML =
-        '<span class="arrow">⊘</span> <span class="dim">canceled by user · ' + doneElapsed + 's</span>';
-      return;
-    }
-    const sp = SPINNER[statusFrame % SPINNER.length];
-    const secs = Math.floor((Date.now() - statusStart) / 1000);
-    // Arrow direction follows the most recent activity. During THINKING
-    // (stalled) it stays in that direction and blinks.
-    const isDown = (phase === PHASE.DOWNLOADING) || (phase === PHASE.THINKING && lastDir === 'down');
-    const arrow = isDown ? '↓' : '↑';
-    const count = isDown ? downTokens : upTokens;
-    statusRow.innerHTML =
-      '<span class="spin">' + sp + '</span> ' + statusVerb + '… ' +
-      '<span class="arrow">' + arrow + '</span> <span class="count">' + fmt(count) + '</span>' +
-      ' <span class="dim">tokens · ' + secs + 's · esc to interrupt</span>' +
-      contextBarHtml() + progressChipHtml();
-  }
-  // The agent's latest per-turn completion estimate (the <task-progress> signal).
-  function progressChipHtml() {
-    if (!taskProgress || typeof taskProgress.percent !== 'number') return '';
-    const pct = Math.max(0, Math.min(100, taskProgress.percent));
-    const tip = taskProgress.note ? (' — ' + taskProgress.note) : '';
-    return \` <span class="dim" title="\${escapeHtml(taskProgress.note || '')}">· task ~\${pct}%\${escapeHtml(tip).slice(0, 80)}</span>\`;
-  }
-  // Context-window fill gauge: total context vs the agent's total budget (the
-  // binding constraint that triggers compaction). Hidden until the first
-  // context-fill arrives. Turns red as it approaches the compaction threshold.
-  function contextBarHtml() {
-    if (!contextFill || contextFill.budgetPct == null) return '';
-    const pct = Math.max(0, Math.min(100, contextFill.budgetPct));
-    const hot = pct >= 80 ? ' hot' : '';
-    const tip = \`context: \${contextFill.totalTokens} / \${contextFill.budgetTokens} tokens (\${pct}%)\`;
-    return \` <span class="context-bar\${hot}" title="\${tip}"><i style="width:\${pct}%"></i></span>\`
-      + \`<span class="context-pct">\${pct}%</span>\`;
-  }
+
+  // The MAIN chat as a component instance. inputEl:null — the main composer has
+  // its own queue/steer/⇧-key wiring (below), so it keeps that and shares only
+  // the core (spinner + rc hooks + render). \`status\` aliases its spinner so the
+  // thin module wrappers + every existing SSE call site stay byte-identical.
+  const mainChat = createChatComponent({ rc: RC, inputEl: null, showContextBar: true });
+  const status = mainChat.spinner;
+  function ensureStatusRow() { return status.ensureRow(); }
+  function startSpinner() { return status.startSpinner(); }
+  function stopSpinnerOnly() { return status.stopSpinnerOnly(); }
+  function setUploading(t, ms) { return status.setUploading(t, ms); }
+  function setThinking() { return status.setThinking(); }
+  function setDownloading() { return status.setDownloading(); }
+  function setDone() { return status.setDone(); }
+  function setCanceled() { return status.setCanceled(); }
+  function renderStatus() { return status.renderStatus(); }
+  function startSpinTick() { return status.startTick(); }
+  function stopSpinTick() { return status.stopTick(); }
   function estimateTokens(s) { return Math.ceil((s || '').length / 4); }
 
   function basename(p) {
@@ -15514,46 +18069,8 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     };
   }
 
-  // Mid-task developer-approval prompt. Fired from the SSE 'approval-needed'
-  // handler (and re-shown on reconnect from state.approvalPending) when a tool
-  // — e.g. edit_docx flattening formatting — needs an explicit human OK. The
-  // tool's impl is awaiting our /api/approval-resolve POST. Reuses the git
-  // wizard overlay (only one mid-task prompt is ever live at a time).
-  function showApprovalPrompt({ id, kind, message }) {
-    const $bg = document.getElementById('gitWizardBg');
-    const $body = document.getElementById('gitWizardBody');
-    $body.innerHTML = \`
-      <p style="margin: 0 0 12px; color: var(--fg); font-size: 13px;">\${escapeHtml(message || 'Approve this action?')}</p>
-      <p id="ap-err" style="margin: 8px 0 0; color: var(--error); font-size: 12px; min-height: 14px;"></p>
-      <div style="display:flex; gap:8px; justify-content:flex-end; margin-top: 14px;">
-        <button id="ap-deny" class="btn">Deny</button>
-        <button id="ap-approve" class="btn primary">Approve</button>
-      </div>
-    \`;
-    $bg.classList.add('show');
-    const $err = document.getElementById('ap-err');
-    function close() { $bg.classList.remove('show'); $body.innerHTML = ''; }
-    async function resolve(approved) {
-      const $a = document.getElementById('ap-approve');
-      const $d = document.getElementById('ap-deny');
-      $a.disabled = true; $d.disabled = true;
-      try {
-        const r = await fetch('/api/approval-resolve', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ id, approved }),
-        });
-        const data = await r.json();
-        if (!r.ok) throw new Error(data.error ?? ('HTTP ' + r.status));
-        close();
-      } catch (e) {
-        $a.disabled = false; $d.disabled = false;
-        $err.textContent = 'Failed: ' + e.message;
-      }
-    }
-    document.getElementById('ap-approve').onclick = () => resolve(true);
-    document.getElementById('ap-deny').onclick = () => resolve(false);
-  }
+  // (The mid-task per-edit developer-approval modal was retired — review-off auto-applies, review-on
+  // is propose-first, and revert safety comes from git / the shadow-git undo.)
 
   // Tracks the most-recent project so the folder picker starts at its
   // parent (siblings = one click). Falls back to home dir.
@@ -15621,7 +18138,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
 
   // Side-panel tabs: Assignments | Queue | Memory. Clicking a tab marks it
   // active and shows its pane; Memory/Queue refresh their content on open.
-  const SIDE_TABS = ['queue', 'assignments', 'memory'];
+  const SIDE_TABS = ['checklists', 'subagents', 'cognition', 'queue', 'assignments', 'memory'];
   function selectSideTab(name) {
     for (const t of SIDE_TABS) {
       const btn = document.getElementById('tabbtn-' + t);
@@ -15632,6 +18149,67 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     }
     if (name === 'memory') loadMemory();
     if (name === 'queue') renderQueue();
+    if (name === 'subagents') renderSubagents();
+    if (name === 'cognition') renderCognitionTree();
+    if (name === 'checklists') renderChecklistTab();
+  }
+
+  // ── Cognition tree (transparency for CB_COGNITION runs) ──────────────────
+  // Streamed live via ephemeral 'cognition-event's: how the agent sized the problem, which
+  // strategy layers engaged, the recursion, and the salience×budget spend.
+  const cogState = { rows: [], budget: null };
+  function handleCognitionEvent(cog) {
+    if (!cog) return;
+    if (cog.type === 'budget') { cogState.rows = []; cogState.budget = { complexity: cog.complexity }; }
+    if (cog.spent != null) cogState.budget = Object.assign(cogState.budget || {}, { spent: cog.spent, ceiling: cog.ceiling, nodes: cog.nodes, overhead: cog.overhead });
+    cogState.rows.push(cog);
+    const cnt = document.getElementById('cognitionCount');
+    if (cnt) cnt.textContent = cog.type === 'done' ? '' : String(cogState.budget?.nodes || '');
+    const ctab = document.getElementById('tabbtn-cognition');   // reveal the tab once cognition is actually used
+    if (ctab) ctab.style.display = '';
+    renderCognitionTree();
+  }
+  function renderCognitionTree() {
+    const b = document.getElementById('cogBudget');
+    if (b) {
+      if (cogState.budget && cogState.budget.ceiling) {
+        const { spent = 0, ceiling = 0, nodes = 0, overhead = 0, complexity } = cogState.budget;
+        const pct = ceiling ? Math.min(100, (spent / ceiling) * 100) : 0;
+        b.innerHTML = '<div class="cog-bar"><div class="cog-bar-fill" style="width:' + pct.toFixed(0) + '%"></div></div>'
+          + '<div class="cog-bar-label">' + Math.round(spent) + ' / ' + Math.round(ceiling) + ' work-units · ' + nodes + ' nodes · overhead ' + Math.round(overhead) + (complexity ? ' · ' + complexity + ' complexity' : '') + '</div>';
+      } else b.innerHTML = '';
+    }
+    const tree = document.getElementById('cogTree'); if (!tree) return;
+    if (!cogState.rows.length) return;
+    tree.innerHTML = '';
+    for (const cog of cogState.rows) tree.appendChild(cogRowEl(cog));
+    tree.scrollTop = tree.scrollHeight;
+  }
+  function cogRowEl(cog) {
+    const d = document.createElement('div');
+    d.className = 'cog-row cog-' + (cog.type || '');
+    d.style.paddingLeft = (6 + (cog.depth || 0) * 14) + 'px';
+    const sal = (cog.salience != null) ? (+cog.salience).toFixed(2) : null;
+    let t;
+    switch (cog.type) {
+      case 'budget': t = '▣ budget: ' + (cog.complexity || '?') + ' → ' + Math.round(cog.ceiling || 0) + ' units'; break;
+      case 'node': t = '◆ assess [' + ((cog.layers || []).join(' → ')) + ']' + (cog.verify ? ' +verify' : '') + (cog.metrics ? ' · ' + cog.metrics.complexity + '/' + cog.metrics.creativity + (cog.metrics.accuracy === 'critical' ? '/crit' : '') : '') + (sal ? ' · sal ' + sal : ''); break;
+      case 'explore-start': t = '✦ explore: ' + (cog.n || '') + ' parallel proposers'; break;
+      case 'proposer': t = '· proposer ' + (cog.i || '') + (cog.lens ? ' — ' + cog.lens : ''); break;
+      case 'judge': t = '⚖ judge: synthesizing ' + (cog.proposals || '') + ' approaches'; break;
+      case 'explore': t = '✦ explored → approach chosen'; break;
+      case 'decompose': t = '⑃ decompose → ' + ((cog.steps || []).length) + ' steps'; break;
+      case 'worker-start': t = '▶ worker: ' + (cog.topic || cog.id || ''); break;
+      case 'worker': t = '● worked (' + (cog.mode || 'single') + ')'; break;
+      case 'verify': t = cog.ok ? '✓ verified' : '✗ verify failed → re-run'; break;
+      case 'rerun': t = '↻ re-run #' + (cog.round || ''); break;
+      case 'stopped': t = '■ stopped — budget' + (sal ? ' (salience ' + sal + ' too low for the spend)' : ''); break;
+      case 'answer': t = '💬 answered directly'; break;
+      case 'done': t = '✔ done — ' + (cog.nodes || 0) + ' nodes, ' + Math.round(cog.spent || 0) + ' units'; break;
+      default: t = cog.type || '';
+    }
+    d.textContent = t;
+    return d;
   }
 
   // Collapse / expand the left side panel (chat reclaims the width).
@@ -15647,11 +18225,207 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       chrome.classList.toggle('docked', collapsed);
       (collapsed ? footer : p).appendChild(chrome);   // dock under input / back into panel
     }
+    updateChecklistViews();   // panel OPEN → the Checklists tab (scroll-synced); CLOSED → the footer (current)
     try { localStorage.setItem('cb-side-collapsed', collapsed ? '1' : '0'); } catch {}
+  }
+
+  // ── Per-task checklists ───────────────────────────────────────────────────
+  // Checklists arrive per task (the 'checklist' event carries its taskId). The Checklists TAB shows
+  // the checklist of the task at the viewport MIDDLE (scroll-synced — go back in time as you scroll
+  // up); the footer panel above the input shows ONLY the CURRENT checklist, and ONLY when the side
+  // panel is collapsed. (Live within a session; ephemeral events aren't replayed on reload.)
+  const _checklistsByTask = new Map();   // taskId → items
+  let _currentChecklistTaskId = null;
+  function _checklistHtml(items) {
+    const done = items.filter((i) => i && i.done).length;
+    return \`<div class="cl-title">checklist · \${done}/\${items.length} done</div>\` + items.map((i) =>
+      \`<div class="checklist-item\${i && i.done ? ' done' : ''}"><span class="cl-box">\${i && i.done ? '✓' : '☐'}</span><span class="cl-text">\${escapeHtml((i && i.text) || '')}</span></div>\`
+    ).join('');
+  }
+  // Entry point for a checklist signal (taskId may be undefined → '_').
+  function onChecklist(taskId, items) {
+    const key = taskId || '_';
+    if (Array.isArray(items) && items.length) { _checklistsByTask.set(key, items); _currentChecklistTaskId = key; }
+    else { _checklistsByTask.delete(key); if (_currentChecklistTaskId === key) _currentChecklistTaskId = null; }
+    const c = document.getElementById('checklistCount');
+    if (c) c.textContent = _checklistsByTask.size ? \` (\${_checklistsByTask.size})\` : '';
+    updateChecklistViews();
+  }
+  // Which task's checklist to show in the tab: the wrapped task straddling the viewport middle,
+  // else the current one (the still-open task below the last wrap).
+  function checklistTaskAtViewportMiddle() {
+    const log = RC.log; if (!log) return _currentChecklistTaskId;
+    // Middle of the VISIBLE portion of the chat (clamped to the window) — robust whether #log is the
+    // scroller or an ancestor is. Using log.clientHeight alone breaks when #log isn't the scroller.
+    const lr = log.getBoundingClientRect();
+    const winH = window.innerHeight || document.documentElement.clientHeight || lr.height;
+    const midY = (Math.max(lr.top, 0) + Math.min(lr.bottom, winH)) / 2;
+    for (const w of log.querySelectorAll('.task-wrap[data-task-id]')) {
+      const wr = w.getBoundingClientRect();
+      if (wr.top <= midY && wr.bottom >= midY) return w.dataset.taskId;
+    }
+    return _currentChecklistTaskId;
+  }
+  function renderChecklistTab() {
+    const tab = document.getElementById('checklistTab'); if (!tab) return;
+    const taskId = checklistTaskAtViewportMiddle();
+    const items = (taskId && _checklistsByTask.get(taskId)) || null;
+    if (!items || !items.length) { tab.innerHTML = '<div class="checklist-empty">No checklist for the task here. The agent adds one for multi-step work — scroll the chat to see each task\\'s checklist.</div>'; return; }
+    tab.innerHTML = _checklistHtml(items);
+  }
+  // Footer (#checklistPanel): CURRENT checklist, only when the side panel is collapsed.
+  function updateChecklistViews() {
+    const collapsed = !!document.getElementById('sidePanel')?.classList.contains('collapsed');
+    renderChecklist(collapsed && _currentChecklistTaskId ? _checklistsByTask.get(_currentChecklistTaskId) : null);
+    renderChecklistTab();
+  }
+  // Scroll-sync: while the panel is open + the Checklists tab active, the tab follows the task at
+  // the viewport middle as you scroll the chat. Attached once (rAF-throttled, passive).
+  let _checklistScrollAttached = false;
+  function attachChecklistScrollSync() {
+    if (_checklistScrollAttached) return;
+    const log = document.getElementById('log');
+    if (!log) return;
+    _checklistScrollAttached = true;
+    let raf = 0;
+    log.addEventListener('scroll', () => {
+      if (raf) return;
+      raf = requestAnimationFrame(() => {
+        raf = 0;
+        const open = !document.getElementById('sidePanel')?.classList.contains('collapsed');
+        const active = document.getElementById('tabbtn-checklists')?.classList.contains('active');
+        if (open && active) renderChecklistTab();
+      });
+    }, { passive: true });
   }
   function toggleSidePanel() {
     const p = document.getElementById('sidePanel');
     setSidePanelCollapsed(!(p && p.classList.contains('collapsed')));   // « (in panel) collapses; » pip reopens
+    renderSubagents();   // the collapsed-panel fallback list appears/hides with the panel
+  }
+
+  // ── Sub-agents (orchestrator delegation) ──────────────────────────────────
+  // A message that arrives while the foreground is busy is delegated to a background
+  // sub-agent running in its own git worktree. We track each one's status + live tool
+  // activity here, list them in the left-panel "Sub-agents" tab (or a fallback list
+  // under the input when the panel is collapsed), and show full activity in a right
+  // slide-out on click. Tool activity arrives tagged with subagentChannel (kept OUT of
+  // the main chat); the bounded result folds in as a subagent-card chat event.
+  const saStore = new Map();   // id -> { id, topic, status, content, files, activity: [] }
+  let saDrawerId = null;
+  const SA_STATE_LABEL = { working: 'working', 'awaiting-review': 'awaiting review', reviewing: 'reviewing', done: 'done', error: 'failed', aborted: 'aborted', conflict: 'conflict', rejected: 'rejected', unmergeable: 'needs manual merge', recovered: 'recovered' };
+  async function subagentAction(id, action) {
+    try { await fetch('/api/subagent-action', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id, action }) }); } catch {}
+  }
+
+  function saUpsert(id, patch) {
+    if (!id) return;
+    const cur = saStore.get(id) || { id, topic: id, status: 'working', content: '', files: [], activity: [] };
+    Object.assign(cur, patch);
+    saStore.set(id, cur);
+    renderSubagents();
+    if (saDrawerId === id) renderSubagentDetail(id);
+  }
+  function saAddActivity(id, ev) {
+    const cur = saStore.get(id) || { id, topic: id, status: 'working', content: '', files: [], activity: [] };
+    cur.activity.push(ev);
+    saStore.set(id, cur);
+    if (saDrawerId === id) appendDrawerActivity(ev);
+  }
+  function saItemEl(sa) {
+    const item = document.createElement('div');
+    item.className = 'sa-item ' + (sa.status || 'working');
+    item.onclick = () => openSubagentDetail(sa.id);
+    const dot = document.createElement('span'); dot.className = 'sa-dot';
+    const topic = document.createElement('span'); topic.className = 'sa-topic'; topic.textContent = sa.topic || sa.id; topic.title = sa.topic || sa.id;
+    const state = document.createElement('span'); state.className = 'sa-state'; state.textContent = SA_STATE_LABEL[sa.status] || sa.status || '';
+    item.appendChild(dot); item.appendChild(topic); item.appendChild(state);
+    // Recovered (crash-resume) sub-agents need an explicit decision: re-review or discard.
+    if (sa.status === 'recovered') {
+      const mk = (label, action, cls) => { const b = document.createElement('button'); b.className = 'sa-act-btn' + (cls ? ' ' + cls : ''); b.textContent = label; b.onclick = (ev) => { ev.stopPropagation(); subagentAction(sa.id, action); }; return b; };
+      item.appendChild(mk('Review', 'review'));
+      item.appendChild(mk('Discard', 'discard', 'danger'));
+    }
+    return item;
+  }
+  function renderSubagents() {
+    const list = [...saStore.values()].sort((a, b) => (a.id < b.id ? 1 : -1));   // newest first
+    const working = list.filter((s) => s.status === 'working').length;
+    const pane = document.getElementById('saList');
+    if (pane) {
+      pane.innerHTML = '';
+      if (!list.length) {
+        const e = document.createElement('div'); e.className = 'sa-empty';
+        e.textContent = 'No sub-agents yet. While the agent is busy, a new message is delegated to a background sub-agent (isolated in its own git worktree) and appears here.';
+        pane.appendChild(e);
+      } else list.forEach((s) => pane.appendChild(saItemEl(s)));
+    }
+    const count = document.getElementById('subagentCount');
+    if (count) count.textContent = working ? String(working) : '';
+    const stab = document.getElementById('tabbtn-subagents');   // reveal the tab once a sub-agent actually exists
+    if (stab) stab.style.display = '';
+    // collapsed-panel fallback under the input
+    const fb = document.getElementById('saFallback');
+    if (fb) {
+      const collapsed = document.getElementById('sidePanel')?.classList.contains('collapsed');
+      fb.innerHTML = '';
+      if (collapsed && list.length) {
+        const head = document.createElement('div'); head.className = 'sa-fallback-head';
+        head.textContent = working ? \`Sub-agents — \${working} working\` : 'Sub-agents';
+        fb.appendChild(head);
+        const inner = document.createElement('div'); inner.className = 'sa-list';
+        list.forEach((s) => inner.appendChild(saItemEl(s)));
+        fb.appendChild(inner);
+        fb.classList.add('show');
+      } else fb.classList.remove('show');
+    }
+  }
+  function openSubagentDetail(id) {
+    saDrawerId = id;
+    document.getElementById('saDrawerBg')?.classList.add('show');
+    renderSubagentDetail(id);
+  }
+  function closeSubagentDetail() {
+    saDrawerId = null;
+    document.getElementById('saDrawerBg')?.classList.remove('show');
+  }
+  function drawerActivityEl(ev) {
+    const d = document.createElement('div'); d.className = 'sa-act';
+    if (ev.type === 'tool-call') {
+      const v = document.createElement('span'); v.className = 'sa-act-verb'; v.textContent = ev.name || ev.verb || 'tool';
+      d.appendChild(v); d.appendChild(document.createTextNode(' ' + (ev.summary || ev.argsPreview || ev.path || '')));
+    } else if (ev.type === 'tool-progress') { d.textContent = ev.chunk || ''; }
+    else if (ev.type === 'tool-result') { d.textContent = '→ ' + (ev.summary || (ev.content || '').slice(0, 200)); }
+    else if (ev.type === 'assistant-text' || ev.type === 'assistant-text-chunk') { d.textContent = ev.content || ev.chunk || ''; }
+    else if (ev.type === 'acceptance-verdict') { d.className = 'sa-act sa-act-verdict' + (ev.verdict === 'reject' ? ' reject' : ''); d.textContent = \`Verdict: \${ev.verdict === 'reject' ? 'REJECT' : 'APPROVE'}\${ev.rationale ? ' — ' + ev.rationale : ''}\`; }
+    else if (ev.type === 'acceptance-feedback') { d.className = 'sa-act sa-act-feedback'; d.textContent = 'Feedback: ' + (ev.feedback || ''); }
+    else if (ev.type === 'feedback-round') { d.className = 'sa-act sa-act-feedback'; d.textContent = \`↻ revision round \${ev.round || ''}: \${ev.feedback || ''}\`; }
+    else if (ev.type === 'review') { const st = ev.state || 'pending'; d.className = 'sa-act sa-act-review ' + st; d.textContent = \`Review (round \${ev.round || 1}): \${st === 'pending' ? 'reviewing…' : st}\${ev.concerns ? ' — ' + String(ev.concerns).slice(0, 200) : ''}\`; }
+    else { d.textContent = (ev.type || '') + ' ' + (ev.content || ev.summary || ''); }
+    return d;
+  }
+  function appendDrawerActivity(ev) {
+    const body = document.getElementById('saDrawerBody');
+    if (body) { body.appendChild(drawerActivityEl(ev)); body.scrollTop = body.scrollHeight; }
+  }
+  function renderSubagentDetail(id) {
+    const sa = saStore.get(id); if (!sa) return;
+    const t = document.getElementById('saDrawerTitle'); if (t) t.textContent = sa.topic || sa.id;
+    const st = document.getElementById('saDrawerState'); if (st) st.textContent = SA_STATE_LABEL[sa.status] || sa.status || '';
+    const dot = document.getElementById('saDrawerDot'); if (dot) dot.className = 'sa-dot ' + (sa.status || 'working');
+    const body = document.getElementById('saDrawerBody'); if (!body) return;
+    body.innerHTML = '';
+    if (sa.status && sa.status !== 'working' && sa.content) {
+      const r = document.createElement('div'); r.className = 'sa-drawer-result';
+      r.innerHTML = '<div class="sa-card-head">Result</div>' + renderInline(sa.content);
+      body.appendChild(r);
+    }
+    if (!sa.activity.length) {
+      const e = document.createElement('div'); e.className = 'sa-act-empty';
+      e.textContent = sa.status === 'working' ? 'Working… activity will stream here.' : 'No recorded activity for this sub-agent.';
+      body.appendChild(e);
+    } else sa.activity.forEach((ev) => body.appendChild(drawerActivityEl(ev)));
+    body.scrollTop = body.scrollHeight;
   }
 
   // ── Snapshot fab: one consistent bottom-right icon ───────────────────────
@@ -15943,7 +18717,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     // If the status row already exists (SSE 'status: running' often arrives
     // BEFORE the user-message event), keep it pinned to the bottom — without
     // this the spinner can end up above the first user bubble.
-    pinStatusToBottom();
+    RC.afterRow?.();
     scrollToBottom();
     return div;
   }
@@ -16025,7 +18799,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     row.appendChild(dot);
     row.appendChild(body);
     RC.log.appendChild(row);
-    pinStatusToBottom();
+    RC.afterRow?.();
     scrollToBottom();
     return body;
   }
@@ -16067,7 +18841,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       }
     });
     RC.log.appendChild(row);
-    pinStatusToBottom();
+    RC.afterRow?.();
     scrollToBottom();
     return row;
   }
@@ -16139,7 +18913,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       }
     }
     if (!inserted) RC.log.appendChild(row);
-    pinStatusToBottom();
+    RC.afterRow?.();
     scrollToBottom();
     return row;
   }
@@ -16207,7 +18981,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     const pct = ev.budgetPct != null ? \` (\${ev.budgetPct}% of window)\` : '';
     row.textContent = \`↔ Context window full\${pct} — compacting: older tasks are being summarized/archived to free room.\`;
     RC.log.appendChild(row);
-    pinStatusToBottom();
+    RC.afterRow?.();
     scrollToBottom();
     return row;
   }
@@ -16231,7 +19005,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       row.appendChild(list);
     }
     RC.log.appendChild(row);
-    pinStatusToBottom();
+    RC.afterRow?.();
     scrollToBottom();
     return row;
   }
@@ -16299,6 +19073,48 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     input.select();
   }
 
+  // Remove ORPHANED streaming prose bubbles whose content is ONLY tool-tag noise — the model's
+  // <remote-workspace>/<powershell .../> streams as prose text before the block is parsed, and
+  // that bubble never gets a finalize event. Called on each tool-call (flush=false, so a legit
+  // bubble still streaming isn't disturbed) AND on terminal status (flush=true to finish renderers).
+  function sweepOrphanToolTagBubbles(flush) {
+    RC.log.querySelectorAll('.row.assistant[data-streaming="true"]').forEach((r) => {
+      if (flush) { try { r._smd?.finish(); } catch {} r._smd = null; }
+      const stripped = (r.textContent || '')
+        .replace(/<remote-workspace\\b[\\s\\S]*?<\\/remote-workspace>/gi, '')
+        .replace(/<\\/?(?:remote-workspace|read|write|edit|list|find|search|info|powershell|next-task|list-tasks|task-detail|search-tasks|remember|forget)\\b[^>]*>/gi, '')
+        .replace(/[\\s●.]+/g, '');   // strip the leading marker + whitespace + stray dots
+      if (!stripped) r.remove();
+    });
+  }
+
+  // Fold consecutive <remember> tool-calls into ONE collapsible "🧠 remembered N" row
+  // (click to expand the individual saves). Breaks the moment a non-remember row intervenes.
+  function appendRememberItem(ev, display) {
+    let group = RC.log.lastElementChild;
+    if (!group || !group.classList.contains('remember-group')) {
+      group = document.createElement('div');
+      group.className = 'row remember-group collapsed';
+      if (ev.taskId) group.dataset.taskId = ev.taskId;
+      group._count = 0;
+      const hdr = document.createElement('div');
+      hdr.className = 'rg-hdr';
+      hdr.onclick = () => group.classList.toggle('collapsed');
+      const bodyEl = document.createElement('div');
+      bodyEl.className = 'rg-body';
+      group.appendChild(hdr);
+      group.appendChild(bodyEl);
+      RC.log.appendChild(group);
+    }
+    group._count = (group._count || 0) + 1;
+    const item = document.createElement('div');
+    item.className = 'rg-item';
+    item.textContent = String(display || '').replace(/^remember\\(?/, '').replace(/\\)$/, '').trim() || 'memory';
+    group.querySelector('.rg-body').appendChild(item);
+    group.querySelector('.rg-hdr').innerHTML = \`<span class="rg-icon">🧠</span> remembered \${group._count} \${group._count === 1 ? 'memory' : 'memories'}\`;
+    RC.afterRow?.();
+  }
+
   function addDiffBlock(ev) {
     const block = document.createElement('div');
     block.className = 'diff-block';
@@ -16363,8 +19179,15 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
 
     block.appendChild(hdr);
     block.appendChild(body);
-    RC.log.appendChild(block);
-    pinStatusToBottom();
+    // Place the diff directly UNDER its edit's tool row (the last element carrying this callId —
+    // the result row), so several edits in a row each show their own diff in place instead of all
+    // diffs piling up at the end. Fall back to the log tail if the row isn't found.
+    const cid = ev.callId && CSS.escape(String(ev.callId));
+    const anchors = cid ? RC.log.querySelectorAll(\`[data-call-id="\${cid}"]\`) : [];
+    const anchor = anchors[anchors.length - 1];
+    if (anchor && anchor.parentNode) anchor.parentNode.insertBefore(block, anchor.nextSibling);
+    else RC.log.appendChild(block);
+    RC.afterRow?.();
     scrollToBottom();
     return block;
   }
@@ -16411,7 +19234,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     }
 
     RC.log.appendChild(row);
-    pinStatusToBottom();
+    RC.afterRow?.();
     scrollToBottom();
     return row;
   }
@@ -16492,7 +19315,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       row.appendChild(list);
     }
     RC.log.appendChild(row);
-    pinStatusToBottom();
+    RC.afterRow?.();
     scrollToBottom();
     return row;
   }
@@ -16616,11 +19439,14 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     $input.value = '';
     autoGrowInput();  // shrink the textarea back to one line
     const discuss = document.getElementById('discussToggle')?.checked;
+    const review = document.getElementById('reviewToggle')?.checked;
+    _lastSendReview = !!review && !discuss;   // a propose run iff review-on and not discuss
+    setApproveButton(false);                  // hide the old proposal's approve button while this run goes
     try {
       const r = await fetchWithTimeout('/api/message', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ text, model: $model.value, mode: discuss ? 'discuss' : undefined }),
+        body: JSON.stringify({ text, model: $model.value, mode: discuss ? 'discuss' : undefined, review: review || undefined }),
       }, 15000);
       if (!r.ok) {
         const body = await r.text();
@@ -16723,16 +19549,25 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   // Two panes: editable fields (left) + a read-only mini-chat manager (right)
   // that refines those fields. Not the worker; no files edited, no run.
   let _intakeMessages = [];
-  // The intake mini-chat reuses the MAIN chat renderer: #im-log is its own
-  // render context (its own scroll container), so renderInto(imRC(), …) builds
-  // the same bubbles / tool-call / tool-result rows the main chat uses.
-  function imRC() { const el = document.getElementById('im-log'); return { log: el, scroll: el, isIntake: true }; }
-  function imRender(ev) { renderInto(imRC(), () => renderEvent(ev)); }
+  // The intake mini-chat is a createChatComponent INSTANCE — it shares the SAME
+  // renderer (renderEvent), the SAME status spinner, and the SAME input behavior
+  // (auto-grow + Enter→send) as the main chat. Only its TRANSPORT differs: the
+  // NDJSON /api/intake-chat adapter in sendIntakeChat below (vs the main chat's
+  // SSE). #im-log is its render context; #im-input its composer; the form on the
+  // left is its only bespoke extra. No server-pushed context/progress signals,
+  // so showContextBar:false.
+  const intakeChat = createChatComponent({
+    rc: { log: document.getElementById('im-log'), scroll: document.getElementById('im-log'), isIntake: true },
+    inputEl: document.getElementById('im-input'),
+    showContextBar: false,
+    onSubmit: () => sendIntakeChat(),
+  });
+  const imRender = (ev) => intakeChat.render(ev);
   function openIntakeModal() {
     _intakeMessages = [];
     for (const id of ['im-title', 'im-req', 'im-acc', 'im-input']) { const el = document.getElementById(id); if (el) el.value = ''; }
-    const log = document.getElementById('im-log');
-    if (log) log.innerHTML = '';
+    intakeChat.spinner.reset();
+    intakeChat.rc.log.innerHTML = '';
     imRender({ type: 'assistant-text', content: 'Tell me what you want done — paste a ticket/email or just describe it. I\\'ll read the project (read-only) and draft the fields on the left. You can also edit them yourself; hit Add when it looks right.' });
     document.getElementById('intakeModalBg').classList.add('show');
     setTimeout(() => document.getElementById('im-input')?.focus(), 50);
@@ -16745,8 +19580,8 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     inp.value = ''; autoGrowEl(inp);
     imRender({ type: 'user-message', content: text });
     _intakeMessages.push({ role: 'user', content: text });
-    const log = document.getElementById('im-log');
-    imStartSpinner();
+    intakeChat.spinner.setUploading();   // same animated spinner as the main chat
+    intakeChat.spinner.startTick();
     const assistantParts = [];
     try {
       const fields = {
@@ -16769,10 +19604,9 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
           }
           return;
         }
-        if (ev.type === 'tokens') { imSetTokens(ev.total); return; }
+        if (ev.type === 'tokens') { intakeChat.spinner.applyTokens(ev.total || 0, 0); return; }
         if (ev.type === 'assistant-text') assistantParts.push(ev.content || '');
-        imRender(ev);
-        imSpinnerToBottom();   // keep the working indicator last
+        imRender(ev);   // the spinner re-pins itself to the bottom via rc.afterRow
       };
       for (;;) {
         const { done, value } = await reader.read();
@@ -16790,42 +19624,9 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     } catch (e) {
       imRender({ type: 'assistant-text', content: 'Error: ' + (e?.message || e) });
     } finally {
-      imStopSpinner();
+      intakeChat.spinner.setDone();   // persists the final ↑tokens · Ns row, like the main chat
+      intakeChat.spinner.stopTick();
     }
-  }
-  // Animated working indicator for the intake mini-chat — reuses the main chat's
-  // .status row (braille spinner + token count + elapsed) and ANIMATES it (the old
-  // static one was frozen on frame 1). Tokens come from the stream's {type:'tokens'}
-  // events (per-turn cumulative — the intake LLM call is non-streaming).
-  let _imSpin = { timer: null, row: null, start: 0, frame: 0, tokens: 0 };
-  function imStartSpinner() {
-    imStopSpinner();
-    const log = document.getElementById('im-log'); if (!log) return;
-    const row = document.createElement('div'); row.className = 'status'; log.appendChild(row);
-    _imSpin = { timer: null, row, start: Date.now(), frame: 0, tokens: 0 };
-    const fmt = (n) => (n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n));
-    const tick = () => {
-      if (!_imSpin.row) return;
-      const sp = SPINNER[_imSpin.frame++ % SPINNER.length];
-      const secs = Math.floor((Date.now() - _imSpin.start) / 1000);
-      const toks = _imSpin.tokens
-        ? '<span class="arrow">↕</span> <span class="count">' + fmt(_imSpin.tokens) + '</span> <span class="dim">tokens · ' + secs + 's</span>'
-        : '<span class="dim">' + secs + 's</span>';
-      _imSpin.row.innerHTML = '<span class="spin">' + sp + '</span> Working… ' + toks;
-      log.scrollTop = log.scrollHeight;
-    };
-    tick();
-    _imSpin.timer = setInterval(tick, 120);
-  }
-  function imSpinnerToBottom() {
-    const log = document.getElementById('im-log');
-    if (log && _imSpin.row && _imSpin.row.parentNode === log && _imSpin.row !== log.lastChild) log.appendChild(_imSpin.row);
-  }
-  function imSetTokens(n) { if (typeof n === 'number') _imSpin.tokens = n; }
-  function imStopSpinner() {
-    if (_imSpin.timer) clearInterval(_imSpin.timer);
-    if (_imSpin.row) _imSpin.row.remove();
-    _imSpin = { timer: null, row: null, start: 0, frame: 0, tokens: 0 };
   }
   async function addFromIntake() {
     const requirement = (document.getElementById('im-req').value || '').trim();
@@ -18016,7 +20817,12 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       const lines = repos.map((r) =>
         \`\${r.relDir} (\${r.branch}\${r.codeBoss ? '' : ' — not CODE_BOSS'}) — \${r.changeCount} change(s)\`,
       );
-      $gitDirty.title = 'Uncommitted changes:\\n' + lines.join('\\n');
+      // CODE_BOSS-branch repos auto-commit when the current task CLOSES (<next-task>), so dirt here
+      // is just in-progress work, not a problem. Only a non-CODE_BOSS repo needs manual attention.
+      const anyNonCB = repos.some((r) => !r.codeBoss);
+      $gitDirty.title = (anyNonCB
+        ? 'Uncommitted changes (a repo is not on a CODE_BOSS branch — needs attention):\\n'
+        : 'Uncommitted changes — in-progress work; auto-commits when the task closes:\\n') + lines.join('\\n');
     } catch {}
   }
   setInterval(refreshGitDirty, 8000);
@@ -18045,12 +20851,101 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     const noEdit = cb.checked;
     el.textContent = noEdit ? 'no edit' : 'edit';
     el.classList.toggle('off', noEdit);
+    // Discuss (read-only) overrides Review server-side, so hide the now-inert review controls.
+    const rl = document.getElementById('reviewLabel'); if (rl) rl.style.display = noEdit ? 'none' : '';
+    const ai = document.getElementById('approveImplementBtn');
+    if (ai && noEdit) ai.style.display = 'none';
   }
   function toggleEditAllowed() {
     const cb = document.getElementById('discussToggle');
     if (!cb) return;
     cb.checked = !cb.checked;
     syncEditToggle();
+  }
+  let _lastSendReview = false;   // was the last run a review (propose) run? → a proposal is waiting
+  function setApproveButton(show) { const b = document.getElementById('approveImplementBtn'); if (b) b.style.display = show ? '' : 'none'; }
+  function toggleReview() {
+    // The label reads "Auto-approve" (default ON = apply directly). The hidden #reviewToggle is the
+    // INVERSE: checked === true → review/propose-first ON → Auto-approve OFF (gray + struck through).
+    const cb = document.getElementById('reviewToggle'); const lbl = document.getElementById('reviewLabel');
+    if (!cb || !lbl) return;
+    cb.checked = !cb.checked;
+    lbl.classList.toggle('off', cb.checked);   // auto-approve OFF → grayed + crossed out (reuses .edit-toggle.off)
+    // The approve button appears only AFTER a propose run produces a proposal (see run-completion);
+    // turning Auto-approve back ON (review off) hides it.
+    if (!cb.checked) { _lastSendReview = false; setApproveButton(false); }
+  }
+  // Live checklist panel: the agent's <checklist> for multi-step work, ticking off in place.
+  // Re-rendered each time a fresh <checklist> arrives (the agent re-emits the full list with
+  // updated [x]); hidden when empty/absent. One panel for the main chat.
+  function renderChecklist(items) {
+    const panel = document.getElementById('checklistPanel');
+    if (!panel) return;
+    clearTimeout(panel._hideT);
+    if (!Array.isArray(items) || !items.length) { panel.style.display = 'none'; panel.innerHTML = ''; return; }
+    const done = items.filter((i) => i && i.done).length;
+    const rows = items.map((i) =>
+      \`<div class="checklist-item\${i && i.done ? ' done' : ''}"><span class="cl-box">\${i && i.done ? '✓' : '☐'}</span><span class="cl-text">\${escapeHtml((i && i.text) || '')}</span></div>\`
+    ).join('');
+    panel.innerHTML = \`<div class="cl-title">checklist · \${done}/\${items.length} done</div>\${rows}\`;
+    panel.style.display = '';
+    // All steps done → show the completed list briefly, then auto-hide (the work is finished).
+    if (done === items.length) panel._hideT = setTimeout(() => { panel.style.display = 'none'; panel.innerHTML = ''; }, 6000);
+  }
+  // Approve the proposal the agent just made and implement it: one run with review OFF (write
+  // mode), so it applies exactly what it proposed. The review toggle stays on for the next cycle.
+  async function approveImplement() {
+    _lastSendReview = false;     // this run IMPLEMENTS (review off) — no new proposal results
+    setApproveButton(false);
+    try {
+      await fetchWithTimeout('/api/message', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ text: 'Approved — go ahead and implement the proposal you just described.', model: $model.value, review: false }),
+      }, 15000);
+    } catch (e) { /* surfaced via SSE/status as usual */ }
+  }
+
+  // ── Shadow-git "undo last run" (non-repo targets) ───────────────────────
+  function setUndoButton(canUndo, request) {
+    const b = document.getElementById('undoRunBtn');
+    if (!b) return;
+    b.style.display = canUndo ? '' : 'none';
+    if (canUndo && request) b.title = \`Undo the last run ("\${request}") — this folder isn't a git project, so code_boss kept an internal snapshot.\`;
+  }
+  async function refreshUndoButton() {
+    try { const s = await (await fetch('/api/state?limit=1')).json(); setUndoButton(!!s.canUndo, s.undoRequest); } catch {}
+  }
+  async function undoLastRun() {
+    const b = document.getElementById('undoRunBtn');
+    if (b && b.dataset.busy) return; if (b) b.dataset.busy = '1';
+    try {
+      const j = await (await fetch('/api/undo-last-run', { method: 'POST' })).json().catch(() => ({}));
+      if (j.ok) {
+        setUndoButton(false);
+        // Files are reverted; now TELL the agent (a fresh turn — history stays intact) so it can
+        // acknowledge/adapt instead of assuming its changes are still there.
+        try {
+          await fetchWithTimeout('/api/message', { method: 'POST', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ text: \`I used Undo to revert the file changes from the last run\${j.request ? \` ("\${j.request}")\` : ''} — those edits are gone, the files are back to how they were before that run.\`, model: $model.value }) }, 15000);
+        } catch (e) { /* the revert already happened; the notify is best-effort */ }
+      } else { alert(j.note || j.error || 'Nothing to undo.'); }
+    } catch (e) { showError('Undo failed', e); }
+    finally { if (b) delete b.dataset.busy; }
+  }
+  // The agent suggested reverting the last run — offer Allow (runs the undo) / Keep changes.
+  function showRollbackPrompt(reason) {
+    const log = document.getElementById('log');
+    if (!log) return;
+    const old = document.getElementById('rollbackPrompt'); if (old) old.remove();
+    const d = document.createElement('div');
+    d.id = 'rollbackPrompt'; d.className = 'bubble system';
+    d.appendChild(document.createTextNode('↶ The agent suggests rolling back the last run: ' + (reason || '') + '  '));
+    const allow = document.createElement('button'); allow.className = 'btn'; allow.textContent = 'Allow rollback';
+    const keep = document.createElement('button'); keep.className = 'btn'; keep.textContent = 'Keep changes';
+    allow.onclick = () => { d.remove(); undoLastRun(); };
+    keep.onclick = () => { d.remove(); };
+    d.appendChild(allow); d.appendChild(document.createTextNode(' ')); d.appendChild(keep);
+    log.appendChild(d); d.scrollIntoView({ block: 'end' });
   }
 
   // ── Tab leadership (single live SSE) ────────────────────────────────────
@@ -18109,18 +21004,10 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     window.addEventListener('beforeunload', () => { try { bc.postMessage({ type: 'bye', id: TAB_ID }); } catch {} });
   })();
 
-  // Spinner tick — runs only while a chat is in progress so the spinner glyph
-  // animates and the elapsed timer counts up.
-  let _spinTick = null;
-  function startSpinTick() {
-    if (_spinTick) return;
-    chatStartedAtLocal = chatStartedAtLocal || Date.now();
-    _spinTick = setInterval(renderStatus, 100);
-  }
-  function stopSpinTick() {
-    if (_spinTick) { clearInterval(_spinTick); _spinTick = null; }
-    renderStatus();
-  }
+  // The spinner tick (elapsed clock) now lives INSIDE the spinner instance;
+  // startSpinTick / stopSpinTick are thin wrappers over status.startTick /
+  // status.stopTick (defined with the spinner). Callers set chatStartedAtLocal
+  // before startSpinTick (renderSessionInChat / the running-status case).
 
   let _initialized = false;       // initialize() flips this once chat is allowed
   let _pendingSession = null;     // SSE init arriving during init is parked here
@@ -18163,7 +21050,10 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     if (s.pendingUnlockUrl) showUnlockModal(s.pendingUnlockUrl);
     // Re-show a mid-task developer-approval prompt so a reload / late tab
     // doesn't strand the paused agent.
-    if (s.approvalPending) showApprovalPrompt(s.approvalPending);
+    // Restore the live checklist panel on reload/reconnect (the server is still driving it).
+    onChecklist(null, s.lastChecklist || null);
+    attachChecklistScrollSync();   // the Checklists tab follows the task at the viewport middle as you scroll
+    setUndoButton(!!s.canUndo, s.undoRequest);   // restore the shadow-git "undo last run" button
     if (!activeProject) {
       showLanding(s.recent || []);
       stopSpinTick();
@@ -18190,6 +21080,12 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
         // in-progress edits. openMemory() always fetches fresh on next open.
         break;
       case 'event':
+        // Sub-agent tool activity is routed to that sub-agent's detail drawer, NOT the
+        // main chat (the foreground stays uncluttered; the bounded result folds in later
+        // as a subagent-card). Tagged by the server with subagentChannel.
+        // Cognition tree (CB_COGNITION): live thinking-tree updates → the Cognition tab.
+        if (msg.event && msg.event.type === 'cognition-event') { handleCognitionEvent(msg.event.cog); break; }
+        if (msg.event && msg.event.subagentChannel) { saAddActivity(msg.event.subagentChannel, msg.event); break; }
         // tool-progress streams live stdout from a running tool — render
         // it but do NOT keep it in session.events. The server doesn't
         // persist it either (see appendChatEvent in server.mjs). Pushing
@@ -18200,20 +21096,45 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
         // context-fill is a per-turn gauge update, not a chat row — update the
         // bar and stop (the server never persists it; don't push it either).
         if (msg.event.type === 'context-fill') {
-          contextFill = { totalTokens: msg.event.totalTokens, budgetTokens: msg.event.budgetTokens, budgetPct: msg.event.budgetPct };
+          status.setContextFill({ totalTokens: msg.event.totalTokens, budgetTokens: msg.event.budgetTokens, budgetPct: msg.event.budgetPct });
           renderStatus();
           break;
         }
         // task-progress is a per-turn signal (the agent's completion estimate +
         // what remains), not a chat row — update the chip and stop.
         if (msg.event.type === 'task-progress') {
-          taskProgress = { percent: msg.event.percent, note: msg.event.note };
+          status.setTaskProgress({ percent: msg.event.percent, note: msg.event.note });
           renderStatus();
+          break;
+        }
+        // checklist is a live, in-place signal (the agent's <checklist> for multi-step work,
+        // ticking off as it goes) — update the pinned panel, don't push a chat row. (Main chat
+        // only for now; sub-agent checklists ride their drawer later.)
+        if (msg.event.type === 'checklist') {
+          if (!msg.event.subagentChannel) onChecklist(msg.event.taskId, msg.event.items);
+          break;
+        }
+        // The agent suggests reverting the last run → offer Allow / Cancel (main chat only).
+        if (msg.event.type === 'rollback-suggested') {
+          if (!msg.event.subagentChannel) showRollbackPrompt(msg.event.reason);
           break;
         }
         if (msg.event.type !== 'tool-progress') session.events.push(msg.event);
         renderEvent(msg.event);
         break;
+      case 'subagent-event': {
+        // orchestrator lifecycle pings (spawn → working → awaiting-review → reviewing →
+        // [resume → working]* → done/rejected). Patch the sub-agent's status in saStore.
+        const e = msg.event || {};
+        if (e.type === 'subagent-spawned') saUpsert(e.id, { topic: e.topic, status: 'working' });
+        else if (e.type === 'subagent-result') saUpsert(e.id, { status: 'awaiting-review' });
+        else if (e.type === 'subagent-reviewing') saUpsert(e.id, { status: 'reviewing' });
+        else if (e.type === 'subagent-resume') { saUpsert(e.id, { status: 'working' }); saAddActivity(e.id, { type: 'feedback-round', round: e.round, feedback: e.feedback }); }
+        else if (e.type === 'subagent-review-exhausted') saUpsert(e.id, { status: 'rejected' });
+        else if (e.type === 'subagent-recovered') saUpsert(e.id, { topic: e.topic, status: 'recovered', recovered: true });
+        else if (e.type === 'subagent-done') saUpsert(e.id, { status: e.status || 'done' });
+        break;
+      }
       case 'event-patch': {
         const ev = session.events.find((e) => e.id === msg.eventId);
         if (ev) {
@@ -18221,6 +21142,13 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
           // Simple Phase 4 strategy: re-render all events (Phase 5 will be smarter)
           clearLog();
           for (const e2 of session.events) renderEvent(e2);
+        } else {
+          // A drawer-routed event (a forked task's review row lives in saStore, not
+          // session.events) — patch it there + re-render that sub-agent's drawer.
+          for (const sa of saStore.values()) {
+            const a = sa.activity.find((e) => e.id === msg.eventId);
+            if (a) { Object.assign(a, msg.patch); if (saDrawerId === sa.id) renderSubagentDetail(sa.id); break; }
+          }
         }
         break;
       }
@@ -18250,25 +21178,14 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
             setDone();
           }
           stopSpinTick();
+          refreshUndoButton();   // a write-mode run may have created an undo point (non-repo targets)
+          if (msg.status === 'done') setApproveButton(_lastSendReview);   // a completed PROPOSE run → a proposal awaits approval
           // Defensive: any tool row still marked running (e.g., agent
           // aborted mid-tool) should stop blinking now.
           RC.log.querySelectorAll('.row.tool.tool-running').forEach((r) => r.classList.remove('tool-running'));
-          // Sweep ORPHANED streaming bubbles: a prose segment that sanitized to
-          // empty (pure tool-tag noise like "<read ...args/>") never gets its
-          // finalize event, so its data-streaming row is never replaced/removed.
-          // On terminal status, drop any such row whose content is ONLY tool-tag
-          // noise (real prose leaves visible text and is kept).
-          RC.log.querySelectorAll('.row.assistant[data-streaming="true"]').forEach((r) => {
-            // No finalize event will come for these — flush the streaming
-            // renderer's last partial line so the kept rows show their full text.
-            try { r._smd?.finish(); } catch {}
-            r._smd = null;
-            const stripped = (r.textContent || '')
-              .replace(/<remote-workspace\\b[\\s\\S]*?<\\/remote-workspace>/gi, '')
-              .replace(/<\\/?(?:remote-workspace|read|write|edit|list|find|search|info|powershell|next-task|list-tasks|task-detail|search-tasks|remember|forget)\\b[^>]*>/gi, '')
-              .replace(/[\\s●.]+/g, '');   // strip the leading marker + whitespace + stray dots
-            if (!stripped) r.remove();
-          });
+          // Sweep ORPHANED streaming bubbles whose content is ONLY tool-tag noise (see
+          // sweepOrphanToolTagBubbles). On terminal status, flush each streaming renderer first.
+          sweepOrphanToolTagBubbles(true);
           // Repos most likely changed during the chat — refresh the
           // footer indicator now rather than waiting for the next poll.
           refreshGitDirty();
@@ -18280,36 +21197,30 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       case 'phase':
         session.phase = msg.phase;
         // Map server phase strings to the UI's status row phase functions.
-        if (msg.phase === 'uploading')        { statusVerb = VERB; setUploading(); }
-        else if (msg.phase === 'thinking')    { statusVerb = VERB; setThinking(); }
-        else if (msg.phase === 'downloading') { statusVerb = VERB; setDownloading(); }
+        if (msg.phase === 'uploading')        { status.setVerb(VERB); setUploading(); }
+        else if (msg.phase === 'thinking')    { status.setVerb(VERB); setThinking(); }
+        else if (msg.phase === 'downloading') { status.setVerb(VERB); setDownloading(); }
         // Manager phases: the worker is done; the reviewer / acceptance manager
         // is now running. Keep the spinner alive but relabel WHO is busy.
-        else if (msg.phase === 'reviewing')   { statusVerb = 'Reviewing'; setThinking(); }
-        else if (msg.phase === 'manager')     { statusVerb = 'Checking the assignment'; setThinking(); }
+        else if (msg.phase === 'reviewing')   { status.setVerb('Reviewing'); setThinking(); }
+        else if (msg.phase === 'manager')     { status.setVerb('Checking the assignment'); setThinking(); }
         // Network retry/backoff: the LLM endpoint was unreachable and we're
         // retrying. "reconnecting:N/M" carries the attempt count. Make it visibly
         // distinct from a normal slow turn (recovery flips back to "Working").
         else if (msg.phase.indexOf('reconnecting') === 0) {
           const m = (msg.phase.split(':')[1] || '').trim();
-          statusVerb = 'Reconnecting to the LLM' + (m ? \` (attempt \${m})\` : '');
+          status.setVerb('Reconnecting to the LLM' + (m ? \` (attempt \${m})\` : ''));
           setThinking();
         }
         renderStatus();
         break;
       case 'tokens':
         session.tokens = msg.tokens;
-        // Mirror server-side token counts into the locals renderStatus reads.
-        // Also infer phase from which side moved — useful when phase events
-        // are delayed or skipped.
+        // Mirror server-side token counts into the spinner (which also infers
+        // DOWNLOADING from which side moved — phase events can lag/skip).
         const newUp = msg.tokens.up || 0;
         const newDown = msg.tokens.down || 0;
-        if (newDown > downTokens && phase !== PHASE.DOWNLOADING && phase !== PHASE.DONE) {
-          setDownloading();
-        }
-        upTokens = newUp;
-        downTokens = newDown;
-        lastDeltaTime = Date.now();
+        status.applyTokens(newUp, newDown);
         if ($settingsTokens) $settingsTokens.textContent = (newUp + newDown).toLocaleString();
         renderStatus();
         break;
@@ -18329,10 +21240,18 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
         session.timeoutMs = msg.timeoutMs;
         renderTimeoutChip();
         break;
-      case 'reset':
+      case 'reset': {
         session.events = [];
         clearLog();
+        _checklistsByTask.clear(); _currentChecklistTaskId = null;   // drop all per-task checklists on Clear/reset
+        { const c = document.getElementById('checklistCount'); if (c) c.textContent = ''; }
+        updateChecklistViews();   // hide the footer + clear the tab
+        setUndoButton(false);    // and the undo button
+        setApproveButton(false); _lastSendReview = false;   // and the approve button
+        // re-hide the on-demand side-tabs (Cognition / Sub-agents) so a cleared session is clean
+        for (const id of ['tabbtn-cognition', 'tabbtn-subagents']) { const t = document.getElementById(id); if (t) t.style.display = 'none'; }
         break;
+      }
       case 'unlock-needed':
         console.log('[sse] unlock-needed', msg.url);
         showUnlockModal(msg.url);
@@ -18361,12 +21280,6 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
         // is awaiting our /api/git-pending-resolve POST.
         console.log('[sse] git-needs-branch', msg.repoDir);
         showGitBranchPrompt({ repoDir: msg.repoDir, relDir: msg.relDir, currentBranch: msg.currentBranch });
-        break;
-      case 'approval-needed':
-        // Mid-task pause: a tool wants explicit developer approval (e.g.
-        // edit_docx flatten). The tool is awaiting /api/approval-resolve.
-        console.log('[sse] approval-needed', msg.kind);
-        showApprovalPrompt({ id: msg.id, kind: msg.kind, message: msg.message });
         break;
     }
     // Some compaction events the server emits as regular chat events via
@@ -18457,7 +21370,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     const chev = document.createElement('span');
     chev.className = 'task-foot-toggle';
     chev.title = 'Collapse / expand';
-    chev.onclick = (e) => { e.stopPropagation(); setTaskCollapsed(project, foot, !project.classList.contains('collapsed')); };
+    chev.onclick = (e) => { e.stopPropagation(); setTaskCollapsed(project, foot, !project.classList.contains('collapsed'), true); };
     foot.appendChild(chev);
     const sum = document.createElement('span');
     sum.className = 'task-foot-project';
@@ -18465,7 +21378,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     foot.appendChild(sum);
     project.appendChild(foot);
 
-    head.onclick = () => setTaskCollapsed(project, foot, false);
+    head.onclick = () => setTaskCollapsed(project, foot, false, true);
     setTaskCollapsed(project, foot, _taskCollapsed.get(String(ev.parentTaskId)) || false);
 
     scrollToBottom();
@@ -18473,11 +21386,15 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
 
   function clearLog() {
     RC.log.innerHTML = '';
-    statusRow = null;
+    RC.clearStatus?.();   // drop the active chat's spinner row ref (its DOM is gone)
   }
 
   function renderEvent(ev) {
     if (!ev || !ev.type) return;
+    // Sub-agent activity never renders in the main chat — it's routed to that
+    // sub-agent's drawer (defensive: live events are intercepted in the SSE dispatch;
+    // this also catches any that arrive via a full re-render).
+    if (ev.subagentChannel) { saAddActivity(ev.subagentChannel, ev); return; }
 
     // Compaction events drive UI-only effects (mute classes, project wrap).
     if (ev.type === 'task-tier-change' || ev.type === 'task-rollup' || ev.type === 'task-archived') {
@@ -18551,6 +21468,9 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
         break;
       }
       case 'tool-call': {
+        // The block just parsed — drop any orphan prose bubble that streamed its raw tag, so the
+        // raw <powershell …>/<edit …> tag doesn't linger mid-run (it used to clear only at run-end).
+        sweepOrphanToolTagBubbles(false);
         // Suppress next-task chrome from the chat — the just-closed task
         // gets a wrap right after, which conveys the switch by itself.
         if ((ev.verb || ev.name) === 'next-task') break;
@@ -18584,6 +21504,8 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
         const TOOL_DISPLAY_MAX = 200;
         const truncated = fullLine.length > TOOL_DISPLAY_MAX;
         const display = truncated ? fullLine.slice(0, TOOL_DISPLAY_MAX - 1) + '…' : fullLine;
+        // Group consecutive memory saves into ONE collapsible row instead of N tool rows.
+        if (verb === 'remember') { appendRememberItem(ev, display); break; }
         const body = addRow('tool', display);
         const row = body.parentElement;
         // Tag the row with its callId so the matching tool-result event
@@ -18630,6 +21552,8 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       case 'tool-result': {
         // Pair with the next-task tool-call suppression above.
         if ((ev.verb || ev.name) === 'next-task') break;
+        // remember results are folded into the grouped memory row (no standalone result row).
+        if ((ev.verb || ev.name) === 'remember') break;
         // The matching tool-call row's blinking dot should stop now.
         if (ev.callId) {
           const cid = CSS.escape(ev.callId);
@@ -18658,6 +21582,36 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       case 'diff':
         node = addDiffBlock(ev);
         break;
+      case 'plan-review-start': {
+        const n = ev.count || 0;
+        node = addRow('plan-review', \`⚖ hardening the plan — \${n} adversarial critic\${n === 1 ? '' : 's'} reading the code…\`).parentElement;
+        break;
+      }
+      case 'plan-review-done': {
+        const findings = ev.findings || [];
+        const row = document.createElement('div');
+        row.className = 'row plan-review' + (findings.length ? ' has-findings' : '');
+        const hdr = document.createElement('div');
+        hdr.className = 'pr-hdr';
+        hdr.textContent = findings.length
+          ? \`⚖ plan review: \${findings.length} concern\${findings.length === 1 ? '' : 's'} found → revising the plan\`
+          : '⚖ plan review: no concerns — plan stands';
+        row.appendChild(hdr);
+        if (findings.length) {
+          const body = document.createElement('div');
+          body.className = 'pr-findings';
+          for (const f of findings) {
+            const it = document.createElement('div');
+            it.className = 'pr-finding';
+            it.textContent = \`[\${f.lens}] \${String(f.concerns || '').replace(/\\s+/g, ' ').slice(0, 400)}\`;
+            body.appendChild(it);
+          }
+          row.appendChild(body);
+        }
+        RC.log.appendChild(row); RC.afterRow?.(); scrollToBottom();
+        node = row;
+        break;
+      }
       case 'review':
         // Per-task reviews render their verdict in the task's footer. Fall
         // back to a standalone row when there's no matching task-wrap (e.g.
@@ -18696,6 +21650,55 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
       case 'task-undo':
         node = addTaskUndoRow(ev);
         break;
+      case 'subagent-card': {
+        // the bounded labeled result of a delegated sub-agent, folded into the chat;
+        // also seeds/updates the store so the list + drawer reflect the final state.
+        saUpsert(ev.subagentId, { topic: ev.topic, status: ev.status || 'done', content: ev.content || '' });
+        const row = document.createElement('div');
+        row.className = 'row subagent-card ' + (ev.status || 'done');
+        row.style.cursor = 'pointer';
+        row.title = 'Click to view this sub-agent\\'s activity';
+        row.onclick = () => openSubagentDetail(ev.subagentId);
+        const head = document.createElement('div'); head.className = 'sa-card-head';
+        head.textContent = '◇ sub-agent finished: ' + (ev.topic || ev.subagentId || '');
+        const prev = document.createElement('div'); prev.className = 'sa-card-preview';
+        prev.textContent = (ev.content || '').replace(/\\s+/g, ' ').trim().slice(0, 180) + ' — click to view activity';
+        row.appendChild(head); row.appendChild(prev);
+        RC.log.appendChild(row);
+        RC.afterRow?.();
+        scrollToBottom();
+        node = row;
+        break;
+      }
+      case 'acceptance-verdict': {
+        // the Acceptance agent's verdict on a sub-agent's work — visible in the main chat
+        // (the both-sides bridge); click → the sub-agent's drawer.
+        const reject = ev.verdict === 'reject';
+        const row = document.createElement('div');
+        row.className = 'row acceptance-verdict' + (reject ? ' reject' : '');
+        row.style.cursor = 'pointer';
+        row.onclick = () => openSubagentDetail(ev.subagentId);
+        const head = document.createElement('div'); head.className = 'av-head';
+        head.textContent = (reject ? '✎ review: changes requested' : '✓ review: approved') + (ev.topic ? \` — \${ev.topic}\` : '');
+        const body = document.createElement('div'); body.className = 'av-body';
+        body.textContent = (ev.rationale || '').replace(/\\s+/g, ' ').trim().slice(0, 200);
+        row.appendChild(head); if (body.textContent) row.appendChild(body);
+        RC.log.appendChild(row); RC.afterRow?.(); scrollToBottom();
+        node = row;
+        break;
+      }
+      case 'acceptance-feedback': {
+        const row = document.createElement('div');
+        row.className = 'row acceptance-verdict reject';
+        row.style.cursor = 'pointer';
+        row.onclick = () => openSubagentDetail(ev.subagentId);
+        const head = document.createElement('div'); head.className = 'av-head'; head.textContent = '✎ feedback → sub-agent';
+        const body = document.createElement('div'); body.className = 'av-body'; body.textContent = (ev.feedback || '').replace(/\\s+/g, ' ').trim().slice(0, 240);
+        row.appendChild(head); row.appendChild(body);
+        RC.log.appendChild(row); RC.afterRow?.(); scrollToBottom();
+        node = row;
+        break;
+      }
     }
 
     // Tag the rendered node with its task id so task-end can wrap it later.
@@ -18771,7 +21774,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     const chev = document.createElement('span');
     chev.className = 'task-foot-toggle';
     chev.title = 'Collapse / expand';
-    chev.onclick = (e) => { e.stopPropagation(); setTaskCollapsed(wrap, foot, !wrap.classList.contains('collapsed')); };
+    chev.onclick = (e) => { e.stopPropagation(); setTaskCollapsed(wrap, foot, !wrap.classList.contains('collapsed'), true); };
     foot.appendChild(chev);
     const summarySpan = document.createElement('span');
     summarySpan.className = 'task-foot-summary';
@@ -18785,7 +21788,7 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     wrap.appendChild(foot);
 
     // Clicking the (collapsed-only) header expands the task.
-    head.onclick = () => setTaskCollapsed(wrap, foot, false);
+    head.onclick = () => setTaskCollapsed(wrap, foot, false, true);
     // Restore persisted collapse state (lost otherwise on the re-render cycle).
     setTaskCollapsed(wrap, foot, _taskCollapsed.get(String(taskId)) || false);
 
@@ -18794,12 +21797,21 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
 
   // Toggle a task wrap's collapse state, sync the foot chevron glyph, and
   // remember it (keyed by taskId) so it survives the clearLog() re-render.
-  function setTaskCollapsed(wrap, foot, collapsed) {
+  function setTaskCollapsed(wrap, foot, collapsed, scroll = false) {
     wrap.classList.toggle('collapsed', collapsed);
     const ch = foot && foot.querySelector('.task-foot-toggle');
     if (ch) ch.textContent = collapsed ? '▶' : '▼';
     const id = wrap.dataset.taskId;
     if (id) _taskCollapsed.set(String(id), collapsed);
+    // On a USER click, keep the task's FOOT (where the chevron is) at the viewport bottom — AFTER
+    // the expand/collapse reflow (rAF), or scrollIntoView targets the stale pre-reflow layout. This
+    // makes expand reveal the task's bottom (latest) and collapse scroll UP so the now-collapsed
+    // task stays in view instead of leaving you parked where its bottom used to be.
+    if (scroll && foot) {
+      requestAnimationFrame(() => requestAnimationFrame(() => {
+        try { foot.scrollIntoView({ block: 'end', behavior: 'smooth' }); } catch {}
+      }));
+    }
   }
 
   // Render the commit status into a task footer from the task-end event's
@@ -18865,7 +21877,9 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     // adds to the queue above. While idle: Enter submits as before.
     $input.disabled = false;
     $input.placeholder = running
-      ? 'Agent running — Enter to queue, Esc to stop'
+      ? (session?.orchestrator
+          ? 'Agent busy — Enter delegates to a sub-agent · Shift+← to queue · Esc to stop'
+          : 'Agent running — Enter to queue, Esc to stop')
       : 'Ask… (Enter to send · Shift+← to queue · Shift+Space toggles the panel)';
     if (!running) {
       try { $input.focus(); } catch {}
@@ -19089,18 +22103,10 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       if (!$input.value.trim()) return;        // empty Enter = no-op
-      if (session?.status === 'running') {
-        // Agent busy → queue instead of submit. Stays composable.
-        enqueueCurrentInput();
-      } else {
-        send();
-      }
-    } else if (e.shiftKey && e.key === 'ArrowLeft') {
-      // ⇧← → move the current draft into the Queue tab.
-      if ($input.value.trim()) { e.preventDefault(); enqueueCurrentInput(); }
-    } else if (e.shiftKey && e.key === 'ArrowRight') {
-      // ⇧→ → pull the highlighted queue item back into the input.
-      if (_selectedQueueId != null) { e.preventDefault(); pullQueueItem(_selectedQueueId); }
+      // Busy or not, just send: when the foreground is busy the server delegates the message to
+      // a background sub-agent (orchestrator, default-on). The old client-side queue is retired —
+      // async delegation replaces it. (A non-repo busy target still 409s; the error surfaces.)
+      send();
     }
   });
   // Auto-grow textarea: start at one line, grow with content up to its CSS
@@ -19115,15 +22121,8 @@ function layoutMosaic(tiles, pageCols = 12, pageRows = 8, opts = {}) {
   }
   function autoGrowInput() { autoGrowEl($input); }
   $input.addEventListener('input', autoGrowInput);
-  // Intake modal: same input behavior as the main chat — auto-grow on input,
-  // Enter sends, shift+Enter newline.
-  {
-    const im = document.getElementById('im-input');
-    if (im) {
-      im.addEventListener('input', () => autoGrowEl(im));
-      im.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendIntakeChat(); } });
-    }
-  }
+  // (The intake textarea's auto-grow + Enter→send is wired by its
+  // createChatComponent instance — see \`intakeChat\` above.)
   document.addEventListener('keydown', (e) => {
     // F1 → open snapshot. Works even if every UI click is being eaten by
     // an invisible overlay — handy when the page seems "frozen" and the
