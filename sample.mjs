@@ -20,7 +20,7 @@
 // Build stamp — injected at build time so the running server can report it
 // (visible in the Snapshot view). Lets you confirm "yes, this is the bundle
 // I just copied over" without guessing from file size.
-const BUILD_VERSION = '444';
+const BUILD_VERSION = '446';
 
 // ====== CONFIG (edit these) ======
 const API_KEY  = '';                                // bearer token
@@ -3331,6 +3331,7 @@ function buildSystemPrompt({ taskId, taskUserRequest, tier1Tokens, tier1Pct, pro
     'Work AUTONOMOUSLY: once the developer gives you a task, carry out the obvious next steps yourself. Do NOT end a reply asking permission to proceed ("would you like me to…?", "should I…?") when the next action is clear from the task or from what you just read — just take it. Use information already in the request instead of asking for it again. Ask the developer ONLY when you are genuinely blocked: the request is too ambiguous to pick any reasonable next step, or an action is destructive/irreversible and they did not ask for it. (Tool-level approvals — e.g. branch creation, tracked .docx edits — still pause on their own; that is separate from this.)',
     'THINK BEFORE YOU ACT — plan your strategy, then do it. For any non-trivial request, FIRST state a short plan in prose: the goal and how you will approach it. The plan covers whatever the task is — not just edits: for an INVESTIGATION or question, what you will look at and WHY (so you read only what is needed, not everything); for a REFACTOR or design, the strategy, the sequence, and what must be preserved; for a change, the specific files/edits you intend. THEN carry it out (you may do both in one reply when the plan is obvious). Do not dive into reading files or editing without a plan, and read ONLY what the current step needs.',
     'CHECKLIST for multi-step work: when the work is a SEQUENCE OF CONCRETE STEPS, emit a <checklist> (a standalone signal like <task-progress>) listing them as markdown items, then re-emit the FULL list each turn with finished items checked so the developer sees live progress — e.g. `<checklist>\n- [x] read the entity + DDL\n- [ ] add the field\n- [ ] build to verify\n</checklist>`. Use it ONLY for genuinely multi-step concrete work — NOT for a one-step change, a question, or open-ended strategy (reason those through in prose). It renders as a live panel, not chat text. In Review mode the proposal\'s checklist IS this <checklist>.',
+    'PHASE SIGNAL: when your working MODE changes, emit <phase>name</phase> on its own line BEFORE that work — name is one of: exploring (reading/searching to understand), designing (deciding the approach/architecture in prose BEFORE changing files), implementing (making the changes), debugging (chasing a fault), verifying (building/testing/checking the result). One phase is active at a time; emit it ONLY when the mode changes, not every turn. It renders as a status marker, not chat text. Skip it entirely for purely conversational replies.',
     'UNDO / ROLLBACK: if the developer says they used Undo to revert your last run\'s changes, acknowledge briefly and ask what to adjust or try differently — do NOT silently re-apply the same changes. And if YOU realize the last run\'s changes were wrong or harmful, you may suggest reverting them by emitting a standalone <rollback reason="why">…</rollback> signal; the developer will choose Allow or Cancel.',
     // Pin the active checklist back in each turn — it is stripped from the visible history, so this
     // is the ONLY way the agent sees its own current list (and the approved plan after implement).
@@ -3555,6 +3556,8 @@ function sanitizeAssistantProse(text, opts = {}) {
   text = text.replace(/<rollback\b[\s\S]*?<\/rollback>/gi, '').replace(/<rollback\b[^>]*\/>/gi, '');
   // <tick> is a shorthand mark-done signal — strip it (folded into the 'checklist' event).
   text = text.replace(/<tick\b[\s\S]*?<\/tick>/gi, '').replace(/<tick\b[^>]*\/>/gi, '');
+  // <phase> is a working-mode signal — strip it (surfaced as a 'phase' event).
+  text = text.replace(/<phase\b[^>]*>[\s\S]*?<\/phase>/gi, '').replace(/<phase\b[^>]*\/>/gi, '');
   // Also strip tool-call-looking XML tags from the prose. The model
   // sometimes "previews" what it's about to do by writing the tag in
   // its narration before the actual <remote-workspace> block — so the
@@ -4532,6 +4535,7 @@ async function runPromptedAgent({
   maxTurns = DEFAULT_MAX_TURNS,
   parallelCritic,            // adversarial-critic UI toggle (off by default); undefined → CB_PARALLEL_CRITIC env
   deepThink,                 // deep_think UI toggle (off by default); undefined → CB_DEEP_THINK env (opt-in)
+  phaseAdversaries,          // design-attack fleet on <phase>designing</phase> exits; undefined → CB_PHASE_ADVERSARIES env (opt-in)
   // Legacy callbacks (used by /api/chat SSE response):
   onText, onToolCalls, onToolResult, onLog,
   // New chat-event callback (used by /api/message + chat state on server):
@@ -4853,6 +4857,70 @@ async function runPromptedAgent({
     }
     return (await drainReviewer()) > 0;
   };
+  // ── phase machinery: <phase>name</phase> signals + the design-attack fleet ──
+  // The agent self-reports its working MODE (exploring/designing/implementing/
+  // debugging/verifying); the SYSTEM decides what scrutiny that mode deserves —
+  // the agent can't recognize the risks it can't recognize, so the trigger
+  // must live outside it. Today: leaving a designing span (with enough design
+  // prose) fires three ADVERSARIES that try to BREAK the plan as written,
+  // async like the reviewer; concrete breaks are injected at a turn boundary.
+  const PHASE_NAMES = new Set(['exploring', 'designing', 'implementing', 'debugging', 'verifying']);
+  const DESIGN_ATTACK_MAX_FLEETS = 2;       // per run
+  const DESIGN_ATTACK_MIN_CHARS = 200;      // a one-liner "design" isn't worth a fleet
+  let currentPhase = null;
+  let designBuffer = '';                    // prose written while currentPhase === 'designing'
+  let attackFleets = 0;
+  let attackInflight = null;                // at most one fleet at a time
+  const attackFindings = [];                // {ownerTaskId, attacks:[{lens,text}]} awaiting injection
+  const phaseAdversariesOn = (phaseAdversaries ?? /^(1|true|on|yes)$/i.test(String(process.env.CB_PHASE_ADVERSARIES ?? ''))) && !discussMode;
+  const kickDesignAttack = (cur) => {
+    const design = designBuffer.trim();
+    designBuffer = '';
+    if (!phaseAdversariesOn || design.length < DESIGN_ATTACK_MIN_CHARS) return;
+    if (attackInflight || attackFleets >= DESIGN_ATTACK_MAX_FLEETS || signal?.aborted) return;
+    attackFleets++;
+    const ownerTaskId = cur?.id;
+    const goal = String(cur?.userRequest || messages?.[0]?.content || '').trim();
+    const brief = (goal ? `The task:\n${goal.slice(0, 4000)}\n\n` : '') + `The agent's design (about to be implemented):\n${design.slice(0, 8000)}`;
+    emitChat({ type: 'design-attack', phase: 'start', taskId: ownerTaskId, design: design.slice(0, 200) });
+    log(`design-attack: fanning out ${DESIGN_ATTACK_LENSES.length} adversaries (fleet ${attackFleets}/${DESIGN_ATTACK_MAX_FLEETS})`);
+    // Attackers are read-only one-shot passes with no chat events of their own;
+    // a per-attacker failure degrades to "no attack" (the fleet still settles).
+    attackInflight = Promise.all(DESIGN_ATTACK_LENSES.map((lens) =>
+      runDesignAttacker({ adapter, model, signal, brief, lens: lens.guidance, projectDir })
+        .then((r) => ({ lens: lens.key, attack: (r && r.attack) ? String(r.attack).trim() : null }))
+        .catch(() => ({ lens: lens.key, attack: null }))))
+      .then((results) => {
+        const real = results.filter((r) => r.attack);
+        const shaped = real.map((r) => ({ lens: r.lens, text: r.attack.slice(0, 1200) }));
+        emitChat({ type: 'design-attack', phase: 'result', taskId: ownerTaskId, attacks: shaped });
+        if (shaped.length) attackFindings.push({ ownerTaskId, attacks: shaped });
+        log(`design-attack: ${real.length}/${results.length} adversaries found a break`);
+      })
+      .catch((e) => log(`design-attack failed: ${e?.message ?? e}`))
+      .finally(() => { attackInflight = null; });
+  };
+  const drainDesignAttacks = async () => {
+    let n = 0;
+    while (attackFindings.length) {
+      const { ownerTaskId, attacks } = attackFindings.shift();
+      const tid = ownerTaskId || store.currentId();
+      const body = attacks.map((a) => `[${a.lens}]\n${a.text.slice(0, 1200)}`).join('\n\n');
+      await store.appendMessage({ kind: 'user-message', role: 'user', content: `<design-attack-findings>\nAdversarial reviewers attacked your design and found ${attacks.length} concrete break(s):\n\n${body}\n\nAddress each one — adjust the design or the implementation. If an attack is wrong, say why in one or two sentences and continue.\n</design-attack-findings>` }, tid);
+      lastTurnGotCritique = true;   // the rework turn shouldn't ALSO be reviewed by the critic
+      log(`design-attack: injected ${attacks.length} finding(s)`);
+      n++;
+    }
+    return n;
+  };
+  // Settle the fleet at run end so a slow attack is never silently dropped:
+  // if it finds breaks, the agent gets one more turn (caller keeps looping).
+  const designAttackFlush = async () => {
+    if (!phaseAdversariesOn || signal?.aborted) return false;
+    if (currentPhase === 'designing') kickDesignAttack(await store.getCurrent());   // run ended mid-design: attack what's written
+    if (attackInflight) { try { await attackInflight; } catch {} }
+    return (await drainDesignAttacks()) > 0;
+  };
   // The user-request of the PREVIOUS <next-task> close. Used to detect the
   // re-answer loop: closing the SAME request again, on a turn that did no tool
   // work, is the model re-answering something it already answered (not new
@@ -4946,6 +5014,8 @@ async function runPromptedAgent({
     // Inject any findings a BACKGROUND reviewer has verified since the last turn — non-blocking; the
     // agent sees them this turn as <reviewer-finding> messages.
     await drainReviewer();
+    // …and any concrete breaks the design-attack fleet found (same shape).
+    await drainDesignAttacks();
 
     // Compute current tier-1 tokens to inject into the system prompt.
     let cur = await store.getCurrent();
@@ -5454,6 +5524,26 @@ async function runPromptedAgent({
     }
     // ROLLBACK SUGGESTION — the agent proposes reverting the last run; the UI offers Allow/Cancel.
     if (rollbackReason) emitChat({ type: 'rollback-suggested', taskId: cur?.id, reason: String(rollbackReason).slice(0, 300) });
+    // PHASE SIGNALS — walk the turn's text, attributing prose to the phase
+    // active where it appears; each valid <phase> marker is a transition.
+    // Leaving a designing span fires the adversaries on the captured design.
+    {
+      const phaseRe = /<phase\b[^>]*>\s*([a-z-]+)\s*<\/phase>/gi;
+      let pIdx = 0, pm;
+      const applyProse = (chunk) => { if (currentPhase === 'designing' && chunk.trim()) designBuffer += chunk; };
+      while ((pm = phaseRe.exec(text)) !== null) {
+        applyProse(text.slice(pIdx, pm.index));
+        pIdx = pm.index + pm[0].length;
+        const name = pm[1].toLowerCase();
+        if (!PHASE_NAMES.has(name) || name === currentPhase) continue;
+        if (currentPhase === 'designing') kickDesignAttack(cur);
+        currentPhase = name;
+        if (name === 'designing') designBuffer = '';
+        emitChat({ type: 'phase', taskId: cur?.id, phase: name });
+        log(`phase: ${name}`);
+      }
+      applyProse(text.slice(pIdx));
+    }
     const allCalls = segments.flatMap((s) => s.type === 'tool-block' ? s.calls : []);
     log(`turn ${turn}: ${text.length} chars in ${Date.now() - t0}ms, ${allCalls.length} call(s) across ${segments.filter((s) => s.type === 'tool-block').length} block(s)${hasProgressSignal ? ` · progress=${Math.min(100, parseInt(progressMatch[1], 10))}%` : ''}`);
 
@@ -5465,6 +5555,13 @@ async function runPromptedAgent({
       const finalText = segments.map((s) => s.content).join('').trim();
       if (finalText) {
         await store.appendMessage({ kind: 'assistant', role: 'assistant', content: finalText });
+      }
+      // FLUSH (design attackers): settle an in-flight fleet (or fire on a
+      // design the run is ending inside of) — concrete breaks give the agent
+      // one more turn, same contract as the reviewer flush below.
+      if (await designAttackFlush()) {
+        await maybeCompact({ store, adapter, model, log, emitChat });
+        return undefined;   // keep going — the agent addresses the attacks
       }
       // FLUSH (adversarial critic): critique the agent's final answer — unless it is itself a rework
       // of a prior critique. If the critic surfaces something, give the agent ONE more turn to address
@@ -6503,6 +6600,51 @@ async function runProposer({ adapter, model, signal, onLog, brief, lens = '', pr
       return { finish: true, result: { approach: String(prose || '').trim() } };
     },
     onMaxTurns: ({ transcript }) => ({ approach: lastAssistantText(transcript) || '' }),
+  });
+}
+
+// ── design attackers: adversaries that try to BREAK a written design ─────────
+// Fired by the worker's phase machinery when it leaves a <phase>designing</phase>
+// span (see kickDesignAttack). Where proposers converge on confirmation (the
+// deep_think benchmark's weakness), each attacker hunts a DIFFERENT failure
+// mode of the plan AS WRITTEN. Output contract: a CONCRETE, traceable break —
+// or an explicit no-break. Vague unease ("consider concurrency") is not a finding.
+const DESIGN_ATTACK_LENSES = [
+  { key: 'break-input', guidance: 'Construct a CONCRETE input, call sequence, or data shape - allowed by the stated requirements - that this design handles WRONG. Favor duplicates, empty/boundary values, repeated keys, same-entity-twice, and unusual-but-legal orderings. Walk the design step by step against your input and show exactly where the result or state goes wrong.' },
+  { key: 'state-corruption', guidance: 'Hunt state bugs: concurrency, reentrancy, partial failure mid-sequence, stale or detached copies of the same entity, double-apply, lost updates, ordering between cached reads and writes. Find ONE concrete interleaving or failure point where the design corrupts state or violates an invariant the code relies on.' },
+  { key: 'requirement-gap', guidance: 'List every requirement STATED in the task (including ones mentioned in passing), then check the design against each one. Name a requirement the design does not satisfy - or silently weakens - and the concrete case that exposes it.' },
+];
+const DESIGN_ATTACK_SYSTEM_PROMPT = `You are an ADVERSARY reviewing a design the implementing agent just wrote, BEFORE it gets built. Your ONLY job is to BREAK it - do not improve it, do not praise it, do not propose alternatives.
+You MAY read the repo READ-ONLY to ground your attack in the actual code the design touches. Then emit EXACTLY ONE of:
+   <attack>the concrete breaking case: the exact input/sequence/interleaving, what the design does with it step by step, and the wrong outcome (cite the files/requirements involved)</attack>
+   <no-break>one line: the angle you attacked from and why the design holds</no-break>
+A real attack must be CONCRETE and CHECKABLE - a specific case someone can trace through the design - not a generic risk, a style preference, or a "you should also consider". If you cannot construct one, say <no-break> honestly.`;
+
+/** One design attacker: task + design (+ lens) → { attack: string|null }. */
+async function runDesignAttacker({ adapter, model, signal, onLog, brief, lens = '', projectDir = null, repoRoots = [], onTokens }) {
+  const systemPrompt = lens ? `${DESIGN_ATTACK_SYSTEM_PROMPT}\n\nYour attack angle: ${lens}` : DESIGN_ATTACK_SYSTEM_PROMPT;
+  const parseAttack = (prose) => {
+    const s = String(prose || '');
+    const a = s.match(/<attack\b[^>]*>([\s\S]*?)<\/attack>/i);
+    if (a && a[1].trim()) return { attack: a[1].trim() };
+    if (/<no-break\b/i.test(s) || /^\s*no[- ]break\b/i.test(s)) return { attack: null };
+    return null;
+  };
+  return runReadonlyPass({
+    adapter, model, signal, onLog, label: 'design-attacker', systemPrompt, priming: [],
+    seedMessages: [{ role: 'user', content: String(brief || '') }],
+    allowedVerbs: REVIEWER_TOOL_VERBS, maxTurns: REVIEWER_MAX_TURNS,
+    resolvePath: makeRepoResolver(projectDir, repoRoots), cwd: projectDir, suppressTags: ['attack', 'no-break'],
+    onTokens: onTokens ? (t) => onTokens(t) : undefined,
+    interpret: ({ prose, allowed }) => {
+      const r = parseAttack(prose);
+      if (r) return { finish: true, result: r };
+      if (allowed.length > 0) return {};
+      // Free-prose ending without the contract tags: treat as no finding —
+      // an attack that can't state itself concretely isn't injectable.
+      return { finish: true, result: { attack: null } };
+    },
+    onMaxTurns: () => ({ attack: null }),
   });
 }
 
@@ -17697,6 +17839,19 @@ const UI_HTML = `<!DOCTYPE html>
   .dt-note[data-dt-phase="start"] .cn-head::after { content: ''; }   /* nothing to expand yet */
   .dt-note .cn-full { display: none; white-space: pre-wrap; overflow-wrap: anywhere; word-wrap: break-word; min-width: 0; margin-top: 4px; padding-top: 4px; border-top: 1px dashed var(--border); }
   .dt-note.expanded .cn-full { display: block; }
+  /* Phase markers — the agent's self-reported working mode (<phase> signal).
+     Always visible (cheap, orienting); a thin inline divider, not a bubble. */
+  .phase-marker { margin: 6px 0 2px 6px; font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); opacity: 0.8; user-select: none; }
+  .phase-marker::before { content: '◇ '; color: color-mix(in srgb, var(--accent) 70%, transparent); }
+  /* Design-attack markers — adversaries attacking a just-written design. Rides
+     the REVIEWER eye (same finding-class scrutiny); start replaced by result. */
+  .atk-note { display: none; margin: 4px 0 4px 6px; padding-left: 8px; font-size: 11px; color: var(--muted); font-style: italic; border-left: 2px solid color-mix(in srgb, #e5534b 55%, transparent); cursor: pointer; }
+  body.show-reviewer-notes .atk-note { display: block; }
+  .atk-note .cn-head::after { content: ' ▸'; opacity: 0.6; }
+  .atk-note.expanded .cn-head::after { content: ' ▾'; }
+  .atk-note[data-atk-phase="start"] .cn-head::after { content: ''; }
+  .atk-note .cn-full { display: none; white-space: pre-wrap; overflow-wrap: anywhere; word-wrap: break-word; min-width: 0; margin-top: 4px; padding-top: 4px; border-top: 1px dashed var(--border); }
+  .atk-note.expanded .cn-full { display: block; }
   /* The deep-think eye dims while its own chip is OFF (same pattern as the reviewer's). */
   #deepThinkLabel.off ~ .reviewer-eye { opacity: 0.45; }
   /* "What's new" entries inside the post-update modal. The coral accent belongs to the
@@ -21037,9 +21192,48 @@ Keep diagrams small and labeled: one idea per diagram, short node text.\`;
     container.appendChild(el);
     return el;
   }
+  // Phase marker: the agent's self-reported working mode — a thin always-visible divider.
+  function phaseMarkerEl(ev) {
+    const d = document.createElement('div'); d.className = 'phase-marker';
+    d.textContent = (ev.phase || '').slice(0, 24);
+    return d;
+  }
+  // Design-attack marker — 🗡 adversaries attacking a just-written design. Same start→result
+  // replacement contract as deep-think (keyed by taskId+design snippet), gated by the REVIEWER eye.
+  function attackKey(ev) { return (ev.taskId || '') + '|' + (ev.design || ''); }
+  function attackNoteEl(ev) {
+    const d = document.createElement('div'); d.className = 'atk-note';
+    d.dataset.atkKey = attackKey(ev);
+    d.dataset.atkPhase = ev.phase === 'start' ? 'start' : 'result';
+    const head = document.createElement('div'); head.className = 'cn-head';
+    if (ev.phase === 'start') {
+      head.textContent = '🗡 Design attack · 3 adversaries running…';
+      d.appendChild(head);
+      return d;
+    }
+    const attacks = Array.isArray(ev.attacks) ? ev.attacks : [];
+    head.textContent = '🗡 Design attack · ' + (attacks.length ? attacks.length + ' break(s) found' : 'design held (no break)');
+    const body = document.createElement('div'); body.className = 'cn-full';
+    body.textContent = attacks.map((a) => '[' + ((a && a.lens) || '') + ']\\n' + ((a && a.text) || '')).join('\\n\\n');
+    d.appendChild(head);
+    if (attacks.length) { d.appendChild(body); d.onclick = () => d.classList.toggle('expanded'); }
+    return d;
+  }
+  function placeAttackNote(container, ev) {
+    const el = attackNoteEl(ev);
+    if (el.dataset.atkPhase === 'result') {
+      const match = Array.from(container.querySelectorAll('.atk-note[data-atk-phase="start"]'))
+        .find((n) => n.dataset.atkKey === el.dataset.atkKey);
+      if (match) { match.replaceWith(el); return el; }
+    }
+    container.appendChild(el);
+    return el;
+  }
   function drawerActivityEl(ev) {
     if (ev.type === 'reviewer-note') return reviewerNoteEl(ev.content);   // same marker + eye gating as the main chat
     if (ev.type === 'deep-think') return deepThinkNoteEl(ev);             // 🧠 marker (placeDeepThinkNote handles start→result replacement at the call sites)
+    if (ev.type === 'phase') return phaseMarkerEl(ev);
+    if (ev.type === 'design-attack') return attackNoteEl(ev);             // placeAttackNote handles replacement at the chat call site
     const d = document.createElement('div'); d.className = 'sa-act';
     if (ev.type === 'tool-call') {
       const v = document.createElement('span'); v.className = 'sa-act-verb'; v.textContent = ev.name || ev.verb || 'tool';
@@ -24954,6 +25148,19 @@ Keep diagrams small and labeled: one idea per diagram, short node text.\`;
         // running… line; the matching 'result' replaces it in place.
         const d = placeDeepThinkNote(RC.log, ev); node = d;
         if (ev.phase === 'result') bumpDeepThinkEyeBadge();   // a verdict landed while hidden → count it on the eye
+        if (_stickBottom) scrollToBottom();
+        break;
+      }
+      case 'phase': {
+        const d = phaseMarkerEl(ev);
+        RC.log.appendChild(d); node = d;
+        if (_stickBottom) scrollToBottom();
+        break;
+      }
+      case 'design-attack': {
+        // 🗡 marker behind the REVIEWER eye; 'result' replaces its 'start'.
+        const d = placeAttackNote(RC.log, ev); node = d;
+        if (ev.phase === 'result' && (ev.attacks || []).length) bumpReviewerEyeBadge();
         if (_stickBottom) scrollToBottom();
         break;
       }
