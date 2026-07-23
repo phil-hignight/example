@@ -34,11 +34,30 @@
  * tokens THROW (fail-closed) rather than reaching a tool as literal "@(x)".
  */
 
-import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { readdirSync, readFileSync, statSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 
 const STORE_DIRNAME = '.testdata';
 const LABEL_RE = /^[a-z0-9_-]+$/i;
+
+// ── Hardcoded schema (PLUGIN-UI-PANEL-SPEC.md §8) ──────────────────────────────────────────────────────────────
+// The fixed set of fields a test case may hold. The editor lets you fill ONLY these; the agent is shown this whole
+// list (so it can build @(case.field) tokens) and calls <testdata_fields> to see which are filled per case. Edit
+// this array to change the fields. `format` is a hint (shown as the input placeholder); masking still works on any
+// value regardless. Dotted names (address.zip) nest. Values themselves live in .testdata/<label>.json.
+const SCHEMA = [
+  { name: 'first_name' },
+  { name: 'last_name' },
+  { name: 'middle_name' },
+  { name: 'dob', label: 'Date of birth', format: 'YYYY-MM-DD' },
+  { name: 'ssn', format: '123-45-6789' },
+  { name: 'phone', format: '555-012-3456' },
+  { name: 'email' },
+  { name: 'member_id' },
+  { name: 'address.street', label: 'Street' },
+  { name: 'address.city', label: 'City' },
+  { name: 'address.zip', label: 'ZIP' },
+];
 // A token is @( label . field.path ) — label has no dot; the field path may be dotted (address.zip). The closing
 // paren cannot appear in either, so the boundary is unambiguous and mask never has to guess one out of prose.
 const TOKEN_RE = /@\(([a-z0-9_-]+)\.([a-z0-9_.-]+)\)/gi;
@@ -85,6 +104,60 @@ function loadStore(projectDir) {
     cases.set(stem.toLowerCase(), { label: stem.toLowerCase(), description: typeof obj.description === 'string' ? obj.description : '', fields });
   }
   return cases;
+}
+
+// ── store WRITING (the panel editor; the agent never writes here) ─────────────────────────────────────────────
+// Set a dotted field on a fields object, building the nesting; a blank value REMOVES the leaf (blank ⇔ absent, so
+// "which fields are filled" stays honest and a cleared field never lingers as "").
+function setField(fields, dotted, value) {
+  const parts = String(dotted).split('.');
+  let o = fields;
+  for (let i = 0; i < parts.length - 1; i++) {
+    if (!o[parts[i]] || typeof o[parts[i]] !== 'object') o[parts[i]] = {};
+    o = o[parts[i]];
+  }
+  const leaf = parts[parts.length - 1];
+  if (value == null || value === '') delete o[leaf];
+  else o[leaf] = String(value);
+}
+function writeCase(projectDir, label, obj) {
+  const dir = storeDirFor(projectDir);
+  if (!dir) throw new Error('no project open');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, label + '.json'), JSON.stringify(obj, null, 2), 'utf8');
+}
+function deleteCase(projectDir, label) {
+  const dir = storeDirFor(projectDir);
+  if (!dir) return;
+  try { rmSync(join(dir, label + '.json'), { force: true }); } catch {}
+}
+
+// ── the panel editor's component tree (PLUGIN-UI-PANEL-SPEC.md §4) ─────────────────────────────────────────────
+function textRow(label, fieldPath, lbl, value, placeholder) {
+  return { type: 'text', id: `field:${label}:${fieldPath}`, label: lbl, value: typeof value === 'string' ? value : '', placeholder: placeholder || '' };
+}
+// Per case: a row for every SCHEMA field (fill only these), PLUS any leaf already on the object that isn't in the
+// schema (so nothing on disk is hidden — "object fields + schema fields") + a delete button.
+function caseSection(label, c) {
+  const schemaNames = new Set(SCHEMA.map((s) => s.name));
+  const rows = SCHEMA.map((s) => textRow(label, s.name, s.label || s.name, getField(c.fields, s.name), s.format));
+  for (const fp of leafPaths(c.fields)) if (!schemaNames.has(fp)) rows.push(textRow(label, fp, fp + ' (extra)', getField(c.fields, fp), ''));
+  rows.push({ type: 'button', id: `del:${label}`, label: 'Delete case', variant: 'danger' });
+  return { type: 'section', id: `case:${label}`, title: label, children: rows };
+}
+function buildPanelTree(projectDir) {
+  const cases = loadStore(projectDir);
+  const sections = [...cases.entries()].map(([label, c]) => caseSection(label, c));
+  return { type: 'stack', children: [
+    { type: 'note', text: cases.size
+      ? `${cases.size} test case(s). Real values live in .testdata (hidden from the agent — it only ever sees tokens). Edits save as you type.`
+      : 'No test cases yet — add one below. Real values stay in .testdata, hidden from the agent.' },
+    ...sections,
+    { type: 'section', id: 'addcase', title: '+ Add a case', collapsed: true, children: [
+      { type: 'text', id: 'newlabel', label: 'Label', placeholder: 'e.g. alice (lowercase, no spaces)' },
+      { type: 'button', id: 'addcase-go', label: 'Create case', variant: 'primary' },
+    ] },
+  ] };
 }
 
 // ── field access (dotted paths) ──────────────────────────────────────────────────────────────────────────────
@@ -185,21 +258,61 @@ export default {
   author: 'code_boss',
   blockedPaths: [STORE_DIRNAME],   // the platform hides .testdata from the agent
 
-  // Field list for the prompt — rebuilt from THIS project's store each turn (values never appear).
+  // Field list for the prompt — the case labels + the FULL schema (same for every case), rebuilt each turn.
+  // Values never appear. The agent sees the whole schema so it can build @(case.field) tokens; which fields are
+  // actually filled per case comes from <testdata_fields>, not the prompt (keeps it lean).
   promptAddition: (projectDir) => {
     const cases = loadStore(projectDir);
     if (!cases.size) return '';   // no store in this project → say nothing
-    const lines = ['TEST DATA AVAILABLE (values are hidden — fetch a token, never the real value):'];
-    for (const [label, c] of cases) {
-      lines.push(`  ${label}${c.description ? `   (${c.description})` : ''}`);
-      const fps = leafPaths(c.fields);
-      if (fps.length) lines.push(`    fields: ${fps.join(', ')}`);
-    }
-    lines.push('To use a value, call <testdata_get label="alice" field="ssn"/> — you receive a TOKEN like @(alice.ssn).');
-    lines.push('A token is OPAQUE: pass it wherever the real value is needed (a form field, a request body) and the system');
-    lines.push('substitutes the real value when the tool runs. Never invent, edit, validate, or reformat a token, and never');
-    lines.push('ask for a raw value — you only ever handle tokens.');
+    const lines = [
+      'TEST DATA AVAILABLE (values are hidden — you only ever get a TOKEN, never the real value):',
+      `  cases: ${[...cases.keys()].join(', ')}`,
+      `  schema fields (available on every case): ${SCHEMA.map((s) => s.name).join(', ')}`,
+      'Build a token as @(<case>.<field>) — e.g. @(alice.ssn) or @(alice.address.zip) — and pass it wherever the real',
+      'value is needed (a browser field, a request body, a form). The platform substitutes the real value when the',
+      'tool runs, and re-tokenizes any real values a tool pulls BACK (a scraped page) before you see them.',
+      'Not every case has every field filled — call <testdata_fields label="alice"/> to see which are filled vs blank',
+      'BEFORE you use one (a token for a blank field is refused). Never invent, edit, reformat a token, or ask for a raw value.',
+    ];
     return lines.join('\n');
+  },
+
+  // Side-panel editor (PLUGIN-UI-PANEL-SPEC.md). The developer fills the schema fields per case; the agent never
+  // touches this — it edits .testdata directly through the plugin (which is agent-blocked). Save-as-you-type.
+  panel: {
+    title: 'Test data', icon: '🔒',
+    render: (ctx) => buildPanelTree(ctx && ctx.projectDir),
+    onEvent: (ev, ctx) => {
+      const projectDir = ctx && ctx.projectDir;
+      if (!projectDir) return { error: 'Open a project first — test data is stored per project (.testdata).' };
+      // Save a field as it changes. blank ⇔ absent. No re-render (would clobber the box being typed in).
+      if (ev.event === 'change' && typeof ev.id === 'string' && ev.id.startsWith('field:')) {
+        const rest = ev.id.slice('field:'.length);
+        const ci = rest.indexOf(':');
+        if (ci < 0) return {};
+        const label = rest.slice(0, ci), fieldPath = rest.slice(ci + 1);
+        const cases = loadStore(projectDir);
+        const c = cases.get(label) || { label, description: '', fields: {} };
+        setField(c.fields, fieldPath, ev.value);
+        writeCase(projectDir, label, { label, description: c.description || '', fields: c.fields });
+        return { toast: { text: `saved ${label}.${fieldPath || ''}`.replace(/\.$/, ''), tone: 'ok' } };
+      }
+      // Add a case (values come with the click). A structural change → re-render.
+      if (ev.event === 'click' && ev.id === 'addcase-go') {
+        const label = String((ev.values && ev.values.newlabel) || '').toLowerCase().trim();
+        if (!LABEL_RE.test(label)) return { error: 'Label must be letters/digits/_/- only (e.g. alice).' };
+        if (loadStore(projectDir).has(label)) return { error: `A case "${label}" already exists.` };
+        writeCase(projectDir, label, { label, description: '', fields: {} });
+        return { toast: { text: `created case "${label}"`, tone: 'ok' }, render: buildPanelTree(projectDir) };
+      }
+      // Delete a case → re-render.
+      if (ev.event === 'click' && typeof ev.id === 'string' && ev.id.startsWith('del:')) {
+        const label = ev.id.slice('del:'.length);
+        deleteCase(projectDir, label);
+        return { toast: { text: `deleted case "${label}"`, tone: 'ok' }, render: buildPanelTree(projectDir) };
+      }
+      return {};
+    },
   },
 
   filters: [{
@@ -257,6 +370,24 @@ export default {
         const lines = [];
         for (const [label, c] of cases) lines.push(`${label}${c.description ? ` — ${c.description}` : ''}: ${leafPaths(c.fields).join(', ') || '(no fields)'}`);
         return { content: lines.join('\n') };
+      },
+    },
+    {
+      verb: 'testdata_fields', name: 'testdata_fields',
+      schema: {
+        description: 'For ONE test case, show every SCHEMA field and whether it is FILLED or BLANK (no values). Use this before building a token — e.g. to check whether "alice" has a middle_name — because a token for a blank field is refused.',
+        parameters: { type: 'object', properties: { label: { type: 'string', description: 'the test-case label' } }, required: ['label'] },
+      },
+      impl: async ({ label }, ctx) => {
+        const cases = loadStore(ctx?.cwd);
+        const c = cases.get(String(label || '').toLowerCase());
+        if (!c) return { content: `ERROR: no test case "${label}". Use <testdata_list/> to see what exists.` };
+        const schemaNames = new Set(SCHEMA.map((s) => s.name));
+        const lines = SCHEMA.map((s) => { const v = getField(c.fields, s.name); return `  ${(typeof v === 'string' && v.length) ? '✓' : '·'} ${s.name}`; });
+        // any non-schema fields present on disk, so the picture is complete
+        const extra = leafPaths(c.fields).filter((fp) => !schemaNames.has(fp));
+        for (const fp of extra) lines.push(`  ✓ ${fp} (not in schema)`);
+        return { content: `${c.label} — ✓ filled · blank:\n${lines.join('\n')}` };
       },
     },
   ],
