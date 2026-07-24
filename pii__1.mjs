@@ -1,51 +1,62 @@
 /**
  * pii__1.mjs — PII-safe test data plugin for code_boss.  (spec: PII-PLUGIN-SPEC.md)
  *
- * Lets the agent drive a real workflow with real PII it is NEVER shown. Test cases live as labelled JSON files
- * in a BLOCKED directory the agent cannot read; the plugin exposes the field NAMES into the prompt and hands the
- * agent TOKENS of the form @(label.field). The token IS the lookup key — there is no separate id or stored map:
+ * Lets the agent drive a real workflow with real PII it is NEVER shown. Test data lives as JSON files in a BLOCKED
+ * directory the agent cannot read; the plugin exposes the labels + field NAMES into the prompt and hands the agent
+ * TOKENS. The token IS the lookup key — there is no separate id or stored map:
  *
- *   mask   (real value -> @(label.field))   applied to the outbound request AND to tool results  (H1 + H3)
- *   unmask (@(label.field) -> real value)   applied to tool arguments, so the tool acts on the real value  (H2)
+ *   mask   (real value -> token)   applied to the outbound request AND to tool results  (H1 + H3)
+ *   unmask (token -> real value)   applied to tool arguments, so the tool acts on the real value  (H2)
  *
- * So the model reasons over tokens; the real SSN only exists for the duration of a tool call, and never enters
- * the transcript. FAIL-CLOSED by the platform: a throw here refuses the call rather than leaking.
+ * So the model reasons over tokens; the real value only exists for the duration of a tool call, and never enters the
+ * transcript. FAIL-CLOSED by the platform: a throw here refuses the call rather than leaking.
  *
- * ── Install ──
- *   Copy this file to  ~/.code_boss/plugins/pii__1.mjs  (e.g. via the <copy> verb).
- *   Create  <your-project>/.testdata/  and drop labelled JSON files in it (see the shape below). That directory
- *   is hidden from the agent automatically (blockedPaths).
+ * ── Model: a case is a FAMILY of DEERS beneficiaries ──
+ *   A family has ONE family-level field (the DEERS Family ID) shared by everyone, and a list of MEMBERS
+ *   (sponsor / spouse / child…), each with their own person fields (name, ssn, edi, DEERS Beneficiary ID, …).
+ *   File shape: { label?, description?, family:{deers_family_id}, members:{<label>:{fields}} }.
  *
- * ── Test-case file shape:  .testdata/alice.json ──
- *   {
- *     "label": "alice",                       // optional; the FILENAME stem wins if they disagree
- *     "description": "standard enrollee",     // optional; shown in the field list
- *     "fields": {
- *       "ssn": "111-22-3333",
- *       "phone": "555-0142",
- *       "address": { "street": "1 Main St", "city": "Lynchburg", "zip": "24501" }
- *     }
- *   }
- *   The agent then does  <testdata_get label="alice" field="address.zip"/>  → @(alice.address.zip), passes that
- *   token wherever the real value is needed, and the platform substitutes "24501" when the tool runs.
+ * ── Tokens are TIERED by how SHARED a value is (so a value in 50 families never lists 50 paths) ──
+ *   USABLE placeholders (you can emit these to inject a value):
+ *     a member's field    @@@(<family>.<member>.<field>)   e.g. @@@(smiths.sponsor.ssn), @@@(smiths.spouse.address.zip)
+ *     the family id        @@@(<family>.deers_family_id)
+ *   FUZZY, READ-ONLY descriptors (a value shared by several beneficiaries — you CANNOT inject these):
+ *     shared within ONE family    ###{sponsor.first_name, spouse.first_name in smiths}   ← the slots are listed; pick one → @@@()
+ *     shared across MANY families  ###{address.city across 4 families incl. smiths #<16hex>}  ← paths elided; #id is a handle
+ *   To turn a cross-family ###{… #id} into a usable token, call <testdata_expand id="<16hex>"/> — it lists ALL the paths
+ *   (family → member → field) holding that value (NO value shown) so you can pick one and build @@@(family.member.field).
+ *   The TRIPLE sigil (@@@ / ###) makes tokens unmistakable — real code never writes them — so there is no collision.
  *
- * v1 scope (PII-PLUGIN-SPEC.md §7): EXACT-VALUE tokenization only — the plugin can only tokenize values it holds
- * in the store (that is the safe, reliable core). It does NOT regex-guess unknown SSNs/addresses. Unresolved
- * tokens THROW (fail-closed) rather than reaching a tool as literal "@(x)".
+ * Anchoring: when masking a page, unique + within-family matches are resolved FIRST; the families they touch become
+ * "anchors", and a cross-family descriptor then names the anchor families it also belongs to ("incl. smiths") — so a
+ * shared value on a one-family page reads as belonging to that family.
+ *
+ * Matching is NORMALIZED, and deliberately errs toward masking TOO MUCH: a numeric id is matched by its digit
+ * sequence in any separator layout (space/dot/comma/slash/dash/nbsp/…), and text is matched case-insensitively and
+ * in either unicode composition — so a stored value is caught however a document spells it. Unresolved / ambiguous
+ * tokens THROW (fail-closed) rather than reaching a tool as text.
+ *
+ * Ambiguity is prevented where values ENTER the store, not guessed at match time: valueProblem() refuses a 1-char
+ * value, a 1-2 digit value (it would collide with every date/version/list number), and a common English word (masking
+ * "an" or "Green" would tokenize ordinary prose). That keeps this matching path uniform — mask exactly what is in
+ * the store — with no length/case special cases.
  */
 
 import { readdirSync, readFileSync, statSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
 import { resolve, join } from 'node:path';
+import { createHmac, randomBytes } from 'node:crypto';
 
-const STORE_DIRNAME = '.testdata';
+const STORE_DIRNAME = 'testdata';
+const SECRET_FILE = '.pii-secret';   // per-project HMAC key for the fuzzy #id — agent-blocked (inside testdata), not .json
 const LABEL_RE = /^[a-z0-9_-]+$/i;
 
-// ── Hardcoded schema (PLUGIN-UI-PANEL-SPEC.md §8) ──────────────────────────────────────────────────────────────
-// The fixed set of fields a test case may hold. The editor lets you fill ONLY these; the agent is shown this whole
-// list (so it can build @(case.field) tokens) and calls <testdata_fields> to see which are filled per case. Edit
-// this array to change the fields. `format` is a hint (shown as the input placeholder); masking still works on any
-// value regardless. Dotted names (address.zip) nest. Values themselves live in .testdata/<label>.json.
-const SCHEMA = [
+// ── Hardcoded schemas ─────────────────────────────────────────────────────────────────────────────────────────
+// FAMILY_SCHEMA = family-level fields (shared). MEMBER_SCHEMA = per-person fields. The editor fills ONLY these; the
+// agent is shown both lists + calls <testdata_fields>. Edit to change fields. `format` is the input placeholder hint.
+const FAMILY_SCHEMA = [
+  { name: 'deers_family_id', label: 'DEERS Family ID' },
+];
+const MEMBER_SCHEMA = [
   { name: 'first_name' },
   { name: 'last_name' },
   { name: 'middle_name' },
@@ -55,30 +66,28 @@ const SCHEMA = [
   { name: 'email' },
   { name: 'edi', label: 'EDI', format: '10 digits' },
   { name: 'deers_beneficiary_id', label: 'DEERS Beneficiary ID' },
-  { name: 'deers_family_id', label: 'DEERS Family ID' },
   { name: 'address.street', label: 'Street' },
   { name: 'address.city', label: 'City' },
   { name: 'address.zip', label: 'ZIP' },
 ];
-// A token is @( label . field.path ) — label has no dot; the field path may be dotted (address.zip). The closing
-// paren cannot appear in either, so the boundary is unambiguous and mask never has to guess one out of prose.
-const TOKEN_RE = /@\(([a-z0-9_-]+)\.([a-z0-9_.-]+)\)/gi;
+// A USABLE token is @@@( path ) — a single path `family.rest` where rest is a family field (deers_family_id) or
+// member.field(.sub). A FUZZY descriptor is ###{ … } (read-only). The TRIPLE sigil (three @ / three #) is what makes
+// our tokens unmistakable: ordinary code never writes "@@@(" or "###{" (Razor is @(, Sass is #{, Markdown "### " has
+// a trailing space), so there is no collision surface with real tool content. The closing paren/brace can't appear
+// inside a path/descriptor.
+const ONE_PATH = '[a-z0-9_-]+\\.[a-z0-9_.-]+';
+const TOKEN_RE = new RegExp(`@@@\\((${ONE_PATH})\\)`, 'gi');
+// ANY ###{…} reaching a tool is a mistake (fail-closed) — it is a read-only descriptor, never a settable value.
+// Because the triple-# opener is unambiguously ours we can catch BOTH tiers, not just the cross-family one; the id
+// sub-form (16 hex — a 64-bit HMAC, so collisions are negligible) is captured for the expand hint.
+// The interior must read like a descriptor (" in " / " across " / a #id) — "###" immediately followed by "{" also
+// occurs in ordinary payload text (a "####" markdown rule against a CSS/Sass brace), and refusing THAT tool call is a
+// false alarm. A mangled descriptor without any of those words carries no value, so letting it through is not a leak.
+const FUZZY_RE = /###\{[^{}]*(?: in | across |#[0-9a-f]{16})[^{}]*\}/g;
+const FUZZY_ID_RE = /###\{[^{}]*#([0-9a-f]{16})\}/g;
 
-// ── store loading ────────────────────────────────────────────────────────────────────────────────────────────
-// Per-PROJECT: the store dir is resolved from the project directory the platform passes to every hook (filter
-// ctx.projectDir, tool ctx.cwd, promptAddition(projectDir)). Read + parse on EVERY call (no cache) — the store is
-// small (test cases), and correctness beats micro-perf here: a stale cache could miss a value the developer just
-// added (a leak) or a same-millisecond edit an mtime cache cannot see. A file the developer drops in is picked up
-// with no reload.
-//
-// FAIL-CLOSED READ (audit 2026-07-22, sev3). A MISSING store (ENOENT) is legitimate → empty (nothing to mask). But
-// a real READ FAILURE (EACCES/EBUSY/EPERM/EIO, or a per-file read/parse error) is NOT swallowed — it THROWS, so
-// the platform refuses the call rather than passing content through unmasked. A store that exists but cannot be
-// fully read is the exact situation where fail-open would leak: never treat it as "no store".
-function storeDirFor(projectDir) {
-  if (!projectDir) return null;
-  return resolve(projectDir, STORE_DIRNAME);
-}
+// ── store loading (per-project, no cache, FAIL-CLOSED read) ───────────────────────────────────────────────────
+function storeDirFor(projectDir) { return projectDir ? resolve(projectDir, STORE_DIRNAME) : null; }
 function loadStore(projectDir) {
   const dir = storeDirFor(projectDir);
   if (!dir) return new Map();
@@ -90,76 +99,94 @@ function loadStore(projectDir) {
   }
   const cases = new Map();
   for (const f of names) {
-    if (!f.toLowerCase().endsWith('.json')) continue;
+    if (!f.toLowerCase().endsWith('.json')) continue;   // skips .pii-secret + any dotfile/non-json
     const stem = f.replace(/\.json$/i, '');
-    if (!LABEL_RE.test(stem)) continue;               // a label must be a clean token — skip odd filenames
+    if (!LABEL_RE.test(stem)) continue;                 // a label must be a clean token
     let raw;
     try { raw = readFileSync(join(dir, f), 'utf8'); }
     catch (e) {
-      if (e && e.code === 'ENOENT') continue;         // file vanished between readdir and read (a race) — skip it
+      if (e && e.code === 'ENOENT') continue;
       throw new Error(`test-data file "${f}" could not be read (${e?.code || e?.message}) — refusing to pass content through unmasked (fail-closed)`);
     }
     let obj;
     try { obj = JSON.parse(raw); } catch { throw new Error(`test-data file "${f}" is not valid JSON — refusing to pass content through unmasked (a malformed store must not silently leak). Fix or remove it.`); }
     if (!obj || typeof obj !== 'object') continue;
-    const fields = (obj.fields && typeof obj.fields === 'object') ? obj.fields : {};
-    cases.set(stem.toLowerCase(), { label: stem.toLowerCase(), description: typeof obj.description === 'string' ? obj.description : '', fields });
+    const family = (obj.family && typeof obj.family === 'object' && !Array.isArray(obj.family)) ? obj.family : {};
+    const members = (obj.members && typeof obj.members === 'object' && !Array.isArray(obj.members)) ? obj.members : {};
+    cases.set(stem.toLowerCase(), { label: stem.toLowerCase(), description: typeof obj.description === 'string' ? obj.description : '', family, members });
   }
   return cases;
 }
+function loadFamily(projectDir, family) {
+  return loadStore(projectDir).get(String(family).toLowerCase()) || { label: String(family).toLowerCase(), description: '', family: {}, members: {} };
+}
+
+// The fuzzy #id is HMAC(value, per-project secret): stable per value (so the same value always shows the same id,
+// even across restarts — the id lives in the persisted transcript), leak-proof (a keyed hash reveals nothing about
+// the value without the secret, unlike a plain hash which a low-entropy value could be dictionary-attacked from).
+// Only the small SECRET is persisted; there is no id→value map to grow. Generated once, agent-blocked (inside testdata).
+const secretCache = new Map();   // resolved storeDir -> secret: stable within a process even if the disk write fails
+function getSecret(projectDir) {
+  const dir = storeDirFor(projectDir);
+  if (!dir) return null;
+  if (secretCache.has(dir)) return secretCache.get(dir);   // one read per project per process (stable + cheap)
+  const p = join(dir, SECRET_FILE);
+  try { const s = readFileSync(p, 'utf8').trim(); if (s) { secretCache.set(dir, s); return s; } } catch {}
+  const s = randomBytes(32).toString('hex');
+  let final = s;
+  // Exclusive create: if two code_boss INSTANCES race to mint the first-ever secret, the loser gets EEXIST and
+  // re-reads the winner's value, so ids never diverge from what testdata_expand will later read off disk.
+  try {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(p, s, { encoding: 'utf8', flag: 'wx' });
+  } catch (e) {
+    if (e && e.code === 'EEXIST') { try { const s2 = readFileSync(p, 'utf8').trim(); if (s2) final = s2; } catch {} }
+    // else UNPERSISTABLE (read-only dir / .pii-secret is a directory): fall back to the in-memory secret so ids stay
+    // STABLE for the life of this process (across restarts they'd differ, but a wholly-unwritable testdata is a
+    // degraded env). We do NOT throw — masking must still tokenize the value (no leak), just with a session-stable id.
+  }
+  secretCache.set(dir, final);
+  return final;
+}
+// 16 hex = 64-bit HMAC prefix — collisions are negligible even for a very large store (birthday bound ~5e9 values).
+function idFor(key, secret) { return createHmac('sha256', String(secret)).update(key).digest('hex').slice(0, 16); }
 
 // ── store WRITING (the panel editor; the agent never writes here) ─────────────────────────────────────────────
-// Set a dotted field on a fields object, building the nesting; a blank value REMOVES the leaf (blank ⇔ absent, so
-// "which fields are filled" stays honest and a cleared field never lingers as "").
+const UNSAFE_KEY = new Set(['__proto__', 'prototype', 'constructor']);
+// A family/member label is BOTH a filename stem AND an object key (c.members[label]). LABEL_RE alone admits "__proto__"
+// / "constructor", and a crafted panel event id ("mf:smiths:__proto__:x") would then write onto Object.prototype
+// (process-wide pollution) through c.members[member]. Screen every label used as a key against UNSAFE_KEY too.
+function safeLabel(l) { return LABEL_RE.test(l) && !UNSAFE_KEY.has(String(l).toLowerCase()); }
 function setField(fields, dotted, value) {
   const parts = String(dotted).split('.');
+  if (parts.some((p) => UNSAFE_KEY.has(p))) throw new Error(`illegal field path "${dotted}" (a segment would touch the object prototype)`);
   let o = fields;
   for (let i = 0; i < parts.length - 1; i++) {
-    if (!o[parts[i]] || typeof o[parts[i]] !== 'object') o[parts[i]] = {};
+    if (!Object.prototype.hasOwnProperty.call(o, parts[i]) || !o[parts[i]] || typeof o[parts[i]] !== 'object') o[parts[i]] = {};
     o = o[parts[i]];
   }
   const leaf = parts[parts.length - 1];
-  if (value == null || value === '') delete o[leaf];
-  else o[leaf] = String(value);
+  // Store the TRIMMED value: valueProblem() validates the trimmed form, and a padded store value ("  Okonkwo  ")
+  // would never match the same name written normally in a document — a silent leak. Trim strips only the ends, so a
+  // multi-word value ("Kilimanjaro Terrace") is preserved.
+  const s = value == null ? '' : String(value).trim();
+  if (s === '') delete o[leaf];
+  else o[leaf] = s;
 }
-function writeCase(projectDir, label, obj) {
+// A family label is a FILE NAME under the agent-blocked store dir. LABEL_RE (no dots, slashes or ..) is the guard that
+// keeps a panel event id like "ff:../../pwned:deers_family_id" from writing real PII OUTSIDE the blocked dir — validate
+// here too, not only at the panel edge, so no caller can bypass it.
+function writeFamily(projectDir, label, c) {
   const dir = storeDirFor(projectDir);
   if (!dir) throw new Error('no project open');
+  if (!LABEL_RE.test(label)) throw new Error(`illegal family label "${label}"`);
   mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, label + '.json'), JSON.stringify(obj, null, 2), 'utf8');
+  writeFileSync(join(dir, label + '.json'), JSON.stringify({ label, description: c.description || '', family: c.family || {}, members: c.members || {} }, null, 2), 'utf8');
 }
-function deleteCase(projectDir, label) {
+function deleteFamily(projectDir, label) {
   const dir = storeDirFor(projectDir);
-  if (!dir) return;
+  if (!dir || !LABEL_RE.test(label)) return;
   try { rmSync(join(dir, label + '.json'), { force: true }); } catch {}
-}
-
-// ── the panel editor's component tree (PLUGIN-UI-PANEL-SPEC.md §4) ─────────────────────────────────────────────
-function textRow(label, fieldPath, lbl, value, placeholder) {
-  return { type: 'text', id: `field:${label}:${fieldPath}`, label: lbl, value: typeof value === 'string' ? value : '', placeholder: placeholder || '' };
-}
-// Per case: a row for every SCHEMA field (fill only these), PLUS any leaf already on the object that isn't in the
-// schema (so nothing on disk is hidden — "object fields + schema fields") + a delete button.
-function caseSection(label, c) {
-  const schemaNames = new Set(SCHEMA.map((s) => s.name));
-  const rows = SCHEMA.map((s) => textRow(label, s.name, s.label || s.name, getField(c.fields, s.name), s.format));
-  for (const fp of leafPaths(c.fields)) if (!schemaNames.has(fp)) rows.push(textRow(label, fp, fp + ' (extra)', getField(c.fields, fp), ''));
-  rows.push({ type: 'button', id: `del:${label}`, label: 'Delete case', variant: 'danger' });
-  return { type: 'section', id: `case:${label}`, title: label, children: rows };
-}
-function buildPanelTree(projectDir) {
-  const cases = loadStore(projectDir);
-  const sections = [...cases.entries()].map(([label, c]) => caseSection(label, c));
-  return { type: 'stack', children: [
-    { type: 'note', text: cases.size
-      ? `${cases.size} test case(s). Real values live in .testdata (hidden from the agent — it only ever sees tokens). Edits save as you type.`
-      : 'No test cases yet — add one below. Real values stay in .testdata, hidden from the agent.' },
-    ...sections,
-    { type: 'section', id: 'addcase', title: '+ Add a case', collapsed: true, children: [
-      { type: 'text', id: 'newlabel', label: 'Label', placeholder: 'e.g. alice (lowercase, no spaces)' },
-      { type: 'button', id: 'addcase-go', label: 'Create case', variant: 'primary' },
-    ] },
-  ] };
 }
 
 // ── field access (dotted paths) ──────────────────────────────────────────────────────────────────────────────
@@ -171,147 +198,454 @@ function getField(fields, dottedPath) {
   }
   return v;
 }
-// Flatten to leaf STRING paths (address -> address.street, address.zip). Only string leaves are real values.
-// Arrays recurse too (phones -> phones.0), with numeric path parts — SYMMETRIC with getField, which walks any
-// object including arrays. The asymmetry was a silent leak: an array-stored value contributed nothing to the
-// mask (so it reached the model raw in tool results) while its @(label.phones.0) token still resolved on unmask.
-function leafPaths(obj, prefix = '') {
+// [dottedPath, value] for every leaf. The VALUE is carried out rather than looked back up with getField(): a key that
+// itself contains a dot ("weird.key") produces a path getField cannot re-read, and the value would then never be
+// indexed and so never masked — a silent leak. Masking uses the value; only UNMASKING needs the path to be readable,
+// and resolveRest fails closed there.
+function leafEntries(obj, prefix = '') {
   const out = [];
   for (const [k, v] of Object.entries(obj || {})) {
     const p = prefix ? `${prefix}.${k}` : k;
-    if (v && typeof v === 'object') out.push(...leafPaths(v, p));
-    else if (typeof v === 'string') out.push(p);
+    if (v && typeof v === 'object') out.push(...leafEntries(v, p));
+    else if (typeof v === 'string' || typeof v === 'number') out.push([p, v]);   // numbers too — a JSON-number store must mask
+    // a boolean / null leaf is INTENTIONALLY skipped: its text form ("true"/"false"/"null") is a common word, and
+    // masking it would tokenize that word across ordinary prose (the reason COMMON_WORDS exists). Such a leaf is not PII.
   }
   return out;
 }
-
+function leafPaths(obj, prefix = '') { return leafEntries(obj, prefix).map(([p]) => p); }
+// A store value as text. A JSON number beyond MAX_SAFE_INTEGER was ALREADY rounded by JSON.parse, so its digits no
+// longer match the document and it could neither be masked nor unmasked correctly — refuse rather than leak.
+function asStr(v) {
+  if (typeof v === 'string') return v;
+  if (typeof v !== 'number') return undefined;
+  if (!Number.isFinite(v) || Math.abs(v) > Number.MAX_SAFE_INTEGER) {
+    throw new Error(`test-data value ${v} is too large to be an exact JSON number — JSON.parse has already rounded its digits, so it cannot be masked reliably. Quote it as a string in the testdata file (fail-closed).`);
+  }
+  return String(v);
+}
 function escapeReg(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+function familyOfPath(p) { return p.slice(0, p.indexOf('.')); }
+function restOfPath(p) { return p.slice(p.indexOf('.') + 1); }   // "sponsor.ssn" | "deers_family_id"
 
-// A numeric-identifier value (SSN, phone, account #) is often written in more than one punctuation form — the
-// store may hold "111-22-3333" while a form field or a tool result uses "111223333", or vice versa. So for a
-// value that is essentially digits + separators, generate its FORMAT VARIANTS and map them ALL to the same token,
-// so the value is masked whichever way it appears. This is still EXACT-VALUE tokenization of a KNOWN value — just
-// its equivalent spellings — NOT pattern-guessing of unknown PII. (A real SSN is 9 digits: XXX-XX-XXXX; a US
-// phone is 10: XXX-XXX-XXXX. We de-hyphenate ANY numeric value unambiguously, and re-hyphenate a bare 9- or
-// 10-digit run into its standard grouping.)
-function numericVariants(v) {
-  const out = [v];
-  if (!/^[()\d\s.\-]+$/.test(v)) return out;    // not a numeric-with-separators value → only the literal
-  const digits = v.replace(/\D/g, '');
-  if (digits.length < 7 || digits.length > 15) return out;   // too short/long to be a phone/SSN/account id
-  if (digits !== v) out.push(digits);            // strip separators (always unambiguous)
-  if (digits.length === 9) out.push(`${digits.slice(0, 3)}-${digits.slice(3, 5)}-${digits.slice(5)}`);   // SSN 3-2-4
-  if (digits.length === 10) out.push(`${digits.slice(0, 3)}-${digits.slice(3, 6)}-${digits.slice(6)}`);  // phone 3-3-4
-  return [...new Set(out)];
+// ── value NORMALIZATION (mask-side only; unmask always restores the real STORED spelling) ─────────────────────────
+// The value index is keyed by a NORMALIZED form so a value is recognized however it is spelled in a document:
+//   • a NUMERIC IDENTIFIER (only digits + the usual separators, >= 3 digits) is keyed by its DIGIT SEQUENCE, so any
+//     separator layout — "482-11-9037", "482 11 9037", "482.11.9037", "(555) 012-3456" — is the same value;
+//   • everything else is TEXT, keyed case-INSENSITIVELY (lowercased), so "OKONKWO"/"okonkwo" is the same value.
+// The n:/t: prefix keeps the two namespaces from ever colliding. The >=3 floor on the KEY body is a deliberate
+// low-entropy cutoff (a 1-2 char value is not masked — a documented non-guarantee).
+// Separators a numeric identifier may be written with. Deliberately WIDE (we would rather over-match than let a real
+// id through in an unusual rendering): whitespace incl. nbsp + the zero-width/soft-hyphen invisibles, the ASCII and
+// fullwidth punctuation a form or a table can put between digit groups, and the unicode dashes/minus. Only characters
+// that are NOT letters or digits — so a run can never eat a word. NUM_GAP bounds how many of them may sit between two
+// digits (column padding, " | ", a soft hyphen + newline). Markup containing LETTERS ("482<b>11</b>9037",
+// "482&nbsp;11") is a documented non-guarantee: a separator class with letters in it would swallow prose.
+const NUM_SEP = '[\\s\\u00a0\\u00ad\\u200b-\\u200d\\u2060\\ufeff.,;:/\\\\_|()\\[\\]\\{\\}<>*~=+#&\'"\\u00b7\\u2010-\\u2015\\u2212\\uff0d\\uff0e\\uff0f\\uff1a\\-]';
+const NUM_GAP = 6;
+// NUM_FLOOR (5) is the low-entropy cutoff for a NUMERIC identifier. A 1-4 digit number collides with the years,
+// versions, HTTP status codes and list numbers that fill ordinary content, so masking it would corrupt that content
+// and its token would unmask to the wrong value. Real DEERS identifiers — SSN(9), EDI(10), DEERS ids, ZIP(5) — are all
+// >= 5 digits, so this keeps every real value maskable while refusing the ambiguous short ones at authoring time.
+const NUM_FLOOR = 5;
+const NUMERIC_ONLY_RE = new RegExp(`^(?:${NUM_SEP}|\\d)+$`, 'u');
+// Whole-word guards. TEXT uses a UNICODE letter/digit guard (an ASCII-only guard splits "Okonkwoe-acute" mid-word).
+// NUMERIC uses a DIGIT-ONLY guard: a stored id must not be masked when it is a substring of a LONGER digit run (a
+// different number), but it SHOULD mask when glued to a letter or "_" ("SSN111223333", "edi_1002003004") — same id, and
+// leaving those raw was a confirmed leak. So only an adjacent DIGIT blocks a numeric match.
+const WORD = '[\\p{L}\\p{N}_]';
+const LB = `(?<!${WORD})`, RB = `(?!${WORD})`;
+const LB_NUM = '(?<!\\d)', RB_NUM = '(?!\\d)';
+const STARTS_WORD = /^[\p{L}\p{N}_]/u, ENDS_WORD = /[\p{L}\p{N}_]$/u;
+function digitsOf(v) { return String(v).replace(/\D/g, ''); }
+function isNumericId(v) { return NUMERIC_ONLY_RE.test(v) && digitsOf(v).length >= NUM_FLOOR; }
+// Text is NFC-normalized before lowercasing so a composed and a decomposed spelling of the same name are ONE value.
+function foldText(v) { return String(v).normalize('NFC').toLowerCase(); }
+function normKey(v) { const s = String(v); return isNumericId(s) ? 'n:' + digitsOf(s) : 't:' + foldText(s); }
+// A name's punctuation is spelled many ways in real documents: an apostrophe (O'Brien) may be a straight ', a curly ’
+// or a modifier ʼ; a hyphen (Smith-Jones) may be an ASCII -, a non-breaking ‑, or an en/em dash. A document exported
+// from Word or a PDF routinely uses the "typographic" variants while the store holds the ASCII form, so an exact match
+// would leak the whole surname. Treat each of these as an equivalence CLASS and emit the value with every combination
+// (bounded, so a value peppered with punctuation can't explode the alternation).
+const PUNCT_CLASSES = ["'‘’ʼ′", "-‐‑‒–—―−"];
+const PUNCT_CLASS_RE = ['[\'‘’ʼ′]', '[‐‑‒–—―−-]'];   // '-' LAST so it is a literal, not a range
+const PUNCT_CANON = new Map();   // any variant char -> { canon: first char of its class, cls: the class regex source }
+for (let ci = 0; ci < PUNCT_CLASSES.length; ci++) for (const ch of PUNCT_CLASSES[ci]) PUNCT_CANON.set(ch, { canon: PUNCT_CLASSES[ci][0], cls: PUNCT_CLASS_RE[ci] });
+// Canonicalize every punctuation variant to its class's first member — for the RESOLUTION key, so a match written with
+// any variant looks up the same value. Matching itself is a char-CLASS per mark (textPattern) — NO cartesian blow-up,
+// so a name with any number of marks matches every typographic rendering (the old expansion hit a cap that silently
+// dropped the protection at 3 marks — a confirmed leak).
+function canonPunct(s) { let out = ''; for (const ch of String(s)) { const e = PUNCT_CANON.get(ch); out += e ? e.canon : ch; } return out; }
+// A regex SOURCE matching one spelling of a text value, each punctuation mark rendered as its variant char-class.
+function textPattern(form) {
+  let src = '';
+  for (const ch of form) { const e = PUNCT_CANON.get(ch); src += e ? e.cls : escapeReg(ch); }
+  return src;
+}
+// Every spelling of a text value we must be able to MATCH. Lowercasing a key is not enough to recover the value: for
+// İ (U+0130), ẞ, Å (U+212B) and ß→SS the case mapping is not a per-character round trip, so a regex built from the
+// lowercased key fails to match the value's OWN on-disk spelling. Emit the literal stored form and its punctuation /
+// case / composition variants, and index every one of them back to the value (see buildMasker).
+function spellingForms(s) {
+  const out = new Set();
+  for (const b of [s, s.normalize('NFC'), s.normalize('NFD'), s.toLowerCase(), s.toUpperCase()]) {
+    out.add(b); out.add(b.normalize('NFC')); out.add(b.normalize('NFD'));
+  }
+  return [...out].filter(Boolean);
+  // NON-GUARANTEE: a COMPATIBILITY rendering in the DOCUMENT — a PDF ﬁ/ﬀ ligature, a fullwidth or superscript letter —
+  // when the store holds plain ASCII is not caught: matching it would require NFKC-normalizing the scan INPUT, which
+  // would change offsets and corrupt the passthrough of ordinary (non-PII) text. Store the value the way it renders.
 }
 
-// ── the value → token mask, as ONE single-pass regex ──────────────────────────────────────────────────────────
-// value -> token, longest values first so "1 Main St, Lynchburg" wins over "Lynchburg". Only values ≥ 3 chars
-// are tokenized — a 1-2 char value (a middle initial, "0") would match all over ordinary text and shred context.
-// ONE alternation regex, replaced in a SINGLE pass: a per-value split/join loop re-scans its own output, so a
-// value could be double-masked; a single pass never re-examines replaced text. WHOLE-TOKEN matching, not
-// substring: every value is boundary-guarded on its alphanumeric edges, so an SSN is never masked inside a longer
-// number and a city name never inside a longer word (see buildMask body).
-function buildMask(cases) {
-  const map = new Map();   // spelling (an exact value OR a generated numeric variant) -> token
-  // Collect every string leaf once, then index in TWO passes so a value's exact stored spelling always wins its
-  // own token. PASS 1 indexes the LITERALS; PASS 2 adds generated numeric VARIANTS, but only for spellings not
-  // already claimed. Without the split, two DIFFERENT values that share a digit sequence (e.g. an SSN
-  // "123-45-6789" and an account "123456789" — whose variant sets are identical) would let whichever loaded first
-  // claim BOTH spellings, so the second value's real spelling masked to the FIRST value's token (mis-attribution)
-  // and never surfaced as its own. Literals-first guarantees each real value masks correctly; only the genuinely
-  // ambiguous cross-variant spellings fall to first-writer-wins (they cannot belong to both, by construction).
-  const leaves = [];
-  for (const [label, c] of cases) {
-    for (const fp of leafPaths(c.fields)) {
-      const val = getField(c.fields, fp);
-      if (typeof val !== 'string' || val.length < 3) continue;
-      leaves.push({ tok: `@(${label}.${fp})`, val });
+// ── AUTHORING-TIME validation: keep ambiguous values OUT of the store ─────────────────────────────────────────
+// Because masking is exact-value and whole-word, a value that is an ordinary English word would tokenize ordinary
+// prose everywhere it appears ("Green", "Reading", "an"). Rather than a runtime heuristic that guesses which
+// occurrences are "really" the value — surprising, and it silently leaks the ones it skips — we REFUSE the value at
+// the point the developer enters it. This is TEST data: a distinctive value is always available. The result is that
+// the matching path stays uniform ("mask exactly what is in the store") with no special cases.
+const COMMON_WORDS = new Set(('a an and are as at be been but by call can come could day did do does down each even find first for from get give go had has have he her here him his how i if in into is it its just know like look make man many may me more most my new no not now of on one only or other our out over people take than that the their them then there these they thing think this those time to too two up us use very want was way we well were what when where which who why will with word work would year you your about after again against all also always another any around back because before below between both came come does down each end even every few found give great group hand help high home house just keep kind large last late left less life little long look made make most move much must name need never next night number off often old open own part place point put right room said same saw say school see seem set she should show side small some sound still such sure tell thought three through today together took turn under until upon used want water week went while white why without world write yes yet young green brown black blue red gray grey good bad big top low hard easy free full real true false near far half whole main cold hot warm rich poor safe wild deep wide fine nice front north south east west start stop short round square light dark heavy quick slow strong weak clean happy best better king church cross bell hall park price rose stone field wood hill').split(' '));
+// Returns a human-readable reason a value must not be stored, or null if it is fine to store + mask.
+function valueProblem(v) {
+  const s = String(v == null ? '' : v).trim();
+  if (!s) return null;                                     // blank clears the field — always allowed
+  // Use the SAME numeric test the runtime uses (NUMERIC_ONLY_RE), or a value like "1/2" slips past this guard as
+  // "text" and is then masked as a literal across ordinary prose.
+  if (NUMERIC_ONLY_RE.test(s)) {
+    if (digitsOf(s).length < NUM_FLOOR) return `"${s}" has only ${digitsOf(s).length} digit(s) — too short to mask safely (a 1-${NUM_FLOOR - 1} digit number collides with years, versions, status codes and list numbers, so masking it would corrupt ordinary content). Use an identifier with at least ${NUM_FLOOR} digits.`;
+    return null;
+  }
+  // Count LETTERS/DIGITS, not characters: "J." is one letter dressed as two, and masking it tokenizes every "J." in prose.
+  const body = s.replace(/[^\p{L}\p{N}]/gu, '');
+  if (body.length < 2) return `"${s}" carries only ${body.length} letter/digit — too ambiguous to mask (it would tokenize that letter everywhere). Use at least 2 letters.`;
+  if (COMMON_WORDS.has(foldText(s))) return `"${s}" is a common English word — masking it would tokenize ordinary prose everywhere it appears. Pick a distinctive test value.`;
+  return null;
+}
+
+// ── the value index: normKey -> the sorted set of every PATH that holds it ────────────────────────────────────
+function buildIndex(cases) {
+  const byKey = new Map();     // normKey -> Set(path)
+  const spell = new Map();     // normKey -> Set(raw spelling as stored)
+  const add = (path, raw) => {
+    let s = asStr(raw); if (s == null) return;
+    s = s.trim(); if (!s) return;   // a hand-authored padded value would otherwise never match the same word in prose
+    // The only runtime floor is what can NEVER be matched safely whatever the developer intended: a 1-char value, and
+    // a short NUMERIC value (< NUM_FLOOR digits — an enumerator/date/version like "01"/"2024" collides with ordinary
+    // numbers). Everything else in the store IS masked, uniformly — ambiguous values are rejected at AUTHORING time.
+    if (NUMERIC_ONLY_RE.test(s) && digitsOf(s).length < NUM_FLOOR) return;
+    const key = normKey(s);
+    if (key.length - 2 < 2) return;
+    if (!byKey.has(key)) { byKey.set(key, new Set()); spell.set(key, new Set()); }
+    byKey.get(key).add(path);
+    spell.get(key).add(s);
+  };
+  for (const [flabel, c] of cases) {
+    for (const [fp, v] of leafEntries(c.family)) add(`${flabel}.${fp}`, v);
+    for (const [mlabel, mfields] of Object.entries(c.members)) {
+      for (const [fp, v] of leafEntries(mfields)) add(`${flabel}.${mlabel}.${fp}`, v);
     }
   }
-  for (const { tok, val } of leaves) if (!map.has(val)) map.set(val, tok);          // pass 1: exact literals
-  for (const { tok, val } of leaves) {                                              // pass 2: numeric variants
-    for (const variant of numericVariants(val)) {
-      if (variant === val) continue;                                               // the literal is already indexed
-      if (variant.length >= 3 && !map.has(variant)) map.set(variant, tok);
+  const paths = new Map(), raw = new Map();
+  for (const [key, set] of byKey) { paths.set(key, [...set].sort()); raw.set(key, [...spell.get(key)]); }
+  return { paths, raw };   // normKey -> sorted paths | normKey -> the spellings actually on disk
+}
+function familiesOf(paths) { return [...new Set(paths.map(familyOfPath))].sort(); }
+function tierOf(paths) { if (paths.length <= 1) return 1; return familiesOf(paths).length === 1 ? 2 : 3; }
+
+// The fields component of a cross-family descriptor — the same string tier3Token() emits.
+function tier3FieldsOf(paths) {
+  return [...new Set(paths.map(restOfPath).map((r) => { const i = r.indexOf('.'); return i < 0 ? r : r.slice(i + 1); }))].sort().join('/');
+}
+// Does this @@@(…)/###{…} match a token the plugin could ACTUALLY have emitted from the CURRENT store? Validating the
+// SHAPE is not enough and was a confirmed leak: "###{482.11.9037 across 2 families #0123456789abcdef}" and
+// "@@@(smiths.20240001)" both satisfy a shape grammar, and sheltering them from the mask pass hands the raw value to
+// the model verbatim. So every part is checked against the live store — the path must be a REAL path, the within-family
+// descriptor must be one we would emit, and a cross-family descriptor's field list + family count + named anchors must
+// all match a value that really is shared that way. Anything else is NOT a token: it gets re-scanned and its interior
+// masks normally.
+function buildTokenValidator(idx, cases) {
+  const realPaths = new Set();
+  for (const [flabel, c] of cases) {
+    for (const p of leafPaths(c.family)) realPaths.add(foldText(`${flabel}.${p}`));
+    for (const [ml, mf] of Object.entries(c.members)) for (const p of leafPaths(mf)) realPaths.add(foldText(`${flabel}.${ml}.${p}`));
+  }
+  const tier2 = new Set();
+  const tier3 = [];
+  for (const [, ps] of idx.paths) {
+    const t = tierOf(ps);
+    if (t === 2) tier2.add(foldText(tier2Token(ps)));
+    else if (t === 3) tier3.push({ fields: foldText(tier3FieldsOf(ps)), fams: new Set(familiesOf(ps)) });
+  }
+  const T3 = /^###\{(.+?) across (\d+) families(?: incl\. ([^#{}]+?))? #[0-9a-f]{16}\}$/;
+  return (tok) => {
+    if (tok.startsWith('@@@(')) return tok.endsWith(')') && realPaths.has(foldText(tok.slice(4, -1)));
+    if (tier2.has(foldText(tok))) return true;
+    const m3 = T3.exec(foldText(tok));
+    if (!m3) return false;
+    const named = m3[3] ? m3[3].split(', ') : [];
+    return tier3.some((e) => e.fields === m3[1] && e.fams.size === Number(m3[2]) && named.every((n) => e.fams.has(n)));
+  };
+}
+
+// Build the single left-to-right MASK SCAN. One regex alternation finds each candidate; the caller's visit() gets the
+// span and the paths it resolves to (or null for an already-emitted token, left verbatim). Alternation order and the
+// scan loop together give LONGEST-RESOLVING-MATCH semantics, which plain String.replace does not:
+//   1) token protectors FIRST, so an emitted token is consumed whole and never re-masked from the inside (idempotence);
+//      a candidate that is not a REAL token is rejected and its interior re-scanned (see buildTokenValidator).
+//   2) TEXT values, longest-first. These MUST precede the numeric alternatives: JS alternation is first-match-at-a-
+//      position, not longest-match, so with numerics first a stored street "12345 Kilimanjaro Terrace" is cut down to
+//      its house number by the 5-digit alternative built for the ZIP in the very same address — and since that digit
+//      run resolves to nothing, replace() consumed it and the whole street reached the model verbatim.
+//   3) numeric identifiers, longest digit-count first: EXACTLY N digits with bounded separators between them, so every
+//      separator layout of one value is caught. (RESIDUAL non-guarantee: if two stored ids sit adjacent separated only
+//      by NUM_SEP AND their concatenation happens to equal a THIRD stored id, the longest alternative matches the pair
+//      as that third value — a mis-attribution, not a leak; it needs that exact three-value coincidence.)
+// And a match that resolves to NOTHING is never consumed — the scan resumes one character later (and, for a digit run,
+// first retries the SHORTER stored digit lengths at the same spot). Otherwise a stored 5-digit ZIP sitting next to four
+// unrelated digits is eaten by the 9-digit alternative built for an SSN and passes through unmasked.
+function buildMasker(idx, cases) {
+  const digitLens = new Set();
+  // byForm : CANONICAL-folded spelling -> Map(normKey -> Set(path)). Keeping the normKey dimension is what stops a
+  // value's lossy uppercase (e.g. "Große".toUpperCase() === "GROSSE", folds to "grosse") from unioning with a DISTINCT
+  // stored value ("Grosse") and mis-masking it as a false cross-family descriptor. A genuinely SHARED value keeps one
+  // normKey across families, so real tier-2/tier-3 is unaffected.
+  const byForm = new Map();
+  const seenPat = new Set();    // regex-pattern source already emitted (dedup the alternatives)
+  const patForms = [];          // { pat, len, first, last } per DISTINCT match pattern
+  for (const [key, ps] of idx.paths) {
+    if (key.startsWith('n:')) { digitLens.add(key.length - 2); continue; }
+    for (const s of idx.raw.get(key) || []) {
+      for (const form of spellingForms(s)) {
+        // Match pattern per spelling: punctuation marks become their variant char-class (textPattern); a case-insensitive
+        // regex still cannot match across unicode COMPOSITION, so each NFC/NFD form yields its own pattern.
+        const pat = textPattern(form);
+        if (!seenPat.has(pat)) { const cp = [...form]; seenPat.add(pat); patForms.push({ pat, len: cp.length, first: cp[0], last: cp[cp.length - 1] }); }
+        const folded = foldText(canonPunct(form));
+        let m = byForm.get(folded); if (!m) { m = new Map(); byForm.set(folded, m); }
+        let set = m.get(key); if (!set) { set = new Set(); m.set(key, set); }
+        for (const p of ps) set.add(p);
+      }
     }
   }
-  if (!map.size) return null;
-  const vals = [...map.keys()].sort((a, b) => b.length - a.length);   // longest-first ⇒ regex prefers longer
-  // BOUNDARY-GUARD every value on its ALPHANUMERIC edges, so a value is matched as a whole token and NEVER as a
-  // substring of a longer number or word. Guard the START only if the value starts alphanumeric, the END only if
-  // it ends alphanumeric (so "$100" or "(555)" still match on their punctuation side). Uses [0-9A-Za-z] — a
-  // digit/letter touching the match means it is part of a LONGER run and must not be tokenized:
-  //   111-22-3333  will NOT match inside 5111-22-33339 / 111-22-33334   (a longer number that contains the SSN)
-  //   24501        will NOT match inside 245019999                       (a longer number)
-  //   Lynchburg    will NOT match inside Lynchburgh                      (a longer word)
-  //   111-22-3333  WILL match in "ssn 111-22-3333." (a period is not alphanumeric → a real boundary)
-  const alt = vals.map((v) => {
-    const left = /^[0-9A-Za-z]/.test(v) ? '(?<![0-9A-Za-z])' : '';
-    const right = /[0-9A-Za-z]$/.test(v) ? '(?![0-9A-Za-z])' : '';
-    return left + escapeReg(v) + right;
-  }).join('|');
-  return { re: new RegExp(alt, 'g'), map };
+  const numLens = [...digitLens].filter((l) => l >= NUM_FLOOR).sort((a, b) => b - a);
+  const numSrc = numLens.map((len) => `${LB_NUM}\\d(?:${NUM_SEP}{0,${NUM_GAP}}\\d){${len - 1}}${RB_NUM}`);
+  if (!patForms.length && !numSrc.length) return null;     // nothing real to mask
+  const textSrc = patForms.sort((a, b) => b.len - a.len)
+    .map((f) => (STARTS_WORD.test(f.first || '') ? LB : '') + f.pat + (ENDS_WORD.test(f.last || '') ? RB : ''));
+  // A generous protector SHAPE — correctness comes from validating the capture, not from the shape.
+  const protSrc = ['@@@\\([^()\\s]{0,200}\\)', '###\\{[^{}]{0,400}\\}'];
+  const re = new RegExp([...protSrc, ...textSrc, ...numSrc].join('|'), 'gui');
+  const numSticky = numSrc.map((s) => new RegExp(s, 'uiy'));
+  const isRealToken = buildTokenValidator(idx, cases);
+  const NUM_RUN = new RegExp(`^(?:${NUM_SEP}|\\d)+$`, 'u');
+  const resolve = (s) => {
+    if (NUM_RUN.test(s)) { const k = 'n:' + digitsOf(s); const ps = idx.paths.get(k); return ps ? { key: k, paths: ps } : null; }
+    const m = byForm.get(foldText(canonPunct(s)));
+    if (!m) return null;
+    if (m.size === 1) { const [key, set] = [...m][0]; return { key, paths: [...set].sort() }; }
+    // AMBIGUOUS fold (distinct values share a lossy uppercase/case-fold): prefer the value whose OWN spelling folds here,
+    // else pick deterministically. Either way emit a SINGLE value's paths (mask, no leak) — never a false shared descriptor.
+    const direct = normKey(canonPunct(s));
+    const pick = m.has(direct) ? direct : [...m.keys()].sort()[0];
+    return { key: pick, paths: [...m.get(pick)].sort() };
+  };
+  return {
+    // visit(index, matchedText, resolved|null). resolved===null means "a genuine token — leave it alone".
+    scan(text, visit) {
+      re.lastIndex = 0;
+      let m;
+      while ((m = re.exec(text)) !== null) {
+        const i = m.index;
+        let matched = m[0];
+        if (!matched) { re.lastIndex = i + 1; continue; }
+        if (isToken(matched)) {
+          if (isRealToken(matched)) { visit(i, matched, null); re.lastIndex = i + matched.length; }
+          else re.lastIndex = i + 1;              // a forged wrapper — rescan so its interior masks
+          continue;
+        }
+        let hit = resolve(matched);
+        if (!hit && NUM_RUN.test(matched)) {
+          for (const sre of numSticky) {          // longest-first: retry the SHORTER stored lengths at this same spot
+            sre.lastIndex = i;
+            const s2 = sre.exec(text);
+            if (!s2 || s2[0].length >= matched.length) continue;
+            const h2 = resolve(s2[0]);
+            if (h2) { matched = s2[0]; hit = h2; break; }
+          }
+        }
+        if (hit) { visit(i, matched, hit); re.lastIndex = i + matched.length; }
+        else re.lastIndex = i + 1;                // NEVER consume a span that resolves to nothing
+      }
+    },
+  };
+}
+function isToken(s) { return s.startsWith('@@@(') || s.startsWith('###{'); }
+
+// The tokens for a value, given its paths + the anchor families for THIS text.
+function tier1Token(paths) { return `@@@(${paths[0]})`; }
+function tier2Token(paths) { return `###{${paths.map(restOfPath).sort().join(', ')} in ${familyOfPath(paths[0])}}`; }
+function tier3Token(paths, anchors, id) {
+  const fams = familiesOf(paths);
+  const named = fams.filter((f) => anchors.has(f)).slice(0, 3);
+  const incl = named.length ? ` incl. ${named.join(', ')}` : '';
+  return `###{${tier3FieldsOf(paths)} across ${fams.length} families${incl} #${id}}`;
+}
+
+// ── resolve a single-path token's rest against a family case ──────────────────────────────────────────────────
+// A path can, for an off-schema hand-authored store, be produced by BOTH a family-level nested key and a member
+// field. If both exist and DIFFER, refuse to guess (fail-closed) rather than silently returning the wrong person's
+// value; if they're equal (a genuinely shared value) either is correct.
+function resolveRest(c, rest) {
+  const found = [];
+  const push = (v) => { if (v !== undefined && !found.includes(v)) found.push(v); };
+  push(asStr(getField(c.family, rest)));
+  // EVERY member/field split, not just the first dot: a store with members "sponsor" and "sponsor.address" makes
+  // "sponsor.address.zip" mean two different people's zips. Silently taking the first was a fail-OPEN wrong value.
+  for (let dot = rest.indexOf('.'); dot >= 0; dot = rest.indexOf('.', dot + 1)) {
+    const m = c.members[rest.slice(0, dot)];
+    if (m) push(asStr(getField(m, rest.slice(dot + 1))));
+  }
+  if (found.length > 1) {
+    throw new Error(`ambiguous test-data token @@@(${c.label}.${rest}) — it maps to ${found.length} DIFFERENT stored values (a family-level key or a member label shadows another member's path); refusing to guess which (fail-closed). Fix the store so no label contains a dot and no family-level key shadows a member label.`);
+  }
+  return found[0];
+}
+
+// ── the panel editor's component tree (PLUGIN-UI-PANEL-SPEC.md §4) ─────────────────────────────────────────────
+function textRow(idPrefix, fieldPath, lbl, value, placeholder) {
+  return { type: 'text', id: `${idPrefix}:${fieldPath}`, label: lbl, value: typeof value === 'string' ? value : '', placeholder: placeholder || '' };
+}
+function memberSection(family, mlabel, mfields) {
+  const schemaNames = new Set(MEMBER_SCHEMA.map((s) => s.name));
+  const rows = MEMBER_SCHEMA.map((s) => textRow(`mf:${family}:${mlabel}`, s.name, s.label || s.name, getField(mfields, s.name), s.format));
+  for (const fp of leafPaths(mfields)) if (!schemaNames.has(fp)) rows.push(textRow(`mf:${family}:${mlabel}`, fp, fp + ' (extra)', getField(mfields, fp), ''));
+  rows.push({ type: 'button', id: `delm:${family}:${mlabel}`, label: 'Delete member', variant: 'danger' });
+  return { type: 'section', id: `member:${family}:${mlabel}`, title: '👤 ' + mlabel, children: rows };
+}
+function familySection(flabel, c) {
+  const famRows = FAMILY_SCHEMA.map((s) => textRow(`ff:${flabel}`, s.name, s.label || s.name, getField(c.family, s.name), s.format));
+  const members = Object.entries(c.members).map(([m, mf]) => memberSection(flabel, m, mf));
+  return { type: 'section', id: `family:${flabel}`, title: '👪 ' + flabel, children: [
+    ...famRows,
+    { type: 'note', text: members.length ? 'Members:' : 'No members yet — add one below.' },
+    ...members,
+    { type: 'section', id: `addmember:${flabel}`, title: '+ Add a member', collapsed: true, children: [
+      { type: 'text', id: `newmember:${flabel}`, label: 'Member label', placeholder: 'e.g. sponsor, spouse, child1' },
+      { type: 'button', id: `addm:${flabel}`, label: 'Add member', variant: 'primary' },
+    ] },
+    { type: 'button', id: `delf:${flabel}`, label: 'Delete family', variant: 'danger' },
+  ] };
+}
+function buildPanelTree(projectDir) {
+  const cases = loadStore(projectDir);
+  const sections = [...cases.entries()].map(([flabel, c]) => familySection(flabel, c));
+  return { type: 'stack', children: [
+    { type: 'note', text: cases.size
+      ? `${cases.size} famil${cases.size === 1 ? 'y' : 'ies'}. Real values live in testdata (hidden from the agent — it only ever sees tokens). Edits save as you type.`
+      : 'No families yet — add one below. Real values stay in testdata, hidden from the agent.' },
+    ...sections,
+    { type: 'section', id: 'addfamily', title: '+ Add a family', collapsed: true, children: [
+      { type: 'text', id: 'newfamily', label: 'Family label', placeholder: 'e.g. smiths (lowercase, no spaces)' },
+      { type: 'button', id: 'addfamily-go', label: 'Create family', variant: 'primary' },
+    ] },
+  ] };
+}
+function fieldStatusLines(schema, obj) {
+  const isFilled = (v) => (typeof v === 'string' && v.length > 0) || typeof v === 'number';
+  const names = new Set(schema.map((s) => s.name));
+  const lines = schema.map((s) => { const v = getField(obj, s.name); return `  ${isFilled(v) ? '✓' : '·'} ${s.name}`; });
+  for (const fp of leafPaths(obj).filter((fp) => !names.has(fp))) lines.push(`  ✓ ${fp} (not in schema)`);
+  return lines;
 }
 
 // ── the plugin ────────────────────────────────────────────────────────────────────────────────────────────────
 export default {
-  description: 'PII-safe test data: real values stay tokenized to the model and are only real inside tool calls',
+  description: 'PII-safe test data: DEERS families whose real values stay tokenized to the model, real only inside tool calls',
   author: 'code_boss',
-  blockedPaths: [STORE_DIRNAME],   // the platform hides .testdata from the agent
+  blockedPaths: [STORE_DIRNAME],
 
-  // Field list for the prompt — the case labels + the FULL schema (same for every case), rebuilt each turn.
-  // Values never appear. The agent sees the whole schema so it can build @(case.field) tokens; which fields are
-  // actually filled per case comes from <testdata_fields>, not the prompt (keeps it lean).
   promptAddition: (projectDir) => {
     const cases = loadStore(projectDir);
-    if (!cases.size) return '';   // no store in this project → say nothing
-    const lines = [
-      'TEST DATA AVAILABLE (values are hidden — you only ever get a TOKEN, never the real value):',
-      `  cases: ${[...cases.keys()].join(', ')}`,
-      `  schema fields (available on every case): ${SCHEMA.map((s) => s.name).join(', ')}`,
-      'Build a token as @(<case>.<field>) — e.g. @(alice.ssn) or @(alice.address.zip) — and pass it wherever the real',
-      'value is needed (a browser field, a request body, a form). The platform substitutes the real value when the',
-      'tool runs, and re-tokenizes any real values a tool pulls BACK (a scraped page) before you see them.',
-      'Not every case has every field filled — call <testdata_fields label="alice"/> to see which are filled vs blank',
-      'BEFORE you use one (a token for a blank field is refused). Never invent, edit, reformat a token, or ask for a raw value.',
-    ];
+    if (!cases.size) return '';
+    const lines = ['TEST DATA — families of DEERS beneficiaries (values are hidden — you only ever get a TOKEN):'];
+    for (const [flabel, c] of cases) {
+      lines.push(`  ${flabel}${c.description ? ` (${c.description})` : ''} — members: ${Object.keys(c.members).join(', ') || '(none)'}`);
+    }
+    lines.push(`  family-level field: ${FAMILY_SCHEMA.map((s) => s.name).join(', ')}`);
+    lines.push(`  per-member fields: ${MEMBER_SCHEMA.map((s) => s.name).join(', ')}`);
+    lines.push('To SET a value, build a SINGLE-path token — you CAN emit these:');
+    lines.push("  a member's field   →  @@@(<family>.<member>.<field>)   e.g. @@@(smiths.sponsor.ssn), @@@(smiths.spouse.address.zip)");
+    lines.push('  the family id       →  @@@(<family>.deers_family_id)');
+    lines.push('The platform substitutes the real value when the tool runs, and re-tokenizes any real values a tool pulls BACK.');
+    lines.push('When you READ data back, a value shared by SEVERAL beneficiaries comes back as a FUZZY, READ-ONLY ###{…} descriptor');
+    lines.push('(NOT a usable placeholder — never pass a ###{…} to a tool):');
+    lines.push('  shared within one family   →  ###{first_name: sponsor, spouse in smiths}   (the slots are listed — pick one → @@@(smiths.sponsor.first_name))');
+    lines.push('  shared across families      →  ###{address.city across 4 families incl. smiths #<id>}   (paths elided; call <testdata_expand id="<id>"/>');
+    lines.push('                                 to list every path holding it, then pick one → @@@(family.member.field))');
+    lines.push('Never invent, edit, or reformat a token, and never ask for a raw value.');
     return lines.join('\n');
   },
 
-  // Side-panel editor (PLUGIN-UI-PANEL-SPEC.md). The developer fills the schema fields per case; the agent never
-  // touches this — it edits .testdata directly through the plugin (which is agent-blocked). Save-as-you-type.
   panel: {
     title: 'Test data', icon: '🔒',
     render: (ctx) => buildPanelTree(ctx && ctx.projectDir),
     onEvent: (ev, ctx) => {
       const projectDir = ctx && ctx.projectDir;
-      if (!projectDir) return { error: 'Open a project first — test data is stored per project (.testdata).' };
-      // Save a field as it changes. blank ⇔ absent. No re-render (would clobber the box being typed in).
-      if (ev.event === 'change' && typeof ev.id === 'string' && ev.id.startsWith('field:')) {
-        const rest = ev.id.slice('field:'.length);
-        const ci = rest.indexOf(':');
-        if (ci < 0) return {};
-        const label = rest.slice(0, ci), fieldPath = rest.slice(ci + 1);
-        const cases = loadStore(projectDir);
-        const c = cases.get(label) || { label, description: '', fields: {} };
-        setField(c.fields, fieldPath, ev.value);
-        writeCase(projectDir, label, { label, description: c.description || '', fields: c.fields });
-        return { toast: { text: `saved ${label}.${fieldPath || ''}`.replace(/\.$/, ''), tone: 'ok' } };
+      if (!projectDir) return { error: 'Open a project first — test data is stored per project (testdata).' };
+      const id = typeof ev.id === 'string' ? ev.id : '';
+      const parts = id.split(':');
+      if (ev.event === 'change' && parts[0] === 'ff') {
+        const family = parts[1], field = parts.slice(2).join(':');
+        if (!family || !field) return {};
+        if (!safeLabel(family)) return { error: `illegal family label "${family}".` };
+        const bad = valueProblem(ev.value);
+        if (bad) return { error: bad };
+        const c = loadFamily(projectDir, family);
+        try { setField(c.family, field, ev.value); } catch (e) { return { error: e.message }; }
+        writeFamily(projectDir, family, c);
+        return { toast: { text: `saved ${family}.${field}`, tone: 'ok' } };
       }
-      // Add a case (values come with the click). A structural change → re-render.
-      if (ev.event === 'click' && ev.id === 'addcase-go') {
-        const label = String((ev.values && ev.values.newlabel) || '').toLowerCase().trim();
-        if (!LABEL_RE.test(label)) return { error: 'Label must be letters/digits/_/- only (e.g. alice).' };
-        if (loadStore(projectDir).has(label)) return { error: `A case "${label}" already exists.` };
-        writeCase(projectDir, label, { label, description: '', fields: {} });
-        return { toast: { text: `created case "${label}"`, tone: 'ok' }, render: buildPanelTree(projectDir) };
+      if (ev.event === 'change' && parts[0] === 'mf') {
+        const family = parts[1], member = parts[2], field = parts.slice(3).join(':');
+        if (!family || !member || !field) return {};
+        if (!safeLabel(family)) return { error: `illegal family label "${family}".` };
+        if (!safeLabel(member)) return { error: `illegal member label "${member}".` };
+        const bad = valueProblem(ev.value);
+        if (bad) return { error: bad };
+        const c = loadFamily(projectDir, family);
+        if (!c.members[member]) c.members[member] = {};
+        try { setField(c.members[member], field, ev.value); } catch (e) { return { error: e.message }; }
+        writeFamily(projectDir, family, c);
+        return { toast: { text: `saved ${family}.${member}.${field}`, tone: 'ok' } };
       }
-      // Delete a case → re-render.
-      if (ev.event === 'click' && typeof ev.id === 'string' && ev.id.startsWith('del:')) {
-        const label = ev.id.slice('del:'.length);
-        deleteCase(projectDir, label);
-        return { toast: { text: `deleted case "${label}"`, tone: 'ok' }, render: buildPanelTree(projectDir) };
+      if (ev.event === 'click' && id === 'addfamily-go') {
+        const family = String((ev.values && ev.values.newfamily) || '').toLowerCase().trim();
+        if (!safeLabel(family)) return { error: 'Family label must be letters/digits/_/- only (e.g. smiths), and not a reserved word.' };
+        if (loadStore(projectDir).has(family)) return { error: `A family "${family}" already exists.` };
+        writeFamily(projectDir, family, { description: '', family: {}, members: {} });
+        return { toast: { text: `created family "${family}"`, tone: 'ok' }, render: buildPanelTree(projectDir) };
+      }
+      if (ev.event === 'click' && parts[0] === 'addm') {
+        const family = parts[1];
+        if (!safeLabel(family)) return { error: `illegal family label "${family}".` };
+        const member = String((ev.values && ev.values[`newmember:${family}`]) || '').toLowerCase().trim();
+        if (!safeLabel(member)) return { error: 'Member label must be letters/digits/_/- only (e.g. sponsor), and not a reserved word.' };
+        const c = loadFamily(projectDir, family);
+        if (c.members[member]) return { error: `Member "${member}" already exists in "${family}".` };
+        c.members[member] = {};
+        writeFamily(projectDir, family, c);
+        return { toast: { text: `added member "${member}" to "${family}"`, tone: 'ok' }, render: buildPanelTree(projectDir) };
+      }
+      if (ev.event === 'click' && parts[0] === 'delm') {
+        const family = parts[1], member = parts[2];
+        if (!safeLabel(family) || !safeLabel(member)) return { error: 'illegal label.' };
+        const c = loadFamily(projectDir, family);
+        delete c.members[member];
+        writeFamily(projectDir, family, c);
+        return { toast: { text: `deleted member "${member}"`, tone: 'ok' }, render: buildPanelTree(projectDir) };
+      }
+      if (ev.event === 'click' && parts[0] === 'delf') {
+        deleteFamily(projectDir, parts[1]);
+        return { toast: { text: `deleted family "${parts[1]}"`, tone: 'ok' }, render: buildPanelTree(projectDir) };
       }
       return {};
     },
@@ -319,30 +653,59 @@ export default {
 
   filters: [{
     name: 'pii',
-    // real value -> token. ONE single-pass regex over the store's values, longest-first. (H1 request + H3 result.)
+    // real value -> token (H1 request + H3 result). TWO passes over THIS text so cross-family descriptors can name
+    // the families anchored by unique/within-family matches on the same page.
     mask: async (text, ctx) => {
       if (typeof text !== 'string' || !text) return text;
       const cases = loadStore(ctx?.projectDir);   // throws (fail-closed) on a store READ error
-      const m = buildMask(cases);
-      if (!m) return text;                          // no store / no maskable values
-      return text.replace(m.re, (v) => m.map.get(v) || v);
+      const idx = buildIndex(cases);
+      const m = buildMasker(idx, cases);
+      if (!m) return text;
+      // PASS A — anchors: families touched by a unique (tier 1) or within-family (tier 2) match in this text.
+      // (Genuine tokens are consumed whole by the protectors and arrive here as hit===null.)
+      const anchors = new Set();
+      m.scan(text, (_i, _s, hit) => {
+        if (hit && tierOf(hit.paths) <= 2) for (const f of familiesOf(hit.paths)) anchors.add(f);
+      });
+      // PASS B — replace by tier. Secret loaded lazily, only if a cross-family id is actually needed.
+      let secret;
+      const secretOnce = () => (secret !== undefined ? secret : (secret = getSecret(ctx?.projectDir)));
+      let out = '', last = 0;
+      m.scan(text, (i, matched, hit) => {
+        if (!hit) return;                            // a genuine token — leave it untouched (idempotent)
+        const t = tierOf(hit.paths);
+        out += text.slice(last, i) + (t === 1 ? tier1Token(hit.paths)
+          : t === 2 ? tier2Token(hit.paths)
+          : tier3Token(hit.paths, anchors, idFor(hit.key, secretOnce())));
+        last = i + matched.length;
+      });
+      return out + text.slice(last);
     },
-    // token -> real value. (H2 tool arguments.) Only a token whose LABEL is a real test case is treated as ours:
-    // an unknown label is left VERBATIM (so ordinary content like a template's @(Model.Name) is not our token and
-    // is not touched — audit 2026-07-22, sev3). A token for a KNOWN case but a missing/typo'd FIELD is a genuine
-    // mistake and still THROWS (fail-closed) — a real token that would reach a tool unresolved.
+    // token -> real value (H2 tool arguments). A single-path @@@(…) resolves; an unknown family passes through; a
+    // known family with a bad path THROWS (fail-closed). Any ###{…} reaching a tool is a mistake — THROW with
+    // guidance (it is a read-only descriptor, not an injectable value).
     unmask: async (text, ctx) => {
-      if (typeof text !== 'string' || text.indexOf('@(') === -1) return text;
+      if (typeof text !== 'string') return text;
+      const fuzz = [...text.matchAll(FUZZY_RE)];
+      if (fuzz.length) {
+        const names = [...new Set(fuzz.map((f) => f[0]))].join(', ');
+        const withId = [...text.matchAll(FUZZY_ID_RE)][0];
+        const hint = withId
+          ? ` For a cross-family value, call <testdata_expand id="${withId[1]}"/> to list its paths, then pass a specific @@@(family.member.field).`
+          : ' Pick one of the slots it lists and pass @@@(family.member.field).';
+        throw new Error(`a FUZZY read-only descriptor reached a tool: ${names}. Never inject a ###{…} (its value is shared, so it is not a settable placeholder).${hint}`);
+      }
+      if (text.indexOf('@@@(') === -1) return text;
       const cases = loadStore(ctx?.projectDir);
       const missing = [];
-      const out = text.replace(TOKEN_RE, (whole, label, field) => {
-        const c = cases.get(String(label).toLowerCase());
-        if (!c) return whole;                       // label is not a test case → not our token, pass through
-        const v = getField(c.fields, field);
-        if (typeof v !== 'string') { missing.push(whole); return whole; }   // our case, bad field → fail-closed
+      const out = text.replace(TOKEN_RE, (whole, path) => {
+        const c = cases.get(familyOfPath(path).toLowerCase());
+        if (!c) return whole;                       // not our family → pass through
+        const v = resolveRest(c, restOfPath(path));   // may THROW (fail-closed) on an ambiguous path
+        if (typeof v !== 'string') { missing.push(whole); return whole; }
         return v;
       });
-      if (missing.length) throw new Error(`unresolved test-data token(s): ${[...new Set(missing)].join(', ')} — the test case exists but has no such string field. Use <testdata_list/> to see the fields; do not invent tokens.`);
+      if (missing.length) throw new Error(`unresolved test-data token(s): ${[...new Set(missing)].join(', ')} — the family exists but has no such member/field. Use <testdata_fields> to see what is filled; do not invent tokens.`);
       return out;
     },
   }],
@@ -351,45 +714,82 @@ export default {
     {
       verb: 'testdata_get', name: 'testdata_get',
       schema: {
-        description: 'Get a TOKEN for a test-data field (you never receive the real value). e.g. label="alice" field="ssn" → the token @(alice.ssn). Pass the token wherever the real value is needed; the system substitutes it inside the tool call. field may be dotted for nested data (address.zip).',
-        parameters: { type: 'object', properties: { label: { type: 'string', description: 'the test-case label' }, field: { type: 'string', description: 'the field name (dotted for nested, e.g. address.zip)' } }, required: ['label', 'field'] },
+        description: 'Get a usable TOKEN for a test-data value (you never receive the real value). Member field → @@@(family.member.field); family-level field (omit member) → @@@(family.deers_family_id). field may be dotted (address.zip).',
+        parameters: { type: 'object', properties: {
+          family: { type: 'string', description: 'the family label' },
+          member: { type: 'string', description: 'the member label (omit for the family-level field)' },
+          field: { type: 'string', description: 'the field name (dotted for nested, e.g. address.zip)' },
+        }, required: ['family', 'field'] },
       },
-      impl: async ({ label, field }, ctx) => {
-        const cases = loadStore(ctx?.cwd);
-        const c = cases.get(String(label || '').toLowerCase());
-        if (!c) return { content: `ERROR: no test case "${label}". Use <testdata_list/> to see what exists.` };
-        const v = getField(c.fields, field);
-        if (typeof v !== 'string') return { content: `ERROR: test case "${label}" has no string field "${field}". Available: ${leafPaths(c.fields).join(', ') || '(none)'}.` };
-        return { content: `@(${c.label}.${field})` };   // the TOKEN, never the value
+      impl: async ({ family, member, field }, ctx) => {
+        const c = loadStore(ctx?.cwd).get(String(family || '').toLowerCase());
+        if (!c) return { content: `ERROR: no family "${family}". Use <testdata_list/> to see what exists.` };
+        if (member) {
+          const ml = String(member).toLowerCase();
+          const m = c.members[ml];
+          if (!m) return { content: `ERROR: family "${family}" has no member "${member}". Members: ${Object.keys(c.members).join(', ') || '(none)'}.` };
+          if (asStr(getField(m, field)) === undefined) return { content: `ERROR: ${family}.${ml} has no filled field "${field}". Available: ${leafPaths(m).join(', ') || '(none)'}.` };
+          return { content: `@@@(${family.toLowerCase()}.${ml}.${field})` };
+        }
+        if (asStr(getField(c.family, field)) === undefined) return { content: `ERROR: family "${family}" has no family-level field "${field}". Available: ${leafPaths(c.family).join(', ') || '(none)'}.` };
+        return { content: `@@@(${family.toLowerCase()}.${field})` };
       },
     },
     {
       verb: 'testdata_list', name: 'testdata_list',
-      schema: { description: 'List the available test cases and their field names (values are never shown).', parameters: { type: 'object', properties: {} } },
+      schema: { description: 'List the test-data families, their members, and the field names available (values are never shown).', parameters: { type: 'object', properties: {} } },
       impl: async (_args, ctx) => {
         const cases = loadStore(ctx?.cwd);
-        if (!cases.size) return { content: `No test data. Add labelled JSON files to <project>/${STORE_DIRNAME}/ (each: { "fields": { … } }).` };
+        if (!cases.size) return { content: `No test data. Add families in the "Test data" side panel (stored under <project>/${STORE_DIRNAME}/).` };
         const lines = [];
-        for (const [label, c] of cases) lines.push(`${label}${c.description ? ` — ${c.description}` : ''}: ${leafPaths(c.fields).join(', ') || '(no fields)'}`);
+        for (const [flabel, c] of cases) lines.push(`${flabel}${c.description ? ` — ${c.description}` : ''}: family fields [${leafPaths(c.family).join(', ') || 'none'}], members: ${Object.keys(c.members).join(', ') || '(none)'}`);
         return { content: lines.join('\n') };
       },
     },
     {
       verb: 'testdata_fields', name: 'testdata_fields',
       schema: {
-        description: 'For ONE test case, show every SCHEMA field and whether it is FILLED or BLANK (no values). Use this before building a token — e.g. to check whether "alice" has a middle_name — because a token for a blank field is refused.',
-        parameters: { type: 'object', properties: { label: { type: 'string', description: 'the test-case label' } }, required: ['label'] },
+        description: "Show which fields are FILLED vs BLANK (no values). Pass family + member for a member's fields, or family alone for the family-level field + the member list. Use this before building a token — a token for a blank field is refused.",
+        parameters: { type: 'object', properties: {
+          family: { type: 'string', description: 'the family label' },
+          member: { type: 'string', description: 'the member label (omit for the family-level view)' },
+        }, required: ['family'] },
       },
-      impl: async ({ label }, ctx) => {
-        const cases = loadStore(ctx?.cwd);
-        const c = cases.get(String(label || '').toLowerCase());
-        if (!c) return { content: `ERROR: no test case "${label}". Use <testdata_list/> to see what exists.` };
-        const schemaNames = new Set(SCHEMA.map((s) => s.name));
-        const lines = SCHEMA.map((s) => { const v = getField(c.fields, s.name); return `  ${(typeof v === 'string' && v.length) ? '✓' : '·'} ${s.name}`; });
-        // any non-schema fields present on disk, so the picture is complete
-        const extra = leafPaths(c.fields).filter((fp) => !schemaNames.has(fp));
-        for (const fp of extra) lines.push(`  ✓ ${fp} (not in schema)`);
-        return { content: `${c.label} — ✓ filled · blank:\n${lines.join('\n')}` };
+      impl: async ({ family, member }, ctx) => {
+        const c = loadStore(ctx?.cwd).get(String(family || '').toLowerCase());
+        if (!c) return { content: `ERROR: no family "${family}". Use <testdata_list/> to see what exists.` };
+        if (member) {
+          const m = c.members[String(member).toLowerCase()];
+          if (!m) return { content: `ERROR: family "${family}" has no member "${member}". Members: ${Object.keys(c.members).join(', ') || '(none)'}.` };
+          return { content: `${family}.${String(member).toLowerCase()} — ✓ filled · blank:\n${fieldStatusLines(MEMBER_SCHEMA, m).join('\n')}` };
+        }
+        const lines = fieldStatusLines(FAMILY_SCHEMA, c.family);
+        lines.push(`  members: ${Object.keys(c.members).join(', ') || '(none)'}`);
+        return { content: `${family} (family level) — ✓ filled · blank:\n${lines.join('\n')}\n(call again with member="<label>" for a member's fields)` };
+      },
+    },
+    {
+      verb: 'testdata_expand', name: 'testdata_expand',
+      schema: {
+        description: 'Expand a fuzzy cross-family token — pass the #id shown in a ###{… #id} descriptor and get the FULL list of paths (family → member → field) whose value is the shared one, so you can pick a specific one and build @@@(family.member.field). Values are NEVER shown.',
+        parameters: { type: 'object', properties: { id: { type: 'string', description: 'the 16-hex #id from a ###{…} fuzzy token (with or without the leading #)' } }, required: ['id'] },
+      },
+      impl: async ({ id }, ctx) => {
+        const wanted = String(id || '').toLowerCase().replace(/[^0-9a-f]/g, '');
+        if (wanted.length !== 16) return { content: `ERROR: "${id}" is not a valid fuzzy id (expected the 16-hex #id from a ###{…} token).` };
+        const secret = getSecret(ctx?.cwd);
+        if (!secret) return { content: 'ERROR: no test data in this project.' };
+        const idx = buildIndex(loadStore(ctx?.cwd));
+        const hits = [...idx.paths.entries()].filter(([key]) => idFor(key, secret) === wanted);   // group by VALUE (normKey)
+        if (!hits.length) return { content: `ERROR: id "${wanted}" does not match any current test-data value (it may have been edited or removed).` };
+        if (hits.length > 1) return { content: `ERROR: id "${wanted}" is ambiguous — it matches ${hits.length} DISTINCT values (an id collision). Refusing to merge their paths (fail-closed). Use <testdata_fields> to locate the value you need.` };
+        const matches = hits[0][1];
+        // group into a family → member → fields graph (no values)
+        const byFam = new Map();
+        for (const p of matches.slice().sort()) { const f = familyOfPath(p); if (!byFam.has(f)) byFam.set(f, []); byFam.get(f).push(restOfPath(p)); }
+        const lines = [];
+        for (const [f, rests] of byFam) lines.push(`  ${f}: ${rests.sort().join(', ')}`);
+        return { content: `${matches.length} path(s) share this value:\n${lines.join('\n')}\nPick one and build @@@(family.member.field) to use it.` };
       },
     },
   ],
