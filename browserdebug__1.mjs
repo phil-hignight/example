@@ -5,8 +5,9 @@
  * drive it, and READ what actually broke at runtime (console, exceptions, network, live state, a DOM-diff
  * timeline) — which curl + reading source cannot show.
  *
- * ZERO dependencies. Node 22 ships WebSocket + fetch as globals, so this speaks the raw Chrome DevTools Protocol
- * over the DevTools WebSocket directly — no puppeteer, no npm. Chrome is launched through host.spawn (the tracked
+ * ZERO dependencies: this speaks the raw Chrome DevTools Protocol over the DevTools WebSocket directly — no
+ * puppeteer, no npm. It uses the global WebSocket when the runtime has one (Node 21+) and falls back to a minimal
+ * built-in RFC-6455 client over node:net when it does not (Node 18/20). Chrome is launched through host.spawn (the tracked
  * platform spawn), so code_boss owns the process: it is visible in <bg-status>, stoppable via <kill-background>,
  * and auto-reaped on project close + shutdown. This plugin NEVER spawns Chrome itself.
  *
@@ -22,6 +23,7 @@
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { existsSync, writeFileSync, readFileSync } from 'node:fs';
 
 // ── config ────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -54,10 +56,135 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const clip = (s) => { s = String(s == null ? '' : s); return s.length > RESULT_CAP ? s.slice(0, RESULT_CAP) + `\n…[+${s.length - RESULT_CAP} chars]` : s; };
 function push(buf, item) { buf.push(item); while (buf.length > BUFFER_MAX) buf.shift(); }
 
+// ── the socket: global WebSocket where it exists, else a built-in fallback ──────────────────────────────────────
+// Node ships a global WebSocket only from v21; on Node 18/20 `new WebSocket(...)` throws "WebSocket is not defined"
+// and the plugin cannot connect at all. Rather than make the plugin demand a Node upgrade on the developer's
+// machine, fall back to a minimal RFC-6455 client (below) that covers exactly what the DevTools endpoint needs.
+// CB_BROWSERDEBUG_WS=shim forces the fallback on a modern Node so the tests can exercise it.
+function openSocket(url) {
+  const forced = String(process.env.CB_BROWSERDEBUG_WS || '').toLowerCase() === 'shim';
+  if (!forced && typeof globalThis.WebSocket === 'function') return new globalThis.WebSocket(url);
+  return new NodeWS(url);
+}
+
+// A minimal RFC-6455 CLIENT over node:net, scoped to the DevTools endpoint: plain ws:// only (the debugging port is
+// never TLS), no extensions offered (so no permessage-deflate to inflate), text frames. It exposes the slice of the
+// WebSocket surface CDP uses below — addEventListener(open|message|error|close), send(string), close() — so the two
+// implementations are interchangeable. Handles fragmentation, both extended length forms, and server pings.
+const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+class NodeWS {
+  constructor(url) {
+    this._ls = { open: [], message: [], error: [], close: [] };
+    this._sendQ = [];            // frames queued until the handshake completes
+    this._rx = Buffer.alloc(0);  // unparsed bytes
+    this._frag = null;           // { opcode, chunks } across a fragmented message
+    this._open = false; this._done = false; this._sock = null;
+    let u;
+    try { u = new URL(url); } catch { u = null; }
+    if (!u || u.protocol !== 'ws:') {
+      // Defer so the caller can attach its error listener first.
+      setTimeout(() => this._fail(`the built-in WebSocket fallback speaks plain ws:// only (got "${url}") — upgrade to Node 21+ for anything else`), 0);
+      return;
+    }
+    const key = crypto.randomBytes(16).toString('base64');
+    this._accept = crypto.createHash('sha1').update(key + WS_GUID).digest('base64');
+    const sock = this._sock = net.connect({ host: u.hostname, port: Number(u.port) || 80 });
+    sock.setNoDelay(true);
+    sock.on('error', (e) => this._fail(e?.message || 'socket error'));
+    sock.on('close', () => this._emitClose());
+    sock.on('connect', () => {
+      sock.write(
+        `GET ${u.pathname}${u.search} HTTP/1.1\r\n` +
+        `Host: ${u.host}\r\n` +
+        'Upgrade: websocket\r\nConnection: Upgrade\r\n' +
+        `Sec-WebSocket-Key: ${key}\r\nSec-WebSocket-Version: 13\r\n\r\n`);
+    });
+    sock.on('data', (d) => {
+      this._rx = Buffer.concat([this._rx, d]);
+      if (!this._open) { if (!this._handshake()) return; }
+      try { this._frames(); } catch (e) { this._fail(e?.message || 'frame error'); }
+    });
+  }
+  // Consume the 101 response; returns true once the connection is live.
+  _handshake() {
+    const end = this._rx.indexOf('\r\n\r\n');
+    if (end < 0) return false;
+    const head = this._rx.subarray(0, end).toString('latin1');
+    this._rx = this._rx.subarray(end + 4);
+    if (!/^HTTP\/1\.1 101/i.test(head)) { this._fail('DevTools refused the WebSocket upgrade: ' + head.split('\r\n')[0]); return false; }
+    const got = (/^sec-websocket-accept:\s*(\S+)/im.exec(head) || [])[1];
+    if (got !== this._accept) { this._fail('WebSocket handshake failed (bad Sec-WebSocket-Accept)'); return false; }
+    this._open = true;
+    this._emit('open', { type: 'open' });
+    for (const f of this._sendQ.splice(0)) { try { this._sock.write(f); } catch {} }
+    return true;
+  }
+  // Parse whole frames out of _rx; leaves a partial frame buffered for the next chunk.
+  _frames() {
+    for (;;) {
+      const b = this._rx;
+      if (b.length < 2) return;
+      const fin = (b[0] & 0x80) !== 0, opcode = b[0] & 0x0f, masked = (b[1] & 0x80) !== 0;
+      let len = b[1] & 0x7f, off = 2;
+      if (len === 126) { if (b.length < 4) return; len = b.readUInt16BE(2); off = 4; }
+      else if (len === 127) {
+        if (b.length < 10) return;
+        const big = b.readBigUInt64BE(2);
+        if (big > 0x7fffffffn) throw new Error('WebSocket frame larger than this client supports');
+        len = Number(big); off = 10;
+      }
+      let mask = null;
+      if (masked) { if (b.length < off + 4) return; mask = b.subarray(off, off + 4); off += 4; }   // servers must not mask; tolerate it
+      if (b.length < off + len) return;
+      const payload = Buffer.from(b.subarray(off, off + len));
+      if (mask) for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i & 3];
+      this._rx = b.subarray(off + len);
+
+      if (opcode === 0x8) { try { this._sock.write(this._frame(0x8, Buffer.alloc(0))); } catch {} this._destroy(); return; }
+      if (opcode === 0x9) { try { this._sock.write(this._frame(0xa, payload)); } catch {} continue; }   // ping → pong
+      if (opcode === 0xa) continue;                                                                     // pong
+      if (opcode === 0x0) {                                                                             // continuation
+        if (!this._frag) continue;
+        this._frag.chunks.push(payload);
+        if (fin) { const f = this._frag; this._frag = null; this._deliver(f.opcode, Buffer.concat(f.chunks)); }
+        continue;
+      }
+      if (!fin) { this._frag = { opcode, chunks: [payload] }; continue; }
+      this._deliver(opcode, payload);
+    }
+  }
+  _deliver(opcode, payload) { this._emit('message', { type: 'message', data: opcode === 0x1 ? payload.toString('utf8') : payload }); }
+  // Client→server frames MUST be masked (RFC 6455 §5.3).
+  _frame(opcode, payload) {
+    const len = payload.length;
+    const head = Buffer.alloc(len < 126 ? 2 : len < 65536 ? 4 : 10);
+    head[0] = 0x80 | opcode;
+    if (len < 126) head[1] = 0x80 | len;
+    else if (len < 65536) { head[1] = 0x80 | 126; head.writeUInt16BE(len, 2); }
+    else { head[1] = 0x80 | 127; head.writeBigUInt64BE(BigInt(len), 2); }
+    const mask = crypto.randomBytes(4);
+    const body = Buffer.allocUnsafe(len);
+    for (let i = 0; i < len; i++) body[i] = payload[i] ^ mask[i & 3];
+    return Buffer.concat([head, mask, body]);
+  }
+  addEventListener(type, fn, opts) { const l = this._ls[type]; if (l) l.push({ fn, once: !!(opts && opts.once) }); }
+  removeEventListener(type, fn) { const l = this._ls[type]; if (!l) return; const i = l.findIndex((x) => x.fn === fn); if (i >= 0) l.splice(i, 1); }
+  _emit(type, ev) { for (const e of this._ls[type].slice()) { if (e.once) this.removeEventListener(type, e.fn); try { e.fn(ev); } catch {} } }
+  _fail(message) { if (this._done) return; this._emit('error', { type: 'error', message }); this._destroy(); }
+  _emitClose() { if (this._done) return; this._done = true; this._open = false; this._emit('close', { type: 'close' }); }
+  _destroy() { try { this._sock?.destroy(); } catch {} this._emitClose(); }
+  send(data) {
+    if (this._done) throw new Error('WebSocket is closed');
+    const f = this._frame(0x1, Buffer.from(String(data), 'utf8'));
+    if (this._open) this._sock.write(f); else this._sendQ.push(f);
+  }
+  close() { if (this._done) return; try { this._sock.write(this._frame(0x8, Buffer.alloc(0))); } catch {} this._destroy(); }
+}
+
 // ── a minimal CDP client over one browser WebSocket (flatten mode multiplexes page sessions) ────────────────────
 class CDP {
   constructor(wsUrl) {
-    this.ws = new WebSocket(wsUrl);
+    this.ws = openSocket(wsUrl);
     this._id = 0; this._pending = new Map(); this._on = [];
     this._ready = new Promise((res, rej) => {
       const t = setTimeout(() => rej(new Error('CDP websocket open timed out')), CONNECT_TIMEOUT_MS);
