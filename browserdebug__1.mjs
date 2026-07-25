@@ -464,13 +464,93 @@ const SNAPSHOT_FN = `(() => {
 
 async function actByRef(s, ref, action) {
   // action runs in-page with `el` bound to the ref'd element. Returns {ok} or {error}.
-  const js = `(() => { const cb=window.__cb; const el=cb&&cb.refs.get(${JSON.stringify(String(ref))}); if(!el) return {error:'stale or unknown ref "${ref}" — take a fresh <browser_snapshot/> and use a current ref'}; try { ${action} return {ok:true, el: cb.desc(el)}; } catch(e){ return {error: String(e && e.message || e)}; } })();`;
+  const R = JSON.stringify(String(ref));
+  const js = `(() => { const cb=window.__cb; const el=cb&&cb.refs.get(${R}); if(!el) return {error:'stale or unknown ref ' + ${R} + ' — take a fresh <browser_snapshot/> and use a current ref'}; if(!el.isConnected) return {error:'ref ' + ${R} + ' (' + cb.desc(el) + ') is no longer in the page — it was re-rendered or removed since the snapshot, so acting on it would hit a detached element nobody can see. Take a fresh <browser_snapshot/>'}; try { ${action} return {ok:true, el: cb.desc(el)}; } catch(e){ return {error: String(e && e.message || e)}; } })();`;
   const r = await evalIn(s, js);
   if (r && r.error) throw new Error(r.error);
   return r;
 }
-function dispatchInput(valueJson) {
-  return `el.focus(); el.value=${valueJson}; el.dispatchEvent(new Event('input',{bubbles:true})); el.dispatchEvent(new Event('change',{bubbles:true}));`;
+
+// ── real input (trusted events), not synthetic dispatch ─────────────────────────────────────────────────────────
+// `el.click()` fires ONE untrusted `click` and nothing else: no pointerdown/mousedown/mouseup, no focus change,
+// `isTrusted === false`. Real UIs miss it — anything driven by mousedown/pointerdown (menus, custom widgets, drag
+// handles) or gated on isTrusted just sits there while the plugin cheerfully reports "clicked". So interaction goes
+// through CDP Input instead, where Chrome synthesizes the SAME trusted event sequence a human's mouse produces.
+const DESC_FN = `((el) => { const t = el.tagName.toLowerCase(); const id = el.id ? '#' + el.id : ''; const cls = (el.className && typeof el.className === 'string' && el.className.trim()) ? '.' + el.className.trim().split(/\\s+/).slice(0,2).join('.') : ''; return t + id + cls; })`;
+
+// Render ANY JS value as text the agent can read: undefined/null/functions/DOM nodes/Errors/cycles all get a
+// legible form instead of vanishing (JSON.stringify) or collapsing to '{}'.
+const DESCRIBE_FN = `((v) => {
+  const seen = new WeakSet();
+  const el = (x) => '<' + x.tagName.toLowerCase() + (x.id ? '#' + x.id : '') + (x.className && typeof x.className === 'string' && x.className.trim() ? '.' + x.className.trim().split(/\\s+/).join('.') : '') + '>';
+  const special = (x) => {
+    if (typeof x === 'function') return '[Function ' + (x.name || 'anonymous') + ']';
+    if (typeof x === 'symbol' || typeof x === 'bigint') return String(x);
+    if (typeof Element !== 'undefined' && x instanceof Element) return el(x);
+    if (typeof Node !== 'undefined' && x instanceof Node) return '[' + x.nodeName + ']';
+    if (x instanceof Error) return x.stack || (x.name + ': ' + x.message);
+    return null;
+  };
+  if (v === undefined) return 'undefined';
+  if (v === null) return 'null';
+  const s0 = special(v);
+  if (s0 !== null) return s0;
+  if (typeof v === 'string') return v;
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+  try {
+    return JSON.stringify(v, (k, val) => {
+      if (val === undefined) return '[undefined]';
+      const s1 = special(val);
+      if (s1 !== null) return s1;
+      if (val && typeof val === 'object') { if (seen.has(val)) return '[Circular]'; seen.add(val); }
+      return val;
+    }, 2);
+  } catch (e) { return String(v); }
+})`;
+
+// Resolve a ref (or CSS selector) to the viewport point a real click would land on, and report what is actually
+// painted there — an overlay swallowing the click is the classic "I clicked it and nothing happened".
+async function pointFor(s, { ref, selector }) {
+  const byRef = ref != null && ref !== '';
+  const key = JSON.stringify(String(byRef ? ref : selector));
+  const lookup = byRef
+    ? `const cb = window.__cb; const el = cb && cb.refs.get(${key});`
+    : `const el = document.querySelector(${key});`;
+  const missing = byRef
+    ? `stale or unknown ref ' + ${key} + ' — take a fresh <browser_snapshot/> and use a current ref`
+    : `no element matches selector ' + ${key} + '`;
+  const js = `(() => {
+    const desc = ${DESC_FN};
+    ${lookup}
+    if (!el) return { error: '${missing}' };
+    if (!el.isConnected) return { error: 'ref ' + ${key} + ' (' + desc(el) + ') is no longer in the page — it was re-rendered or removed since the snapshot. Take a fresh <browser_snapshot/>' };
+    el.scrollIntoView({ block: 'center', inline: 'center' });
+    const r = el.getBoundingClientRect();
+    if (!r.width || !r.height) return { error: ${key} + ' (' + desc(el) + ') has zero size on screen, so there is nothing to click — it is hidden, collapsed, or not laid out yet' };
+    const x = r.left + r.width / 2, y = r.top + r.height / 2;
+    const hit = document.elementFromPoint(x, y);
+    return { x, y, desc: desc(el), disabled: !!el.disabled,
+             blocked: (hit && hit !== el && !el.contains(hit) && !hit.contains(el)) ? desc(hit) : null };
+  })();`;
+  const r = await evalIn(s, js);
+  if (!r || r.error) throw new Error(r ? r.error : `could not resolve ${byRef ? 'ref' : 'selector'} ${key}`);
+  return r;
+}
+async function dispatchClick(s, x, y) {
+  await s.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, buttons: 0 }, s.sessionId);
+  await s.cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', buttons: 1, clickCount: 1 }, s.sessionId);
+  await s.cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', buttons: 0, clickCount: 1 }, s.sessionId);
+}
+// Click to focus, select whatever is there, then insert the text as a REAL edit (trusted `input`, which is what
+// controlled inputs in React/Vue/Angular actually listen for — assigning el.value does not reach them). The
+// trailing `change` mirrors the blur a human would do next; the result reports the value that actually landed.
+async function typeInto(s, ref, text) {
+  const pt = await pointFor(s, { ref });
+  await dispatchClick(s, pt.x, pt.y);
+  await evalIn(s, `(() => { const el = document.activeElement; if (el && typeof el.select === 'function') el.select(); return true; })()`);
+  await s.cdp.send('Input.insertText', { text: String(text) }, s.sessionId);
+  const value = await actByRef(s, ref, `el.dispatchEvent(new Event('change',{bubbles:true})); return {ok:true, el: cb.desc(el), value: (el.value != null ? String(el.value) : el.textContent || '')};`);
+  return { desc: pt.desc, value: value?.value };
 }
 
 // ── mock / fetch interception (Tier 2) ──────────────────────────────────────────────────────────────────────────
@@ -569,22 +649,43 @@ export default {
       { label: { type: 'string' }, js: { type: 'string' }, ref: { type: 'string' } }, ['label', 'js'],
       async (a) => {
         const s = getSession(a.label);
-        const expr = a.ref ? `(() => { const $0 = window.__cb && window.__cb.refs.get(${JSON.stringify(String(a.ref))}); return (${a.js}); })()` : `(${a.js})`;
-        const v = await evalIn(s, expr);
-        return ok(typeof v === 'string' ? v : JSON.stringify(v, null, 2));
+        // Describe the value IN THE PAGE and hand back a string. JSON.stringify(undefined) is the VALUE undefined,
+        // which used to clip to '' — so every eval of a void expression (a setter, a method call, a missing
+        // property) came back as a blank result the agent could not read as anything at all. Functions and DOM
+        // nodes stringified to a bare '{}', which is no better. Now every JS value has a legible rendering.
+        const bind = a.ref ? `const $0 = window.__cb && window.__cb.refs.get(${JSON.stringify(String(a.ref))});` : '';
+        const expr = `(async () => { ${bind} const __v = await (${a.js}); return ${DESCRIBE_FN}(__v); })()`;
+        const out = await evalIn(s, expr);
+        return ok(out === '' ? '(empty string)' : out);
       }),
 
     // ── interact (by ref) ──
     T('browser_click', 'Click an element by its [ref] (from the latest snapshot) or a CSS selector.', { label: { type: 'string' }, ref: { type: 'string' }, selector: { type: 'string' } }, ['label'],
-      async (a) => { const s = getSession(a.label); s.lastAction = `click ${a.ref || a.selector}`; if (a.ref) { const r = await actByRef(s, a.ref, 'el.scrollIntoView({block:"center"}); el.click();'); await sleep(100); await drainDom(s); return ok(`clicked ${r.el}.`); } await evalIn(s, `document.querySelector(${JSON.stringify(a.selector)}).click()`); await sleep(100); await drainDom(s); return ok(`clicked ${a.selector}.`); }),
+      async (a) => {
+        const s = getSession(a.label);
+        if (!a.ref && !a.selector) throw new Error('browser_click needs a ref (from the latest <browser_snapshot/>) or a CSS selector — got neither.');
+        s.lastAction = `click ${a.ref || a.selector}`;
+        const pt = await pointFor(s, { ref: a.ref, selector: a.selector });
+        await dispatchClick(s, pt.x, pt.y);
+        await sleep(100); await drainDom(s);
+        if (pt.disabled) return ok(`clicked ${pt.desc}, but it is DISABLED — the page will ignore the click. Nothing happened.`);
+        if (pt.blocked) return ok(`clicked at the centre of ${pt.desc}, but ${pt.blocked} is painted on top there and received the click instead. Dismiss/scroll past it, or target ${pt.blocked}.`);
+        return ok(`clicked ${pt.desc}.`);
+      }),
     T('browser_hover', 'Hover an element (triggers hover-only UI: tooltips, dropdowns).', { label: { type: 'string' }, ref: { type: 'string' } }, ['label', 'ref'],
-      async (a) => { const s = getSession(a.label); s.lastAction = `hover ${a.ref}`; await actByRef(s, a.ref, 'el.dispatchEvent(new MouseEvent("mouseover",{bubbles:true})); el.dispatchEvent(new MouseEvent("mouseenter",{bubbles:true}));'); await sleep(100); await drainDom(s); return ok(`hovered ${a.ref}.`); }),
-    T('browser_type', 'Type text into an input by ref (dispatches input+change so frameworks react).', { label: { type: 'string' }, ref: { type: 'string' }, text: { type: 'string' } }, ['label', 'ref', 'text'],
-      async (a) => { const s = getSession(a.label); s.lastAction = `type ${a.ref}`; await actByRef(s, a.ref, dispatchInput(JSON.stringify(a.text))); await drainDom(s); return ok(`typed into ${a.ref}.`); }),
-    T('browser_fill', 'Fill many inputs in one call: a map of ref → value.', { label: { type: 'string' }, fields: { type: 'object', description: '{ "e5": "value", ... }' } }, ['label', 'fields'],
-      async (a) => { const s = getSession(a.label); s.lastAction = 'fill form'; for (const [ref, val] of Object.entries(a.fields || {})) await actByRef(s, ref, dispatchInput(JSON.stringify(String(val)))); await drainDom(s); return ok(`filled ${Object.keys(a.fields || {}).length} field(s).`); }),
+      async (a) => { const s = getSession(a.label); s.lastAction = `hover ${a.ref}`; const pt = await pointFor(s, { ref: a.ref }); await s.cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: pt.x, y: pt.y, buttons: 0 }, s.sessionId); await sleep(100); await drainDom(s); return ok(`hovered ${pt.desc}.`); }),
+    T('browser_type', 'Type text into an input by ref, as REAL keystrokes (trusted input events, so controlled React/Vue fields update). Returns the value that actually landed.', { label: { type: 'string' }, ref: { type: 'string' }, text: { type: 'string' } }, ['label', 'ref', 'text'],
+      async (a) => { const s = getSession(a.label); s.lastAction = `type ${a.ref}`; const r = await typeInto(s, a.ref, a.text); await drainDom(s); return ok(`typed into ${r.desc} — its value is now ${JSON.stringify(r.value ?? '')}.`); }),
+    T('browser_fill', 'Fill many inputs in one call: a map of ref → value. Same real keystrokes as browser_type.', { label: { type: 'string' }, fields: { type: 'object', description: '{ "e5": "value", ... }' } }, ['label', 'fields'],
+      async (a) => {
+        const s = getSession(a.label); s.lastAction = 'fill form';
+        const done = [];
+        for (const [ref, val] of Object.entries(a.fields || {})) { const r = await typeInto(s, ref, String(val)); done.push(`${r.desc}=${JSON.stringify(r.value ?? '')}`); }
+        await drainDom(s);
+        return ok(done.length ? `filled ${done.length} field(s): ${done.join(', ')}` : 'no fields given.');
+      }),
     T('browser_select', 'Choose an option in a <select> by ref.', { label: { type: 'string' }, ref: { type: 'string' }, value: { type: 'string' } }, ['label', 'ref', 'value'],
-      async (a) => { const s = getSession(a.label); s.lastAction = `select ${a.ref}`; await actByRef(s, a.ref, `el.value=${JSON.stringify(a.value)}; el.dispatchEvent(new Event('change',{bubbles:true}));`); await drainDom(s); return ok(`selected ${JSON.stringify(a.value)}.`); }),
+      async (a) => { const s = getSession(a.label); s.lastAction = `select ${a.ref}`; const r = await actByRef(s, a.ref, `el.value=${JSON.stringify(a.value)}; el.dispatchEvent(new Event('input',{bubbles:true})); el.dispatchEvent(new Event('change',{bubbles:true})); if (el.value !== ${JSON.stringify(a.value)}) return {error: 'no option with value ' + ${JSON.stringify(JSON.stringify(a.value))} + ' in ' + cb.desc(el) + ' — options are: ' + [...el.options].map((o) => JSON.stringify(o.value)).join(', ')};`); await drainDom(s); return ok(`selected ${JSON.stringify(a.value)} in ${r.el}.`); }),
     T('browser_press', 'Press a key / combo on the page (Enter, Tab, Escape, ArrowDown, Ctrl+A).', { label: { type: 'string' }, keys: { type: 'string' } }, ['label', 'keys'],
       async (a) => {
         const s = getSession(a.label); s.lastAction = `press ${a.keys}`;
