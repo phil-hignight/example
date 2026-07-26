@@ -31,15 +31,19 @@
  * "anchors", and a cross-family descriptor then names the anchor families it also belongs to ("incl. smiths") — so a
  * shared value on a one-family page reads as belonging to that family.
  *
- * Matching is NORMALIZED, and deliberately errs toward masking TOO MUCH: a numeric id is matched by its digit
- * sequence in any separator layout (space/dot/comma/slash/dash/nbsp/…), and text is matched case-insensitively and
- * in either unicode composition — so a stored value is caught however a document spells it. Unresolved / ambiguous
- * tokens THROW (fail-closed) rather than reaching a tool as text.
+ * Matching is NORMALIZE-BOTH-SIDES and deliberately errs toward masking TOO MUCH: the document and the stored
+ * dictionary are folded to the SAME canonical form (case fold, unicode composition + COMPATIBILITY so ligatures /
+ * fullwidth match, punctuation-variant canonicalization, dropped invisibles, collapsed whitespace), each stored value
+ * is found in the folded stream, and the match is mapped back to its ORIGINAL byte span — so non-PII text is copied
+ * through verbatim and only the matched span is replaced. A numeric id matches its digit sequence in any separator
+ * layout (space/dot/comma/slash/dash/nbsp/fullwidth/…); text matches whole-value, case- and composition-insensitive.
+ * TEXT and NUMERIC candidates are merged by leftmost-longest overlap resolution (so a street "12345 Kili…" wins over a
+ * 5-digit ZIP hiding inside it). Unresolved / ambiguous tokens THROW (fail-closed) rather than reaching a tool as text.
  *
  * Ambiguity is prevented where values ENTER the store, not guessed at match time: valueProblem() refuses a 1-char
- * value, a 1-2 digit value (it would collide with every date/version/list number), and a common English word (masking
- * "an" or "Green" would tokenize ordinary prose). That keeps this matching path uniform — mask exactly what is in
- * the store — with no length/case special cases.
+ * value, a <5 digit number (it would collide with every date/version/status/list number), and a common English word
+ * (masking "an" or "Green" would tokenize ordinary prose). That keeps the matching path uniform — mask exactly what is
+ * in the store — with no length/case special cases.
  */
 
 import { readdirSync, readFileSync, statSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
@@ -224,7 +228,6 @@ function asStr(v) {
   }
   return String(v);
 }
-function escapeReg(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 function familyOfPath(p) { return p.slice(0, p.indexOf('.')); }
 function restOfPath(p) { return p.slice(p.indexOf('.') + 1); }   // "sponsor.ssn" | "deers_family_id"
 
@@ -253,48 +256,100 @@ const NUMERIC_ONLY_RE = new RegExp(`^(?:${NUM_SEP}|\\d)+$`, 'u');
 // NUMERIC uses a DIGIT-ONLY guard: a stored id must not be masked when it is a substring of a LONGER digit run (a
 // different number), but it SHOULD mask when glued to a letter or "_" ("SSN111223333", "edi_1002003004") — same id, and
 // leaving those raw was a confirmed leak. So only an adjacent DIGIT blocks a numeric match.
-const WORD = '[\\p{L}\\p{N}_]';
-const LB = `(?<!${WORD})`, RB = `(?!${WORD})`;
-const LB_NUM = '(?<!\\d)', RB_NUM = '(?!\\d)';
+const WORD_RE = /[\p{L}\p{N}_]/u;
+function isWordChar(ch) { return !!ch && WORD_RE.test(ch); }
 const STARTS_WORD = /^[\p{L}\p{N}_]/u, ENDS_WORD = /[\p{L}\p{N}_]$/u;
+// Text-normalization character classes. INVISIBLE marks are DROPPED (a soft hyphen / zero-width char injected inside a
+// name or id must not hide it); real WHITESPACE collapses to a single space (so a value written across a line break or
+// with doubled spaces still matches); a MARK (combining accent) rides with its base cluster for composition folding.
+const INVISIBLE_RE = /[\u00ad\u200b\u200c\u200d\u2060\ufeff]/;
+const WS_RE = /[\s\u00a0]/;
+const MARK_RE = /\p{M}/u;
 function digitsOf(v) { return String(v).replace(/\D/g, ''); }
 function isNumericId(v) { return NUMERIC_ONLY_RE.test(v) && digitsOf(v).length >= NUM_FLOOR; }
 // Text is NFC-normalized before lowercasing so a composed and a decomposed spelling of the same name are ONE value.
 function foldText(v) { return String(v).normalize('NFC').toLowerCase(); }
 function normKey(v) { const s = String(v); return isNumericId(s) ? 'n:' + digitsOf(s) : 't:' + foldText(s); }
-// A name's punctuation is spelled many ways in real documents: an apostrophe (O'Brien) may be a straight ', a curly ’
-// or a modifier ʼ; a hyphen (Smith-Jones) may be an ASCII -, a non-breaking ‑, or an en/em dash. A document exported
-// from Word or a PDF routinely uses the "typographic" variants while the store holds the ASCII form, so an exact match
-// would leak the whole surname. Treat each of these as an equivalence CLASS and emit the value with every combination
-// (bounded, so a value peppered with punctuation can't explode the alternation).
-const PUNCT_CLASSES = ["'‘’ʼ′", "-‐‑‒–—―−"];
-const PUNCT_CLASS_RE = ['[\'‘’ʼ′]', '[‐‑‒–—―−-]'];   // '-' LAST so it is a literal, not a range
-const PUNCT_CANON = new Map();   // any variant char -> { canon: first char of its class, cls: the class regex source }
-for (let ci = 0; ci < PUNCT_CLASSES.length; ci++) for (const ch of PUNCT_CLASSES[ci]) PUNCT_CANON.set(ch, { canon: PUNCT_CLASSES[ci][0], cls: PUNCT_CLASS_RE[ci] });
-// Canonicalize every punctuation variant to its class's first member — for the RESOLUTION key, so a match written with
-// any variant looks up the same value. Matching itself is a char-CLASS per mark (textPattern) — NO cartesian blow-up,
-// so a name with any number of marks matches every typographic rendering (the old expansion hit a cap that silently
-// dropped the protection at 3 marks — a confirmed leak).
-function canonPunct(s) { let out = ''; for (const ch of String(s)) { const e = PUNCT_CANON.get(ch); out += e ? e.canon : ch; } return out; }
-// A regex SOURCE matching one spelling of a text value, each punctuation mark rendered as its variant char-class.
-function textPattern(form) {
-  let src = '';
-  for (const ch of form) { const e = PUNCT_CANON.get(ch); src += e ? e.cls : escapeReg(ch); }
-  return src;
-}
-// Every spelling of a text value we must be able to MATCH. Lowercasing a key is not enough to recover the value: for
-// İ (U+0130), ẞ, Å (U+212B) and ß→SS the case mapping is not a per-character round trip, so a regex built from the
-// lowercased key fails to match the value's OWN on-disk spelling. Emit the literal stored form and its punctuation /
-// case / composition variants, and index every one of them back to the value (see buildMasker).
-function spellingForms(s) {
-  const out = new Set();
-  for (const b of [s, s.normalize('NFC'), s.normalize('NFD'), s.toLowerCase(), s.toUpperCase()]) {
-    out.add(b); out.add(b.normalize('NFC')); out.add(b.normalize('NFD'));
+// Punctuation-variant equivalence: an apostrophe (O'Brien) may be written straight ' / curly / modifier; a hyphen
+// (Smith-Jones) may be an ASCII - / non-breaking / en / em dash. NORMALIZATION canonicalizes each to its class's first
+// member so a match written any way resolves to the same stored value (matching is on the normalized form, so there is
+// no variant enumeration and no combinatorial blow-up).
+const PUNCT_CLASSES = ['\u0027\u2018\u2019\u02bc\u2032', '\u002d\u2010\u2011\u2012\u2013\u2014\u2015\u2212'];
+const PUNCT_CANON = new Map();   // any variant char -> the canonical (first) char of its class
+for (const cls of PUNCT_CLASSES) for (const ch of cls) PUNCT_CANON.set(ch, cls[0]);
+function canonPunct(s) { let out = ''; for (const ch of String(s)) out += PUNCT_CANON.get(ch) || ch; return out; }
+
+// ── NORMALIZE-BOTH-SIDES matching primitives ──────────────────────────────────────────────────────────────────────
+// The document and the stored dictionary are folded to the SAME canonical form, matched on that form, and each match is
+// mapped back to the ORIGINAL byte span (so non-PII text is copied through verbatim and only the matched span is
+// replaced). This folds case, unicode composition/COMPATIBILITY (NFKC — so a PDF ligature or fullwidth char matches),
+// punctuation variants, dropped invisibles, and collapsed whitespace into ONE fold instead of enumerating every
+// rendering as a separate regex alternative.
+//
+// normalizeText(text) -> { norm, map } where norm is the folded string and map[i] = [origStart, origEnd) is the
+// ORIGINAL code-unit span that produced folded char i (so a folded run maps back to real offsets even when a fold
+// expands one char to several, e.g. the ligature fi -> "fi" or eszett -> "ss").
+function normalizeText(text) {
+  const s = String(text);
+  const norm = [];
+  const map = [];
+  let i = 0;
+  while (i < s.length) {
+    const cp = s.codePointAt(i);
+    const ch = String.fromCodePoint(cp);
+    const cuLen = ch.length;                                   // 1 or 2 (surrogate pair)
+    if (INVISIBLE_RE.test(ch)) { i += cuLen; continue; }       // drop a soft-hyphen / zero-width char entirely
+    if (WS_RE.test(ch)) {                                       // collapse a whitespace run to one space
+      let j = i + cuLen;
+      while (j < s.length) { const c2 = String.fromCodePoint(s.codePointAt(j)); if (WS_RE.test(c2) || INVISIBLE_RE.test(c2)) j += c2.length; else break; }
+      norm.push(' '); map.push([i, j]); i = j; continue;
+    }
+    // gather a base char + its trailing combining marks into one cluster so NFKC can compose an accent
+    let j = i + cuLen;
+    let cluster = ch;
+    while (j < s.length) { const c2 = String.fromCodePoint(s.codePointAt(j)); if (MARK_RE.test(c2)) { cluster += c2; j += c2.length; } else break; }
+    // Full CASE FOLD: toUpperCase().toLowerCase() (not just toLowerCase) so an already-lowercase char whose UPPER form
+    // expands folds correctly — the German sharp-s "ß" upper-cases to "SS", so a document "STRASSE" folds to the same
+    // "strasse" as the stored "Straße". (An idempotent, both-sides fold.)
+    const folded = canonPunct(cluster).normalize('NFKC').toUpperCase().toLowerCase();
+    for (const fc of folded) { norm.push(fc); map.push([i, j]); }
+    i = j;
   }
-  return [...out].filter(Boolean);
-  // NON-GUARANTEE: a COMPATIBILITY rendering in the DOCUMENT — a PDF ﬁ/ﬀ ligature, a fullwidth or superscript letter —
-  // when the store holds plain ASCII is not caught: matching it would require NFKC-normalizing the scan INPUT, which
-  // would change offsets and corrupt the passthrough of ordinary (non-PII) text. Store the value the way it renders.
+  return { norm: norm.join(''), map };
+}
+function normalizeTextKey(v) { return normalizeText(v).norm; }
+
+// A digit, NFKC-folded to its ASCII value — so a FULLWIDTH digit ("４"), which stored ids never use, still matches the
+// stored ASCII digit (an id written in fullwidth digits was otherwise an evasion). Returns the ASCII digit char or null.
+function digitFold(ch) {
+  if (!ch) return null;
+  if (ch >= '0' && ch <= '9') return ch;
+  const f = ch.normalize('NFKC');
+  return (f.length === 1 && f >= '0' && f <= '9') ? f : null;
+}
+// numberSegments(text) -> [{ digits, pos }] — each a maximal run of digits joined by <= NUM_GAP separator chars (a
+// letter or a wider gap BREAKS the run, so "call 482 on gate 11" is three numbers, not one). digits is the bare digit
+// string (folded to ASCII); pos[k] is the ORIGINAL code-unit index of digit k. A stored key is searched in each segment.
+const NUM_SEP_CH = new RegExp('^' + NUM_SEP + '$', 'u');
+function numberSegments(text) {
+  const s = String(text);
+  const segs = [];
+  let i = 0;
+  while (i < s.length) {
+    if (digitFold(s[i]) == null) { i++; continue; }
+    let digits = '', pos = [], j = i;
+    while (j < s.length) {
+      const d = digitFold(s[j]);
+      if (d != null) { digits += d; pos.push(j); j++; continue; }
+      let k = j, sep = 0;
+      while (k < s.length && NUM_SEP_CH.test(s[k])) { k++; sep++; }
+      if (k < s.length && digitFold(s[k]) != null && sep <= NUM_GAP) { j = k; continue; }   // bridge a bounded separator gap
+      break;
+    }
+    segs.push({ digits, pos });
+    i = j;
+  }
+  return segs;
 }
 
 // ── AUTHORING-TIME validation: keep ambiguous values OUT of the store ─────────────────────────────────────────
@@ -386,99 +441,109 @@ function buildTokenValidator(idx, cases) {
   };
 }
 
-// Build the single left-to-right MASK SCAN. One regex alternation finds each candidate; the caller's visit() gets the
-// span and the paths it resolves to (or null for an already-emitted token, left verbatim). Alternation order and the
-// scan loop together give LONGEST-RESOLVING-MATCH semantics, which plain String.replace does not:
-//   1) token protectors FIRST, so an emitted token is consumed whole and never re-masked from the inside (idempotence);
-//      a candidate that is not a REAL token is rejected and its interior re-scanned (see buildTokenValidator).
-//   2) TEXT values, longest-first. These MUST precede the numeric alternatives: JS alternation is first-match-at-a-
-//      position, not longest-match, so with numerics first a stored street "12345 Kilimanjaro Terrace" is cut down to
-//      its house number by the 5-digit alternative built for the ZIP in the very same address — and since that digit
-//      run resolves to nothing, replace() consumed it and the whole street reached the model verbatim.
-//   3) numeric identifiers, longest digit-count first: EXACTLY N digits with bounded separators between them, so every
-//      separator layout of one value is caught. (RESIDUAL non-guarantee: if two stored ids sit adjacent separated only
-//      by NUM_SEP AND their concatenation happens to equal a THIRD stored id, the longest alternative matches the pair
-//      as that third value — a mis-attribution, not a leak; it needs that exact three-value coincidence.)
-// And a match that resolves to NOTHING is never consumed — the scan resumes one character later (and, for a digit run,
-// first retries the SHORTER stored digit lengths at the same spot). Otherwise a stored 5-digit ZIP sitting next to four
-// unrelated digits is eaten by the 9-digit alternative built for an SSN and passes through unmasked.
-function buildMasker(idx, cases) {
-  const digitLens = new Set();
-  // byForm : CANONICAL-folded spelling -> Map(normKey -> Set(path)). Keeping the normKey dimension is what stops a
-  // value's lossy uppercase (e.g. "Große".toUpperCase() === "GROSSE", folds to "grosse") from unioning with a DISTINCT
-  // stored value ("Grosse") and mis-masking it as a false cross-family descriptor. A genuinely SHARED value keeps one
-  // normKey across families, so real tier-2/tier-3 is unaffected.
-  const byForm = new Map();
-  const seenPat = new Set();    // regex-pattern source already emitted (dedup the alternatives)
-  const patForms = [];          // { pat, len, first, last } per DISTINCT match pattern
+// ── the MATCHER (normalize-both-sides) ──────────────────────────────────────────────────────────────────────────
+// Fold the document and the stored dictionary to the SAME canonical form, find each stored value in the folded stream,
+// then map the match back to its ORIGINAL byte span. This replaces the old "enumerate every spelling into one giant
+// regex alternation" scan — which required anticipating every rendering and was the source of the recurring leak/
+// over-mask class. Now case, unicode composition + COMPATIBILITY (ligatures, fullwidth), punctuation variants, dropped
+// invisibles and collapsed whitespace all fall out of ONE fold. TEXT and NUMERIC use different folds (text keeps its
+// letters and matches whole-value; a number ignores its internal separators and matches by digit run), so they are two
+// candidate sources that are merged by leftmost-longest overlap resolution — which is what makes a street "12345 Kili…"
+// win over the 5-digit ZIP alt hiding inside it, structurally rather than by hand-ordered alternatives.
+function charAt(text, i) { if (i < 0 || i >= text.length) return ''; return String.fromCodePoint(text.codePointAt(i)); }
+function prevChar(text, i) {
+  if (i <= 0) return '';
+  const c = text.charCodeAt(i - 1);
+  if (c >= 0xdc00 && c <= 0xdfff && i >= 2) return text.slice(i - 2, i);   // trailing surrogate -> return the full pair
+  return text[i - 1];
+}
+function buildMatcher(idx, cases) {
+  const textKeys = new Map();   // normalized text key -> Map(normKey -> Set(path))
+  const numKeys = new Map();    // digit string -> { key, paths[] }
   for (const [key, ps] of idx.paths) {
-    if (key.startsWith('n:')) { digitLens.add(key.length - 2); continue; }
-    for (const s of idx.raw.get(key) || []) {
-      for (const form of spellingForms(s)) {
-        // Match pattern per spelling: punctuation marks become their variant char-class (textPattern); a case-insensitive
-        // regex still cannot match across unicode COMPOSITION, so each NFC/NFD form yields its own pattern.
-        const pat = textPattern(form);
-        if (!seenPat.has(pat)) { const cp = [...form]; seenPat.add(pat); patForms.push({ pat, len: cp.length, first: cp[0], last: cp[cp.length - 1] }); }
-        const folded = foldText(canonPunct(form));
-        let m = byForm.get(folded); if (!m) { m = new Map(); byForm.set(folded, m); }
-        let set = m.get(key); if (!set) { set = new Set(); m.set(key, set); }
-        for (const p of ps) set.add(p);
-      }
+    if (key.startsWith('n:')) { numKeys.set(key.slice(2), { key, paths: ps }); continue; }
+    for (const raw of idx.raw.get(key) || []) {
+      const nk = normalizeTextKey(raw);
+      if (!nk) continue;
+      let m = textKeys.get(nk); if (!m) { m = new Map(); textKeys.set(nk, m); }
+      let set = m.get(key); if (!set) { set = new Set(); m.set(key, set); }
+      for (const path of ps) set.add(path);
     }
   }
-  const numLens = [...digitLens].filter((l) => l >= NUM_FLOOR).sort((a, b) => b - a);
-  const numSrc = numLens.map((len) => `${LB_NUM}\\d(?:${NUM_SEP}{0,${NUM_GAP}}\\d){${len - 1}}${RB_NUM}`);
-  if (!patForms.length && !numSrc.length) return null;     // nothing real to mask
-  const textSrc = patForms.sort((a, b) => b.len - a.len)
-    .map((f) => (STARTS_WORD.test(f.first || '') ? LB : '') + f.pat + (ENDS_WORD.test(f.last || '') ? RB : ''));
-  // A generous protector SHAPE — correctness comes from validating the capture, not from the shape.
-  const protSrc = ['@@@\\([^()\\s]{0,200}\\)', '###\\{[^{}]{0,400}\\}'];
-  const re = new RegExp([...protSrc, ...textSrc, ...numSrc].join('|'), 'gui');
-  const numSticky = numSrc.map((s) => new RegExp(s, 'uiy'));
+  if (!textKeys.size && !numKeys.size) return null;
+  const textList = [...textKeys.keys()];
+  const numList = [...numKeys.keys()];
   const isRealToken = buildTokenValidator(idx, cases);
-  const NUM_RUN = new RegExp(`^(?:${NUM_SEP}|\\d)+$`, 'u');
-  const resolve = (s) => {
-    if (NUM_RUN.test(s)) { const k = 'n:' + digitsOf(s); const ps = idx.paths.get(k); return ps ? { key: k, paths: ps } : null; }
-    const m = byForm.get(foldText(canonPunct(s)));
-    if (!m) return null;
-    if (m.size === 1) { const [key, set] = [...m][0]; return { key, paths: [...set].sort() }; }
-    // AMBIGUOUS fold (distinct values share a lossy uppercase/case-fold): prefer the value whose OWN spelling folds here,
-    // else pick deterministically. Either way emit a SINGLE value's paths (mask, no leak) — never a false shared descriptor.
-    const direct = normKey(canonPunct(s));
+  // Resolve one text key to a SINGLE value's { key, paths }. A folded key can map to >1 distinct stored value only when
+  // a lossy case-fold collides ("Große".toUpperCase() === "GROSSE" -> "grosse", same as "Grosse"); prefer the value
+  // whose own spelling folds to the matched text, else pick deterministically — always a single value, never a false
+  // cross-family descriptor.
+  function textResolve(nk, matchedOrig) {
+    const m = textKeys.get(nk); if (!m) return null;
+    if (m.size === 1) { const [k, set] = [...m][0]; return { key: k, paths: [...set].sort() }; }
+    const direct = normKey(canonPunct(matchedOrig));
     const pick = m.has(direct) ? direct : [...m.keys()].sort()[0];
     return { key: pick, paths: [...m.get(pick)].sort() };
-  };
+  }
   return {
-    // visit(index, matchedText, resolved|null). resolved===null means "a genuine token — leave it alone".
-    scan(text, visit) {
-      re.lastIndex = 0;
-      let m;
-      while ((m = re.exec(text)) !== null) {
-        const i = m.index;
-        let matched = m[0];
-        if (!matched) { re.lastIndex = i + 1; continue; }
-        if (isToken(matched)) {
-          if (isRealToken(matched)) { visit(i, matched, null); re.lastIndex = i + matched.length; }
-          else re.lastIndex = i + 1;              // a forged wrapper — rescan so its interior masks
-          continue;
-        }
-        let hit = resolve(matched);
-        if (!hit && NUM_RUN.test(matched)) {
-          for (const sre of numSticky) {          // longest-first: retry the SHORTER stored lengths at this same spot
-            sre.lastIndex = i;
-            const s2 = sre.exec(text);
-            if (!s2 || s2[0].length >= matched.length) continue;
-            const h2 = resolve(s2[0]);
-            if (h2) { matched = s2[0]; hit = h2; break; }
+    // GENUINE emitted-token spans (leave verbatim + do not mask their interior). A FORGED wrapper is NOT reserved, so
+    // its interior falls through to normal masking. Same store-keyed validation as before (buildTokenValidator).
+    reserved(text) {
+      const out = [];
+      const shape = /@@@\([^()\s]{0,200}\)|###\{[^{}]{0,400}\}/gu;
+      let m; while ((m = shape.exec(text)) !== null) { if (isRealToken(m[0])) out.push([m.index, m.index + m[0].length]); }
+      return out;
+    },
+    // every value occurrence as { start, end, key, paths } in ORIGINAL offsets, skipping any overlapping a reserved span.
+    candidates(text, reserved) {
+      const inReserved = (s, e) => reserved.some(([rs, re]) => s < re && e > rs);
+      const cands = [];
+      if (textList.length) {
+        const { norm, map } = normalizeText(text);
+        for (const nk of textList) {
+          let from = 0, pos;
+          while ((pos = norm.indexOf(nk, from)) !== -1) {
+            from = pos + 1;
+            const start = map[pos][0], end = map[pos + nk.length - 1][1];
+            // whole-value boundary: only where the key EDGE is a word char, the ORIGINAL neighbor must not be one
+            if (STARTS_WORD.test(nk[0]) && isWordChar(prevChar(text, start))) continue;
+            if (ENDS_WORD.test(nk[nk.length - 1]) && isWordChar(charAt(text, end))) continue;
+            if (inReserved(start, end)) continue;
+            const hit = textResolve(nk, text.slice(start, end));
+            if (hit) cands.push({ start, end, key: hit.key, paths: hit.paths });
           }
         }
-        if (hit) { visit(i, matched, hit); re.lastIndex = i + matched.length; }
-        else re.lastIndex = i + 1;                // NEVER consume a span that resolves to nothing
       }
+      if (numList.length) {
+        for (const seg of numberSegments(text)) {
+          for (const dk of numList) {
+            if (dk.length > seg.digits.length) continue;
+            let from = 0, pos;
+            while ((pos = seg.digits.indexOf(dk, from)) !== -1) {
+              from = pos + 1;
+              const start = seg.pos[pos], end = seg.pos[pos + dk.length - 1] + 1;
+              // digit boundary: an adjacent DIGIT in the original means this is a slice of a LONGER number -> reject
+              if (digitFold(prevChar(text, start)) != null || digitFold(charAt(text, end)) != null) continue;
+              if (inReserved(start, end)) continue;
+              const nk = numKeys.get(dk);
+              cands.push({ start, end, key: nk.key, paths: [...nk.paths] });
+            }
+          }
+        }
+      }
+      return cands;
     },
   };
 }
-function isToken(s) { return s.startsWith('@@@(') || s.startsWith('###{'); }
+// leftmost-longest resolution: at each position take the longest match, jump past it — same semantics a regex scan gives,
+// and what makes the longer (text street) win over a shorter (numeric ZIP) candidate covering the same span.
+function resolveOverlaps(cands) {
+  cands.sort((a, b) => a.start - b.start || (b.end - b.start) - (a.end - a.start));
+  const chosen = [];
+  let cursor = 0;
+  for (const c of cands) if (c.start >= cursor) { chosen.push(c); cursor = c.end; }
+  return chosen;
+}
 
 // The tokens for a value, given its paths + the anchor families for THIS text.
 function tier1Token(paths) { return `@@@(${paths[0]})`; }
@@ -653,32 +718,33 @@ export default {
 
   filters: [{
     name: 'pii',
-    // real value -> token (H1 request + H3 result). TWO passes over THIS text so cross-family descriptors can name
-    // the families anchored by unique/within-family matches on the same page.
+    // real value -> token (H1 request + H3 result). Normalize-both-sides match, then rebuild: genuine emitted tokens are
+    // RESERVED (left verbatim, no re-masking inside — idempotent), value occurrences are found in ORIGINAL offsets,
+    // overlaps resolve leftmost-longest, and cross-family (tier-3) descriptors name the families anchored by the
+    // unique/within-family winners on the same page.
     mask: async (text, ctx) => {
       if (typeof text !== 'string' || !text) return text;
       const cases = loadStore(ctx?.projectDir);   // throws (fail-closed) on a store READ error
       const idx = buildIndex(cases);
-      const m = buildMasker(idx, cases);
-      if (!m) return text;
-      // PASS A — anchors: families touched by a unique (tier 1) or within-family (tier 2) match in this text.
-      // (Genuine tokens are consumed whole by the protectors and arrive here as hit===null.)
+      const matcher = buildMatcher(idx, cases);
+      if (!matcher) return text;
+      const reserved = matcher.reserved(text);
+      const chosen = resolveOverlaps(matcher.candidates(text, reserved));
+      if (!chosen.length) return text;
+      // anchors: families touched by a unique (tier 1) or within-family (tier 2) winner in this text.
       const anchors = new Set();
-      m.scan(text, (_i, _s, hit) => {
-        if (hit && tierOf(hit.paths) <= 2) for (const f of familiesOf(hit.paths)) anchors.add(f);
-      });
-      // PASS B — replace by tier. Secret loaded lazily, only if a cross-family id is actually needed.
+      for (const c of chosen) if (tierOf(c.paths) <= 2) for (const f of familiesOf(c.paths)) anchors.add(f);
+      // rebuild, replacing each chosen span by its tier token. Secret loaded lazily, only if a cross-family id is needed.
       let secret;
       const secretOnce = () => (secret !== undefined ? secret : (secret = getSecret(ctx?.projectDir)));
       let out = '', last = 0;
-      m.scan(text, (i, matched, hit) => {
-        if (!hit) return;                            // a genuine token — leave it untouched (idempotent)
-        const t = tierOf(hit.paths);
-        out += text.slice(last, i) + (t === 1 ? tier1Token(hit.paths)
-          : t === 2 ? tier2Token(hit.paths)
-          : tier3Token(hit.paths, anchors, idFor(hit.key, secretOnce())));
-        last = i + matched.length;
-      });
+      for (const c of chosen) {
+        const t = tierOf(c.paths);
+        out += text.slice(last, c.start) + (t === 1 ? tier1Token(c.paths)
+          : t === 2 ? tier2Token(c.paths)
+          : tier3Token(c.paths, anchors, idFor(c.key, secretOnce())));
+        last = c.end;
+      }
       return out + text.slice(last);
     },
     // token -> real value (H2 tool arguments). A single-path @@@(…) resolves; an unknown family passes through; a
