@@ -218,6 +218,200 @@ class CDP {
   close() { try { this.ws.close(); } catch {} }
 }
 
+// ── THE WALL: shapes of UNKNOWN PII (spec: PII-PLUGIN-SPEC.md §9; sited here per BROWSER-PLUGIN-SPEC §5a-wall) ───────────────────────────────────────────────────────────
+// The pii plugin's masker is STORE-KEYED — it masks values you registered. The wall is SHAPE-KEYED: it catches values
+// nobody registered because they merely LOOK like an identifier, pauses, and asks. Add an id class by adding a row.
+//
+// This lives in the BROWSER plugin, not the pii one, and never runs on files. Two reasons, both load-bearing:
+// (1) the surface must be page TEXT, not markup — only the plugin that owns the injected page runtime can walk text
+//     nodes and tell a street address from a CSS class name; and (2) the noisy rules below are affordable ONLY on page
+//     text (PII-PLUGIN-SPEC §9.4a measured ~30 false positives per source FILE from ZIP + Address alone).
+// It carries NO dependency on the pii plugin: browser debugging must keep working when pii is not installed.
+//
+// `digits` is the DIGIT COUNT, and a contiguous run of exactly that many digits always matches. `groupings` lists the
+// SEPARATED layouts that also count ("3-2-4" → 123-45-6789). Separated forms are matched only against DECLARED
+// layouts, never by joining digit groups freely across any separator — that distinction is what makes this usable:
+// free joining turns every log timestamp ("2026-07-25 19" → 4+2+2+2 = 10) and every IPv4 ("192.168.1.100" → 10) into
+// an EDI, and the wall's main ingress is browser network/console output, which is made of exactly those.
+const WALL_ID_SHAPES = [
+  { name: 'ssn', label: 'SSN', digits: 9, groupings: ['3-2-4'] },
+  { name: 'edi', label: 'EDI', digits: 10, groupings: [] },
+  // ZIP is deliberately BROAD — 5 digits matches any 5-digit number (ports, build numbers, quantities). That is the
+  // "err on the side of blocking too much" call, and it is affordable only because the wall's surface is page TEXT
+  // content, where bare 5-digit numbers are rare, rather than source code, where they are everywhere. If the wall is
+  // ever widened past browser text, revisit this row FIRST — it is the one that will generate the noise.
+  { name: 'zip', label: 'ZIP', digits: 5, groupings: [] },
+];
+// Separators allowed INSIDE a declared grouping: hyphen family + space. Not '.' or '/' — those are what make version
+// strings, IPs and dates look like identifiers.
+const WALL_GROUP_SEP = '[-\\u2010-\\u2015 ]';
+
+// Shapes that are a PATTERN rather than a digit count. Same "add a row" contract as WALL_ID_SHAPES.
+const WALL_PATTERN_SHAPES = [
+  { name: 'email', label: 'Email', re: /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/gu },
+  // STREET ADDRESS — a house number (<=5 digits) then a word: "123 Main", "1600 Pennsylvania".
+  // This is the NOISIEST rule by a wide margin: the same shape is every numeric UI label ("3 Comments",
+  // "12 Results", "404 Error"). It is here because over-blocking is the explicit instruction and the surface is
+  // page text a human reviews once per source. WALL_ADDRESS_REQUIRE_CAPITAL is the cheap precision lever — with
+  // it on, "3 items" and "5 files" fall away while "123 Main" survives; capitalized UI labels still fire.
+  { name: 'address', label: 'Address', re: null },
+];
+// Flip to false to take EVERY "<=5 digits> <word>" regardless of case (noisier still).
+const WALL_ADDRESS_REQUIRE_CAPITAL = true;
+{
+  const word = WALL_ADDRESS_REQUIRE_CAPITAL ? '\\p{Lu}[\\p{L}\'’.-]*' : '\\p{L}[\\p{L}\'’.-]*';
+  // (?<!\d) keeps the house number digit-bounded, so "123456 Main" is NOT an address with house number 12345.
+  WALL_PATTERN_SHAPES.find((s) => s.name === 'address').re = new RegExp(`(?<!\\d)\\d{1,5}[ \\t]+${word}`, 'gu');
+}
+
+// Compiled once: for each id shape, the contiguous form plus every declared grouping. Each alternative asserts a
+// NON-DIGIT (or string edge) on both sides — the developer's rule: a digit run only counts when it is bounded by
+// non-numbers, so a 9-digit id inside a 15-digit number is NOT an SSN.
+const WALL_ID_PATTERNS = WALL_ID_SHAPES.flatMap((s) => {
+  const alts = [`\\d{${s.digits}}`];
+  for (const g of s.groupings || []) {
+    const parts = String(g).split('-').map((n) => Number(n)).filter((n) => Number.isInteger(n) && n > 0);
+    if (parts.reduce((a, b) => a + b, 0) !== s.digits) continue;   // a grouping that does not add up is a typo, not a rule
+    alts.push(parts.map((n) => `\\d{${n}}`).join(WALL_GROUP_SEP));
+  }
+  return alts.map((a) => ({ shape: s.name, label: s.label, re: new RegExp(`(?<!\\d)(?:${a})(?!\\d)`, 'gu') }));
+});
+
+/**
+ * Find UNKNOWN values that merely LOOK like PII. Pure + exported for unit tests.
+ * @param {string} text
+ * @param {Array<[number,number]>} reserved  spans of already-emitted tokens (never re-flag a masked value)
+ * @returns {Array<{shape,label,value,start,end}>} non-overlapping, in document order
+ */
+export function detectWallShapes(text, reserved = []) {
+  const src = typeof text === 'string' ? text : '';
+  if (!src) return [];
+  const inReserved = (s, e) => reserved.some(([rs, re]) => s < re && e > rs);
+  const hits = [];
+  const push = (shape, label, m) => {
+    const start = m.index, end = m.index + m[0].length;
+    if (!inReserved(start, end)) hits.push({ shape, label, value: m[0], start, end });
+  };
+  for (const p of WALL_ID_PATTERNS) { p.re.lastIndex = 0; let m; while ((m = p.re.exec(src)) !== null) push(p.shape, p.label, m); }
+  for (const s of WALL_PATTERN_SHAPES) { s.re.lastIndex = 0; let m; while ((m = s.re.exec(src)) !== null) push(s.name, s.label, m); }
+  // Longest-wins on overlap (a grouped SSN beats a bare run inside it), then document order.
+  hits.sort((a, b) => a.start - b.start || (b.end - b.start) - (a.end - a.start));
+  const out = [];
+  for (const h of hits) if (!out.some((k) => h.start < k.end && h.end > k.start)) out.push(h);
+  return out;
+}
+
+// ── the WALL: scan surface, session decisions, ephemeral tokens ─────────────────────────────────────────────────
+// SCAN SURFACE. The wall must scan everything the tool RETURNS — a surface narrower than the payload leaks by
+// construction (measured: text-nodes-only missed an SSN in value=, an EDI in data-edi= and an SSN in a ?ssn= query,
+// all of which ship to the model inside the serialized markup anyway). So the cut is DATA-CARRYING vs STRUCTURAL:
+// blank out class / style / placeholder, keep everything else. `id` is deliberately KEPT — a badly built app can put
+// a real member number in one, and the developer chose recall over quiet.
+// Blanking pads with SPACES of the same length so every match offset still points at the ORIGINAL text.
+const WALL_TOKEN_RE = /⟦wall:[0-9a-f]{16}⟧/g;
+const WALL_SKIP_ATTRS = /\s(?:class|style|placeholder)\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi;
+// A URL PORT is structurally never PII, and it is 5 digits often enough to matter: every browser_open result
+// carries one, and it is RANDOM per run, so without this the developer is asked about a fresh "ZIP" every single
+// session and the wall trains them to click allow. Blanked, not exempted from the payload — the rest of the URL
+// (including a ?ssn= query) is still scanned.
+const WALL_URL_PORT = /(https?:\/\/[^\s/:?#]+):(\d{1,5})/gi;
+export function wallScanSurface(text) {
+  return String(text == null ? '' : text)
+    .replace(WALL_SKIP_ATTRS, (m) => ' '.repeat(m.length))
+    .replace(WALL_URL_PORT, (m, host, port) => host + ':' + ' '.repeat(port.length))
+    // Our OWN emitted tokens are not page content. Without this the wall re-flags what it just masked: an id
+    // containing five digits reads as a ZIP, so every masked value would prompt again on the next scan.
+    .replace(WALL_TOKEN_RE, (m) => ' '.repeat(m.length));
+}
+/** Scan a tool result. Offsets index the ORIGINAL text. */
+export function wallScan(text, reserved = []) { return detectWallShapes(wallScanSurface(text), reserved); }
+
+// DECISIONS live for the PROCESS lifetime, keyed by (source, normalized value). A different page asks again — a
+// value approved on a test fixture must not silently pass out of a real record.
+const WALL_DECISIONS = new Map();   // `${source} ${norm}` -> 'allow' | 'mask'   (source '*' = every source)
+const WALL_TOKENS = new Map();      // token -> real value  (ephemeral: this process only, never persisted)
+const WALL_BY_VALUE = new Map();    // real value -> token  (so one value gets one stable token)
+let _wallSeq = 0;
+
+// Fold separators + case so "555-012-3456" and "555 012 3456" are ONE decision, not two prompts.
+export function wallNormalize(v) { return String(v == null ? '' : v).toLowerCase().replace(/[\s.‐-―-]/g, ''); }
+/** The decision key for a browser source. The QUERY is dropped — it can itself carry PII (?ssn=...), so it is
+ *  scanned as content but never used as a key or a label. */
+export function wallSourceKey(label, url) {
+  let u = String(url || '');
+  try { const p = new URL(u); u = p.origin + p.pathname; } catch {}
+  return `browser:${label || '?'}@${u}`;
+}
+export function wallDecision(source, value) {
+  const n = wallNormalize(value);
+  return WALL_DECISIONS.get(`* ${n}`) || WALL_DECISIONS.get(`${source} ${n}`) || null;
+}
+export function wallRemember(source, value, decision, allSources = false) {
+  if (decision !== 'allow' && decision !== 'mask') throw new Error(`wall decision must be "allow" or "mask" (got ${JSON.stringify(decision)})`);
+  WALL_DECISIONS.set(`${allSources ? '*' : source} ${wallNormalize(value)}`, decision);
+}
+// The token is deliberately UNLIKE the pii plugin's @@@()/###{} — a wall token must never be mistaken for a
+// store-keyed one, or pii's unmask would try to resolve it and fail CLOSED on a value it has never heard of.
+export function wallToken(value) {
+  const v = String(value);
+  let t = WALL_BY_VALUE.get(v);
+  // UNGUESSABLE id, not a counter. With sequential ids, seeing one token (wall:2) hands you every other one
+  // (wall:1) — and wallResolve would substitute the real value on the way back INTO the page. That is an
+  // exfiltration primitive twice over: the agent can reach a value it was never shown, and a hostile PAGE can
+  // print a token verbatim and have this plugin resolve it into real PII when that text is typed back.
+  if (!t) { t = `⟦wall:${crypto.randomBytes(8).toString('hex')}⟧`; WALL_BY_VALUE.set(v, t); WALL_TOKENS.set(t, v); }
+  return t;
+}
+/** Resolve wall tokens back to real values — used by this plugin's OWN type/fill, so a masked value can still be
+ *  typed back into the page. No H2 filter participation: the wall owns both ends of the browser round-trip. */
+export function wallResolve(text) {
+  return String(text == null ? '' : text).replace(WALL_TOKEN_RE, (t) => (WALL_TOKENS.has(t) ? WALL_TOKENS.get(t) : t));
+}
+export function _wallReset() { WALL_DECISIONS.clear(); WALL_TOKENS.clear(); WALL_BY_VALUE.clear(); _wallSeq = 0; }
+
+/**
+ * Apply known decisions to a scanned result.
+ * @returns {{text, pending:Array, masked:number, allowed:number}} `pending` = matches with NO recorded decision;
+ *          the caller must ask about those and must NOT release `text` until it has (fail-closed).
+ */
+export function wallApply(text, matches, source) {
+  const src = String(text == null ? '' : text);
+  const pending = [];
+  let masked = 0, allowed = 0;
+  // Right-to-left so each splice leaves earlier offsets valid.
+  const ordered = [...matches].sort((a, b) => b.start - a.start);
+  let out = src;
+  for (const m of ordered) {
+    const d = wallDecision(source, m.value);
+    if (!d) { pending.push(m); continue; }
+    if (d === 'allow') { allowed++; continue; }
+    out = out.slice(0, m.start) + wallToken(m.value) + out.slice(m.end);
+    masked++;
+  }
+  pending.reverse();   // back to document order for display
+  return { text: out, pending, masked, allowed };
+}
+
+// Widest excerpt shown per match. Minified content (a JSON body, a bundled script) is ONE enormous line, so an
+// unbounded excerpt would put ~100KB per match into a payload that is broadcast over SSE and rendered in a modal.
+const WALL_CTX_WIDTH = 160;   // chars kept either side of the match on the hit line
+const clampLine = (l) => (l.length <= WALL_CTX_WIDTH * 2 ? l : l.slice(0, WALL_CTX_WIDTH * 2) + ' …');
+/** A couple of lines above and below a match, for the review screen. Bounded on every axis. */
+export function wallContext(text, match, lines = 2) {
+  const src = String(text == null ? '' : text);
+  const all = src.split('\n');
+  let idx = 0, line = 0;
+  for (; line < all.length; line++) { const end = idx + all[line].length + 1; if (match.start < end) break; idx = end; }
+  const raw = all[line] ?? '';
+  // WINDOW the hit line around the match, so a value at column 90000 is still readable rather than buried.
+  const col = Math.max(0, match.start - idx);
+  const from = Math.max(0, col - WALL_CTX_WIDTH);
+  const to = Math.min(raw.length, col + (match.end - match.start) + WALL_CTX_WIDTH);
+  const hit = (from > 0 ? '… ' : '') + raw.slice(from, to) + (to < raw.length ? ' …' : '');
+  const lf = Math.max(0, line - lines), lt = Math.min(all.length - 1, line + lines);
+  return { line: line + 1, before: all.slice(lf, line).map(clampLine), hit, after: all.slice(line + 1, lt + 1).map(clampLine) };
+}
+
 // ── session lifecycle ───────────────────────────────────────────────────────────────────────────────────────────
 function getSession(label) {
   const s = SESSIONS.get(String(label));
@@ -386,6 +580,14 @@ function wireEvents(s) {
     } else if (method === 'Page.frameNavigated' && !params.frame?.parentId) {
       s.url = params.frame.url; push(b.timeline, { t: now, kind: 'navigate', text: params.frame.url });
       installRuntime(s).catch(() => {});
+    } else if (method === 'Page.navigatedWithinDocument' && !params.frameId?.parentId) {
+      // An SPA route change (History pushState) fires THIS, not frameNavigated, and does NOT reload the document.
+      // Tracking it matters beyond the timeline: the PII wall keys its decision memory on the session + page URL,
+      // so leaving s.url frozen at the first route makes per-source memory degrade to per-SESSION in exactly the
+      // apps most likely to show real records — a value cleared on one route would then pass silently on every
+      // other. The page runtime survives an in-document navigation, so it is NOT re-installed here.
+      s.url = params.url || s.url;
+      push(b.timeline, { t: now, kind: 'navigate', text: params.url + ' (in-document)' });
     } else if (method === 'Page.javascriptDialogOpening') {
       s.dialogs.push({ t: now, type: params.type, message: params.message });
       // default: accept, unless a handler config says otherwise (browser_dialog sets s.dialogHandler)
@@ -548,7 +750,9 @@ async function typeInto(s, ref, text) {
   const pt = await pointFor(s, { ref });
   await dispatchClick(s, pt.x, pt.y);
   await evalIn(s, `(() => { const el = document.activeElement; if (el && typeof el.select === 'function') el.select(); return true; })()`);
-  await s.cdp.send('Input.insertText', { text: String(text) }, s.sessionId);
+  // Resolve our OWN wall tokens here: a value the developer chose to MASK is still typeable back into the page,
+  // because this plugin owns both ends of the round-trip (no H2 filter participation needed).
+  await s.cdp.send('Input.insertText', { text: String(wallResolve(text)) }, s.sessionId);
   const value = await actByRef(s, ref, `el.dispatchEvent(new Event('change',{bubbles:true})); return {ok:true, el: cb.desc(el), value: (el.value != null ? String(el.value) : el.textContent || '')};`);
   return { desc: pt.desc, value: value?.value };
 }
@@ -601,7 +805,140 @@ async function drainDom(s) {
 }
 
 // ── the plugin ──────────────────────────────────────────────────────────────────────────────────────────────────
-const T = (verb, description, properties, required, impl) => ({ verb, name: verb, schema: { description, parameters: { type: 'object', properties: properties || {}, required: required || [] } }, impl });
+// ── the WALL gate: EVERY tool result passes through it ──────────────────────────────────────────────────────────
+// Wrapped at the tool FACTORY, not per-verb, so a verb added later cannot forget the wall — the failure mode of a
+// per-verb list is that the one new verb is the one that leaks.
+// FAIL-CLOSED: a match with no recorded decision must be decided before the text is released. If no UI is reachable
+// (no host, plugin unloading, the developer dismissed it) the tool call FAILS rather than returning unscanned text.
+let WALL_ON = true;                       // always on for now (developer); flip here if a toggle is ever added.
+export function _wallEnabled(v) { if (v !== undefined) WALL_ON = !!v; return WALL_ON; }
+
+// An ERROR is a result too. A thrown message routes straight to the agent, and browser errors quote page content
+// verbatim — a page exception ("lookup failed for 482-11-9037"), a select's real option values, an element
+// descriptor built from an id. Those bypassed the gate entirely, because it only wrapped the RETURN path.
+//
+// Errors AUTO-MASK rather than prompt: a failure path is the wrong moment to open a modal, and a token keeps the
+// message's diagnostic shape ("lookup failed for ⟦wall:…⟧"). Existing decisions still apply first, so a value the
+// developer already allowed stays readable.
+async function wallGateError(verb, args, message) {
+  if (!WALL_ON) return message;
+  const text = String(message == null ? '' : message);
+  if (!text) return text;
+  const label = args && args.label != null ? String(args.label) : '';
+  const s = label ? SESSIONS.get(label) : null;
+  const source = wallSourceKey(label, s ? s.url : '');
+  const matches = wallScan(text);
+  if (!matches.length) return text;
+  const applied = wallApply(text, matches, source);
+  let out = applied.text;
+  for (const m of [...applied.pending].sort((a, b) => b.start - a.start)) out = out.slice(0, m.start) + wallToken(m.value) + out.slice(m.end);
+  return out;
+}
+
+async function wallGate(verb, args, result) {
+  if (!WALL_ON) return result;
+  const raw = result && typeof result.content === 'string' ? result.content : null;
+  if (!raw) return result;
+  const label = args && args.label != null ? String(args.label) : '';
+  const s = label ? SESSIONS.get(label) : null;
+  const source = wallSourceKey(label, s ? s.url : '');
+
+  // PRE-MASK FIRST. Another plugin may already protect some of this text (the pii test-data store knows real
+  // values by heart). Letting the platform's content filters run BEFORE the wall means a known value leaves as
+  // that plugin's STABLE token — the one the agent can reason about and round-trip through its tools — instead
+  // of being re-discovered here as if it were unknown, prompting the developer about a value the system already
+  // knew was protected. This asks the PLATFORM to run the filters it owns; it is not knowledge of any plugin.
+  let content = raw;
+  if (typeof HOST?.request === 'function') {
+    try {
+      const pre = await HOST.request('mask-content', { text: raw, hook: 'tool-result' });
+      if (pre && typeof pre.text === 'string') content = pre.text;
+    } catch (e) {
+      // An older platform without this request type is fine — carry on with the raw text. A filter that FAILED
+      // is not: the pipeline is fail-closed, so refuse rather than release text it could not mask.
+      if (!/unknown host request type/i.test(String(e && e.message))) throw e;
+    }
+  }
+
+  // Only prompt for values that are genuinely IN THE PAGE. Masking inserts tokens, and a token can carry digit
+  // runs of its own (pii's fuzzy descriptor embeds a 16-hex id); a match that exists only in the masked copy is
+  // an artefact of masking, not page content. No token syntax is hardcoded here — the test is "was it in the
+  // original?", which stays true whatever another plugin's tokens look like.
+  let matches = wallScan(content).filter((m) => raw.includes(m.value));
+  if (!matches.length) return result.content === content ? result : { ...result, content };
+
+  let applied = wallApply(content, matches, source);
+  if (applied.pending.length) {
+    // ONE card per DISTINCT value. A value repeated in a result is one question, not N — and asking N times
+    // invited contradictory answers, of which only the LAST took effect, silently, for every occurrence.
+    const seen = new Set();
+    const distinct = applied.pending.filter((m) => { const k = wallNormalize(m.value); if (seen.has(k)) return false; seen.add(k); return true; });
+    const decisions = await wallAsk(distinct, content, source, verb);
+    // A missing/!== decision for ANY pending value is a refusal, not a pass.
+    for (const m of distinct) {
+      const d = decisions && decisions[wallNormalize(m.value)];
+      if (d !== 'allow' && d !== 'mask') {
+        throw new Error(`PII wall: ${distinct.length} value(s) in this ${verb} result were not cleared, so the result was WITHHELD rather than sent unscanned. Decide each match (allow or mask) and re-run.`);
+      }
+      wallRemember(source, m.value, d, !!(decisions.__all));
+    }
+    applied = wallApply(content, wallScan(content).filter((m) => raw.includes(m.value)), source);   // same artefact filter as above
+    if (applied.pending.length) throw new Error('PII wall: matches remained undecided after review — result WITHHELD (fail-closed).');
+  }
+  return { ...result, content: applied.text };
+}
+
+/**
+ * Ask the developer about pending matches. Returns { <normalizedValue>: 'allow'|'mask' } or null.
+ *
+ * The PLUGIN owns every word of this screen. The platform is handed a component tree and a generic
+ * "blocking panel" request; it knows nothing about PII, what a match is, or what allow/mask mean — it renders,
+ * collects the answers and hands them back. (A plugin cannot ship DOM into a CSP-locked page, so the core has to
+ * do the rendering; PLUGIN-UI-PANEL-SPEC.md §1. Keeping the VOCABULARY here is what stops that being a leak of
+ * this feature into the platform.)
+ */
+async function wallAsk(pending, text, source, verb) {
+  if (typeof HOST?.request !== 'function') return null;
+  const children = [
+    { type: 'note', tone: 'muted',
+      text: `${pending.length} value${pending.length === 1 ? '' : 's'} in a ${verb} result look like PII. `
+        + 'Allow sends the real value to the model. Mask replaces it with a token — tools still receive the real value.' },
+    { type: 'note', tone: 'muted', text: source },
+  ];
+  pending.forEach((m, i) => {
+    const c = wallContext(text, m);
+    const excerpt = [...(c.before || []), c.hit || '', ...(c.after || [])].join('\n');
+    children.push({
+      type: 'section', id: 'sec' + i, title: `${m.label}  —  ${m.value}`,
+      children: [
+        { type: 'note', mono: true, text: excerpt },
+        { type: 'choice', id: 'm' + i, label: 'This value:', options: [{ value: 'mask', label: 'Mask' }, { value: 'allow', label: 'Allow' }] },
+      ],
+    });
+  });
+  try {
+    const r = await HOST.request('ask-panel', {
+      title: 'Possible PII — review before sending',
+      tree: { type: 'stack', gap: 12, children },
+      requireAll: true,            // every match must be decided; undecided is NOT allow
+      submitLabel: 'Send',
+      cancelLabel: 'Cancel (withhold)',
+    });
+    if (!r || !r.submitted || !r.values) return null;
+    const out = {};
+    pending.forEach((m, i) => { const v = r.values['m' + i]; if (v === 'allow' || v === 'mask') out[wallNormalize(m.value)] = v; });
+    return out;
+  } catch { return null; }   // dismissed / unloaded / unknown type -> the caller fails closed
+}
+
+const T = (verb, description, properties, required, impl) => ({ verb, name: verb,
+  schema: { description, parameters: { type: 'object', properties: properties || {}, required: required || [] } },
+  impl: async (a, ctx) => {
+    let r;
+    try { r = await impl(a, ctx); }
+    catch (e) { const msg = await wallGateError(verb, a, e && e.message); const err = new Error(msg); err.cause = e; throw err; }
+    return wallGate(verb, a, r);
+  } });
 const ok = (content) => ({ content: clip(content) });
 
 export default {
@@ -685,7 +1022,8 @@ export default {
         return ok(done.length ? `filled ${done.length} field(s): ${done.join(', ')}` : 'no fields given.');
       }),
     T('browser_select', 'Choose an option in a <select> by ref.', { label: { type: 'string' }, ref: { type: 'string' }, value: { type: 'string' } }, ['label', 'ref', 'value'],
-      async (a) => { const s = getSession(a.label); s.lastAction = `select ${a.ref}`; const r = await actByRef(s, a.ref, `el.value=${JSON.stringify(a.value)}; el.dispatchEvent(new Event('input',{bubbles:true})); el.dispatchEvent(new Event('change',{bubbles:true})); if (el.value !== ${JSON.stringify(a.value)}) return {error: 'no option with value ' + ${JSON.stringify(JSON.stringify(a.value))} + ' in ' + cb.desc(el) + ' — options are: ' + [...el.options].map((o) => JSON.stringify(o.value)).join(', ')};`); await drainDom(s); return ok(`selected ${JSON.stringify(a.value)} in ${r.el}.`); }),
+      async (a) => { const s = getSession(a.label); s.lastAction = `select ${a.ref}`; a = { ...a, value: wallResolve(a.value) };   // a MASKED option value is still selectable
+        const r = await actByRef(s, a.ref, `el.value=${JSON.stringify(a.value)}; el.dispatchEvent(new Event('input',{bubbles:true})); el.dispatchEvent(new Event('change',{bubbles:true})); if (el.value !== ${JSON.stringify(a.value)}) return {error: 'no option with value ' + ${JSON.stringify(JSON.stringify(a.value))} + ' in ' + cb.desc(el) + ' — options are: ' + [...el.options].map((o) => JSON.stringify(o.value)).join(', ')};`); await drainDom(s); return ok(`selected ${JSON.stringify(a.value)} in ${r.el}.`); }),
     T('browser_press', 'Press a key / combo on the page (Enter, Tab, Escape, ArrowDown, Ctrl+A).', { label: { type: 'string' }, keys: { type: 'string' } }, ['label', 'keys'],
       async (a) => {
         const s = getSession(a.label); s.lastAction = `press ${a.keys}`;
