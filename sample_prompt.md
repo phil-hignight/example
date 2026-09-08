@@ -1970,7 +1970,7 @@ runCli({ schemaFromDefinition: schemaFromDefinition, extractSchema: extractSchem
 
 ````
 
-=========================
+=======================
 
 <!DOCTYPE html>
 <html lang="en">
@@ -2083,6 +2083,19 @@ main { max-width: 1100px; margin: 0 auto; padding: 8px 20px 80px; }
 .remind { color: var(--muted); font-size: 12px; margin: 8px 0 0; }
 .remind a { color: var(--accent); }
 
+/* Comparison with a second result */
+.cmpbar { grid-column: 1 / -1; display: flex; gap: 14px; align-items: center; flex-wrap: wrap; background: #fff8e6; border: 1px solid #f5d38f; border-radius: 6px; padding: 6px 10px; font-size: 13px; }
+.cmp { margin-top: 10px; border: 1px dashed var(--line); border-radius: 5px; padding: 8px 10px; font-size: 13px; background: #fafbfc; }
+.cmp.cmp-diff { border-color: #f5d38f; background: #fff8e6; }
+.cmp .cmphead { font-weight: 600; margin-bottom: 4px; }
+.cmp .cmprows { margin: 4px 0 0 18px; padding: 0; }
+.cmp .muted { color: var(--muted); }
+.pre { white-space: pre-wrap; }
+.item.differs { border-left: 4px solid var(--warn); }
+.aifields { margin-top: 8px; font-size: 13px; }
+.aifields > summary { cursor: pointer; color: var(--accent); }
+.aifields .pre { margin: 4px 0; }
+
 /* Tables */
 .tablescroll { overflow-x: auto; }
 table.rows { border-collapse: collapse; width: 100%; min-width: 600px; }
@@ -2094,6 +2107,7 @@ table.rows input:focus, table.rows select:focus, table.rows textarea:focus { bor
 table.rows td.rowact { width: 30px; text-align: center; }
 .tableactions { margin-top: 6px; display: flex; gap: 6px; align-items: center; }
 .rowcount { color: var(--muted); font-size: 12.5px; margin-left: 6px; }
+.nonebox { margin-left: auto; font-size: 13px; }
 
 /* Modal */
 [hidden] { display: none !important; }
@@ -2137,6 +2151,11 @@ table.rows td.rowact { width: 30px; text-align: center; }
     <span id="progresstext"></span>
     <span id="dirty" class="badge" hidden></span>
     <span id="status"></span>
+  </div>
+  <div id="cmpbar" class="cmpbar" hidden>
+    <span id="cmpinfo"></span>
+    <label><input type="checkbox" id="cmp-only"> Only differences</label>
+    <button type="button" id="btn-cmp-clear" class="small">Stop comparing</button>
   </div>
 </header>
 <details class="instructions" open>
@@ -2193,6 +2212,9 @@ table.rows td.rowact { width: 30px; text-align: center; }
   var applCache = {};
   var naReason = {};
   var ui = { items: {}, sections: {} };
+  // Comparison: a second result (for example the AI's) shown beside every item.
+  var compare = null;
+  var onlyDiff = false;
 
   function freshState() {
     return { app: '', reviewer: '', answers: {}, lastModifiedAt: null, lastExportedAt: null };
@@ -2391,7 +2413,7 @@ table.rows td.rowact { width: 30px; text-align: center; }
       if (rs) return rs.some(function (x) { return !!x.rec.status; });
       return !!a.status;
     }
-    if (item.type === 'list') return (a.rows || []).length > 0;
+    if (item.type === 'list') return (a.rows || []).length > 0 || (DEV && !!a.none);
     if (item.type === 'multiselect') return Array.isArray(a.value) && a.value.length > 0;
     return a.value !== undefined && a.value !== null && a.value !== '' && hasText(String(a.value));
   }
@@ -2585,8 +2607,16 @@ table.rows td.rowact { width: 30px; text-align: center; }
     var pasteBtn = h('button', { type: 'button', class: 'small', text: 'Paste rows' });
     pasteBtn.addEventListener('click', function () { openPasteModal(item, function () { drawRows(); touch(item.id); }); });
 
+    var actions = [addBtn, ' ', pasteBtn, ' ', h('span', { class: 'rowcount' })];
+    if (DEV && !item.optional) {
+      // A developer with nothing to list needs a way to say so.
+      var none = h('input', { type: 'checkbox' });
+      none.checked = !!a.none;
+      none.addEventListener('change', function () { ans(item.id).none = none.checked; touch(item.id); });
+      actions.push(h('label', { class: 'opt inline nonebox' }, [none, ' None to list']));
+    }
     box.appendChild(h('div', { class: 'tablescroll' }, [table]));
-    box.appendChild(h('div', { class: 'tableactions' }, [addBtn, ' ', pasteBtn, ' ', h('span', { class: 'rowcount' })]));
+    box.appendChild(h('div', { class: 'tableactions' }, actions));
     drawRows();
     ui.items[item.id].drawRows = drawRows;
     return box;
@@ -2639,6 +2669,23 @@ table.rows td.rowact { width: 30px; text-align: center; }
       ? h('p', { class: 'remind' }, ['Spotted something else wrong while looking? Add it to ', h('a', { href: '#sec-' + findingsItem.section, text: sectionsById[findingsItem.section].title }), ' at the end of this phase.'])
       : null;
 
+    // Evidence fields present only in an imported AI result: shown read-only.
+    var aiBits = [];
+    if (hasText(a.evidence)) aiBits.push(['Evidence', a.evidence]);
+    if (hasText(a.searched)) aiBits.push(['Searched', a.searched]);
+    if (hasText(a.whyNoMore)) aiBits.push(['Why no more findings', a.whyNoMore]);
+    if (a.perRow) Object.keys(a.perRow).forEach(function (k) {
+      var x = a.perRow[k] || {};
+      if (hasText(x.evidence)) aiBits.push(['Evidence (' + k + ')', x.evidence]);
+      if (hasText(x.whyNoMore)) aiBits.push(['Why no more findings (' + k + ')', x.whyNoMore]);
+    });
+    var aiEl = (DEV && aiBits.length)
+      ? h('details', { class: 'aifields' }, [h('summary', { text: 'Evidence from the imported result' })].concat(aiBits.map(function (b) {
+          return h('div', { class: 'pre' }, [h('strong', { text: b[0] + ': ' }), b[1]]);
+        })))
+      : null;
+
+    var cmp = h('div', { class: 'cmp', hidden: true });
     var meta = h('footer', { class: 'meta' });
     var root = h('article', { class: 'item', 'data-id': item.id }, [
       head,
@@ -2646,10 +2693,13 @@ table.rows td.rowact { width: 30px; text-align: center; }
       how,
       renderControl(item),
       h('div', { class: 'fields' }, fields),
+      aiEl,
+      cmp,
       remind,
       meta
     ]);
     ui.items[item.id].root = root;
+    ui.items[item.id].cmp = cmp;
     ui.items[item.id].chip = chip;
     ui.items[item.id].req = req;
     ui.items[item.id].meta = meta;
@@ -2662,6 +2712,7 @@ table.rows td.rowact { width: 30px; text-align: center; }
     form.innerHTML = '';
     ui.items = {}; ui.sections = {};
     applCache = {}; naReason = {};
+    compare = readCompare();
     DEF.items.forEach(function (it) {
       if (it.default !== undefined && state.answers[it.id] === undefined) state.answers[it.id] = { value: it.default };
     });
@@ -2696,13 +2747,13 @@ table.rows td.rowact { width: 30px; text-align: center; }
   function statusLabel(v) { var o = STATUS_OPTS.filter(function (x) { return x.value === v; })[0]; return o ? o.label : v; }
   function refresh() {
     applCache = {}; naReason = {};
-    var total = 0, done = 0, findings = 0;
+    var total = 0, done = 0, findings = 0, cmpDiff = 0, cmpTotal = 0;
     DEF.sections.forEach(function (sec) {
       var secEl = ui.sections[sec.id];
       if (!secEl) return;
       var on = sectionApplicable(sec);
       secEl.classList.toggle('na', !on);
-      secEl.hidden = !on && !showHidden;
+      secEl.hidden = !on && !showHidden && !compare;
     });
     DEF.items.forEach(function (it) {
       var u = ui.items[it.id];
@@ -2718,6 +2769,12 @@ table.rows td.rowact { width: 30px; text-align: center; }
       u.root.hidden = !on && !showHidden;
       Array.prototype.forEach.call(u.root.querySelectorAll('input,select,textarea,button'), function (x) { x.disabled = !on; });
       if (u.ruleEl && it.forEach) { var rt = ruleText(it); u.ruleEl.textContent = rt ? 'Applies when: ' + rt : ''; }
+      var diff = renderCompare(it, u);
+      if (compare) {
+        cmpTotal++;
+        if (diff) { cmpDiff++; u.root.hidden = false; }
+        else if (onlyDiff) u.root.hidden = true;
+      }
       if (!on) {
         u.chip.textContent = 'N/A by rule';
         u.chip.className = 'chip chip-na';
@@ -2764,6 +2821,23 @@ table.rows td.rowact { width: 30px; text-align: center; }
       u.req.className = 'req' + (r && missing ? ' req-missing' : '');
       u.meta.textContent = a.updatedAt ? 'Updated ' + fmtTime(a.updatedAt) : '';
     });
+    // Comparison bar and, in only-differences mode, sections with nothing left to show.
+    var bar = document.getElementById('cmpbar');
+    if (bar) {
+      bar.hidden = !compare;
+      if (compare) {
+        var who = compare.sources.map(function (s) { return (s.reviewer || 'unknown') + ' [' + (s.reviewerKind || '?') + (s.phase ? ', ' + s.phase : '') + ']'; }).join(' + ');
+        document.getElementById('cmpinfo').textContent = 'Comparing with ' + who + ': ' + cmpDiff + ' of ' + cmpTotal + ' items differ';
+      }
+    }
+    if (compare) {
+      DEF.sections.forEach(function (sec) {
+        var secEl = ui.sections[sec.id];
+        if (!secEl) return;
+        var anyVisible = Array.prototype.some.call(secEl.querySelectorAll('.item'), function (el) { return !el.hidden; });
+        secEl.hidden = !anyVisible;
+      });
+    }
     var pct = total ? Math.round(done / total * 100) : 0;
     document.getElementById('progress').value = pct;
     document.getElementById('progresstext').textContent = done + ' of ' + total + ' applicable items complete (' + pct + '%)' + (findings ? ', ' + findings + ' issue' + (findings === 1 ? '' : 's') + ' recorded' : '');
@@ -2780,13 +2854,137 @@ table.rows td.rowact { width: 30px; text-align: center; }
   }
 
   // ---------------------------------------------------------------------------
+  // Comparison with a second result (for example the AI's), shown per item
+  // ---------------------------------------------------------------------------
+  function compareKey() { return slotKey(state.app) + ':compare'; }
+  function saveCompare() {
+    try { if (compare) localStorage.setItem(compareKey(), JSON.stringify(compare)); else localStorage.removeItem(compareKey()); } catch (e) { /* ignore */ }
+  }
+  function readCompare() {
+    try { var raw = localStorage.getItem(compareKey()); return raw ? JSON.parse(raw) : null; } catch (e) { return null; }
+  }
+  function loadCompare(obj) {
+    if (!compare) compare = { sources: [], answers: {} };
+    compare.sources.push({ reviewer: obj.reviewer || '', reviewerKind: obj.reviewerKind || '', exportedAt: obj.exportedAt || '', app: obj.app || '', phase: obj.phase || '' });
+    Object.keys(obj.answers || {}).forEach(function (id) { if (itemsById[id]) compare.answers[id] = obj.answers[id]; });
+    saveCompare();
+    refresh();
+  }
+  function clearCompare() {
+    compare = null; onlyDiff = false;
+    var box = document.getElementById('cmp-only');
+    if (box) box.checked = false;
+    saveCompare();
+    refresh();
+  }
+
+  // Where the AI has a table and the developer form has a text field, rows
+  // become lines; where the AI answered per row and the form asks once, the
+  // statuses collapse to one. Used by import and by comparison alike.
+  function rowsToText(rows) {
+    return (rows || []).map(function (r) { return Object.keys(r).map(function (k) { return r[k]; }).filter(hasText).join(' | '); }).filter(hasText).join('\n');
+  }
+  function collapseRows(perRow) {
+    var st = perRow.map(function (x) { return x.status || null; }).filter(Boolean);
+    var status = !st.length ? null
+      : st.every(function (s) { return s === st[0]; }) ? st[0]
+      : st.indexOf('finding') >= 0 ? 'finding' : st.indexOf('unable') >= 0 ? 'unable' : st.indexOf('pass') >= 0 ? 'pass' : 'na';
+    var join = function (k) { return perRow.map(function (x) { return hasText(x[k]) ? ((x.label || ('row ' + x.row)) + ': ' + x[k]) : ''; }).filter(Boolean).join('\n'); };
+    return { status: status, location: join('location'), findings: join('findings'), evidence: join('evidence'), whyNoMore: join('whyNoMore'), reason: join('reason') };
+  }
+
+  // A comparable form of an answer: null when unanswered or not applicable.
+  function normalizeRec(item, rec, perRowStatuses) {
+    if (!rec || rec.status === 'na' || rec.status === 'missing') return null;
+    if (item.type === 'check') {
+      if (perRowStatuses) return perRowStatuses.length ? perRowStatuses : null;
+      return rec.status || null;
+    }
+    if (item.type === 'list') { var labels = (rec.rows || []).map(rowLabel).sort(); return labels.length ? labels : null; }
+    if (item.type === 'multiselect') return Array.isArray(rec.value) && rec.value.length ? rec.value.slice().sort() : null;
+    if (item.type === 'text') { var tv = rec.rows ? rowsToText(rec.rows) : rec.value; return hasText(tv) ? String(tv).trim() : null; }
+    return (rec.value === undefined || rec.value === null || rec.value === '') ? null : rec.value;
+  }
+  function mineNormalized(item) {
+    if (!applicable(item)) return null;
+    var a = state.answers[item.id] || {};
+    var rs = (item.type === 'check' && item.forEach) ? checkRows(item) : null;
+    return normalizeRec(item, a, rs ? rs.map(function (x) { return x.rec.status || null; }) : null);
+  }
+  function theirsNormalized(item, rec) {
+    if (rec && rec.perRow && item.type === 'check' && item.forEach && sourceRows(item) === null) {
+      return normalizeRec(item, collapseRows(rec.perRow), null);
+    }
+    return normalizeRec(item, rec, (rec && rec.perRow) ? rec.perRow.map(function (x) { return x.status || null; }) : null);
+  }
+  function statusText(v) { return v ? statusLabel(v) : '(no status)'; }
+  function formatTheirs(item, rec) {
+    if (!rec) return h('div', { class: 'cmpv muted', text: 'no answer in the other result' });
+    if (rec.status === 'na') return h('div', { class: 'cmpv muted', text: 'N/A: ' + (rec.reason || '') });
+    if (rec.status === 'missing') return h('div', { class: 'cmpv muted', text: 'missing in the other result' });
+    var parts = [];
+    if (item.type === 'check') {
+      if (rec.perRow) {
+        var ul = h('ul', { class: 'cmprows' });
+        rec.perRow.forEach(function (x) {
+          ul.appendChild(h('li', null, [h('code', { text: x.label || ('row ' + x.row) }), ': ' + statusText(x.status) + (x.location ? ' at ' + x.location : '') + (x.findings ? '. ' + x.findings : '')]));
+        });
+        parts.push(ul);
+      } else {
+        parts.push(h('div', { text: statusText(rec.status) + (rec.location ? ' at ' + rec.location : '') + (rec.findings ? '. ' + rec.findings : '') }));
+      }
+    } else if (item.type === 'list') {
+      var rows = rec.rows || [];
+      parts.push(h('div', { text: rows.length + ' row' + (rows.length === 1 ? '' : 's') + (rows.length > 12 ? ' (first 12 shown)' : '') }));
+      if (rows.length) {
+        var ul2 = h('ul', { class: 'cmprows' });
+        rows.slice(0, 12).forEach(function (r) { ul2.appendChild(h('li', { text: Object.keys(r).map(function (k) { return r[k]; }).filter(hasText).join(' | ') })); });
+        parts.push(ul2);
+      }
+    } else if (item.type === 'multiselect') {
+      parts.push(h('div', { text: (rec.value || []).map(function (v) { return v === UNSURE ? UNSURE_LABEL : optionLabel(item, v); }).join(', ') || '(none)' }));
+    } else if (item.type === 'text') {
+      parts.push(h('div', { class: 'pre', text: rec.value || '(empty)' }));
+    } else {
+      var v = rec.value;
+      var shown = v === UNSURE ? UNSURE_LABEL : (item.type === 'yesno' ? ({ yes: 'Yes', no: 'No' })[v] || v : (v ? optionLabel(item, v) : ''));
+      parts.push(h('div', { text: shown || '(empty)' }));
+    }
+    if (hasText(rec.detail)) parts.push(h('div', { class: 'muted', text: 'Detail: ' + rec.detail }));
+    if (hasText(rec.notes)) parts.push(h('div', { class: 'muted', text: 'Notes: ' + rec.notes }));
+    if (hasText(rec.evidence)) parts.push(h('div', { class: 'muted pre', text: 'Evidence: ' + rec.evidence }));
+    if (hasText(rec.searched)) parts.push(h('div', { class: 'muted pre', text: 'Searched: ' + rec.searched }));
+    if (hasText(rec.whyNoMore)) parts.push(h('div', { class: 'muted pre', text: 'Why no more findings: ' + rec.whyNoMore }));
+    if (rec.perRow) rec.perRow.forEach(function (x) {
+      if (hasText(x.evidence)) parts.push(h('div', { class: 'muted pre', text: 'Evidence (' + (x.label || 'row ' + x.row) + '): ' + x.evidence }));
+      if (hasText(x.whyNoMore)) parts.push(h('div', { class: 'muted pre', text: 'Why no more findings (' + (x.label || 'row ' + x.row) + '): ' + x.whyNoMore }));
+    });
+    return h('div', { class: 'cmpv' }, parts);
+  }
+  // Paints the comparison panel of one item; returns true when the answers differ.
+  function renderCompare(item, u) {
+    if (!compare) { u.cmp.hidden = true; u.root.classList.remove('differs'); return false; }
+    var theirs = compare.answers[item.id];
+    var mine = mineNormalized(item);
+    var other = theirsNormalized(item, theirs);
+    var diff = !(mine === null && other === null) && JSON.stringify(mine) !== JSON.stringify(other);
+    u.cmp.innerHTML = '';
+    u.cmp.appendChild(h('div', { class: 'cmphead', text: diff ? 'Differs from the other result:' : 'Same as the other result:' }));
+    u.cmp.appendChild(formatTheirs(item, theirs));
+    u.cmp.hidden = false;
+    u.cmp.classList.toggle('cmp-diff', diff);
+    u.root.classList.toggle('differs', diff);
+    return diff;
+  }
+
+  // ---------------------------------------------------------------------------
   // Export and import
   // ---------------------------------------------------------------------------
   function buildExport() {
     applCache = {}; naReason = {};
     var out = {
-      checklist: DEF.id, version: DEF.version, title: DEF.title,
-      app: state.app || '', reviewer: state.reviewer || '', reviewerKind: 'dev',
+      checklist: DEF.id, version: DEF.version, title: DEF.title, phase: 'all',
+      app: state.app || '', reviewer: state.reviewer || '', reviewerKind: state.reviewerKind || 'dev',
       exportedAt: now(), answers: {}, findings: []
     };
     DEF.items.forEach(function (it) {
@@ -2807,6 +3005,7 @@ table.rows td.rowact { width: 30px; text-align: center; }
         }
       } else if (it.type === 'list') {
         rec.rows = a.rows || [];
+        if (a.none) rec.none = true;
         if (it.findings) rec.rows.forEach(function (r) { out.findings.push(Object.assign({ item: it.id }, r)); });
       } else {
         rec.value = (a.value === undefined) ? null : a.value;
@@ -2872,44 +3071,79 @@ table.rows td.rowact { width: 30px; text-align: center; }
       parsed = obj; replace.disabled = false; merge.disabled = false;
     }
     ta.addEventListener('input', check);
-    function apply(mode) {
-      if (!parsed) return;
-      if (mode === 'replace') { state = freshState(); }
-      if (parsed.app) state.app = parsed.app;
-      if (parsed.reviewer && !state.reviewer) state.reviewer = parsed.reviewer;
-      Object.keys(parsed.answers || {}).forEach(function (id) {
-        var r = parsed.answers[id];
-        var it = itemsById[id];
-        if (!it || !r || r.status === 'na' && !it.type === 'check') return;
-        if (r.status === 'na' && r.reason && /^rule:/.test(r.reason)) return;
-        var a = {};
-        if (Object.prototype.hasOwnProperty.call(r, 'rows')) a.rows = Array.isArray(r.rows) ? r.rows : [];
-        if (Object.prototype.hasOwnProperty.call(r, 'value') && r.value !== null) a.value = r.value;
-        if (it.type === 'check') {
-          if (Array.isArray(r.perRow)) {
-            a.perRow = {};
-            r.perRow.forEach(function (x) { a.perRow[x.label || ('#' + x.row)] = { status: x.status || undefined, location: x.location || '', findings: x.findings || '' }; });
-          } else {
-            if (r.status) a.status = r.status;
-            a.location = r.location || ''; a.findings = r.findings || '';
-          }
+    var asCompare = h('button', { type: 'button', text: 'Load as comparison', disabled: true });
+    replace.addEventListener('click', function () { if (parsed) { importResult(parsed, 'replace'); closeModal(); } });
+    merge.addEventListener('click', function () { if (parsed) { importResult(parsed, 'merge'); closeModal(); } });
+    asCompare.addEventListener('click', function () { if (parsed) { loadCompare(parsed); closeModal(); flash('Loaded comparison from ' + (parsed.reviewer || parsed.reviewerKind || 'the other result')); } });
+    var oldCheck = check;
+    check = function () { oldCheck(); asCompare.disabled = !parsed; };
+    ta.removeEventListener('input', oldCheck);
+    ta.addEventListener('input', check);
+    openModal('Import review JSON', [
+      h('p', { class: 'note', text: 'Replace or Merge loads the answers into this form. Load as comparison keeps your answers and shows the other result beside each item.' }),
+      ta, preview
+    ], [replace, merge, asCompare]);
+  }
+
+  // Loads a result (developer or AI, either phase) into the form. Per-row answers
+  // from the AI are numbered; they are matched to the current table rows by
+  // label when present, otherwise by position.
+  function importResult(parsed, mode) {
+    if (mode === 'replace') { state = freshState(); state.reviewerKind = parsed.reviewerKind || 'dev'; }
+    if (parsed.app) state.app = parsed.app;
+    if (parsed.reviewer && !state.reviewer) state.reviewer = parsed.reviewer;
+    var pendingRows = {};
+    Object.keys(parsed.answers || {}).forEach(function (id) {
+      var r = parsed.answers[id];
+      var it = itemsById[id];
+      if (!it || !r) return;
+      if (r.status === 'na' && r.reason && /^rule:/.test(r.reason)) return;
+      if (r.status === 'missing') return;
+      var a = {};
+      if (Object.prototype.hasOwnProperty.call(r, 'rows')) {
+        // An AI table landing on a developer text field becomes one line per row.
+        if (it.type === 'text') a.value = rowsToText(r.rows);
+        else a.rows = Array.isArray(r.rows) ? r.rows : [];
+      }
+      if (Object.prototype.hasOwnProperty.call(r, 'value') && r.value !== null) a.value = r.value;
+      if (it.type === 'check') {
+        if (Array.isArray(r.perRow)) {
+          // Single-instance in this form (the source is a text field here): collapse.
+          if (it.forEach && sourceRows(it) === null) Object.assign(a, collapseRows(r.perRow));
+          else pendingRows[id] = r.perRow;
+        } else {
+          if (r.status) a.status = r.status;
+          a.location = r.location || ''; a.findings = r.findings || '';
+          if (r.whyNoMore) a.whyNoMore = r.whyNoMore;
         }
-        if (r.detail) a.detail = r.detail;
-        if (r.notes) a.notes = r.notes;
-        if (r.evidence) a.evidence = r.evidence;
-        if (r.searched) a.searched = r.searched;
-        a.updatedAt = r.updatedAt || null;
-        state.answers[id] = (mode === 'merge') ? Object.assign(state.answers[id] || {}, a) : a;
+      }
+      if (r.detail) a.detail = r.detail;
+      if (r.notes) a.notes = r.notes;
+      if (r.none) a.none = true;
+      if (r.evidence) a.evidence = r.evidence;
+      if (r.searched) a.searched = r.searched;
+      if (r.whyNoMore) a.whyNoMore = r.whyNoMore;
+      a.updatedAt = r.updatedAt || null;
+      state.answers[id] = (mode === 'merge') ? Object.assign(state.answers[id] || {}, a) : a;
+    });
+    // Now that any imported tables are in place, place the per-row answers.
+    applCache = {}; naReason = {};
+    Object.keys(pendingRows).forEach(function (id) {
+      var it = itemsById[id];
+      var rows = it.forEach ? sourceRows(it) : null;
+      var keys = rows ? rowKeys(rows) : [];
+      var a = ans(id);
+      if (mode !== 'merge' || !a.perRow) a.perRow = {};
+      pendingRows[id].forEach(function (x, i) {
+        var n = x.row || (i + 1);
+        var key = (x.label && keys.indexOf(x.label) >= 0) ? x.label : (keys[n - 1] || x.label || ('#' + n));
+        a.perRow[key] = { status: x.status || undefined, location: x.location || '', findings: x.findings || '', evidence: x.evidence || '', whyNoMore: x.whyNoMore || '' };
       });
-      state.lastModifiedAt = now();
-      closeModal();
-      renderAll();
-      save();
-      flash('Imported into "' + slotName(state.app) + '"');
-    }
-    replace.addEventListener('click', function () { apply('replace'); });
-    merge.addEventListener('click', function () { apply('merge'); });
-    openModal('Import review JSON', [ta, preview], [replace, merge]);
+    });
+    state.lastModifiedAt = now();
+    renderAll();
+    save();
+    flash('Imported into "' + slotName(state.app) + '"');
   }
 
   function openPasteModal(item, done) {
@@ -2996,6 +3230,10 @@ table.rows td.rowact { width: 30px; text-align: center; }
     document.getElementById('btn-print').addEventListener('click', function () { window.print(); });
     var showHiddenBox = document.getElementById('show-hidden');
     if (showHiddenBox) showHiddenBox.addEventListener('change', function (e) { showHidden = e.target.checked; refresh(); });
+    var cmpOnly = document.getElementById('cmp-only');
+    if (cmpOnly) cmpOnly.addEventListener('change', function (e) { onlyDiff = e.target.checked; refresh(); });
+    var cmpClear = document.getElementById('btn-cmp-clear');
+    if (cmpClear) cmpClear.addEventListener('click', clearCompare);
     document.getElementById('modal').addEventListener('click', function (e) { if (e.target.id === 'modal') closeModal(); });
     document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeModal(); });
 
@@ -3012,6 +3250,9 @@ table.rows td.rowact { width: 30px; text-align: center; }
     buildExport: buildExport,
     getState: function () { return state; },
     setAnswer: function (id, patch) { Object.assign(ans(id), patch); touch(id); },
+    importResult: importResult,
+    loadCompare: loadCompare,
+    clearCompare: clearCompare,
     rerender: renderAll
   };
 
