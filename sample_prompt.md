@@ -1971,7 +1971,8 @@ runCli({ schemaFromDefinition: schemaFromDefinition, extractSchema: extractSchem
 ````
 
 
-==========================
+==============
+
 
 
 <!DOCTYPE html>
@@ -2043,6 +2044,11 @@ legend { padding: 0; }
 .gapbar ul { margin: 4px 0 6px; padding-left: 22px; }
 .gapbar code { font-family: Consolas, "Courier New", monospace; font-size: 12.5px; }
 .gapbar a { color: var(--bad); font-weight: 600; }
+.gapbar .snap { margin: 0 0 6px; }
+.summary .unfinished-head { color: var(--warn); }
+.summary ul.unfinished { margin: 0 0 16px; padding-left: 22px; columns: 2; column-gap: 24px; }
+.summary ul.unfinished li { margin: 3px 0; break-inside: avoid; }
+.summary ul.unfinished .small { color: var(--muted); font-size: 12px; }
 .summary .unsettled-head { color: var(--bad); }
 .summary ul.unsettled { margin: 0 0 16px; padding-left: 22px; }
 .summary ul.unsettled li { margin: 4px 0; }
@@ -2446,7 +2452,7 @@ table.rows td.rowact { width: 30px; text-align: center; }
         }
       }
     }
-    if (r && why.length) viaUnsure[item.id] = why;
+    if (r && why.length) viaUnsure[item.id] = why.filter(function (x, i) { return why.indexOf(x) === i; });
     applCache[item.id] = r;
     return r;
   }
@@ -3028,11 +3034,25 @@ table.rows td.rowact { width: 30px; text-align: center; }
     });
     return out;
   }
+  // The imported file was written while the linter still reported problems, or an AI
+  // result carries no linter stamp at all: a snapshot of an unfinished run.
+  function snapshotNote() {
+    var f = state.importedFrom;
+    if (!f) return '';
+    if (f.lintProblems > 0) return 'This result was written while the linter still reported ' + f.lintProblems + ' problem' + (f.lintProblems === 1 ? '' : 's') + '. It is a snapshot of an unfinished review, not a final result; the unfinished items are listed at the end of the form.';
+    if (f.reviewerKind === 'ai' && f.lintProblems === null) return 'This AI result carries no linter stamp, so it was not written by the linter and may be a snapshot of an unfinished review.';
+    return '';
+  }
   function renderGapBar(gaps) {
     var bar = document.getElementById('gapbar');
     if (!bar) return;
     bar.innerHTML = '';
-    bar.hidden = gaps.length === 0;
+    var snap = snapshotNote();
+    bar.hidden = gaps.length === 0 && !snap;
+    if (bar.hidden) return;
+    if (snap) {
+      bar.appendChild(h('p', { class: 'snap' }, [h('strong', { text: 'Unfinished result: ' }), snap, ' ', (function () { var a = h('a', { href: '#issues-summary', text: 'See what is unfinished' }); a.addEventListener('click', function (e) { e.preventDefault(); goToIssues(); }); return a; })()]));
+    }
     if (!gaps.length) return;
     bar.appendChild(h('strong', { text: 'Review incomplete: ' }));
     bar.appendChild(document.createTextNode(gaps.length === 1 ? 'the source of one library this review depends on was not obtained. ' : 'the sources of ' + gaps.length + ' libraries this review depends on were not obtained. '));
@@ -3042,6 +3062,22 @@ table.rows td.rowact { width: 30px; text-align: center; }
     var link = h('a', { href: '#issues-summary', text: 'See what is unsettled' });
     link.addEventListener('click', function (e) { e.preventDefault(); goToIssues(); });
     bar.appendChild(link);
+  }
+  function unfinishedItems() {
+    var out = [];
+    DEF.items.forEach(function (it) {
+      if (!applicable(it) || it.optional || complete(it)) return;
+      var u = ui.items[it.id];
+      out.push({ item: it.id, title: it.title, why: u && u.chip ? u.chip.textContent : '' });
+    });
+    return out;
+  }
+  function renderUnfinished(list, items) {
+    if (!items.length) return;
+    list.appendChild(h('h3', { class: 'unfinished-head', text: 'Unfinished: ' + items.length + ' item' + (items.length === 1 ? '' : 's') }));
+    list.appendChild(h('ul', { class: 'unfinished' }, items.map(function (x) {
+      return h('li', null, [h('a', { href: '#item-' + x.item, text: x.item }), ' ', h('span', { text: x.title }), x.why ? h('span', { class: 'small', text: ' (' + x.why + ')' }) : null]);
+    })));
   }
   function renderUnsettled(list, gaps, unsettled) {
     if (!gaps.length && !unsettled.length) return;
@@ -3078,6 +3114,7 @@ table.rows td.rowact { width: 30px; text-align: center; }
     renderGapBar(gaps);
     if (list) {
       list.innerHTML = '';
+      renderUnfinished(list, unfinishedItems());
       renderUnsettled(list, gaps, unsettledChecks());
       if (issues.length) list.appendChild(issueTable(issues));
       else list.appendChild(h('p', { class: 'intro', text: 'No issues recorded yet.' }));
@@ -3429,7 +3466,7 @@ table.rows td.rowact { width: 30px; text-align: center; }
       state.app = hasText(parsed.app) ? parsed.app : keepApp;
       state.reviewerKind = parsed.reviewerKind === 'ai' ? 'ai' : 'dev';
       state.reviewer = parsed.reviewer || '';
-      state.importedFrom = { reviewer: parsed.reviewer || '', reviewerKind: parsed.reviewerKind || '', exportedAt: parsed.exportedAt || '' };
+      state.importedFrom = { reviewer: parsed.reviewer || '', reviewerKind: parsed.reviewerKind || '', exportedAt: parsed.exportedAt || '', lintProblems: typeof parsed.lintProblems === 'number' ? parsed.lintProblems : null, version: parsed.version || '' };
       state.lastExportedAt = parsed.exportedAt || now();
     }
     var pendingRows = {};
@@ -3667,6 +3704,7 @@ table.rows td.rowact { width: 30px; text-align: center; }
     clearCompare: clearCompare,
     collectIssues: collectIssues,
     reviewGaps: reviewGaps,
+    unfinishedItems: unfinishedItems,
     goToIssues: goToIssues,
     rowsOf: function (id) { return ((state.answers[id] || {}).rows || []).slice(); },
     rerender: renderAll
