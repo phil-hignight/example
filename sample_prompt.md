@@ -1970,7 +1970,10 @@ runCli({ schemaFromDefinition: schemaFromDefinition, extractSchema: extractSchem
 
 ````
 
-=======================
+
+==============
+
+
 
 <!DOCTYPE html>
 <html lang="en">
@@ -2000,30 +2003,51 @@ body {
   color: var(--ink);
   font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
+[hidden] { display: none !important; }
 code { background: var(--code); padding: 0 4px; border-radius: 3px; font-size: 12.5px; }
 h1 { font-size: 20px; margin: 28px 0 6px; }
 h2 { font-size: 17px; margin: 24px 0 6px; }
 h3 { font-size: 15px; margin: 0; font-weight: 600; }
 p { margin: 6px 0; }
+fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
+legend { padding: 0; }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 .intro { color: var(--muted); }
+.flowintro { margin: 18px 0 4px; }
 .rule { color: var(--accent); font-size: 13px; margin: 4px 0; }
 .refs { color: var(--muted); font-size: 12.5px; }
 
-/* Top bar */
+/* Top bar: kept to two rows so it does not eat the screen */
 .top {
   position: sticky; top: 0; z-index: 5;
   background: var(--panel); border-bottom: 1px solid var(--line);
-  padding: 10px 20px; display: grid; gap: 8px;
+  padding: 8px 20px; display: grid; gap: 6px;
   grid-template-columns: 1fr auto; align-items: center;
 }
 .top .title { font-weight: 600; font-size: 16px; }
 .top .ver { color: var(--muted); font-weight: 400; font-size: 13px; margin-left: 6px; }
-.top .fields { display: flex; gap: 14px; flex-wrap: wrap; grid-column: 1 / -1; }
+.top .fields { display: flex; gap: 14px; flex-wrap: wrap; grid-column: 1 / -1; align-items: center; }
 .top .fields label { display: flex; align-items: center; gap: 6px; }
-.top .fields input { padding: 5px 8px; border: 1px solid var(--line); border-radius: 4px; min-width: 220px; }
+.top .fields input { padding: 5px 8px; border: 1px solid var(--line); border-radius: 4px; min-width: 200px; }
 .top .actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; justify-content: flex-end; }
-.top .progressrow { display: flex; align-items: center; gap: 10px; grid-column: 1 / -1; flex-wrap: wrap; }
-.top progress { width: 240px; height: 10px; }
+.top .progressrow { display: inline-flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.top progress { width: 160px; height: 10px; }
+
+/* Issue count badge in the sticky top bar; hidden while there are no issues */
+.issuesbadge { display: inline-flex; align-items: center; gap: 6px; border-radius: 999px; border: 1px solid #f3b4ae; background: #fdf0ee; color: var(--bad); font-weight: 600; padding: 4px 10px; cursor: pointer; }
+.issuesbadge:hover, .issuesbadge:focus { background: #fbe3e0; outline: 2px solid var(--bad); outline-offset: 1px; }
+.issuesbadge .ico { font-size: 15px; line-height: 1; }
+.issuesbadge .count { background: var(--bad); color: #fff; border-radius: 999px; padding: 0 7px; font-size: 12px; line-height: 18px; min-width: 18px; text-align: center; }
+
+/* Summary of every recorded issue, last section of the form */
+.summary { scroll-margin-top: 130px; }
+.summary h2:focus { outline: none; }
+.summary .note { color: var(--muted); }
+.summary h3 { font-size: 15px; margin: 18px 0 6px; }
+.summary table.issues { border-collapse: collapse; width: 100%; min-width: 600px; }
+.summary table.issues th, .summary table.issues td { border: 1px solid var(--line); padding: 5px 8px; text-align: left; vertical-align: top; font-size: 13px; }
+.summary table.issues th { background: #f1f3f5; font-weight: 600; }
+.summary table.issues .small { color: var(--muted); font-size: 12px; }
 #status { color: var(--muted); font-size: 12.5px; }
 .badge { background: #fff4e5; color: var(--warn); border: 1px solid #f5d38f; border-radius: 10px; padding: 1px 8px; font-size: 12px; }
 
@@ -2049,6 +2073,7 @@ main { max-width: 1100px; margin: 0 auto; padding: 8px 20px 80px; }
 .item {
   background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
   padding: 12px 14px; margin: 10px 0;
+  scroll-margin-top: 130px;
 }
 .item.na { opacity: .6; background: #fafafa; }
 .ihead { display: flex; align-items: baseline; gap: 10px; }
@@ -2056,9 +2081,12 @@ main { max-width: 1100px; margin: 0 auto; padding: 8px 20px 80px; }
 .chip { margin-left: auto; font-size: 12px; border-radius: 10px; padding: 1px 8px; border: 1px solid var(--line); white-space: nowrap; }
 .chip-ok { color: var(--ok); border-color: #b7e0c0; background: #eefaf0; }
 .chip-warn { color: var(--warn); border-color: #f5d38f; background: #fff8e6; }
+.chip-bad { color: var(--bad); border-color: #f3b4ae; background: #fdf0ee; }
 .chip-open { color: var(--muted); }
 .chip-na { color: var(--na); }
 .tip { color: var(--muted); margin: 2px 0 8px; font-size: 13.5px; }
+.problemif { margin: -2px 0 10px; font-size: 13.5px; color: var(--ink); background: #fdf0ee; border-left: 3px solid var(--bad); padding: 6px 10px; border-radius: 0 4px 4px 0; }
+.problemif strong { color: var(--bad); }
 .how { margin: 6px 0; }
 .how > summary { cursor: pointer; color: var(--accent); font-size: 13px; }
 .how p { margin: 6px 0 0; }
@@ -2066,14 +2094,6 @@ main { max-width: 1100px; margin: 0 auto; padding: 8px 20px 80px; }
 .control { margin: 8px 0; }
 .control .opt { display: block; padding: 2px 0; }
 .control .opt.inline { display: inline-block; margin-right: 14px; }
-.chip-bad { color: var(--bad); border-color: #f3b4ae; background: #fdf0ee; }
-
-/* Check items: one block, or one per row of the source table */
-.checkblock { border-left: 3px solid var(--line); padding: 6px 0 6px 12px; margin: 6px 0 10px; }
-.checkblock .rowlabel { font-family: ui-monospace, Consolas, monospace; font-size: 13px; font-weight: 600; margin-bottom: 4px; word-break: break-all; }
-.checkblock .statusopts { margin-bottom: 6px; }
-.checkblock .fld { margin-top: 6px; }
-.checkblock input.where { width: 100%; font: inherit; padding: 5px 8px; border: 1px solid var(--line); border-radius: 4px; }
 .control textarea, .fields textarea { width: 100%; font: inherit; padding: 6px 8px; border: 1px solid var(--line); border-radius: 4px; resize: vertical; }
 .fields { display: grid; gap: 8px; margin-top: 8px; }
 .fld > span { display: block; font-size: 12.5px; color: var(--muted); margin-bottom: 2px; }
@@ -2083,18 +2103,12 @@ main { max-width: 1100px; margin: 0 auto; padding: 8px 20px 80px; }
 .remind { color: var(--muted); font-size: 12px; margin: 8px 0 0; }
 .remind a { color: var(--accent); }
 
-/* Comparison with a second result */
-.cmpbar { grid-column: 1 / -1; display: flex; gap: 14px; align-items: center; flex-wrap: wrap; background: #fff8e6; border: 1px solid #f5d38f; border-radius: 6px; padding: 6px 10px; font-size: 13px; }
-.cmp { margin-top: 10px; border: 1px dashed var(--line); border-radius: 5px; padding: 8px 10px; font-size: 13px; background: #fafbfc; }
-.cmp.cmp-diff { border-color: #f5d38f; background: #fff8e6; }
-.cmp .cmphead { font-weight: 600; margin-bottom: 4px; }
-.cmp .cmprows { margin: 4px 0 0 18px; padding: 0; }
-.cmp .muted { color: var(--muted); }
-.pre { white-space: pre-wrap; }
-.item.differs { border-left: 4px solid var(--warn); }
-.aifields { margin-top: 8px; font-size: 13px; }
-.aifields > summary { cursor: pointer; color: var(--accent); }
-.aifields .pre { margin: 4px 0; }
+/* Check items: one block, or one per row of the source table */
+.checkblock { border-left: 3px solid var(--line); padding: 6px 0 6px 12px; margin: 6px 0 10px; }
+.checkblock .rowlabel { font-family: ui-monospace, Consolas, monospace; font-size: 13px; font-weight: 600; margin-bottom: 4px; word-break: break-all; }
+.checkblock .statusopts { margin-bottom: 6px; }
+.checkblock .fld { margin-top: 6px; }
+.checkblock textarea.where { width: 100%; font: inherit; padding: 5px 8px; border: 1px solid var(--line); border-radius: 4px; resize: vertical; min-height: 30px; }
 
 /* Tables */
 .tablescroll { overflow-x: auto; }
@@ -2109,8 +2123,20 @@ table.rows td.rowact { width: 30px; text-align: center; }
 .rowcount { color: var(--muted); font-size: 12.5px; margin-left: 6px; }
 .nonebox { margin-left: auto; font-size: 13px; }
 
+/* Comparison with a second result */
+.cmpbar { grid-column: 1 / -1; display: flex; gap: 14px; align-items: center; flex-wrap: wrap; background: #fff8e6; border: 1px solid #f5d38f; border-radius: 6px; padding: 6px 10px; font-size: 13px; }
+.cmp { margin-top: 10px; border: 1px dashed var(--line); border-radius: 5px; padding: 8px 10px; font-size: 13px; background: #fafbfc; }
+.cmp.cmp-diff { border-color: #f5d38f; background: #fff8e6; }
+.cmp .cmphead { font-weight: 600; margin-bottom: 4px; }
+.cmp .cmprows { margin: 4px 0 0 18px; padding: 0; }
+.cmp .muted { color: var(--muted); }
+.pre { white-space: pre-wrap; }
+.item.differs { border-left: 4px solid var(--warn); }
+.aifields { margin-top: 8px; font-size: 13px; }
+.aifields > summary { cursor: pointer; color: var(--accent); }
+.aifields .pre { margin: 4px 0; }
+
 /* Modal */
-[hidden] { display: none !important; }
 #modal { position: fixed; inset: 0; background: rgba(0,0,0,.35); display: flex; align-items: center; justify-content: center; z-index: 20; }
 .modal { background: var(--panel); border-radius: 8px; padding: 18px 20px; width: min(900px, 94vw); max-height: 90vh; overflow: auto; box-shadow: 0 10px 40px rgba(0,0,0,.25); }
 .modal h2 { margin: 0 0 10px; }
@@ -2119,14 +2145,15 @@ table.rows td.rowact { width: 30px; text-align: center; }
 .modal .preview { white-space: pre-wrap; font-size: 13px; margin: 8px 0; color: var(--ink); }
 .modalactions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 10px; }
 
-/* Print */
+/* Print: everything visible, nothing clipped, no placeholder text */
 @media print {
-  .top .actions, .top .fields input::placeholder, #modal, .how > summary, .tableactions, .rowact, .instructions { display: none !important; }
+  .top .actions, .issuesbadge, #modal, .how > summary, .tableactions, .rowact, .instructions, .remind, .cmpbar { display: none !important; }
   .top { position: static; border: 0; }
   .how { display: block; }
   .how p { display: block; }
   .item { break-inside: avoid; border-color: #bbb; }
-  textarea { border: 1px solid #bbb; }
+  textarea { border: 1px solid #bbb; overflow: visible; resize: none; }
+  ::placeholder { color: transparent; }
   body { background: #fff; }
 }
 
@@ -2134,23 +2161,24 @@ table.rows td.rowact { width: 30px; text-align: center; }
 </head>
 <body>
 <header class="top">
-  <div class="title">Web Application Security Review <span class="ver">checklist web-idor-review v0.1.0</span></div>
+  <div class="title">Web Application Security Review <span class="ver">checklist web-idor-review v0.3.0</span></div>
   <div class="actions">
     <button type="button" id="btn-import">Import JSON</button>
     <button type="button" id="btn-export" class="primary">Export JSON</button>
     <button type="button" id="btn-clear">Clear this review</button>
     <button type="button" id="btn-print">Print</button>
+    <button type="button" id="issues-badge" class="issuesbadge" hidden title="Issues recorded. Click to see the list at the end of the form."><span class="ico" aria-hidden="true">&#9888;</span><span class="count">0</span></button>
   </div>
   <div class="fields">
     <label>Application <input id="app" list="slots" placeholder="artifactId or app name" autocomplete="off"></label>
     <datalist id="slots"></datalist>
     <label>Reviewer <input id="reviewer" placeholder="your name"></label>
-  </div>
-  <div class="progressrow">
-    <progress id="progress" max="100" value="0"></progress>
-    <span id="progresstext"></span>
-    <span id="dirty" class="badge" hidden></span>
-    <span id="status"></span>
+    <span class="progressrow">
+      <progress id="progress" max="100" value="0"></progress>
+      <span id="progresstext"></span>
+      <span id="dirty" class="badge" hidden></span>
+      <span id="status"></span>
+    </span>
   </div>
   <div id="cmpbar" class="cmpbar" hidden>
     <span id="cmpinfo"></span>
@@ -2158,22 +2186,20 @@ table.rows td.rowact { width: 30px; text-align: center; }
     <button type="button" id="btn-cmp-clear" class="small">Stop comparing</button>
   </div>
 </header>
-<details class="instructions" open>
+<details class="instructions" id="instructions" open>
   <summary>Instructions</summary>
   <div class="body">
 <p><strong>Why.</strong> Another application at the customer had a download URL with a numeric id in it. Changing the id returned someone else's file. The application checked that the caller was logged in, but never checked that the caller was allowed to see that particular file. Scanners and code review both missed it. You are reviewing your application for the same shape, and what you record here is the review.</p>
 
-<p><strong>Phase 1: map the application.</strong> Work through the questions from the code, not from memory. The checks in Phase 2 are chosen from these answers, and an endpoint, file handler, or service call left out here is one that never gets checked.</p>
-
-<p><strong>Phase 2: check it.</strong> Each item is a statement to verify. Open the code, follow the identifier from the request to the data, and decide. Mark it OK only when you can point at the line that does the check. If it fails, mark it Problem found and describe what you saw and what a caller could do with it. Anything else you notice that looks wrong goes in the Issues found table at the end of each phase.</p>
+<p><strong>How to work through it.</strong> Twelve topics, each about one area of the application; later topics only show what your earlier answers make relevant. Answer the questions from the code, not from memory. For each check, open the code, follow the identifier from the request to the data, and decide. Mark it Checked, OK only when you can point at the line that does the check. If you find the problem the item describes, or anything like it, mark it Problem found and write down where it is and what a caller could do with it. Everything you record that way, and every row you add to a topic's issues table, is collected in "All issues found" at the end of the form; the red count in the top bar takes you there.</p>
 
 <p><strong>Saving and export.</strong> Your work saves in this browser as you type, under the application name above. When you have worked through everything, click Export, copy the JSON, and send it where you were asked to.</p>
 
   </div>
 </details>
 <main id="form"></main>
-<div id="modal" hidden><div class="modal"></div></div>
-<script type="application/json" id="def">{"id":"web-idor-review","version":"0.1.0","title":"Web Application Security Review","mode":"dev","negativeValues":["no","none","none-found","unknown","not-established","not-set-default","no-weblogic-xml","none-api-only"],"phases":[{"id":"profile","title":"Phase 1: Map the application","intro":"Work through these from the code. The checks in Phase 2 are chosen from these answers, so an endpoint, file handler, or service call left out here is one that never gets checked."},{"id":"review","title":"Phase 2: Check it","intro":"Each item is a statement to verify, chosen from your Phase 1 answers. Open the code, follow the identifier from the request to the data, and decide. Mark it OK only when you can point at the line that does the check. Describe every problem."}],"sections":[{"id":"A","phase":"profile","title":"Identity and stack"},{"id":"B","phase":"profile","title":"Authentication and session"},{"id":"C","phase":"profile","title":"Portal to portlet token handoff","when":{"q":"C-03","in":["portal","portlet"]}},{"id":"D","phase":"profile","title":"Authorization and ownership model"},{"id":"E","phase":"profile","title":"HTTP entry points and identifiers"},{"id":"F","phase":"profile","title":"Data access and outbound services"},{"id":"G","phase":"profile","title":"Files, documents, and uploads"},{"id":"H","phase":"profile","title":"Responses, binding, headers, and static content"},{"id":"J","phase":"profile","title":"JSF specifics","when":{"q":"C-04","includes":"jsf"}},{"id":"K","phase":"profile","title":"Environment"},{"id":"Z","phase":"profile","title":"Issues found","intro":"Anything that looks like a problem, whether or not a question asked about it. One row per issue."},{"id":"RA","phase":"review","title":"Public surface","when":{"any":[{"q":"C-12","notEmpty":true},{"q":"C-13","notEmpty":true}]}},{"id":"RB","phase":"review","title":"Identity and session"},{"id":"RC","phase":"review","title":"Portal to portlet token","when":{"q":"C-03","in":["portal","portlet"]}},{"id":"RD","phase":"review","title":"Object-level authorization: reads"},{"id":"RE","phase":"review","title":"Object-level authorization: writes","when":{"q":"C-41","notEmpty":true}},{"id":"RF","phase":"review","title":"Data access and outbound calls","when":{"q":"C-50","notEmpty":true}},{"id":"RG","phase":"review","title":"Files and documents","when":{"q":"C-60","eq":"yes"}},{"id":"RH","phase":"review","title":"Responses, caching, and static content"},{"id":"RI","phase":"review","title":"JSF","when":{"q":"C-04","includes":"jsf"}},{"id":"RZ","phase":"review","title":"Other issues found during review","intro":"Anything found that no item asked about. One row per issue."}],"items":[{"id":"C-01","section":"A","type":"text","title":"Which module builds the deployable WAR, and what is its context root?","tip":"Root pom or the module with war packaging. Context root is in weblogic.xml."},{"id":"C-02","section":"A","type":"select","title":"Who uses this application: beneficiaries or operators?","tip":"Beneficiary self-service apps log people in through the beneficiary SSO filter (AuthFilter, iPlanetDirectoryPro cookie) and scope data to a family. Operator apps use OperatorAuthenticationFilter and OperatorAuthorizationFilter and scope data by access level or selected site.","detail":"Who exactly: sponsors, dependents, call-centre operators, site staff","options":[{"value":"beneficiary","label":"Beneficiary self-service"},{"value":"operator","label":"Operator (call centre or office staff)"},{"value":"both","label":"Both audiences"}]},{"id":"C-03","section":"A","type":"select","title":"Is this a portal, a portlet, or a standalone application?","tip":"A portal hosts other apps in iframes and creates the token they receive. A portlet runs inside a portal iframe and receives that token. A standalone app logs users in itself.","detail":"Naming convention observed (artifactId prefix, package name)","options":[{"value":"portal","label":"Portal: hosts portlets and mints their token"},{"value":"portlet","label":"Portlet: loaded in a portal iframe, receives a token"},{"value":"standalone","label":"Standalone: own SSO, no iframe hosting, no parent token"}]},{"id":"C-04","section":"A","type":"multiselect","title":"Which frameworks handle requests on the backend?","tip":"Select everything that handles even one page. The pom and web.xml settle it.","detail":"Versions and anything selected as Other","options":[{"value":"spring-mvc","label":"Spring MVC (@Controller, DispatcherServlet)"},{"value":"spring-boot","label":"Spring Boot"},{"value":"spring-security","label":"Spring Security"},{"value":"jaxrs","label":"JAX-RS (@Path; Jersey, RESTEasy, or CXF)"},{"value":"jsf","label":"JSF (FacesServlet, .xhtml or .jspx pages)"},{"value":"jsp","label":"JSP pages"},{"value":"servlets","label":"Raw servlets (web.xml \u003cservlet> or @WebServlet)"},{"value":"websocket","label":"WebSocket endpoints"},{"value":"struts","label":"Struts"},{"value":"other","label":"Other (describe in Detail)"}]},{"id":"C-05","section":"A","type":"select","title":"What is the frontend?","tip":"package.json under src/main/angular shows the Angular version.","detail":"Version from package.json and where the frontend source lives","options":[{"value":"angular","label":"Angular 2 or later"},{"value":"angularjs","label":"AngularJS 1.x"},{"value":"mixed","label":"Mixed (describe in Detail)"},{"value":"server-rendered","label":"Server-rendered pages only (JSF or JSP)"},{"value":"none-api-only","label":"None: API only"}]},{"id":"C-06","section":"A","type":"select","title":"Is the frontend served from the same WAR as the backend?","tip":"CORS configuration on the backend (@CrossOrigin, CorsFilter) means a separate origin.","detail":"CORS allowed origins and credentials setting, if any","options":[{"value":"same-war","label":"Served from the same WAR (same origin)"},{"value":"separate-origin-cors","label":"Separate origin with CORS"},{"value":"separate-proxied","label":"Separate deployment behind the same origin (proxy)"}]},{"id":"C-10","section":"B","type":"multiselect","title":"How do users log in?","tip":"Usually one of the enterprise filters from the shared web-security library, declared in web.xml. Select everything that applies.","detail":"Logon methods supported (CAC, FAM, DFAS, SNT) and anything custom","options":[{"value":"beneficiary-sso","label":"Enterprise beneficiary SSO filter (AuthFilter / BeneficiaryAgentSSO)"},{"value":"operator-filter","label":"Enterprise operator filters (OperatorAuthenticationFilter / OperatorAuthorizationFilter)"},{"value":"portal-jwt","label":"Token received from a parent portal"},{"value":"spring-security","label":"Spring Security"},{"value":"container-managed","label":"Container-managed (\u003clogin-config> in web.xml)"},{"value":"custom","label":"Custom or home-grown"},{"value":"none","label":"None found"}]},{"id":"C-12","section":"B","type":"text","title":"Which URL patterns skip the login filter?","tip":"Filter mappings and exclusion patterns in web.xml or the filter's init-params, for example /ws/public/*, appmonitor.status, static folders. One per line."},{"id":"C-13","section":"B","type":"text","title":"What can be reached without logging in, and does any of it return data?","tip":"For each excluded pattern, list what is behind it. Health checks and static assets are expected; anything that returns records is an issue."},{"id":"C-14","section":"B","type":"select","title":"After login, where does the code keep who the user is?","tip":"Follow the login filter to where it stores the user, then find the class the rest of the code reads to get the person, family, or operator ids.","detail":"Class holding the identity and the identifiers it carries (person id, sponsor id, family id, operator id, access levels, site)","options":[{"value":"http-session","label":"HttpSession attribute"},{"value":"custom-principal","label":"Custom Principal via request.getUserPrincipal()"},{"value":"thread-local","label":"ThreadLocal or request-scoped holder"},{"value":"spring-security-context","label":"Spring SecurityContextHolder"},{"value":"jwt-each-request","label":"Re-derived from the token on every request"},{"value":"other","label":"Other (describe in Detail)"}]},{"id":"C-15","section":"B","type":"select","title":"What does each request carry after login: a session cookie or a token?","tip":"A token means an Angular interceptor adds an Authorization header and the server parses it on every request.","options":[{"value":"session-cookie","label":"Session cookie"},{"value":"bearer-jwt","label":"Bearer token on every request"},{"value":"both","label":"Both"},{"value":"none","label":"None found"}]},{"id":"C-17","section":"B","type":"yesno","title":"Does the Angular code read the login cookie directly, for example iPlanetDirectoryPro?","tip":"Search the frontend for document.cookie or a cookie service. If JavaScript can read it, the cookie is not HttpOnly.","detail":"Cookie names and the files that read them"},{"id":"C-20","section":"C","type":"select","title":"How does the token get from the portal into the portlet?","tip":"How the iframe src is built on the portal side, and where the portlet first reads the token. A query parameter ends up in access logs and browser history.","detail":"Portal side (file:line) and portlet side (file:line)","options":[{"value":"query-param","label":"iframe src query parameter"},{"value":"url-fragment","label":"URL fragment"},{"value":"postmessage","label":"window.postMessage"},{"value":"shared-domain-cookie","label":"Cookie on a shared domain"},{"value":"proxy-header","label":"Header injected by a proxy"},{"value":"other","label":"Other (describe in Detail)"}]},{"id":"C-21","section":"C","type":"select","title":"How is the token protected?","tip":"jjwt, auth0, or nimbus with a signWith call means signed. Cipher calls outside a JWT library mean custom encryption.","detail":"Library, class, and algorithm constant","options":[{"value":"jws-hmac","label":"JWS signed with HMAC (shared secret)"},{"value":"jws-asymmetric","label":"JWS signed with an asymmetric key"},{"value":"jwe","label":"JWE encrypted"},{"value":"jws-and-jwe","label":"Signed and encrypted"},{"value":"custom-crypto","label":"Custom encrypt/decrypt outside a JOSE library"}]},{"id":"C-22","section":"C","type":"text","title":"What is in the token?","tip":"Family id, sponsor id, person id, access levels, app id, site, expiry."},{"id":"C-23","section":"C","type":"multiselect","title":"What does the portlet check when it receives the token?","tip":"Select only what the code demonstrably checks. A library call that verifies the signature does not check issuer, audience, or expiry unless configured to.","when":{"q":"C-03","eq":"portlet"},"detail":"Class and lines performing each check","options":[{"value":"signature","label":"Signature verified"},{"value":"exp","label":"Expiry (exp) enforced"},{"value":"nbf","label":"Not-before (nbf) enforced"},{"value":"iss","label":"Issuer (iss) checked"},{"value":"aud-or-app-id","label":"Audience or application id checked"},{"value":"alg-pinned","label":"Algorithm pinned (rejects none and algorithm switching)"},{"value":"jti-replay","label":"Replay protection (jti or one-time use)"},{"value":"none-found","label":"None found"}]},{"id":"C-24","section":"C","type":"select","title":"Where does the signing secret live?","tip":"Follow the property key from the code that loads the key.","detail":"Property key and file","options":[{"value":"properties-in-war","label":"Properties file inside the WAR"},{"value":"credential-store-jndi","label":"WebLogic credential store or JNDI"},{"value":"env-var","label":"Environment variable"},{"value":"hardcoded","label":"Hardcoded in source"},{"value":"other","label":"Other (describe in Detail)"}]},{"id":"C-25","section":"C","type":"select","title":"Is the secret shared across all portlets or specific to this one?","tip":"A shared library default or the same property name in several apps means shared.","detail":"How this was determined","options":[{"value":"fleet-shared","label":"One key shared across the fleet"},{"value":"per-portlet","label":"Per portlet"}]},{"id":"C-26","section":"C","type":"select","title":"After the token is accepted, does the portlet create a session or require the token on every request?","tip":"Look for getSession(true) after the token check.","when":{"q":"C-03","eq":"portlet"},"detail":"What is stored and how it is bound to the token identity","options":[{"value":"creates-http-session","label":"Creates an HttpSession holding identity"},{"value":"stateless","label":"Stateless: token on every request"},{"value":"both","label":"Both"}]},{"id":"C-27","section":"C","type":"text","title":"Which filter rejects requests with no valid token or session, and what happens if the portlet URL is opened directly in a browser tab?","tip":"The filter class, its URL patterns, and its exclusions.","when":{"q":"C-03","eq":"portlet"}},{"id":"C-28","section":"C","type":"select","title":"Is framing restricted with X-Frame-Options or a CSP frame-ancestors header?","tip":"Usually set in a filter or by the shared web-security library.","detail":"Values and where they are set","options":[{"value":"x-frame-options","label":"X-Frame-Options set"},{"value":"csp-frame-ancestors","label":"CSP frame-ancestors set"},{"value":"both","label":"Both"},{"value":"none-found","label":"None found"}]},{"id":"C-29","section":"C","type":"text","title":"Where does the portal create the token, and what does it put in it?","tip":"Class and method, the fields copied from the logged-in user, and the expiry.","when":{"q":"C-03","eq":"portal"}},{"id":"C-30","section":"D","type":"select","title":"Who is allowed to see a given record in this application?","tip":"Beneficiary apps: the user's own family. Operator apps: by access level, by selected site, or both. Write the rule as one sentence in Detail.","detail":"In one sentence: what does 'allowed to see this record' mean in this application?","options":[{"value":"beneficiary-family","label":"Beneficiary: own family only"},{"value":"operator-access-level","label":"Operator: by access level"},{"value":"operator-site","label":"Operator: by selected site"},{"value":"mixed","label":"Mixed (describe in Detail)"},{"value":"none-found","label":"No ownership rule found in code"}]},{"id":"C-31","section":"D","type":"yesno","title":"Is there a check that the user may use this application at all?","tip":"For operator apps this is the App ID check in OperatorAuthorizationFilter. It is not the same as checking a specific record.","detail":"Class, application id, and configuration location"},{"id":"C-32","section":"D","type":"select","title":"When a request names a specific record, where is it checked that this user may see that record?","tip":"This is the question the whole review is about. If you cannot point at a place where it happens, choose none found.","detail":"Helper name and location, or examples of the ad hoc pattern","options":[{"value":"canonical-helper","label":"Single canonical helper, for example isInMyFamily(personId)"},{"value":"per-endpoint","label":"Ad hoc per endpoint"},{"value":"annotation","label":"Annotation or aspect based"},{"value":"none-found","label":"None found"}]},{"id":"C-33","section":"D","type":"select","title":"Where does the list of records the user may see come from?","tip":"Loaded at login into the session, looked up per request, carried in the token, or nowhere.","detail":"Class and method that establishes it","options":[{"value":"roster-in-session","label":"Roster fetched at login and stored in the session"},{"value":"per-request-lookup","label":"Looked up on every request"},{"value":"jwt-claims","label":"Carried in token claims"},{"value":"not-established","label":"Not established anywhere"}]},{"id":"C-34","section":"D","type":"text","title":"What do access levels mean here, and how is the selected site enforced on later requests?","tip":"List the levels or roles and what each allows. Where the selected site is stored and how later requests are limited to it.","when":{"q":"C-02","in":["operator","both"]}},{"id":"C-35","section":"D","type":"text","title":"Which people can a logged-in beneficiary see or change, and where is that set built?","tip":"Only themselves, their dependents, their sponsor, the whole family, or different by role. Where the set comes from (login, session, per request, token) and where it is consulted.","when":{"q":"C-02","in":["beneficiary","both"]}},{"id":"C-40","section":"E","type":"multiselect","title":"How do requests reach code?","tip":"JSF action methods count. Actuator is out of scope but note it if present.","detail":"Anything selected as Other","options":[{"value":"spring-mvc","label":"Spring MVC controllers"},{"value":"jaxrs","label":"JAX-RS resources"},{"value":"jsf-actions","label":"JSF managed-bean actions"},{"value":"servlets","label":"Raw servlets"},{"value":"websocket","label":"WebSocket endpoints"},{"value":"actuator","label":"Spring Boot actuator (note only)"},{"value":"other","label":"Other (describe in Detail)"}]},{"id":"C-41","section":"E","type":"list","title":"Which endpoints take a record identifier from the request, and where is scope checked for each?","tip":"Every endpoint where the caller supplies an id for a person, family, document, or other record in the path, query string, or body. One row each.","columns":[{"key":"path","label":"Path"},{"key":"idParams","label":"What the id identifies"},{"key":"scopeCheck","label":"Scope check","type":"select","options":["checked","none","could not determine"]},{"key":"where","label":"Where it is checked (class or method)"}]},{"id":"C-42","section":"E","type":"multiselect","title":"What kinds of identifiers appear in requests?","tip":"Sequential numeric ids are the easiest to guess.","detail":"Format notes: sequential numeric, guessable, base64 of an id, and so on","options":[{"value":"person-id","label":"Person id"},{"value":"sponsor-id","label":"Sponsor id"},{"value":"family-id","label":"Family id"},{"value":"document-id","label":"Document or file id"},{"value":"db-primary-key","label":"Database primary key"},{"value":"uuid","label":"UUID or GUID"},{"value":"opaque-token","label":"Opaque or encoded token"},{"value":"composite","label":"Composite key"},{"value":"other","label":"Other (describe in Detail)"}]},{"id":"C-50","section":"F","type":"multiselect","title":"How does the app read and write data?","tip":"Select everything in use, not just the main path.","detail":"Anything selected as Other","options":[{"value":"cuf","label":"CUF (Common Update Framework) client"},{"value":"rest-client","label":"Other REST service clients"},{"value":"soap-client","label":"SOAP or JAX-WS clients"},{"value":"jpa-hibernate","label":"JPA or Hibernate"},{"value":"jdbctemplate","label":"JdbcTemplate or raw JDBC"},{"value":"stored-procedures","label":"Stored procedures"},{"value":"mybatis","label":"MyBatis"},{"value":"file-system","label":"File system"},{"value":"ldap","label":"LDAP"},{"value":"other","label":"Other (describe in Detail)"}]},{"id":"C-51","section":"F","type":"text","title":"Which backend services does the app call, and what identifier does it send them?","tip":"Services return whatever they are asked for, so the check has to happen in this app before the call. One service per line."},{"id":"C-52","section":"F","type":"text","title":"What identifies a record in a CUF request, and does the request carry anything about the caller's scope?","tip":"Person id, sponsor id, family id, or something else.","when":{"q":"C-50","includes":"cuf"}},{"id":"C-53","section":"F","type":"text","title":"For direct queries and stored procedures, is the WHERE clause limited to the caller's family or site, or only to the record id?","tip":"A query that finds by id alone returns anyone's record if the id is changed.","when":{"q":"C-50","includesAny":["jpa-hibernate","jdbctemplate","stored-procedures","mybatis"]}},{"id":"C-60","section":"G","type":"yesno","title":"Does the app return files, PDFs, images, or documents by an identifier?","tip":"Downloads, reports, forms, letters, attachments. This is the exact pattern from the incident."},{"id":"C-61","section":"G","type":"list","title":"For each file-serving endpoint, where is it checked that the caller may have that file?","tip":"One row per endpoint.","when":{"q":"C-60","eq":"yes"},"columns":[{"key":"url","label":"URL"},{"key":"idParam","label":"Identifier parameter"},{"key":"scopeCheck","label":"Scope check","type":"select","options":["checked","none","could not determine"]},{"key":"where","label":"Where it is checked"}]},{"id":"C-62","section":"G","type":"yesno","title":"Does the app accept file uploads?","tip":"MultipartFile, @FormDataParam, or a multipart-config in web.xml."},{"id":"C-63","section":"G","type":"text","title":"Which record does each upload attach to, and where does that record's id come from?","tip":"An upload attached to a record id taken from the request is the write-side twin of file serving.","when":{"q":"C-62","eq":"yes"}},{"id":"C-70","section":"H","type":"select","title":"Do endpoints return whole entities or CUF objects, or DTOs with only the needed fields?","tip":"Whole objects expose every field they carry, including ones the UI never shows.","detail":"Examples, and any @JsonIgnore or @JsonView usage","options":[{"value":"entities-wholesale","label":"Entities or CUF objects serialized wholesale"},{"value":"dto-mapped","label":"DTOs mapped from domain objects"},{"value":"mixed","label":"Mixed (describe in Detail)"}]},{"id":"C-71","section":"H","type":"multiselect","title":"How are request bodies turned into objects on updates?","tip":"Binding straight onto a domain or CUF object lets the client set any field the object has.","detail":"Examples with file:line","options":[{"value":"requestbody-domain","label":"@RequestBody onto a domain, entity, or CUF object"},{"value":"requestbody-dto","label":"@RequestBody onto a DTO or command object"},{"value":"modelattribute","label":"@ModelAttribute form binding"},{"value":"beanparam","label":"JAX-RS @BeanParam or @FormParam"},{"value":"jsf-properties","label":"JSF managed-bean properties bound from forms"},{"value":"getparameter","label":"Manual request.getParameter"},{"value":"none-found","label":"None found (no writes)"}]},{"id":"C-72","section":"H","type":"multiselect","title":"Is there anything that limits which fields a request can set?","tip":"@InitBinder allowed fields, read-only Jackson properties, or DTOs that only carry the intended fields.","detail":"Where applied, global or per controller","options":[{"value":"initbinder-allowed","label":"@InitBinder setAllowedFields"},{"value":"initbinder-disallowed","label":"@InitBinder setDisallowedFields"},{"value":"jsonignore-setters","label":"@JsonIgnoreProperties or @JsonProperty(access = READ_ONLY)"},{"value":"dto-only","label":"DTOs carrying only the intended fields"},{"value":"none-found","label":"None found"}]},{"id":"C-73","section":"H","type":"select","title":"Are authenticated responses sent with Cache-Control: no-store?","tip":"Usually a filter or the shared web-security library.","detail":"Where set and the header value","options":[{"value":"global-filter","label":"Global filter or header writer sets no-store"},{"value":"per-endpoint","label":"Set per endpoint only"},{"value":"none-found","label":"None found"}]},{"id":"C-74","section":"H","type":"select","title":"Is directory listing disabled in weblogic.xml?","tip":"index-directory-enabled inside container-descriptor.","options":[{"value":"disabled-explicit","label":"Explicitly disabled"},{"value":"enabled-explicit","label":"Explicitly enabled"},{"value":"not-set-default","label":"Not set (container default)"},{"value":"no-weblogic-xml","label":"No weblogic.xml present"}]},{"id":"C-75","section":"H","type":"text","title":"Which folders are served as static content, and is anything besides frontend assets in them?","tip":"Resource handlers, the default servlet, src/main/webapp. Config files, source maps, or documents under a static folder are reachable by URL."},{"id":"C-90","section":"J","type":"text","title":"Which JSF pages hold a record id in a backing bean, and where does that id come from?","tip":"A view parameter or f:param comes from the request and can be changed. A session attribute cannot."},{"id":"C-91","section":"J","type":"select","title":"Is JSF view state saved on the server, or on the client, and if on the client is it encrypted?","tip":"javax.faces.STATE_SAVING_METHOD in web.xml.","options":[{"value":"server-side","label":"Server-side state saving"},{"value":"client-encrypted","label":"Client-side, encrypted"},{"value":"client-unencrypted","label":"Client-side, not encrypted"}]},{"id":"C-96","section":"K","type":"yesno","title":"Is CUF the main data path for this app?","tip":"The Common Update Framework service most apps use to read and write the main data set."},{"id":"C-97","section":"K","type":"yesno","title":"Are backend services called without any authentication?","tip":"If so, this app is the only place a record-level check can happen."},{"id":"C-98","section":"K","type":"yesno","title":"Is this app deployed to WebLogic?","tip":"weblogic.xml in WEB-INF.","detail":"WebLogic version from the descriptor namespace"},{"id":"F-01","section":"Z","type":"list","title":"Issues found","tip":"Where it is (URL, class, or file), what is wrong, and how bad you think it is.","optional":true,"findings":true,"columns":[{"key":"location","label":"Where (URL, class, or file)"},{"key":"description","label":"What is wrong","type":"long"},{"key":"relatedItem","label":"Related question (optional)"},{"key":"severity","label":"How bad","type":"select","options":["high","medium","low","not sure"]}]},{"id":"R-01","section":"RA","type":"check","title":"This public endpoint returns no record data and accepts no identifier.","tip":"Open the handler and follow every path to the response. A status string is fine; a record, document, or list, or any parameter that selects a record, is a problem.","forEach":"C-13","severity":"high"},{"id":"R-02","section":"RA","type":"check","title":"This exclusion pattern cannot be used to reach a protected path.","tip":"For prefix, regex, or contains matches on the raw URI, try in your head: /public/../private, a double slash, an encoded slash, ;jsessionid=x, a case change, a .json suffix. An exact match on the normalised path is fine.","forEach":"C-12","severity":"high"},{"id":"R-03","section":"RA","type":"check","title":"Every servlet and controller path is covered by the login filter's mappings.","tip":"Compare web.xml servlet mappings and controller prefixes with the filter mappings. Watch /* versus /ws/*, and filters that do not run on FORWARD or ERROR dispatches.","severity":"high"},{"id":"R-10","section":"RB","type":"check","title":"Who the caller is comes only from the session or the validated token, never from a request parameter.","tip":"Search for personId, sponsorId, familyId, or operatorId read from a parameter or header and then used as the current user.","severity":"high"},{"id":"R-11","section":"RB","type":"check","title":"The session cookie is HttpOnly and Secure, and the session id never appears in a URL.","tip":"cookie-config in web.xml, session-descriptor in weblogic.xml, url-rewriting-enabled false, no encodeURL calls that add jsessionid.","when":{"q":"C-15","in":["session-cookie","both"]},"severity":"medium"},{"id":"R-12","section":"RB","type":"check","title":"The login cookie is readable from JavaScript, so it is not HttpOnly.","tip":"Confirm the read runs in production code. If it does, this is a problem by itself: script injection anywhere on the cookie domain can steal the SSO session. Mark it Problem found and note the file, even though the fix belongs to the identity service.","when":{"q":"C-17","eq":"yes"},"severity":"medium"},{"id":"R-13","section":"RB","type":"check","title":"The operator's selected site and access level limit every data request on the server, not only at the moment of selection.","tip":"Find where the selection from /selectsite is stored, then check that each query, CUF request, and service call uses it. A site id taken from the request instead, or a data path that never looks at the selection, is a problem.","when":{"q":"C-02","in":["operator","both"]},"severity":"high"},{"id":"R-20","section":"RC","type":"check","title":"The token signature is verified with a fixed algorithm before any claim is read.","tip":"jjwt: parseClaimsJws with a key passes; parse or parseClaimsJwt accept unsigned tokens. auth0: the verifier must name the algorithm. Custom decryption must also authenticate the token.","when":{"q":"C-03","eq":"portlet"},"severity":"high"},{"id":"R-21","section":"RC","type":"check","title":"Expiry, issuer, and audience or app id are all enforced.","tip":"Find the line for each and what happens on failure. With a secret shared across portlets, the audience check is what stops a token minted for another portlet.","when":{"q":"C-03","eq":"portlet"},"severity":"high"},{"id":"R-22","section":"RC","type":"check","title":"The token travels in the iframe URL.","tip":"That puts it in access logs, browser history, and Referer headers, so this is a problem by itself. Mark it Problem found and note the expiry and whether it is exchanged for a session immediately.","when":{"q":"C-20","eq":"query-param"},"severity":"medium"},{"id":"R-23","section":"RC","type":"check","title":"Every scope decision uses the token's claims; no request parameter can replace the family id, sponsor id, or access levels.","tip":"Search for those names read from parameters or the body and followed into data calls.","when":{"q":"C-03","eq":"portlet"},"severity":"high"},{"id":"R-24","section":"RC","type":"check","title":"The session created after token validation cannot be mixed with a second token, and the session id changes at token login.","tip":"Look for invalidate or changeSessionId at login, and what happens if a different token arrives later.","when":{"all":[{"q":"C-03","eq":"portlet"},{"q":"C-26","in":["creates-http-session","both"]}]},"severity":"medium"},{"id":"R-25","section":"RC","type":"check","title":"Token claims come only from the logged-in session; nothing from the request shapes them; expiry is short.","tip":"Open the minting code and check the source of each claim.","when":{"q":"C-03","eq":"portal"},"severity":"high"},{"id":"R-26","section":"RC","type":"check","title":"The token secret is hardcoded in source.","tip":"Anyone with repository access can mint tokens, so this is a problem by itself. Mark it Problem found and note the class. Do not paste the value.","when":{"q":"C-24","eq":"hardcoded"},"severity":"high"},{"id":"R-27","section":"RC","type":"check","title":"No framing restriction is set.","tip":"Any origin can frame this application, so this is a problem by itself. Mark it Problem found. For a portlet, the correct value allows only the portal origin.","when":{"q":"C-28","eq":"none-found"},"severity":"low"},{"id":"R-30","section":"RD","type":"check","title":"The id is compared with the caller's family, site, or access level before any data for it is returned.","tip":"Follow the id from the parameter through the service to the data call and point at the comparison line. Logged in plus allowed to use the app is not enough. A check only in Angular does not count.","forEach":"C-41","severity":"high"},{"id":"R-31","section":"RD","type":"check","title":"Every endpoint in your C-41 list goes through the shared scope helper.","tip":"Find the helper's call sites and compare with the list.","when":{"q":"C-32","eq":"canonical-helper"},"severity":"high"},{"id":"R-32","section":"RD","type":"check","title":"No record-level check exists anywhere in this application.","tip":"That is the incident shape across the whole application, so this is a problem by itself. Mark it Problem found, then still work through R-30 for every endpoint so the exposure is listed per endpoint.","when":{"q":"C-32","eq":"none-found"},"severity":"high"},{"id":"R-33","section":"RD","type":"check","title":"List and search endpoints limit results to the caller's scope on the server, not in Angular.","tip":"The constraint must be in the query, the CUF request, or a server-side filter before the response is built.","severity":"high"},{"id":"R-40","section":"RE","type":"check","title":"Update or delete by id checks that the record belongs to the caller before writing.","tip":"Check both the id in the URL and any id inside the body; they can name different records.","forEach":"C-41","forEachWhere":{"col":"mutates","eq":"yes"},"severity":"high"},{"id":"R-41","section":"RE","type":"check","title":"Request bodies bound onto domain or CUF objects cannot set ids, ownership, status, or access fields.","tip":"List the settable fields of the bound class and compare with what the form sends. Look for an @InitBinder allow-list or read-only Jackson properties.","when":{"q":"C-71","includesAny":["requestbody-domain","modelattribute","jsf-properties","beanparam"]},"severity":"high"},{"id":"R-42","section":"RE","type":"check","title":"This upload attaches only to a record the caller owns.","tip":"The target record id must be checked before the bytes are stored or linked.","forEach":"C-63","severity":"high"},{"id":"R-50","section":"RF","type":"check","title":"Before every call to this service, the id being sent has been checked against the caller's scope.","tip":"Find each call site and walk back to the check. The service checks nothing.","forEach":"C-51","severity":"high"},{"id":"R-51","section":"RF","type":"check","title":"This query limits results to the caller's scope, or the result is checked before it is returned.","tip":"A find-by-id alone returns anyone's record if the id is changed.","forEach":"C-53","severity":"high"},{"id":"R-60","section":"RG","type":"check","title":"The file's owner is compared with the caller's scope before the first byte is read.","tip":"This is the incident. Follow the id to the file path, service call, or blob read. If the handler is public, it is a problem regardless of any check.","forEach":"C-61","severity":"high"},{"id":"R-61","section":"RG","type":"check","title":"File ids are only shown to callers allowed to see the file.","tip":"Listings, links, JSON fields. Note whether ids are sequential.","severity":"medium"},{"id":"R-70","section":"RH","type":"check","title":"Responses contain no fields the screen never shows.","tip":"Compare the returned class, including nested objects, with what the component reads. Other family members, SSNs, internal flags, audit fields.","when":{"q":"C-70","in":["entities-wholesale","mixed"]},"severity":"medium"},{"id":"R-71","section":"RH","type":"check","title":"Authenticated responses carry Cache-Control: no-store.","tip":"Look for a filter or header writer; note data endpoints it does not cover.","when":{"q":"C-73","in":["per-endpoint","none-found","unknown"]},"severity":"low"},{"id":"R-72","section":"RH","type":"check","title":"Directory listing is off and static folders hold only frontend assets.","tip":"index-directory-enabled in weblogic.xml. Walk each static root for config files, source maps, backups, documents.","when":{"any":[{"q":"C-74","in":["enabled-explicit","not-set-default","no-weblogic-xml"]},{"q":"C-75","notEmpty":true}]},"severity":"low"},{"id":"R-80","section":"RI","type":"check","title":"The id from the view parameter is checked against scope on page load and again in every action that uses it.","tip":"A view- or session-scoped bean keeps the id between requests, and a postback can change it.","forEach":"C-90","severity":"high"},{"id":"R-81","section":"RI","type":"check","title":"Client-side view state is encrypted.","tip":"javax.faces.STATE_SAVING_METHOD and the implementation's secret key parameter.","when":{"q":"C-91","in":["client-unencrypted","unknown"]},"severity":"medium"},{"id":"F-02","section":"RZ","type":"list","title":"Other issues found during review","tip":"Where it is, what is wrong, and how bad you think it is.","optional":true,"findings":true,"columns":[{"key":"location","label":"Where (URL, class, or file)"},{"key":"description","label":"What is wrong","type":"long"},{"key":"relatedItem","label":"Related item (optional)"},{"key":"severity","label":"How bad","type":"select","options":["high","medium","low","not sure"]}]}]}</script>
+<div id="modal" hidden role="dialog" aria-modal="true"><div class="modal"></div></div>
+<script type="application/json" id="def">{"id":"web-idor-review","version":"0.3.0","title":"Web Application Security Review","mode":"dev","negativeValues":["no","none","none-found","unknown","not-established","not-set-default","no-weblogic-xml","none-api-only"],"intro":"Each topic asks a few questions about one area of the application, then tells you what to check there and what a problem looks like, then gives you a place to record anything else you noticed in that area. Answer from the code. Mark a check Checked, OK only when you found the line that does the check; describe every problem.","phases":[],"sections":[{"id":"T0","title":"What this application is"},{"id":"T1","title":"Who uses it and how they log in"},{"id":"T2","title":"The token from the portal","when":{"q":"C-03","in":["portal","portlet","unknown"]}},{"id":"T3","title":"What can be reached without logging in"},{"id":"T4","title":"Who is allowed to see what"},{"id":"T5","title":"Reading records by identifier"},{"id":"T6","title":"Changing records"},{"id":"T7","title":"Files and documents"},{"id":"T8","title":"Where the data comes from"},{"id":"T9","title":"Caching and static content"},{"id":"T10","title":"JSF pages","when":{"q":"C-04","includes":"jsf"}},{"id":"T12","title":"Anything else"}],"items":[{"id":"C-01","section":"T0","type":"text","title":"Which module builds the deployable WAR, and what is its context root?","tip":"Root pom or the module with war packaging. Context root is in weblogic.xml."},{"id":"C-04","section":"T0","type":"multiselect","title":"Which frameworks handle requests on the backend?","tip":"Select everything that handles even one page. The pom and web.xml settle it.","detail":"Versions and anything selected as Other","options":[{"value":"spring-mvc","label":"Spring MVC (@Controller, DispatcherServlet)"},{"value":"spring-boot","label":"Spring Boot"},{"value":"spring-security","label":"Spring Security"},{"value":"jaxrs","label":"JAX-RS (@Path; Jersey, RESTEasy, or CXF)"},{"value":"jsf","label":"JSF (FacesServlet, .xhtml or .jspx pages)"},{"value":"jsp","label":"JSP pages"},{"value":"servlets","label":"Raw servlets (web.xml \u003cservlet> or @WebServlet)"},{"value":"websocket","label":"WebSocket endpoints"},{"value":"struts","label":"Struts"},{"value":"other","label":"Other (describe in Detail)"}]},{"id":"C-05","section":"T0","type":"select","title":"What is the frontend?","tip":"package.json under src/main/angular shows the Angular version.","detail":"Version from package.json and where the frontend source lives","options":[{"value":"angular","label":"Angular 2 or later"},{"value":"angularjs","label":"AngularJS 1.x"},{"value":"mixed","label":"Mixed (describe in Detail)"},{"value":"server-rendered","label":"Server-rendered pages only (JSF or JSP)"},{"value":"none-api-only","label":"None: API only"}]},{"id":"C-06","section":"T0","type":"select","title":"Is the frontend served from the same WAR as the backend?","tip":"CORS configuration on the backend (@CrossOrigin, CorsFilter) means a separate origin.","detail":"CORS allowed origins and credentials setting, if any","options":[{"value":"same-war","label":"Served from the same WAR (same origin)"},{"value":"separate-origin-cors","label":"Separate origin with CORS"},{"value":"separate-proxied","label":"Separate deployment behind the same origin (proxy)"}]},{"id":"C-98","section":"T0","type":"yesno","title":"Is this app deployed to WebLogic?","tip":"weblogic.xml in WEB-INF.","detail":"WebLogic version from the descriptor namespace"},{"id":"C-02","section":"T1","type":"select","title":"Who uses this application: beneficiaries or operators?","tip":"Beneficiary self-service apps log people in through the beneficiary SSO filter (AuthFilter, iPlanetDirectoryPro cookie) and scope data to a family. Operator apps use OperatorAuthenticationFilter and OperatorAuthorizationFilter and scope data by access level or selected site.","detail":"Who exactly: sponsors, dependents, call-centre operators, site staff","options":[{"value":"beneficiary","label":"Beneficiary self-service"},{"value":"operator","label":"Operator (call centre or office staff)"},{"value":"both","label":"Both audiences"}]},{"id":"C-03","section":"T1","type":"select","title":"Is this a portal, a portlet, or a standalone application?","tip":"A portal hosts other apps in iframes and creates the token they receive. A portlet runs inside a portal iframe and receives that token. A standalone app logs users in itself.","detail":"Naming convention observed (artifactId prefix, package name)","options":[{"value":"portal","label":"Portal: hosts portlets and mints their token"},{"value":"portlet","label":"Portlet: loaded in a portal iframe, receives a token"},{"value":"standalone","label":"Standalone: own SSO, no iframe hosting, no parent token"}]},{"id":"C-10","section":"T1","type":"multiselect","title":"How do users log in?","tip":"Usually one of the enterprise filters from the shared web-security library, declared in web.xml. Select everything that applies.","detail":"Logon methods supported (CAC, FAM, DFAS, SNT) and anything custom","options":[{"value":"beneficiary-sso","label":"Enterprise beneficiary SSO filter (AuthFilter / BeneficiaryAgentSSO)"},{"value":"operator-filter","label":"Enterprise operator filters (OperatorAuthenticationFilter / OperatorAuthorizationFilter)"},{"value":"portal-jwt","label":"Token received from a parent portal"},{"value":"spring-security","label":"Spring Security"},{"value":"container-managed","label":"Container-managed (\u003clogin-config> in web.xml)"},{"value":"custom","label":"Custom or home-grown"},{"value":"none","label":"None found"}]},{"id":"C-14","section":"T1","type":"select","title":"After login, where does the code keep who the user is?","tip":"Follow the login filter to where it stores the user, then find the class the rest of the code reads to get the person, family, or operator ids.","detail":"Class holding the identity and the identifiers it carries (person id, sponsor id, family id, operator id, access levels, site)","options":[{"value":"http-session","label":"HttpSession attribute"},{"value":"custom-principal","label":"Custom Principal via request.getUserPrincipal()"},{"value":"thread-local","label":"ThreadLocal or request-scoped holder"},{"value":"spring-security-context","label":"Spring SecurityContextHolder"},{"value":"jwt-each-request","label":"Re-derived from the token on every request"},{"value":"other","label":"Other (describe in Detail)"}]},{"id":"C-15","section":"T1","type":"select","title":"What does each request carry after login: a session cookie or a token?","tip":"A token means an Angular interceptor adds an Authorization header and the server parses it on every request.","options":[{"value":"session-cookie","label":"Session cookie"},{"value":"bearer-jwt","label":"Bearer token on every request"},{"value":"both","label":"Both"},{"value":"none","label":"None found"}]},{"id":"C-17","section":"T1","type":"yesno","title":"Does the Angular code read the login cookie directly, for example iPlanetDirectoryPro?","tip":"Search the frontend for document.cookie or a cookie service. If JavaScript can read it, the cookie is not HttpOnly.","detail":"Cookie names and the files that read them"},{"id":"R-10","section":"T1","type":"check","title":"Search for personId, sponsorId, familyId, or operatorId being read from a request parameter, header, or cookie.","tip":"Then follow each one to see whether it is used as the current user.","finding":"Any of them used as who the caller is, instead of the value from the session or the validated token.","severity":"high"},{"id":"R-11","section":"T1","type":"check","title":"Check the cookie flags in web.xml and weblogic.xml, and search for encodeURL and url-rewriting-enabled.","tip":"Effective values count, defaults included: WebLogic defaults HttpOnly on, Secure off, and URL rewriting on. \u003ctracking-mode>COOKIE\u003c/tracking-mode> in web.xml or url-rewriting-enabled false switches rewriting off.","finding":"HttpOnly explicitly false, Secure not explicitly true, URL rewriting left on, or code that appends jsessionid to a URL.","when":{"q":"C-15","in":["session-cookie","both"]},"severity":"medium"},{"id":"R-12","section":"T1","type":"check","title":"The login cookie is readable from JavaScript, so it is not HttpOnly.","tip":"Confirm the read runs in production code (it has a caller). If JavaScript can read it, script injection anywhere on the cookie domain can steal the SSO session.","finding":"It is (confirmed in code: the read runs in production). Mark it Problem found and note the file, even though the fix belongs to the identity service.","when":{"q":"C-17","eq":"yes"},"severity":"medium"},{"id":"F-01","section":"T1","type":"list","title":"Anything else wrong that you noticed in this area","tip":"Where it is (URL, class, or file), what is wrong, and how bad you think it is.","optional":true,"findings":true,"columns":[{"key":"location","label":"Where (URL, class, or file)"},{"key":"description","label":"What is wrong","type":"long"},{"key":"relatedItem","label":"Related item (optional)"},{"key":"severity","label":"How bad","type":"select","options":["high","medium","low","not sure"]}]},{"id":"C-20","section":"T2","type":"select","title":"How does the token get from the portal into the portlet?","tip":"How the iframe src is built on the portal side, and where the portlet first reads the token. A query parameter ends up in access logs and browser history.","detail":"Portal side (file:line) and portlet side (file:line)","options":[{"value":"query-param","label":"iframe src query parameter"},{"value":"url-fragment","label":"URL fragment"},{"value":"postmessage","label":"window.postMessage"},{"value":"shared-domain-cookie","label":"Cookie on a shared domain"},{"value":"proxy-header","label":"Header injected by a proxy"},{"value":"other","label":"Other (describe in Detail)"}]},{"id":"C-21","section":"T2","type":"select","title":"How is the token protected?","tip":"jjwt, auth0, or nimbus with a signWith call means signed. Cipher calls outside a JWT library mean custom encryption.","detail":"Library, class, and algorithm constant","options":[{"value":"jws-hmac","label":"JWS signed with HMAC (shared secret)"},{"value":"jws-asymmetric","label":"JWS signed with an asymmetric key"},{"value":"jwe","label":"JWE encrypted"},{"value":"jws-and-jwe","label":"Signed and encrypted"},{"value":"custom-crypto","label":"Custom encrypt/decrypt outside a JOSE library"}]},{"id":"C-22","section":"T2","type":"text","title":"What is in the token?","tip":"Family id, sponsor id, person id, access levels, app id, site, expiry."},{"id":"C-23","section":"T2","type":"multiselect","title":"What does the portlet check when it receives the token?","tip":"Select only what the code demonstrably enforces. jjwt and auth0 reject an expired token automatically when exp is present, but neither requires exp to exist; select exp only if the code requires it. Issuer and audience count only with requireIssuer/requireAudience, withIssuer/withAudience, or an explicit comparison.","when":{"q":"C-03","eq":"portlet"},"detail":"Class and lines performing each check","options":[{"value":"signature","label":"Signature verified"},{"value":"exp","label":"Expiry (exp) enforced"},{"value":"nbf","label":"Not-before (nbf) enforced"},{"value":"iss","label":"Issuer (iss) checked"},{"value":"aud-or-app-id","label":"Audience or application id checked"},{"value":"alg-pinned","label":"Algorithm pinned (rejects none and algorithm switching)"},{"value":"jti-replay","label":"Replay protection (jti or one-time use)"},{"value":"none-found","label":"None found"}]},{"id":"C-24","section":"T2","type":"select","title":"Where does the signing secret live?","tip":"Follow the property key from the code that loads the key.","detail":"Property key and file","options":[{"value":"properties-in-war","label":"Properties file inside the WAR"},{"value":"credential-store-jndi","label":"WebLogic credential store or JNDI"},{"value":"env-var","label":"Environment variable"},{"value":"hardcoded","label":"Hardcoded in source"},{"value":"other","label":"Other (describe in Detail)"}]},{"id":"C-25","section":"T2","type":"select","title":"Is the secret shared across all portlets or specific to this one?","tip":"A shared library default or the same property name in several apps means shared.","detail":"How this was determined","options":[{"value":"fleet-shared","label":"One key shared across the fleet"},{"value":"per-portlet","label":"Per portlet"}]},{"id":"C-26","section":"T2","type":"select","title":"After the token is accepted, does the portlet create a session or require the token on every request?","tip":"Look for getSession(true) after the token check.","when":{"q":"C-03","eq":"portlet"},"detail":"What is stored and how it is bound to the token identity","options":[{"value":"creates-http-session","label":"Creates an HttpSession holding identity"},{"value":"stateless","label":"Stateless: token on every request"},{"value":"both","label":"Both"}]},{"id":"C-27","section":"T2","type":"text","title":"Which filter rejects requests with no valid token or session, and what happens if the portlet URL is opened directly in a browser tab?","tip":"The filter class, its URL patterns, and its exclusions.","when":{"q":"C-03","eq":"portlet"}},{"id":"C-28","section":"T2","type":"select","title":"Is framing restricted with X-Frame-Options or a CSP frame-ancestors header?","tip":"Usually set in a filter or by the shared web-security library.","detail":"Values and where they are set","options":[{"value":"x-frame-options","label":"X-Frame-Options set"},{"value":"csp-frame-ancestors","label":"CSP frame-ancestors set"},{"value":"both","label":"Both"},{"value":"none-found","label":"None found"}]},{"id":"C-29","section":"T2","type":"text","title":"Where does the portal create the token, and what does it put in it?","tip":"Class and method, the fields copied from the logged-in user, and the expiry.","when":{"q":"C-03","eq":"portal"}},{"id":"R-20","section":"T2","type":"check","title":"Find the call that parses the token and read what it verifies.","tip":"jjwt: parseClaimsJws with a key is right (a byte[] key also pins HMAC); parse or parseClaimsJwt accept unsigned tokens. auth0: the verifier must name the algorithm; JWT.decode reads claims without verifying. Custom decryption must also authenticate the token.","finding":"An unsigned parse, a verifier without a fixed algorithm, custom decryption that does not authenticate, or any claim read before verification.","when":{"q":"C-03","eq":"portlet"},"severity":"high"},{"id":"R-21","section":"T2","type":"check","title":"Find the lines that enforce expiry, issuer, and audience or app id.","tip":"With jjwt or auth0, look for the line that requires exp to be present; expiry itself is automatic when the claim exists. Audience and issuer need requireAudience/withAudience or an explicit comparison.","finding":"exp not required to be present, or issuer or audience never compared. With a secret shared across portlets, a missing audience check accepts a token minted for another portlet.","when":{"q":"C-03","eq":"portlet"},"severity":"high"},{"id":"R-22","section":"T2","type":"check","title":"The token travels in the iframe URL.","tip":"A URL token ends up in access logs, browser history, and Referer headers.","finding":"It is (confirmed in code). Mark it Problem found and note the expiry and whether it is exchanged for a session immediately.","when":{"q":"C-20","eq":"query-param"},"severity":"medium"},{"id":"R-23","section":"T2","type":"check","title":"Search for familyId, sponsorId, or accessLevel being read from a parameter or the body, and follow each into a data call.","tip":"Compare with where the validated token claims are stored.","finding":"A request value replacing the token's claim on any data path.","when":{"q":"C-03","eq":"portlet"},"severity":"high"},{"id":"R-24","section":"T2","type":"check","title":"Read what happens at token login and what happens when a different token arrives on an existing session.","tip":"Look for invalidate or changeSessionId, and for attribute writes on later requests.","finding":"No session-id change at login, or a second token changing part of the session while the rest stays.","when":{"all":[{"q":"C-03","eq":"portlet"},{"q":"C-26","in":["creates-http-session","both","unknown"]}]},"severity":"medium"},{"id":"R-25","section":"T2","type":"check","title":"Open the minting code and trace the source of each claim.","tip":"Every value must come from the server-side identity.","finding":"A claim populated from a request parameter, including the target portlet used as audience, or a long expiry.","when":{"q":"C-03","eq":"portal"},"severity":"high"},{"id":"R-26","section":"T2","type":"check","title":"The signing secret is a literal in source.","tip":"Do not paste the value anywhere.","finding":"It is (confirmed in code). Anyone with repository access can mint tokens. Mark it Problem found and note the class.","when":{"q":"C-24","eq":"hardcoded"},"severity":"high"},{"id":"R-27","section":"T2","type":"check","title":"No framing restriction is set anywhere.","tip":"Search filters, security configuration, and the shared library for X-Frame-Options and frame-ancestors. For a portlet, the correct value allows only the portal origin.","finding":"It is (confirmed: neither header is set). Any origin can frame the application. Mark it Problem found.","when":{"q":"C-28","eq":"none-found"},"severity":"low"},{"id":"R-28","section":"T2","type":"check","title":"Find where the portal chooses which portlet URL the token is attached to, and where it posts the token.","tip":"The destination must come from fixed configuration. A postMessage must name the portlet origin.","finding":"The destination comes from a request or route parameter, or postMessage uses \"*\". A caller can then send a token valid for every portlet to a server they control.","when":{"q":"C-03","eq":"portal"},"severity":"high"},{"id":"F-02","section":"T2","type":"list","title":"Anything else wrong that you noticed in this area","tip":"Where it is (URL, class, or file), what is wrong, and how bad you think it is.","optional":true,"findings":true,"columns":[{"key":"location","label":"Where (URL, class, or file)"},{"key":"description","label":"What is wrong","type":"long"},{"key":"relatedItem","label":"Related item (optional)"},{"key":"severity","label":"How bad","type":"select","options":["high","medium","low","not sure"]}]},{"id":"C-12","section":"T3","type":"text","title":"Which URL patterns skip the login filter?","tip":"Filter mappings and exclusion patterns in web.xml or the filter's init-params, for example /ws/public/*, appmonitor.status, static folders. One per line."},{"id":"C-13","section":"T3","type":"text","title":"What can be reached without logging in, and does any of it return data?","tip":"For each excluded pattern, list what is behind it. Health checks and static assets are expected; anything that returns records is an issue."},{"id":"R-03","section":"T3","type":"check","title":"List every servlet mapping and controller prefix, and compare them with the login filter's mappings.","tip":"web.xml servlet mappings, controller @RequestMapping prefixes, the JSF servlet, error pages. Watch /* against /ws/*.","finding":"A mapping the filter does not cover, or a filter that does not run on FORWARD or ERROR dispatches.","severity":"high"},{"id":"R-02","section":"T3","type":"check","title":"For every exclusion pattern you listed in C-12, read the code that decides it skips the login filter.","tip":"Find the comparison and what it compares: the raw request URI or the normalised servlet path. For Spring Security rules, compare antMatchers with MVC's own matching and check web.ignoring.","finding":"A prefix, regex, or contains match on the raw URI. Try in your head: /public/../private, a double slash, an encoded slash, ;jsessionid=x, a case change, a .json suffix. For a servlet-mapping gap, the gap itself is the problem.","forEach":"C-12","severity":"high"},{"id":"R-01","section":"T3","type":"check","title":"For every public URL you listed in C-13, open its handler and follow every path to the response.","tip":"A status string or a health check is fine.","finding":"Any of them returns a record, a document, or a list, or looks anything up by an id, name, or number taken from the request.","forEach":"C-13","severity":"high"},{"id":"F-03","section":"T3","type":"list","title":"Anything else wrong that you noticed in this area","tip":"Where it is (URL, class, or file), what is wrong, and how bad you think it is.","optional":true,"findings":true,"columns":[{"key":"location","label":"Where (URL, class, or file)"},{"key":"description","label":"What is wrong","type":"long"},{"key":"relatedItem","label":"Related item (optional)"},{"key":"severity","label":"How bad","type":"select","options":["high","medium","low","not sure"]}]},{"id":"C-30","section":"T4","type":"select","title":"Who is allowed to see a given record in this application?","tip":"Beneficiary apps: the user's own family. Operator apps: by access level, by selected site, or both. Write the rule as one sentence in Detail.","detail":"In one sentence: what does 'allowed to see this record' mean in this application?","options":[{"value":"beneficiary-family","label":"Beneficiary: own family only"},{"value":"operator-access-level","label":"Operator: by access level"},{"value":"operator-site","label":"Operator: by selected site"},{"value":"mixed","label":"Mixed (describe in Detail)"},{"value":"none-found","label":"No ownership rule found in code"}]},{"id":"C-35","section":"T4","type":"text","title":"Which people can a logged-in beneficiary see or change, and where is that set built?","tip":"Only themselves, their dependents, their sponsor, the whole family, or different by role. Where the set comes from (login, session, per request, token) and where it is consulted.","when":{"q":"C-02","in":["beneficiary","both","unknown"]}},{"id":"C-34","section":"T4","type":"text","title":"What do access levels mean here, and how is the selected site enforced on later requests?","tip":"List the levels or roles and what each allows. Where the selected site is stored and how later requests are limited to it.","when":{"q":"C-02","in":["operator","both","unknown"]}},{"id":"C-31","section":"T4","type":"yesno","title":"Is there a check that the user may use this application at all?","tip":"For operator apps this is the App ID check in OperatorAuthorizationFilter. It is not the same as checking a specific record.","detail":"Class, application id, and configuration location"},{"id":"C-33","section":"T4","type":"select","title":"Where does the list of records the user may see come from?","tip":"Loaded at login into the session, looked up per request, carried in the token, or nowhere.","detail":"Class and method that establishes it","options":[{"value":"roster-in-session","label":"Roster fetched at login and stored in the session"},{"value":"per-request-lookup","label":"Looked up on every request"},{"value":"jwt-claims","label":"Carried in token claims"},{"value":"not-established","label":"Not established anywhere"}]},{"id":"C-32","section":"T4","type":"select","title":"When a request names a specific record, where is it checked that this user may see that record?","tip":"This is the question the whole review is about. One shared helper is best. Role checks (hasRole, @Secured, @RolesAllowed) do not count; they say who may use the app, not who may see this record. If you cannot point at a place where the record is checked, choose none found.","detail":"Helper name and location, or examples of the ad hoc pattern","options":[{"value":"canonical-helper","label":"Single canonical helper, for example isInMyFamily(personId)"},{"value":"per-endpoint","label":"Ad hoc per endpoint"},{"value":"annotation","label":"Annotation or aspect based"},{"value":"none-found","label":"None found"}]},{"id":"R-13","section":"T4","type":"check","title":"Find where the selection made through /selectsite is stored, then check that each query, CUF request, and service call uses it.","tip":"Session attribute or token claim, then every data path.","finding":"A data path that takes a site id from the request instead, or that never looks at the stored selection.","when":{"q":"C-02","in":["operator","both","unknown"]},"severity":"high"},{"id":"F-04","section":"T4","type":"list","title":"Anything else wrong that you noticed in this area","tip":"Where it is (URL, class, or file), what is wrong, and how bad you think it is.","optional":true,"findings":true,"columns":[{"key":"location","label":"Where (URL, class, or file)"},{"key":"description","label":"What is wrong","type":"long"},{"key":"relatedItem","label":"Related item (optional)"},{"key":"severity","label":"How bad","type":"select","options":["high","medium","low","not sure"]}]},{"id":"C-40","section":"T5","type":"multiselect","title":"How do requests reach code?","tip":"JSF action methods count. Actuator is out of scope but note it if present.","detail":"Anything selected as Other","options":[{"value":"spring-mvc","label":"Spring MVC controllers"},{"value":"jaxrs","label":"JAX-RS resources"},{"value":"jsf-actions","label":"JSF managed-bean actions"},{"value":"servlets","label":"Raw servlets"},{"value":"websocket","label":"WebSocket endpoints"},{"value":"actuator","label":"Spring Boot actuator (note only)"},{"value":"other","label":"Other (describe in Detail)"}]},{"id":"C-41","section":"T5","type":"list","title":"Which endpoints take a record identifier from the request, and where is scope checked for each?","tip":"Every endpoint where the caller supplies an id for a person, family, document, or other record in the path, query string, body, or a header. One row each; the checks below ask about each row.","columns":[{"key":"methods","label":"HTTP method"},{"key":"path","label":"Path"},{"key":"idParams","label":"What the id identifies"},{"key":"mutates","label":"Writes or deletes","type":"select","options":["yes","no"]}]},{"id":"C-42","section":"T5","type":"multiselect","title":"What kinds of identifiers appear in requests?","tip":"Sequential numeric ids are the easiest to guess.","detail":"Format notes: sequential numeric, guessable, base64 of an id, and so on","options":[{"value":"person-id","label":"Person id"},{"value":"sponsor-id","label":"Sponsor id"},{"value":"family-id","label":"Family id"},{"value":"document-id","label":"Document or file id"},{"value":"db-primary-key","label":"Database primary key"},{"value":"uuid","label":"UUID or GUID"},{"value":"opaque-token","label":"Opaque or encoded token"},{"value":"composite","label":"Composite key"},{"value":"other","label":"Other (describe in Detail)"},{"value":"none","label":"No request-supplied identifiers (every record is chosen from the session or token)"}]},{"id":"R-30","section":"T5","type":"check","title":"Follow the id from the request through the service to the data call, and find the line that compares it with the caller's family, site, or access level.","tip":"Logged in plus allowed to use the app is not enough. A check only in Angular does not count. A check after the data is already written to the response does not count.","finding":"No such line on any path from this handler to the data. Any caller can then read another person's record by changing the id.","forEach":"C-41","severity":"high"},{"id":"R-31","section":"T5","type":"check","title":"Find every call site of the shared scope helper, or every record-level annotation, and compare them with the endpoints you listed in C-41.","tip":"For annotations, first confirm method security is enabled (@EnableGlobalMethodSecurity(prePostEnabled = true) or @EnableMethodSecurity); without it @PreAuthorize is ignored.","finding":"An endpoint that reaches data without the helper or annotation, calls it with a different id than it uses, or has an annotation that only checks a role.","when":{"q":"C-32","in":["canonical-helper","annotation"]},"severity":"high"},{"id":"R-32","section":"T5","type":"check","title":"If no record-level check exists anywhere in this application, that is the incident shape across the whole application.","tip":"Only mark this if you searched (C-32) and found nothing that compares a requested record with the caller, and the R-30 rows above bear that out.","finding":"It is (confirmed by your search in C-32 and the rows above). Mark it Problem found.","when":{"q":"C-32","eq":"none-found"},"severity":"high"},{"id":"R-33","section":"T5","type":"check","title":"For each endpoint that returns a list or search result, find where the family or site constraint is applied.","tip":"It must be in the query, the CUF request, or a server-side filter before the response is built.","finding":"A list fetched whole and filtered in Angular, or not constrained at all.","severity":"high"},{"id":"C-70","section":"T5","type":"select","title":"Do endpoints return whole entities or CUF objects, or DTOs with only the needed fields?","tip":"Whole objects expose every field they carry, including ones the UI never shows.","detail":"Examples, and any @JsonIgnore or @JsonView usage","options":[{"value":"entities-wholesale","label":"Entities or CUF objects serialized wholesale"},{"value":"dto-mapped","label":"DTOs mapped from domain objects"},{"value":"mixed","label":"Mixed (describe in Detail)"}]},{"id":"R-70","section":"T5","type":"check","title":"Compare the class each endpoint returns, including nested objects, with what the screen actually shows.","tip":"Compare the returned class, including nested objects, with what the component reads, whatever the class is named. A DTO filled by MapStruct, ModelMapper, or copyProperties from the full record carries the full record.","finding":"Fields in the response the screen never shows: other family members, SSNs, internal flags, audit fields.","severity":"medium"},{"id":"F-05","section":"T5","type":"list","title":"Anything else wrong that you noticed in this area","tip":"Where it is (URL, class, or file), what is wrong, and how bad you think it is.","optional":true,"findings":true,"columns":[{"key":"location","label":"Where (URL, class, or file)"},{"key":"description","label":"What is wrong","type":"long"},{"key":"relatedItem","label":"Related item (optional)"},{"key":"severity","label":"How bad","type":"select","options":["high","medium","low","not sure"]}]},{"id":"C-71","section":"T6","type":"multiselect","title":"How are request bodies turned into objects on updates?","tip":"Binding straight onto a domain or CUF object lets the client set any field the object has.","detail":"Examples with file:line","options":[{"value":"requestbody-domain","label":"@RequestBody onto a domain, entity, or CUF object"},{"value":"requestbody-dto","label":"@RequestBody onto a DTO or command object"},{"value":"modelattribute","label":"@ModelAttribute form binding"},{"value":"beanparam","label":"JAX-RS @BeanParam or @FormParam"},{"value":"jaxrs-entity","label":"JAX-RS entity parameter onto a domain or CUF object (@Consumes JSON, @PUT/@POST)"},{"value":"jsf-properties","label":"JSF managed-bean properties bound from forms"},{"value":"getparameter","label":"Manual request.getParameter"},{"value":"none-found","label":"None found (no writes)"}]},{"id":"C-72","section":"T6","type":"multiselect","title":"Is there anything that limits which fields a request can set?","tip":"@InitBinder allowed fields, read-only Jackson properties, or DTOs that only carry the intended fields.","detail":"Where applied, global or per controller, and which binding style each mechanism covers","options":[{"value":"initbinder-allowed","label":"@InitBinder setAllowedFields (covers @ModelAttribute, form, and query binding only)"},{"value":"initbinder-disallowed","label":"@InitBinder setDisallowedFields (same coverage)"},{"value":"jsonignore-setters","label":"@JsonIgnoreProperties or @JsonProperty(access = READ_ONLY) without allowSetters (covers @RequestBody and JAX-RS entities)"},{"value":"dto-only","label":"DTOs carrying only the intended fields"},{"value":"none-found","label":"None found"}]},{"id":"R-40","section":"T6","type":"check","title":"Follow the id in the URL, and any id inside the body, to the write.","tip":"The body can name a different record than the URL.","finding":"No comparison with the caller's scope before the write. Any caller can then change or delete another person's record.","forEach":"C-41","forEachWhere":{"col":"mutates","eq":"yes"},"severity":"high"},{"id":"R-41","section":"T6","type":"check","title":"List the settable fields of the class the request body binds to, and compare with what the form actually sends.","tip":"List the settable fields of the class the body lands on (a Dto name proves nothing) and compare with what the form sends. @InitBinder allow-lists cover @ModelAttribute and form binding only; for @RequestBody only @JsonIgnore, @JsonProperty(access = READ_ONLY), or a class without the field counts.","finding":"A settable id, ownership, status, or access field with no allow-list. A caller can then include it in the body and the binder sets it.","when":{"q":"C-71","includesAny":["requestbody-domain","requestbody-dto","modelattribute","beanparam","jaxrs-entity","jsf-properties","getparameter"]},"severity":"high"},{"id":"C-62","section":"T6","type":"yesno","title":"Does the app accept file uploads?","tip":"MultipartFile, @FormDataParam, or a multipart-config in web.xml."},{"id":"C-63","section":"T6","type":"text","title":"Which record does each upload attach to, and where does that record's id come from?","tip":"An upload attached to a record id taken from the request is the write-side twin of file serving.","when":{"q":"C-62","eq":"yes"}},{"id":"R-42","section":"T6","type":"check","title":"Find where the target record id is checked before the upload is stored or linked.","tip":"Also note where the stored name or path comes from.","finding":"No check. A caller can attach a file to someone else's record.","forEach":"C-63","severity":"high"},{"id":"F-06","section":"T6","type":"list","title":"Anything else wrong that you noticed in this area","tip":"Where it is (URL, class, or file), what is wrong, and how bad you think it is.","optional":true,"findings":true,"columns":[{"key":"location","label":"Where (URL, class, or file)"},{"key":"description","label":"What is wrong","type":"long"},{"key":"relatedItem","label":"Related item (optional)"},{"key":"severity","label":"How bad","type":"select","options":["high","medium","low","not sure"]}]},{"id":"C-60","section":"T7","type":"yesno","title":"Does the app return files, PDFs, images, or documents by an identifier?","tip":"Downloads, reports, forms, letters, attachments. This is the exact pattern from the incident."},{"id":"C-61","section":"T7","type":"list","title":"For each file-serving endpoint, where is it checked that the caller may have that file?","tip":"One row per endpoint that returns bytes. The check below asks about each row.","when":{"q":"C-60","eq":"yes"},"columns":[{"key":"url","label":"URL"},{"key":"idParam","label":"Identifier parameter"},{"key":"isPublic","label":"Reachable without login","type":"select","options":["yes","no"]}]},{"id":"R-60","section":"T7","type":"check","title":"Follow the id to the file path, service call, or blob read, and find the line that compares the file's owner with the caller before the first byte is read.","tip":"This is the incident. If the id is used to build a file path, also look for the canonicalisation and base-directory check.","finding":"No comparison before the bytes are read, the handler is reachable without login, or a path built from the id with no canonicalisation check. Any caller can then download anyone's file by changing the id.","forEach":"C-61","severity":"high"},{"id":"R-61","section":"T7","type":"check","title":"Find every place a file id is written into a response.","tip":"Listings, links, JSON fields, generated HTML. Note whether ids are sequential.","finding":"Ids of other people's files reaching a caller, or sequential ids together with a missing check in R-60.","when":{"q":"C-60","eq":"yes"},"severity":"medium"},{"id":"F-07","section":"T7","type":"list","title":"Anything else wrong that you noticed in this area","tip":"Where it is (URL, class, or file), what is wrong, and how bad you think it is.","optional":true,"findings":true,"columns":[{"key":"location","label":"Where (URL, class, or file)"},{"key":"description","label":"What is wrong","type":"long"},{"key":"relatedItem","label":"Related item (optional)"},{"key":"severity","label":"How bad","type":"select","options":["high","medium","low","not sure"]}]},{"id":"C-50","section":"T8","type":"multiselect","title":"How does the app read and write data?","tip":"Select everything in use, not just the main path.","detail":"Anything selected as Other","options":[{"value":"cuf","label":"CUF (Common Update Framework) client"},{"value":"rest-client","label":"Other REST service clients"},{"value":"soap-client","label":"SOAP or JAX-WS clients"},{"value":"jpa-hibernate","label":"JPA or Hibernate"},{"value":"jdbctemplate","label":"JdbcTemplate or raw JDBC"},{"value":"stored-procedures","label":"Stored procedures"},{"value":"mybatis","label":"MyBatis"},{"value":"file-system","label":"File system"},{"value":"ldap","label":"LDAP"},{"value":"other","label":"Other (describe in Detail)"}]},{"id":"C-51","section":"T8","type":"text","title":"Which backend services does the app call, and what identifier does it send them?","tip":"Services return whatever they are asked for, so the check has to happen in this app before the call. One service per line."},{"id":"C-97","section":"T8","type":"yesno","title":"Are backend services called without any authentication?","tip":"If so, this app is the only place a record-level check can happen."},{"id":"C-52","section":"T8","type":"text","title":"What identifies a record in a CUF request, and does the request carry anything about the caller's scope?","tip":"Person id, sponsor id, family id, or something else.","when":{"q":"C-50","includes":"cuf"}},{"id":"C-53","section":"T8","type":"text","title":"For direct queries and stored procedures, is the WHERE clause limited to the caller's family or site, or only to the record id?","tip":"A query that finds by id alone returns anyone's record if the id is changed.","when":{"q":"C-50","includesAny":["jpa-hibernate","jdbctemplate","stored-procedures","mybatis"]}},{"id":"R-50","section":"T8","type":"check","title":"For every service you listed in C-51, find each call site and walk back up to the scope check.","tip":"The service checks nothing; whatever id it is sent, it returns.","finding":"A call site with no scope check anywhere above it.","forEach":"C-51","severity":"high"},{"id":"R-51","section":"T8","type":"check","title":"For every query or procedure you listed in C-53, read the WHERE clause and the code that calls it.","tip":"A scope constraint in the query, or a check on the result before it is returned, is fine.","finding":"Find-by-id alone, with no scope constraint and no check on the result.","forEach":"C-53","severity":"high"},{"id":"F-08","section":"T8","type":"list","title":"Anything else wrong that you noticed in this area","tip":"Where it is (URL, class, or file), what is wrong, and how bad you think it is.","optional":true,"findings":true,"columns":[{"key":"location","label":"Where (URL, class, or file)"},{"key":"description","label":"What is wrong","type":"long"},{"key":"relatedItem","label":"Related item (optional)"},{"key":"severity","label":"How bad","type":"select","options":["high","medium","low","not sure"]}]},{"id":"C-73","section":"T9","type":"select","title":"Are authenticated responses sent with Cache-Control: no-store?","tip":"Usually a filter or the shared web-security library. Spring Security adds no-store by default unless its headers are disabled.","detail":"Where set and the header value","options":[{"value":"global-filter","label":"Global filter or header writer sets no-store"},{"value":"per-endpoint","label":"Set per endpoint only"},{"value":"none-found","label":"None found"}]},{"id":"R-71","section":"T9","type":"check","title":"Search for Cache-Control and find which data endpoints get no-store.","tip":"Usually a filter or the shared web-security library.","finding":"Data endpoints with no no-store header. Browsers and proxies may keep the responses, including on shared workstations.","when":{"q":"C-73","in":["per-endpoint","none-found","unknown"]},"severity":"low"},{"id":"C-74","section":"T9","type":"select","title":"Is directory listing disabled in weblogic.xml?","tip":"index-directory-enabled inside container-descriptor.","when":{"q":"C-98","eq":"yes"},"options":[{"value":"disabled-explicit","label":"Explicitly disabled"},{"value":"enabled-explicit","label":"Explicitly enabled"},{"value":"not-set-default","label":"Not set (container default)"},{"value":"no-weblogic-xml","label":"No weblogic.xml present"}]},{"id":"C-75","section":"T9","type":"text","title":"Which folders are served as static content, and is anything besides frontend assets in them?","tip":"Resource handlers, the default servlet, src/main/webapp. Config files, source maps, or documents under a static folder are reachable by URL."},{"id":"R-72","section":"T9","type":"check","title":"Check index-directory-enabled in weblogic.xml, then walk each static root.","tip":"Config files, source maps, backups, documents.","finding":"Directory listing enabled, or anything under a static folder that is not a frontend asset.","when":{"any":[{"q":"C-74","in":["enabled-explicit","not-set-default","no-weblogic-xml"]},{"q":"C-75","notEmpty":true}]},"severity":"low"},{"id":"F-09","section":"T9","type":"list","title":"Anything else wrong that you noticed in this area","tip":"Where it is (URL, class, or file), what is wrong, and how bad you think it is.","optional":true,"findings":true,"columns":[{"key":"location","label":"Where (URL, class, or file)"},{"key":"description","label":"What is wrong","type":"long"},{"key":"relatedItem","label":"Related item (optional)"},{"key":"severity","label":"How bad","type":"select","options":["high","medium","low","not sure"]}]},{"id":"C-90","section":"T10","type":"text","title":"Which JSF pages hold a record id in a backing bean, and where does that id come from?","tip":"A view parameter, f:param, a managed-property bound to #{param.x}, getRequestParameterMap(), or f:attribute on a command link comes from the request and can be changed. A session attribute cannot."},{"id":"C-91","section":"T10","type":"select","title":"Is JSF view state saved on the server, or on the client, and if on the client is it encrypted?","tip":"javax.faces.STATE_SAVING_METHOD in web.xml; absent means server. For client-side state, MyFaces and Mojarra 2.2 and later encrypt by default; older Mojarra and the JSF 1.2 reference implementation need ClientStateSavingPassword.","options":[{"value":"server-side","label":"Server-side state saving"},{"value":"client-encrypted","label":"Client-side, encrypted"},{"value":"client-unencrypted","label":"Client-side, not encrypted"}]},{"id":"R-80","section":"T10","type":"check","title":"For every page you listed in C-90, find where the identifier enters the bean and every action method that uses it.","tip":"A view- or session-scoped bean keeps the id between requests, and a postback can change it. A managed-property bound to #{param.x} is re-read on every request.","finding":"No scope check when the page loads, or an action that trusts an id a postback can change.","forEach":"C-90","severity":"high"},{"id":"R-81","section":"T10","type":"check","title":"Check javax.faces.STATE_SAVING_METHOD and the implementation's secret key parameter.","tip":"Client-side state travels to the browser.","finding":"Client-side state without encryption. A caller can edit held identifiers.","when":{"q":"C-91","in":["client-unencrypted","unknown"]},"severity":"medium"},{"id":"F-10","section":"T10","type":"list","title":"Anything else wrong that you noticed in this area","tip":"Where it is (URL, class, or file), what is wrong, and how bad you think it is.","optional":true,"findings":true,"columns":[{"key":"location","label":"Where (URL, class, or file)"},{"key":"description","label":"What is wrong","type":"long"},{"key":"relatedItem","label":"Related item (optional)"},{"key":"severity","label":"How bad","type":"select","options":["high","medium","low","not sure"]}]},{"id":"F-12","section":"T12","type":"list","title":"Anything else wrong that no topic covered","tip":"Where it is (URL, class, or file), what is wrong, and how bad you think it is.","optional":true,"findings":true,"columns":[{"key":"location","label":"Where (URL, class, or file)"},{"key":"description","label":"What is wrong","type":"long"},{"key":"relatedItem","label":"Related item (optional)"},{"key":"severity","label":"How bad","type":"select","options":["high","medium","low","not sure"]}]}]}</script>
 <script>
 (function () {
   'use strict';
@@ -2185,66 +2211,79 @@ table.rows td.rowact { width: 30px; text-align: center; }
   var MAJOR = String(DEF.version).split('.')[0];
   var PREFIX = 'secreview:' + DEF.id + ':' + MAJOR + ':';
   var NEG = DEF.negativeValues || [];
-  // Developer mode: questionnaire wording, an escape option on every choice,
-  // no evidence or search records. The escape option on a branching question
-  // shows the dependent items rather than hiding them.
   var DEV = DEF.mode === 'dev';
   var UNSURE = 'unsure';
   var UNSURE_LABEL = 'Could not determine';
   var STATUS_OPTS = [
-    { value: 'pass', label: 'OK' },
+    { value: 'pass', label: 'Checked, OK' },
     { value: 'finding', label: 'Problem found' },
     { value: 'unable', label: 'Could not determine' },
     { value: 'na', label: 'Does not apply' }
   ];
-  var ROW_LABEL_KEYS = ['path', 'url', 'handler', 'service', 'location', 'page', 'pattern', 'method', 'module', 'claim', 'guardClass', 'filterClass', 'artifact'];
+  var ROW_LABEL_KEYS = ['path', 'url', 'handler', 'service', 'location', 'page', 'pattern', 'method', 'module', 'claim', 'guardClass', 'filterClass', 'artifact', 'query'];
+  var NONE_TEXT = /^none( to list| found)?\.?$/i;
   function isUnsure(v) { return v === UNSURE || (Array.isArray(v) && v.indexOf(UNSURE) >= 0); }
-  var itemsById = {}, sectionsById = {};
+  function own(o, k) { return Object.prototype.hasOwnProperty.call(o, k); }
+  var itemsById = Object.create(null), sectionsById = Object.create(null);
   DEF.items.forEach(function (it) { itemsById[it.id] = it; });
   DEF.sections.forEach(function (s) { sectionsById[s.id] = s; });
-  var phaseOfSection = {};
-  DEF.sections.forEach(function (s) { phaseOfSection[s.id] = s.phase; });
-  var findingsItemByPhase = {};
-  DEF.items.forEach(function (it) { if (it.findings) findingsItemByPhase[phaseOfSection[it.section]] = it; });
+  var findingsItemBySection = Object.create(null);
+  DEF.items.forEach(function (it) { if (it.findings) findingsItemBySection[it.section] = it; });
+  function sectionHeading(sec) {
+    var m = /^T(\d+)$/.exec(sec.id);
+    return m ? m[1] + '. ' + sec.title : 'Section ' + sec.id + ': ' + sec.title;
+  }
 
   var state = freshState();
-  var showHidden = false;
   var applCache = {};
   var naReason = {};
+  var viaUnsure = {};
   var ui = { items: {}, sections: {} };
-  // Comparison: a second result (for example the AI's) shown beside every item.
   var compare = null;
   var onlyDiff = false;
+  var nextRowId = 1;
 
   function freshState() {
-    return { app: '', reviewer: '', answers: {}, lastModifiedAt: null, lastExportedAt: null };
+    return { app: '', reviewer: '', reviewerKind: 'dev', answers: {}, passthrough: {}, lastModifiedAt: null, lastExportedAt: null, importedFrom: null };
   }
   function ans(id) { return state.answers[id] || (state.answers[id] = {}); }
+  // A control disabled for its own reasons (e.g. Add row while "None to list" is
+  // ticked) must stay disabled when refresh() re-enables an applicable item.
+  function lock(el, locked) { el.disabled = locked; if (locked) el.setAttribute('data-lock', '1'); else el.removeAttribute('data-lock'); }
   function now() { return new Date().toISOString(); }
   function fmtTime(iso) { return iso ? new Date(iso).toLocaleString() : ''; }
   function hasText(s) { return !!(s && String(s).trim()); }
+  function code(s) { return String(s === undefined || s === null ? '' : s).trim().replace(/^`+|`+$/g, '').toLowerCase(); }
+  function newRowId() {
+    var id;
+    do { id = 'r' + (nextRowId++).toString(36) + Math.floor(Math.random() * 1e6).toString(36); } while (false);
+    return id;
+  }
 
   // ---------------------------------------------------------------------------
-  // Storage: one slot per application name
+  // Storage: one slot per application name; comparisons live beside a slot
   // ---------------------------------------------------------------------------
-  function slotName(app) { var s = (app || '').trim(); return s ? s.toLowerCase() : '(unnamed)'; }
+  function slotName(app) { var s = (app || '').trim().replace(/:/g, '-'); return s ? s.toLowerCase() : '(unnamed)'; }
   function slotKey(app) { return PREFIX + slotName(app); }
   function listSlots() {
     var out = [];
     try {
       for (var i = 0; i < localStorage.length; i++) {
         var k = localStorage.key(i);
-        if (k.indexOf(PREFIX) === 0 && !/:prev$/.test(k)) out.push(k.slice(PREFIX.length));
+        if (k.indexOf(PREFIX) === 0 && !/:(prev|compare)$/.test(k)) out.push(k.slice(PREFIX.length));
       }
     } catch (e) { /* storage unavailable */ }
     return out.sort();
   }
   function slotExists(app) { try { return localStorage.getItem(slotKey(app)) !== null; } catch (e) { return false; } }
+  function reviewShaped(o) { return o && typeof o === 'object' && o.answers && typeof o.answers === 'object' && !Array.isArray(o.answers); }
 
   var saveTimer = null;
   function touch(id) {
     if (id) ans(id).updatedAt = now();
     state.lastModifiedAt = now();
+    // A viewed AI result becomes the developer's own review as soon as it is edited.
+    if (state.reviewerKind !== 'dev' && id) { state.reviewerKind = 'dev'; state.reviewer = ''; document.getElementById('reviewer').value = ''; }
     clearTimeout(saveTimer);
     saveTimer = setTimeout(save, 250);
     refresh();
@@ -2257,15 +2296,23 @@ table.rows td.rowact { width: 30px; text-align: center; }
       setStatus('Save failed: ' + e.message);
     }
   }
+  function backupSlot(app) {
+    try { var k = slotKey(app); var cur = localStorage.getItem(k); if (cur) localStorage.setItem(k + ':prev', cur); } catch (e) { /* ignore */ }
+  }
   function loadSlot(app) {
     var raw = null;
     try { raw = localStorage.getItem(slotKey(app)); } catch (e) { /* ignore */ }
     if (raw) {
       try {
-        state = JSON.parse(raw);
-        state.app = app;
-        state.answers = state.answers || {};
-        return true;
+        var parsed = JSON.parse(raw);
+        if (reviewShaped(parsed)) {
+          state = parsed;
+          // Keep the stored spelling of the name when it maps to the same slot.
+          if (slotName(state.app) !== slotName(app)) state.app = app;
+          state.reviewerKind = state.reviewerKind || 'dev';
+          migrateRows();
+          return true;
+        }
       } catch (e) { /* fall through */ }
     }
     state = freshState();
@@ -2276,82 +2323,128 @@ table.rows td.rowact { width: 30px; text-align: center; }
     try { localStorage.setItem(slotKey(app), JSON.stringify(state)); } catch (e) { /* ignore */ }
   }
 
+  // Every table row carries a stable id; per-row answers are keyed by it.
+  // Older saved reviews keyed answers by the row label: migrate once.
+  function ensureRowIds(rows) {
+    (rows || []).forEach(function (r) { if (!r._id) r._id = newRowId(); });
+  }
+  function migrateRows() {
+    DEF.items.forEach(function (it) {
+      var a = state.answers[it.id];
+      if (!a) return;
+      if (it.type === 'list' && Array.isArray(a.rows)) ensureRowIds(a.rows);
+    });
+    DEF.items.forEach(function (it) {
+      var a = state.answers[it.id];
+      if (!a || it.type !== 'check' || !it.forEach || !a.perRow) return;
+      var src = itemsById[it.forEach];
+      if (!src || src.type !== 'list') return;
+      var rows = (state.answers[src.id] || {}).rows || [];
+      var migrated = {};
+      var byLabel = {};
+      rows.forEach(function (r, i) { var l = rowLabel(r) || ('#' + (i + 1)); if (!byLabel[l]) byLabel[l] = r; });
+      Object.keys(a.perRow).forEach(function (k) {
+        if (rows.some(function (r) { return r._id === k; })) { migrated[k] = a.perRow[k]; return; }
+        var m = /^(.*) #(\d+)$/.exec(k);
+        var r = byLabel[k] || (m && rows[Number(m[2]) - 1]) || null;
+        if (r && !migrated[r._id]) migrated[r._id] = a.perRow[k];
+      });
+      a.perRow = migrated;
+    });
+  }
+
   // ---------------------------------------------------------------------------
   // Conditions and per-row sources
   // ---------------------------------------------------------------------------
   function value(id) { var a = state.answers[id]; return a ? a.value : undefined; }
+  function textEmpty(v) { return !hasText(v) || NONE_TEXT.test(String(v).trim()); }
 
-  function evalCond(c) {
+  function evalCond(c, why) {
     if (!c) return true;
-    if (c.all) return c.all.every(evalCond);
-    if (c.any) return c.any.some(evalCond);
-    if (c.not) return !evalCond(c.not);
+    if (c.all) return c.all.every(function (x) { return evalCond(x, why); });
+    if (c.any) return c.any.some(function (x) { return evalCond(x, why); });
+    if (c.not) return !evalCond(c.not, why);
     var item = itemsById[c.q];
     if (!item || !applicable(item)) return false;
     var v = value(c.q);
     var a = state.answers[c.q] || {};
-    if (DEV && isUnsure(v)) return true;
-    if (Object.prototype.hasOwnProperty.call(c, 'eq')) return v === c.eq;
+    if (DEV && isUnsure(v)) { if (why) why.push(c.q); return true; }
+    if (own(c, 'eq')) return v === c.eq;
     if (c.in) return c.in.indexOf(v) >= 0;
     if (c.includes) return Array.isArray(v) && v.indexOf(c.includes) >= 0;
     if (c.includesAny) return Array.isArray(v) && c.includesAny.some(function (x) { return v.indexOf(x) >= 0; });
-    if (c.notEmpty) return item.type === 'list' ? (a.rows || []).length > 0 : !!(v && String(v).trim());
+    if (c.notEmpty) return item.type === 'list' ? (a.rows || []).length > 0 : !textEmpty(v);
     return false;
   }
 
-  // Rows a per-row item iterates over. null: the source is not a table in this
-  // form (a developer text override), so the item is asked once.
+  // Rows a per-row item iterates over. null: the source is a text field in this
+  // form, so the item is asked once (and not at all when that text is empty).
   function sourceRows(item) {
     var src = itemsById[item.forEach];
     if (!src || src.type !== 'list') return null;
     var rows = (state.answers[src.id] || {}).rows || [];
     var w = item.forEachWhere;
-    if (w && rows.length && rows.some(function (r) { return Object.prototype.hasOwnProperty.call(r, w.col); })) {
-      rows = rows.filter(function (r) { return r[w.col] === w.eq; });
-    }
+    if (w) rows = rows.filter(function (r) { return !own(r, w.col) || code(r[w.col]) === code(w.eq); });
     return rows;
   }
-  function rowLabel(row) {
-    for (var i = 0; i < ROW_LABEL_KEYS.length; i++) { if (hasText(row[ROW_LABEL_KEYS[i]])) return String(row[ROW_LABEL_KEYS[i]]).trim(); }
-    var keys = Object.keys(row);
-    for (var j = 0; j < keys.length; j++) { if (hasText(row[keys[j]])) return String(row[keys[j]]).trim(); }
-    return '';
+  function sourceTextEmpty(item) {
+    var src = itemsById[item.forEach];
+    if (!src || src.type !== 'text') return false;
+    return textEmpty(value(src.id));
   }
-  function rowKeys(rows) {
-    var seen = {}, keys = [];
-    rows.forEach(function (r, i) {
-      var k = rowLabel(r) || ('#' + (i + 1));
-      if (seen[k]) k = k + ' #' + (i + 1);
-      seen[k] = true;
-      keys.push(k);
-    });
-    return keys;
+  function rowLabel(row) {
+    var parts = [];
+    if (hasText(row.methods)) parts.push(String(row.methods).trim());
+    for (var i = 0; i < ROW_LABEL_KEYS.length; i++) {
+      if (ROW_LABEL_KEYS[i] === 'method') continue;
+      if (hasText(row[ROW_LABEL_KEYS[i]])) { parts.push(String(row[ROW_LABEL_KEYS[i]]).trim()); return parts.join(' '); }
+    }
+    var keys = Object.keys(row);
+    for (var j = 0; j < keys.length; j++) { if (keys[j] !== '_id' && keys[j] !== 'methods' && hasText(row[keys[j]])) { parts.push(String(row[keys[j]]).trim()); return parts.join(' '); } }
+    return parts.join(' ');
   }
 
   function applicable(item) {
     if (!item) return false;
-    if (Object.prototype.hasOwnProperty.call(applCache, item.id)) return applCache[item.id];
-    applCache[item.id] = false; // guard against cycles
+    if (own(applCache, item.id)) return applCache[item.id];
+    applCache[item.id] = false;
+    var why = [];
     var sec = sectionsById[item.section];
-    var r = evalCond(sec && sec.when) && evalCond(item.when);
+    var r = evalCond(sec && sec.when, why) && evalCond(item.when, why);
     if (r && item.forEach) {
-      var rows = sourceRows(item);
-      if (rows !== null && rows.length === 0) {
+      var src = itemsById[item.forEach];
+      if (src && !applicable(src)) {
         r = false;
-        naReason[item.id] = item.forEach + ' has no ' + (item.forEachWhere ? 'rows where ' + item.forEachWhere.col + ' = ' + item.forEachWhere.eq : 'rows');
+        naReason[item.id] = item.forEach + ' does not apply';
+      } else if (sourceTextEmpty(item)) {
+        r = false;
+        naReason[item.id] = item.forEach + ' is empty';
+      } else {
+        var rows = sourceRows(item);
+        if (rows !== null && rows.length === 0) {
+          r = false;
+          naReason[item.id] = item.forEach + ' has no ' + (item.forEachWhere ? 'rows where ' + item.forEachWhere.col + ' = ' + item.forEachWhere.eq : 'rows');
+        }
       }
     }
+    if (r && why.length) viaUnsure[item.id] = why;
     applCache[item.id] = r;
     return r;
   }
   function sectionApplicable(sec) { return evalCond(sec.when); }
 
   function optionLabel(item, v) {
+    if (v === UNSURE || v === 'unknown') return UNSURE_LABEL;
+    if (item.type === 'yesno') return v === 'yes' ? 'Yes' : v === 'no' ? 'No' : v;
     var o = (item.options || []).filter(function (x) { return x.value === v; })[0];
     return o ? o.label : v;
   }
+  function shortLabel(item, v) {
+    var l = optionLabel(item, v);
+    return l.split(/[:(]/)[0].trim();
+  }
   // codes=true renders option codes (for export, matching the agent's Markdown);
-  // otherwise option labels (for the screen).
+  // otherwise short labels for the screen.
   function condText(c, codes) {
     if (!c) return '';
     var rec = function (x) { return condText(x, codes); };
@@ -2359,22 +2452,28 @@ table.rows td.rowact { width: 30px; text-align: center; }
     if (c.any) return c.any.map(rec).join(' or ');
     if (c.not) return 'not (' + rec(c.not) + ')';
     var item = itemsById[c.q];
-    var name = c.q + (item ? ' (' + item.title + ')' : '');
-    var show = function (v) { return (codes || !item) ? v : optionLabel(item, v); };
-    if (Object.prototype.hasOwnProperty.call(c, 'eq')) return name + (codes ? ' = ' : ' is ') + show(c.eq);
+    var name = codes ? c.q + (item ? ' (' + item.title + ')' : '') : c.q;
+    var show = function (v) { return (codes || !item) ? v : shortLabel(item, v); };
+    if (own(c, 'eq')) return name + (codes ? ' = ' : ' is ') + show(c.eq);
     if (c.in) return name + ' is one of ' + c.in.map(show).join(', ');
     if (c.includes) return name + ' includes ' + show(c.includes);
     if (c.includesAny) return name + ' includes any of ' + c.includesAny.map(show).join(', ');
-    if (c.notEmpty) return name + ' has at least one row';
+    if (c.notEmpty) return name + (item && item.type === 'text' ? ' is not empty' : ' has at least one row');
     return JSON.stringify(c);
   }
   function ruleText(item, codes) {
     var parts = [];
     var sec = sectionsById[item.section];
-    if (sec && sec.when) parts.push(condText(sec.when, codes));
+    if (codes && sec && sec.when) parts.push(condText(sec.when, codes));
     if (item.when) parts.push(condText(item.when, codes));
     if (item.forEach && naReason[item.id] && !applicable(item)) parts.push(naReason[item.id]);
+    else if (item.forEach && codes) parts.push(item.forEach + ' has at least one row' + (item.forEachWhere ? ' where ' + item.forEachWhere.col + ' = ' + item.forEachWhere.eq : ''));
     return parts.join('; and ');
+  }
+  function screenRule(item) {
+    if (viaUnsure[item.id]) return 'Shown because ' + viaUnsure[item.id].join(' and ') + ' is "' + UNSURE_LABEL + '"; answering it will settle whether this applies.';
+    var t = ruleText(item, false);
+    return t ? 'Applies when ' + t : '';
   }
 
   // ---------------------------------------------------------------------------
@@ -2395,16 +2494,16 @@ table.rows td.rowact { width: 30px; text-align: center; }
   function checkRowComplete(r) {
     if (!r || !r.status) return false;
     if (r.status === 'finding') return hasText(r.findings);
+    if (r.status === 'pass') return hasText(r.location);
     return true;
   }
   function checkRows(item) {
-    // Per-row answer records for a per-row check item, aligned with current source rows.
     var rows = sourceRows(item);
     if (rows === null) return null;
-    var keys = rowKeys(rows);
     var a = ans(item.id);
     if (!a.perRow) a.perRow = {};
-    return keys.map(function (k, i) { return { key: k, index: i, row: rows[i], rec: a.perRow[k] || (a.perRow[k] = {}) }; });
+    ensureRowIds(rows);
+    return rows.map(function (r, i) { return { key: r._id, index: i, row: r, label: rowLabel(r) || ('row ' + (i + 1)), rec: a.perRow[r._id] || (a.perRow[r._id] = {}) }; });
   }
   function answered(item) {
     var a = state.answers[item.id] || {};
@@ -2416,6 +2515,15 @@ table.rows td.rowact { width: 30px; text-align: center; }
     if (item.type === 'list') return (a.rows || []).length > 0 || (DEV && !!a.none);
     if (item.type === 'multiselect') return Array.isArray(a.value) && a.value.length > 0;
     return a.value !== undefined && a.value !== null && a.value !== '' && hasText(String(a.value));
+  }
+  function uncertain(item) {
+    var a = state.answers[item.id] || {};
+    if (item.type === 'check') {
+      var rs = item.forEach ? checkRows(item) : null;
+      if (rs) return rs.some(function (x) { return x.rec.status === 'unable'; });
+      return a.status === 'unable';
+    }
+    return isUnsure(a.value);
   }
   function complete(item) {
     var a = state.answers[item.id] || {};
@@ -2441,7 +2549,7 @@ table.rows td.rowact { width: 30px; text-align: center; }
     }
     if (isNegative(item, a)) {
       var v = Array.isArray(a.value) ? a.value.filter(function (x) { return NEG.indexOf(x) >= 0; }).join(', ') : a.value;
-      return 'Answering "' + (item.type === 'yesno' ? v : optionLabel(item, v)) + '" requires Searched to list every signal and directory searched.';
+      return 'Answering "' + optionLabel(item, v) + '" requires Searched to list every signal and directory searched.';
     }
     if (needsEvidence(item)) return 'This is a fleet default. Confirm or override it with evidence.';
     return '';
@@ -2455,7 +2563,6 @@ table.rows td.rowact { width: 30px; text-align: center; }
     if (attrs) Object.keys(attrs).forEach(function (k) {
       if (k === 'class') e.className = attrs[k];
       else if (k === 'text') e.textContent = attrs[k];
-      else if (k === 'html') e.innerHTML = attrs[k];
       else if (k.indexOf('on') === 0) e.addEventListener(k.slice(2), attrs[k]);
       else if (attrs[k] !== undefined && attrs[k] !== null && attrs[k] !== false) e.setAttribute(k, attrs[k] === true ? '' : attrs[k]);
     });
@@ -2467,8 +2574,8 @@ table.rows td.rowact { width: 30px; text-align: center; }
   }
   function setStatus(msg) { var s = document.getElementById('status'); if (s) s.textContent = msg; }
   function flash(msg) { setStatus(msg); }
-  function textarea(rows, placeholder, val, oninput) {
-    var t = h('textarea', { rows: rows, placeholder: placeholder });
+  function textarea(rows, placeholder, val, oninput, label) {
+    var t = h('textarea', { rows: rows, placeholder: placeholder, 'aria-label': label || placeholder });
     t.value = val || '';
     t.addEventListener('input', function () { oninput(t.value); });
     return t;
@@ -2485,16 +2592,19 @@ table.rows td.rowact { width: 30px; text-align: center; }
         ? [{ value: 'yes', label: 'Yes' }, { value: 'no', label: 'No' }]
         : item.options.slice();
       if (DEV) opts.push({ value: UNSURE, label: UNSURE_LABEL });
+      var group = h('fieldset', { class: 'choices' }, [h('legend', { class: 'sr', text: item.title })]);
       opts.forEach(function (o) {
         var input = h('input', { type: 'radio', name: item.id, value: o.value });
         if (a.value === o.value) input.checked = true;
         input.addEventListener('change', function () { ans(item.id).value = o.value; touch(item.id); });
-        wrap.appendChild(h('label', { class: 'opt' }, [input, ' ', o.label]));
+        group.appendChild(h('label', { class: 'opt' }, [input, ' ', o.label]));
       });
+      wrap.appendChild(group);
     } else if (item.type === 'multiselect') {
       if (!Array.isArray(a.value)) a.value = [];
       var mopts = item.options.slice();
       if (DEV) mopts.push({ value: UNSURE, label: UNSURE_LABEL });
+      var mgroup = h('fieldset', { class: 'choices' }, [h('legend', { class: 'sr', text: item.title })]);
       mopts.forEach(function (o) {
         var input = h('input', { type: 'checkbox', name: item.id, value: o.value });
         if (a.value.indexOf(o.value) >= 0) input.checked = true;
@@ -2506,10 +2616,11 @@ table.rows td.rowact { width: 30px; text-align: center; }
           ans(item.id).value = v;
           touch(item.id);
         });
-        wrap.appendChild(h('label', { class: 'opt' }, [input, ' ', o.label]));
+        mgroup.appendChild(h('label', { class: 'opt' }, [input, ' ', o.label]));
       });
+      wrap.appendChild(mgroup);
     } else if (item.type === 'text') {
-      wrap.appendChild(textarea(3, 'Answer', a.value, function (v) { ans(item.id).value = v; touch(item.id); }));
+      wrap.appendChild(textarea(3, 'Answer', a.value, function (v) { ans(item.id).value = v; touch(item.id); }, item.title));
     } else if (item.type === 'list') {
       wrap.appendChild(renderTable(item));
     } else if (item.type === 'check') {
@@ -2518,27 +2629,36 @@ table.rows td.rowact { width: 30px; text-align: center; }
     return wrap;
   }
 
-  // A check: status radios, where, and what is wrong. Per-row items get one
-  // block per row of the source table.
+  // A check: status radios, where, and a description whose meaning follows the
+  // status. Per-row items get one block per row of the source table.
   function renderCheckBlock(item, rec, name, label) {
     var block = h('div', { class: 'checkblock' });
-    if (label) block.appendChild(h('div', { class: 'rowlabel', text: label }));
-    var radios = h('div', { class: 'statusopts' });
+    var fs = h('fieldset', { class: 'statusopts' }, [h('legend', { class: label ? 'rowlabel' : 'sr', text: label || item.title })]);
     STATUS_OPTS.forEach(function (o) {
       var input = h('input', { type: 'radio', name: name, value: o.value });
       if (rec.status === o.value) input.checked = true;
-      input.addEventListener('change', function () { rec.status = o.value; touch(item.id); syncFinding(); });
-      radios.appendChild(h('label', { class: 'opt inline' }, [input, ' ', o.label]));
+      input.addEventListener('change', function () { rec.status = o.value; sync(); touch(item.id); });
+      fs.appendChild(h('label', { class: 'opt inline' }, [input, ' ', o.label]));
     });
-    block.appendChild(radios);
-    var where = h('input', { type: 'text', class: 'where', placeholder: 'Where: class, method, or URL', value: rec.location || '' });
+    block.appendChild(fs);
+    var whereLabel = h('span', { text: 'Where' });
+    var where = h('textarea', { rows: 1, class: 'where', placeholder: 'class, method, or URL', 'aria-label': 'Where' });
+    where.value = rec.location || '';
     where.addEventListener('input', function () { rec.location = where.value; touch(item.id); });
-    block.appendChild(h('label', { class: 'fld' }, [h('span', { text: 'Where' }), where]));
-    var what = textarea(2, 'What is wrong, and what a caller could do', rec.findings, function (v) { rec.findings = v; touch(item.id); });
-    var whatWrap = h('label', { class: 'fld' }, [h('span', { text: 'What is wrong' }), what]);
+    block.appendChild(h('label', { class: 'fld' }, [whereLabel, where]));
+    var whatLabel = h('span', { text: 'What is wrong' });
+    var what = textarea(2, '', rec.findings, function (v) { rec.findings = v; touch(item.id); }, 'What is wrong');
+    var whatWrap = h('label', { class: 'fld' }, [whatLabel, what]);
     block.appendChild(whatWrap);
-    function syncFinding() { whatWrap.hidden = rec.status !== 'finding'; }
-    syncFinding();
+    function sync() {
+      var s = rec.status;
+      whereLabel.textContent = s === 'finding' ? 'Where the problem is' : (s === 'pass' ? 'Where the check is (required)' : 'Where');
+      if (s === 'finding') { whatLabel.textContent = 'What is wrong, and what a caller could do'; whatWrap.hidden = false; }
+      else if (s === 'unable') { whatLabel.textContent = 'What you tried and where the trail ended'; whatWrap.hidden = false; }
+      else if (s === 'na') { whatLabel.textContent = 'Why it does not apply'; whatWrap.hidden = false; }
+      else { whatWrap.hidden = true; }
+    }
+    sync();
     return block;
   }
   function renderCheck(item) {
@@ -2547,10 +2667,11 @@ table.rows td.rowact { width: 30px; text-align: center; }
       box.innerHTML = '';
       var rs = item.forEach ? checkRows(item) : null;
       if (rs) {
-        rs.forEach(function (x) { box.appendChild(renderCheckBlock(item, x.rec, item.id + ':' + x.index, x.key)); });
-        ui.items[item.id].rowsKey = rs.map(function (x) { return x.key; }).join('');
+        rs.forEach(function (x) { box.appendChild(renderCheckBlock(item, x.rec, item.id + ':' + x.key, x.label)); });
+        ui.items[item.id].rowsKey = rs.map(function (x) { return x.key; }).join('');
       } else {
         box.appendChild(renderCheckBlock(item, ans(item.id), item.id, null));
+        ui.items[item.id].rowsKey = '';
       }
     }
     draw();
@@ -2561,12 +2682,14 @@ table.rows td.rowact { width: 30px; text-align: center; }
   function renderTable(item) {
     var a = ans(item.id);
     if (!Array.isArray(a.rows)) a.rows = [];
+    ensureRowIds(a.rows);
     var box = h('div', { class: 'tablebox' });
     var table = h('table', { class: 'rows' });
     var thead = h('thead', null, [h('tr', null, item.columns.map(function (c) { return h('th', { text: c.label }); }).concat([h('th', { text: '' })]))]);
     var tbody = h('tbody');
     table.appendChild(thead);
     table.appendChild(tbody);
+    var noneBox = null;
 
     function drawRows() {
       tbody.innerHTML = '';
@@ -2574,46 +2697,56 @@ table.rows td.rowact { width: 30px; text-align: center; }
         var tr = h('tr');
         item.columns.forEach(function (c) {
           var cell;
+          var aria = c.label + ', row ' + (idx + 1);
           if (c.type === 'select') {
-            cell = h('select', null, [h('option', { value: '', text: '' })].concat(c.options.map(function (o) { return h('option', { value: o, text: o }); })));
-            cell.value = row[c.key] || '';
+            var stored = row[c.key] || '';
+            var opts = c.options.slice();
+            var match = opts.filter(function (o) { return code(o) === code(stored); })[0];
+            if (stored && !match) opts.push(stored); // keep an unlisted value visible rather than losing it
+            cell = h('select', { 'aria-label': aria }, [h('option', { value: '', text: '' })].concat(opts.map(function (o) { return h('option', { value: o, text: o }); })));
+            cell.value = match || stored;
             cell.addEventListener('change', function () { row[c.key] = cell.value; touch(item.id); });
           } else if (c.type === 'long') {
-            cell = h('textarea', { rows: 2 });
+            cell = h('textarea', { rows: 2, 'aria-label': aria });
             cell.value = row[c.key] || '';
             cell.addEventListener('input', function () { row[c.key] = cell.value; touch(item.id); });
           } else {
-            cell = h('input', { type: 'text', value: row[c.key] || '' });
+            cell = h('input', { type: 'text', value: row[c.key] || '', 'aria-label': aria });
             cell.addEventListener('input', function () { row[c.key] = cell.value; touch(item.id); });
           }
           tr.appendChild(h('td', null, [cell]));
         });
-        var del = h('button', { type: 'button', class: 'mini', title: 'Remove row', text: 'x' });
+        var del = h('button', { type: 'button', class: 'mini', title: 'Remove row', 'aria-label': 'Remove row ' + (idx + 1), text: 'x' });
         del.addEventListener('click', function () { a.rows.splice(idx, 1); drawRows(); touch(item.id); });
         tr.appendChild(h('td', { class: 'rowact' }, [del]));
         tbody.appendChild(tr);
       });
       var count = box.querySelector('.rowcount');
       if (count) count.textContent = a.rows.length + ' row' + (a.rows.length === 1 ? '' : 's');
+      if (noneBox) {
+        if (a.rows.length) { a.none = false; noneBox.checked = false; }
+        noneBox.parentNode.hidden = a.rows.length > 0;
+      }
+      lock(addBtn, !!a.none);
+      lock(pasteBtn, !!a.none);
     }
 
     var addBtn = h('button', { type: 'button', class: 'small', text: 'Add row' });
     addBtn.addEventListener('click', function () {
-      var row = {}; item.columns.forEach(function (c) { row[c.key] = ''; });
+      var row = { _id: newRowId() }; item.columns.forEach(function (c) { row[c.key] = ''; });
       a.rows.push(row); drawRows(); touch(item.id);
       var last = tbody.lastChild && tbody.lastChild.querySelector('input,select,textarea');
       if (last) last.focus();
     });
     var pasteBtn = h('button', { type: 'button', class: 'small', text: 'Paste rows' });
-    pasteBtn.addEventListener('click', function () { openPasteModal(item, function () { drawRows(); touch(item.id); }); });
+    pasteBtn.addEventListener('click', function () { openPasteModal(item, function () { drawRows(); touch(item.id); }, pasteBtn); });
 
     var actions = [addBtn, ' ', pasteBtn, ' ', h('span', { class: 'rowcount' })];
     if (DEV && !item.optional) {
-      // A developer with nothing to list needs a way to say so.
-      var none = h('input', { type: 'checkbox' });
-      none.checked = !!a.none;
-      none.addEventListener('change', function () { ans(item.id).none = none.checked; touch(item.id); });
-      actions.push(h('label', { class: 'opt inline nonebox' }, [none, ' None to list']));
+      noneBox = h('input', { type: 'checkbox' });
+      noneBox.checked = !!a.none;
+      noneBox.addEventListener('change', function () { ans(item.id).none = noneBox.checked; drawRows(); touch(item.id); });
+      actions.push(h('label', { class: 'opt inline nonebox' }, [noneBox, ' None to list']));
     }
     box.appendChild(h('div', { class: 'tablescroll' }, [table]));
     box.appendChild(h('div', { class: 'tableactions' }, actions));
@@ -2629,13 +2762,12 @@ table.rows td.rowact { width: 30px; text-align: center; }
     var a = ans(item.id);
     ui.items[item.id] = {};
     var chip = h('span', { class: 'chip' });
-    var rule = ruleText(item);
-
     var head = h('header', { class: 'ihead' }, [
       h('span', { class: 'iid', text: item.id }),
       h('h3', { text: item.title }),
       chip
     ]);
+    var ruleEl = h('p', { class: 'rule' });
 
     var howParts = [h('p', { text: item.how || '' })];
     if (item.signals && item.signals.length) {
@@ -2643,41 +2775,38 @@ table.rows td.rowact { width: 30px; text-align: center; }
         return h('span', null, [h('code', { text: s }), i < item.signals.length - 1 ? ', ' : '']);
       }))));
     }
-    if (item.refs && item.refs.length) howParts.push(h('p', { class: 'refs', text: 'Refs: ' + item.refs.join(', ') }));
     var how = DEV
-      ? h('p', { class: 'tip', text: item.tip || '' })
+      ? h('div', null, [
+          h('p', { class: 'tip', text: item.tip || '' }),
+          (item.type === 'check' && item.finding) ? h('p', { class: 'problemif' }, [h('strong', { text: 'Problem if: ' }), item.finding]) : null
+        ])
       : h('details', { class: 'how' }, [h('summary', { text: 'How to find it' })].concat(howParts));
 
     var fields = [];
     var req = h('div', { class: 'req' });
     if (item.detail) {
       fields.push(h('label', { class: 'fld' }, [h('span', { text: 'Detail: ' + item.detail }),
-        textarea(2, item.detail, a.detail, function (v) { ans(item.id).detail = v; touch(item.id); })]));
+        textarea(2, item.detail, a.detail, function (v) { ans(item.id).detail = v; touch(item.id); }, 'Detail')]));
     }
     if (DEV) {
       fields.push(h('label', { class: 'fld' }, [h('span', { text: 'Notes' }),
-        textarea(2, 'optional', a.notes, function (v) { ans(item.id).notes = v; touch(item.id); }), req]));
+        textarea(2, 'optional', a.notes, function (v) { ans(item.id).notes = v; touch(item.id); }, 'Notes'), req]));
     } else {
       fields.push(h('label', { class: 'fld' }, [h('span', { text: 'Evidence' }),
-        textarea(2, 'file:line citations that support the answer', a.evidence, function (v) { ans(item.id).evidence = v; touch(item.id); })]));
+        textarea(2, 'file:line citations that support the answer', a.evidence, function (v) { ans(item.id).evidence = v; touch(item.id); }, 'Evidence')]));
       fields.push(h('label', { class: 'fld' }, [h('span', { text: 'Searched' }),
-        textarea(2, 'patterns and directories searched', a.searched, function (v) { ans(item.id).searched = v; touch(item.id); }), req]));
+        textarea(2, 'patterns and directories searched', a.searched, function (v) { ans(item.id).searched = v; touch(item.id); }, 'Searched'), req]));
     }
 
-    var findingsItem = findingsItemByPhase[phaseOfSection[item.section]];
-    var remind = (DEV && !item.findings && findingsItem)
-      ? h('p', { class: 'remind' }, ['Spotted something else wrong while looking? Add it to ', h('a', { href: '#sec-' + findingsItem.section, text: sectionsById[findingsItem.section].title }), ' at the end of this phase.'])
-      : null;
-
-    // Evidence fields present only in an imported AI result: shown read-only.
     var aiBits = [];
     if (hasText(a.evidence)) aiBits.push(['Evidence', a.evidence]);
     if (hasText(a.searched)) aiBits.push(['Searched', a.searched]);
     if (hasText(a.whyNoMore)) aiBits.push(['Why no more findings', a.whyNoMore]);
     if (a.perRow) Object.keys(a.perRow).forEach(function (k) {
       var x = a.perRow[k] || {};
-      if (hasText(x.evidence)) aiBits.push(['Evidence (' + k + ')', x.evidence]);
-      if (hasText(x.whyNoMore)) aiBits.push(['Why no more findings (' + k + ')', x.whyNoMore]);
+      var lab = (function () { var rows = (state.answers[item.forEach] || {}).rows || []; var r = rows.filter(function (q) { return q._id === k; })[0]; return r ? rowLabel(r) : k; })();
+      if (hasText(x.evidence)) aiBits.push(['Evidence (' + lab + ')', x.evidence]);
+      if (hasText(x.whyNoMore)) aiBits.push(['Why no more findings (' + lab + ')', x.whyNoMore]);
     });
     var aiEl = (DEV && aiBits.length)
       ? h('details', { class: 'aifields' }, [h('summary', { text: 'Evidence from the imported result' })].concat(aiBits.map(function (b) {
@@ -2685,25 +2814,22 @@ table.rows td.rowact { width: 30px; text-align: center; }
         })))
       : null;
 
+    var findingsItem = findingsItemBySection[item.section];
+    var remind = (DEV && !item.findings && findingsItem)
+      ? h('p', { class: 'remind' }, ['Spotted something else wrong while looking? Add it to ', h('a', { href: '#item-' + findingsItem.id, text: 'Issues found in this area' }), ' at the end of this topic.'])
+      : null;
+
     var cmp = h('div', { class: 'cmp', hidden: true });
     var meta = h('footer', { class: 'meta' });
-    var root = h('article', { class: 'item', 'data-id': item.id }, [
-      head,
-      rule ? h('p', { class: 'rule', text: 'Applies when: ' + rule }) : null,
-      how,
-      renderControl(item),
-      h('div', { class: 'fields' }, fields),
-      aiEl,
-      cmp,
-      remind,
-      meta
+    var root = h('article', { class: 'item', 'data-id': item.id, id: 'item-' + item.id }, [
+      head, ruleEl, how, renderControl(item), h('div', { class: 'fields' }, fields), aiEl, cmp, remind, meta
     ]);
     ui.items[item.id].root = root;
     ui.items[item.id].cmp = cmp;
     ui.items[item.id].chip = chip;
     ui.items[item.id].req = req;
     ui.items[item.id].meta = meta;
-    ui.items[item.id].ruleEl = root.querySelector('.rule');
+    ui.items[item.id].ruleEl = ruleEl;
     return root;
   }
 
@@ -2711,11 +2837,13 @@ table.rows td.rowact { width: 30px; text-align: center; }
     var form = document.getElementById('form');
     form.innerHTML = '';
     ui.items = {}; ui.sections = {};
-    applCache = {}; naReason = {};
+    applCache = {}; naReason = {}; viaUnsure = {};
     compare = readCompare();
     DEF.items.forEach(function (it) {
       if (it.default !== undefined && state.answers[it.id] === undefined) state.answers[it.id] = { value: it.default };
+      if (it.type === 'list' && state.answers[it.id] && Array.isArray(state.answers[it.id].rows)) ensureRowIds(state.answers[it.id].rows);
     });
+    if (DEF.intro) form.appendChild(h('p', { class: 'intro flowintro', text: DEF.intro }));
     var phases = DEF.phases && DEF.phases.length ? DEF.phases : [{ id: null, title: '' }];
     phases.forEach(function (ph) {
       var phEl = h('div', { class: 'phase', 'data-phase': ph.id || '' });
@@ -2723,9 +2851,9 @@ table.rows td.rowact { width: 30px; text-align: center; }
       if (ph.intro) phEl.appendChild(h('p', { class: 'intro', text: ph.intro }));
       DEF.sections.filter(function (s) { return ph.id === null || s.phase === ph.id; }).forEach(function (sec) {
         var secEl = h('section', { class: 'sec', 'data-sec': sec.id, id: 'sec-' + sec.id }, [
-          h('h2', { text: 'Section ' + sec.id + ': ' + sec.title }),
+          h('h2', { text: sectionHeading(sec) }),
           sec.intro ? h('p', { class: 'intro', text: sec.intro }) : null,
-          sec.when ? h('p', { class: 'rule', text: 'Applies when: ' + condText(sec.when) }) : null
+          sec.when ? h('p', { class: 'rule', text: 'Applies when ' + condText(sec.when) }) : null
         ]);
         DEF.items.filter(function (it) { return it.section === sec.id; }).forEach(function (it) {
           secEl.appendChild(renderItem(it));
@@ -2735,6 +2863,11 @@ table.rows td.rowact { width: 30px; text-align: center; }
       });
       form.appendChild(phEl);
     });
+    form.appendChild(h('section', { class: 'sec summary', id: 'issues-summary' }, [
+      h('h2', { id: 'issues-heading', tabindex: '-1', text: 'All issues found' }),
+      h('p', { class: 'note', text: 'Filled in automatically from every check marked "' + statusLabel('finding') + '" and every row of the issues tables above. Nothing is entered here directly; click an item to go to where it was recorded.' }),
+      h('div', { id: 'issues-list' })
+    ]));
     document.getElementById('app').value = state.app || '';
     document.getElementById('reviewer').value = state.reviewer || '';
     refreshSlots();
@@ -2746,29 +2879,30 @@ table.rows td.rowact { width: 30px; text-align: center; }
   // ---------------------------------------------------------------------------
   function statusLabel(v) { var o = STATUS_OPTS.filter(function (x) { return x.value === v; })[0]; return o ? o.label : v; }
   function refresh() {
-    applCache = {}; naReason = {};
-    var total = 0, done = 0, findings = 0, cmpDiff = 0, cmpTotal = 0;
+    applCache = {}; naReason = {}; viaUnsure = {};
+    var total = 0, done = 0, findings = 0, unsureCount = 0, cmpDiff = 0, cmpTotal = 0;
     DEF.sections.forEach(function (sec) {
       var secEl = ui.sections[sec.id];
       if (!secEl) return;
       var on = sectionApplicable(sec);
       secEl.classList.toggle('na', !on);
-      secEl.hidden = !on && !showHidden && !compare;
+      secEl.hidden = !on && !compare;
     });
     DEF.items.forEach(function (it) {
       var u = ui.items[it.id];
       if (!u) return;
-      // Per-row items follow their source table: redraw when the rows change.
       if (it.type === 'check' && it.forEach && u.redraw) {
         var rs = checkRows(it);
-        var key = rs ? rs.map(function (x) { return x.key; }).join('') : '';
+        var key = rs ? rs.map(function (x) { return x.key; }).join('') : '';
         if (key !== u.rowsKey) u.redraw();
       }
       var on = applicable(it);
       u.root.classList.toggle('na', !on);
-      u.root.hidden = !on && !showHidden;
-      Array.prototype.forEach.call(u.root.querySelectorAll('input,select,textarea,button'), function (x) { x.disabled = !on; });
-      if (u.ruleEl && it.forEach) { var rt = ruleText(it); u.ruleEl.textContent = rt ? 'Applies when: ' + rt : ''; }
+      u.root.hidden = !on;
+      Array.prototype.forEach.call(u.root.querySelectorAll('input,select,textarea,button'), function (x) { x.disabled = !on || x.getAttribute('data-lock') === '1'; });
+      var rt = screenRule(it);
+      u.ruleEl.textContent = rt;
+      u.ruleEl.hidden = !rt;
       var diff = renderCompare(it, u);
       if (compare) {
         cmpTotal++;
@@ -2784,7 +2918,6 @@ table.rows td.rowact { width: 30px; text-align: center; }
       }
       var a = state.answers[it.id] || {};
       if (it.optional && !answered(it)) {
-        // Empty issue tables are fine and do not count toward progress either way.
         u.chip.textContent = 'Optional';
         u.chip.className = 'chip chip-open';
         u.req.textContent = '';
@@ -2794,25 +2927,24 @@ table.rows td.rowact { width: 30px; text-align: center; }
       total++;
       var ok = complete(it);
       if (ok) done++;
+      var unc = uncertain(it);
+      if (unc) unsureCount++;
       if (it.type === 'check') {
         var rs2 = it.forEach ? checkRows(it) : null;
         if (rs2) {
           var n = rs2.filter(function (x) { return checkRowComplete(x.rec); }).length;
           var f = rs2.filter(function (x) { return x.rec.status === 'finding'; }).length;
           findings += f;
-          u.chip.textContent = n + ' of ' + rs2.length + (f ? ', ' + f + ' problem' + (f === 1 ? '' : 's') : '');
-          u.chip.className = 'chip ' + (f ? 'chip-bad' : (ok ? 'chip-ok' : 'chip-open'));
+          u.chip.textContent = n + ' of ' + rs2.length + (f ? ', ' + f + ' problem' + (f === 1 ? '' : 's') : '') + (unc ? ', some undetermined' : '');
+          u.chip.className = 'chip ' + (f ? 'chip-bad' : (unc ? 'chip-warn' : (ok ? 'chip-ok' : 'chip-open')));
         } else {
           if (a.status === 'finding') findings++;
-          u.chip.textContent = a.status ? (ok ? statusLabel(a.status) : 'Describe the problem') : 'Open';
-          u.chip.className = 'chip ' + (a.status === 'finding' ? 'chip-bad' : (ok ? 'chip-ok' : (a.status ? 'chip-warn' : 'chip-open')));
+          u.chip.textContent = a.status ? (ok ? statusLabel(a.status) : (a.status === 'pass' ? 'Say where the check is' : 'Describe the problem')) : 'Open';
+          u.chip.className = 'chip ' + (a.status === 'finding' ? 'chip-bad' : (a.status === 'unable' ? 'chip-warn' : (ok ? 'chip-ok' : (a.status ? 'chip-warn' : 'chip-open'))));
         }
-      } else if (it.optional && !answered(it)) {
-        u.chip.textContent = 'Optional';
-        u.chip.className = 'chip chip-open';
       } else {
-        u.chip.textContent = ok ? (DEV ? 'Done' : 'Complete') : (answered(it) ? 'Needs evidence' : 'Open');
-        u.chip.className = 'chip ' + (ok ? 'chip-ok' : (answered(it) ? 'chip-warn' : 'chip-open'));
+        u.chip.textContent = ok ? (unc ? UNSURE_LABEL : (DEV ? 'Done' : 'Complete')) : (answered(it) ? 'Needs evidence' : 'Open');
+        u.chip.className = 'chip ' + (ok ? (unc ? 'chip-warn' : 'chip-ok') : (answered(it) ? 'chip-warn' : 'chip-open'));
       }
       if (it.findings && a.rows) findings += a.rows.length;
       var r = requirementText(it);
@@ -2821,12 +2953,11 @@ table.rows td.rowact { width: 30px; text-align: center; }
       u.req.className = 'req' + (r && missing ? ' req-missing' : '');
       u.meta.textContent = a.updatedAt ? 'Updated ' + fmtTime(a.updatedAt) : '';
     });
-    // Comparison bar and, in only-differences mode, sections with nothing left to show.
     var bar = document.getElementById('cmpbar');
     if (bar) {
       bar.hidden = !compare;
       if (compare) {
-        var who = compare.sources.map(function (s) { return (s.reviewer || 'unknown') + ' [' + (s.reviewerKind || '?') + (s.phase ? ', ' + s.phase : '') + ']'; }).join(' + ');
+        var who = compare.sources.map(function (s) { return (s.reviewer || 'unknown') + ' [' + (s.reviewerKind || '?') + ']'; }).join(' + ');
         document.getElementById('cmpinfo').textContent = 'Comparing with ' + who + ': ' + cmpDiff + ' of ' + cmpTotal + ' items differ';
       }
     }
@@ -2834,19 +2965,70 @@ table.rows td.rowact { width: 30px; text-align: center; }
       DEF.sections.forEach(function (sec) {
         var secEl = ui.sections[sec.id];
         if (!secEl) return;
-        var anyVisible = Array.prototype.some.call(secEl.querySelectorAll('.item'), function (el) { return !el.hidden; });
-        secEl.hidden = !anyVisible;
+        secEl.hidden = !Array.prototype.some.call(secEl.querySelectorAll('.item'), function (el) { return !el.hidden; });
       });
     }
+    var issues = collectIssues();
+    findings = issues.length;
+    renderIssueSummary(issues);
     var pct = total ? Math.round(done / total * 100) : 0;
     document.getElementById('progress').value = pct;
-    document.getElementById('progresstext').textContent = done + ' of ' + total + ' applicable items complete (' + pct + '%)' + (findings ? ', ' + findings + ' issue' + (findings === 1 ? '' : 's') + ' recorded' : '');
+    document.getElementById('progresstext').textContent = done + ' of ' + total + ' applicable items complete (' + pct + '%)'
+      + (unsureCount ? ', ' + unsureCount + ' undetermined' : '')
+      + (findings ? ', ' + findings + ' issue' + (findings === 1 ? '' : 's') + ' recorded' : '');
     var dirty = state.lastModifiedAt && (!state.lastExportedAt || state.lastModifiedAt > state.lastExportedAt);
     var badge = document.getElementById('dirty');
     badge.hidden = !dirty;
     badge.textContent = state.lastExportedAt ? 'Changes since last export' : 'Never exported';
   }
 
+  function issueTable(issues) {
+    var head = h('tr', null, ['Topic', 'Item', 'Where', 'What', 'Severity'].map(function (t) { return h('th', { text: t }); }));
+    var tbody = h('tbody', null, []);
+    issues.forEach(function (x) {
+      var sec = sectionsById[x.sectionId];
+      var where = [x.label, x.location].filter(hasText).join(' ');
+      var itemText = x.item + (x.row ? ' row ' + x.row : '') + (hasText(x.relatedItem) ? ' (see ' + x.relatedItem + ')' : '');
+      tbody.appendChild(h('tr', null, [
+        h('td', { text: sec ? sectionHeading(sec) : (x.sectionId || '') }),
+        h('td', null, [h('a', { href: '#item-' + x.item, text: itemText }), h('div', { class: 'small', text: x.title || '' })]),
+        h('td', { text: where }),
+        h('td', { text: x.description || '' }),
+        h('td', { text: x.severity || '' })
+      ]));
+    });
+    return h('div', { class: 'tablescroll' }, [h('table', { class: 'issues' }, [h('thead', null, [head]), tbody])]);
+  }
+  function renderIssueSummary(issues) {
+    var list = document.getElementById('issues-list');
+    if (list) {
+      list.innerHTML = '';
+      if (issues.length) list.appendChild(issueTable(issues));
+      else list.appendChild(h('p', { class: 'intro', text: 'No issues recorded yet.' }));
+      if (compare) {
+        var theirs = issuesFromResult(compare.answers);
+        var who = compare.sources.map(function (s) { return (s.reviewer || 'unknown') + ' [' + (s.reviewerKind || '?') + ']'; }).join(' + ');
+        list.appendChild(h('h3', { text: 'Issues in the comparison result from ' + who + ': ' + theirs.length }));
+        if (theirs.length) list.appendChild(issueTable(theirs));
+      }
+    }
+    var badge = document.getElementById('issues-badge');
+    if (badge) {
+      var n = issues.length;
+      var words = n + ' issue' + (n === 1 ? '' : 's') + ' recorded';
+      badge.hidden = n === 0;
+      badge.querySelector('.count').textContent = String(n);
+      badge.setAttribute('aria-label', words + '; go to the list');
+      badge.title = words + '. Click to see the list at the end of the form.';
+    }
+  }
+  function goToIssues() {
+    var target = document.getElementById('issues-summary');
+    if (!target) return;
+    if (target.scrollIntoView) target.scrollIntoView({ block: 'start', behavior: 'smooth' });
+    var hd = document.getElementById('issues-heading');
+    if (hd) { try { hd.focus({ preventScroll: true }); } catch (e) { hd.focus(); } }
+  }
   function refreshSlots() {
     var dl = document.getElementById('slots');
     dl.innerHTML = '';
@@ -2861,14 +3043,16 @@ table.rows td.rowact { width: 30px; text-align: center; }
     try { if (compare) localStorage.setItem(compareKey(), JSON.stringify(compare)); else localStorage.removeItem(compareKey()); } catch (e) { /* ignore */ }
   }
   function readCompare() {
-    try { var raw = localStorage.getItem(compareKey()); return raw ? JSON.parse(raw) : null; } catch (e) { return null; }
+    try { var raw = localStorage.getItem(compareKey()); var c = raw ? JSON.parse(raw) : null; return (c && Array.isArray(c.sources) && c.answers && typeof c.answers === 'object') ? c : null; } catch (e) { return null; }
   }
   function loadCompare(obj) {
-    if (!compare) compare = { sources: [], answers: {} };
-    compare.sources.push({ reviewer: obj.reviewer || '', reviewerKind: obj.reviewerKind || '', exportedAt: obj.exportedAt || '', app: obj.app || '', phase: obj.phase || '' });
-    Object.keys(obj.answers || {}).forEach(function (id) { if (itemsById[id]) compare.answers[id] = obj.answers[id]; });
-    saveCompare();
+    if (!obj || typeof obj !== 'object' || !obj.answers || typeof obj.answers !== 'object') { flash('That JSON has no answers to compare'); return; }
+    var next = compare && Array.isArray(compare.sources) ? compare : { sources: [], answers: Object.create(null) };
+    next.sources.push({ reviewer: obj.reviewer || '', reviewerKind: obj.reviewerKind || '', exportedAt: obj.exportedAt || '', app: obj.app || '' });
+    Object.keys(obj.answers).forEach(function (id) { if (own(itemsById, id) && obj.answers[id] && typeof obj.answers[id] === 'object') next.answers[id] = obj.answers[id]; });
+    compare = next;
     refresh();
+    saveCompare();
   }
   function clearCompare() {
     compare = null; onlyDiff = false;
@@ -2878,22 +3062,22 @@ table.rows td.rowact { width: 30px; text-align: center; }
     refresh();
   }
 
-  // Where the AI has a table and the developer form has a text field, rows
-  // become lines; where the AI answered per row and the form asks once, the
-  // statuses collapse to one. Used by import and by comparison alike.
   function rowsToText(rows) {
-    return (rows || []).map(function (r) { return Object.keys(r).map(function (k) { return r[k]; }).filter(hasText).join(' | '); }).filter(hasText).join('\n');
+    return (rows || []).map(function (r) { return Object.keys(r).filter(function (k) { return k !== '_id'; }).map(function (k) { return r[k]; }).filter(hasText).join(' | '); }).filter(hasText).join('\n');
   }
   function collapseRows(perRow) {
     var st = perRow.map(function (x) { return x.status || null; }).filter(Boolean);
     var status = !st.length ? null
       : st.every(function (s) { return s === st[0]; }) ? st[0]
       : st.indexOf('finding') >= 0 ? 'finding' : st.indexOf('unable') >= 0 ? 'unable' : st.indexOf('pass') >= 0 ? 'pass' : 'na';
-    var join = function (k) { return perRow.map(function (x) { return hasText(x[k]) ? ((x.label || ('row ' + x.row)) + ': ' + x[k]) : ''; }).filter(Boolean).join('\n'); };
+    var join = function (k) { return perRow.map(function (x) { return hasText(x[k]) ? ((x.label || ('row ' + x.row)) + ': ' + x[k]) : ''; }).filter(Boolean).join('; '); };
     return { status: status, location: join('location'), findings: join('findings'), evidence: join('evidence'), whyNoMore: join('whyNoMore'), reason: join('reason') };
   }
-
-  // A comparable form of an answer: null when unanswered or not applicable.
+  function textOf(rec) {
+    if (!rec) return '';
+    if (Array.isArray(rec.rows)) return rec.rows.length ? rowsToText(rec.rows) : ((rec.complete || hasText(rec.searched) || rec.none) ? 'None' : '');
+    return rec.value === undefined || rec.value === null ? '' : String(rec.value);
+  }
   function normalizeRec(item, rec, perRowStatuses) {
     if (!rec || rec.status === 'na' || rec.status === 'missing') return null;
     if (item.type === 'check') {
@@ -2902,7 +3086,7 @@ table.rows td.rowact { width: 30px; text-align: center; }
     }
     if (item.type === 'list') { var labels = (rec.rows || []).map(rowLabel).sort(); return labels.length ? labels : null; }
     if (item.type === 'multiselect') return Array.isArray(rec.value) && rec.value.length ? rec.value.slice().sort() : null;
-    if (item.type === 'text') { var tv = rec.rows ? rowsToText(rec.rows) : rec.value; return hasText(tv) ? String(tv).trim() : null; }
+    if (item.type === 'text') { var tv = textOf(rec); return hasText(tv) ? String(tv).trim() : null; }
     return (rec.value === undefined || rec.value === null || rec.value === '') ? null : rec.value;
   }
   function mineNormalized(item) {
@@ -2912,10 +3096,8 @@ table.rows td.rowact { width: 30px; text-align: center; }
     return normalizeRec(item, a, rs ? rs.map(function (x) { return x.rec.status || null; }) : null);
   }
   function theirsNormalized(item, rec) {
-    if (rec && rec.perRow && item.type === 'check' && item.forEach && sourceRows(item) === null) {
-      return normalizeRec(item, collapseRows(rec.perRow), null);
-    }
-    return normalizeRec(item, rec, (rec && rec.perRow) ? rec.perRow.map(function (x) { return x.status || null; }) : null);
+    if (rec && Array.isArray(rec.perRow) && item.type === 'check' && item.forEach && sourceRows(item) === null) return normalizeRec(item, collapseRows(rec.perRow), null);
+    return normalizeRec(item, rec, (rec && Array.isArray(rec.perRow)) ? rec.perRow.map(function (x) { return x.status || null; }) : null);
   }
   function statusText(v) { return v ? statusLabel(v) : '(no status)'; }
   function formatTheirs(item, rec) {
@@ -2924,7 +3106,7 @@ table.rows td.rowact { width: 30px; text-align: center; }
     if (rec.status === 'missing') return h('div', { class: 'cmpv muted', text: 'missing in the other result' });
     var parts = [];
     if (item.type === 'check') {
-      if (rec.perRow) {
+      if (Array.isArray(rec.perRow)) {
         var ul = h('ul', { class: 'cmprows' });
         rec.perRow.forEach(function (x) {
           ul.appendChild(h('li', null, [h('code', { text: x.label || ('row ' + x.row) }), ': ' + statusText(x.status) + (x.location ? ' at ' + x.location : '') + (x.findings ? '. ' + x.findings : '')]));
@@ -2934,20 +3116,20 @@ table.rows td.rowact { width: 30px; text-align: center; }
         parts.push(h('div', { text: statusText(rec.status) + (rec.location ? ' at ' + rec.location : '') + (rec.findings ? '. ' + rec.findings : '') }));
       }
     } else if (item.type === 'list') {
-      var rows = rec.rows || [];
+      var rows = Array.isArray(rec.rows) ? rec.rows : [];
       parts.push(h('div', { text: rows.length + ' row' + (rows.length === 1 ? '' : 's') + (rows.length > 12 ? ' (first 12 shown)' : '') }));
       if (rows.length) {
         var ul2 = h('ul', { class: 'cmprows' });
-        rows.slice(0, 12).forEach(function (r) { ul2.appendChild(h('li', { text: Object.keys(r).map(function (k) { return r[k]; }).filter(hasText).join(' | ') })); });
+        rows.slice(0, 12).forEach(function (r) { ul2.appendChild(h('li', { text: rowLabel(r) + (Object.keys(r).length > 2 ? ' | ' + Object.keys(r).filter(function (k) { return k !== '_id'; }).map(function (k) { return r[k]; }).filter(hasText).slice(1).join(' | ') : '') })); });
         parts.push(ul2);
       }
     } else if (item.type === 'multiselect') {
-      parts.push(h('div', { text: (rec.value || []).map(function (v) { return v === UNSURE ? UNSURE_LABEL : optionLabel(item, v); }).join(', ') || '(none)' }));
+      parts.push(h('div', { text: (Array.isArray(rec.value) ? rec.value : []).map(function (v) { return optionLabel(item, v); }).join(', ') || '(none)' }));
     } else if (item.type === 'text') {
-      parts.push(h('div', { class: 'pre', text: rec.value || '(empty)' }));
+      parts.push(h('div', { class: 'pre', text: textOf(rec) || '(empty)' }));
     } else {
       var v = rec.value;
-      var shown = v === UNSURE ? UNSURE_LABEL : (item.type === 'yesno' ? ({ yes: 'Yes', no: 'No' })[v] || v : (v ? optionLabel(item, v) : ''));
+      var shown = v ? optionLabel(item, v) : '';
       parts.push(h('div', { text: shown || '(empty)' }));
     }
     if (hasText(rec.detail)) parts.push(h('div', { class: 'muted', text: 'Detail: ' + rec.detail }));
@@ -2955,16 +3137,15 @@ table.rows td.rowact { width: 30px; text-align: center; }
     if (hasText(rec.evidence)) parts.push(h('div', { class: 'muted pre', text: 'Evidence: ' + rec.evidence }));
     if (hasText(rec.searched)) parts.push(h('div', { class: 'muted pre', text: 'Searched: ' + rec.searched }));
     if (hasText(rec.whyNoMore)) parts.push(h('div', { class: 'muted pre', text: 'Why no more findings: ' + rec.whyNoMore }));
-    if (rec.perRow) rec.perRow.forEach(function (x) {
+    if (Array.isArray(rec.perRow)) rec.perRow.forEach(function (x) {
       if (hasText(x.evidence)) parts.push(h('div', { class: 'muted pre', text: 'Evidence (' + (x.label || 'row ' + x.row) + '): ' + x.evidence }));
       if (hasText(x.whyNoMore)) parts.push(h('div', { class: 'muted pre', text: 'Why no more findings (' + (x.label || 'row ' + x.row) + '): ' + x.whyNoMore }));
     });
     return h('div', { class: 'cmpv' }, parts);
   }
-  // Paints the comparison panel of one item; returns true when the answers differ.
   function renderCompare(item, u) {
     if (!compare) { u.cmp.hidden = true; u.root.classList.remove('differs'); return false; }
-    var theirs = compare.answers[item.id];
+    var theirs = own(compare.answers, item.id) ? compare.answers[item.id] : undefined;
     var mine = mineNormalized(item);
     var other = theirsNormalized(item, theirs);
     var diff = !(mine === null && other === null) && JSON.stringify(mine) !== JSON.stringify(other);
@@ -2980,8 +3161,70 @@ table.rows td.rowact { width: 30px; text-align: center; }
   // ---------------------------------------------------------------------------
   // Export and import
   // ---------------------------------------------------------------------------
+  // Every recorded issue in the current state: checks marked Problem found (per row
+  // or as a whole) and every row of an issues table. One list feeds the export's
+  // findings array, the summary section, and the badge, so they cannot disagree.
+  function collectIssues() {
+    var out = [];
+    DEF.items.forEach(function (it) {
+      if (!applicable(it)) return;
+      var a = state.answers[it.id] || {};
+      if (it.type === 'check') {
+        var rs = it.forEach ? checkRows(it) : null;
+        if (rs) {
+          rs.forEach(function (x) {
+            if (x.rec.status !== 'finding') return;
+            out.push({ item: it.id, row: x.index + 1, label: x.label, location: x.rec.location || '', description: x.rec.findings || '', severity: it.severity, sectionId: it.section, title: it.title });
+          });
+        } else if (a.status === 'finding') {
+          out.push({ item: it.id, location: a.location || '', description: a.findings || '', severity: it.severity, sectionId: it.section, title: it.title });
+        }
+      } else if (it.type === 'list' && it.findings && Array.isArray(a.rows)) {
+        a.rows.forEach(function (r) {
+          var c = { item: it.id };
+          Object.keys(r).forEach(function (k) { if (k !== '_id') c[k] = r[k]; });
+          c.sectionId = it.section; c.title = it.title;
+          out.push(c);
+        });
+      }
+    });
+    return out;
+  }
+  // The same list read from a result file (the comparison side).
+  function issuesFromResult(answers) {
+    var out = [];
+    DEF.items.forEach(function (it) {
+      var r = own(answers, it.id) ? answers[it.id] : null;
+      if (!r || typeof r !== 'object') return;
+      if (it.type === 'check') {
+        if (Array.isArray(r.perRow)) {
+          r.perRow.forEach(function (x, i) {
+            if (!x || x.status !== 'finding') return;
+            out.push({ item: it.id, row: x.row || (i + 1), label: x.label || '', location: x.location || '', description: x.findings || '', severity: it.severity, sectionId: it.section, title: it.title });
+          });
+        } else if (r.status === 'finding') {
+          out.push({ item: it.id, location: r.location || '', description: r.findings || '', severity: it.severity, sectionId: it.section, title: it.title });
+        }
+      } else if (it.type === 'list' && it.findings && Array.isArray(r.rows)) {
+        r.rows.forEach(function (x) {
+          if (!x || typeof x !== 'object') return;
+          var c = { item: it.id };
+          Object.keys(x).forEach(function (k) { if (k !== '_id') c[k] = x[k]; });
+          c.sectionId = it.section; c.title = it.title;
+          out.push(c);
+        });
+      }
+    });
+    return out;
+  }
+  function exportIssue(x) {
+    var c = {};
+    Object.keys(x).forEach(function (k) { if (k !== 'sectionId' && k !== 'title') c[k] = x[k]; });
+    return c;
+  }
+
   function buildExport() {
-    applCache = {}; naReason = {};
+    applCache = {}; naReason = {}; viaUnsure = {};
     var out = {
       checklist: DEF.id, version: DEF.version, title: DEF.title, phase: 'all',
       app: state.app || '', reviewer: state.reviewer || '', reviewerKind: state.reviewerKind || 'dev',
@@ -2995,125 +3238,168 @@ table.rows td.rowact { width: 30px; text-align: center; }
         var rs = it.forEach ? checkRows(it) : null;
         if (rs) {
           rec.perRow = rs.map(function (x) {
-            var r = { row: x.index + 1, label: x.key, status: x.rec.status || null, location: x.rec.location || '', findings: x.rec.findings || '' };
-            if (r.status === 'finding') out.findings.push({ item: it.id, row: r.row, label: r.label, location: r.location, description: r.findings, severity: it.severity });
+            var r = { row: x.index + 1, label: x.label, status: x.rec.status || null, location: x.rec.location || '', findings: x.rec.findings || '' };
+            if (r.status === 'na' || r.status === 'unable') r.reason = x.rec.findings || '';
+            if (hasText(x.rec.evidence)) r.evidence = x.rec.evidence;
+            if (hasText(x.rec.whyNoMore)) r.whyNoMore = x.rec.whyNoMore;
             return r;
           });
         } else {
           rec.status = a.status || null; rec.location = a.location || ''; rec.findings = a.findings || '';
-          if (rec.status === 'finding') out.findings.push({ item: it.id, location: rec.location, description: rec.findings, severity: it.severity });
+          if (rec.status === 'na' || rec.status === 'unable') rec.reason = a.findings || '';
+          if (hasText(a.evidence)) rec.evidence = a.evidence;
+          if (hasText(a.whyNoMore)) rec.whyNoMore = a.whyNoMore;
         }
       } else if (it.type === 'list') {
-        rec.rows = a.rows || [];
-        if (a.none) rec.none = true;
-        if (it.findings) rec.rows.forEach(function (r) { out.findings.push(Object.assign({ item: it.id }, r)); });
+        rec.rows = (a.rows || []).map(function (r) { var c = {}; Object.keys(r).forEach(function (k) { if (k !== '_id') c[k] = r[k]; }); return c; });
+        if (a.none && !rec.rows.length) rec.none = true;
       } else {
         rec.value = (a.value === undefined) ? null : a.value;
       }
       if (it.detail) rec.detail = a.detail || '';
-      if (DEV) rec.notes = a.notes || '';
+      if (DEV) { rec.notes = a.notes || ''; if (hasText(a.evidence)) rec.evidence = a.evidence; if (hasText(a.searched)) rec.searched = a.searched; if (hasText(a.whyNoMore)) rec.whyNoMore = a.whyNoMore; }
       else { rec.evidence = a.evidence || ''; rec.searched = a.searched || ''; }
       rec.complete = complete(it);
       rec.updatedAt = a.updatedAt || null;
       out.answers[it.id] = rec;
     });
+    out.findings = collectIssues().map(exportIssue);
+    // An unedited AI result re-exports with the answers this form never showed.
+    if (state.reviewerKind === 'ai' && state.passthrough) Object.keys(state.passthrough).forEach(function (id) { if (!own(out.answers, id)) out.answers[id] = state.passthrough[id]; });
     return out;
   }
 
-  function openExportModal() {
+  function openExportModal(opener) {
     var json = JSON.stringify(buildExport(), null, 2);
-    var ta = h('textarea', { class: 'json', readonly: true, rows: 18 });
+    var ta = h('textarea', { class: 'json', readonly: true, rows: 18, 'aria-label': 'Exported JSON' });
     ta.value = json;
     var copy = h('button', { type: 'button', class: 'primary', text: 'Copy to clipboard' });
-    copy.addEventListener('click', function () { copyText(ta); });
+    copy.addEventListener('click', function () { copyText(ta, function () { state.lastExportedAt = now(); save(); refresh(); }); });
+    ta.addEventListener('copy', function () { state.lastExportedAt = now(); save(); refresh(); });
     openModal('Export review as JSON', [
-      h('p', { class: 'note', text: 'Your answers stay saved in this browser until you use Clear.' }),
+      h('p', { class: 'note', text: 'Your answers stay saved in this browser until you use Clear. "Never exported" clears once the JSON has been copied.' }),
       ta
-    ], [copy]);
-    state.lastExportedAt = now();
-    save();
-    refresh();
+    ], [copy], opener);
   }
 
-  function copyText(ta) {
+  function copyText(ta, done) {
     function fallback() {
       var ok = false;
       try { ta.focus(); ta.select(); ok = document.execCommand('copy'); } catch (e) { ok = false; }
       flash(ok ? 'Copied to clipboard' : 'Copy failed. Select the text and copy it manually.');
+      if (ok && done) done();
     }
     if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(ta.value).then(function () { flash('Copied to clipboard'); }, fallback);
+      navigator.clipboard.writeText(ta.value).then(function () { flash('Copied to clipboard'); if (done) done(); }, fallback);
     } else fallback();
   }
 
-  function openImportModal() {
-    var ta = h('textarea', { class: 'json', rows: 14, placeholder: 'Paste exported JSON here' });
+  function openImportModal(opener) {
+    var ta = h('textarea', { class: 'json', rows: 14, placeholder: 'Paste exported JSON here', 'aria-label': 'JSON to import' });
     var preview = h('div', { class: 'preview' });
     var replace = h('button', { type: 'button', class: 'primary', text: 'Replace current answers', disabled: true });
     var merge = h('button', { type: 'button', text: 'Merge into current answers', disabled: true });
+    var asCompare = h('button', { type: 'button', text: 'Load as comparison', disabled: true });
     var parsed = null;
     function check() {
-      parsed = null; replace.disabled = true; merge.disabled = true;
+      parsed = null; replace.disabled = true; merge.disabled = true; asCompare.disabled = true;
       var obj;
+      if (!hasText(ta.value)) { preview.textContent = ''; return; }
       try { obj = JSON.parse(ta.value); } catch (e) { preview.textContent = 'Not valid JSON: ' + e.message; return; }
+      if (!obj || typeof obj !== 'object' || Array.isArray(obj)) { preview.textContent = 'Not a result file.'; return; }
       if (obj.checklist !== DEF.id) { preview.textContent = 'This JSON is for checklist "' + obj.checklist + '", not "' + DEF.id + '".'; return; }
       var major = String(obj.version || '').split('.')[0];
-      var n = Object.keys(obj.answers || {}).length;
-      var known = Object.keys(obj.answers || {}).filter(function (id) { return itemsById[id]; }).length;
+      var answers = obj.answers && typeof obj.answers === 'object' ? obj.answers : {};
+      var n = Object.keys(answers).length;
+      var known = Object.keys(answers).filter(function (id) { return own(itemsById, id); }).length;
       var lines = [
         'Application: ' + (obj.app || '(none)'),
         'Reviewer: ' + (obj.reviewer || '(none)') + ' [' + (obj.reviewerKind || 'unknown') + ']',
         'Exported: ' + fmtTime(obj.exportedAt),
         'Answers: ' + n + ' (' + known + ' match items in this checklist)'
       ];
-      if (major !== MAJOR) lines.push('Warning: exported from version ' + obj.version + ', this form is ' + DEF.version + '. Items may not line up.');
+      if (String(obj.version) !== String(DEF.version)) lines.push((major !== MAJOR ? 'Warning' : 'Note') + ': exported from version ' + obj.version + ', this form is ' + DEF.version + '. Items may not line up.');
+      if (obj.lintProblems > 0) lines.push('Warning: the linter reported ' + obj.lintProblems + ' unresolved problem' + (obj.lintProblems === 1 ? '' : 's') + ' when this file was written. It is a snapshot of an unfinished review, not a final result.');
+      else if (obj.reviewerKind === 'ai' && obj.lintProblems === undefined) lines.push('Warning: this AI result carries no linter stamp, so it was not produced by the linter and may be a snapshot.');
       preview.textContent = lines.join('\n');
-      parsed = obj; replace.disabled = false; merge.disabled = false;
+      parsed = obj; replace.disabled = false; merge.disabled = false; asCompare.disabled = false;
     }
     ta.addEventListener('input', check);
-    var asCompare = h('button', { type: 'button', text: 'Load as comparison', disabled: true });
-    replace.addEventListener('click', function () { if (parsed) { importResult(parsed, 'replace'); closeModal(); } });
+    replace.addEventListener('click', function () {
+      if (!parsed) return;
+      var hasAnswers = Object.keys(state.answers).some(function (id) { return own(itemsById, id) && answered(itemsById[id]); });
+      if (hasAnswers && !window.confirm('Replace every answer in the review "' + slotName(state.app) + '" with this file? The current answers are kept once under a backup key.')) return;
+      importResult(parsed, 'replace'); closeModal();
+    });
     merge.addEventListener('click', function () { if (parsed) { importResult(parsed, 'merge'); closeModal(); } });
     asCompare.addEventListener('click', function () { if (parsed) { loadCompare(parsed); closeModal(); flash('Loaded comparison from ' + (parsed.reviewer || parsed.reviewerKind || 'the other result')); } });
-    var oldCheck = check;
-    check = function () { oldCheck(); asCompare.disabled = !parsed; };
-    ta.removeEventListener('input', oldCheck);
-    ta.addEventListener('input', check);
     openModal('Import review JSON', [
       h('p', { class: 'note', text: 'Replace or Merge loads the answers into this form. Load as comparison keeps your answers and shows the other result beside each item.' }),
       ta, preview
-    ], [replace, merge, asCompare]);
+    ], [replace, merge, asCompare], opener, function () { return hasText(ta.value) ? 'Discard the pasted JSON?' : null; });
   }
 
-  // Loads a result (developer or AI, either phase) into the form. Per-row answers
-  // from the AI are numbered; they are matched to the current table rows by
-  // label when present, otherwise by position.
+  // Loads a result (developer or AI) into the form. Per-row answers from the AI
+  // are numbered; they are matched to the current table rows by label when
+  // present, otherwise by position. Merge never moves the review to another
+  // application, and only fields that carry content are merged.
   function importResult(parsed, mode) {
-    if (mode === 'replace') { state = freshState(); state.reviewerKind = parsed.reviewerKind || 'dev'; }
-    if (parsed.app) state.app = parsed.app;
-    if (parsed.reviewer && !state.reviewer) state.reviewer = parsed.reviewer;
+    if (!parsed || typeof parsed !== 'object' || !parsed.answers || typeof parsed.answers !== 'object') { flash('Nothing to import'); return; }
+    if (mode === 'replace') {
+      backupSlot(state.app);
+      var keepApp = state.app;
+      state = freshState();
+      state.app = hasText(parsed.app) ? parsed.app : keepApp;
+      state.reviewerKind = parsed.reviewerKind === 'ai' ? 'ai' : 'dev';
+      state.reviewer = parsed.reviewer || '';
+      state.importedFrom = { reviewer: parsed.reviewer || '', reviewerKind: parsed.reviewerKind || '', exportedAt: parsed.exportedAt || '' };
+      state.lastExportedAt = parsed.exportedAt || now();
+    }
     var pendingRows = {};
-    Object.keys(parsed.answers || {}).forEach(function (id) {
+    var mergeOnto = function (id, a) {
+      if (mode !== 'merge') { state.answers[id] = a; return; }
+      var cur = state.answers[id] || {};
+      Object.keys(a).forEach(function (k) {
+        var v = a[k];
+        var empty = v === undefined || v === null || v === '' || (Array.isArray(v) && !v.length);
+        if (!empty) cur[k] = v;
+      });
+      state.answers[id] = cur;
+    };
+    // Answers to items this form does not show (skipped for developers) are kept
+    // verbatim so that viewing and re-exporting an AI result loses nothing.
+    if (mode !== 'merge' || !state.passthrough) state.passthrough = {};
+    Object.keys(parsed.answers).forEach(function (id) {
+      if (!own(itemsById, id)) { if (/^[CRF]-\d{2}$/.test(id) && parsed.answers[id] && typeof parsed.answers[id] === 'object' && !Array.isArray(parsed.answers[id])) state.passthrough[id] = parsed.answers[id]; return; }
       var r = parsed.answers[id];
       var it = itemsById[id];
-      if (!it || !r) return;
-      if (r.status === 'na' && r.reason && /^rule:/.test(r.reason)) return;
+      if (!r || typeof r !== 'object' || Array.isArray(r)) return;
       if (r.status === 'missing') return;
-      var a = {};
-      if (Object.prototype.hasOwnProperty.call(r, 'rows')) {
-        // An AI table landing on a developer text field becomes one line per row.
-        if (it.type === 'text') a.value = rowsToText(r.rows);
-        else a.rows = Array.isArray(r.rows) ? r.rows : [];
+      if (r.status === 'na') {
+        if (it.type === 'check') mergeOnto(id, { status: 'na', findings: r.reason && !/^rule:/.test(r.reason) ? r.reason : '' });
+        return;
       }
-      if (Object.prototype.hasOwnProperty.call(r, 'value') && r.value !== null) a.value = r.value;
+      var a = {};
+      if (own(r, 'rows')) {
+        var rows = Array.isArray(r.rows) ? r.rows.filter(function (x) { return x && typeof x === 'object'; }) : [];
+        var emptyButDone = rows.length === 0 && (r.complete === true || hasText(r.searched) || r.none);
+        if (it.type === 'text') a.value = rows.length ? rowsToText(rows) : (emptyButDone ? 'None' : '');
+        else { a.rows = rows.map(function (x) { var c = { _id: newRowId() }; Object.keys(x).forEach(function (k) { if (k !== '_id') c[k] = x[k]; }); return c; }); if (emptyButDone) a.none = true; }
+      }
+      if (own(r, 'value') && r.value !== null) {
+        var v = r.value;
+        if (it.type === 'yesno' || it.type === 'select') { if (v === 'unknown') v = UNSURE; }
+        if (it.type === 'multiselect' && Array.isArray(v)) v = v.map(function (x) { return x === 'unknown' ? UNSURE : x; });
+        if (it.type === 'list' && typeof v === 'string') { a.rows = NONE_TEXT.test(v.trim()) ? [] : v.split(/\r?\n/).filter(hasText).map(function (line) { var o = { _id: newRowId() }; o[it.columns[0].key] = line; return o; }); if (NONE_TEXT.test(v.trim())) a.none = true; }
+        else a.value = v;
+      }
       if (it.type === 'check') {
         if (Array.isArray(r.perRow)) {
-          // Single-instance in this form (the source is a text field here): collapse.
           if (it.forEach && sourceRows(it) === null) Object.assign(a, collapseRows(r.perRow));
           else pendingRows[id] = r.perRow;
         } else {
           if (r.status) a.status = r.status;
-          a.location = r.location || ''; a.findings = r.findings || '';
+          a.location = r.location || ''; a.findings = r.findings || (r.reason && !/^rule:/.test(r.reason) ? r.reason : '');
           if (r.whyNoMore) a.whyNoMore = r.whyNoMore;
         }
       }
@@ -3124,43 +3410,55 @@ table.rows td.rowact { width: 30px; text-align: center; }
       if (r.searched) a.searched = r.searched;
       if (r.whyNoMore) a.whyNoMore = r.whyNoMore;
       a.updatedAt = r.updatedAt || null;
-      state.answers[id] = (mode === 'merge') ? Object.assign(state.answers[id] || {}, a) : a;
+      mergeOnto(id, a);
     });
-    // Now that any imported tables are in place, place the per-row answers.
-    applCache = {}; naReason = {};
+    applCache = {}; naReason = {}; viaUnsure = {};
     Object.keys(pendingRows).forEach(function (id) {
       var it = itemsById[id];
       var rows = it.forEach ? sourceRows(it) : null;
-      var keys = rows ? rowKeys(rows) : [];
+      if (!rows) return;
+      ensureRowIds(rows);
       var a = ans(id);
       if (mode !== 'merge' || !a.perRow) a.perRow = {};
       pendingRows[id].forEach(function (x, i) {
-        var n = x.row || (i + 1);
-        var key = (x.label && keys.indexOf(x.label) >= 0) ? x.label : (keys[n - 1] || x.label || ('#' + n));
-        a.perRow[key] = { status: x.status || undefined, location: x.location || '', findings: x.findings || '', evidence: x.evidence || '', whyNoMore: x.whyNoMore || '' };
+        if (!x || typeof x !== 'object') return;
+        var n = Number(x.row) || (i + 1);
+        var byLabel = x.label ? rows.filter(function (r) { return rowLabel(r) === x.label; })[0] : null;
+        var target = byLabel || rows[n - 1];
+        if (!target) return;
+        a.perRow[target._id] = { status: x.status || undefined, location: x.location || '', findings: x.findings || (x.reason && !/^rule:/.test(x.reason) ? x.reason : ''), evidence: x.evidence || '', whyNoMore: x.whyNoMore || '' };
       });
     });
     state.lastModifiedAt = now();
     renderAll();
     save();
-    flash('Imported into "' + slotName(state.app) + '"');
+    flash('Imported into "' + slotName(state.app) + '"' + (parsed.lintProblems > 0 ? '. Warning: this file was a snapshot with ' + parsed.lintProblems + ' unresolved linter problems.' : ''));
   }
 
-  function openPasteModal(item, done) {
-    var ta = h('textarea', { class: 'json', rows: 10, placeholder: 'One row per line. Separate columns with tabs or " | ".\nColumn order: ' + item.columns.map(function (c) { return c.label; }).join(' | ') });
+  function openPasteModal(item, done, opener) {
+    var ta = h('textarea', { class: 'json', rows: 10, placeholder: 'One row per line. Separate columns with tabs or " | ".\nColumn order: ' + item.columns.map(function (c) { return c.label; }).join(' | '), 'aria-label': 'Rows to paste' });
     var add = h('button', { type: 'button', class: 'primary', text: 'Add rows' });
     add.addEventListener('click', function () {
       var a = ans(item.id); if (!Array.isArray(a.rows)) a.rows = [];
-      ta.value.split(/\r?\n/).forEach(function (line) {
+      var unmatched = [];
+      ta.value.split(/\r?\n/).forEach(function (line, li) {
         if (!line.trim()) return;
         var cells = line.indexOf('\t') >= 0 ? line.split('\t') : line.split(/\s*\|\s*/);
-        var row = {};
-        item.columns.forEach(function (c, i) { row[c.key] = (cells[i] || '').trim(); });
+        var row = { _id: newRowId() };
+        item.columns.forEach(function (c, i) {
+          var v = (cells[i] || '').trim();
+          if (c.type === 'select' && v) {
+            var m = c.options.filter(function (o) { return code(o) === code(v); })[0];
+            if (m) v = m; else unmatched.push('line ' + (li + 1) + ' "' + v + '" is not one of ' + c.options.join(', '));
+          }
+          row[c.key] = v;
+        });
         a.rows.push(row);
       });
       closeModal(); done();
+      if (unmatched.length) flash('Pasted, but check: ' + unmatched.join('; '));
     });
-    openModal('Paste rows into ' + item.id, [ta], [add]);
+    openModal('Paste rows into ' + item.id, [ta], [add], opener, function () { return hasText(ta.value) ? 'Discard the pasted rows?' : null; });
   }
 
   function clearReview() {
@@ -3168,17 +3466,19 @@ table.rows td.rowact { width: 30px; text-align: center; }
     var dirty = state.lastModifiedAt && (!state.lastExportedAt || state.lastModifiedAt > state.lastExportedAt);
     var msg = 'Clear the saved review for "' + name + '"?';
     if (dirty) msg += '\n\nThere are changes newer than the last export. Export first if you want to keep them.';
-    msg += '\n\nThe previous copy is kept once under a backup key until the next clear.';
+    msg += '\n\nThe previous copy is kept once under a backup key until the next clear. Any loaded comparison is removed.';
     if (!window.confirm(msg)) return;
     try {
       var k = slotKey(state.app);
       var cur = localStorage.getItem(k);
       if (cur) localStorage.setItem(k + ':prev', cur);
       localStorage.removeItem(k);
+      localStorage.removeItem(k + ':compare');
     } catch (e) { /* ignore */ }
     var app = state.app;
     state = freshState();
     state.app = app;
+    compare = null; onlyDiff = false;
     renderAll();
     flash('Cleared "' + name + '"');
   }
@@ -3186,10 +3486,13 @@ table.rows td.rowact { width: 30px; text-align: center; }
   // ---------------------------------------------------------------------------
   // Modal
   // ---------------------------------------------------------------------------
-  function openModal(title, body, actions) {
+  var modalOpener = null, modalGuard = null;
+  function openModal(title, body, actions, opener, guard) {
     var back = document.getElementById('modal');
     var box = back.querySelector('.modal');
     box.innerHTML = '';
+    modalOpener = opener || document.activeElement;
+    modalGuard = guard || null;
     var close = h('button', { type: 'button', text: 'Close' });
     close.addEventListener('click', closeModal);
     box.appendChild(h('h2', { text: title }));
@@ -3199,7 +3502,15 @@ table.rows td.rowact { width: 30px; text-align: center; }
     var first = box.querySelector('textarea,input,button');
     if (first) first.focus();
   }
-  function closeModal() { document.getElementById('modal').hidden = true; }
+  function closeModal(force) {
+    var back = document.getElementById('modal');
+    if (back.hidden) return;
+    if (!force && modalGuard) { var q = modalGuard(); if (q && !window.confirm(q)) return; }
+    back.hidden = true;
+    modalGuard = null;
+    if (modalOpener && typeof modalOpener.focus === 'function') { try { modalOpener.focus(); } catch (e) { /* ignore */ } }
+    modalOpener = null;
+  }
 
   // ---------------------------------------------------------------------------
   // Wiring
@@ -3209,33 +3520,51 @@ table.rows td.rowact { width: 30px; text-align: center; }
     var revInput = document.getElementById('reviewer');
     appInput.addEventListener('change', function () {
       var target = appInput.value;
-      if (slotName(target) === slotName(state.app)) return;
-      var hasAnswers = Object.keys(state.answers).some(function (id) { return itemsById[id] && answered(itemsById[id]); });
-      if (!slotExists(target) && hasAnswers) {
-        try { localStorage.removeItem(slotKey(state.app)); } catch (e) { /* ignore */ }
-        state.app = target;
-        saveNowTo(target);
+      if (slotName(target) === slotName(state.app)) { if (state.app !== target) { state.app = target; save(); } return; }
+      var hasAnswers = Object.keys(state.answers).some(function (id) { return own(itemsById, id) && answered(itemsById[id]); });
+      if (!slotExists(target) && hasAnswers && slotName(state.app) === '(unnamed)') {
+        // Naming an unnamed review: carry the work and any comparison to the new name.
+        try {
+          var cmp = localStorage.getItem(slotKey(state.app) + ':compare');
+          localStorage.removeItem(slotKey(state.app));
+          localStorage.removeItem(slotKey(state.app) + ':compare');
+          state.app = target;
+          saveNowTo(target);
+          if (cmp) localStorage.setItem(slotKey(target) + ':compare', cmp);
+        } catch (e) { state.app = target; }
         renderAll();
-        flash('Renamed review to "' + slotName(target) + '"');
+        flash('Named this review "' + slotName(target) + '"');
         return;
       }
+      save();
       var found = loadSlot(target);
       renderAll();
-      flash(found ? 'Loaded "' + slotName(target) + '", last saved ' + fmtTime(state.lastModifiedAt) : 'Started new review "' + slotName(target) + '"');
+      flash(found ? 'Loaded "' + slotName(target) + '", last saved ' + fmtTime(state.lastModifiedAt) : 'Started a new review "' + slotName(target) + '"; the previous one is still saved under its own name');
     });
-    revInput.addEventListener('input', function () { state.reviewer = revInput.value; touch(null); });
-    document.getElementById('btn-export').addEventListener('click', openExportModal);
-    document.getElementById('btn-import').addEventListener('click', openImportModal);
+    revInput.addEventListener('input', function () { state.reviewer = revInput.value; state.lastModifiedAt = now(); clearTimeout(saveTimer); saveTimer = setTimeout(save, 250); refresh(); });
+    document.getElementById('btn-export').addEventListener('click', function (e) { openExportModal(e.currentTarget); });
+    document.getElementById('btn-import').addEventListener('click', function (e) { openImportModal(e.currentTarget); });
     document.getElementById('btn-clear').addEventListener('click', clearReview);
     document.getElementById('btn-print').addEventListener('click', function () { window.print(); });
-    var showHiddenBox = document.getElementById('show-hidden');
-    if (showHiddenBox) showHiddenBox.addEventListener('change', function (e) { showHidden = e.target.checked; refresh(); });
+    var issuesBadge = document.getElementById('issues-badge');
+    if (issuesBadge) issuesBadge.addEventListener('click', goToIssues);
     var cmpOnly = document.getElementById('cmp-only');
     if (cmpOnly) cmpOnly.addEventListener('change', function (e) { onlyDiff = e.target.checked; refresh(); });
     var cmpClear = document.getElementById('btn-cmp-clear');
     if (cmpClear) cmpClear.addEventListener('click', clearCompare);
-    document.getElementById('modal').addEventListener('click', function (e) { if (e.target.id === 'modal') closeModal(); });
     document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeModal(); });
+    var instr = document.getElementById('instructions');
+    if (instr) {
+      try { if (localStorage.getItem(PREFIX + 'instructions') === 'closed') instr.removeAttribute('open'); } catch (e) { /* ignore */ }
+      instr.addEventListener('toggle', function () { try { localStorage.setItem(PREFIX + 'instructions', instr.open ? 'open' : 'closed'); } catch (e) { /* ignore */ } });
+    }
+    // Printing: grow textareas to their content so nothing is clipped.
+    window.addEventListener('beforeprint', function () {
+      Array.prototype.forEach.call(document.querySelectorAll('textarea'), function (t) { t.dataset.h = t.style.height; t.style.height = 'auto'; t.style.height = Math.max(t.scrollHeight, 24) + 'px'; });
+    });
+    window.addEventListener('afterprint', function () {
+      Array.prototype.forEach.call(document.querySelectorAll('textarea'), function (t) { t.style.height = t.dataset.h || ''; });
+    });
 
     var slots = listSlots();
     var initial = slots.length === 1 ? slots[0] : '';
@@ -3249,10 +3578,19 @@ table.rows td.rowact { width: 30px; text-align: center; }
   window.SecReview = {
     buildExport: buildExport,
     getState: function () { return state; },
-    setAnswer: function (id, patch) { Object.assign(ans(id), patch); touch(id); },
+    setAnswer: function (id, patch) {
+      Object.assign(ans(id), patch);
+      if (patch && Array.isArray(patch.rows)) ensureRowIds(patch.rows);
+      var u = ui.items[id];
+      if (u && u.drawRows && patch && (Array.isArray(patch.rows) || own(patch, 'none'))) u.drawRows();
+      touch(id);
+    },
     importResult: importResult,
     loadCompare: loadCompare,
     clearCompare: clearCompare,
+    collectIssues: collectIssues,
+    goToIssues: goToIssues,
+    rowsOf: function (id) { return ((state.answers[id] || {}).rows || []).slice(); },
     rerender: renderAll
   };
 
