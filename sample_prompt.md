@@ -49,9 +49,10 @@ The linter rejects each of these when the supporting field is empty. A block tha
 Appendix A at the end of this document contains a small Node script that checks this document: every answer block present, values within each item's option list, table cells within their column's options, negative answers backed by a `Searched:` record, `Status: na` used only where the rules allow it, one check block per table row, and a negative justification on every pass. It reads its rules from the hidden `lint-schema` comment near the top of this document and evaluates the branching rules against your own answers, so it needs nothing else.
 
 1. If a file named `checklist-lint.js` already sits next to this document, use it. Otherwise create it by copying the script from Appendix A, exactly as written, in a single write. Do not retype or abbreviate any part of it.
-2. Fill the META block under "Application" (the artifactId from the pom, one token), then run the linter against this document: `node checklist-lint.js <this document's file name>`. Before you have answered anything else it reports every unconditional item in every topic as not answered, and everything conditional as not applicable until the items they depend on are answered. Each problem line starts with the topic id. If it reports a syntax error, your copy differs from Appendix A: recopy it. If the script cannot be run in your environment at all, write that in the self-check block at the end and continue without it.
-3. Run it again after finishing each topic. Fix every problem it reports against the topics you have completed; problems in later topics are listed until you reach them. Fix a problem by reading more code, by correcting the answer, or by asking the developer; never by filling a field with something you did not find. A negative answer with a complete `Searched:` record is a legitimate, complete answer and needs no citation.
-4. Finish only when it reports zero problems. Then run it once more with `--json ai-result.json` to write the result file, and then run `node checklist-lint.js ai-result.json` to confirm the result file itself is well formed and consistent with the rules. Leave the document, the result file, and the linter in place.
+2. Create your task list before answering anything. Run `node checklist-lint.js <this document's file name> --tasks review-tasks.md`: it writes `review-tasks.md` next to this document with one unticked entry per answer block, in order (META, every item, the Self-check). That file is the record the linter reads. Then create the same list with your checklist tool, one entry per line of the file, in the same order, so the person running you can watch the review's progress from your interface. Do this every time, without being asked; it is part of the review, not an option. Keep the two in step: when you tick an entry in the file, tick it in the checklist tool too. Do not open a topic, and do not write a single block, until both exist.
+3. Fill the META block under "Application" (the artifactId from the pom, one token), then run the linter against this document: `node checklist-lint.js <this document's file name>`. Before you have answered anything else it reports every unconditional item in every topic as not answered, and everything conditional as not applicable until the items they depend on are answered. Each problem line starts with the topic id. If it reports a syntax error, your copy differs from Appendix A: recopy it. If the script cannot be run in your environment at all, write that in the self-check block at the end and continue without it.
+4. Run it again after finishing each topic. It also reads `review-tasks.md` and reports entries ticked without a written block and blocks written without a tick; both mean the one-item-at-a-time rule slipped. Fix every problem it reports against the topics you have completed; problems in later topics are listed until you reach them. Fix a problem by reading more code, by correcting the answer, or by asking the developer; never by filling a field with something you did not find. A negative answer with a complete `Searched:` record is a legitimate, complete answer and needs no citation.
+5. Finish only when it reports zero problems and every task entry is ticked. Then run it once more with `--json ai-result.json` to write the result file, and then run `node checklist-lint.js ai-result.json` to confirm the result file itself is well formed and consistent with the rules. Leave the document, the result file, and the linter in place.
 
 The linter checks form, not truth. A wrong answer that passes the linter is still wrong.
 
@@ -59,8 +60,8 @@ The linter checks form, not truth. A wrong answer that passes the linter is stil
 
 This document is long, and the flaw it exists to catch hides in the item you rush. Work it as a task list, not as a form to fill in:
 
-1. Before answering anything, create a task list in your task tool with one entry per answer block in this document, in document order: `META`, every item by id and title, and the Self-check block. `node checklist-lint.js <this document's file name> --list` prints them in order, ready to paste. If your tool caps the list, create one entry per topic and, when you open a topic, replace its entry with one entry per item in that topic.
-2. Take the first open entry. Read that item's How, Signals, and Trace. Search and read the code for that item alone. Write that item's block. Mark the entry done. Only then take the next.
+1. Your task list exists twice, and both are required: `review-tasks.md`, written next to this document in Step 0 by `--tasks` (one unticked `- [ ]` entry per answer block in document order: META, every item by id and title, the Self-check), which is what the linter reads; and the same entries in your checklist tool, which is what the person running you watches. Create the checklist-tool copy yourself, every run, without waiting to be told. If the tool caps the list, create one entry per topic and expand it when you open that topic.
+2. Take the first open entry. Read that item's How, Signals, and Trace. Search and read the code for that item alone. Write that item's block. Tick the entry in the file (`- [x]`) and in the checklist tool. Only then take the next.
 3. An entry is never marked done before its block is written, and a block is never written for an item you have not researched. If you catch yourself planning to "fill in the remaining items", "quickly complete" a topic, or write a script that fills several blocks at once, stop: that is the moment items stop getting the attention they need. Take the next single item.
 4. Per-row blocks are separate entries, one per row, each researched on its own.
 5. There is no deadline. If your context or session is running out, run the linter, write the result file (it is stamped as a snapshot), and say which entry comes next so a fresh session can continue from there. Run it from the project root (where this document sits) so it can also check every cited file and line against the code; it says on its second line whether it did. Warnings are information about what to re-read; never add content to silence one, and never fill a field to make a problem go away. If a problem cannot be fixed honestly, the right answer is `unable` with what you read and where the trail ended.
@@ -3554,7 +3555,31 @@ if (typeof module !== 'undefined' && module.exports) {
   module.exports = { schemaFromDefinition: schemaFromDefinition, extractSchema: extractSchema, parseAnswers: parseAnswers, lint: lint, lintJson: lintJson };
 }
 
-var VALUE_OPTS = ['json', 'doc', 'app', 'reviewer', 'profile', 'definition', 'project'];
+var VALUE_OPTS = ['json', 'doc', 'app', 'reviewer', 'profile', 'definition', 'project', 'tasks'];
+var TASK_LINE = /^\s*[-*]\s*\[( |x|X)\]\s*(META|SELFCHECK|[CRF]-\d{2})\b/;
+function taskEntries(schema) {
+  var entries = [{ id: 'META', title: 'Application and reviewer' }];
+  schema.items.forEach(function (it) { entries.push({ id: it.id, title: it.title + (it.forEach ? ' (one block per row of ' + it.forEach + ')' : '') }); });
+  entries.push({ id: 'SELFCHECK', title: 'Self-check block' });
+  return entries;
+}
+function readTasks(text) {
+  var ticks = {}, count = 0;
+  text.split(/\r?\n/).forEach(function (line) {
+    var m = line.match(TASK_LINE);
+    if (m) { ticks[m[2]] = m[1] !== ' '; count++; }
+  });
+  return { ticks: ticks, count: count };
+}
+function blockWritten(rec) {
+  if (!rec || rec.status === 'missing' || rec.inferred) return false;
+  if (rec.status === 'na' || rec.status === 'unable') return true;
+  if (Array.isArray(rec.perRow)) return rec.perRow.some(function (p) { return p && p.status; });
+  if (rec.status) return true;
+  if (Array.isArray(rec.rows)) return rec.rows.length > 0 || !!(rec.searched && String(rec.searched).trim());
+  if (Array.isArray(rec.value)) return rec.value.length > 0;
+  return !!((rec.value !== undefined && rec.value !== null && String(rec.value).trim()) || (rec.evidence && String(rec.evidence).trim()) || (rec.searched && String(rec.searched).trim()));
+}
 var SKIP_DIRS = ['node_modules', '.git', '.svn', 'target', 'build', 'dist', 'out', '.idea', '.gradle', 'bin', '.angular'];
 var PROJECT_MARKERS = ['src', 'pom.xml', 'build.gradle', 'build.gradle.kts', 'package.json', 'web.xml'];
 function fileIndex(fs, path, root) {
@@ -3617,7 +3642,7 @@ function runCli(core, argv, defaults) {
   var fs = require('fs');
   var path = require('path');
   defaults = defaults || {};
-  var usage = 'usage: node ' + path.basename(process.argv[1]) + ' <filled.md | result.json> [--json result.json] [--print-json] [--list] [--endpoints] [--doc checklist.md] [--project dir] [--no-files] [--app name] [--reviewer name] [--definition definitions/checklist.json] [--profile profile-result.json (legacy split documents only)]';
+  var usage = 'usage: node ' + path.basename(process.argv[1]) + ' <filled.md | result.json> [--json result.json] [--print-json] [--tasks review-tasks.md] [--list] [--endpoints] [--doc checklist.md] [--project dir] [--no-files] [--app name] [--reviewer name] [--definition definitions/checklist.json] [--profile profile-result.json (legacy split documents only)]';
   function fail(msg, exitCode) { console.error(msg); process.exit(exitCode || 2); }
   var opts = {}, flags = {}, positional = [];
   for (var i = 0; i < argv.length; i++) {
@@ -3660,6 +3685,22 @@ function runCli(core, argv, defaults) {
     schema = core.extractSchema(text);
     if (!schema && opts.definition) schema = schemaFromDefinitionFile(opts.definition);
     if (!schema) fail('No <!-- lint-schema --> comment found in ' + file + ' and no --definition given. Do not remove the schema comment from the document.');
+  }
+  if (opts.tasks) {
+    var taskPath = path.resolve(opts.tasks);
+    if (fs.existsSync(taskPath)) { console.log(taskPath + ' already exists; not overwritten. Tick entries there as you complete blocks.'); process.exit(0); }
+    var taskLines = ['# Review tasks for ' + path.basename(file), '', 'One entry per answer block, in document order. Research the item, write its block, then tick it. Never tick ahead, never write ahead.', ''];
+    var lastTaskSec = null;
+    taskEntries(schema).forEach(function (e) {
+      var it = schema.items.filter(function (x) { return x.id === e.id; })[0];
+      var secId = it ? it.section : null;
+      if (secId && secId !== lastTaskSec) { lastTaskSec = secId; var sec = schema.sections.filter(function (x) { return x.id === secId; })[0]; taskLines.push(''); taskLines.push('## ' + secId + ' ' + (sec ? sec.title : '')); }
+      if (!it && e.id === 'SELFCHECK') taskLines.push('');
+      taskLines.push('- [ ] ' + e.id + ' ' + e.title);
+    });
+    try { fs.writeFileSync(taskPath, taskLines.join('\n') + '\n'); } catch (e) { fail('cannot write ' + taskPath + ': ' + e.message); }
+    console.log('Wrote ' + taskPath + ' with ' + taskEntries(schema).length + ' entries. Mirror them into your task tool if you have one; tick each entry only after its block is written.');
+    process.exit(0);
   }
   if (flags.list) {
     var listLines = ['META  Application and reviewer'];
@@ -3711,6 +3752,31 @@ function runCli(core, argv, defaults) {
   report.push(filesNote);
   if (lintPhase !== 'profile' && lintPhase !== 'all') report.push(profile ? 'Profile result: ' + profilePath : 'Profile result: none (pass --profile to verify rules and row counts)');
   report.push('Items: ' + s.items + '. Complete: ' + s.complete + '. Incomplete: ' + s.incomplete + '. Not applicable: ' + s.na + (s.inferredNa ? ' (' + s.inferredNa + ' by rule)' : '') + (s.freeTextNa ? ' (' + s.freeTextNa + ' with a free-text reason)' : '') + (s.undetermined ? '. Undetermined: ' + s.undetermined : '') + '. Missing: ' + s.missing + '. Findings: ' + (out.result ? out.result.findings.length : 0) + '.');
+  if (!isJson) {
+    var tasksFile = path.join(path.dirname(path.resolve(file)), 'review-tasks.md');
+    if (fs.existsSync(tasksFile)) {
+      var tasks = readTasks(fs.readFileSync(tasksFile, 'utf8'));
+      var ticked = 0, aheadTicks = [], behindTicks = [];
+      taskEntries(schema).forEach(function (e) {
+        if (!(e.id in tasks.ticks)) return;
+        var isTicked = tasks.ticks[e.id];
+        if (isTicked) ticked++;
+        var w;
+        if (e.id === 'META') w = !!(out.result && out.result.app);
+        else if (e.id === 'SELFCHECK') w = !!(out.result && out.result.selfCheck && String(out.result.selfCheck).trim());
+        else w = blockWritten(out.result && out.result.answers ? out.result.answers[e.id] : null);
+        if (isTicked && !w) aheadTicks.push(e.id);
+        if (!isTicked && w) behindTicks.push(e.id);
+      });
+      report.push('Tasks: ' + ticked + ' of ' + tasks.count + ' ticked in review-tasks.md.');
+      if (aheadTicks.length) out.warnings.push('TASKS: ticked but the block is not written: ' + aheadTicks.join(', ') + '. Untick them; an entry is ticked only after its block is written.');
+      if (behindTicks.length) out.warnings.push('TASKS: block written but the entry is not ticked: ' + behindTicks.join(', ') + '. Tick each entry as you finish it, before taking the next; several at once means items were filled in a batch.');
+    } else {
+      report.push('Tasks: no review-tasks.md next to the document. Create it with --tasks review-tasks.md before answering, and tick one entry per finished block.');
+      if (out.problems.length && out.result && out.result.answers && Object.keys(out.result.answers).some(function (id) { return blockWritten(out.result.answers[id]); })) out.warnings.push('TASKS: blocks have been written without a task file; create review-tasks.md with --tasks and tick what is already done, then continue one item at a time.');
+    }
+    if (out.result) out.result.lintWarnings = out.warnings.length;
+  }
   var endpoints = (out.result && out.result.endpoints) || [];
   report.push('Endpoints listed: ' + endpoints.length + (endpoints.length ? ' (print them with --endpoints)' : ''));
   if (flags.endpoints) {
