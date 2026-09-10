@@ -48,7 +48,14 @@ The linter rejects each of these when the supporting field is empty. A block tha
 
 Appendix A at the end of this document contains a small Node script that checks this document: every answer block present, values within each item's option list, table cells within their column's options, negative answers backed by a `Searched:` record, `Status: na` used only where the rules allow it, one check block per table row, and a negative justification on every pass. It reads its rules from the hidden `lint-schema` comment near the top of this document and evaluates the branching rules against your own answers, so it needs nothing else.
 
-1. If a file named `checklist-lint.js` already sits next to this document, use it. Otherwise create it by copying the script from Appendix A, exactly as written, in a single write. Do not retype or abbreviate any part of it.
+1. If a file named `checklist-lint.js` already sits next to this document, use it. Otherwise extract it from Appendix A instead of retyping it. From the folder that holds this document, write these two lines to `extract-lint.mjs`:
+
+```js
+import { readFileSync, writeFileSync } from 'fs';
+writeFileSync('checklist-lint.js', readFileSync(process.argv[2], 'utf8').match(/`{4}javascript\r?\n([\s\S]*?)\r?\n`{4}/)[1] + '\n');
+```
+
+   then run `node extract-lint.mjs <this document's file name>`. It copies the fenced block of Appendix A into `checklist-lint.js` byte for byte, which hand-copying does not reliably do. Confirm it worked by running `node checklist-lint.js` with no arguments: it prints its usage line. If the extraction fails, copy the fence contents from Appendix A yourself, exactly as written and in a single write, abbreviating nothing. Delete `extract-lint.mjs` when the linter is in place.
 2. Create your task list before answering anything. Run `node checklist-lint.js <this document's file name> --tasks review-tasks.md`: it writes `review-tasks.md` next to this document with one unticked entry per answer block, in order (META, every item, the Self-check). That file is the record the linter reads. Then create the same list with your checklist tool, one entry per line of the file, in the same order, so the person running you can watch the review's progress from your interface. Do this every time, without being asked; it is part of the review, not an option. Keep the two in step: when you tick an entry in the file, tick it in the checklist tool too. Do not open a topic, and do not write a single block, until both exist.
 3. Fill the META block under "Application" (the artifactId from the pom, one token), then run the linter against this document: `node checklist-lint.js <this document's file name>`. Before you have answered anything else it reports every unconditional item in every topic as not answered, and everything conditional as not applicable until the items they depend on are answered. Each problem line starts with the topic id. If it reports a syntax error, your copy differs from Appendix A: recopy it. If the script cannot be run in your environment at all, write that in the self-check block at the end and continue without it.
 4. Run it again after finishing each topic. It also reads `review-tasks.md` and reports entries ticked without a written block and blocks written without a tick; both mean the one-item-at-a-time rule slipped. Fix every problem it reports against the topics you have completed; problems in later topics are listed until you reach them. Fix a problem by reading more code, by correcting the answer, or by asking the developer; never by filling a field with something you did not find. A negative answer with a complete `Searched:` record is a legitimate, complete answer and needs no citation.
@@ -2850,7 +2857,7 @@ List any item you could not complete and why, and any runtime-only caveats. This
 
 ## Appendix A: the linter
 
-Copy everything inside the fence below, exactly as written, into a file named `checklist-lint.js` in the same folder as this document, unless that file is already there. See Step 0 at the top for how to use it. It reads the rules from the hidden `lint-schema` comment near the top of this document, so do not remove that comment.
+This fence holds the linter. Do not copy it by hand: Step 0 at the top gives a two-line `extract-lint.mjs` that writes it to `checklist-lint.js` byte for byte, and says how to use it. Copy the fence contents yourself only if that extraction fails, exactly as written and in a single write, into `checklist-lint.js` in the same folder as this document, unless that file is already there. It reads the rules from the hidden `lint-schema` comment near the top of this document, so do not remove that comment.
 
 ````javascript
 #!/usr/bin/env node
