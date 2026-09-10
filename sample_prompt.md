@@ -152,8 +152,8 @@ main { max-width: 1100px; margin: 0 auto; padding: 8px 20px 80px; }
 .chip-open { color: var(--muted); }
 .chip-na { color: var(--na); }
 .tip { color: var(--muted); margin: 2px 0 8px; font-size: 13.5px; }
-.problemif { margin: -2px 0 10px; font-size: 13.5px; color: var(--ink); background: #fdf0ee; border-left: 3px solid var(--bad); padding: 6px 10px; border-radius: 0 4px 4px 0; }
-.problemif strong { color: var(--bad); }
+.problemif { margin: -2px 0 10px; font-size: 13.5px; color: var(--ink); background: #fff8e6; border-left: 3px solid var(--warn); padding: 6px 10px; border-radius: 0 4px 4px 0; }
+.problemif strong { color: var(--warn); }
 .how { margin: 6px 0; }
 .how > summary { cursor: pointer; color: var(--accent); font-size: 13px; }
 .how p { margin: 6px 0 0; }
@@ -172,6 +172,9 @@ main { max-width: 1100px; margin: 0 auto; padding: 8px 20px 80px; }
 
 /* Check items: one block, or one per row of the source table */
 .checkblock { border-left: 3px solid var(--line); padding: 6px 0 6px 12px; margin: 6px 0 10px; }
+.checkblock.block-todo { border-left-color: var(--bad); background: linear-gradient(90deg, #fdf1ef 0 200px, transparent 420px); }
+.checkblock.block-done { border-left-color: #b7e0c0; }
+.checkblock.block-done .rowlabel::after { content: " \2713"; color: var(--ok); font-weight: 700; }
 .checkblock .rowlabel { font-family: ui-monospace, Consolas, monospace; font-size: 13px; font-weight: 600; margin-bottom: 4px; word-break: break-all; }
 .checkblock .statusopts { margin-bottom: 6px; }
 .checkblock .fld { margin-top: 6px; }
@@ -731,13 +734,20 @@ table.rows td.rowact { width: 30px; text-align: center; }
     var whereLabel = h('span', { text: 'Where' });
     var where = h('textarea', { rows: 1, class: 'where', placeholder: 'class, method, or URL', 'aria-label': 'Where' });
     where.value = rec.location || '';
-    where.addEventListener('input', function () { rec.location = where.value; touch(item.id); });
+    where.addEventListener('input', function () { rec.location = where.value; paint(); touch(item.id); });
     block.appendChild(h('label', { class: 'fld' }, [whereLabel, where]));
     var whatLabel = h('span', { text: 'What is wrong' });
-    var what = textarea(2, '', rec.findings, function (v) { rec.findings = v; touch(item.id); }, 'What is wrong');
+    var what = textarea(2, '', rec.findings, function (v) { rec.findings = v; paint(); touch(item.id); }, 'What is wrong');
     var whatWrap = h('label', { class: 'fld' }, [whatLabel, what]);
     block.appendChild(whatWrap);
+    // Only a row confirmed as OK is done; everything else is still to verify, so a card
+    // with eight rows shows which one or two of them need a look.
+    function paint() {
+      var done = rec.status === 'pass' && checkRowComplete(rec);
+      block.className = 'checkblock ' + (done ? 'block-done' : 'block-todo');
+    }
     function sync() {
+      paint();
       var s = rec.status;
       whereLabel.textContent = s === 'finding' ? 'Where the problem is' : (s === 'pass' ? 'Where the check is (required)' : 'Where');
       if (s === 'finding') { whatLabel.textContent = 'What is wrong, and what a caller could do'; whatWrap.hidden = false; }
@@ -746,12 +756,14 @@ table.rows td.rowact { width: 30px; text-align: center; }
       else { whatWrap.hidden = true; }
     }
     sync();
+    (ui.items[item.id].blockPaints = ui.items[item.id].blockPaints || []).push(paint);
     return block;
   }
   function renderCheck(item) {
     var box = h('div', { class: 'checkbox' });
     function draw() {
       box.innerHTML = '';
+      ui.items[item.id].blockPaints = [];
       var rs = item.forEach ? checkRows(item) : null;
       if (rs) {
         rs.forEach(function (x) { box.appendChild(renderCheckBlock(item, x.rec, item.id + ':' + x.key, x.label)); });
@@ -997,6 +1009,7 @@ table.rows td.rowact { width: 30px; text-align: center; }
       var rt = screenRule(it);
       u.ruleEl.textContent = rt;
       u.ruleEl.hidden = !rt;
+      if (u.blockPaints) u.blockPaints.forEach(function (p) { p(); });
       var diff = renderCompare(it, u);
       if (compare) {
         cmpTotal++;
@@ -1811,6 +1824,8 @@ table.rows td.rowact { width: 30px; text-align: center; }
       if (patch && Array.isArray(patch.rows)) ensureRowIds(patch.rows);
       var u = ui.items[id];
       if (u && u.drawRows && patch && (Array.isArray(patch.rows) || own(patch, 'none'))) u.drawRows();
+      // Replacing the per-row record wholesale orphans the blocks that hold the old objects.
+      if (u && u.redraw && patch && patch.perRow) u.redraw();
       touch(id);
     },
     importResult: importResult,
