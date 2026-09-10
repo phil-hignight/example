@@ -75,7 +75,23 @@ writeFileSync('checklist-lint.js', readFileSync(process.argv[2], 'utf8').match(/
 ```
 
    then run `node extract-lint.mjs <this document's file name>`. It copies the fenced block of Appendix A into `checklist-lint.js` byte for byte, which hand-copying does not reliably do. Confirm it worked by running `node checklist-lint.js` with no arguments: it prints its usage line. If the extraction fails, copy the fence contents from Appendix A yourself, exactly as written and in a single write, abbreviating nothing. Delete `extract-lint.mjs` when the linter is in place.
-2. Create your task list before answering anything. Run `node checklist-lint.js <this document's file name> --tasks review-tasks.md`: it writes `review-tasks.md` next to this document with one unticked entry per answer block, in order (META, every item, the Self-check). That file is the record the linter reads. Then create the same list with your checklist tool, one entry per line of the file, in the same order, so the person running you can watch the review's progress from your interface. Do this every time, without being asked; it is part of the review, not an option. Keep the two in step: when you tick an entry in the file, tick it in the checklist tool too. Do not open a topic, and do not write a single block, until both exist.
+2. Create your task list before answering anything. Run `node checklist-lint.js <this document's file name> --tasks review-tasks.md`: it writes `review-tasks.md` next to this document with one unticked entry per answer block, in order (META, every item, the Self-check). That file is the record the linter reads. Then create the same list as a workspace checklist, so the person running you can watch the review's progress. Run `node checklist-lint.js <this document's file name> --checklist`: it prints the exact block to put in your reply, one entry per line, already in order. Send that output as written, in a single tag. Its shape, with the middle elided, is:
+
+```text
+<remote-workspace><checklist>META Application and reviewer
+C-01 Deployable modules, artifact ids, and context roots
+C-02 Backend frameworks present
+...one line per answer block, ending with...
+SELFCHECK Self-check block</checklist></remote-workspace>
+```
+
+   Entries are numbered by position, so the first line is id 1, and those ids match the numbers in `review-tasks.md`. As you finish each block, tick it in both places: `- [x]` in the file, and in your reply
+
+```text
+<remote-workspace><check id="7"/></remote-workspace>
+```
+
+   one id at a time, as you go. `<check id="7,8"/>` ticks several at once; use it only to catch up after forgetting, and treat needing it as a sign you have stopped working one item at a time. Do this every run, without being asked; it is part of the review, not an option. Do not open a topic, and do not write a single block, until both the file and the checklist exist.
 3. Fill the META block under "Application" (the artifactId from the pom, one token), then run the linter against this document: `node checklist-lint.js <this document's file name>`. Before you have answered anything else it reports every unconditional item in every topic as not answered, and everything conditional as not applicable until the items they depend on are answered. Each problem line starts with the topic id. If it reports a syntax error, your copy differs from Appendix A: recopy it. If the script cannot be run in your environment at all, write that in the self-check block at the end and continue without it.
 4. Run it again after finishing each topic. It also reads `review-tasks.md` and reports entries ticked without a written block and blocks written without a tick; both mean the one-item-at-a-time rule slipped. Fix every problem it reports against the topics you have completed; problems in later topics are listed until you reach them. Fix a problem by reading more code, by correcting the answer, or by asking the developer; never by filling a field with something you did not find. A negative answer with a complete `Searched:` record is a legitimate, complete answer and needs no citation.
 5. Finish only when it reports zero problems and every task entry is ticked. Then run it once more with `--json ai-result.json` to write the result file, and then run `node checklist-lint.js ai-result.json` to confirm the result file itself is well formed and consistent with the rules. Leave the document, the result file, and the linter in place.
@@ -86,8 +102,8 @@ The linter checks form, not truth. A wrong answer that passes the linter is stil
 
 This document is long, and the flaw it exists to catch hides in the item you rush. Work it as a task list, not as a form to fill in:
 
-1. Your task list exists twice, and both are required: `review-tasks.md`, written next to this document in Step 0 by `--tasks` (one unticked `- [ ]` entry per answer block in document order: META, every item by id and title, the Self-check), which is what the linter reads; and the same entries in your checklist tool, which is what the person running you watches. Create the checklist-tool copy yourself, every run, without waiting to be told. If the tool caps the list, create one entry per topic and expand it when you open that topic.
-2. Take the first open entry. Read that item's How, Signals, and Trace. Search and read the code for that item alone. Write that item's block. Tick the entry in the file (`- [x]`) and in the checklist tool. Only then take the next.
+1. Your task list exists twice, and both are required: `review-tasks.md`, written next to this document in Step 0 by `--tasks` (one numbered, unticked `- [ ]` entry per answer block in document order: META, every item by id and title, the Self-check), which is what the linter reads; and the same entries as a workspace checklist, printed ready to paste by `--checklist`, which is what the person running you watches. Create both yourself, every run, without waiting to be told.
+2. Take the first open entry. Read that item's How, Signals, and Trace. Search and read the code for that item alone. Write that item's block. Then tick that entry in both places: `- [x]` in `review-tasks.md`, and `<remote-workspace><check id="N"/></remote-workspace>` in your reply, where N is that entry's number. Only then take the next.
 3. An entry is never marked done before its block is written, and a block is never written for an item you have not researched. If you catch yourself planning to "fill in the remaining items", "quickly complete" a topic, or write a script that fills several blocks at once, stop: that is the moment items stop getting the attention they need. Take the next single item.
 4. Per-row blocks are separate entries, one per row, each researched on its own.
 5. There is no deadline. If your context or session is running out, run the linter, write the result file (it is stamped as a snapshot), and say which entry comes next so a fresh session can continue from there. Run it from the project root (where this document sits) so it can also check every cited file and line against the code; it says on its second line whether it did. Warnings are information about what to re-read; never add content to silence one, and never fill a field to make a problem go away. If a problem cannot be fixed honestly, the right answer is `unable` with what you read and where the trail ended.
@@ -3580,7 +3596,7 @@ if (typeof module !== 'undefined' && module.exports) {
 }
 
 var VALUE_OPTS = ['json', 'doc', 'app', 'reviewer', 'profile', 'definition', 'project', 'tasks'];
-var TASK_LINE = /^\s*[-*]\s*\[( |x|X)\]\s*(META|SELFCHECK|[CRF]-\d{2})\b/;
+var TASK_LINE = /^\s*[-*]\s*\[( |x|X)\]\s*(?:\d+[.)]\s*)?(META|SELFCHECK|[CRF]-\d{2})\b/;
 function taskEntries(schema) {
   var entries = [{ id: 'META', title: 'Application and reviewer' }];
   schema.items.forEach(function (it) { entries.push({ id: it.id, title: it.title + (it.forEach ? ' (one block per row of ' + it.forEach + ')' : '') }); });
@@ -3714,17 +3730,24 @@ function runCli(core, argv, defaults) {
   if (opts.tasks) {
     var taskPath = path.resolve(opts.tasks);
     if (fs.existsSync(taskPath)) { console.log(taskPath + ' already exists; not overwritten. Tick entries there as you complete blocks.'); process.exit(0); }
-    var taskLines = ['# Review tasks for ' + path.basename(file), '', 'One entry per answer block, in document order. Research the item, write its block, then tick it. Never tick ahead, never write ahead.', ''];
-    var lastTaskSec = null;
+    var taskLines = ['# Review tasks for ' + path.basename(file), '', 'One entry per answer block, in document order. Research the item, write its block, then tick it. Never tick ahead, never write ahead.', '', 'The number on each entry is its position in the list, which is also its id in your workspace checklist: tick entry 7 here and send <check id="7"/> there.', ''];
+    var lastTaskSec = null, taskNo = 0;
     taskEntries(schema).forEach(function (e) {
       var it = schema.items.filter(function (x) { return x.id === e.id; })[0];
       var secId = it ? it.section : null;
       if (secId && secId !== lastTaskSec) { lastTaskSec = secId; var sec = schema.sections.filter(function (x) { return x.id === secId; })[0]; taskLines.push(''); taskLines.push('## ' + secId + ' ' + (sec ? sec.title : '')); }
       if (!it && e.id === 'SELFCHECK') taskLines.push('');
-      taskLines.push('- [ ] ' + e.id + ' ' + e.title);
+      taskNo++;
+      taskLines.push('- [ ] ' + taskNo + '. ' + e.id + ' ' + e.title);
     });
     try { fs.writeFileSync(taskPath, taskLines.join('\n') + '\n'); } catch (e) { fail('cannot write ' + taskPath + ': ' + e.message); }
-    console.log('Wrote ' + taskPath + ' with ' + taskEntries(schema).length + ' entries. Mirror them into your task tool if you have one; tick each entry only after its block is written.');
+    console.log('Wrote ' + taskPath + ' with ' + taskEntries(schema).length + ' entries. Now run --checklist and paste the block it prints into your reply, so the run can be watched; tick each entry in both places only after its block is written.');
+    process.exit(0);
+  }
+  if (flags.checklist) {
+    var cl = [];
+    taskEntries(schema).forEach(function (e) { cl.push(e.id + ' ' + e.title); });
+    console.log('<remote-workspace><checklist>' + cl.join('\n') + '</checklist></remote-workspace>');
     process.exit(0);
   }
   if (flags.list) {
