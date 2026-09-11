@@ -75,7 +75,7 @@ writeFileSync('checklist-lint.js', readFileSync(process.argv[2], 'utf8').match(/
 ```
 
    then run `node extract-lint.mjs <this document's file name>`. It copies the fenced block of Appendix A into `checklist-lint.js` byte for byte, which hand-copying does not reliably do. Confirm it worked by running `node checklist-lint.js` with no arguments: it prints its usage line. If the extraction fails, copy the fence contents from Appendix A yourself, exactly as written and in a single write, abbreviating nothing. Delete `extract-lint.mjs` when the linter is in place.
-2. Create your task list before answering anything. Run `node checklist-lint.js <this document's file name> --tasks review-tasks.md`: it writes `review-tasks.md` next to this document with one unticked entry per answer block, in order (META, every item, the Self-check). That file is the record the linter reads. Then create the same list as a workspace checklist, so the person running you can watch the review's progress. Run `node checklist-lint.js <this document's file name> --checklist`: it prints the exact block to put in your reply, one entry per line, already in order. Send that output as written, in a single tag. Its shape, with the middle elided, is:
+2. Create your task list before answering anything. Run `node checklist-lint.js <this document's file name> --tasks review-tasks.md`: it writes `review-tasks.md` next to this document with one unticked entry per answer block, in order (META, every item, the Self-check), then two finishing entries: RESULT for the result file and REPORT for the PDF. That file is the record the linter reads. Then create the same list as a workspace checklist, so the person running you can watch the review's progress. Run `node checklist-lint.js <this document's file name> --checklist`: it prints the exact block to put in your reply, one entry per line, already in order. Send that output as written, in a single tag. Its shape, with the middle elided, is:
 
 ```text
 <remote-workspace><checklist>META Application and reviewer
@@ -94,8 +94,9 @@ SELFCHECK Self-check block</checklist></remote-workspace>
    one id at a time, as you go. `<check id="7,8"/>` ticks several at once; use it only to catch up after forgetting, and treat needing it as a sign you have stopped working one item at a time. Do this every run, without being asked; it is part of the review, not an option. Do not open a topic, and do not write a single block, until both the file and the checklist exist.
 3. Fill the META block under "Application" (the artifactId from the pom, one token), then run the linter against this document: `node checklist-lint.js <this document's file name>`. Before you have answered anything else it reports every unconditional item in every topic as not answered, and everything conditional as not applicable until the items they depend on are answered. Each problem line starts with the topic id. If it reports a syntax error, your copy differs from Appendix A: recopy it. If the script cannot be run in your environment at all, write that in the self-check block at the end and continue without it.
 4. Run it again after finishing each topic. It also reads `review-tasks.md` and reports entries ticked without a written block and blocks written without a tick; both mean the one-item-at-a-time rule slipped. Fix every problem it reports against the topics you have completed; problems in later topics are listed until you reach them. Fix a problem by reading more code, by correcting the answer, or by asking the developer; never by filling a field with something you did not find. A negative answer with a complete `Searched:` record is a legitimate, complete answer and needs no citation.
-5. Write the report for people to read. After the result file is written and clean, run `node checklist-lint.js ai-result.json --report review-report.html`. It writes one self-contained page: the issues by severity, what could not be settled, the endpoint list, then every answer by topic. Then turn it into a PDF with whatever browser is on the machine, using the command the linter prints (Edge and Chrome both take `--headless --print-to-pdf`). If no browser is available, leave `review-report.html` in place, say so in the Self-check block, and let whoever reads it print the page themselves. Leave the document, the result file, the report, and the linter in place.
-6. Finish only when it reports zero problems and every task entry is ticked. Then run it once more with `--json ai-result.json` to write the result file, and then run `node checklist-lint.js ai-result.json` to confirm the result file itself is well formed and consistent with the rules. Leave the document, the result file, and the linter in place.
+5. **Write the result file.** When the document lints with zero problems, run `node checklist-lint.js <this document's file name> --json ai-result.json`, then `node checklist-lint.js ai-result.json` to confirm the result file is well formed. Tick RESULT.
+6. **Write the report and its PDF. This step is required, not optional: the review is not finished without `review-report.pdf`.** Run `node checklist-lint.js ai-result.json --report review-report.html --pdf review-report.pdf`. The linter writes the report page (the review topic by topic, then all issues, what could not be settled, and the endpoints), finds Edge or Chrome on the machine, prints the page to `review-report.pdf` itself, and checks the file it produced. Do not print it some other way and do not describe it to the developer as something they could do. If the linter says it cannot find a browser or the print failed, ask the developer for the path to Edge or Chrome and rerun with `--browser <path>`. Tick REPORT only when the linter says it wrote the PDF.
+7. **Finish only when that last command reports no problems.** In the project folder, the check of `ai-result.json` counts a missing `review-report.pdf` as a problem, so the run cannot end clean without it. Every task entry, RESULT and REPORT included, must be ticked. Leave the document, the result file, the report, its PDF, the task file, and the linter in place, and tell the developer where the PDF is.
 
 The linter checks form, not truth. A wrong answer that passes the linter is still wrong.
 
@@ -103,7 +104,7 @@ The linter checks form, not truth. A wrong answer that passes the linter is stil
 
 This document is long, and the flaw it exists to catch hides in the item you rush. Work it as a task list, not as a form to fill in:
 
-1. Your task list exists twice, and both are required: `review-tasks.md`, written next to this document in Step 0 by `--tasks` (one numbered, unticked `- [ ]` entry per answer block in document order: META, every item by id and title, the Self-check), which is what the linter reads; and the same entries as a workspace checklist, printed ready to paste by `--checklist`, which is what the person running you watches. Create both yourself, every run, without waiting to be told.
+1. Your task list exists twice, and both are required: `review-tasks.md`, written next to this document in Step 0 by `--tasks` (one numbered, unticked `- [ ]` entry per answer block in document order: META, every item by id and title, the Self-check, then RESULT and REPORT for the result file and the PDF), which is what the linter reads; and the same entries as a workspace checklist, printed ready to paste by `--checklist`, which is what the person running you watches. Create both yourself, every run, without waiting to be told.
 2. Take the first open entry. Read that item's How, Signals, and Trace. Search and read the code for that item alone. Write that item's block. Then tick that entry in both places: `- [x]` in `review-tasks.md`, and `<remote-workspace><check id="N"/></remote-workspace>` in your reply, where N is that entry's number. Only then take the next.
 3. An entry is never marked done before its block is written, and a block is never written for an item you have not researched. If you catch yourself planning to "fill in the remaining items", "quickly complete" a topic, or write a script that fills several blocks at once, stop: that is the moment items stop getting the attention they need. Take the next single item.
 4. Per-row blocks are separate entries, one per row, each researched on its own.
@@ -158,7 +159,7 @@ Every topic ends with a table for issues noticed while working through it that n
 
 **First, the outside code.** Open the topic 0 item for source that is not in this project and read it against the whole review. Every row marked "source needed: yes" must show a clone path and "obtained: yes", and you must have actually read that code where an item depended on it. Then look for what never reached the table: any item you answered with a belief about a library, a service, or another application rather than a line you read, and any `unable` whose reason is that code was elsewhere. If anything is outstanding, list those repositories to the developer now, ask for the GitLab URL and the matching tag, branch, or commit for each, clone them into `review-deps/`, and answer or re-answer the items that depended on them. The linter warns for each needed source that was not obtained; do not finish with one of those warnings standing unless the developer has said the source cannot be had, in which case every item that rests on it is `unable` with the `Asked:` line, never `pass`.
 
-**Then re-read every block once.** For fact items confirm the value is present, the evidence cites file and line, and every negative answer has a complete `Searched:` record. For checks confirm each `pass` cites the comparison line, each `finding` cites a location and describes the exposure, and every `Why no more findings:` lists paths rather than asserting absence. Then write anything you could not complete, and any runtime-only caveats, in the Self-check block near the end (it is copied into the result file), and run the linter with `--json ai-result.json` followed by the check of that file.
+**Then re-read every block once.** For fact items confirm the value is present, the evidence cites file and line, and every negative answer has a complete `Searched:` record. For checks confirm each `pass` cites the comparison line, each `finding` cites a location and describes the exposure, and every `Why no more findings:` lists paths rather than asserting absence. Then write anything you could not complete, and any runtime-only caveats, in the Self-check block near the end (it is copied into the result file). Then do steps 5 to 7 of Step 0: the result file, then the report and its PDF, which is required.
 
 ---
 
@@ -3866,7 +3867,41 @@ if (typeof module !== 'undefined' && module.exports) {
   module.exports = { schemaFromDefinition: schemaFromDefinition, extractSchema: extractSchema, parseAnswers: parseAnswers, lint: lint, lintJson: lintJson };
 }
 
-var VALUE_OPTS = ['json', 'doc', 'app', 'reviewer', 'profile', 'definition', 'project', 'tasks', 'report'];
+var VALUE_OPTS = ['json', 'doc', 'app', 'reviewer', 'profile', 'definition', 'project', 'tasks', 'report', 'pdf', 'browser'];
+var RESULT_FILE = 'ai-result.json', REPORT_HTML = 'review-report.html', REPORT_PDF = 'review-report.pdf';
+function findBrowser(fs, path, explicit) {
+  function isFile(p) { try { return fs.statSync(p).isFile(); } catch (e) { return false; } }
+  if (explicit) return isFile(explicit) ? explicit : null;
+  var env = process.env, cands = [];
+  ['CHECKLIST_BROWSER', 'CHROME_PATH', 'EDGE_PATH'].forEach(function (k) { if (env[k]) cands.push(env[k]); });
+  [env['ProgramFiles(x86)'], env.ProgramFiles, env.LOCALAPPDATA].forEach(function (b) {
+    if (!b) return;
+    cands.push(path.join(b, 'Microsoft', 'Edge', 'Application', 'msedge.exe'));
+    cands.push(path.join(b, 'Google', 'Chrome', 'Application', 'chrome.exe'));
+  });
+  cands.push('/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge', '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', '/Applications/Chromium.app/Contents/MacOS/Chromium');
+  var names = ['msedge', 'microsoft-edge', 'microsoft-edge-stable', 'google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser', 'chrome'];
+  String(env.PATH || env.Path || '').split(path.delimiter).forEach(function (dir) {
+    if (!dir) return;
+    names.forEach(function (n) { cands.push(path.join(dir, n)); if (process.platform === 'win32') cands.push(path.join(dir, n + '.exe')); });
+  });
+  for (var i = 0; i < cands.length; i++) { if (isFile(cands[i])) return cands[i]; }
+  return null;
+}
+function isPdf(fs, p) {
+  try { var b = fs.readFileSync(p); return b.length > 500 && b.slice(0, 5).toString('latin1') === '%PDF-'; } catch (e) { return false; }
+}
+function printPdf(fs, path, browser, htmlPath, pdfPath) {
+  var abs = path.resolve(htmlPath).replace(/\\/g, '/');
+  var url = 'file://' + (abs.charAt(0) === '/' ? '' : '/') + encodeURI(abs).replace(/#/g, '%23');
+  var out = path.resolve(pdfPath);
+  try { fs.unlinkSync(out); } catch (e) {  }
+  var r = require('child_process').spawnSync(browser, ['--headless', '--disable-gpu', '--no-first-run', '--no-default-browser-check',
+    '--no-pdf-header-footer', '--print-to-pdf-no-header', '--virtual-time-budget=5000', '--print-to-pdf=' + out, url], { encoding: 'utf8', timeout: 180000 });
+  if (r.error) return { ok: false, why: r.error.message };
+  if (!isPdf(fs, out)) return { ok: false, why: 'the browser exited with ' + r.status + ' and wrote no valid PDF' + (r.stderr ? ' (' + String(r.stderr).split('\n')[0].slice(0, 160) + ')' : '') };
+  return { ok: true, bytes: fs.statSync(out).size };
+}
 var REPORT_CSS = [
   '@page { margin: 14mm; }',
   'body { font: 11pt/1.45 system-ui, "Segoe UI", Roboto, sans-serif; color: #111; margin: 0; }',
@@ -4042,11 +4077,13 @@ function buildReport(schema, result, summary) {
   o.push('</body></html>');
   return o.join('\n');
 }
-var TASK_LINE = /^\s*[-*]\s*\[( |x|X)\]\s*(?:\d+[.)]\s*)?(META|SELFCHECK|[CRF]-\d{2})\b/;
+var TASK_LINE = /^\s*[-*]\s*\[( |x|X)\]\s*(?:\d+[.)]\s*)?(META|SELFCHECK|RESULT|REPORT|[CRF]-\d{2})\b/;
 function taskEntries(schema) {
   var entries = [{ id: 'META', title: 'Application and reviewer' }];
   schema.items.forEach(function (it) { entries.push({ id: it.id, title: it.title + (it.forEach ? ' (one block per row of ' + it.forEach + ')' : '') }); });
   entries.push({ id: 'SELFCHECK', title: 'Self-check block' });
+  entries.push({ id: 'RESULT', title: 'Write ' + RESULT_FILE + ' with --json and lint it' });
+  entries.push({ id: 'REPORT', title: 'Write ' + REPORT_PDF + ' with --report ' + REPORT_HTML + ' --pdf ' + REPORT_PDF + ' (required)' });
   return entries;
 }
 function readTasks(text) {
@@ -4129,7 +4166,7 @@ function runCli(core, argv, defaults) {
   var fs = require('fs');
   var path = require('path');
   defaults = defaults || {};
-  var usage = 'usage: node ' + path.basename(process.argv[1]) + ' <filled.md | result.json> [--json result.json] [--report review-report.html] [--print-json] [--tasks review-tasks.md] [--list] [--endpoints] [--doc checklist.md] [--project dir] [--no-files] [--app name] [--reviewer name] [--definition definitions/checklist.json] [--profile profile-result.json (legacy split documents only)]';
+  var usage = 'usage: node ' + path.basename(process.argv[1]) + ' <filled.md | result.json> [--json result.json] [--report review-report.html] [--pdf review-report.pdf] [--browser path] [--print-json] [--tasks review-tasks.md] [--list] [--endpoints] [--doc checklist.md] [--project dir] [--no-files] [--app name] [--reviewer name] [--definition definitions/checklist.json] [--profile profile-result.json (legacy split documents only)]';
   function fail(msg, exitCode) { console.error(msg); process.exit(exitCode || 2); }
   var opts = {}, flags = {}, positional = [];
   for (var i = 0; i < argv.length; i++) {
@@ -4187,7 +4224,7 @@ function runCli(core, argv, defaults) {
       taskLines.push('- [ ] ' + taskNo + '. ' + e.id + ' ' + e.title);
     });
     try { fs.writeFileSync(taskPath, taskLines.join('\n') + '\n'); } catch (e) { fail('cannot write ' + taskPath + ': ' + e.message); }
-    console.log('Wrote ' + taskPath + ' with ' + taskEntries(schema).length + ' entries. Now run --checklist and paste the block it prints into your reply, so the run can be watched; tick each entry in both places only after its block is written.');
+    console.log('Wrote ' + taskPath + ' with ' + taskEntries(schema).length + ' entries, the last two being the result file and the PDF. Now run --checklist and paste the block it prints into your reply, so the run can be watched; tick each entry in both places only after its block is written.');
     process.exit(0);
   }
   if (flags.checklist) {
@@ -4258,6 +4295,8 @@ function runCli(core, argv, defaults) {
         var w;
         if (e.id === 'META') w = !!(out.result && out.result.app);
         else if (e.id === 'SELFCHECK') w = !!(out.result && out.result.selfCheck && String(out.result.selfCheck).trim());
+        else if (e.id === 'RESULT') w = fs.existsSync(path.join(path.dirname(path.resolve(file)), RESULT_FILE));
+        else if (e.id === 'REPORT') w = isPdf(fs, path.join(path.dirname(path.resolve(file)), REPORT_PDF));
         else w = blockWritten(out.result && out.result.answers ? out.result.answers[e.id] : null);
         if (isTicked && !w) aheadTicks.push(e.id);
         if (!isTicked && w) behindTicks.push(e.id);
@@ -4292,6 +4331,27 @@ function runCli(core, argv, defaults) {
     report.push(undetermined.length + ' answer(s) could not be determined from the code. They are not problems; ask the developer, or hand them to QA:');
     undetermined.forEach(function (u) { report.push('  ' + u); });
   }
+  var wrotePdf = null;
+  if ((opts.report || opts.pdf) && out.result) {
+    var htmlOut = opts.report || String(opts.pdf).replace(/\.pdf$/i, '') + '.html';
+    try { fs.writeFileSync(htmlOut, buildReport(schema, out.result, out.summary) + '\n'); }
+    catch (e) { fail('cannot write ' + htmlOut + ': ' + e.message); }
+    report.push('Wrote ' + htmlOut + '.');
+    if (opts.pdf) {
+      var browser = findBrowser(fs, path, opts.browser);
+      if (!browser) out.problems.push('REPORT: cannot print the PDF: ' + (opts.browser ? 'no browser at ' + opts.browser : 'no Edge or Chrome found') + '. Ask the developer for the path to Edge or Chrome and rerun with --browser <path>. The review is not finished without ' + opts.pdf + '.');
+      else {
+        var pr = printPdf(fs, path, browser, htmlOut, opts.pdf);
+        if (pr.ok) { wrotePdf = path.resolve(opts.pdf); report.push('Wrote ' + opts.pdf + ' (' + pr.bytes + ' bytes, printed with ' + browser + ').'); }
+        else out.problems.push('REPORT: cannot print the PDF with ' + browser + ': ' + pr.why + '. Ask the developer for a working Edge or Chrome and rerun with --browser <path>. The review is not finished without ' + opts.pdf + '.');
+      }
+    }
+  }
+  if (isJson && files && out.result && out.result.reviewerKind === 'ai') {
+    var needPdf = path.resolve(opts.pdf || path.join(path.dirname(path.resolve(file)), REPORT_PDF));
+    if (!isPdf(fs, needPdf)) out.problems.push('REPORT: ' + path.basename(needPdf) + ' is required and is missing. Run: node ' + path.basename(process.argv[1]) + ' ' + path.basename(file) + ' --report ' + REPORT_HTML + ' --pdf ' + REPORT_PDF);
+    else if (!wrotePdf) report.push('Report: ' + path.basename(needPdf) + ' present.');
+  }
   if (out.problems.length) {
     report.push('');
     report.push(out.problems.length + ' problem(s) to fix (topic id first; later topics are listed until you reach them):');
@@ -4304,13 +4364,7 @@ function runCli(core, argv, defaults) {
     out.warnings.forEach(function (w) { report.push('  ' + w); });
   }
   report.push('');
-  report.push(out.problems.length ? 'RESULT: not done. Fix the problems above and run the linter again.' : (isJson ? 'RESULT: no problems. The result file is well formed and consistent with the checklist rules.' : 'RESULT: no problems. The linter checks form, not truth; re-read your answers once more.'));
-  if (opts.report && out.result) {
-    try { fs.writeFileSync(opts.report, buildReport(schema, out.result, out.summary) + '\n'); }
-    catch (e) { fail('cannot write ' + opts.report + ': ' + e.message); }
-    report.push('Wrote ' + opts.report + '. Print it to PDF with a browser, for example:');
-    report.push('  msedge --headless --disable-gpu --no-pdf-header-footer --virtual-time-budget=5000 --print-to-pdf="' + path.resolve(String(opts.report).replace(/\.html?$/i, '') + '.pdf') + '" "file:///' + path.resolve(opts.report).replace(/\\/g, '/') + '"');
-  }
+  report.push(out.problems.length ? 'RESULT: not done. Fix the problems above and run the linter again.' : (isJson ? 'RESULT: no problems. The result file is well formed and consistent with the checklist rules.' : 'RESULT: no problems. The linter checks form, not truth; re-read your answers once more.\nRequired next: write the result with --json ' + RESULT_FILE + ', then run: node ' + path.basename(process.argv[1]) + ' ' + RESULT_FILE + ' --report ' + REPORT_HTML + ' --pdf ' + REPORT_PDF + '. The review is not finished until ' + REPORT_PDF + ' exists.'));
   if (opts.json && out.result) {
     try { fs.writeFileSync(opts.json, JSON.stringify(out.result, null, 2) + '\n'); }
     catch (e) { fail('cannot write ' + opts.json + ': ' + e.message); }
