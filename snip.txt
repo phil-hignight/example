@@ -1,0 +1,19 @@
+using System; using System.IO; using System.Windows.Forms; using System.Drawing;
+  public class ProbeForm : Form {
+    string _shown, _click;
+    public ProbeForm(string shown, string click) {
+      _shown = shown; _click = click;
+      Text = "CODEBOSS-SANDBOX-WINDOW-PROBE"; Width = 420; Height = 260; StartPosition = FormStartPosition.CenterScreen; TopMost =
+  true;
+      BackColor = Color.FromArgb(0, 122, 204);
+      var lbl = new Label { Text = "I am running INSIDE the sandbox.\r\n\r\nclick anywhere in me", Dock = DockStyle.Fill, TextAlign
+  = ContentAlignment.MiddleCenter, ForeColor = Color.White, Font = new Font("Segoe UI", 15) };
+      Controls.Add(lbl);
+      MouseDown += (s, e) => Clicked(); lbl.MouseDown += (s, e) => Clicked();
+      Shown += (s, e) => { try { File.WriteAllText(_shown, "shown"); } catch {} };
+      var t = new Timer(); t.Interval = 90000; t.Tick += (s, e) => Close(); t.Start();   // never strand a window
+    }
+    void Clicked() { try { File.WriteAllText(_click, "clicked"); } catch {} Close(); }
+    [STAThread] public static void Main(string[] a) { Application.EnableVisualStyles(); Application.Run(new ProbeForm(a[0], a[1]));
+  }
+  }
