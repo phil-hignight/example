@@ -1,4 +1,5 @@
-({ build: document.title, body: document.body.className, rows: document.querySelectorAll('#log .row').length, results:
-  document.querySelectorAll('#log .row-result').length, last: [...document.querySelectorAll('#log .row')].slice(-4).map((r) =>
-  r.className + ' | ' + getComputedStyle(r).display + ' | opacity ' + getComputedStyle(r).opacity + ' | height ' + r.offsetHeight +
-  ' | ' + getComputedStyle(r).color) })
+({ rowsAnywhere: document.querySelectorAll('.row').length, whereTheyAre: [...new
+  Set([...document.querySelectorAll('.row')].map((r) => (r.parentElement.id || '(no id)') + ' / ' +
+  r.parentElement.className))].slice(0, 6), logChildren: Object.entries([...document.getElementById('log').children].reduce((m, e)
+  => { m[e.className] = (m[e.className] || 0) + 1; return m; }, {})), events: session.events.length, types:
+  session.events.reduce((m, e) => { m[e.type] = (m[e.type] || 0) + 1; return m; }, {}) })
