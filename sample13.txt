@@ -1,0 +1,556 @@
+code_boss chunk 1
+number 13
+made 2026-11-04T03:39:45.766Z
+before 84479e1726992be3084830d4
+after 74c183800b4cccd723b89a3c
+files 12
+left 0
+check 22df44c41a171200
+
+=== change sandbox-launcher/src/main/java/cb/sandbox/App.java
+base 08ed004bca6b86018eda1738
+new cb6ff540d17414860f4a1d10
+@@ 89 -0 +19
++  // THE BUILD OF THE code_boss THE CONTAINER STARTS (the developer, 2026-11-03: "can you put the build number on the
++  // container ui?"): the bundle's own BUILD_VERSION line, near its top; read again only when the file changes
++  private static long buildSeen = -1;
++  private static String buildOf = null;
++  static synchronized String bundleBuild() {
++    try {
++      long t = Files.getLastModifiedTime(bundle()).toMillis();
++      if (t != buildSeen) {
++        byte[] head = new byte[20000];
++        int n = 0;
++        try (java.io.InputStream in = Files.newInputStream(bundle())) { for (int r; n < head.length && (r = in.read(head, n, head.length - n)) > 0; ) n += r; }
++        java.util.regex.Matcher mm = java.util.regex.Pattern.compile("const BUILD_VERSION = '([^']+)'").matcher(new String(head, 0, n, StandardCharsets.UTF_8));
++        buildOf = mm.find() ? mm.group(1) : null;
++        buildSeen = t;
++      }
++      return buildOf;
++    } catch (IOException e) { return null; }
++  }
++
+@@ 99 -0 +1
++    m.put("build", bundleBuild());
+=== change sandbox-launcher/src/main/resources/manager.html
+base e851010f6162b17bc97eca88
+new 006c1d2d8ae824678f58a381
+@@ 92 -0 +1
++  .foot-right { display: flex; align-items: center; gap: 12px; }
+@@ 366 -1 +1
+-  <button id="quit">Quit the manager</button>
++  <span class="foot-right"><span id="builds"></span><button id="quit">Quit the manager</button></span>
+@@ 594 -0 +8
++  // the builds, at the bottom right (the developer, 2026-11-03): the code_boss the container starts, and the image's
++  var builds = { app: null, image: null };
++  function renderBuilds() {
++    var parts = [];
++    if (builds.app) parts.push('code_boss build ' + builds.app);
++    if (builds.image && builds.image !== builds.app) parts.push('image build ' + builds.image);
++    $('builds').textContent = parts.join(' · ');
++  }
+@@ 596 -0 +1
++    builds.app = a.build || null; renderBuilds();
+@@ 912 -0 +1
++    builds.image = s.image && s.image.ok !== false && s.image.build ? String(s.image.build) : null;
+=== change scripts/build-number.txt
+base bf909f738c78f5619d79bbb3
+new 4c87a3c1901469b99f4d1848
+@@ 1 -1 +1
+-2733
++2736
+=== change scripts/build.mjs
+base cfa280f9114e8c543f731199
+new 2024baeb017faf0bdc22e1ee
+@@ 904 -0 +2
++  setupParts.push(`// ====== src/release-settings.mjs ======\n${processSource(await readFile(path.join(SRC, 'release-settings.mjs'), 'utf8'))}`);
++  setupParts.push(`// ====== src/release-channels.mjs ======\n${processSource(await readFile(path.join(SRC, 'release-channels.mjs'), 'utf8'))}`);
+@@ 922 -1 +1
+-    const setupSrc = (await readFile(path.join(SRC, 'deploy-cmd.mjs'), 'utf8')) + '\n' + (await readFile(path.join(SRC, 'devenv.mjs'), 'utf8')) + '\n' + (await readFile(path.join(SRC, 'release-ui.mjs'), 'utf8'));
++    const setupSrc = (await readFile(path.join(SRC, 'deploy-cmd.mjs'), 'utf8')) + '\n' + (await readFile(path.join(SRC, 'devenv.mjs'), 'utf8')) + '\n' + (await readFile(path.join(SRC, 'release-ui.mjs'), 'utf8')) + '\n' + (await readFile(path.join(SRC, 'release-settings.mjs'), 'utf8')) + '\n' + (await readFile(path.join(SRC, 'release-channels.mjs'), 'utf8'));
+@@ 942 -0 +1
++  const rsSrc = await readFile(path.join(SRC, 'release-settings.mjs'), 'utf8'), rcSrc = await readFile(path.join(SRC, 'release-channels.mjs'), 'utf8');
+@@ 957 -1 +1
+-    nodeImports([ssSrc, suuSrc], { 'node:url': ['fileURLToPath'] }),
++    nodeImports([ssSrc, rsSrc, rcSrc, suuSrc], { 'node:url': ['fileURLToPath'] }),
+@@ 959 -0 +2
++    `// ====== src/release-settings.mjs ======\n${processSource(rsSrc)}`,
++    `// ====== src/release-channels.mjs ======\n${processSource(rcSrc)}`,
+@@ 960 -1 +1
+-    `(async () => {\n  const self = fileURLToPath(import.meta.url);\n  const a = process.argv.slice(2);\n  const val = (f) => { const i = a.indexOf(f); return i >= 0 ? a[i + 1] : null; };\n  // (what the window's Release buttons start: the project folder built, and released)\n  if (a[0] === '--release') { process.exit(runSetupRelease({ selfPath: self, projectDir: path.resolve(val('--project')), channel: a[1], push: !a.includes('--no-push') })); return; }\n  console.log('[code_boss] setup window, build ' + BUILD_VERSION);\n  process.exit(await runSetupWindow({ selfPath: self }));\n})();\n`,
++    `(async () => {\n  const self = fileURLToPath(import.meta.url);\n  const a = process.argv.slice(2);\n  const val = (f) => { const i = a.indexOf(f); return i >= 0 ? a[i + 1] : null; };\n  // (what the window's Release buttons start: the project folder built, and released)\n  if (a[0] === '--release') { process.exit(runSetupRelease({ selfPath: self, projectDir: path.resolve(val('--project')), channel: a[1], push: !a.includes('--no-push') })); return; }\n  // (its channel buttons: a channel moved to a release)\n  if (a[0] === '--move') { process.exit(runSetupMove({ selfPath: self, channel: a[1], sha: a[2] })); return; }\n  console.log('[code_boss] setup window, build ' + BUILD_VERSION);\n  process.exit(await runSetupWindow({ selfPath: self }));\n})();\n`,
+=== change src/deploy-cmd.mjs
+base 290e777617ea1d8a92232192
+new 74acf9238aee7259d6431156
+@@ 33 -0 +2
++import { setupPluginsDir, setupLocalPlugins, normalizeRepoUrl } from './release-settings.mjs';
++import { setupAuthedRemote } from './release-channels.mjs';
+@@ 583 -39 +1
+-// ── the team's plugins: picked from the admin's own plugin folder, shipped with the release ──────────────────
+-// (the developer, 2026-10-30: plugins built "inside my own local container in prod" go out with code_boss; which ones,
+-// and which are on by default, chosen in the release window.) The app installs them by src/plugins/team.mjs's rules.
+-
+-// where the admin's plugins are: what the window saved; else the container's home on the production box; else this
+-// account's own
+-export function setupPluginsDir(cfg = {}) {
+-  if (cfg && String(cfg.pluginsDir || '').trim()) return String(cfg.pluginsDir).trim();
+-  const container = 'z:/home/.code_boss/plugins';
+-  if (process.platform === 'win32' && existsSync(container)) return container;
+-  return path.join(cbHomeDir(), '.code_boss', 'plugins');
+-}
+-
+-const SETUP_PLUGIN_RE = /^([a-z0-9][a-z0-9._-]*?)__([^_][^\\/]*)\.mjs$/i;
+-const setupVersionCmp = (a, b) => String(a).localeCompare(String(b), undefined, { numeric: true });
+-const setupSha = (s) => createHash('sha256').update(s).digest('hex');
+-
+-/** The admin's plugins, the newest version of each: [{ name, file, version, sha, size, description }]. */
+-export function setupLocalPlugins(dir) {
+-  let files = [];
+-  try { files = readdirSync(dir); } catch { return []; }
+-  const best = new Map();
+-  for (const f of files) {
+-    const m = SETUP_PLUGIN_RE.exec(f);
+-    if (!m || f.startsWith('.')) continue;
+-    const name = m[1].toLowerCase(), have = best.get(name);
+-    if (!have || setupVersionCmp(m[2], have.version) > 0) best.set(name, { name, file: f, version: m[2] });
+-  }
+-  const out = [];
+-  for (const p of best.values()) {
+-    try {
+-      const src = readFileSync(path.join(dir, p.file));
+-      const d = /description\s*:\s*(['"`])((?:(?!\1)[^\\\n]|\\.){0,240})\1/.exec(src.toString('utf8'));
+-      out.push({ ...p, sha: setupSha(src), size: src.length, description: d ? d[2] : '' });
+-    } catch { /* unreadable: not offered */ }
+-  }
+-  return out.sort((a, b) => a.name.localeCompare(b.name));
+-}
+-
++// (the admin's plugins folder and its plugins: release-settings.mjs)
+@@ 667 -23 +0
+-// Accept a GitLab repo URL in whatever shape a user pastes and return the clean
+-// web URL: no embedded auth, no trailing slash, no pasted browser tail
+-// (…/-/tree/main), and WITH-OR-WITHOUT a trailing .git both fine (downstream the
+-// push remote re-adds .git and the API path strips it — so the stored form just
+-// needs to be the canonical web URL). scp-style (git@host:group/repo) is
+-// converted to https. Non-http sources (a local bare repo in tests) pass through
+-// untouched. Returns '' for empty input.
+-export function normalizeRepoUrl(raw) {
+-  let s = String(raw == null ? '' : raw).trim().replace(/^['"]+|['"]+$/g, '').trim();
+-  if (!s) return '';
+-  const scp = /^[\w.+-]+@([\w.-]+):(.+)$/.exec(s);          // git@host:group/repo[.git]
+-  if (scp && !/^[a-z][\w+.-]*:\/\//i.test(s)) s = 'https://' + scp[1] + '/' + scp[2];
+-  if (/^https?:\/\//i.test(s)) {
+-    try {
+-      const u = new URL(s);
+-      u.username = ''; u.password = ''; u.hash = ''; u.search = '';
+-      u.pathname = u.pathname.replace(/\/-\/.*$/, '').replace(/\/+$/, '').replace(/\.git$/i, '').replace(/\/+$/, '');
+-      s = u.origin + u.pathname;
+-    } catch { /* unparseable — return the trimmed input so the caller errors clearly */ }
+-  }
+-  return s;
+-}
+-
+@@ 758 -12 +1
+-// Push auth rides the URL for the one push call only — the stored remote (and
+-// therefore .git/config) never contains the token. Non-http sources (a local
+-// bare repo in tests, ssh) pass through untouched.
+-function setupAuthedRemote(updateSource, creds) {
+-  if (!/^https?:/i.test(updateSource)) return updateSource;
+-  const u = new URL(updateSource);
+-  u.username = creds.user;
+-  u.password = creds.token;
+-  if (!u.pathname.endsWith('.git')) u.pathname = u.pathname.replace(/\/+$/, '') + '.git';
+-  return u.href;
+-}
+-
++// (push auth rides the URL for the one push call only: release-channels.mjs setupAuthedRemote)
+=== add src/release-channels.mjs
+new 05d8b065b8156ee3b860b9c7
++// ── THE CHANNELS: WHICH RELEASE EACH ONE POINTS AT, AND MOVING THEM ──────────────────────────────────────────────
++// (the developer, 2026-11-03: "I should be able to promote versions from devtest to beta and prod and also move old
++// versions into diff 'regions' if needed")
++// A channel (devtest, beta, production) is a git tag in the release repository on one "Release build N" commit; every
++// code_boss follows its channel's tag (check-update), and takes whatever build is there when it is not the one it runs -
++// an older one too. So promoting a build, or putting an old one back, is moving that tag: nothing is built.
++// The list is the release folder's own history (the folder each release is made in), with the tags as this machine
++// last set them.
++import { spawnSync } from 'node:child_process';
++import { existsSync } from 'node:fs';
++import path from 'node:path';
++
++export const REL_CHANNELS = ['devtest', 'beta', 'production'];
++
++const rcGit = (dir, args) => spawnSync('git', args, { cwd: dir, encoding: 'utf8', windowsHide: true });
++// (never an authed URL in what is said)
++const rcHide = (s) => String(s || '').replace(/\/\/[^@/\s]+@/g, '//***@');
++
++/** The remote a push goes to: the repository with the login in it, for that one push only - the stored remote (and
++ * .git/config) never has the token. A folder, ssh or other non-http source as it is. */
++export function setupAuthedRemote(updateSource, creds) {
++  if (!/^https?:/i.test(updateSource)) return updateSource;
++  const u = new URL(updateSource);
++  u.username = creds.user;
++  u.password = creds.token;
++  if (!u.pathname.endsWith('.git')) u.pathname = u.pathname.replace(/\/+$/, '') + '.git';
++  return u.href;
++}
++
++/**
++ * The releases in the release folder, newest first: [{ sha, build, at, channels: [...] }], and where each channel is.
++ * { ok: false, problem } when the folder is not a release folder yet.
++ */
++export function relChannelList(dir, { max = 40 } = {}) {
++  if (!dir || !existsSync(path.join(dir, '.git'))) return { ok: false, problem: `There is no release folder at ${dir || '(none set)'} yet - its first release makes it.` };
++  const log = rcGit(dir, ['log', 'main', `-n${max}`, '--format=%H%x09%cI%x09%s']);
++  if (log.status !== 0) return { ok: false, problem: 'Its history could not be read: ' + rcHide(log.stderr || log.stdout).trim().slice(0, 300) };
++  const at = {};
++  const refs = rcGit(dir, ['show-ref', '--tags']);
++  for (const l of String(refs.stdout || '').split(/\r?\n/)) {
++    const m = /^([0-9a-f]{40}) refs\/tags\/(\S+)$/.exec(l.trim());
++    if (m && REL_CHANNELS.includes(m[2])) at[m[2]] = m[1];
++  }
++  const builds = String(log.stdout || '').split(/\r?\n/).filter(Boolean).map((l) => {
++    const [sha, when, ...subject] = l.split('\t');
++    const m = /Release build (\S+)/.exec(subject.join('\t'));
++    return { sha, at: when, build: m ? m[1] : '', channels: REL_CHANNELS.filter((c) => at[c] === sha) };
++  });
++  // a channel on a commit older than the ones listed: said, not lost
++  const elsewhere = REL_CHANNELS.filter((c) => at[c] && !builds.some((b) => b.sha === at[c]));
++  return { ok: true, builds, channels: at, elsewhere };
++}
++
++/**
++ * Move a channel to a release: the tag set on it here, then pushed (forced - it is a moving tag). Exit code; what it
++ * does is said through `log`.
++ */
++export function relMoveChannel({ dir, channel, sha, updateSource, creds, push = true, log = (m) => console.log(m) }) {
++  if (!REL_CHANNELS.includes(channel)) { log(`Nothing moved: there is no channel "${channel}".`); return 1; }
++  const list = relChannelList(dir, { max: 400 });
++  if (!list.ok) { log('Nothing moved: ' + list.problem); return 1; }
++  const b = list.builds.find((x) => x.sha === sha);
++  if (!b) { log(`Nothing moved: ${String(sha).slice(0, 12)} is not one of the releases in ${dir}.`); return 1; }
++  const was = list.builds.find((x) => x.sha === list.channels[channel]);
++  log(`moving ${channel} to build ${b.build || sha.slice(0, 12)}${was ? ` (it was on build ${was.build})` : ''} ...`);
++  const t = rcGit(dir, ['tag', '-f', channel, sha]);
++  if (t.status !== 0) { log('Nothing moved: git tag failed - ' + rcHide(t.stderr || t.stdout).trim().slice(0, 300)); return 1; }
++  if (!push) { log(`${channel} is on build ${b.build} here; not pushed, so nobody follows it yet.`); return 0; }
++  if (!updateSource) { log('Not pushed: the repository is not set.'); return 1; }
++  const p = rcGit(dir, ['push', '-f', setupAuthedRemote(updateSource, creds || {}), `refs/tags/${channel}`]);
++  for (const l of rcHide(`${p.stdout || ''}${p.stderr || ''}`).split(/\r?\n/)) if (l.trim()) log(l.trim());
++  if (p.status !== 0) {
++    // (the tag here goes back where it was, so this list does not say something the repository does not)
++    if (was) rcGit(dir, ['tag', '-f', channel, was.sha]); else rcGit(dir, ['tag', '-d', channel]);
++    log(`Nothing moved: the push failed (exit ${p.status}).`);
++    return 1;
++  }
++  log(`${channel} is now build ${b.build}: everyone following ${channel} gets it at their next update${was && Number(was.build) > Number(b.build) ? ` - an older build than the ${was.build} they have, which they take` : ''}.`);
++  return 0;
++}
++
+=== add src/release-settings.mjs
+new 24589cadad9f2c7a03963c19
++// ── A RELEASE'S SETTINGS: what the release command's switches gave, kept ─────────────────────────────────────────
++// ~/.code_boss/build-config.json (the repository, the source folder, the plugins folder and which plugins ship) and
++// gitlab-creds.json (user, token - the token never goes back to a page). Read and saved here for both windows: the
++// release window (release-ui.mjs) and the setup window (setup-update-ui.mjs; the developer, 2026-11-03: "I expected in
++// the setup ui to have the options I was setting in the flags before I release").
++import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync } from 'node:fs';
++import { createHash } from 'node:crypto';
++import { homedir } from 'node:os';
++import path from 'node:path';
++
++const rsHome = () => path.join(process.env.CB_HOME || homedir(), '.code_boss');
++export const rsCfgPath = () => path.join(rsHome(), 'build-config.json');
++export const rsCredsPath = () => path.join(rsHome(), 'gitlab-creds.json');
++export const rsReadJson = (f) => { try { const j = JSON.parse(readFileSync(f, 'utf8')); return j && typeof j === 'object' ? j : {}; } catch { return {}; } };
++export const rsWriteJson = (f, v) => { mkdirSync(path.dirname(f), { recursive: true }); writeFileSync(f, JSON.stringify(v, null, 2) + '\n', 'utf8'); };
++
++// ── the team's plugins: picked from the admin's own plugin folder, shipped with the release ──────────────────
++// (the developer, 2026-10-30: plugins built "inside my own local container in prod" go out with code_boss; which ones,
++// and which are on by default, chosen in the release window.) The app installs them by src/plugins/team.mjs's rules.
++
++// where the admin's plugins are: what the window saved; else the container's home on the production box; else this
++// account's own
++export function setupPluginsDir(cfg = {}) {
++  if (cfg && String(cfg.pluginsDir || '').trim()) return String(cfg.pluginsDir).trim();
++  const container = 'z:/home/.code_boss/plugins';
++  if (process.platform === 'win32' && existsSync(container)) return container;
++  return path.join(rsHome(), 'plugins');
++}
++
++const SETUP_PLUGIN_RE = /^([a-z0-9][a-z0-9._-]*?)__([^_][^\\/]*)\.mjs$/i;
++const setupVersionCmp = (a, b) => String(a).localeCompare(String(b), undefined, { numeric: true });
++const setupSha = (s) => createHash('sha256').update(s).digest('hex');
++
++/** The admin's plugins, the newest version of each: [{ name, file, version, sha, size, description }]. */
++export function setupLocalPlugins(dir) {
++  let files = [];
++  try { files = readdirSync(dir); } catch { return []; }
++  const best = new Map();
++  for (const f of files) {
++    const m = SETUP_PLUGIN_RE.exec(f);
++    if (!m || f.startsWith('.')) continue;
++    const name = m[1].toLowerCase(), have = best.get(name);
++    if (!have || setupVersionCmp(m[2], have.version) > 0) best.set(name, { name, file: f, version: m[2] });
++  }
++  const out = [];
++  for (const p of best.values()) {
++    try {
++      const src = readFileSync(path.join(dir, p.file));
++      const d = /description\s*:\s*(['"`])((?:(?!\1)[^\\\n]|\\.){0,240})\1/.exec(src.toString('utf8'));
++      out.push({ ...p, sha: setupSha(src), size: src.length, description: d ? d[2] : '' });
++    } catch { /* unreadable: not offered */ }
++  }
++  return out.sort((a, b) => a.name.localeCompare(b.name));
++}
++
++/** The plugin folder as a page shows it: each plugin with what it is set to and whether it changed since the last release. */
++export function relPluginView(cfg) {
++  const dir = setupPluginsDir(cfg);
++  const ship = new Map((Array.isArray(cfg.shipPlugins) ? cfg.shipPlugins : []).map((p) => [String(p.name).toLowerCase(), p]));
++  const last = (cfg.lastShipped && cfg.lastShipped.plugins) || {};
++  const local = setupLocalPlugins(dir);
++  const rows = local.map((p) => {
++    const s = ship.get(p.name), was = last[p.name];
++    const status = !was ? 'not shipped yet' : was.sha === p.sha ? 'as shipped' : `changed since ${was.file === p.file ? 'shipped' : was.file + ' shipped'}`;
++    return { name: p.name, file: p.file, version: p.version, size: p.size, description: p.description, ship: !!s, enabled: s ? s.enabled !== false : true, status, changed: !was || was.sha !== p.sha };
++  });
++  // chosen, but gone from the folder: said, so it is not shipped silently short
++  for (const [name] of ship) if (!local.some((p) => p.name === name)) rows.push({ name, file: '', version: '', size: 0, description: '', ship: true, enabled: ship.get(name).enabled !== false, status: 'missing from the folder', missing: true });
++  return { dir, exists: existsSync(dir), rows };
++}
++
++// Accept a GitLab repo URL in whatever shape a user pastes and return the clean
++// web URL: no embedded auth, no trailing slash, no pasted browser tail
++// (…/-/tree/main), and WITH-OR-WITHOUT a trailing .git both fine (downstream the
++// push remote re-adds .git and the API path strips it — so the stored form just
++// needs to be the canonical web URL). scp-style (git@host:group/repo) is
++// converted to https. Non-http sources (a local bare repo in tests) pass through
++// untouched. Returns '' for empty input.
++export function normalizeRepoUrl(raw) {
++  let s = String(raw == null ? '' : raw).trim().replace(/^['"]+|['"]+$/g, '').trim();
++  if (!s) return '';
++  const scp = /^[\w.+-]+@([\w.-]+):(.+)$/.exec(s);          // git@host:group/repo[.git]
++  if (scp && !/^[a-z][\w+.-]*:\/\//i.test(s)) s = 'https://' + scp[1] + '/' + scp[2];
++  if (/^https?:\/\//i.test(s)) {
++    try {
++      const u = new URL(s);
++      u.username = ''; u.password = ''; u.hash = ''; u.search = '';
++      u.pathname = u.pathname.replace(/\/-\/.*$/, '').replace(/\/+$/, '').replace(/\.git$/i, '').replace(/\/+$/, '');
++      s = u.origin + u.pathname;
++    } catch { /* unparseable — return the trimmed input so the caller errors clearly */ }
++  }
++  return s;
++}
++
++/** The settings as a page shows them (never the token, only whether one is saved). */
++export function relSettingsView() {
++  const cfg = rsReadJson(rsCfgPath()), creds = rsReadJson(rsCredsPath());
++  return {
++    updateSource: cfg.updateSource || '', releaseDir: cfg.releaseDir || '', pluginsDir: cfg.pluginsDir || '',
++    glUser: creds.user || '', hasToken: !!creds.token, plugins: relPluginView(cfg),
++    lastShipped: cfg.lastShipped ? { build: cfg.lastShipped.build, channel: cfg.lastShipped.channel, at: cfg.lastShipped.at } : null,
++  };
++}
++
++/** A page's Save: what it sent, kept. An empty token field keeps the saved token. */
++export function relSaveSettings(b = {}) {
++  const cfg = rsReadJson(rsCfgPath()), creds = rsReadJson(rsCredsPath());
++  if (typeof b.updateSource === 'string') cfg.updateSource = normalizeRepoUrl(b.updateSource);
++  if (typeof b.releaseDir === 'string' && b.releaseDir.trim()) cfg.releaseDir = path.resolve(b.releaseDir.trim());
++  if (typeof b.pluginsDir === 'string') { if (b.pluginsDir.trim()) cfg.pluginsDir = b.pluginsDir.trim(); else delete cfg.pluginsDir; }
++  if (Array.isArray(b.ship)) cfg.shipPlugins = b.ship.filter((p) => p && p.name).map((p) => ({ name: String(p.name).toLowerCase(), enabled: p.enabled !== false }));
++  rsWriteJson(rsCfgPath(), cfg);
++  if (typeof b.glUser === 'string' || (typeof b.glToken === 'string' && b.glToken.trim())) {
++    if (typeof b.glUser === 'string') creds.user = b.glUser.trim();
++    if (typeof b.glToken === 'string' && b.glToken.trim()) creds.token = b.glToken.trim();
++    rsWriteJson(rsCredsPath(), creds);
++  }
++}
++
++/** Why a release cannot start with the saved settings, or '' when it can. */
++export function relReleaseProblem({ push = true } = {}) {
++  const cfg = rsReadJson(rsCfgPath()), creds = rsReadJson(rsCredsPath());
++  if (!cfg.updateSource) return 'The repository is needed first.';
++  if (push && !(creds.user && creds.token)) return 'A GitLab user and token are needed to push.';
++  return '';
++}
++
+=== change src/release-ui.mjs
+base 21df8c0ac24082b6aba9c816
+new 742dc9baaa7cc51e813ccf75
+@@ 22 -1 +2
+-import { parseSetupArgs, setupPluginsDir, setupLocalPlugins, normalizeRepoUrl } from './deploy-cmd.mjs';
++import { parseSetupArgs } from './deploy-cmd.mjs';
++import { setupPluginsDir, setupLocalPlugins, normalizeRepoUrl, relPluginView, relSaveSettings, relReleaseProblem } from './release-settings.mjs';
+@@ 68 -16 +0
+-/** The plugin folder as the page shows it: each plugin with what it is set to and whether it changed since the last release. */
+-export function relPluginView(cfg) {
+-  const dir = setupPluginsDir(cfg);
+-  const ship = new Map((Array.isArray(cfg.shipPlugins) ? cfg.shipPlugins : []).map((p) => [String(p.name).toLowerCase(), p]));
+-  const last = (cfg.lastShipped && cfg.lastShipped.plugins) || {};
+-  const local = setupLocalPlugins(dir);
+-  const rows = local.map((p) => {
+-    const s = ship.get(p.name), was = last[p.name];
+-    const status = !was ? 'not shipped yet' : was.sha === p.sha ? 'as shipped' : `changed since ${was.file === p.file ? 'shipped' : was.file + ' shipped'}`;
+-    return { name: p.name, file: p.file, version: p.version, size: p.size, description: p.description, ship: !!s, enabled: s ? s.enabled !== false : true, status, changed: !was || was.sha !== p.sha };
+-  });
+-  // chosen, but gone from the folder: said, so it is not shipped silently short
+-  for (const [name] of ship) if (!local.some((p) => p.name === name)) rows.push({ name, file: '', version: '', size: 0, description: '', ship: true, enabled: ship.get(name).enabled !== false, status: 'missing from the folder', missing: true });
+-  return { dir, exists: existsSync(dir), rows };
+-}
+-
+@@ 243 -6 +1
+-    const cfg = relReadJson(relCfgPath()), creds = relReadJson(relCredsPath());
+-    if (typeof b.updateSource === 'string') cfg.updateSource = normalizeRepoUrl(b.updateSource);
+-    if (typeof b.releaseDir === 'string' && b.releaseDir.trim()) cfg.releaseDir = path.resolve(b.releaseDir.trim());
+-    if (typeof b.pluginsDir === 'string') { if (b.pluginsDir.trim()) cfg.pluginsDir = b.pluginsDir.trim(); else delete cfg.pluginsDir; }
+-    if (Array.isArray(b.ship)) cfg.shipPlugins = b.ship.filter((p) => p && p.name).map((p) => ({ name: String(p.name).toLowerCase(), enabled: p.enabled !== false }));
+-    relWriteJson(relCfgPath(), cfg);
++    relSaveSettings(b);
+@@ 258 -5 +0
+-    if (typeof b.glUser === 'string' || (typeof b.glToken === 'string' && b.glToken.trim())) {
+-      if (typeof b.glUser === 'string') creds.user = b.glUser.trim();
+-      if (typeof b.glToken === 'string' && b.glToken.trim()) creds.token = b.glToken.trim();
+-      relWriteJson(relCredsPath(), creds);
+-    }
+@@ 334 -3 +2
+-          const cfg = relReadJson(relCfgPath()), creds = relReadJson(relCredsPath());
+-          if (!cfg.updateSource && !(image && b.push === false)) return json(400, { ok: false, error: 'The repository is needed first.' });
+-          if (b.push !== false && !(creds.user && creds.token)) return json(400, { ok: false, error: 'A GitLab user and token are needed to push.' });
++          const problem = relReleaseProblem({ push: b.push !== false });
++          if (problem && !(image && b.push === false)) return json(400, { ok: false, error: problem });
+=== add test/test-release-channels.mjs
+new 146f9fa5be265e80375f204b
++/**
++ * THE CHANNELS (src/release-channels.mjs, and the setup window's "Releases and channels"): a channel is a tag on a
++ * "Release build N" commit; promoting a build or putting an old one back moves the tag and pushes it. With a real git
++ * release folder and a bare repository as the remote:
++ *   [1] the list: the releases newest first, each with the channels on it
++ *   [2] moved and pushed: the remote's tag is on the build; an older build said as older
++ *   [3] a push that fails: said, and the tag here goes back where it was
++ *   [4] the setup window, in a browser: the list, a channel button, the remote moved
++ * Run: node test/test-release-channels.mjs
++ */
++import { mkdtempSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
++import { spawnSync } from 'node:child_process';
++import { tmpdir } from 'node:os';
++import { pathToFileURL } from 'node:url';
++import path from 'node:path';
++
++process.env.CB_HOME = mkdtempSync(path.join(tmpdir(), 'cb-chan-home-'));
++const { relChannelList, relMoveChannel } = await import('../src/release-channels.mjs');
++const { spHash, ssWriteRecord } = await import('../src/setup-sync.mjs');
++
++let pass = 0, fail = 0;
++const ok = (c, l) => { if (c) { pass++; console.log('  ok', l); } else { fail++; console.log('  FAIL', l); } };
++const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
++const git = (dir, ...args) => spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.com', ...args], { cwd: dir, encoding: 'utf8' });
++const remoteTag = (bare, tag) => (/^([0-9a-f]{40})\s/.exec(git(bare, 'ls-remote', bare, `refs/tags/${tag}`).stdout) || [])[1] || '';
++
++const work = mkdtempSync(path.join(tmpdir(), 'cb-chan-'));
++const bare = path.join(work, 'remote.git');
++git(work, 'init', '--bare', '-q', bare);
++const rel = path.join(work, 'code_boss-src');
++mkdirSync(rel);
++git(rel, 'init', '-q');
++const sha = {};
++for (const n of ['101', '102', '103']) {
++  writeFileSync(path.join(rel, 'build-number.txt'), n + '\n');
++  git(rel, 'add', '-A'); git(rel, 'commit', '-q', '-m', `Release build ${n}`);
++  sha[n] = git(rel, 'rev-parse', 'HEAD').stdout.trim();
++}
++git(rel, 'branch', '-M', 'main');
++git(rel, 'tag', '-f', 'production', sha['101']); git(rel, 'tag', '-f', 'devtest', sha['103']);
++git(rel, 'push', '-q', bare, 'main', 'refs/tags/production', 'refs/tags/devtest');
++
++console.log('\n[1] the list');
++const l = relChannelList(rel);
++ok(l.ok && l.builds.map((b) => b.build).join(',') === '103,102,101' && l.builds[0].channels.join() === 'devtest' && l.builds[2].channels.join() === 'production' && l.builds[1].channels.length === 0, `newest first, each with its channels (${l.ok ? l.builds.map((b) => b.build + ':' + b.channels.join('+')).join(' ') : l.problem})`);
++ok(relChannelList(path.join(work, 'nowhere')).ok === false, 'no release folder yet: said');
++
++console.log('\n[2] moved and pushed');
++const said = [];
++const m1 = relMoveChannel({ dir: rel, channel: 'production', sha: sha['103'], updateSource: bare, creds: {}, log: (s) => said.push(s) });
++ok(m1 === 0 && remoteTag(bare, 'production') === sha['103'] && relChannelList(rel).builds[0].channels.join() === 'devtest,production', `production promoted to 103: the remote's tag moved (${said.at(-1)})`);
++said.length = 0;
++const m2 = relMoveChannel({ dir: rel, channel: 'production', sha: sha['101'], updateSource: bare, creds: {}, log: (s) => said.push(s) });
++ok(m2 === 0 && remoteTag(bare, 'production') === sha['101'] && /older build than the 103 they have, which they take/.test(said.join('\n')), `an old build put back: moved, and said as older (${said.at(-1)})`);
++ok(relMoveChannel({ dir: rel, channel: 'staging', sha: sha['101'], updateSource: bare, creds: {}, log: () => {} }) === 1 && relMoveChannel({ dir: rel, channel: 'beta', sha: 'f'.repeat(40), updateSource: bare, creds: {}, log: () => {} }) === 1, 'no such channel, no such release: nothing moved');
++
++console.log('\n[3] a push that fails');
++said.length = 0;
++const m3 = relMoveChannel({ dir: rel, channel: 'production', sha: sha['102'], updateSource: path.join(work, 'no-such-remote.git'), creds: {}, log: (s) => said.push(s) });
++const after = relChannelList(rel);
++ok(m3 === 1 && /the push failed/.test(said.join('\n')) && after.channels.production === sha['101'] && remoteTag(bare, 'production') === sha['101'], 'said, and the tag here is back on 101, where the repository has it');
++
++console.log('\n[4] the setup window');
++let puppeteer = null;
++try { puppeteer = (await import('puppeteer-core')).default; } catch { /* none */ }
++const chrome = ['C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe', (process.env.LOCALAPPDATA || '') + '\\Google\\Chrome\\Application\\chrome.exe'].find((p) => { try { return p && existsSync(p); } catch { return false; } });
++if (!puppeteer || !chrome) console.log('  SKIP - no Chrome');
++else {
++  const { runSetupWindow } = await import('../src/setup-update-ui.mjs');
++  const home = path.join(process.env.CB_HOME, '.code_boss');
++  mkdirSync(home, { recursive: true });
++  writeFileSync(path.join(home, 'build-config.json'), JSON.stringify({ updateSource: bare, releaseDir: rel }));
++  writeFileSync(path.join(home, 'gitlab-creds.json'), JSON.stringify({ user: 'someone', token: 'not-a-real-one' }));
++  // a started project folder (the list shows once the folder is started)
++  const project = path.join(work, 'code_boss-project');
++  mkdirSync(project);
++  writeFileSync(path.join(project, 'a.txt'), 'a\n');
++  ssWriteRecord(project, { files: { 'a.txt': spHash('a.txt', Buffer.from('a\n')) }, chunk: 0, from: 'test' });
++  const self = path.join(work, 'setup-window.mjs');
++  writeFileSync(self, `import { runSetupMove } from '${pathToFileURL(path.resolve('src/setup-update-ui.mjs')).href}';\nconst a = process.argv.slice(2);\nif (a[0] === '--move') process.exit(runSetupMove({ selfPath: process.argv[1], channel: a[1], sha: a[2] }));\n`);
++  writeFileSync(path.join(home, 'setup-window.json'), JSON.stringify({ projectDir: project }));
++  let url = '';
++  const done = runSetupWindow({ selfPath: self, open: false, shortcut: false, onReady: (r) => { url = r.url; }, log: () => {} });
++  for (let i = 0; i < 100 && !url; i++) await sleep(50);
++  const browser = await puppeteer.launch({ executablePath: chrome, headless: 'new', args: ['--no-sandbox'] });
++  try {
++    const page = await browser.newPage();
++    const dialogs = [];
++    page.on('dialog', (d) => { dialogs.push(d.message()); d.accept(); });
++    await page.goto(url);
++    await page.waitForFunction(() => document.querySelectorAll('#rels tbody tr').length === 3, { timeout: 10000 });
++    const rows = await page.$$eval('#rels tbody tr', (trs) => trs.map((tr) => tr.textContent));
++    ok(/^103.*devtest/.test(rows[0]) && /^101.*production/.test(rows[2]), `the releases, with the channels on each (${rows.map((r) => r.slice(0, 3)).join(', ')})`);
++    await page.click(`#rels button[data-move="beta"][data-sha="${sha['102']}"]`);
++    await page.waitForFunction(() => /beta is on build 102 now/.test(document.getElementById('status').textContent), { timeout: 30000 });
++    ok(remoteTag(bare, 'beta') === sha['102'] && /Move beta to build 102\?.*even if it is older/.test(dialogs.join(' ')), 'beta moved to 102 from its button, asked first: the remote has it');
++    await page.waitForFunction(() => /beta/.test(document.querySelector('#rels tbody tr:nth-child(2) td:nth-child(3)').textContent), { timeout: 10000 });
++    ok(/beta/.test(await page.$eval('#rels tbody tr:nth-child(2) td:nth-child(3)', (e) => e.textContent)), 'the list says beta is on 102 now');
++    await page.click('#close');
++    await Promise.race([done, sleep(4000)]);
++  } catch (e) { fail++; console.log('  FAIL harness:', e?.stack || e); }
++  finally { await browser.close().catch(() => {}); }
++}
++console.log(`\n${pass} passed, ${fail} failed`);
++process.exit(fail ? 1 : 0);
++
+=== change test/test-sandbox-manager.mjs
+base 066da9085b61c01f0d8b5b38
+new 9d1b6ed74bbad90fe248c769
+@@ 39 -0 +2
++// the code_boss the container starts: its build is on the page (bottom right)
++await mk(path.join(tree, 'tools', 'app', 'code-boss.mjs'), "#!/usr/bin/env node\n/** a stand-in */\nconst BUILD_VERSION = '2056';\n");
+@@ 85 -0 +3
++  ok(s.app && s.app.build === '2056', `the build of the code_boss the container starts, read from its bundle (${s.app && s.app.build})`);
++  const pageText = (await req('GET', `/?t=${token}`)).text || '';
++  ok(/id="builds"/.test(pageText) && /'code_boss build ' \+ builds\.app/.test(pageText), 'the page has its place for the builds, bottom right');
+=== change test/test-setup-url.mjs
+base c28700410f84ef228ae1e8ef
+new aa04fb7713aa71eb3a087f49
+@@ 10 -1 +1
+-import { normalizeRepoUrl } from '../src/deploy-cmd.mjs';
++import { normalizeRepoUrl } from '../src/release-settings.mjs';
+=== change test/test-team-plugins.mjs
+base 42af612a7700f26b073ea188
+new 37f1c271ff4ee03f034c93d0
+@@ 19 -2 +3
+-const { setupLocalPlugins, setupShipPlugins } = await import('../src/deploy-cmd.mjs');
+-const { relSeed, relLineDiff, relPluginView } = await import('../src/release-ui.mjs');
++const { setupShipPlugins } = await import('../src/deploy-cmd.mjs');
++const { setupLocalPlugins, relPluginView } = await import('../src/release-settings.mjs');
++const { relSeed, relLineDiff } = await import('../src/release-ui.mjs');
+=== end
