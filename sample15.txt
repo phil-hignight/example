@@ -1,0 +1,172 @@
+code_boss chunk 1
+number 15
+made 2026-11-04T20:29:38.934Z
+message Chunk 15: Release window: paste the image command to fill the image settings
+before 8912b411404487bf8ac4b10f
+after ca04f7fe9f518bbd5bbb5b47
+files 4
+left 0
+check 1f1e2d956f9b5f56
+
+=== change scripts/build-number.txt
+base aa38cb23365724c289b5e122
+new cfd3ce68c6daf40f17d73ef5
+@@ 1 -1 +1
+-2739
++2741
+=== change scripts/release-window.mjs
+base bad655d09918da3a93125467
+new fc6ad3e0c8b2286e52dae63f
+@@ 5 -0 +1
++//   node scripts/release-window.mjs image <switches>    the same, the image command's switches kept as the image's settings
+@@ 23 -1 +2
+-if (a[0] === '--run') process.exit(runCheckoutRelease({ checkout, channel: a[1], push: !a.includes('--no-push'), withImage: !a.includes('--no-image') }));
++if (a[0] === 'image') process.exit(await runReleaseWindow({ mode: 'release', checkout: root, selfPath: self, imageArgv: a.slice(1) }));
++else if (a[0] === '--run') process.exit(runCheckoutRelease({ checkout, channel: a[1], push: !a.includes('--no-push'), withImage: !a.includes('--no-image') }));
+=== change src/release-ui.mjs
+base 7f7035793c068e862f0d3a89
+new 7a0e90401bed21f72ba1020f
+@@ 155 -1 +1
+-  icfg = { values: { ...(icfg && icfg.values) }, ...(icfg && icfg.flags ? { flags: { ...icfg.flags } } : {}), ...(icfg && icfg.push != null ? { push: icfg.push } : {}), ...(icfg && icfg.channel ? { channel: icfg.channel } : {}) };
++  icfg = { values: { ...(icfg && icfg.values) }, ...(icfg && icfg.flags ? { flags: { ...icfg.flags } } : {}), ...(icfg && icfg.push != null ? { push: icfg.push } : {}), ...(icfg && icfg.channel ? { channel: icfg.channel } : {}), ...(icfg && icfg.withRelease != null ? { withRelease: icfg.withRelease } : {}) };
+@@ 180 -0 +26
++/**
++ * A PASTED COMMAND LINE, AS ITS WORDS (the developer, 2026-11-04: "a button I can click that pops up a modal w/ text
++ * area where I can paste my command and it parses out the args and applies them"): quotes kept together and taken
++ * off, a line continued with ` ^ or \ joined, --switch=value split in two; the words after `image` (else from the
++ * first switch on).
++ */
++export function imgSplitCommand(text) {
++  const s = String(text || '').replace(/[`^\\][ \t]*\r?\n/g, ' ');
++  const words = (s.match(/(?:"[^"]*"|'[^']*'|[^\s"']+)+/g) || []).map((w) => w.replace(/"([^"]*)"|'([^']*)'/g, (m, a, b) => (a ?? b)));
++  const split = words.flatMap((w) => { const m = /^(--[\w-]+)=(.*)$/.exec(w); return m ? [m[1], m[2]] : [w]; });
++  const at = split.indexOf('image');
++  if (at >= 0) return split.slice(at + 1);
++  const first = split.findIndex((w) => w.startsWith('--'));
++  return first >= 0 ? split.slice(first) : [];
++}
++
++/** A pasted command into the image's settings: every value it gives replaces the saved one, the others stay; the on/off
++ * switches are set as it has them (a command line says them all). Pure: { icfg, kept, on }. */
++export function imgFromCommand(icfg, parsed) {
++  icfg = { ...(icfg || {}), values: { ...((icfg && icfg.values) || {}) }, flags: { ...((icfg && icfg.flags) || {}) } };
++  const kept = [];
++  for (const f of IMG_FIELDS) { const g = parsed.values[f.key]; if (g != null && String(g).trim()) { icfg.values[f.key] = String(g).trim(); kept.push('--' + f.key); } }
++  for (const c of IMG_CHECKS) icfg.flags[c.key] = parsed.flags.has(c.key);
++  return { icfg, kept, on: IMG_CHECKS.filter((c) => parsed.flags.has(c.key)).map((c) => '--' + c.key) };
++}
++
+@@ 195 -1 +3
+- * Chrome - tests), onReady({ url }), log.
++ * Chrome - tests), onReady({ url }), log. imageArgv (from a checkout): the image command's switches, kept as the image
++ * window keeps them - `node scripts/release-window.mjs image <switches>` (the developer, 2026-11-04: "it doesn't get the
++ * cli args i was passing to the image command").
+@@ 197 -1 +1
+-export function runReleaseWindow({ mode = 'release', argv = [], bundlePath, checkout = '', selfPath = '', open = true, onReady = () => {}, log = (m) => console.log(m) } = {}) {
++export function runReleaseWindow({ mode = 'release', argv = [], imageArgv = null, bundlePath, checkout = '', selfPath = '', open = true, onReady = () => {}, log = (m) => console.log(m) } = {}) {
+@@ 203 -2 +2
+-  const parsedImg = image ? imgParse(argv) : null;
+-  const seeded = image ? imgSeed(relReadJson(imgCfgPath()), relReadJson(relCfgPath()), relReadJson(relCredsPath()), parsedImg)
++  const parsedImg = image ? imgParse(argv) : co && imageArgv ? imgParse(imageArgv) : null;
++  const seeded = parsedImg ? imgSeed(relReadJson(imgCfgPath()), relReadJson(relCfgPath()), relReadJson(relCredsPath()), parsedImg)
+@@ 208 -1 +1
+-  if (image) relWriteJson(imgCfgPath(), seeded.icfg);
++  if (parsedImg) relWriteJson(imgCfgPath(), seeded.icfg);
+@@ 210 -1 +2
+-  let notes = seeded.notes;
++  // (from a checkout the buttons choose the channel and the push: the command line's --prod and --no-push are not for keeping)
++  let notes = co ? seeded.notes.filter((n) => n.key !== 'imgf:prod' && n.key !== 'imgf:no-push') : seeded.notes;
+@@ 317 -0 +22
++        if (u.pathname === '/api/paste-image' && req.method === 'POST') {
++          if (job.running) return json(409, { ok: false, error: `the ${what} is running` });
++          const args = imgSplitCommand(b.text);
++          if (!args.length) return json(200, { ...view(), pasted: { problem: 'No switches in it - paste the whole command: image and the switches after it.' } });
++          const parsed = imgParse(args);
++          const r = imgFromCommand(relReadJson(imgCfgPath()), parsed);
++          relWriteJson(imgCfgPath(), r.icfg);
++          const login = { ...(parsed.values.source ? { updateSource: parsed.values.source } : {}), ...(parsed.values['gl-user'] ? { glUser: parsed.values['gl-user'] } : {}), ...(parsed.values['gl-token'] ? { glToken: parsed.values['gl-token'] } : {}) };
++          if (Object.keys(login).length) relSaveSettings(login);
++          const buttons = ['prod', 'no-push'].filter((k) => parsed.flags.has(k)).map((k) => '--' + k);
++          const once = IMG_ONCE.filter((k) => parsed.flags.has(k)).map((k) => '--' + k);
++          const said = [
++            r.kept.length ? `Kept: ${r.kept.join(' ')}.` : 'No paths in it.',
++            r.on.length ? `Switched on: ${r.on.join(' ')}; the others off.` : 'Every on/off switch off.',
++            ...(Object.keys(login).length ? [`The ${[login.updateSource ? 'repository' : '', login.glUser ? 'GitLab user' : '', login.glToken ? 'token' : ''].filter(Boolean).join(', ')} saved too.`] : []),
++            ...(buttons.length ? [`${buttons.join(' ')}: the buttons choose that.`] : []),
++            ...(once.length ? [`${once.join(' ')}: for one run, not kept.`] : []),
++            ...(parsed.noop.length ? [`${parsed.noop.join(' ')}: do nothing now, not kept.`] : []),
++            ...(parsed.unknown.length ? [`Not switches of image, not kept: ${parsed.unknown.join(' ')}.`] : []),
++          ].join(' ');
++          return json(200, { ...view(), pasted: { said } });
++        }
+@@ 326 -1 +1
+-            const given = image ? relSeed({}, {}, { source: parsedImg.values.source, 'gl-user': parsedImg.values['gl-user'], 'gl-token': parsedImg.values['gl-token'] }) : relSeed({}, {}, flags, positionals[0] || '');
++            const given = parsedImg ? relSeed({}, {}, { source: parsedImg.values.source, 'gl-user': parsedImg.values['gl-user'], 'gl-token': parsedImg.values['gl-token'] }) : relSeed({}, {}, flags, positionals[0] || '');
+@@ 390 -0 +1
++.modal{position:fixed;inset:0;background:rgba(0,0,0,.5);display:flex;align-items:center;justify-content:center;z-index:20}.modal .box{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:16px 18px;width:min(760px,92vw)}.modal textarea{width:100%;box-sizing:border-box;margin-top:10px;background:var(--panel-alt);color:var(--fg);border:1px solid var(--border);border-radius:5px;padding:6px 8px;font:12px/1.4 monospace;resize:vertical}
+@@ 412 -1 +1
+-<div id="imgSec" style="display:none"><h2 id="imgHead" style="display:none">The container image</h2><div class="row" id="withRow" style="display:none"><label style="display:flex;gap:6px;grid-template-columns:none"><input type="checkbox" id="withRelease"> each release makes the container image too, with the same build</label></div><div id="imgFields"></div><h2>Switches</h2><div id="imgChecks"></div></div>
++<div id="imgSec" style="display:none"><h2 id="imgHead" style="display:none">The container image</h2><div class="row"><button id="pasteCmd">Paste your image command...</button><span class="sub" id="pasteDone"></span></div><div class="row" id="withRow" style="display:none"><label style="display:flex;gap:6px;grid-template-columns:none"><input type="checkbox" id="withRelease"> each release makes the container image too, with the same build</label></div><div id="imgFields"></div><h2>Switches</h2><div id="imgChecks"></div></div>
+@@ 435 -1 +6
+-</main><script>
++</main>
++<div id="pasteModal" class="modal" style="display:none"><div class="box"><h2>Paste your image command</h2>
++<div class="sub">The whole command you run, for example: node code-boss-setup.mjs image --jre C:\jdk11 --weblogic C:\wls --run. The paths in it replace the saved ones (the others stay), and the on/off switches are set as it has them.</div>
++<textarea id="pasteText" rows="8" spellcheck="false"></textarea>
++<div class="row"><button class="primary" id="pasteApply">Apply</button><button id="pasteCancel">Cancel</button><span class="sub" id="pasteSays"></span></div></div></div>
++<script>
+@@ 499 -0 +3
++$('pasteCmd').onclick=()=>{$('pasteSays').textContent='';$('pasteText').value='';$('pasteModal').style.display='flex';$('pasteText').focus();};
++$('pasteCancel').onclick=()=>{$('pasteModal').style.display='none';};
++$('pasteApply').onclick=async()=>{if(dirty&&!(await save()))return;$('pasteSays').textContent='Applying...';const r=await api('/api/paste-image',{text:$('pasteText').value});if(r.ok===false){$('pasteSays').textContent=r.error;return;}const p=r.pasted||{};if(p.problem){$('pasteSays').textContent=p.problem;return;}dirty=false;fill(r);$('pasteModal').style.display='none';$('pasteDone').textContent=p.said||'';};
+=== change test/test-release-window-checkout-e2e.mjs
+base bc1f46fa7e8d08b28e369a40
+new b9d8ca4259e2fc6437cc3482
+@@ 9 -0 +2
++ *   [D] opened with the image command's switches: kept as the image's settings, the ones that differ offered
++ *   [E] Paste your image command: the box parses a pasted command and applies it, says what it did not keep
+@@ 118 -0 +43
++
++console.log('\n[D] the image command\'s switches: node scripts/release-window.mjs image <switches>');
++{
++  let url2 = '';
++  const done2 = runReleaseWindow({ mode: 'release', checkout: co, selfPath: path.resolve('scripts/release-window.mjs'), imageArgv: ['--jre', 'C:/jre2', '--maven', 'C:/mvn', '--run', '--prod'], open: false, onReady: (r) => { url2 = r.url; }, log: () => {} });
++  for (let i = 0; i < 100 && !url2; i++) await sleep(50);
++  const u2 = new URL(url2), T2 = u2.searchParams.get('t');
++  const api = (p, b) => fetch(new URL(p, u2), { method: b ? 'POST' : 'GET', headers: { 'x-cb-token': T2, 'content-type': 'application/json' }, body: b ? JSON.stringify(b) : undefined }).then((r) => r.json());
++  const ic = () => JSON.parse(readFileSync(path.join(home, 'image-config.json'), 'utf8'));
++  const st = await api('/api/state');
++  const keys = st.notes.map((n) => n.key);
++  ok(ic().values.maven === 'C:/mvn' && ic().values.jre === 'C:/jre' && ic().withRelease !== false, `one not saved yet: kept (maven ${ic().values.maven}); one saved: the saved one stays (jre ${ic().values.jre})`);
++  ok(keys.includes('img:jre') && keys.includes('imgf:run'), `the ones that differ from what is saved: offered (${keys.join(', ')})`);
++  await api('/api/take', { key: 'img:jre', use: true });
++  await api('/api/take', { key: 'imgf:run', use: true });
++  const st2 = await api('/api/state');
++  ok(ic().values.jre === 'C:/jre2' && ic().flags.run === true && st2.image.checks.find((c) => c.key === 'run').on && st2.image.fields.find((f) => f.key === 'maven').value === 'C:/mvn', 'taken: in the image settings the release uses');
++  ok(!keys.includes('imgf:prod'), 'from a checkout --prod is not offered: the buttons choose the channel');
++
++  console.log('\n[E] Paste your image command: the window\'s box');
++  const browser2 = await puppeteer.launch({ executablePath: chrome, headless: 'new', args: ['--no-sandbox'] });
++  try {
++    const page = await browser2.newPage();
++    await page.goto(url2);
++    await page.waitForFunction(() => document.querySelectorAll('.ifield').length > 0, { timeout: 10000 });
++    await page.click('#pasteCmd');
++    ok(await page.$eval('#pasteModal', (e) => getComputedStyle(e).display !== 'none'), 'the button opens the box');
++    const cmd = String.raw`& "C:\Program Files\nodejs\node.exe" .\code-boss-setup.mjs image --jre "C:\Program Files\Java\jdk-11" ` + '`\n' + String.raw`  --weblogic=C:\wls --no-browser --prod --uninstall --gl-user pasted-user`;
++    await page.$eval('#pasteText', (e, v) => { e.value = v; }, cmd);
++    await page.click('#pasteApply');
++    await page.waitForFunction(() => /Kept:/.test(document.getElementById('pasteDone').textContent), { timeout: 10000 });
++    const done3 = await page.$eval('#pasteDone', (e) => e.textContent);
++    const fields = Object.fromEntries(await page.$$eval('.ifield', (fs) => fs.map((f) => [f.dataset.key, f.value])));
++    const checks = Object.fromEntries(await page.$$eval('.icheck', (cs) => cs.map((c) => [c.dataset.key, c.checked])));
++    ok(fields.jre === String.raw`C:\Program Files\Java\jdk-11` && fields.weblogic === String.raw`C:\wls` && fields.maven === 'C:/mvn' && ic().values.jre === fields.jre, `its paths replace the saved ones, the others stay (jre ${fields.jre}, maven ${fields.maven})`);
++    ok(checks['no-browser'] === true && checks.run === false && ic().flags.run === false, 'the on/off switches as the command has them');
++    const creds = JSON.parse(readFileSync(path.join(home, 'gitlab-creds.json'), 'utf8'));
++    ok(creds.user === 'pasted-user' && creds.token === 'not-a-real-one' && await page.$eval('#pasteModal', (e) => getComputedStyle(e).display === 'none'), 'the GitLab user saved, the token kept; the box closed');
++    ok(/--prod: the buttons choose that/.test(done3) && /--uninstall: for one run, not kept/.test(done3), `what was not kept, said (${done3})`);
++  } finally { await browser2.close().catch(() => {}); }
++  await api('/api/close', {});
++  await Promise.race([done2, sleep(4000)]);
++}
+=== end
