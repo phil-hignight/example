@@ -1,18 +1,19 @@
 code_boss chunk 1
-number 17
-made 2026-11-05T19:53:28.325Z
-message 5 changes
+number 18
+made 2026-11-05T21:16:49.709Z
+message 6 changes
 message
-message - Image settings: "WebLogic start command file", since it takes a file's path
 message - Image push shows git's progress; a refused token fails instead of waiting
 message - Container pages keep a blue accent, so they read as the container at a glance
 message - Count bubbles a little smaller, with a 2px edge
 message - Buttons wear their box's colour; count bubbles filled gold
-before e47ff2aa88949046b1d4a2b1
-after 61be2bce03913a0c3f7f542f
-files 10
+message - Snippet lines name every call by its function
+message - Release refuses a checkout whose recorded files are not all committed
+before 1512595c3978af6afa68a2eb
+after d8d406d60255b9fc1adb0667
+files 14
 left 0
-check 4855a25d915343a3
+check 998c9cf6f9c11dbd
 
 === change sandbox-launcher/src/main/resources/manager.html
 base 1f2791bef3cfad61623f3da2
@@ -32,11 +33,11 @@ new 7139b796f38737a01ffc65c3
 -  ::selection { background: rgba(255, 169, 92, 0.3); }
 +  ::selection { background: rgba(74, 157, 179, 0.3); }
 === change scripts/build-number.txt
-base 9c570860b93a0a8a4bae2a38
-new 62deae9018fab41292bfd323
+base fe69f706ecd3014a757a39a5
+new 7ed50f0c007ee84b60ee5e1f
 @@ 1 -1 +1
--2742
-+2748
+-2743
++2749
 === change src/agent/sandbox-cmd.mjs
 base 1629b51572446e10b5bd72c0
 new a374e15b5e640629e6898150
@@ -86,12 +87,45 @@ new 3a7d5c494857985ae421b320
 +  // never stop to ask at a console nobody is looking at - nor in a sign-in window of Git Credential Manager's, which
 +  // can open behind everything and wait there for good when GitLab turns the token down
 +  const env = { ...base, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' };
+=== change src/release-run.mjs
+base ccb306fd50008910de8db9f2
+new 05148e5b05dff929a6d42341
+@@ 45 -0 +2
++  const chunks = rrChunkFolderProblem(checkout, changed);
++  if (chunks) return { ok: false, problem: chunks };
+@@ 48 -0 +20
++/**
++ * A FOLDER THE CHUNKS FILL (the setup window's project folder - its record .cb-sync.json is in it) IS RELEASED ONLY AS
++ * GIT HAS IT (a Heads up, 2026-11-05: applying a chunk no longer commits it, and a release before Commit and push left
++ * the files the chunk added out of the build - a release builds what git tracks - and put the ones it changed in its own
++ * "Source of build N" commit; the developer: "make sure ... there's no way to shoot yourself in the foot"). Every file of
++ * the record committed as it is, or no release: the problem said, null when there is none (or no record).
++ */
++export function rrChunkFolderProblem(checkout, changed = []) {
++  let files;
++  try { files = Object.keys(JSON.parse(readFileSync(path.join(checkout, '.cb-sync.json'), 'utf8')).files || {}); } catch { return null; }
++  let tracked;
++  try { tracked = new Set(rrTrackedFiles(checkout)); } catch { return null; }
++  const left = [...changed, ...files.filter((p) => !tracked.has(p))];
++  if (!left.length) return null;
++  return `This folder gets its files from chunks, and ${left.length} of them ${left.length === 1 ? 'is' : 'are'} not committed (${left.slice(0, 4).join(', ')}${left.length > 4 ? ', ...' : ''}). In the setup window, Commit and push (step 3) first: a release builds only what git has.`;
++}
++
++/** The marker a release leaves in the checkout's .git while it runs: the setup window applies and commits nothing meanwhile. */
++export const rrReleasingPath = (checkout) => path.join(checkout, '.git', 'cb-releasing.json');
++
+@@ 85 -1 +7
+-export function runCheckoutRelease({ checkout, channel = 'devtest', push = true, withImage = true, log = (m) => console.log(m) }) {
++export function runCheckoutRelease(opts) {
++  // (while it runs, the checkout is marked: the setup window writes nothing into a folder a release is building from)
++  const mark = opts && opts.checkout && existsSync(path.join(opts.checkout, '.git')) ? rrReleasingPath(opts.checkout) : '';
++  try { if (mark) writeFileSync(mark, JSON.stringify({ pid: process.pid, at: Date.now() })); } catch { /* the release goes on */ }
++  try { return rrRelease(opts); } finally { try { if (mark) rmSync(mark, { force: true }); } catch { /* gone */ } }
++}
++function rrRelease({ checkout, channel = 'devtest', push = true, withImage = true, log = (m) => console.log(m) }) {
 === change src/release-ui.mjs
-base 89dd9cd054a391afba4474a9
-new 2bda8c904b7f71d8bc4f1bad
-@@ 107 -1 +1
--  { key: 'wls-command', label: 'WebLogic start command', group: 'WebLogic' },
-+  { key: 'wls-command', label: 'WebLogic start command file', group: 'WebLogic' },
+base 0ab91b72e43f7141d75b685a
+new ec6f26f346aaeac119833530
 @@ 301 -2 +12
 -    let carry = '';
 -    const take = (d) => { carry += String(d); const parts = carry.split(/\r?\n/); carry = parts.pop(); for (const l of parts) job.lines.push(l.replace(/\/\/[^@/\s]+@/g, '//***@')); if (job.lines.length > 4000) job.lines.splice(0, job.lines.length - 4000); };
@@ -107,9 +141,12 @@ new 2bda8c904b7f71d8bc4f1bad
 +      if (segs.length > 1) { carry = segs.pop(); const cur = segs.filter(Boolean).pop(); if (cur) putLine(cur, true); }
 +      if (job.lines.length > 4000) job.lines.splice(0, job.lines.length - 4000);
 +    };
+@@ 539 -0 +2
++  // (a checkout that cannot be released - its line says why, in red: the buttons are off, not a run that only says so)
++  if(co&&!s.checkout.ok)$('relDev').disabled=$('relBeta').disabled=$('relProd').disabled=true;
 === change src/ui.html
 base 0815e097facf0efabea7f02d
-new 993a1c710b2e27591a7209bc
+new 7501a74472fd17f10d380da6
 @@ 29 -1 +1
 -    --accent-deep: #d38e46;   /* a darker gold, 7.1:1 on --bg: the count bubbles' edge and number (the developer, 2026-10-29) */
 +    --accent-deep: #d38e46;   /* a darker gold, 7.1:1 on --bg (the developer, 2026-10-29: the count bubbles' edge and number, until they were filled gold, 2026-11-05) */
@@ -160,6 +197,26 @@ new 993a1c710b2e27591a7209bc
 +  .heads-up-row .btn.primary, .cb-banner.note .cbb-action { background: var(--note); border-color: var(--note); color: var(--bg); font-weight: 600; }
 +  .heads-up-row .btn.primary:hover:not(:disabled), .cb-banner.note .cbb-action:hover:not(:disabled) { background: var(--note-hover); border-color: var(--note-hover); color: var(--bg); }
 +  .heads-up-row .btn:not(.primary):hover:not(:disabled) { border-color: var(--note); color: var(--note); }
+@@ 8744 -1 +7
+-  function jsCountKey(ev) { return ev.kind === 'exec' && ev.fn ? 'x:' + ev.fn : (ev.kind === 'plugin' || ev.kind === 'ask') && ev.fn ? 'p:' + ev.fn : JS_FILE_OP_FNS.has(ev.fn) ? ev.fn : ev.kind; }
++  // EVERY CALL BY ITS OWN NAME (the developer, 2026-11-05: "the mainChat tool shows up as "read" in the summary line. We
++  // need to show the actual tool names"): a read, a list, a mainChat, a historyAsk, a dsPage ... each counts as itself,
++  // keyed 'f:<kind>|<function>' (in its kind's place on the line) - "2 read, mainChat, list", not "4 reads". The bulk
++  // file ops keep their phrases.
++  function jsCountKey(ev) { return ev.kind === 'exec' && ev.fn ? 'x:' + ev.fn : (ev.kind === 'plugin' || ev.kind === 'ask') && ev.fn ? 'p:' + ev.fn : JS_FILE_OP_FNS.has(ev.fn) ? ev.fn : ev.fn ? 'f:' + ev.kind + '|' + ev.fn : ev.kind; }
++  // what a named count key shows: the function's own name
++  const jsKeyName = (k) => (k.startsWith('f:') ? k.slice(k.indexOf('|') + 1) : k.slice(2));
+@@ 8780 -0 +1
++      for (const x of keys) if (x.startsWith('f:' + k + '|') && seg.counts[x]) parts.push(jsN(seg.counts[x]) + jsKeyName(x));
+@@ 8787 -1 +1
+-    for (const k of Object.keys(seg.failedKinds || {})) { const n = seg.failedKinds[k]; parts.push(JS_FAILED + jsN(n) + (k.startsWith('x:') || k.startsWith('p:') ? k.slice(2) : (JS_FAIL_NOUN[k] || ['call', 'calls'])[n === 1 ? 0 : 1])); }
++    for (const k of Object.keys(seg.failedKinds || {})) { const n = seg.failedKinds[k]; parts.push(JS_FAILED + jsN(n) + (k.startsWith('x:') || k.startsWith('p:') || k.startsWith('f:') ? jsKeyName(k) : (JS_FAIL_NOUN[k] || ['call', 'calls'])[n === 1 ? 0 : 1])); }
+@@ 8790 -1 +1
+-    for (const k of Object.keys(seg.caughtKinds || {})) { const n = seg.caughtKinds[k]; if (n) parts.push(JS_CAUGHT + jsN(n) + (k.startsWith('x:') || k.startsWith('p:') ? k.slice(2) : (JS_FAIL_NOUN[k] || ['call', 'calls'])[n === 1 ? 0 : 1])); }
++    for (const k of Object.keys(seg.caughtKinds || {})) { const n = seg.caughtKinds[k]; if (n) parts.push(JS_CAUGHT + jsN(n) + (k.startsWith('x:') || k.startsWith('p:') || k.startsWith('f:') ? jsKeyName(k) : (JS_FAIL_NOUN[k] || ['call', 'calls'])[n === 1 ? 0 : 1])); }
+@@ 9207 -1 +1
+-    if (seg) { if (ev.status === 'error' && !expected) { const fk = ev.kind === 'exec' && ev.fn ? 'x:' + ev.fn : (ev.kind === 'plugin' || ev.kind === 'ask') && ev.fn ? 'p:' + ev.fn : ev.kind; seg.failed = (seg.failed || 0) + 1; seg.failedKinds = seg.failedKinds || {}; seg.failedKinds[fk] = (seg.failedKinds[fk] || 0) + 1; stepEntry.failedKey = fk; stepEntry.countKey = jsCountKey(ev); } else { const ck = jsCountKey(ev); seg.counts[ck] = (seg.counts[ck] || 0) + 1; } }
++    if (seg) { if (ev.status === 'error' && !expected) { const fk = JS_FILE_OP_FNS.has(ev.fn) ? ev.kind : jsCountKey(ev); seg.failed = (seg.failed || 0) + 1; seg.failedKinds = seg.failedKinds || {}; seg.failedKinds[fk] = (seg.failedKinds[fk] || 0) + 1; stepEntry.failedKey = fk; stepEntry.countKey = jsCountKey(ev); } else { const ck = jsCountKey(ev); seg.counts[ck] = (seg.counts[ck] || 0) + 1; } }
 === change test/test-image-window-e2e.mjs
 base df4ba2d5df5566aba9603228
 new 31152697226b2f10d3148949
@@ -170,6 +227,36 @@ new 31152697226b2f10d3148949
 @@ 93 -0 +2
 +  const writing = log.split('\n').filter((l) => /Writing objects/.test(l));
 +  ok(writing.length === 1 && /100% .*done\.$/.test(writing[0]) && /pushed: done/.test(log), `git's progress: one line, written over in place, its last state kept (${JSON.stringify(writing)})`);
+=== change test/test-js-collapsed-rows-e2e.mjs
+base b41bd0d7bb411f90d7b5ea02
+new 63c2e7bb2b7fa88b553ed8b0
+@@ 6 -1 +1
+- * "2 reads, write, git" as the inner calls report in (a count of one is just the word - the developer, 2026-10-10) (each process by its name, comma separated), and a click opens it into the js
++ * "2 read, write, git" as the inner calls report in (a count of one is just the word - the developer, 2026-10-10) (each process by its name, comma separated), and a click opens it into the js
+@@ 46 -1 +1
+-await new Promise((r) => setTimeout(r, 900));
++await new Promise((r) => setTimeout(r, 2500));
+@@ 140 -1 +1
+-    await page.waitForFunction(() => /2 reads/.test((document.querySelector('.js-group .js-summary .body') || {}).textContent || ''), { timeout: 10000 }).catch(() => {});
++    await page.waitForFunction(() => /^2 read…$/.test((document.querySelector('.js-group .js-summary .body') || {}).textContent || ''), { timeout: 10000 }).catch(() => {});
+@@ 142 -1 +1
+-    ok(/^2 reads…$/.test(afterReads), `after the two reads, before the write: ${JSON.stringify(afterReads)}`);
++    ok(/^2 read…$/.test(afterReads), `after the two reads, before the write: ${JSON.stringify(afterReads)}`);
+@@ 163 -1 +1
+-    ok(done.text === '2 reads', `the first line counts only what it folded (${JSON.stringify(done.text)})`);
++    ok(done.text === '2 read', `the first line counts only what it folded (${JSON.stringify(done.text)})`);
+@@ 307 -1 +1
+-    ok(rerender.text === '2 reads / git' && rerender.steps === 5, `with its tally and its five steps rebuilt from the stored events (${JSON.stringify(rerender.text)}, ${rerender.steps} steps)`);
++    ok(rerender.text === '2 read / git' && rerender.steps === 5, `with its tally and its five steps rebuilt from the stored events (${JSON.stringify(rerender.text)}, ${rerender.steps} steps)`);
+@@ 312 -1 +1
+-    ok(reloaded.text === '2 reads / git' && reloaded.steps === 5 && !reloaded.pulsing, `after a full reload: the same line, settled, with its steps (${JSON.stringify(reloaded)})`);
++    ok(reloaded.text === '2 read / git' && reloaded.steps === 5 && !reloaded.pulsing, `after a full reload: the same line, settled, with its steps (${JSON.stringify(reloaded)})`);
+=== change test/test-js-step-rows-expand-e2e.mjs
+base c23865eafe5ad879ee72b42b
+new da715cf329662c180a9f8fe7
+@@ 111 -1 +1
+-  ok(tally === '2 reads, node, search, read [struck, muted: read]', `the line says "node", not "execution", a count of one is just the word, with commas only (${JSON.stringify(tally)})`);
++  ok(tally === '2 read, node, search, read [struck, muted: read]', `the line says "node", not "execution", a count of one is just the word, with commas only (${JSON.stringify(tally)})`);
 === change test/test-notes-and-paste-e2e.mjs
 base d50e4672cabf9522c5324341
 new f2bd13f799aa5a1588f12fef
@@ -178,6 +265,25 @@ new f2bd13f799aa5a1588f12fef
 +      fill: [cs(hu.querySelector('.heads-up-actions .btn.primary')).backgroundColor, cs(dc.querySelector('.cbb-action')).backgroundColor],
 @@ 94 -0 +1
 +  ok(notes.fill.every((c) => c === 'rgb(127, 185, 214)'), `a note's buttons wear its blue, not the app's gold (${JSON.stringify(notes.fill)})`);
+=== change test/test-release-run.mjs
+base 1347d6876aaaeee27ad5c253
+new ff685b3bb61bf5c789d525f2
+@@ 107 -0 +15
++console.log('\n[5] a folder the chunks fill: released only as git has it');
++const cf = path.join(work, 'chunk-folder'); mkdirSync(path.join(cf, 'scripts'), { recursive: true });
++writeFileSync(path.join(cf, 'scripts', 'build-number.txt'), '60\n'); writeFileSync(path.join(cf, 'a.txt'), 'a\n');
++git(cf, 'init', '-q'); writeFileSync(path.join(cf, '.git', 'info', 'exclude'), '/.cb-sync.json\n'); git(cf, 'add', '-A'); git(cf, 'commit', '-q', '-m', 'first'); git(cf, 'branch', '-M', 'main');
++// a chunk applied, not committed: it added new.txt and changed a.txt
++writeFileSync(path.join(cf, '.cb-sync.json'), JSON.stringify({ files: { 'scripts/build-number.txt': 'x', 'a.txt': 'x', 'new.txt': 'x' }, chunk: 3 }));
++writeFileSync(path.join(cf, 'new.txt'), 'added by a chunk\n'); writeFileSync(path.join(cf, 'a.txt'), 'a, changed by a chunk\n');
++const s5 = rrCheckoutState(cf);
++ok(!s5.ok && /2 of them are not committed \(a\.txt, new\.txt\)/.test(s5.problem) && /Commit and push \(step 3\) first/.test(s5.problem), `a chunk applied and not committed: it cannot be released, and it says why (${s5.problem})`);
++said.length = 0;
++const r5 = runCheckoutRelease({ checkout: cf, channel: 'devtest', log: (m) => said.push(m) });
++ok(r5 === 1 && /Nothing was released: This folder gets its files from chunks/.test(said.join('\n')) && git(cf, 'log', '-1', '--format=%s').stdout.trim() === 'first' && !existsSync(path.join(cf, '.git', 'cb-releasing.json')), 'a release refuses it: no "Source of build" commit, and the release\'s marker is gone after');
++git(cf, 'add', '-A'); git(cf, 'commit', '-q', '-m', 'the chunk');
++ok(rrCheckoutState(cf).ok, 'committed: it can be released');
++
 === change test/test-sandbox-install-window-e2e.mjs
 base 014701f73780413afd3a7830
 new e361f019c89529410be56cf8
