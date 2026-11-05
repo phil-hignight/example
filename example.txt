@@ -1,175 +1,23 @@
 code_boss chunk 1
-number 16
-made 2026-11-04T22:19:41.504Z
-message Chunk 16: Release window and container pages show when they are working
-before ca04f7fe9f518bbd5bbb5b47
-after e47ff2aa88949046b1d4a2b1
-files 4
+number 17
+made 2026-11-04T22:52:41.826Z
+message Chunk 17: Image settings: "WebLogic start command file", since it takes a file's path
+before e47ff2aa88949046b1d4a2b1
+after 1512595c3978af6afa68a2eb
+files 2
 left 0
-check 9428bbdf3a92430f
+check 0d24a8ca96e4448b
 
-=== change sandbox-launcher/src/main/resources/manager.html
-base 006c1d2d8ae824678f58a381
-new 1f2791bef3cfad61623f3da2
-@@ 72 -1 +2
--  button.pressed { opacity: .7; cursor: progress; box-shadow: inset 0 0 0 2px var(--accent); }
-+  button.pressed { cursor: progress; pointer-events: none; box-shadow: inset 0 0 0 2px var(--accent); }
-+  button.pressed::before { content: ''; display: inline-block; width: 10px; height: 10px; border: 2px solid currentColor; border-top-color: transparent; border-radius: 50%; animation: spin .8s linear infinite; vertical-align: -1px; margin-right: 7px; }
-@@ 158 -1 +1
--  @media (prefers-reduced-motion: reduce) { .lamp.busy, ol.steps li.run .dot, .ring.busy, .flow li.run .fd { animation: none; border-top-color: var(--accent); } }
-+  @media (prefers-reduced-motion: reduce) { .lamp.busy, ol.steps li.run .dot, .ring.busy, .flow li.run .fd, button.pressed::before { animation: none; border-top-color: var(--accent); } }
-@@ 206 -2 +2
--        <span class="ring" id="dash-box-lamp"></span>
--        <div class="who"><div class="name">Container</div><div class="st" id="dash-box-text" role="status">&nbsp;</div></div>
-+        <span class="ring busy" id="dash-box-lamp"></span>
-+        <div class="who"><div class="name">Container</div><div class="st" id="dash-box-text" role="status">Looking...</div></div>
-@@ 240 -1 +1
--    <div class="state"><span class="lamp" id="box-lamp"></span><span id="box-text" role="status">&nbsp;</span></div>
-+    <div class="state"><span class="lamp busy" id="box-lamp"></span><span id="box-text" role="status">Looking...</span></div>
 === change scripts/build-number.txt
-base cfd3ce68c6daf40f17d73ef5
-new 9c570860b93a0a8a4bae2a38
+base 9c570860b93a0a8a4bae2a38
+new fe69f706ecd3014a757a39a5
 @@ 1 -1 +1
--2741
-+2742
-=== change src/agent/sandbox-setup-page.mjs
-base 12157110e3405341348cf385
-new ce421946947a4861fa55916b
-@@ 63 -0 +3
-+  .spin, button.busy::before { content: ''; display: inline-block; width: 12px; height: 12px; border: 2px solid currentColor; border-top-color: transparent; border-radius: 50%; animation: spin .8s linear infinite; vertical-align: -1px; margin-right: 8px; }
-+  button.busy { cursor: progress; pointer-events: none; }
-+  #loading p { margin: 0; }
-@@ 64 -1 +1
--  @media (prefers-reduced-motion: reduce) { li.run .dot { animation: none; border-top-color: var(--accent); } li .bar i { transition: none; } }
-+  @media (prefers-reduced-motion: reduce) { li.run .dot, .spin, button.busy::before { animation: none; border-top-color: var(--accent); } li .bar i { transition: none; } }
-@@ 70 -0 +2
-+  <section id="loading" role="status"><p id="loading-text"><span class="spin"></span>Loading...</p></section>
-+
-@@ 88 -0 +1
-+    <div class="note bad hidden" id="go-error" role="alert"></div>
-@@ 96 -0 +1
-+    <div class="note bad hidden" id="install-error" role="alert"></div>
-@@ 104 -0 +1
-+    <div class="note bad hidden" id="retry-error" role="alert"></div>
-@@ 117 -1 +11
--  function only(id) { ['ask', 'needs', 'progress'].forEach(function (s) { $(s).className = s === id ? '' : 'hidden'; }); }
-+  function only(id) { ['loading', 'ask', 'needs', 'progress'].forEach(function (s) { $(s).className = s === id ? '' : 'hidden'; }); }
-+  // A button at work spins until the answer is back, and a second press does nothing; no answer at all says so under it.
-+  function press(btn, errId, call, then) {
-+    if (btn.classList.contains('busy')) return;
-+    btn.classList.add('busy');
-+    $(errId).className = 'note bad hidden';
-+    call().then(function (s) { btn.classList.remove('busy'); if (then) then(); render(s); }, function () {
-+      btn.classList.remove('busy');
-+      $(errId).className = 'note bad'; $(errId).textContent = 'The install window did not answer. If its console window was closed, start it again.';
-+    });
-+  }
-@@ 188 -1 +1
--      .catch(function () { setTimeout(poll, 1500); });
-+      .catch(function () { if (!shown) $('loading-text').lastChild.textContent = 'Waiting for the install window to answer...'; setTimeout(poll, 1500); });
-@@ 192 -3 +1
--    $('go').disabled = true;
--    api('POST', '/api/begin', { tree: $('tree').value, source: $('source').value, glUser: $('gluser').value, glToken: $('gltoken').value })
--      .then(function (s) { $('go').disabled = false; $('gltoken').value = ''; render(s); });
-+    press($('go'), 'go-error', function () { return api('POST', '/api/begin', { tree: $('tree').value, source: $('source').value, glUser: $('gluser').value, glToken: $('gltoken').value }); }, function () { $('gltoken').value = ''; });
-@@ 199 -2 +1
--    $('install').disabled = true;
--    api('POST', '/api/install', { values: values }).then(function (s) { $('install').disabled = false; render(s); });
-+    press($('install'), 'install-error', function () { return api('POST', '/api/install', { values: values }); });
-@@ 202 -1 +1
--  $('retry').addEventListener('click', function () { api('POST', '/api/retry').then(function (s) { filled = false; shown = ''; render(s); }); });
-+  $('retry').addEventListener('click', function () { press($('retry'), 'retry-error', function () { return api('POST', '/api/retry'); }, function () { filled = false; shown = ''; }); });
+-2742
++2743
 === change src/release-ui.mjs
-base 7a0e90401bed21f72ba1020f
-new 89dd9cd054a391afba4474a9
-@@ 447 -0 +5
-+@keyframes spin{to{transform:rotate(360deg)}}
-+.spin,button.busy::before{content:'';display:inline-block;width:10px;height:10px;border:2px solid currentColor;border-top-color:transparent;border-radius:50%;animation:spin .8s linear infinite;vertical-align:-1px;margin-right:7px}
-+button.busy{cursor:progress;pointer-events:none}
-+@media (prefers-reduced-motion:reduce){.spin,button.busy::before{animation:none;border-top-color:currentColor;opacity:.6}}
-+#loading{display:none;margin-top:14px}body.loading #loading{display:block}body.loading main>*:not(h1):not(#loading){display:none}
-@@ 454 -2 +2
--</style></head><body><main>
--<h1 id="title">code_boss release</h1><div class="sub" id="last"></div><div class="sub" id="coSays" style="display:none"></div>
-+</style></head><body class="loading"><main>
-+<h1 id="title">code_boss release</h1><div class="sub" id="loading"><span class="spin"></span>Loading...</div><div class="sub" id="last"></div><div class="sub" id="coSays" style="display:none"></div>
-@@ 498 -0 +13
-+const SP='<span class="spin"></span>';
-+// A BUTTON AT WORK (the developer, 2026-11-04: "often no loading animations"): it spins until the answer is back and a
-+// second press does nothing; its line says what is going on. The polling waits meanwhile, so it does not write over that.
-+let busyN=0;
-+async function busy(btn,line,text,fn){
-+  if(btn.classList.contains('busy'))return;
-+  btn.classList.add('busy');busyN++;
-+  const el=line&&$(line);let sp=null;
-+  if(el&&text){el.innerHTML=SP+esc(text);sp=el.firstChild;}
-+  try{return await fn();}
-+  catch(e){if(el)el.innerHTML='<span class="err">The window did not answer ('+esc(e&&e.message||e)+'). Is it still running?</span>';sp=null;}
-+  finally{busyN--;btn.classList.remove('busy');if(sp&&sp.isConnected)el.textContent='';}
-+}
-@@ 521 -1 +1
--  if(im){$('status').innerHTML=j.running?'Building the image for <b>'+esc(j.channel)+'</b>'+(j.push?'':' (not pushed)')+'...':j.code==null?'':j.code===0?'<span class="okc">The image is built for '+esc(j.channel)+(j.push?'':' (committed in the image clone, not pushed)')+'.</span>':'<span class="err">The image stopped (exit '+esc(j.code)+') - what it said is below.</span>';
-+  if(im){put('status',j.running?SP+'Building the image for <b>'+esc(j.channel)+'</b>'+(j.push?'':' (not pushed)')+'...':j.code==null?'':j.code===0?'<span class="okc">The image is built for '+esc(j.channel)+(j.push?'':' (committed in the image clone, not pushed)')+'.</span>':'<span class="err">The image stopped (exit '+esc(j.code)+') - what it said is below.</span>');
-@@ 525 -3 +3
--  if(co&&(j.what==='move'||j.what==='image')){$('status').innerHTML=j.what==='move'?(j.running?'Moving <b>'+esc(j.channel)+'</b> to build '+esc(j.build)+'...':j.code==null?'':j.code===0?'<span class="okc">'+esc(j.channel)+' is on build '+esc(j.build)+' now.</span>':'<span class="err">The move stopped (exit '+esc(j.code)+') - what it said is below.</span>')
--    :(j.running?'Making the image of build '+esc(j.build)+'...':j.code===0?'<span class="okc">The image of build '+esc(j.build)+' is made.</span>':'<span class="err">The image stopped (exit '+esc(j.code)+') - what it said is below.</span>');return;}
--  $('status').innerHTML=j.running?'Releasing to <b>'+esc(j.channel)+'</b>'+(j.push?'':' (not pushed)')+'...':j.code==null?'':j.code===0?'<span class="okc">Released to '+esc(j.channel)+(j.push?'':' (built and committed, not pushed)')+'.</span>':'<span class="err">The release stopped (exit '+esc(j.code)+') - what it said is below.</span>';
-+  if(co&&(j.what==='move'||j.what==='image')){put('status',j.what==='move'?(j.running?SP+'Moving <b>'+esc(j.channel)+'</b> to build '+esc(j.build)+'...':j.code==null?'':j.code===0?'<span class="okc">'+esc(j.channel)+' is on build '+esc(j.build)+' now.</span>':'<span class="err">The move stopped (exit '+esc(j.code)+') - what it said is below.</span>')
-+    :(j.running?SP+'Making the image of build '+esc(j.build)+'...':j.code===0?'<span class="okc">The image of build '+esc(j.build)+' is made.</span>':'<span class="err">The image stopped (exit '+esc(j.code)+') - what it said is below.</span>'));return;}
-+  put('status',j.running?SP+'Releasing to <b>'+esc(j.channel)+'</b>'+(j.push?'':' (not pushed)')+'...':j.code==null?'':j.code===0?'<span class="okc">Released to '+esc(j.channel)+(j.push?'':' (built and committed, not pushed)')+'.</span>':'<span class="err">The release stopped (exit '+esc(j.code)+') - what it said is below.</span>');
-@@ 529 -0 +3
-+// (written only when it changes: rewritten every second, a spinner restarts and twitches. An error put straight into
-+// the line - a refused release - so stays until the job's own line changes.)
-+function put(id,h){const e=$(id);if(e.dataset.h!==h){e.innerHTML=h;e.dataset.h=h;}}
-@@ 543 -2 +2
--$('save').onclick=save;
--async function rel(channel){
-+$('save').onclick=()=>busy($('save'),'saved','Saving...',save);
-+function rel(channel,btn){
-@@ 546 -4 +5
--  if(dirty&&!(await save()))return;
--  const r=await api('/api/release',{channel,push:$('push').checked});if(r.ok===false){$('status').innerHTML='<span class="err">'+esc(r.error)+'</span>';return;}fill(r);}
--$('relDev').onclick=()=>rel('devtest');$('relBeta').onclick=()=>rel('beta');$('relProd').onclick=()=>rel('production');
--async function img(channel){
-+  return busy(btn,'status','Starting the release to '+channel+'...',async()=>{
-+    if(dirty&&!(await save()))return;
-+    const r=await api('/api/release',{channel,push:$('push').checked});if(r.ok===false){$('status').innerHTML='<span class="err">'+esc(r.error)+'</span>';return;}fill(r);});}
-+$('relDev').onclick=()=>rel('devtest',$('relDev'));$('relBeta').onclick=()=>rel('beta',$('relBeta'));$('relProd').onclick=()=>rel('production',$('relProd'));
-+function img(channel,btn){
-@@ 552 -4 +5
--  if(dirty&&!(await save()))return;
--  const r=await api('/api/release',{channel,push:$('ipush').checked,uninstall:$('iuninstall').checked,yes:$('iyes').checked});if(r.ok===false){$('status').innerHTML='<span class="err">'+esc(r.error)+'</span>';return;}
--  $('iuninstall').checked=false;$('iyes').checked=false;fill(r);}
--$('imgDev').onclick=()=>img('devtest');$('imgProd').onclick=()=>img('production');
-+  return busy(btn,'status','Starting the image for '+channel+'...',async()=>{
-+    if(dirty&&!(await save()))return;
-+    const r=await api('/api/release',{channel,push:$('ipush').checked,uninstall:$('iuninstall').checked,yes:$('iyes').checked});if(r.ok===false){$('status').innerHTML='<span class="err">'+esc(r.error)+'</span>';return;}
-+    $('iuninstall').checked=false;$('iyes').checked=false;fill(r);});}
-+$('imgDev').onclick=()=>img('devtest',$('imgDev'));$('imgProd').onclick=()=>img('production',$('imgProd'));
-@@ 558 -3 +3
--$('pasteApply').onclick=async()=>{if(dirty&&!(await save()))return;$('pasteSays').textContent='Applying...';const r=await api('/api/paste-image',{text:$('pasteText').value});if(r.ok===false){$('pasteSays').textContent=r.error;return;}const p=r.pasted||{};if(p.problem){$('pasteSays').textContent=p.problem;return;}dirty=false;fill(r);$('pasteModal').style.display='none';$('pasteDone').textContent=p.said||'';};
--$('close').onclick=async()=>{const r=await api('/api/close',{});if(r.ok)document.body.innerHTML='<main><h1>Closed.</h1><div class="sub">Run code-boss-setup.mjs again to open it.</div></main>';};
--document.addEventListener('click',async(e)=>{
-+$('pasteApply').onclick=()=>busy($('pasteApply'),'pasteSays','Applying...',async()=>{if(dirty&&!(await save()))return;const r=await api('/api/paste-image',{text:$('pasteText').value});if(r.ok===false){$('pasteSays').textContent=r.error;return;}const p=r.pasted||{};if(p.problem){$('pasteSays').textContent=p.problem;return;}dirty=false;fill(r);$('pasteModal').style.display='none';$('pasteSays').textContent='';$('pasteDone').textContent=p.said||'';});
-+$('close').onclick=()=>busy($('close'),'',null,async()=>{const r=await api('/api/close',{});if(r.ok)document.body.innerHTML='<main><h1>Closed.</h1><div class="sub">Run code-boss-setup.mjs again to open it.</div></main>';});
-+document.addEventListener('click',(e)=>{
-@@ 563 -5 +6
--    const r=await api('/api/move',{channel:c,build:bn});if(r.ok===false){$('status').innerHTML='<span class="err">'+esc(r.error)+'</span>';return;}fill(r);return;}
--  if(t.dataset.imgof){const r=await api('/api/image-of',{build:t.dataset.imgof,channel:t.dataset.ch});if(r.ok===false){$('status').innerHTML='<span class="err">'+esc(r.error)+'</span>';return;}fill(r);return;}
--  if(t.dataset.take||t.dataset.drop){dirty=false;fill(await api('/api/take',{key:t.dataset.take||t.dataset.drop,use:!!t.dataset.take}));}
--  if(t.dataset.view){const name=t.dataset.view;if(shown===name){$('pview').style.display='none';shown='';return;}const r=await api('/api/plugin?name='+encodeURIComponent(name));shown=name;$('pview').style.display='';
--    $('pview').innerHTML=r.ok===false?esc(r.error):r.diff?('<b>'+esc(r.shipped)+' (last release) to '+esc(r.file)+'</b>\n'+r.diff.filter((d,i,a)=>d.op!==' '||a.slice(Math.max(0,i-2),i+3).some(x=>x.op!==' ')).map(d=>'<span class="'+(d.op==='+'?'d-add':d.op==='-'?'d-del':'d-keep')+'">'+esc(d.op+' '+d.text)+'</span>').join('\n')):('<b>'+esc(r.file)+'</b> (not shipped before)\n'+esc(r.source));}
-+    return busy(t,'status','Moving '+c+' to build '+bn+'...',async()=>{const r=await api('/api/move',{channel:c,build:bn});if(r.ok===false){$('status').innerHTML='<span class="err">'+esc(r.error)+'</span>';return;}fill(r);});}
-+  if(t.dataset.imgof)return busy(t,'status','Starting the image of build '+t.dataset.imgof+'...',async()=>{const r=await api('/api/image-of',{build:t.dataset.imgof,channel:t.dataset.ch});if(r.ok===false){$('status').innerHTML='<span class="err">'+esc(r.error)+'</span>';return;}fill(r);});
-+  if(t.dataset.take||t.dataset.drop)return busy(t,'',null,async()=>{dirty=false;fill(await api('/api/take',{key:t.dataset.take||t.dataset.drop,use:!!t.dataset.take}));});
-+  if(t.dataset.view){const name=t.dataset.view;if(shown===name){$('pview').style.display='none';shown='';return;}
-+    return busy(t,'',null,async()=>{const r=await api('/api/plugin?name='+encodeURIComponent(name));shown=name;$('pview').style.display='';
-+    $('pview').innerHTML=r.ok===false?esc(r.error):r.diff?('<b>'+esc(r.shipped)+' (last release) to '+esc(r.file)+'</b>\n'+r.diff.filter((d,i,a)=>d.op!==' '||a.slice(Math.max(0,i-2),i+3).some(x=>x.op!==' ')).map(d=>'<span class="'+(d.op==='+'?'d-add':d.op==='-'?'d-del':'d-keep')+'">'+esc(d.op+' '+d.text)+'</span>').join('\n')):('<b>'+esc(r.file)+'</b> (not shipped before)\n'+esc(r.source));});}
-@@ 569 -1 +5
--async function tick(){try{fill(await api('/api/state'));}catch{}}
-+async function tick(){
-+  if(busyN)return;
-+  try{const s=await api('/api/state');if(!busyN)fill(s);document.body.classList.remove('loading');}
-+  catch{if(document.body.classList.contains('loading'))$('loading').innerHTML=SP+'Waiting for the window to answer...';}
-+}
+base 89dd9cd054a391afba4474a9
+new 0ab91b72e43f7141d75b685a
+@@ 107 -1 +1
+-  { key: 'wls-command', label: 'WebLogic start command', group: 'WebLogic' },
++  { key: 'wls-command', label: 'WebLogic start command file', group: 'WebLogic' },
 === end
