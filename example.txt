@@ -1,186 +1,246 @@
 code_boss chunk 1
-number 18
-made 2026-11-05T19:25:29.290Z
-message Chunk 18: 4 changes
-message
-message - Image push shows git's progress; a refused token fails instead of waiting
-message - Container pages keep a blue accent, so they read as the container at a glance
-message - Count bubbles a little smaller, with a 2px edge
-message - Buttons wear their box's colour; count bubbles filled gold
-before 1512595c3978af6afa68a2eb
-after e71f49ac941205afea0b0298
-files 10
+number 19
+made 2026-11-06T15:48:53.340Z
+message Running calls show how long they have run, against their limit, and when they go quiet
+before d8d406d60255b9fc1adb0667
+after dd39b5e15c407e0f68540b15
+files 5
 left 0
-check 6347ca7deebd7c07
+check feb685ac5778aa7b
 
-=== change sandbox-launcher/src/main/resources/manager.html
-base 1f2791bef3cfad61623f3da2
-new 7139b796f38737a01ffc65c3
-@@ 9 -3 +4
--  /* code_boss's own palette and type (src/ui.html :root): the gold accent, its greens, yellows and reds, its mono face
--     and its radii (the developer, 2026-10-31: the restyle - this window had its own teal and Segoe UI). Colours, fonts
--     and radii only; the layout is as it was. */
-+  /* code_boss's own palette and type (src/ui.html :root): its greens, yellows and reds, its mono face and its radii
-+     (the developer, 2026-10-31: the restyle - this window had its own teal and Segoe UI). Colours, fonts and radii only;
-+     the layout is as it was. THE ACCENT IS BLUE, NOT code_boss's gold (the developer, 2026-11-05: "I wanted it a diff
-+     color so it's obvious to see which ui you're on"): the install window's blue (src/agent/sandbox-setup-page.mjs). */
-@@ 14 -1 +1
--    --accent: #ffa95c; --accent-ink: #170f08; --warn: #e3b341; --warn-bg: #231b12; --bad: #f15d87; --bad-bg: #290e15; --ok: #8fbf72; --ok-bg: #151d11;
-+    --accent: #4a9db3; --accent-ink: #06181d; --warn: #e3b341; --warn-bg: #231b12; --bad: #f15d87; --bad-bg: #290e15; --ok: #8fbf72; --ok-bg: #151d11;
-@@ 18 -1 +1
--  ::selection { background: rgba(255, 169, 92, 0.3); }
-+  ::selection { background: rgba(74, 157, 179, 0.3); }
 === change scripts/build-number.txt
-base fe69f706ecd3014a757a39a5
-new 56e4723f372ce731d87c55df
+base 7ed50f0c007ee84b60ee5e1f
+new 7e21bc8004df9bc73295b0e3
 @@ 1 -1 +1
--2743
-+2746
-=== change src/agent/sandbox-cmd.mjs
-base 1629b51572446e10b5bd72c0
-new a374e15b5e640629e6898150
-@@ 464 -1 +1
--h1{font-size:19px;margin:0 0 4px;color:#d6945d}
-+h1{font-size:19px;margin:0 0 4px;color:#4a9db3}
-@@ 468 -1 +1
--.run .dot{background:#d6945d;animation:p 1s ease-in-out infinite}.done .dot{background:#57b36a}.fail .dot{background:#f0607f}
-+.run .dot{background:#4a9db3;animation:p 1s ease-in-out infinite}.done .dot{background:#57b36a}.fail .dot{background:#f0607f}
-@@ 471 -1 +1
--.bar{height:4px;background:#2b281f;border-radius:2px;margin:14px 0 6px;overflow:hidden}.bar i{display:block;height:100%;width:30%;background:#d6945d;border-radius:2px;animation:s 1.4s linear infinite}
-+.bar{height:4px;background:#2b281f;border-radius:2px;margin:14px 0 6px;overflow:hidden}.bar i{display:block;height:100%;width:30%;background:#4a9db3;border-radius:2px;animation:s 1.4s linear infinite}
-@@ 475 -1 +1
--button.go{background:#d6945d;border-color:#d6945d;color:#17150f;font-weight:600}button:disabled{opacity:.5;cursor:default}
-+button.go{background:#4a9db3;border-color:#4a9db3;color:#17150f;font-weight:600}button:disabled{opacity:.5;cursor:default}
-=== change src/agent/sandbox-image-cli.mjs
-base 38bfd7555dea6994acad5c55
-new f699b277e31e8bb30b5082ce
-@@ 25 -1 +1
--import { spawnSync } from 'node:child_process';
-+import { spawn, spawnSync } from 'node:child_process';
-@@ 200 -0 +12
-+/** A git run whose progress is shown while it goes (its stderr, \r and all, passed on as it comes) and also kept: {status, stdout, stderr}. */
-+function sbiPushLive(repo, args, env) {
-+  return new Promise((resolve) => {
-+    let out = '', err = '';
-+    const c = spawn('git', args, { cwd: repo, env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
-+    c.stdout.on('data', (d) => { out += d; });
-+    c.stderr.on('data', (d) => { err += d; try { process.stderr.write(String(d).replace(/\/\/[^@/\s]+@/g, '//***@')); } catch { /* nowhere to show it */ } });
-+    c.on('error', (e) => resolve({ status: 1, stdout: out, stderr: err + `\n${e.message}` }));
-+    c.on('close', (code) => resolve({ status: code == null ? 1 : code, stdout: out, stderr: err }));
-+  });
-+}
-+
-@@ 741 -1 +5
--  const p = git(repo, ['push', '--atomic', remote, SBI_BRANCH, `+refs/tags/${tag}`, ...(buildNo ? [`+refs/tags/sandbox-build-${buildNo}`] : [])], { allowFail: true, env: remoteEnv });
-+  // THE PUSH, AS IT GOES (the developer, 2026-11-05: a release sat after "committed" for ten minutes with nothing on
-+  // the screen): git's own progress, straight through - only what GitLab does not have yet is sent, and an image it has
-+  // never had is gigabytes. Kept as well, for what a failed push says.
-+  log(`\npushing the image to GitLab (branch '${SBI_BRANCH}', tag '${tag}') - git's progress follows. Only what GitLab does not have yet is sent; an image it has never had is gigabytes, and that takes a while.`);
-+  const p = await sbiPushLive(repo, ['push', '--progress', '--atomic', remote, SBI_BRANCH, `+refs/tags/${tag}`, ...(buildNo ? [`+refs/tags/sandbox-build-${buildNo}`] : [])], remoteEnv);
-=== change src/agent/sandbox-pull.mjs
-base 9c3712bb0ba97351bfb99932
-new 3a7d5c494857985ae421b320
-@@ 64 -1 +3
--  const env = { ...base, GIT_TERMINAL_PROMPT: '0' };   // never stop to ask at a console nobody is looking at
-+  // never stop to ask at a console nobody is looking at - nor in a sign-in window of Git Credential Manager's, which
-+  // can open behind everything and wait there for good when GitLab turns the token down
-+  const env = { ...base, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' };
-=== change src/release-ui.mjs
-base 0ab91b72e43f7141d75b685a
-new 2bda8c904b7f71d8bc4f1bad
-@@ 301 -2 +12
--    let carry = '';
--    const take = (d) => { carry += String(d); const parts = carry.split(/\r?\n/); carry = parts.pop(); for (const l of parts) job.lines.push(l.replace(/\/\/[^@/\s]+@/g, '//***@')); if (job.lines.length > 4000) job.lines.splice(0, job.lines.length - 4000); };
-+    let carry = '', live = false;
-+    // a line written over in place (git's progress, "Writing objects:  45% ...\r") is shown as it goes, each over the
-+    // last, and the line that ends it takes its place
-+    const putLine = (l, isLive) => { const t = l.replace(/\/\/[^@/\s]+@/g, '//***@'); if (live) job.lines[job.lines.length - 1] = t; else job.lines.push(t); live = isLive; };
-+    const take = (d) => {
-+      carry += String(d);
-+      const parts = carry.split(/\r?\n/); carry = parts.pop();
-+      for (const l of parts) { const s = l.split('\r').filter(Boolean); if (s.length) putLine(s[s.length - 1], false); else if (live) live = false; else putLine('', false); }
-+      const segs = carry.split('\r');
-+      if (segs.length > 1) { carry = segs.pop(); const cur = segs.filter(Boolean).pop(); if (cur) putLine(cur, true); }
-+      if (job.lines.length > 4000) job.lines.splice(0, job.lines.length - 4000);
-+    };
+-2749
++2750
+=== change src/agent/minimal-worker.mjs
+base 19f36d2ea6bae113eb8fd642
+new afb71c0cc201941a5cd9bedb
+@@ 526 -1 +0
+-    if (!c) return;
+@@ 528 -0 +6
++    // a process of this call started: how long it may run goes to the screen, nothing to the record
++    if (!c && meta && meta.proc) {
++      if (st) emitChat({ type: 'tool-progress', callId, chunk: '', step: st.step, stepLabel: await progStepLabel(callId, st), limitMs: Number(meta.proc.limitMs) || 0, ...(branch ? { branch } : {}) });
++      return;
++    }
++    if (!c) return;
+=== change src/agent/tools.mjs
+base 54b6c1ee7cf6ffaa86dcc4b1
+new 70bef2183fbce8c6d12c7158
+@@ 1983 -0 +2
++    // (no output, only how long it may run: the screen counts its time against that - minimal-worker's pushProgress)
++    try { onProgress?.('', { proc: { limitMs: Number(timeoutMs) > 0 ? Number(timeoutMs) : 0 } }); } catch {}
 === change src/ui.html
-base 0815e097facf0efabea7f02d
-new 993a1c710b2e27591a7209bc
-@@ 29 -1 +1
--    --accent-deep: #d38e46;   /* a darker gold, 7.1:1 on --bg: the count bubbles' edge and number (the developer, 2026-10-29) */
-+    --accent-deep: #d38e46;   /* a darker gold, 7.1:1 on --bg (the developer, 2026-10-29: the count bubbles' edge and number, until they were filled gold, 2026-11-05) */
-@@ 44 -0 +2
-+    --note-hover: #99c7de;  /* --note a fifth of the way to white: a note's filled button, hovered (a fixed colour, not a color-mix, so it reads back exactly - the caret takes it) */
-+    --error-hover: #f47d9f; /* --error the same way: a red banner's filled button, hovered */
-@@ 879 -1 +1
--       BADGE  an 11px bubble with a 7.5px white digit, hanging from the bar's centre line (see .ps-badge).
-+       BADGE  a 12px gold bubble with a 7.5px digit in the darkest grey, hanging from the bar's centre line (see .ps-badge).
-@@ 1897 -1 +5
--  .cb-banner.red .cbb-actions .btn:not(.primary) { background: rgba(var(--error-rgb), 0.14); border-color: var(--error); }
-+  .cb-banner.red .cbb-actions .btn:not(.primary) { background: rgba(var(--error-rgb), 0.14); border-color: var(--error); color: var(--error); }
-+  /* (a red banner's buttons are red, not the app's gold: a component's buttons wear its colour - see .cb-banner.note) */
-+  .cb-banner.red .cbb-actions .btn:not(.primary):hover:not(:disabled) { background: rgba(var(--error-rgb), 0.24); border-color: var(--error); color: var(--error); }
-+  .cb-banner.red .cbb-action, .cb-banner.red .cbb-actions .btn.primary { background: var(--error); border-color: var(--error); color: var(--bg); }
-+  .cb-banner.red .cbb-action:hover:not(:disabled), .cb-banner.red .cbb-actions .btn.primary:hover:not(:disabled) { background: var(--error-hover); border-color: var(--error-hover); color: var(--bg); }
-@@ 2324 -4 +3
--  /* THE COUNT BUBBLES ON THE ICONS AND THE BRANCH BADGES - ONE LOOK (the developer, 2026-10-29: "let's make the border
--     around 1px and a darker gold and the number same darker gold"): the bar's own dark behind, a 1px edge and the number
--     in the darker gold; a problem (the warnings icon, a branch whose state is unknown) in the error colour the same way.
--     Both bubbles the same size and place - test-status-badge-parity holds them equal. */
-+  /* THE COUNT BUBBLES ON THE ICONS AND THE BRANCH BADGES - ONE LOOK: filled gold, the number dark (see below); a
-+     problem (the warnings icon, a branch whose state is unknown) filled in the error colour the same way. Both bubbles
-+     the same size and place - test-status-badge-parity holds them equal. */
-@@ 2329 -5 +8
--    position: absolute; min-width: 13px; height: 13px; top: calc(50% - 10px); right: -7px; padding: 0 2px; box-sizing: border-box; border-radius: 7px;
--    font-size: 8.5px; font-weight: 700; line-height: 11px; text-align: center; z-index: 3;
--    background: var(--bg); border: 1px solid var(--accent-deep); color: var(--accent-deep); -webkit-text-fill-color: var(--accent-deep); box-shadow: 0 0 0 2px color-mix(in srgb, var(--bg) 50%, transparent); }
--  /* (smaller, and the blank ring around it half see-through - the developer, 2026-11-02: "shrink the number bubbles and
--     make the outer blank border 50% transparent"; 13px, its centre still 3.5px above the bar's centre line) */
-+    position: absolute; min-width: 12px; height: 12px; top: calc(50% - 9.5px); right: -7px; padding: 0 2px; box-sizing: border-box; border-radius: 6px;
-+    font-size: 7.5px; font-weight: 700; line-height: 10px; text-align: center; z-index: 3;
-+    background: var(--accent); border: 1px solid rgba(15, 13, 12, 0.5); color: var(--bg); -webkit-text-fill-color: var(--bg); }
-+  /* (smaller - the developer, 2026-11-02: "shrink the number bubbles"; 2026-11-05: "a little smaller" - 12px across, its
-+     centre still 3.5px above the bar's centre line. FILLED (2026-11-05: "have the bubble be the primary color and the
-+     number be the darkest gray we use and then a 1px border that's the darkest color and 50% transparent"): the gold,
-+     the number in --bg, and a 1px edge of --bg at half strength (rgba of #0f0d0c - --bg as r, g, b) that parts it from
-+     the icon under it. It was the bar's dark with a gold edge and number.) */
-@@ 2343 -0 +1
-+  /* (a problem: the same bubble filled in the error colour) */
-@@ 2344 -1 +1
--    background: var(--bg); border-color: var(--error); color: var(--error); -webkit-text-fill-color: var(--error); }
-+    background: var(--error); }
-@@ 2420 -0 +6
-+  /* A COMPONENT'S BUTTONS WEAR ITS COLOUR (the developer, 2026-11-05: "Buttons should be the same color as any
-+     border/font color on the component"): in a note (Heads up, the dev check) the filled button is the note's blue and
-+     a hover goes blue, not the app's gold - the gold is the developer's own box. A red banner's the same, below. */
-+  .heads-up-row .btn.primary, .cb-banner.note .cbb-action { background: var(--note); border-color: var(--note); color: var(--bg); font-weight: 600; }
-+  .heads-up-row .btn.primary:hover:not(:disabled), .cb-banner.note .cbb-action:hover:not(:disabled) { background: var(--note-hover); border-color: var(--note-hover); color: var(--bg); }
-+  .heads-up-row .btn:not(.primary):hover:not(:disabled) { border-color: var(--note); color: var(--note); }
-=== change test/test-image-window-e2e.mjs
-base df4ba2d5df5566aba9603228
-new 31152697226b2f10d3148949
-@@ 33 -1 +2
--writeFileSync(fake, "const a = process.argv.slice(2); console.log('creator: asked ' + JSON.stringify(a)); process.exit(0);\n");
-+// (and git's push progress, the way git writes it: each step over the last with a carriage return, then the line that ends it)
-+writeFileSync(fake, "const a = process.argv.slice(2); console.log('creator: asked ' + JSON.stringify(a)); for (const n of [10, 55, 90]) process.stderr.write('Writing objects:  ' + n + '% (' + n + '/100)' + String.fromCharCode(13)); process.stderr.write('Writing objects: 100% (100/100), 3.00 MiB | 1.00 MiB/s, done.' + String.fromCharCode(10)); console.log('pushed: done'); process.exit(0);\n");
-@@ 93 -0 +2
-+  const writing = log.split('\n').filter((l) => /Writing objects/.test(l));
-+  ok(writing.length === 1 && /100% .*done\.$/.test(writing[0]) && /pushed: done/.test(log), `git's progress: one line, written over in place, its last state kept (${JSON.stringify(writing)})`);
-=== change test/test-notes-and-paste-e2e.mjs
-base d50e4672cabf9522c5324341
-new f2bd13f799aa5a1588f12fef
-@@ 92 -0 +2
-+      // (the filled button of each: the note's blue, not the gold)
-+      fill: [cs(hu.querySelector('.heads-up-actions .btn.primary')).backgroundColor, cs(dc.querySelector('.cbb-action')).backgroundColor],
-@@ 94 -0 +1
-+  ok(notes.fill.every((c) => c === 'rgb(127, 185, 214)'), `a note's buttons wear its blue, not the app's gold (${JSON.stringify(notes.fill)})`);
-=== change test/test-sandbox-install-window-e2e.mjs
-base 014701f73780413afd3a7830
-new e361f019c89529410be56cf8
-@@ 197 -2 +3
--  // (the app's own palette since the restyle - the developer, 2026-10-31: its --bg and the gold --accent, no longer a blue of its own)
--  ok(look.bg === 'rgb(15, 13, 12)' && look.top === 'rgb(255, 169, 92)' && look.btn === 'rgb(255, 169, 92)' && look.over <= 0, `the management page is code_boss's dark background with its gold highlight: ${JSON.stringify(look)}`);
-+  // (the app's own background since the restyle, 2026-10-31; its highlight blue, not the app's gold - the developer,
-+  // 2026-11-05: "I wanted it a diff color so it's obvious to see which ui you're on")
-+  ok(look.bg === 'rgb(15, 13, 12)' && look.top === 'rgb(74, 157, 179)' && look.btn === 'rgb(74, 157, 179)' && look.over <= 0, `the management page is code_boss's dark background with the container's blue highlight: ${JSON.stringify(look)}`);
+base 7501a74472fd17f10d380da6
+new b1059c11b31ea0bfb327f7b7
+@@ 8742 -0 +9
++  // HOW LONG IT HAS RUN, AND HOW LONG IT HAS BEEN QUIET (the developer, 2026-11-06: a maven() call ran 10 minutes with
++  // nothing on screen to say whether it was working, stuck, or close to its limit). A running line shows its time once
++  // it passes RUN_TIME_SHOWN_MS, a process's line its limit too, and both say so once nothing has come for a minute.
++  const _toolStart = new Map();     // callId → when it started (this page's clock)
++  const _toolLastOut = new Map();   // callId, or a snippet call's step key → when its output last grew
++  const _stepTimes = new Map();     // a snippet call's step key → { at, limitMs, procAt }
++  const RUN_TIME_SHOWN_MS = 10000;
++  const RUN_QUIET_SAID_MS = 60000;
++  const evClock = (ev) => (Number(ev && ev.ts) > 0 ? Number(ev.ts) + (Number(_tbSkew) || 0) : Date.now());
+@@ 9088 -0 +6
++    if (!_stepTimes.has(key)) _stepTimes.set(key, { at: evClock(ev), limitMs: 0, procAt: 0 });
++    const partText = () => { const p = _progressParts.get(g.callId); const part = p ? p.byStep.get(ev.step) : null; return part ? part.text : ''; };
++    const paintSum = () => {
++      const text = partText();
++      sum.textContent = entry.stopped ? '⎿ did not finish — the snippet stopped first' : runSumLabel(row, text ? text.length : null);
++    };
+@@ 9089 -3 +1
+-      const p = _progressParts.get(g.callId);
+-      const part = p ? p.byStep.get(ev.step) : null;
+-      const text = part ? part.text : '';
++      const text = partText();
+@@ 9094 -1 +1
+-      sum.textContent = entry.stopped ? '⎿ did not finish — the snippet stopped first' : runSumLabel(row, text ? text.length : null);
++      paintSum();
+@@ 9106 -1 +1
+-    entry.live = row; entry.paintLive = paint;
++    entry.live = row; entry.paintLive = paint; entry.paintSum = paintSum;
+@@ 9112 -1 +1
+-    if (entry.live) { entry.live.remove(); entry.live = null; entry.paintLive = null; }
++    if (entry.live) { entry.live.remove(); entry.live = null; entry.paintLive = null; entry.paintSum = null; _stepTimes.delete(jsStepKey(g.callId, ev.step)); _toolLastOut.delete(jsStepKey(g.callId, ev.step)); }
+@@ 9530 -1 +1
+-  function appendProgress(callId, chunk, step, stepLabel, branch) {
++  function appendProgress(callId, chunk, step, stepLabel, branch, limitMs) {
+@@ 9533 -0 +12
++    // A PROCESS STARTED inside a snippet's call: no output, only how long it may run (minimal-worker's pushProgress)
++    if (limitMs != null && !chunk) {
++      if (step != null) {
++        const key = jsStepKey(callId, step);
++        const st = _stepTimes.get(key) || { at: Date.now(), limitMs: 0, procAt: 0 };
++        st.limitMs = Number(limitMs) || 0; st.procAt = Date.now();
++        _stepTimes.set(key, st);
++        const g = _jsGroups.get(callId); const ent = g && g.steps.get(step); if (ent && ent.paintSum) ent.paintSum();
++      }
++      return;
++    }
++    if (chunk) { _toolLastOut.set(callId, Date.now()); if (step != null) _toolLastOut.set(jsStepKey(callId, step), Date.now()); }
+@@ 9564 -1 +21
+-    return row?.dataset?.rerun ? `⎿ Rerunning…${size}` : `⎿ Running…${size}`;
++    return (row?.dataset?.rerun ? `⎿ Rerunning…${size}` : `⎿ Running…${size}`) + runTiming(row);
++  }
++  function fmtClock(ms) {
++    const s = Math.max(0, Math.floor(ms / 1000)), h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = s % 60;
++    return (h ? h + ':' + String(m).padStart(2, '0') : String(m)) + ':' + String(r).padStart(2, '0');
++  }
++  // " · 10:02 of 30:00 · no output for 9 min" - a snippet call's line keyed by its step, a tool's by its call
++  function runTiming(row) {
++    const key = row && row.dataset && row.dataset.callId;
++    if (!key) return '';
++    const st = _stepTimes.get(key);
++    const at = st ? st.at : _toolStart.get(key);
++    if (!at) return '';
++    const now = Date.now();
++    if (now - at < RUN_TIME_SHOWN_MS) return '';
++    let s = ' · ' + fmtClock(now - at);
++    // (a skill runs its processes one after another: the limit is the one running now's, from when it started)
++    if (st && st.limitMs > 0) s += st.procAt - at > 2000 ? ` · its process ${fmtClock(now - st.procAt)} of ${fmtClock(st.limitMs)}` : ` of ${fmtClock(st.limitMs)}`;
++    const quiet = now - (_toolLastOut.get(key) || at);
++    if (quiet >= RUN_QUIET_SAID_MS) s += ` · no output for ${Math.floor(quiet / 60000)} min`;
++    return s;
+@@ 9566 -0 +13
++  // the running lines count up while they run
++  setInterval(() => {
++    if (document.hidden) return;
++    for (const row of document.querySelectorAll('.row-result.running[data-call-id]')) {
++      const sum = row.querySelector(':scope > .run-sum');
++      const buf = _progressBuffers.get(row.dataset.callId);
++      if (sum) sum.textContent = runSumLabel(row, buf != null ? buf.length : null);
++    }
++    for (const g of _jsGroups.values()) {
++      if (g.done) continue;
++      for (const ent of g.steps.values()) if (ent.paintSum) ent.paintSum();
++    }
++  }, 1000);
+@@ 13284 -1 +1
+-    if (!keepLiveState) { try { _toolActivity.clear(); _toolLimit.clear(); _progressBuffers.clear(); _progressParts.clear(); _collapsedProcs.clear(); _openResultRows.clear(); _openJsGroups.clear(); _liveStepStarts.clear(); } catch {} }
++    if (!keepLiveState) { try { _toolActivity.clear(); _toolLimit.clear(); _toolStart.clear(); _toolLastOut.clear(); _stepTimes.clear(); _progressBuffers.clear(); _progressParts.clear(); _collapsedProcs.clear(); _openResultRows.clear(); _openJsGroups.clear(); _liveStepStarts.clear(); } catch {} }
+@@ 13672 -1 +1
+-            if (!_replaying) _toolActivity.set(ev.callId, Date.now()); if (Number(ev.budgetMs) > 0) _toolLimit.set(ev.callId, Number(ev.budgetMs));
++            if (!_replaying) _toolActivity.set(ev.callId, Date.now()); if (Number(ev.budgetMs) > 0) _toolLimit.set(ev.callId, Number(ev.budgetMs)); _toolStart.set(ev.callId, evClock(ev));
+@@ 13708 -1 +1
+-        if (ev.callId) { row.dataset.callId = ev.callId; if (!_replaying) _toolActivity.set(ev.callId, Date.now()); if (Number(ev.budgetMs) > 0) _toolLimit.set(ev.callId, Number(ev.budgetMs)); }
++        if (ev.callId) { row.dataset.callId = ev.callId; if (!_replaying) _toolActivity.set(ev.callId, Date.now()); if (Number(ev.budgetMs) > 0) _toolLimit.set(ev.callId, Number(ev.budgetMs)); _toolStart.set(ev.callId, evClock(ev)); }
+@@ 13787 -1 +1
+-        appendProgress(ev.callId, ev.chunk, ev.step, ev.stepLabel, ev.branch);
++        appendProgress(ev.callId, ev.chunk, ev.step, ev.stepLabel, ev.branch, ev.limitMs);
+@@ 13856 -1 +1
+-          _toolActivity.delete(ev.callId); _toolLimit.delete(ev.callId);   // result arrived → stop watching this call
++          _toolActivity.delete(ev.callId); _toolLimit.delete(ev.callId); _toolStart.delete(ev.callId); _toolLastOut.delete(ev.callId);   // result arrived → stop watching this call
+@@ 13881 -1 +1
+-        _progressBuffers.delete(ev.callId); _progressParts.delete(ev.callId); _openResultRows.delete(ev.callId); _toolActivity.delete(ev.callId); _toolLimit.delete(ev.callId);
++        _progressBuffers.delete(ev.callId); _progressParts.delete(ev.callId); _openResultRows.delete(ev.callId); _toolActivity.delete(ev.callId); _toolLimit.delete(ev.callId); _toolStart.delete(ev.callId); _toolLastOut.delete(ev.callId);
+=== add test/test-js-running-time-e2e.mjs
+new 1f6663e846881c803bc97022
++/**
++ * A RUNNING CALL SAYS HOW LONG IT HAS RUN, AGAINST ITS LIMIT, AND WHEN IT HAS GONE QUIET (the developer, 2026-11-06: a
++ * maven() call ran 10 minutes with nothing on screen - working, stuck, or about to be stopped?).
++ *   [1] a quiet process: its line reads "… · 1:15 of 5:00 · no output for 1 min" once it has run a while and printed
++ *       nothing (the process's own limit, from the server); the snippet's own running line says the same of the snippet
++ *   [2] a skill that runs processes one after another: the time is the skill call's, the limit the process now running
++ *       ("its process 1:15 of 5:00")
++ *   [3] a short call shows no time at all
++ * The page's clock is moved forward instead of waiting minutes.
++ *
++ * Run: node test/test-js-running-time-e2e.mjs
++ */
++import { mkdtemp, mkdir, writeFile, readFile } from 'node:fs/promises';
++import { existsSync } from 'node:fs';
++import { tmpdir } from 'node:os';
++import path from 'node:path';
++import { fileURLToPath } from 'node:url';
++import puppeteer from 'puppeteer-core';
++
++const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
++const HOME = await mkdtemp(path.join(tmpdir(), 'cb-runtime-home-'));
++const PROJ = await mkdtemp(path.join(tmpdir(), 'cb-runtime-proj-'));
++process.env.CB_HOME = HOME;   // BEFORE the server is imported: never the developer's own ~/.code_boss
++const PORT = 29761;
++const B = 'http://127.0.0.1:' + PORT;
++
++let pass = 0, fail = 0;
++const ok = (c, l) => { if (c) { pass++; console.log('  ok', l); } else { fail++; console.log('  FAIL', l); } };
++const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
++
++await writeFile(path.join(PROJ, 'notes.txt'), 'the quick brown fox\n');
++// silent for 7 s, then one line
++await writeFile(path.join(PROJ, 'quiet.js'), 'setTimeout(() => console.log("finished fine"), 7000);');
++await writeFile(path.join(PROJ, 'tick.js'), 'let i = 0; const t = setInterval(() => { console.log("pass " + (++i)); if (i >= 3) clearInterval(t); }, 900);');
++await mkdir(path.join(PROJ, '.code_boss', 'skills'), { recursive: true });
++await writeFile(path.join(PROJ, '.code_boss', 'skills', 'maven.mjs'), "export const purpose = 'Runs the build.';\nexport default async function (args, api) { await api.node(['tick.js']); const r = await api.node(['quiet.js']); return r.stdout.trim(); }\n");
++
++let i = 0, script = [];
++const adapter = {
++  async *completeStream(req) {
++    const c = String(req.messages[req.messages.length - 1].content);
++    const tag = (/--- you ([0-9a-z]{3,8}) ---\s*$/.exec(c) || [])[1] || 'zzzz';
++    yield { choices: [{ delta: { content: script[Math.min(i++, script.length - 1)].replace('CLOSE', '/--- you ' + tag + ' ---') } }] };
++  },
++  async complete() { return { choices: [{ message: { content: 'ok' } }] }; },
++};
++const { startServer } = await import('../src/server.mjs');
++const html = (await readFile(path.join(ROOT, 'src', 'ui.html'), 'utf8')).replace('</head>', '<script>window.SERVER_CONFIG=' + JSON.stringify({ defaultModel: 'm', baseURL: '(mock)' }) + ';</script></head>');
++const { server } = await startServer({ html, baseURL: '(mock)', apiKey: 'k', gitlabCreds: { user: 't', token: 't' }, defaultModel: 'm', port: PORT, adapter, modelsList: [{ id: 'm' }], initialProject: PROJ });
++const chrome = ['C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe', (process.env.LOCALAPPDATA || '') + '\\Google\\Chrome\\Application\\chrome.exe', '/usr/bin/google-chrome'].find((p) => existsSync(p));
++const browser = await puppeteer.launch({ executablePath: chrome, headless: 'new', args: ['--no-sandbox'] });
++const page = await browser.newPage();
++const errs = []; page.on('pageerror', (e) => errs.push(e.message));
++// the page's clock, movable: minutes pass in an instant
++await page.evaluateOnNewDocument(() => { const real = Date.now.bind(Date); window.__ahead = 0; Date.now = () => real() + window.__ahead; });
++const ahead = (ms) => page.evaluate((m) => { window.__ahead = m; }, ms);
++
++const status = async () => (await (await fetch(B + '/api/state?limit=5')).json()).status;
++const post = (text) => page.evaluate(async (t) => { await fetch('/api/message', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text: t }) }); }, text);
++const openLastGroup = () => page.evaluate(() => { const g = [...document.querySelectorAll('#log .js-group')].pop(); if (g && !g.classList.contains('open')) g.querySelector(':scope > .js-summary').click(); });
++// each call row of the last snippet with its running line, and the snippet's own running line
++const look = () => page.evaluate(() => {
++  const g = [...document.querySelectorAll('#log .js-group')].pop();
++  if (!g) return { steps: [], own: '' };
++  const steps = [...g.querySelectorAll('.js-step')].map((r) => {
++    const l = r.nextElementSibling && r.nextElementSibling.classList.contains('step-live') ? r.nextElementSibling : null;
++    return { label: r.querySelector('.body').textContent, live: l ? l.querySelector('.run-sum').textContent : null };
++  });
++  const own = document.querySelector(`.row-result.running[data-call-id="${CSS.escape(g.dataset.callId)}"] .run-sum`);
++  return { steps, own: own ? own.textContent : '' };
++});
++const waitFor = async (pred, ms = 15000) => { const t = Date.now(); for (;;) { await openLastGroup(); const v = await look(); if (pred(v)) return v; if (Date.now() - t > ms) return v; await sleep(150); } };
++const stepLine = (v, re) => ((v.steps.find((s) => re.test(s.label)) || {}).live) || '';
++
++try {
++  await page.setViewport({ width: 1200, height: 900 });
++  await page.goto(B + '/'); await page.waitForSelector('#chat:not(.hidden)', { timeout: 20000 }); await sleep(1500);
++  i = 0; script = ['Working.\n<remote-workspace><js>await read("notes.txt"); await node(["quiet.js"]); await maven({}); return "done";</js></remote-workspace>', 'Done.\nCLOSE'];
++  await post('go');
++  // [1] the quiet process
++  let v = await waitFor((x) => !!stepLine(x, /quiet\.js/));
++  await sleep(1200);
++  v = await look();
++  ok(/^⎿ Running…$/.test(stepLine(v, /quiet\.js/)), `[3] a call that has just started shows no time (${stepLine(v, /quiet\.js/)})`);
++  await ahead(75000);
++  v = await waitFor((x) => /no output/.test(stepLine(x, /quiet\.js/)), 4000);
++  ok(/^⎿ Running… · 1:1\d of 5:00 · no output for 1 min$/.test(stepLine(v, /quiet\.js/)), `[1] the quiet process: its time against its limit, and that it has been quiet (${stepLine(v, /quiet\.js/)})`);
++  ok(/Running… · 1:[12]\d · no output for 1 min$/.test(v.own), `[1] the snippet's own running line says how long, and that nothing has come (${v.own})`);
++  // [2] the skill: its first process prints, the second is quiet
++  v = await waitFor((x) => / 21 B/.test(stepLine(x, /maven/)), 20000);   // tick.js's three lines: it is done
++  await sleep(1500);   // quiet.js has started
++  await ahead(150000);
++  v = await waitFor((x) => /no output/.test(stepLine(x, /maven/)), 4000);
++  ok(/^⎿ Running… \d+ B · \d+:\d\d · its process 1:1\d of 5:00 · no output for 1 min$/.test(stepLine(v, /maven/)), `[2] a skill: its own time, the running process's time against that process's limit (${stepLine(v, /maven/)})`);
++  for (let k = 0; k < 120 && (await status()) === 'running'; k++) await sleep(250);
++  v = await look();
++  ok(v.steps.every((s) => s.live == null) && !v.own, 'when it is done, no running line is left');
++  ok(errs.length === 0, `no page errors (${errs.join(' | ') || 'none'})`);
++} catch (e) { fail++; console.log('  FAIL harness:', e?.stack || e); }
++finally { await browser.close(); server.close(); }
++console.log(`
++${pass} passed, ${fail} failed`);
++process.exit(fail ? 1 : 0);
++
 === end
