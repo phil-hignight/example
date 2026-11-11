@@ -1,7 +1,7 @@
 code_boss chunk 1
 number 24
-made 2026-11-11T21:28:38.071Z
-message 38 changes
+made 2026-11-11T21:58:52.419Z
+message 39 changes
 message
 message - Every page in the softer palette; the container pages purple
 message - Replies render lists as lists: nested, numbered, and what is under an item stays in it
@@ -41,11 +41,12 @@ message - A change's Heads up boxes name its commit
 message - A Heads up note does not wake an agent that handed the turn to the developer
 message - Options and analysis are no claim of work run
 message - Heads up runs after every run, a review or not
+message - Plan track-change markers written as escapes
 before 82e8565fd43d0cfedbc3f3b1
-after cedf1a3741b3867617f65a5c
+after 68c6b106aecf72af20921b19
 files 94
 left 0
-check 707e05db6caf1742
+check d3edf600ecb4e305
 
 === change examples/plugins/piishape__1.mjs
 base 5a853cd594f437be3efcd351
@@ -502,10 +503,10 @@ new 8e6d908c99dd3672986a6004
 +  a.btn:hover { background: rgba(var(--accent-rgb), .14); border-color: rgba(var(--accent-rgb), .6); }
 === change scripts/build-number.txt
 base af20be62b63eb7e09f1d1e1e
-new 3b82d924cd820301cfe970a2
+new e8f73157af54133665886b95
 @@ 1 -1 +1
 -2782
-+2801
++2802
 === change src/agent/heads-up.mjs
 base 58b08a73c83e796730f72ee0
 new 1521030a3fb1752623df59a3
@@ -2520,7 +2521,7 @@ new f14c61343b04725e67148801
 +        return sendJson(res, 200, { now: Date.now(), calls: _llmAct.map((r) => ({ rid: r.rid, label: r.label, model: r.model, startedAt: r.startedAt, endedAt: r.endedAt, error: r.error, fg: r.fg, ...(r.sub ? { sub: r.sub.id } : {}), chunks: r.chunks })), marks: _llmMarks });
 === change src/ui.html
 base 3f6c0dbb2d80f2021397a894
-new 3536006d42609e38375671bb
+new dea4104d5e05d3a7eaf26460
 @@ 47 -4 +4
 -    --note: #796cdb;        /* THE SIDE AGENTS' NOTES (Heads up, the dev check): PURPLE (2026-11-08, was the blue #7fb9d6 - "not quite right" with the palette), the fill tone (borders, the button's edge); text takes --note-text; apart from the gold that marks the developer's own message and box (the developer, 2026-11-02: "reserve the primary border color box for the user messages and text input") */
 -    --note-rgb: 121, 108, 219;
@@ -3249,7 +3250,7 @@ new 3536006d42609e38375671bb
 -    return { feed, finish, preview };
 +    function finish() { if (timer) { clearTimeout(timer); timer = null; } done = true; render(); }
 +    return { feed, finish, preview() {} };
-@@ 11698 -0 +104
+@@ 11698 -0 +105
 +  // ── A FIX'S PLAN, VERSIONED (server: planVersionOf; the developer, 2026-11-10: "we can show a diff of the plan by default
 +  // or that can be expanded to see the full plan ... like in ms word w/ track changes where it crosses out the old inline
 +  // and displays the new chunk of words inline. So not a line diff like for code") ──
@@ -3302,7 +3303,8 @@ new 3536006d42609e38375671bb
 +  // THE PLAN WITH ITS CHANGES, as Markdown with marks the renderer passes through: each changed piece marked line by line,
 +  // after a line's own list, heading or quote marker so the line keeps its kind; a fence line is never marked (a struck
 +  // fence would turn the code into text) - an inserted one is kept, a deleted one left out.
-+  const TC = { dO: '', dC: '', iO: '', iC: '' };
++  // (written as escapes: the characters themselves did not survive a chunk's trip to the box - "the chunk is damaged")
++  const TC = { dO: '\uE010', dC: '\uE011', iO: '\uE012', iC: '\uE013' };
 +  function planTrackChangesHtml(prev, cur) {
 +    const diff = planWordDiff(prev, cur);
 +    if (!diff.some((d) => d[0] === '~')) return null;
