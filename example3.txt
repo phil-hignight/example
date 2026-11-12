@@ -1,114 +1,261 @@
 code_boss chunk 1
-number 22
-made 2026-11-08T18:29:50.145Z
-message 2 changes
-message
-message - A release skips a git repository that sits inside the project folder
-message - The setup file imports statSync, which the release now uses
-before d0a448d991c678126ceb1d4b
-after c239b3d2473c0b418e69e2de
-files 4
+number 25
+made 2026-11-11T22:42:55.896Z
+message A server inside the container can be opened in the browser outside
+before 68c6b106aecf72af20921b19
+after e2b9c94115466a69d316876d
+files 11
 left 0
-check 9ab0ecdae5ff9e69
+check 45fc3fab558daa06
 
+=== change SANDBOX-SPEC.md
+base 19a3b3b81f255fd830a24d11
+new 31ffbbe85314498c5163ac8e
+@@ 208 -0 +4
++- **A server of the agent's, for that Chrome** (2026-11-11): `POST /v1/port/publish {port}` listens on a FREE port out
++  here (loopback ports are the machine's: the inside port's number is taken out here too) and carries it to the port
++  inside; `GET /v1/port`, `POST /v1/port/unpublish {port}` (only ones asked for - never code_boss's or WebLogic's); 20 at
++  most; gone when the bridge goes. Plugins: `host.container.ports`; snippets: `publishPort(port)` -> `browserUrl`.
+=== change sandbox-launcher/src/main/java/cb/sandbox/Api.java
+base e471ae7b02be34c0a5385a46
+new 3d6f05b64a7b40090646cf36
+@@ 70 -0 +8
++        // A SERVER INSIDE, REACHED FROM OUT HERE (the agent's own test app, for the Chrome above): any free port out here
++        if ("/v1/port".equals(path) && "GET".equals(method)) { Map<String, Object> m = new LinkedHashMap<String, Object>(); m.put("ok", Boolean.TRUE); m.put("published", Container.published()); Manager.json(x, 200, m); return; }
++        if ("/v1/port/publish".equals(path) && "POST".equals(method)) { Manager.json(x, 200, publishPort(Json.integer(bodyOf(x).get("port")))); return; }
++        if ("/v1/port/unpublish".equals(path) && "POST".equals(method)) {
++          int p = Json.integer(bodyOf(x).get("port"));
++          Map<String, Object> m = new LinkedHashMap<String, Object>(); m.put("ok", Boolean.TRUE); m.put("closed", Boolean.valueOf(p > 0 && Container.unpublishAsked(p)));
++          Manager.json(x, 200, m); return;
++        }
+@@ 106 -1 +1
+-  static final String[] OFFERS = {"GET /v1/container", "GET /v1/weblogic", "POST /v1/weblogic/start", "POST /v1/weblogic/stop", "POST /v1/codeboss/new", "GET /v1/browser", "POST /v1/browser/open", "POST /v1/browser/close", "GET /v1/secure/version", "GET /v1/secure/snapshot", "POST /v1/secure/put", "POST /v1/secure/delete", "POST /v1/secure/append", "POST /v1/secure/merge", "POST /v1/datasets/get", "POST /v1/datasets/put", "POST /v1/datasets/delete"};
++  static final String[] OFFERS = {"GET /v1/container", "GET /v1/weblogic", "POST /v1/weblogic/start", "POST /v1/weblogic/stop", "POST /v1/codeboss/new", "GET /v1/browser", "POST /v1/browser/open", "POST /v1/browser/close", "GET /v1/port", "POST /v1/port/publish", "POST /v1/port/unpublish", "GET /v1/secure/version", "GET /v1/secure/snapshot", "POST /v1/secure/put", "POST /v1/secure/delete", "POST /v1/secure/append", "POST /v1/secure/merge", "POST /v1/datasets/get", "POST /v1/datasets/put", "POST /v1/datasets/delete"};
+@@ 115 -0 +14
++  /** A port inside published to a free port out here: { ok, insidePort, insideUrl, browserPort, browserUrl } or why not. */
++  static Map<String, Object> publishPort(int port) {
++    if (port < 1024 || port > 65535) return error("port: the port inside the container that a server listens on, 1024-65535 (was " + port + ").");
++    if (port == INSIDE_PORT) return error("Port " + port + " inside is this API's own way out; it is not published.");
++    try {
++      int out = Container.publishAsked(port);
++      Map<String, Object> m = new LinkedHashMap<String, Object>();
++      m.put("ok", Boolean.TRUE);
++      m.put("insidePort", Integer.valueOf(port)); m.put("insideUrl", "http://127.0.0.1:" + port);
++      m.put("browserPort", Integer.valueOf(out)); m.put("browserUrl", "http://localhost:" + out);
++      return m;
++    } catch (Sandbox.Failure f) { return error(f.getMessage()); }
++  }
++
+=== change sandbox-launcher/src/main/java/cb/sandbox/Container.java
+base e628df997098a899bdedaaa1
+new 79938e21e1e44bf85511b631
+@@ 738 -0 +3
++  // the ones asked for from inside (Api POST /v1/port/publish): a port inside -> the port out here it was given
++  private static final Map<Integer, Integer> ASKED = new LinkedHashMap<Integer, Integer>();
++  static final int ASKED_MAX = 20;
+@@ 803 -0 +33
++  /**
++   * A PORT ASKED FOR FROM INSIDE (the developer, 2026-11-11: the agent's own test server - a Node app it wrote - reached by
++   * the Chrome the manager starts out here). The port out here is any free one: loopback ports are the machine's, so a
++   * server inside that holds 3456 has 3456 out here too, and the same number cannot be listened on twice. A port that is
++   * already published (code_boss's own, WebLogic's) is answered with the port it has. Returns the port out here.
++   */
++  static int publishAsked(int insidePort) throws Sandbox.Failure {
++    synchronized (BRIDGE_LOCK) {
++      Integer had = ASKED.get(Integer.valueOf(insidePort));
++      if (had != null && PUBLISHED.containsKey(had)) return had.intValue();
++      ASKED.remove(Integer.valueOf(insidePort));
++      for (Map.Entry<Integer, Integer> e : PUBLISHED.entrySet()) if (e.getValue().intValue() == insidePort) return e.getKey().intValue();
++      if (ASKED.size() >= ASKED_MAX) throw new Sandbox.Failure(ASKED_MAX + " ports are published for what runs inside already - unpublish one first.");
++      Mux m = bridge();
++      int out;
++      try { out = m.listen(0, insidePort); }
++      catch (IOException e) { throw new Sandbox.Failure("No port out here could be listened on for port " + insidePort + ": " + e.getMessage()); }
++      PUBLISHED.put(Integer.valueOf(out), Integer.valueOf(insidePort));
++      ASKED.put(Integer.valueOf(insidePort), Integer.valueOf(out));
++      return out;
++    }
++  }
++
++  /** One asked for from inside, by its port inside - never code_boss's own or WebLogic's. Whether one was published. */
++  static boolean unpublishAsked(int insidePort) {
++    synchronized (BRIDGE_LOCK) {
++      Integer out = ASKED.remove(Integer.valueOf(insidePort));
++      if (out == null) return false;
++      unpublish(out.intValue());
++      return true;
++    }
++  }
++
+@@ 841 -0 +1
++      ASKED.clear();
 === change scripts/build-number.txt
-base a8d9dbab58c95589525422a9
-new 37e0693f4e5f0642bd4d1397
+base e8f73157af54133665886b95
+new 94255a0453a7f7fb08e7213f
 @@ 1 -1 +1
--2775
-+2776
-=== change scripts/build.mjs
-base 15e35ae991fea2b0fc054b44
-new e6dc8939a33ce13201eb1099
-@@ 238 -1 +1
--import { existsSync, appendFileSync, mkdirSync, readdirSync, rmSync, chmodSync, lstatSync, readFileSync, writeFileSync, copyFileSync, renameSync, unlinkSync, openSync, closeSync } from 'node:fs';
-+import { existsSync, appendFileSync, mkdirSync, readdirSync, rmSync, chmodSync, lstatSync, statSync, readFileSync, writeFileSync, copyFileSync, renameSync, unlinkSync, openSync, closeSync } from 'node:fs';
-=== change src/release-run.mjs
-base 05148e5b05dff929a6d42341
-new 09f6b14a9d5082dfb7e90ec6
-@@ 14 -1 +1
--import { existsSync, readFileSync, writeFileSync, mkdirSync, copyFileSync, rmSync } from 'node:fs';
-+import { existsSync, readFileSync, writeFileSync, mkdirSync, copyFileSync, rmSync, statSync } from 'node:fs';
-@@ 39 -1 +2
--  const lines = String(rrGit(checkout, ['status', '--porcelain']).stdout || '').split(/\r?\n/).filter(Boolean);
-+  // (a git repository of its own inside the checkout is not part of it - rrGitlinks)
-+  const lines = String(rrGit(checkout, ['status', '--porcelain', '--ignore-submodules=all']).stdout || '').split(/\r?\n/).filter(Boolean);
-@@ 73 -3 +3
--/** What git tracks in the checkout (the release is these and nothing else). */
--export function rrTrackedFiles(checkout) {
--  const r = rrGit(checkout, ['ls-files', '-z']);
-+/** git's list of the checkout: [{ mode, p }]. */
-+function rrIndex(checkout) {
-+  const r = rrGit(checkout, ['ls-files', '-s', '-z']);
-@@ 77 -1 +35
--  return String(r.stdout || '').split('\0').filter(Boolean).filter((p) => existsSync(path.join(checkout, ...p.split('/'))));
-+  return String(r.stdout || '').split('\0').filter(Boolean).map((l) => { const t = l.indexOf('\t'); return { mode: l.slice(0, 6), p: l.slice(t + 1) }; });
-+}
-+
-+/**
-+ * A GIT REPOSITORY OF ITS OWN INSIDE THE CHECKOUT, in git's list as a link to its commit (mode 160000): a folder git
-+ * tracks that is not a file. Prod, 2026-11-08: the dist folder (code_boss-dist, a clone of GitLab's dist) was inside
-+ * the project folder, `git add -A` put it in the list, and the release stopped at copying it ("EPERM: operation not
-+ * permitted, copyfile"). Its paths, [] when none.
-+ */
-+export function rrGitlinks(checkout) {
-+  try { return rrIndex(checkout).filter((e) => e.mode === '160000').map((e) => e.p); } catch { return []; }
-+}
-+
-+/**
-+ * Those repositories taken out of git's list, and kept out (.git/info/exclude, so the setup window's `git add -A` does
-+ * not put them back). The folders stay where they are, untouched. The paths taken out.
-+ */
-+export function rrDropGitlinks(checkout) {
-+  const links = rrGitlinks(checkout);
-+  if (!links.length) return [];
-+  const r = rrGit(checkout, ['rm', '--cached', '-q', '--', ...links]);
-+  if (r.status !== 0) throw new Error('git rm --cached failed: ' + rrHide(r.stderr || r.stdout).trim().slice(0, 300));
-+  const ex = path.join(checkout, '.git', 'info', 'exclude');
-+  const t = existsSync(ex) ? readFileSync(ex, 'utf8') : '';
-+  const have = t.split(/\r?\n/);
-+  const add = links.map((p) => `/${p}/`).filter((l) => !have.includes(l));
-+  if (add.length) { mkdirSync(path.dirname(ex), { recursive: true }); writeFileSync(ex, t + (t && !t.endsWith('\n') ? '\n' : '') + add.join('\n') + '\n'); }
-+  return links;
-+}
-+
-+/** What git tracks in the checkout, as files (the release is these and nothing else - never a folder: rrGitlinks). */
-+export function rrTrackedFiles(checkout) {
-+  return rrIndex(checkout).filter((e) => e.mode !== '160000').map((e) => e.p).filter((p) => {
-+    try { return statSync(path.join(checkout, ...p.split('/'))).isFile(); } catch { return false; }
+-2802
++2803
+=== change src/agent/js-eval.mjs
+base 70ee702d091b0c8c8e4e1b0c
+new 44d11d0c309fbce652e2cbef
+@@ 771 -1 +1
+-  historyAsk: 'read', developerMessage: 'read', mainChat: 'read',
++  historyAsk: 'read', developerMessage: 'read', mainChat: 'read', publishPort: 'exec', unpublishPort: 'exec',
+=== change src/agent/tools.mjs
+base 102d3a085f5cfb791ccfc7ab
+new dc394a3d37cd4d337327069e
+@@ 39 -0 +1
++import { pcContainerHost } from '../plugins/container.mjs';
+@@ 2466 -1 +1
+-function buildJsHostFns(ctx, children, adoptedHere, spawnedHere) {
++export function buildJsHostFns(ctx, children, adoptedHere, spawnedHere) {
+@@ 3122 -0 +17
++    // A SERVER OF THE AGENT'S, FOR A BROWSER (the developer, 2026-11-11: a test app it wrote, for the browser plugin to
++    // drive): in the container the browser is OUTSIDE and 127.0.0.1 does not cross over, so the manager carries a free
++    // port out there to this one (host.container.ports). On a plain machine the browser reaches the port as it is.
++    publishPort: async ([port]) => {
++      const p = Number(port);
++      if (!Number.isInteger(p) || p < 1024 || p > 65535) throw new Error('publishPort(port): the port your server listens on, an integer 1024-65535.');
++      const c = pcContainerHost();
++      if (!c.available) return { insidePort: p, browserPort: p, browserUrl: 'http://localhost:' + p, container: false, note: 'not in a container: a browser on this machine reaches the port as it is' };
++      const r = await c.ports.publish(p);
++      return { insidePort: r.insidePort, browserPort: r.browserPort, browserUrl: r.browserUrl, container: true, note: 'open browserUrl in the browser; your own code (curl, tests) keeps using http://127.0.0.1:' + p };
++    },
++    unpublishPort: async ([port]) => {
++      const c = pcContainerHost();
++      if (!c.available) return { closed: false, container: false };
++      const r = await c.ports.unpublish(Number(port));
++      return { closed: !!r.closed, container: true };
++    },
+=== change src/agent/worker-prompt.mjs
+base 259553f853ace274d1824ee5
+new 4876a2c3631ed919c0d0b82d
+@@ 312 -0 +1
++  [['publishPort', 'unpublishPort'], '(a server of yours, for a browser: publishPort(port) gives the browserUrl to open - in a container the browser is outside and needs it; your own curl keeps 127.0.0.1)'],
+=== change src/plugins/authoring.mjs
+base 1b780cee90a634da472a0000
+new 8f62193dd60a3f98d63be27a
+@@ 685 -0 +2
++  a server of yours    host.container.ports.publish(port) / unpublish(port) / list() - a port inside, reached by
++                       that Chrome: it is OUTSIDE, and 127.0.0.1 does not cross over, so open the browserUrl it gives
+@@ 799 -0 +3
++A PAGE SERVED IN HERE (a test app on 127.0.0.1:3456): the Chrome cannot reach 127.0.0.1:3456 - publish it first:
++    const p = await host.container.ports.publish(3456);   // { browserPort, browserUrl: "http://localhost:<free port>" }
++    await host.container.browser.open({ url: p.browserUrl, label: "test" });   // your own requests keep 127.0.0.1:3456
+=== change src/plugins/container.mjs
+base 3b50fc309bf4cf8db9403254
+new c3cc99693f134d8b8b785c23
+@@ 95 -0 +14
++    // A SERVER INSIDE, REACHED FROM OUT HERE (the developer, 2026-11-11: the agent's own test app, opened in the Chrome
++    // above). A connection to 127.0.0.1 does not cross the container's boundary, so the manager listens on a free port
++    // out here and carries it in. Absent on a plain machine: there the browser reaches the port itself.
++    ports: available ? {
++      /** { ok, insidePort, insideUrl, browserPort, browserUrl } - or throws, with the manager's sentence. */
++      publish: async (port) => {
++        const r = await call('POST', '/v1/port/publish', { port: Number(port) });
++        if (!r.ok) throw new Error(r.error || 'the container did not publish the port');
++        return r;
++      },
++      /** By its port inside. { ok, closed } - one that was not published is not an error. */
++      unpublish: async (port) => call('POST', '/v1/port/unpublish', { port: Number(port) }),
++      list: async () => (await call('GET', '/v1/port')).published || [],
++    } : undefined,
+=== change test/test-plugin-container-host.mjs
+base ba416de00d547f854d92dcd2
+new b7ec868e035a12d1fc2dab35
+@@ 52 -0 +44
++console.log('\n[2d] a server inside, for that browser: ports.publish / list / unpublish, and the snippet\'s publishPort()');
++{
++  const seen = [];
++  const srv = http.createServer((req, res) => {
++    let body = '';
++    req.on('data', (d) => { body += d; });
++    req.on('end', () => {
++      seen.push(`${req.method} ${req.url} ${req.headers['x-cb-container']} ${body}`);
++      res.writeHead(200, { 'content-type': 'application/json' });
++      const j = body ? JSON.parse(body) : {};
++      if (req.url === '/v1/port/publish') res.end(JSON.stringify(j.port === 80 ? { ok: false, error: 'port: the port inside the container that a server listens on, 1024-65535 (was 80).' } : { ok: true, insidePort: j.port, insideUrl: 'http://127.0.0.1:' + j.port, browserPort: 51234, browserUrl: 'http://localhost:51234' }));
++      else if (req.url === '/v1/port') res.end(JSON.stringify({ ok: true, published: [{ browserPort: 51234, insidePort: 3456 }] }));
++      else res.end(JSON.stringify({ ok: true, closed: true }));
++    });
 +  });
-@@ 132 -2 +5
--  // 2. the source, committed and pushed
--  if (st.changed.length) {
-+  // 2. the source, committed and pushed - without a repository of its own that sits inside it (rrGitlinks)
-+  let dropped = [];
-+  try { dropped = rrDropGitlinks(checkout); } catch (e) { log('Nothing was released: ' + e.message); return 1; }
-+  if (dropped.length) log(`${dropped.join(', ')}: a git repository of its own inside the checkout, not part of code_boss - taken out of git's list (the folder is left as it is)`);
-+  if (st.changed.length || dropped.length) {
-@@ 136 -1 +1
--    log(`committed on ${st.branch}: ${st.changed.length} changed file(s), "Source of build ${build}"`);
-+    log(`committed on ${st.branch}: ${st.changed.length + dropped.length} changed file(s), "Source of build ${build}"`);
-=== change test/test-release-run.mjs
-base ff685b3bb61bf5c789d525f2
-new 576b0a05929e9d2bfccb88b8
-@@ 122 -0 +19
-+console.log('\n[6] a git repository of its own inside the checkout (prod, 2026-11-08: EPERM copying code_boss-dist)');
-+const co6 = path.join(work, 'checkout6'); git(work, 'clone', '-q', bare, co6);
-+const inner = path.join(co6, 'code_boss-dist'); mkdirSync(inner);
-+writeFileSync(path.join(inner, 'x.txt'), 'dist\n'); git(inner, 'init', '-q'); git(inner, 'add', '-A'); git(inner, 'commit', '-q', '-m', 'inner');
-+git(co6, 'add', '-A'); git(co6, 'commit', '-q', '-m', 'the setup window committed everything');   // (as its `git add -A` does)
-+git(co6, 'push', '-q', 'origin', 'HEAD:main');
-+ok(/^160000 .*\tcode_boss-dist$/m.test(git(co6, 'ls-files', '-s').stdout), 'set up: the inner repository is in git\'s list as a link');
-+git(inner, 'commit', '-q', '--allow-empty', '-m', 'moved on');                  // (its own history moves: no change of the checkout's)
-+const s6 = rrCheckoutState(co6);
-+ok(s6.ok && s6.changed.length === 0, `its moving on is not a change of the checkout (${JSON.stringify(s6.changed || s6.problem)})`);
-+said.length = 0;
-+const r6 = runCheckoutRelease({ checkout: co6, channel: 'devtest', withImage: false, log: (m) => said.push(m) });
-+ok(r6 === 0, `released (${said.slice(-2).join(' / ')})`);
-+ok(said.some((m) => /code_boss-dist: a git repository of its own inside the checkout/.test(m)), 'and it says what it took out');
-+ok(!/code_boss-dist/.test(git(bare, 'ls-tree', '--name-only', 'main').stdout) && git(bare, 'log', '-1', '--format=%s', 'main').stdout.trim().startsWith('Source of build'), 'the pushed source no longer lists it');
-+ok(readFileSync(path.join(co6, '.git', 'info', 'exclude'), 'utf8').includes('/code_boss-dist/') && existsSync(path.join(inner, 'x.txt')) && existsSync(path.join(inner, '.git')), 'kept out of `git add -A` from now on; the folder itself untouched');
-+git(co6, 'add', '-A');
-+ok(!/code_boss-dist/.test(git(co6, 'ls-files').stdout), 'a later `git add -A` does not put it back');
++  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
++  const env = { CB_IN_CONTAINER: '1', CB_CONTAINER_API: `http://127.0.0.1:${srv.address().port}`, CB_CONTAINER_TOKEN: 'tok-p' };
++  const c = pcContainerHost(env);
++  const p = await c.ports.publish(3456);
++  const l = await c.ports.list();
++  const u = await c.ports.unpublish(3456);
++  ok(p.browserUrl === 'http://localhost:51234' && p.insidePort === 3456 && l.length === 1 && u.closed === true
++    && seen.join(' | ') === 'POST /v1/port/publish tok-p {"port":3456} | GET /v1/port tok-p  | POST /v1/port/unpublish tok-p {"port":3456}', `publish(), list() and unpublish() are the container's three requests: ${seen.join(' | ')}`);
++  let said = '';
++  try { await c.ports.publish(80); } catch (e) { said = e.message; }
++  ok(/1024-65535/.test(said), `a refused publish() THROWS the manager's sentence: ${said}`);
++  ok(pcContainerHost({}).ports === undefined, 'host.container.ports is ABSENT on a plain machine: there the browser reaches the port itself');
++  // the snippet's own: publishPort(port) (tools.mjs), which reads the environment code_boss runs in
++  const { buildJsHostFns } = await import('../src/agent/tools.mjs');
++  const keep = {}; for (const k of Object.keys(env)) { keep[k] = process.env[k]; delete process.env[k]; }
++  const fns = buildJsHostFns({}, new Set(), [], []);
++  const plain = await fns.publishPort([3456]);
++  ok(plain.container === false && plain.browserUrl === 'http://localhost:3456', `publishPort() on a plain machine: the port as it is (${JSON.stringify(plain)})`);
++  Object.assign(process.env, env);
++  const inC = await fns.publishPort([3456]);
++  const un = await fns.unpublishPort([3456]);
++  ok(inC.container === true && inC.browserUrl === 'http://localhost:51234' && /127\.0\.0\.1:3456/.test(inC.note) && un.closed === true, `publishPort() in the container: the browserUrl the manager gave (${JSON.stringify(inC)})`);
++  let bad = '';
++  try { await fns.publishPort(['abc']); } catch (e) { bad = e.message; }
++  ok(/1024-65535/.test(bad), `a port that is not one is refused before anything is asked: ${bad}`);
++  for (const k of Object.keys(env)) { if (keep[k] === undefined) delete process.env[k]; else process.env[k] = keep[k]; }
++  await new Promise((r) => srv.close(r));
++}
++
+=== change test/test-sandbox-browser-e2e.mjs
+base 5253ade29259367b5c9d6b35
+new 3dbf3f883e19265293023f02
+@@ 115 -0 +35
++// A SERVER OF ITS OWN, INSIDE (the developer, 2026-11-11: the agent's test app, for the browser plugin): published, then
++// opened in the Chrome out here, which cannot reach 127.0.0.1 in here by itself
++await writeFile(path.join(PP, 'served.mjs'), `import { pcContainerHost } from './container.mjs';
++import puppeteer from 'puppeteer-core';
++import http from 'node:http';
++const c = pcContainerHost(process.env);
++const out = { hasPorts: !!c.ports, hits: [] };
++const srv = http.createServer((req, res) => { out.hits.push(req.url); res.writeHead(200, { 'content-type': 'text/html', connection: 'close' }); res.end('<!doctype html><title>served from inside</title><p id="p">inside</p>'); });
++await new Promise((r) => srv.listen(0, '127.0.0.1', r));
++const port = srv.address().port;
++out.insidePort = port;
++const tryIt = async (f) => { try { return { r: await f() }; } catch (e) { return { e: e.message }; } };
++out.bad80 = await tryIt(() => c.ports.publish(80));
++out.badApi = await tryIt(() => c.ports.publish(28900));
++const p = await c.ports.publish(port);
++out.pub = p;
++out.again = await c.ports.publish(port);
++out.list = await c.ports.list();
++const b = await c.browser.open({ url: p.browserUrl, label: 's' });
++const browser = await puppeteer.connect({ browserURL: b.cdpUrl, defaultViewport: null });
++const page = (await browser.pages()).find((x) => x.url().startsWith(p.browserUrl)) || (await browser.pages())[0];
++await page.waitForSelector('#p', { timeout: 15000 }).catch(() => {});
++out.title = await page.title();
++out.pText = await page.$eval('#p', (e) => e.textContent).catch((e) => 'no #p: ' + e.message);
++out.un = await c.ports.unpublish(port);
++out.unAgain = await c.ports.unpublish(port);
++out.listAfter = await c.ports.list();
++const before = out.hits.length;
++out.reload = await page.goto(p.browserUrl + '/after', { timeout: 10000 }).then(() => 'loaded').catch((e) => 'failed: ' + e.message.slice(0, 80));
++out.hitsAfterUnpublish = out.hits.length - before;
++browser.disconnect();
++await c.browser.close(b.id);
++srv.close();
++console.log('RESULT ' + JSON.stringify(out));
++`);
+@@ 270 -0 +10
++  console.log('\n[3b] a server INSIDE, published, opened in the Chrome out here');
++  const sv = await inside('node pp\\served.mjs');
++  if (!sv.pub) console.log('  (inside said: ' + String(sv.text || sv.refused).slice(-1500) + ')');
++  ok(sv.hasPorts === true && sv.bad80 && /1024-65535/.test(sv.bad80.e || '') && sv.badApi && /own way out/.test(sv.badApi.e || ''), `host.container.ports is there; port 80 and the API's own port are refused with a sentence (${sv.bad80 && sv.bad80.e} | ${sv.badApi && sv.badApi.e})`);
++  ok(sv.pub && sv.pub.ok === true && sv.pub.insidePort === sv.insidePort && sv.pub.browserPort !== sv.insidePort && sv.pub.browserUrl === `http://localhost:${sv.pub.browserPort}`, `publish(${sv.insidePort}) gives a free port out here: ${sv.pub && sv.pub.browserUrl}`);
++  ok(sv.again && sv.again.browserPort === sv.pub.browserPort && Array.isArray(sv.list) && sv.list.some((x) => x.insidePort === sv.insidePort && x.browserPort === sv.pub.browserPort), `asked again it is the same port, and list() has it`);
++  ok(sv.title === 'served from inside' && sv.pText === 'inside' && sv.hits.includes('/'), `Chrome OUT HERE loaded the page from the server INSIDE: "${sv.title}", ${sv.hits.length} request(s) reached it `);
++  ok(sv.un && sv.un.closed === true && sv.unAgain && sv.unAgain.closed === false && !(sv.listAfter || []).some((x) => x.insidePort === sv.insidePort), `unpublish() closes it; again is not an error (closed:false); list() no longer has it`);
++  ok(/^failed/.test(String(sv.reload)) && sv.hitsAfterUnpublish === 0, `after it, Chrome can no longer reach the server (${sv.reload}; ${sv.hitsAfterUnpublish} request(s) arrived)`);
 +
 === end
