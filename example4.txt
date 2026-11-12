@@ -1,134 +1,1471 @@
 code_boss chunk 1
-number 18
-made 2026-11-05T20:11:38.984Z
-message 2 changes
+number 26
+made 2026-11-12T06:41:12.725Z
+message 12 changes
 message
-message - Snippet lines name every call by its function
-message - Release refuses a checkout whose recorded files are not all committed
-before 61be2bce03913a0c3f7f542f
-after d8d406d60255b9fc1adb0667
-files 7
+message - piishape shows a run of consonants only (fns, TRS, CDP, px)
+message - piishape: a JWT or base64 blob hidden whole; colour codes split off; short number groups and seen words shown
+message - From the prod feedback list: commit() outside a repo, example tokens in docs, ids on pages, a check's note quoted
+message - Count bubbles: the number heavier, and a brighter orange ring inside the dark edge
+message - Count bubbles: a hairline dark edge, the light ring nearer the fill
+message - The purple faded a little more (OKLCH chroma 0.130 -> 0.110), app and container pages
+message - Three columns: a right panel with what runs, artifacts, branches, icons and the path; both panels resizable per project
+message - A model chosen in Settings while a run goes takes effect at its next call
+message - The chat's side margins: 18px each side (was 36 left, 20 right)
+message - The commit window copies what it shows as Markdown (⧉ beside the ×)
+message - Commit suggestions are made when the commit window opens, and only then
+message - A running check is pinned to the bottom of the chat; "Checking the change"; the minor-points box is the points alone
+before e2b9c94115466a69d316876d
+after 92f962719b5859deede70475
+files 33
 left 0
-check df4f675cae1f28f3
+check 3a4530a565bb0b33
 
+=== change examples/plugins/piishape__1.mjs
+base 19ed29d84f1240a5a8ba5c80
+new ee996750fb1ec387cfd26f58
+@@ 36 -3 +3
+-// ==== BEGIN GENERATED lexicon (481KB, built 2026-11-09) ====
+-// 77081 English words, 2016 that are also names, 13881
+-// surnames that are also words, 2306 short names. Sources: SCOWL via wordlist-english@1.2.1 (sizes <=60); Census 2010 surnames; Census 1990 given names; SSA baby names 1880-2008 (hadley/data-baby-names); SSA baby names 1880-2017, all names (TidyTuesday mirror); Census 2023 Gazetteer places.
++// ==== BEGIN GENERATED lexicon (482KB, built 2026-11-12) ====
++// 77083 English words, 2011 that are also names, 13881
++// surnames that are also words, 2305 short names. Sources: SCOWL via wordlist-english@1.2.1 (sizes <=60); Census 2010 surnames; Census 1990 given names; SSA baby names 1880-2008 (hadley/data-baby-names); SSA baby names 1880-2017, all names (TidyTuesday mirror); Census 2023 Gazetteer places.
+@@ 42 -1 +1
+-2026-11-09
++2026-11-12
+@@ 72810 -0 +1
++unregister
+@@ 72811 -0 +1
++unregisters
+@@ 78182 -1 +0
+-line
+@@ 78184 -1 +0
+-lines
+@@ 78390 -1 +0
+-numbers
+@@ 78578 -1 +0
+-register
+@@ 79062 -1 +0
+-welcome
+@@ 94316 -1 +0
+-line
+@@ 118938 -0 +1
++atter
+@@ 181232 -0 +1
++  bigint bigints attrs attr ripple toolbar jspx popstate llm llms
+@@ 181281 -0 +1
++  register registers unregister unregisters line lines welcome numbers
+@@ 182225 -0 +1
++  const NO_VOWEL = /^[b-df-hj-np-tv-xz]+$/i;
+@@ 182236 -0 +15
++    // A TERMINAL COLOUR CODE runs into the word after it: ESC[32mflow is one run, "32mflow" (prod feedback, 2026-11-11:
++    // tsc's coloured output hid an identifier that way). The code's own digits and m are split off and shown.
++    if (text.includes('\x1b[')) {
++      for (let i = 0; i < runs.length; i++) {
++        const r = runs[i];
++        const sgr = /^(\d{1,3})m/.exec(r.t);
++        if (!sgr || !/\x1b\[(?:\d{1,3};)*$/.test(text.slice(Math.max(0, r.s - 16), r.s))) continue;
++        const n = sgr[0].length;
++        const code = { ...r, e: r.s + n, t: r.t.slice(0, n), show: true, why: 'ansi' };
++        if (n === r.t.length) { runs[i] = code; continue; }
++        const rest = { ...r, s: r.s + n, t: r.t.slice(n), pos: L.pos[r.s + n] };
++        runs.splice(i, 1, code, rest);
++        i++;
++      }
++    }
+@@ 182322 -0 +1
++          else if (NO_VOWEL.test(r.t)) { r.show = true; r.why = 'no-vowel'; }
+@@ 182335 -0 +3
++        // CONSONANTS ONLY - fns, TRS, CDP, LLM, px, nm (the developer, 2026-11-11: "let's unmask any sequence of consonants
++        // only"): an abbreviation, a unit, an acronym. A name has a vowel; y counts as one, so Lynn and Flynn stay masked.
++        if (NO_VOWEL.test(r.t)) { r.show = true; r.why = 'no-vowel'; return; }
+@@ 182522 -1 +4
+-          if (STANDARDS.has(before) && lens.every((n) => n <= 5) && r.pos !== VALUE) decide(true, 'standard-number');   // ISO 3166-1, RFC 2616
++          // THREE DIGITS OR FEWER IN ALL - CSS's "flex: 1 1 30px", "1/2" (prod feedback, 2026-11-11): the rule above for one
++          // number, kept for a group
++          if (lens.reduce((a, n) => a + n, 0) <= 3) decide(true, 'short-numbers');
++          else if (STANDARDS.has(before) && lens.every((n) => n <= 5) && r.pos !== VALUE) decide(true, 'standard-number');   // ISO 3166-1, RFC 2616
+@@ 182595 -0 +17
++      // A BASE64 BLOB IS HIDDEN WHOLE (prod feedback, 2026-11-11: a JWT's signature in an Authorization header reached the
++      // model nearly unmasked - split at + and /, its pieces read as words, short letter runs, consonants). 16 or more
++      // characters of base64 or base64url with upper case, lower case and a digit, whose case and digit changes come
++      // every few characters: random bytes do, an identifier (getUserById2) or a path changes once a word.
++      for (const b of text.matchAll(/[A-Za-z0-9+/=_-]{16,}/g)) {
++        const t = b[0];
++        if (!/[A-Z]/.test(t) || !/[a-z]/.test(t) || !/[0-9]/.test(t)) continue;
++        const kind = (c) => (/[A-Z]/.test(c) ? 1 : /[a-z]/.test(c) ? 2 : /[0-9]/.test(c) ? 3 : 0);
++        let changes = 0;
++        for (let k = 1; k < t.length; k++) { const p = kind(t[k - 1]), q = kind(t[k]); if (p && q && p !== q) changes++; }
++        if (changes * 4 < t.length) continue;
++        // ...and an identifier is made of words: get User Account By Id. Half its pieces words, and it is one.
++        const pieces = t.match(/[A-Z]?[a-z]+|[A-Z]+(?![a-z])/g) || [];
++        const wordy = pieces.filter((p) => p.length >= 2 && (strict(p.toLowerCase()) || JARGON.has(p.toLowerCase()))).length;
++        if (pieces.length && wordy * 2 >= pieces.length) continue;
++        for (const r of runsIn(b.index, b.index + t.length)) hide(r, 'base64');
++      }
+@@ 183609 -0 +1
++const EXAMPLE_IDS = new Set(['k2j4q7m', 'a4ut5k2', 'p8r2m1x', 'abc1234', '3f9a0c2', 'ab12cd3']);
+@@ 183619 -0 +4
++      // THE WORKED EXAMPLES' IDS (prod feedback, 2026-11-11: documentation the agent wrote quoted authorPlugins()'s
++      // #Xxxx0#k2j4q7m, and the write was refused as an unknown token): an example in code_boss's own instructions
++      // is text, written as it is. No value of the developer's has one of these ids unless it was issued, above.
++      if (!hit && EXAMPLE_IDS.has(tok.slice(tok.lastIndexOf('#') + 1))) return tok;
+=== change sandbox-launcher/src/main/resources/manager.html
+base 8e6d908c99dd3672986a6004
+new dbfde3d05a346ed5b6e4cdd3
+@@ 17 -1 +1
+-    --accent: #7972c9; --accent-text: #938dd6; --accent-rgb: 121, 114, 201; --accent-hover: #8b85d3; --accent-ink: #130f1f;
++    --accent: #7975be; --accent-text: #938fcd; --accent-rgb: 121, 117, 190; --accent-hover: #8b87c9; --accent-ink: #130f1f;
 === change scripts/build-number.txt
-base 62deae9018fab41292bfd323
-new 7ed50f0c007ee84b60ee5e1f
+base 94255a0453a7f7fb08e7213f
+new d4e06ab83f2e915d903dffd8
 @@ 1 -1 +1
--2748
-+2749
-=== change src/release-run.mjs
-base ccb306fd50008910de8db9f2
-new 05148e5b05dff929a6d42341
-@@ 45 -0 +2
-+  const chunks = rrChunkFolderProblem(checkout, changed);
-+  if (chunks) return { ok: false, problem: chunks };
-@@ 48 -0 +20
-+/**
-+ * A FOLDER THE CHUNKS FILL (the setup window's project folder - its record .cb-sync.json is in it) IS RELEASED ONLY AS
-+ * GIT HAS IT (a Heads up, 2026-11-05: applying a chunk no longer commits it, and a release before Commit and push left
-+ * the files the chunk added out of the build - a release builds what git tracks - and put the ones it changed in its own
-+ * "Source of build N" commit; the developer: "make sure ... there's no way to shoot yourself in the foot"). Every file of
-+ * the record committed as it is, or no release: the problem said, null when there is none (or no record).
-+ */
-+export function rrChunkFolderProblem(checkout, changed = []) {
-+  let files;
-+  try { files = Object.keys(JSON.parse(readFileSync(path.join(checkout, '.cb-sync.json'), 'utf8')).files || {}); } catch { return null; }
-+  let tracked;
-+  try { tracked = new Set(rrTrackedFiles(checkout)); } catch { return null; }
-+  const left = [...changed, ...files.filter((p) => !tracked.has(p))];
-+  if (!left.length) return null;
-+  return `This folder gets its files from chunks, and ${left.length} of them ${left.length === 1 ? 'is' : 'are'} not committed (${left.slice(0, 4).join(', ')}${left.length > 4 ? ', ...' : ''}). In the setup window, Commit and push (step 3) first: a release builds only what git has.`;
-+}
-+
-+/** The marker a release leaves in the checkout's .git while it runs: the setup window applies and commits nothing meanwhile. */
-+export const rrReleasingPath = (checkout) => path.join(checkout, '.git', 'cb-releasing.json');
-+
-@@ 85 -1 +7
--export function runCheckoutRelease({ checkout, channel = 'devtest', push = true, withImage = true, log = (m) => console.log(m) }) {
-+export function runCheckoutRelease(opts) {
-+  // (while it runs, the checkout is marked: the setup window writes nothing into a folder a release is building from)
-+  const mark = opts && opts.checkout && existsSync(path.join(opts.checkout, '.git')) ? rrReleasingPath(opts.checkout) : '';
-+  try { if (mark) writeFileSync(mark, JSON.stringify({ pid: process.pid, at: Date.now() })); } catch { /* the release goes on */ }
-+  try { return rrRelease(opts); } finally { try { if (mark) rmSync(mark, { force: true }); } catch { /* gone */ } }
-+}
-+function rrRelease({ checkout, channel = 'devtest', push = true, withImage = true, log = (m) => console.log(m) }) {
-=== change src/release-ui.mjs
-base 2bda8c904b7f71d8bc4f1bad
-new ec6f26f346aaeac119833530
-@@ 549 -0 +2
-+  // (a checkout that cannot be released - its line says why, in red: the buttons are off, not a run that only says so)
-+  if(co&&!s.checkout.ok)$('relDev').disabled=$('relBeta').disabled=$('relProd').disabled=true;
+-2803
++2805
+=== change src/agent/review-loop.mjs
+base f0af47b86b816e83f6063a05
+new 988d7a3a235f63adf9a63d47
+@@ 180 -1 +3
+-    description: `Small things I noticed checking ${myOf(kind, sha)} - each small, or I am not sure of it, so I did not hold things up for it. Yours to use or not:\n\n${minor.map(devLine).join('\n')}`,
++    // (the points alone - the developer, 2026-11-12: "remove the part that says 'Small things I noticed...' let's just put
++    // the content"; the title says what they are)
++    description: minor.map(devLine).join('\n'),
+=== change src/agent/sandbox-cmd.mjs
+base fa2a093e42645941d7d1e8e4
+new 1c90220ef7646a8afc6e2057
+@@ 463 -1 +1
+-:root{--bg:#181615;--panel:#221f1d;--border:#463f3a;--fg:#e7e1db;--muted:#b6ac9f;--accent:#7972c9;--accent-text:#938dd6;--accent-rgb:121,114,201;--accent-hover:#8b85d3;--error:#db6a86;--ok:#92b77c}
++:root{--bg:#181615;--panel:#221f1d;--border:#463f3a;--fg:#e7e1db;--muted:#b6ac9f;--accent:#7975be;--accent-text:#938fcd;--accent-rgb:121,114,201;--accent-hover:#8b87c9;--error:#db6a86;--ok:#92b77c}
+=== change src/agent/sandbox-setup-page.mjs
+base 109ac40ce9191d21ee3d1c06
+new b1c37377e2002c19671ad6eb
+@@ 12 -1 +1
+-    --accent: #7972c9; --accent-text: #938dd6; --accent-rgb: 121, 114, 201; --accent-hover: #8b85d3; --accent-fg: #130f1f;
++    --accent: #7975be; --accent-text: #938fcd; --accent-rgb: 121, 117, 190; --accent-hover: #8b87c9; --accent-fg: #130f1f;
+=== change src/agent/tools.mjs
+base dc394a3d37cd4d337327069e
+new 924013b93624c02f68527d7e
+@@ 2837 -0 +4
++      // NOT A REPOSITORY (prod feedback, 2026-11-11: "git add exited 128 fatal: not a git repository" came back as a
++      // failure, and the agent was left to make sense of it): said plainly, with the way on
++      const noRepo = (r) => r && r.code !== 0 && /not a git repository/i.test(String(r.stderr || '') + String(r.stdout || ''));
++      const noRepoRefusal = () => cbRefusal(`commit(): ${cwd} is not in a git repository, so nothing was committed. Your change is on disk as it is, and it has not been checked. Tell the developer the folder has no repository and ask whether to make one (git init); if they say yes, commit() again.`);
+@@ 2840 -0 +1
++        if (noRepo(a)) throw noRepoRefusal();
+@@ 2843 -0 +1
++      if (noRepo(c)) throw noRepoRefusal();
+=== change src/agent/worker-prompt.mjs
+base 4876a2c3631ed919c0d0b82d
+new ffd7c6b5b6209fe305865d7e
+@@ 136 -1 +1
+-    '  MASKED VALUES ARE TOKENS IN YOUR CODE. When the project is masked, what read(), search() and every tool hand your snippet has a token where each value was (#Xxxxx#k2j4q7m, #@smiths.sponsor.ssn~000-00-0000#k2j4q7m, #num~0000#k2j4q7m for a number). Your code never holds the real characters, so do not compute on a token\'s text (t.length, t.match, parseInt, t.slice). A TOKEN IS ONE PIECE: to shorten text that has tokens in it, cut it by lines (text.split("\\n").slice(-40).join("\\n")), not by characters - text.slice(-1500) can cut a token in two, and half a token is neither the value nor a token.A SHAPE IS NOT THE CHARACTERS - wherever you see a token, the developer\'s own message included: in #0x0Xx#k2j4q7m each 0 stands for some digit, x for some lowercase letter, X for some capital. Never answer a question about the characters from the shape ("is it valid hex?", "does it contain an x?"): run piiMatches(token, "^[0-9a-f]+$") (below) and answer from that. A LONG value\'s shape is shortened to its start and its length: #0000xx000xx000xx0000xx00…1200#k2j4q7m is 1,200 characters (piiShape() gives the whole shape); pass it like any token. What you CAN do: (1) compare, count and group BY THE ID — the 7 characters after the last # (tok.slice(-7)); one value always has one id, though its token may look different where it is spelled differently (555-0142 and 5550142, SMITH and Smith) or named differently by different plugins (#@smiths.sponsor.ssn#k2j4q7m and #@member_ssn~000-00-0000#k2j4q7m are ONE value: same id); (2) pass a token to any call — write(), edit(), curl(), a plugin tool — and the real value is used there (a number token as the number); (3) ask about one without seeing it, each answering a promise: piiShape(token) -> e.g. "ddddd-dddd", piiLength(token), piiMatches(token, "^[0-9]{5}$") (at most 5 patterns per value in a run), piiValid(token, "luhn" | "date" | "email" | "example-domain" | "ssn"); (4) A TOKEN YOU ARE SHOWN IS NOT A TOKEN IN THE FILE: tokenCheck({ path }) looks at the file as it is on disk (tokenCheck({ text }) at a string before you write it) — check before you say a token ended up in a file. When the characters themselves are needed, ask with pii_reveal({ token, reason }); never work around a mask. Do not comment on masking in a reply unless the developer asks about it or a masked value stops the work.',
++    '  MASKED VALUES ARE TOKENS IN YOUR CODE. When the project is masked, what read(), search() and every tool hand your snippet has a token where each value was (#Xxxxx#k2j4q7m, #@smiths.sponsor.ssn~000-00-0000#k2j4q7m, #num~0000#k2j4q7m for a number). Your code never holds the real characters, so do not compute on a token\'s text (t.length, t.match, parseInt, t.slice). A TOKEN IS ONE PIECE: to shorten text that has tokens in it, cut it by lines (text.split("\\n").slice(-40).join("\\n")), not by characters - text.slice(-1500) can cut a token in two, and half a token is neither the value nor a token.A SHAPE IS NOT THE CHARACTERS - wherever you see a token, the developer\'s own message included: in #0x0Xx#k2j4q7m each 0 stands for some digit, x for some lowercase letter, X for some capital. Never answer a question about the characters from the shape ("is it valid hex?", "does it contain an x?"): run piiMatches(token, "^[0-9a-f]+$") (below) and answer from that. A LONG value\'s shape is shortened to its start and its length: #0000xx000xx000xx0000xx00…1200#k2j4q7m is 1,200 characters (piiShape() gives the whole shape); pass it like any token. What you CAN do: (1) compare, count and group BY THE ID — the 7 characters after the last # (tok.slice(-7)); one value always has one id, though its token may look different where it is spelled differently (555-0142 and 5550142, SMITH and Smith) or named differently by different plugins (#@smiths.sponsor.ssn#k2j4q7m and #@member_ssn~000-00-0000#k2j4q7m are ONE value: same id); (2) pass a token to any call — write(), edit(), curl(), a plugin tool — and the real value is used there (a number token as the number) - ALWAYS THE WHOLE TOKEN: its id or its shape alone is on no page and in no file (browser_wait({ text: token }), never the 7 characters of its id); A WORD YOU TYPE IS NOT ITS TOKEN: text from read() may hold a token where a literal in your snippet has the plain word, so text.indexOf("...") can miss - change a file with edit(path, find, replace), whose find is matched against the real file, and when you do search read() text, check the position is not -1 before you use it; (3) ask about one without seeing it, each answering a promise: piiShape(token) -> e.g. "ddddd-dddd", piiLength(token), piiMatches(token, "^[0-9]{5}$") (at most 5 patterns per value in a run), piiValid(token, "luhn" | "date" | "email" | "example-domain" | "ssn"); (4) A TOKEN YOU ARE SHOWN IS NOT A TOKEN IN THE FILE: tokenCheck({ path }) looks at the file as it is on disk (tokenCheck({ text }) at a string before you write it) — check before you say a token ended up in a file. When the characters themselves are needed, ask with pii_reveal({ token, reason }); never work around a mask. Do not comment on masking in a reply unless the developer asks about it or a masked value stops the work.',
+=== change src/server.mjs
+base f14c61343b04725e67148801
+new f5ff836f9b2d420d8b599f6a
+@@ 3448 -4 +2
+-      // Eager commit-recs: precompute for dirty repos so the modal opens instantly - but NOT mid-run: made right after
+-      // each run that changed files (setStatus rescans at the run's end; the developer, 2026-10-30: "instead of each
+-      // minute, let's do it immediately after each run that made changes"), and on this scan for changes made outside
+-      for (const p of projects) if (p.uncommitted > 0 && session.status !== 'running') computeCommitRecs(p.path).catch(() => {});
++      // (no suggestion made here: the commit window asks for one when it OPENS - the developer, 2026-11-12: "not generate
++      // a new commit suggestion round every time there's a change. Let's just have it do it when the modal is opened")
+@@ 3496 -1 +1
+-  //     the background tries once more (CB_COMMIT_RECS_RETRY_MS), and the modal's Try again asks with force
++  //     the modal's Try again asks with force
+@@ 3499 -2 +2
+-  //   - the agent's writes rescan while it runs, when no suggestion is made: the run's end rescans (setStatus)
+-  const RECS_RETRY_MS = Number(process.env.CB_COMMIT_RECS_RETRY_MS) || 30000;
++  // MADE ONLY WHEN THE WINDOW OPENS since 2026-11-12 (the developer: "not generate a new commit suggestion round every
++  // time there's a change"): no suggestion after a scan or a run, none again when the changes move, no retry behind it
+@@ 3541 -7 +0
+-  // the changes moved while a suggestion was made, and nothing is running: looked at again, shortly
+-  function recsLater(repoDir) {
+-    const i = recsInfoOf(repoDir);
+-    if (i.timer) return;
+-    i.timer = setTimeout(() => { i.timer = null; if (session.status !== 'running') computeCommitRecs(repoDir).catch(() => {}); }, 1500);
+-    i.timer.unref?.();
+-  }
+@@ 3693 -2 +2
+-      // the changes moved while it was made: looked at again, within the minute's rule
+-      if (recsInfoOf(repoDir).again) { recsInfoOf(repoDir).again = false; recsLater(repoDir); }
++      // (the changes moved while it was made: NOT made again here - the next opening of the window reads them, 2026-11-12)
++      recsInfoOf(repoDir).again = false;
+@@ 3697 -9 +1
+-      // a failure is tried once more in the background, for the same changes - not at the next click
+-      if (r && r.status === 'error' && !retriedFor.has(repoDir + '\n' + diffSig)) {
+-        retriedFor.add(repoDir + '\n' + diffSig);
+-        const t = setTimeout(() => {
+-          const now = session.gitCommitRecs[repoDir];
+-          if (now && now.status === 'error' && now.diffSig === diffSig) computeCommitRecs(repoDir, { force: true }).catch(() => {});
+-        }, RECS_RETRY_MS);
+-        t.unref?.();
+-      }
++      // (a failure is not tried again in the background since 2026-11-12: the window's Try again does it)
+@@ 3708 -1 +0
+-  const retriedFor = new Set();
+@@ 5926 -0 +30
++  // A MODEL CHANGED MID-RUN TAKES EFFECT AT THE RUN'S NEXT CALL (the developer, 2026-11-12: "let's have a mid-run model
++  // switch work" - the Calls tab showed the old model for messages that joined a running run). The run was started on
++  // `startModel`; each call it makes on that model goes to the model chosen in Settings NOW. A call made on another
++  // model on purpose (a role of its own) is left as it is.
++  function liveModelAdapter(adapter, startModel, side) {
++    if (!adapter) return adapter;
++    // (only a CHANGE in Settings while the run goes: a message sent on purpose to another model than the chosen one keeps
++    // it - the wire-session test sends one that way)
++    const chosen = () => (side ? sideChatModelOf(session.defaultModel) : session.defaultModel);
++    const atStart = chosen();
++    const live = () => { const m = chosen(); return m && m !== atStart ? m : startModel; };
++    let said = startModel;
++    return new Proxy(adapter, {
++      get(t, k, r) {
++        const v = Reflect.get(t, k, r);
++        if (typeof v !== 'function' || k === 'listModels') return v;
++        return function (...args) {
++          const o = args[0];
++          if (o && typeof o === 'object' && o.model === startModel) {
++            const m = live();
++            if (m && m !== startModel) {
++              if (m !== said) { said = m; fileLog(`model: this run goes on with ${m} (chosen in Settings; it started on ${startModel})`); }
++              args[0] = { ...o, model: m };
++            }
++          }
++          return v.apply(t, args);
++        };
++      },
++    });
++  }
+@@ 9851 -0 +3
++        // (the agents after the run take the model chosen NOW - it may have changed while the run went: liveModelAdapter)
++        const _chosenNow = () => (inSide() ? sideChatModelOf(session.defaultModel) : session.defaultModel), _chosenAtStart = _chosenNow();
++        const _endModel = () => { const m = _chosenNow(); return m && m !== _chosenAtStart ? m : model; };
+@@ 10023 -1 +1
+-              adapter, model, signal,
++              adapter: liveModelAdapter(adapter, model, inSide()), model, signal,
+@@ 10253 -1 +1
+-            if (_streamRun && !_quietGone && !myController._retracted) { try { streamAfterRun(model, { terminated: _streamTerminated, source: messageSource, discussMode, toolCalls: _streamToolCalls }); } catch (e) { fileLog('bookkeeper: the pass could not start: ' + (e?.message || e)); } }
++            if (_streamRun && !_quietGone && !myController._retracted) { try { streamAfterRun(_endModel(), { terminated: _streamTerminated, source: messageSource, discussMode, toolCalls: _streamToolCalls }); } catch (e) { fileLog('bookkeeper: the pass could not start: ' + (e?.message || e)); } }
+@@ 10274 -1 +1
+-            if (_huRun && !myController._retracted) { try { headsUpAfterRun(model, { dev: _huDev }); } catch (e) { fileLog('heads up: the check could not start: ' + (e?.message || e)); } }
++            if (_huRun && !myController._retracted) { try { headsUpAfterRun(_endModel(), { dev: _huDev }); } catch (e) { fileLog('heads up: the check could not start: ' + (e?.message || e)); } }
+@@ 10278 -1 +1
+-            if (!inSide() && session.demo && !myController._retracted) { try { helpNextAfterRun(model, _runT0); } catch (e) { fileLog('help: the next message could not start: ' + (e?.message || e)); } }
++            if (!inSide() && session.demo && !myController._retracted) { try { helpNextAfterRun(_endModel(), _runT0); } catch (e) { fileLog('help: the next message could not start: ' + (e?.message || e)); } }
+@@ 10280 -1 +1
+-            if (!myController._retracted) { try { skillsMaintainerAfterRun(model); } catch (e) { fileLog('skills maintainer: the pass could not start: ' + (e?.message || e)); } }
++            if (!myController._retracted) { try { skillsMaintainerAfterRun(_endModel()); } catch (e) { fileLog('skills maintainer: the pass could not start: ' + (e?.message || e)); } }
+@@ 10282 -1 +1
+-            if (_huRun && !inSide() && !myController._retracted) { try { inspectorDevCheckAfterRun(model); } catch (e) { fileLog('dev check: could not start: ' + (e?.message || e)); } }
++            if (_huRun && !inSide() && !myController._retracted) { try { inspectorDevCheckAfterRun(_endModel()); } catch (e) { fileLog('dev check: could not start: ' + (e?.message || e)); } }
 === change src/ui.html
-base 993a1c710b2e27591a7209bc
-new 7501a74472fd17f10d380da6
-@@ 8759 -1 +7
--  function jsCountKey(ev) { return ev.kind === 'exec' && ev.fn ? 'x:' + ev.fn : (ev.kind === 'plugin' || ev.kind === 'ask') && ev.fn ? 'p:' + ev.fn : JS_FILE_OP_FNS.has(ev.fn) ? ev.fn : ev.kind; }
-+  // EVERY CALL BY ITS OWN NAME (the developer, 2026-11-05: "the mainChat tool shows up as "read" in the summary line. We
-+  // need to show the actual tool names"): a read, a list, a mainChat, a historyAsk, a dsPage ... each counts as itself,
-+  // keyed 'f:<kind>|<function>' (in its kind's place on the line) - "2 read, mainChat, list", not "4 reads". The bulk
-+  // file ops keep their phrases.
-+  function jsCountKey(ev) { return ev.kind === 'exec' && ev.fn ? 'x:' + ev.fn : (ev.kind === 'plugin' || ev.kind === 'ask') && ev.fn ? 'p:' + ev.fn : JS_FILE_OP_FNS.has(ev.fn) ? ev.fn : ev.fn ? 'f:' + ev.kind + '|' + ev.fn : ev.kind; }
-+  // what a named count key shows: the function's own name
-+  const jsKeyName = (k) => (k.startsWith('f:') ? k.slice(k.indexOf('|') + 1) : k.slice(2));
-@@ 8795 -0 +1
-+      for (const x of keys) if (x.startsWith('f:' + k + '|') && seg.counts[x]) parts.push(jsN(seg.counts[x]) + jsKeyName(x));
-@@ 8802 -1 +1
--    for (const k of Object.keys(seg.failedKinds || {})) { const n = seg.failedKinds[k]; parts.push(JS_FAILED + jsN(n) + (k.startsWith('x:') || k.startsWith('p:') ? k.slice(2) : (JS_FAIL_NOUN[k] || ['call', 'calls'])[n === 1 ? 0 : 1])); }
-+    for (const k of Object.keys(seg.failedKinds || {})) { const n = seg.failedKinds[k]; parts.push(JS_FAILED + jsN(n) + (k.startsWith('x:') || k.startsWith('p:') || k.startsWith('f:') ? jsKeyName(k) : (JS_FAIL_NOUN[k] || ['call', 'calls'])[n === 1 ? 0 : 1])); }
-@@ 8805 -1 +1
--    for (const k of Object.keys(seg.caughtKinds || {})) { const n = seg.caughtKinds[k]; if (n) parts.push(JS_CAUGHT + jsN(n) + (k.startsWith('x:') || k.startsWith('p:') ? k.slice(2) : (JS_FAIL_NOUN[k] || ['call', 'calls'])[n === 1 ? 0 : 1])); }
-+    for (const k of Object.keys(seg.caughtKinds || {})) { const n = seg.caughtKinds[k]; if (n) parts.push(JS_CAUGHT + jsN(n) + (k.startsWith('x:') || k.startsWith('p:') || k.startsWith('f:') ? jsKeyName(k) : (JS_FAIL_NOUN[k] || ['call', 'calls'])[n === 1 ? 0 : 1])); }
-@@ 9222 -1 +1
--    if (seg) { if (ev.status === 'error' && !expected) { const fk = ev.kind === 'exec' && ev.fn ? 'x:' + ev.fn : (ev.kind === 'plugin' || ev.kind === 'ask') && ev.fn ? 'p:' + ev.fn : ev.kind; seg.failed = (seg.failed || 0) + 1; seg.failedKinds = seg.failedKinds || {}; seg.failedKinds[fk] = (seg.failedKinds[fk] || 0) + 1; stepEntry.failedKey = fk; stepEntry.countKey = jsCountKey(ev); } else { const ck = jsCountKey(ev); seg.counts[ck] = (seg.counts[ck] || 0) + 1; } }
-+    if (seg) { if (ev.status === 'error' && !expected) { const fk = JS_FILE_OP_FNS.has(ev.fn) ? ev.kind : jsCountKey(ev); seg.failed = (seg.failed || 0) + 1; seg.failedKinds = seg.failedKinds || {}; seg.failedKinds[fk] = (seg.failedKinds[fk] || 0) + 1; stepEntry.failedKey = fk; stepEntry.countKey = jsCountKey(ev); } else { const ck = jsCountKey(ev); seg.counts[ck] = (seg.counts[ck] || 0) + 1; } }
-=== change test/test-js-collapsed-rows-e2e.mjs
-base b41bd0d7bb411f90d7b5ea02
-new 63c2e7bb2b7fa88b553ed8b0
-@@ 6 -1 +1
-- * "2 reads, write, git" as the inner calls report in (a count of one is just the word - the developer, 2026-10-10) (each process by its name, comma separated), and a click opens it into the js
-+ * "2 read, write, git" as the inner calls report in (a count of one is just the word - the developer, 2026-10-10) (each process by its name, comma separated), and a click opens it into the js
-@@ 46 -1 +1
--await new Promise((r) => setTimeout(r, 900));
-+await new Promise((r) => setTimeout(r, 2500));
-@@ 140 -1 +1
--    await page.waitForFunction(() => /2 reads/.test((document.querySelector('.js-group .js-summary .body') || {}).textContent || ''), { timeout: 10000 }).catch(() => {});
-+    await page.waitForFunction(() => /^2 read…$/.test((document.querySelector('.js-group .js-summary .body') || {}).textContent || ''), { timeout: 10000 }).catch(() => {});
-@@ 142 -1 +1
--    ok(/^2 reads…$/.test(afterReads), `after the two reads, before the write: ${JSON.stringify(afterReads)}`);
-+    ok(/^2 read…$/.test(afterReads), `after the two reads, before the write: ${JSON.stringify(afterReads)}`);
-@@ 163 -1 +1
--    ok(done.text === '2 reads', `the first line counts only what it folded (${JSON.stringify(done.text)})`);
-+    ok(done.text === '2 read', `the first line counts only what it folded (${JSON.stringify(done.text)})`);
-@@ 307 -1 +1
--    ok(rerender.text === '2 reads / git' && rerender.steps === 5, `with its tally and its five steps rebuilt from the stored events (${JSON.stringify(rerender.text)}, ${rerender.steps} steps)`);
-+    ok(rerender.text === '2 read / git' && rerender.steps === 5, `with its tally and its five steps rebuilt from the stored events (${JSON.stringify(rerender.text)}, ${rerender.steps} steps)`);
-@@ 312 -1 +1
--    ok(reloaded.text === '2 reads / git' && reloaded.steps === 5 && !reloaded.pulsing, `after a full reload: the same line, settled, with its steps (${JSON.stringify(reloaded)})`);
-+    ok(reloaded.text === '2 read / git' && reloaded.steps === 5 && !reloaded.pulsing, `after a full reload: the same line, settled, with its steps (${JSON.stringify(reloaded)})`);
-=== change test/test-js-step-rows-expand-e2e.mjs
-base c23865eafe5ad879ee72b42b
-new da715cf329662c180a9f8fe7
-@@ 111 -1 +1
--  ok(tally === '2 reads, node, search, read [struck, muted: read]', `the line says "node", not "execution", a count of one is just the word, with commas only (${JSON.stringify(tally)})`);
-+  ok(tally === '2 read, node, search, read [struck, muted: read]', `the line says "node", not "execution", a count of one is just the word, with commas only (${JSON.stringify(tally)})`);
-=== change test/test-release-run.mjs
-base 1347d6876aaaeee27ad5c253
-new ff685b3bb61bf5c789d525f2
-@@ 107 -0 +15
-+console.log('\n[5] a folder the chunks fill: released only as git has it');
-+const cf = path.join(work, 'chunk-folder'); mkdirSync(path.join(cf, 'scripts'), { recursive: true });
-+writeFileSync(path.join(cf, 'scripts', 'build-number.txt'), '60\n'); writeFileSync(path.join(cf, 'a.txt'), 'a\n');
-+git(cf, 'init', '-q'); writeFileSync(path.join(cf, '.git', 'info', 'exclude'), '/.cb-sync.json\n'); git(cf, 'add', '-A'); git(cf, 'commit', '-q', '-m', 'first'); git(cf, 'branch', '-M', 'main');
-+// a chunk applied, not committed: it added new.txt and changed a.txt
-+writeFileSync(path.join(cf, '.cb-sync.json'), JSON.stringify({ files: { 'scripts/build-number.txt': 'x', 'a.txt': 'x', 'new.txt': 'x' }, chunk: 3 }));
-+writeFileSync(path.join(cf, 'new.txt'), 'added by a chunk\n'); writeFileSync(path.join(cf, 'a.txt'), 'a, changed by a chunk\n');
-+const s5 = rrCheckoutState(cf);
-+ok(!s5.ok && /2 of them are not committed \(a\.txt, new\.txt\)/.test(s5.problem) && /Commit and push \(step 3\) first/.test(s5.problem), `a chunk applied and not committed: it cannot be released, and it says why (${s5.problem})`);
-+said.length = 0;
-+const r5 = runCheckoutRelease({ checkout: cf, channel: 'devtest', log: (m) => said.push(m) });
-+ok(r5 === 1 && /Nothing was released: This folder gets its files from chunks/.test(said.join('\n')) && git(cf, 'log', '-1', '--format=%s').stdout.trim() === 'first' && !existsSync(path.join(cf, '.git', 'cb-releasing.json')), 'a release refuses it: no "Source of build" commit, and the release\'s marker is gone after');
-+git(cf, 'add', '-A'); git(cf, 'commit', '-q', '-m', 'the chunk');
-+ok(rrCheckoutState(cf).ok, 'committed: it can be released');
+base dea4104d5e05d3a7eaf26460
+new 1a312304cc8b04330bd4ad32
+@@ 47 -4 +4
+-    --note: #7972c9;        /* (2026-11-09, "the purple stands out slightly more than the orange ... fade it a little": chroma 0.164 -> 0.131, the orange's 0.137, lightness kept) THE SIDE AGENTS' NOTES (Heads up, the dev check): PURPLE (2026-11-08, was the blue #7fb9d6 - "not quite right" with the palette), the fill tone (borders, the button's edge); text takes --note-text; apart from the gold that marks the developer's own message and box (the developer, 2026-11-02: "reserve the primary border color box for the user messages and text input") */
+-    --note-rgb: 121, 114, 201;
+-    --note-text: #938dd6;   /* the purple as TEXT: lighter - the fill tone is too dark for 12px text (6.0:1 here) and thin strokes read darker than a fill */
+-    --note-hover: #8b85d3;  /* --note a little lighter: a note's button edge, hovered (a fixed colour, not a color-mix, so it reads back exactly - the caret takes it) */
++    --note: #7975be;        /* (2026-11-12, "the purple still stands out a little more than the orange": chroma 0.130 -> 0.110, lightness kept; was #7972c9) (2026-11-09, "the purple stands out slightly more than the orange ... fade it a little": chroma 0.164 -> 0.131, the orange's 0.137, lightness kept) THE SIDE AGENTS' NOTES (Heads up, the dev check): PURPLE (2026-11-08, was the blue #7fb9d6 - "not quite right" with the palette), the fill tone (borders, the button's edge); text takes --note-text; apart from the gold that marks the developer's own message and box (the developer, 2026-11-02: "reserve the primary border color box for the user messages and text input") */
++    --note-rgb: 121, 117, 190;
++    --note-text: #938fcd;   /* the purple as TEXT: lighter - the fill tone is too dark for 12px text (6.0:1 here) and thin strokes read darker than a fill */
++    --note-hover: #8b87c9;  /* --note a little lighter: a note's button edge, hovered (a fixed colour, not a color-mix, so it reads back exactly - the caret takes it) */
+@@ 464 -1 +1
+-  #chatMain { flex: 1 1 880px; min-width: 0; display: flex; flex-direction: column; min-height: 0; position: relative; }
++  #chatMain { flex: 1 1 0; min-width: 320px; display: flex; flex-direction: column; min-height: 0; position: relative; }
+@@ 472 -1 +1
+-  #sidePanel { flex: 50 0 300px; min-width: 300px; max-width: 600px; display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--border); background: var(--panel-alt); transition: flex-basis 0.12s ease, min-width 0.12s ease, max-width 0.12s ease; }
++  #sidePanel { flex: 0 0 var(--left-w, 25%); min-width: 200px; max-width: 60%; position: relative; display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--border); background: var(--panel-alt); transition: flex-basis 0.12s ease, min-width 0.12s ease, max-width 0.12s ease; }
+@@ 492 -0 +30
++  /* THREE COLUMNS (the developer, 2026-11-12): the left panel, the chat, the RIGHT PANEL - each side 25% to start, the chat
++     50%, each side dragged to its own width (kept per project) and collapsed on its own */
++  #rightPanel { flex: 0 0 var(--right-w, 25%); min-width: 200px; max-width: 60%; position: relative; display: flex; flex-direction: column; min-height: 0; border-left: 1px solid var(--border); background: var(--panel-alt); transition: flex-basis 0.12s ease, min-width 0.12s ease, max-width 0.12s ease; }
++  #rightPanel.collapsed { flex-basis: 0; min-width: 0; max-width: 0; border-left: none; overflow: hidden; }
++  #chat.resizing #sidePanel, #chat.resizing #rightPanel { transition: none; }
++  #chat.resizing { cursor: col-resize; user-select: none; }
++  .panel-resizer { position: absolute; top: 0; bottom: 0; width: 7px; z-index: 25; cursor: col-resize; }
++  #sidePanel > .panel-resizer { right: -4px; }
++  #rightPanel > .panel-resizer { left: -4px; }
++  .panel-resizer:hover, #chat.resizing .panel-resizer.active { background: linear-gradient(90deg, transparent 3px, var(--accent) 3px, var(--accent) 4px, transparent 4px); }
++  .collapsed > .panel-resizer { display: none; }
++  .rp-head { display: flex; align-items: center; gap: 6px; flex-shrink: 0; padding: 0 0 0 10px; height: 31px; border-bottom: 1px solid var(--border); font-size: 11px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
++  .rp-head .rp-count { color: var(--accent-text); }
++  .rp-head .side-collapse { margin-left: auto; height: 100%; }
++  /* the list fills what the artifacts and the status bar leave; the dock look (its orange box) is not wanted here */
++  #rightPanel .rp-running { flex: 1 1 auto; min-height: 0; overflow: auto; margin: 0; padding: 4px 8px 6px; border: none; border-radius: 0; background: transparent; box-shadow: none; }
++  #rightPanel .rp-running .bg-row .row-body { min-width: 0; overflow-wrap: anywhere; }
++  #rightPanel .rp-running .ag-convo { margin-left: 0; max-height: 50vh; }
++  #rightPanel #carousel { border-top: 1px solid var(--border); }
++  #rightReopen { position: absolute; top: 8px; right: 0; z-index: 30; width: 18px; height: 26px; border: 1px solid var(--border); border-right: none; border-radius: 5px 0 0 5px; background: var(--panel); color: var(--muted); cursor: pointer; font-size: 12px; line-height: 24px; padding: 0; display: none; }
++  #rightReopen:hover { color: var(--accent-text); }
++  #rightReopen:hover::after { content: ''; position: absolute; inset: 0; border: 1px solid var(--accent); border-right: none; border-radius: 4px 0 0 4px; pointer-events: none; }
++  #chat.right-collapsed #rightReopen { display: block; }
++  html.side-mode #rightPanel, html.side-mode #rightReopen { display: none !important; }
++  /* in the panel the status bar's rows go bottom-up: the path, then the icons above it, the branches above them */
++  .side-chrome:not(.docked) .sc-main { flex-direction: column-reverse; align-items: stretch; gap: 5px; }
++  .side-chrome:not(.docked) .sc-right { justify-content: flex-end; flex-wrap: wrap; }   /* (the icons to the right - the developer, 2026-11-12) */
++  .side-chrome:not(.docked) .sc-left { flex: 0 0 auto; }
++  /* the line between the branches and the icons runs the panel's whole width (the developer, 2026-11-12), past the bar's 8px padding */
++  #rightPanel .side-chrome:not(.docked) .sc-branches { margin-left: -8px; margin-right: -8px; padding-left: 5px; padding-right: 8px; }
+@@ 897 -1 +1
+-  #logScroll { padding: 16px 20px 48px 36px; overflow-anchor: none; }
++  #logScroll { padding: 16px 18px 48px 18px; overflow-anchor: none; }   /* (18px each side, 2026-11-12 - the developer: "more margin on the left side of the chat than the right and they're both too much"; was 36/20. 18 is what a task's 16px bracket needs on the left) */
+@@ 1569 -0 +1
++  #chat:has(#sidePanel.fullscreen) #rightPanel { display: none; }
+@@ 2307 -1 +1
+-    /* Horizontal padding MATCHES #logScroll (36 left / 20 right) so the centered
++    /* Horizontal padding MATCHES #logScroll (18 each side) so the centered
+@@ 2309 -1 +1
+-    padding: 10px calc(20px + var(--log-sb, 0px)) 8px 36px;   /* (+ the conversation's scrollbar, so the two columns stay one width - setLogScrollbarVar) */
++    padding: 10px calc(18px + var(--log-sb, 0px)) 8px 18px;   /* (+ the conversation's scrollbar, so the two columns stay one width - setLogScrollbarVar) */
+@@ 2441 -2 +7
+-    font-size: 7.5px; font-weight: 700; line-height: 10px; text-align: center; z-index: 3;
+-    background: var(--accent); border: 1px solid rgba(24, 22, 21, 0.5); color: var(--bg); -webkit-text-fill-color: var(--bg); }
++    font-size: 7.5px; font-weight: 900; line-height: 10px; text-align: center; z-index: 3;
++    background: var(--accent); border: 0.5px solid rgba(24, 22, 21, 0.5); color: var(--bg); -webkit-text-fill-color: var(--bg);
++    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent-hover) 60%, var(--accent)); }
++  /* (2026-11-12, again: "the outer border be 1 px instead of 2" - 1px CSS is two screen pixels on a scaled display, so
++     0.5px: one screen pixel there, still 1px unscaled; and the light ring "slightly closer to the bubble color") */
++  /* (the developer, 2026-11-12: the number bold - 700 read thin at 7.5px, so 900 - and "a border that's a little brighter
++     than the orange between the orange circle and the faded black circle": a 1px ring of --accent-hover inside the edge) */
+@@ 2459 -1 +1
+-    background: var(--error); }
++    background: var(--error); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--error) 75%, white); }
+@@ 3254 -0 +3
++  /* the commit window's copy (2026-11-12): beside the ×, at the header's right */
++  .cm-copy { margin-left: auto; background: none; border: none; cursor: pointer; font-size: 15px; color: var(--muted); padding: 4px 8px; line-height: 1; }
++  .cm-copy:hover, .cm-copy.copied { color: var(--accent-text); }
+@@ 3615 -0 +1
++    <div class="panel-resizer" id="leftResizer" title="Drag to resize - the width is kept for this project"></div>
+@@ 3651 -8 +0
+-    <!-- ARTIFACT CAROUSEL (#5): portrait thumbnails of every plan + diagram in
+-         this conversation — the current plan pinned leftmost, diagrams to the
+-         right, newest first (last 10 rendered). Click a thumbnail → document
+-         mode. Hidden until the first artifact exists. -->
+-    <div id="carousel">
+-      <div class="carousel-head"><span>Artifacts</span><span id="carCount"></span></div>
+-      <div class="carousel-strip" id="carouselStrip"></div>
+-    </div>
+@@ 3675 -43 +0
+-    <!-- Status bar = THREE columns. LEFT (open folder — shrinks to fit, ellipsis) · CENTER (git pills — centered,
+-         takes the remaining width) · RIGHT (edit toggle · token count · ⚙ — shrinks to fit, right-aligned). The git
+-         badges render into #gitProjects here (the old above-input strip was retired). -->
+-    <div class="side-chrome" id="sideChrome">
+-      <!-- Git-project pills get their OWN row, above everything else: one per repo found in the cwd (branch icon +
+-           name + uncommitted-count bubble). They used to share the line with the path and the Edit toggle, which
+-           left three unrelated things competing for one narrow row — and with several repos the branches won,
+-           squeezing the rest. Full width, left to right, wrapping onto a second line when there are too many. -->
+-      <div class="sc-branches git-projects" id="gitProjects"></div>
+-      <div class="sc-main">
+-      <div class="sc-col sc-left">
+-        <span class="proj-path" id="projectPath" title="Click for project options" onclick="openProjectMenu()">(no project)</span>
+-        <span class="chrome-break"></span>
+-      </div>
+-
+-      <div class="sc-col sc-right">
+-        <!-- Plugin-contributed status-bar buttons, right-aligned to the LEFT of the built-in Edit/tokens/⚙. Content,
+-             style, tooltip + click are all owned by the plugin (polled from /api/plugin-status). Empty → collapses. -->
+-        <!-- ONE SET OF ICONS, uniformly spaced, all drawn the same way (a 14px silhouette in the bar's colour, a small
+-             count badge on the upper right): the plugin-contributed items, then ▶ (background processes), then 🧩
+-             (plugin status). Only the settings gear stays apart, at the far right. -->
+-        <span class="status-icons" id="statusIcons">
+-          <!-- Plugin-contributed status-bar buttons (polled from /api/plugin-status). Empty → collapses. -->
+-          <span class="plugin-status-items" id="pluginStatusItems"></span>
+-          <!-- Background processes the agent started (a <js background="true"> snippet): ▶ + a floating running-count; always shown,
+-               idle (dimmed) while nothing runs. Click → selected + the pinned list below the chat; click again → hidden. -->
+-          <span class="sb-icon bg-procs" id="bgProcsBtn" onclick="toggleBgDock()" title="Background processes"><span class="ps-text">▶</span><span class="plugin-badge ps-badge" id="bgProcsBadge" style="display:none;">0</span></span>
+-          <span class="sb-icon bg-procs" id="agentsBtn" onclick="toggleAgentsDock()" title="Sub-agents" style="display:none;"><span class="ps-text"><svg class="ag-person" width="12" height="12" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><circle cx="8" cy="4.6" r="3"/><path d="M2.2 15c0-3.4 2.6-6 5.8-6s5.8 2.6 5.8 6z"/></svg></span><span class="plugin-badge ps-badge" id="agentsBadge" style="display:none;">0</span></span>
+-          <!-- Plugin status: shown when a plugin failed to load or a loaded one has a runtime warning; the badge counts. -->
+-          <span class="sb-icon plugin-warn" id="pluginWarn" onclick="openPluginIssues()" style="display:none;" title="Plugin status — click for details"><span class="ps-text">🧩</span><span class="plugin-badge ps-badge" id="pluginBadge">0</span></span>
+-        </span>
+-        <span class="edit-toggle" id="editToggle" onclick="toggleEditAllowed()" title="Edit — the agent edits files and runs commands. Click to switch to read-only (discuss): it investigates and explains but won't modify files or run shell commands.">Edit</span>
+-        <input type="checkbox" id="discussToggle" style="display:none;">
+-        <!-- Conversation token counter — approximate total tokens sent to the model this conversation. Shows just the
+-             compact count ("139K"), hidden at 0. -->
+-        <span id="tokenCounter" class="tok-count" style="display:none;" title="Approximate total tokens in this conversation (what's sent to the model). Compaction shrinks it — see Settings."></span>
+-        <!-- The daily credit budget the gateway states on every reply, as a pie: the filled part is what is LEFT. Takes the
+-             counter's place once a reply has carried the budget; an endpoint that states none keeps the counter. -->
+-        <span id="budgetPie" class="budget-pie" style="display:none;"></span>
+-        <button class="settings-btn" id="settingsBtn" onclick="openSettings()" title="Settings — model, API key, GitLab, timeout, Debug, Log, Clear conversation" aria-label="Settings"><svg class="gear" width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><g fill="currentColor"><rect x="6.75" y="0.6" width="2.5" height="3.3" rx="0.6" transform="rotate(0 8 8)"/><rect x="6.75" y="0.6" width="2.5" height="3.3" rx="0.6" transform="rotate(45 8 8)"/><rect x="6.75" y="0.6" width="2.5" height="3.3" rx="0.6" transform="rotate(90 8 8)"/><rect x="6.75" y="0.6" width="2.5" height="3.3" rx="0.6" transform="rotate(135 8 8)"/><rect x="6.75" y="0.6" width="2.5" height="3.3" rx="0.6" transform="rotate(180 8 8)"/><rect x="6.75" y="0.6" width="2.5" height="3.3" rx="0.6" transform="rotate(225 8 8)"/><rect x="6.75" y="0.6" width="2.5" height="3.3" rx="0.6" transform="rotate(270 8 8)"/><rect x="6.75" y="0.6" width="2.5" height="3.3" rx="0.6" transform="rotate(315 8 8)"/></g><circle cx="8" cy="8" r="4.3" fill="none" stroke="currentColor" stroke-width="2.7"/></svg></button>
+-      </div>
+-      </div><!-- /.sc-main -->
+-    </div>
+@@ 3721 -0 +1
++  <button id="rightReopen" onclick="toggleRightPanel()" title="Show the right panel">«</button>
+@@ 3800 -0 +56
++  <!-- THE RIGHT PANEL (the developer, 2026-11-12): from the bottom up - the project's path, the icons (plugins, Edit, the
++       count, settings), the git branches, the artifacts, and at the top ONE list of what runs: background processes
++       and sub-agents (their icons and the docks in the chat are gone). Collapsed, the status bar docks under the input. -->
++  <aside id="rightPanel">
++    <div class="panel-resizer" id="rightResizer" title="Drag to resize - the width is kept for this project"></div>
++    <div class="rp-head"><span class="rp-title">Running</span><span class="rp-count" id="rpCount"></span><button class="side-collapse" id="rightToggle" onclick="toggleRightPanel()" title="Collapse the right panel">»</button></div>
++    <div class="rp-running bg-dock ag-dock" id="rpRunning"></div>
++    <!-- ARTIFACT CAROUSEL (#5): portrait thumbnails of every plan + diagram in
++         this conversation — the current plan pinned leftmost, diagrams to the
++         right, newest first (last 10 rendered). Click a thumbnail → document
++         mode. Hidden until the first artifact exists. -->
++    <div id="carousel">
++      <div class="carousel-head"><span>Artifacts</span><span id="carCount"></span></div>
++      <div class="carousel-strip" id="carouselStrip"></div>
++    </div>
++    <!-- Status bar = THREE columns. LEFT (open folder — shrinks to fit, ellipsis) · CENTER (git pills — centered,
++         takes the remaining width) · RIGHT (edit toggle · token count · ⚙ — shrinks to fit, right-aligned). The git
++         badges render into #gitProjects here (the old above-input strip was retired). -->
++    <div class="side-chrome" id="sideChrome">
++      <!-- Git-project pills get their OWN row, above everything else: one per repo found in the cwd (branch icon +
++           name + uncommitted-count bubble). They used to share the line with the path and the Edit toggle, which
++           left three unrelated things competing for one narrow row — and with several repos the branches won,
++           squeezing the rest. Full width, left to right, wrapping onto a second line when there are too many. -->
++      <div class="sc-branches git-projects" id="gitProjects"></div>
++      <div class="sc-main">
++      <div class="sc-col sc-left">
++        <span class="proj-path" id="projectPath" title="Click for project options" onclick="openProjectMenu()">(no project)</span>
++        <span class="chrome-break"></span>
++      </div>
 +
++      <div class="sc-col sc-right">
++        <!-- Plugin-contributed status-bar buttons, right-aligned to the LEFT of the built-in Edit/tokens/⚙. Content,
++             style, tooltip + click are all owned by the plugin (polled from /api/plugin-status). Empty → collapses. -->
++        <!-- ONE SET OF ICONS, uniformly spaced, all drawn the same way (a 14px silhouette in the bar's colour, a small
++             count badge on the upper right): the plugin-contributed items, then ▶ (background processes), then 🧩
++             (plugin status). Only the settings gear stays apart, at the far right. -->
++        <span class="status-icons" id="statusIcons">
++          <!-- Plugin-contributed status-bar buttons (polled from /api/plugin-status). Empty → collapses. -->
++          <span class="plugin-status-items" id="pluginStatusItems"></span>
++          <!-- (the ▶ and sub-agent icons are gone since 2026-11-12: what runs is the list at the top of the right panel) -->
++          <!-- Plugin status: shown when a plugin failed to load or a loaded one has a runtime warning; the badge counts. -->
++          <span class="sb-icon plugin-warn" id="pluginWarn" onclick="openPluginIssues()" style="display:none;" title="Plugin status — click for details"><span class="ps-text">🧩</span><span class="plugin-badge ps-badge" id="pluginBadge">0</span></span>
++        </span>
++        <span class="edit-toggle" id="editToggle" onclick="toggleEditAllowed()" title="Edit — the agent edits files and runs commands. Click to switch to read-only (discuss): it investigates and explains but won't modify files or run shell commands.">Edit</span>
++        <input type="checkbox" id="discussToggle" style="display:none;">
++        <!-- Conversation token counter — approximate total tokens sent to the model this conversation. Shows just the
++             compact count ("139K"), hidden at 0. -->
++        <span id="tokenCounter" class="tok-count" style="display:none;" title="Approximate total tokens in this conversation (what's sent to the model). Compaction shrinks it — see Settings."></span>
++        <!-- The daily credit budget the gateway states on every reply, as a pie: the filled part is what is LEFT. Takes the
++             counter's place once a reply has carried the budget; an endpoint that states none keeps the counter. -->
++        <span id="budgetPie" class="budget-pie" style="display:none;"></span>
++        <button class="settings-btn" id="settingsBtn" onclick="openSettings()" title="Settings — model, API key, GitLab, timeout, Debug, Log, Clear conversation" aria-label="Settings"><svg class="gear" width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><g fill="currentColor"><rect x="6.75" y="0.6" width="2.5" height="3.3" rx="0.6" transform="rotate(0 8 8)"/><rect x="6.75" y="0.6" width="2.5" height="3.3" rx="0.6" transform="rotate(45 8 8)"/><rect x="6.75" y="0.6" width="2.5" height="3.3" rx="0.6" transform="rotate(90 8 8)"/><rect x="6.75" y="0.6" width="2.5" height="3.3" rx="0.6" transform="rotate(135 8 8)"/><rect x="6.75" y="0.6" width="2.5" height="3.3" rx="0.6" transform="rotate(180 8 8)"/><rect x="6.75" y="0.6" width="2.5" height="3.3" rx="0.6" transform="rotate(225 8 8)"/><rect x="6.75" y="0.6" width="2.5" height="3.3" rx="0.6" transform="rotate(270 8 8)"/><rect x="6.75" y="0.6" width="2.5" height="3.3" rx="0.6" transform="rotate(315 8 8)"/></g><circle cx="8" cy="8" r="4.3" fill="none" stroke="currentColor" stroke-width="2.7"/></svg></button>
++      </div>
++      </div><!-- /.sc-main -->
++    </div>
++  </aside>
+@@ 4079 -0 +1
++      <button class="cm-copy" id="commitCopy" onclick="copyCommitView(this)" title="Copy the changes - with the suggested commit messages once they are there - as Markdown" aria-label="Copy">⧉</button>
+@@ 4842 -1 +1
+-    rc.afterRow = () => { try { pinHeadsUp(); } catch {} spinner.pinToBottom(); try { pinPendingSteer(); } catch {} try { pinBgDock(); } catch {} try { pinAgentsDock(); } catch {} };   // the process dock stays below the status row
++    rc.afterRow = () => { try { pinHeadsUp(); } catch {} try { pinLiveCheck(); } catch {} spinner.pinToBottom(); try { pinPendingSteer(); } catch {} try { pinBgDock(); } catch {} try { pinAgentsDock(); } catch {} };   // the process dock stays below the status row
+@@ 5463 -0 +1
++    try { applyPanelSizes(projectPath); } catch {}   // this project's panel widths
+@@ 6742 -7 +1
+-  function toggleBgDock(force) {
+-    _bgDockOpen = typeof force === 'boolean' ? force : !_bgDockOpen;
+-    if (_bgDockOpen && _agDockOpen) toggleAgentsDock(false);   // one dock at a time
+-    try { uiState.set('bgDockOpen', _bgDockOpen); } catch {}
+-    renderBgDock(); renderBgIcon();
+-    if (_bgDockOpen && typeof force !== 'boolean') dockIntoView('.bg-dock');
+-  }
++  function toggleBgDock() { setRightPanelCollapsed(false); renderRunning(); }   // (/bg and the like: the right panel shows the list)
+@@ 6823 -1 +1
+-    const res = RC && RC.log ? RC.log.querySelector(`.bg-result[data-call-id="${CSS.escape(cid)}"]`) : null;
++    const res = document.getElementById('rpRunning')?.querySelector(`.bg-result[data-call-id="${CSS.escape(cid)}"]`) || null;   // (the list is in the right panel)
+@@ 6834 -20 +23
+-  function renderBgDock() {
+-    if (!RC || !RC.log) return;
+-    let dock = RC.log.querySelector('.bg-dock');
+-    const procs = _bgProcs || [];
+-    if (!_bgDockOpen) { if (dock) dock.remove(); return; }
+-    if (!dock) { dock = document.createElement('div'); dock.className = 'bg-dock'; }
+-    dock.innerHTML = '';
+-    const live = procs.filter((p) => p.alive).length;
+-    const head = document.createElement('div'); head.className = 'bg-dock-head';
+-    head.innerHTML = '<span>▶</span><span>Running in the background' + (live ? ' · ' + live : '') + '</span><span class="bg-dock-hint">click ▶ in the status bar (or here) to hide</span>';
+-    head.onclick = () => toggleBgDock(false);
+-    dock.appendChild(head);
+-    // The button is always in the bar now, so an open, EMPTY list must say so rather than show nothing.
+-    if (!procs.length) { const e = document.createElement('div'); e.className = 'bg-dock-empty'; e.textContent = 'Nothing running in the background. A server or build the agent starts in the background, and any snippet moved there (⇱ on it, or waiting its turn to change files), shows up here with a Stop button.'; dock.appendChild(e); }
+-    // RUNNING ones are the list; an ENDED one leaves it into "Finished", folded - as the agents dock does (the developer,
+-    // 2026-10-23: "yes, for bg processes, finished to match")
+-    const now = procs.filter((p) => p.alive), fin = procs.filter((p) => !p.alive);
+-    if (procs.length && !now.length) { const e = document.createElement('div'); e.className = 'bg-dock-empty'; e.textContent = 'Nothing running in the background now. What ended is under "Finished".'; dock.appendChild(e); }
+-    for (const p of now) dock.appendChild(bgEntryEl(p));
+-    if (fin.length) {
++  // WHAT RUNS, ONE LIST AT THE TOP OF THE RIGHT PANEL (the developer, 2026-11-12: "1 list of bg processes and agents
++  // running. So we don't need the agents or bg processes icon anymore, we won't display either in the conversation
++  // area"): working sub-agents and running processes, then one "Finished" fold with what ended of both. The rows are the
++  // docks' rows as they were - an agent opens to its conversation, a process to its output, each with its Stop.
++  function renderBgDock() { renderRunning(); }
++  function renderRunning() {
++    const box = document.getElementById('rpRunning');
++    if (!box) return;
++    const procs = _bgProcs || [], agents = _agents || [];
++    const pNow = procs.filter((p) => p.alive), pFin = procs.filter((p) => !p.alive);
++    const aNow = agents.filter((a) => agLive(a) || a.state === 'needs-reply'), aFin = agents.filter((a) => !aNow.includes(a));
++    const cnt = document.getElementById('rpCount');
++    if (cnt) cnt.textContent = (pNow.length + aNow.length) ? String(pNow.length + aNow.length) : '';
++    box.innerHTML = '';
++    if (!pNow.length && !aNow.length) {
++      const e = document.createElement('div'); e.className = 'bg-dock-empty';
++      e.textContent = (pFin.length || aFin.length) ? 'Nothing running now. What ended is under "Finished".' : 'Nothing running. A sub-agent the agent starts, and a server, build or snippet it runs in the background, shows here while it runs, with a Stop button.';
++      box.appendChild(e);
++    }
++    for (const a of aNow) box.appendChild(agEntryEl(a));
++    for (const p of pNow) box.appendChild(bgEntryEl(p));
++    const fin = aFin.length + pFin.length;
++    if (fin) {
+@@ 6855 -4 +4
+-      fh.textContent = (_bgFinOpen ? '▾ ' : '▸ ') + 'Finished (' + fin.length + ')';
+-      fh.onclick = () => { _bgFinOpen = !_bgFinOpen; renderBgDock(); };
+-      dock.appendChild(fh);
+-      if (_bgFinOpen) for (const p of fin) dock.appendChild(bgEntryEl(p));
++      fh.textContent = (_bgFinOpen ? '▾ ' : '▸ ') + 'Finished (' + fin + ')';
++      fh.onclick = () => { _bgFinOpen = !_bgFinOpen; renderRunning(); };
++      box.appendChild(fh);
++      if (_bgFinOpen) { for (const a of aFin) box.appendChild(agEntryEl(a)); for (const p of pFin) box.appendChild(bgEntryEl(p)); }
+@@ 6860 -1 +0
+-    pinBgDock(dock);
+@@ 6866 -1 +5
+-  function pinPendingSteer() {
++  // A CHECK OF THE WORK STAYS AT THE BOTTOM WHILE IT RUNS (the developer, 2026-11-12: "when it's review time, we start
++  // the checking and then the agent's final message comes in below that. We should pin the checking sub agent
++  // conversation to the bottom ... once it's done, the node is unpinned"): its line, with its steps under it, is moved
++  // below each row that comes while it checks; once it is done it stays where it ended, and what comes next is below it
++  function pinLiveCheck() {
+@@ 6868 -1 +8
+-    for (const n of RC.log.querySelectorAll(':scope > .pending-steer')) RC.log.appendChild(n);
++    // (the rows that came after it are moved above it - the check's own line is never taken out and put back)
++    for (const w of RC.log.querySelectorAll(':scope > .work-check.wc-live')) {
++      for (let n = w.nextElementSibling; n;) {
++        const next = n.nextElementSibling;
++        if (!n.classList.contains('status') && !n.classList.contains('pending-steer') && !n.classList.contains('work-check') && !n.classList.contains('check-step-el') && !n.classList.contains('heads-up-row')) w.before(n);
++        n = next;
++      }
++    }
+@@ 6870 -3 +1
+-  // Keep the dock LAST in the log (called from RC.afterRow after every appended row). A full re-render wipes the
+-  // log, so if the dock should be showing but is gone, rebuild it — this is what makes it survive event-patch replays.
+-  function pinBgDock(dock) {
++  function pinPendingSteer() {
+@@ 6874 -3 +1
+-    dock = dock || RC.log.querySelector('.bg-dock');
+-    if (!dock) { if (_bgDockOpen && (_bgProcs || []).length) renderBgDock(); return; }
+-    if (dock !== RC.log.lastChild) RC.log.appendChild(dock);
++    for (const n of RC.log.querySelectorAll(':scope > .pending-steer')) RC.log.appendChild(n);
+@@ 6878 -0 +1
++  function pinBgDock() {}   // (the list is in the right panel now, not in the log)
+@@ 6910 -8 +1
+-  function toggleAgentsDock(force) {
+-    _agDockOpen = typeof force === 'boolean' ? force : !_agDockOpen;
+-    if (_agDockOpen && _bgDockOpen) toggleBgDock(false);   // one dock at a time
+-    try { uiState.set('agDockOpen', _agDockOpen); } catch {}
+-    renderAgentsDock(); renderAgentsIcon();
+-    if (_agDockOpen) hydrateAgents();
+-    if (_agDockOpen && typeof force !== 'boolean') dockIntoView('.ag-dock');
+-  }
++  function toggleAgentsDock() { setRightPanelCollapsed(false); hydrateAgents(); }
+@@ 6992 -34 +2
+-  // JUST AFTER the main log, not in it: an agent's conversation is drawn with the chat's own rows, and the sweeps that
+-  // settle the main run's unfinished tool rows would take its running steps for abandoned ones
+-  const agDockOf = (log) => (log && log.nextElementSibling && log.nextElementSibling.classList.contains('ag-dock') ? log.nextElementSibling : null);
+-  function renderAgentsDock() {
+-    const log = mainChat.rc.log;
+-    if (!log) return;
+-    let dock = agDockOf(log);
+-    if (!_agDockOpen) { if (dock) dock.remove(); return; }
+-    if (!dock) { dock = document.createElement('div'); dock.className = 'ag-dock'; }
+-    dock.innerHTML = '';
+-    const live = (_agents || []).filter(agLive).length;
+-    const head = document.createElement('div'); head.className = 'bg-dock-head';
+-    head.innerHTML = '<span>' + AG_PERSON + '</span><span>Sub-agents' + (live ? ' · ' + live + ' working' : '') + '</span><span class="bg-dock-hint">click ' + AG_PERSON + ' in the status bar (or here) to hide</span>';
+-    head.onclick = () => toggleAgentsDock(false);
+-    dock.appendChild(head);
+-    // WORKING ones, and one waiting for an answer, are the list; a FINISHED one leaves it (the developer, 2026-10-23: "when
+-    // it's done we should remove it from the dock") into "Finished", folded, where its conversation can still be opened
+-    const now = (_agents || []).filter((a) => agLive(a) || a.state === 'needs-reply'), fin = (_agents || []).filter((a) => !now.includes(a));
+-    if (!now.length) { const e = document.createElement('div'); e.className = 'bg-dock-empty'; e.textContent = 'No sub-agent is working. One the agent starts shows here while it works; a finished one is under "Finished".'; dock.appendChild(e); }
+-    for (const a of now) dock.appendChild(agEntryEl(a));
+-    if (fin.length) {
+-      const fh = document.createElement('div'); fh.className = 'row tool bg-row ag-row ag-fin-head';
+-      fh.textContent = (_agFinOpen ? '▾ ' : '▸ ') + 'Finished (' + fin.length + ')';
+-      fh.onclick = () => { _agFinOpen = !_agFinOpen; renderAgentsDock(); };
+-      dock.appendChild(fh);
+-      if (_agFinOpen) for (const a of fin) dock.appendChild(agEntryEl(a));
+-    }
+-    if (agDockOf(log) !== dock) log.after(dock);
+-  }
+-  function pinAgentsDock() {
+-    const log = mainChat.rc.log;
+-    if (!log || RC.log !== log) return;   // the main chat's
+-    if (!agDockOf(log) && _agDockOpen) renderAgentsDock();
+-  }
++  function renderAgentsDock() { renderRunning(); }
++  function pinAgentsDock() {}
+@@ 7941 -0 +9
++    if (!_applyingUiState) uiState.set('sideCollapsed', collapsed);   // persist a user action; hydration does not re-write
++  }
++  // THE RIGHT PANEL (2026-11-12) holds the status bar now: collapsed, the bar DOCKS under the input as it did when the
++  // left panel held it; opened, it goes back to the panel's foot
++  function setRightPanelCollapsed(collapsed) {
++    const p = document.getElementById('rightPanel');
++    if (!p) return;
++    p.classList.toggle('collapsed', collapsed);
++    document.getElementById('chat')?.classList.toggle('right-collapsed', collapsed);
+@@ 7945 -1 +1
+-      (collapsed ? footer : p).appendChild(chrome);   // dock under input / back into panel
++      (collapsed ? footer : p).appendChild(chrome);
+@@ 7948 -1 +61
+-    if (!_applyingUiState) uiState.set('sideCollapsed', collapsed);   // persist a user action; hydration does not re-write
++    if (!_applyingUiState) uiState.set('rightCollapsed', collapsed);
++  }
++  function toggleRightPanel() {
++    const p = document.getElementById('rightPanel');
++    setRightPanelCollapsed(!(p && p.classList.contains('collapsed')));
++  }
++  // EACH PANEL'S WIDTH, DRAGGED, KEPT PER PROJECT (the developer, 2026-11-12): as a share of the window (25% each to
++  // start), so a project opened on another screen keeps its proportions. One map in the UI state, by project path.
++  const PANEL_DEFAULT = 25, PANEL_MIN = 10, PANEL_MAX = 45;
++  function panelSizesFor(project) {
++    const all = uiState.get('panelSizes', {}) || {};
++    const v = (project && all[project]) || {};
++    const ok = (x) => (Number.isFinite(x) ? Math.min(PANEL_MAX, Math.max(PANEL_MIN, x)) : PANEL_DEFAULT);
++    return { l: ok(v.l), r: ok(v.r) };
++  }
++  function applyPanelSizes(project) {
++    const chat = document.getElementById('chat');
++    if (!chat) return;
++    const { l, r } = panelSizesFor(project);
++    chat.style.setProperty('--left-w', l + '%');
++    chat.style.setProperty('--right-w', r + '%');
++  }
++  function savePanelSize(project, side, pct) {
++    if (!project) return;
++    const all = { ...(uiState.get('panelSizes', {}) || {}) };
++    const cur = { ...(all[project] || {}) };
++    cur[side] = Math.round(pct * 10) / 10;
++    delete all[project];
++    all[project] = cur;   // the newest last; only the 40 most recent projects are kept
++    const keys = Object.keys(all);
++    for (const k of keys.slice(0, Math.max(0, keys.length - 40))) delete all[k];
++    uiState.set('panelSizes', all);
++  }
++  function initPanelResizers() {
++    const chat = document.getElementById('chat');
++    for (const [id, side] of [['leftResizer', 'l'], ['rightResizer', 'r']]) {
++      const h = document.getElementById(id);
++      if (!h || !chat) continue;
++      h.addEventListener('pointerdown', (e) => {
++        if (e.button !== 0) return;
++        e.preventDefault();
++        const box = chat.getBoundingClientRect();
++        let pct = null;
++        h.setPointerCapture(e.pointerId);
++        chat.classList.add('resizing'); h.classList.add('active');
++        const move = (ev) => {
++          const px = side === 'l' ? ev.clientX - box.left : box.right - ev.clientX;
++          pct = Math.min(PANEL_MAX, Math.max(PANEL_MIN, (px / box.width) * 100));
++          chat.style.setProperty(side === 'l' ? '--left-w' : '--right-w', pct + '%');
++        };
++        const up = () => {
++          h.removeEventListener('pointermove', move); h.removeEventListener('pointerup', up); h.removeEventListener('pointercancel', up);
++          chat.classList.remove('resizing'); h.classList.remove('active');
++          if (pct != null) savePanelSize(activeProject, side, pct);
++          requestAnimationFrame(fitGitPills);
++        };
++        h.addEventListener('pointermove', move); h.addEventListener('pointerup', up); h.addEventListener('pointercancel', up);
++      });
++      // a double-click puts the panel back to its starting width
++      h.addEventListener('dblclick', () => { chat.style.setProperty(side === 'l' ? '--left-w' : '--right-w', PANEL_DEFAULT + '%'); savePanelSize(activeProject, side, PANEL_DEFAULT); });
++    }
+@@ 7993 -1 +0
+-    renderSubagents();   // the collapsed-panel fallback list appears/hides with the panel
+@@ 8080 -15 +2
+-    // collapsed-panel fallback under the input
+-    const fb = document.getElementById('saFallback');
+-    if (fb) {
+-      const collapsed = document.getElementById('sidePanel')?.classList.contains('collapsed');
+-      fb.innerHTML = '';
+-      if (collapsed && list.length) {
+-        const head = document.createElement('div'); head.className = 'sa-fallback-head';
+-        head.textContent = working ? `Sub-agents — ${working} working` : 'Sub-agents';
+-        fb.appendChild(head);
+-        const inner = document.createElement('div'); inner.className = 'sa-list';
+-        list.forEach((s) => inner.appendChild(saItemEl(s)));
+-        fb.appendChild(inner);
+-        fb.classList.add('show');
+-      } else fb.classList.remove('show');
+-    }
++    // (the list under the input while the panel was collapsed is gone, 2026-11-12: nothing that runs is shown in the
++    // conversation area - the right panel lists it)
+@@ 10061 -1 +2
+-    body.textContent = `${live ? 'Checking' : ev.state === 'interrupted' || ev.state === 'superseded' ? 'Stopped checking' : 'Checked'} my work: ${WC_KIND[ev.kind] || ev.kind}${ev.round > 1 ? ` (round ${ev.round})` : ''}`;
++    // ("Checking the change", not "Checking my work: the change" - the developer, 2026-11-12)
++    body.textContent = `${live ? 'Checking' : ev.state === 'interrupted' || ev.state === 'superseded' ? 'Stopped checking' : 'Checked'} ${WC_KIND[ev.kind] || ev.kind}${ev.round > 1 ? ` (round ${ev.round})` : ''}`;
+@@ 10378 -2 +4
+-  function headsUpAccept(text) {
+-    const quoted = String(text || '').split('\n').map((l) => '> ' + l).join('\n');
++  function headsUpAccept(text, review) {
++    // A CHECK'S NOTE IS IN THE AGENT'S OWN VOICE ("Small things I noticed checking my plan"): quoted bare, it reached the
++    // agent as the developer saying "I" (prod feedback, 2026-11-11). Its source goes on the line above it.
++    const quoted = (review ? 'From code_boss\'s check of your work ("I" in it is you):\n' : '') + String(text || '').split('\n').map((l) => '> ' + l).join('\n');
+@@ 10419 -1 +1
+-      if (outcome === 'accepted' && !forCb) headsUpAccept(ev && ev.description);   // (a code_boss note is copied as a report, not put in the message box)
++      if (outcome === 'accepted' && !forCb) headsUpAccept(ev && ev.description, !!(ev && ev.review));   // (a code_boss note is copied as a report, not put in the message box)
+@@ 12873 -2 +4
+-      // Side panel: collapsed by DEFAULT (the chat is the focus); re-opened only if the developer expanded it before.
+-      setSidePanelCollapsed(uiState.get('sideCollapsed', true) !== false);
++      // BOTH PANELS OPEN BY DEFAULT (the developer, 2026-11-12: 25% each, the chat 50%), each as the developer left it
++      setSidePanelCollapsed(uiState.get('sideCollapsed', false) === true);
++      setRightPanelCollapsed(uiState.get('rightCollapsed', false) === true);
++      applyPanelSizes(activeProject);
+@@ 12879 -3 +0
+-      // Background-process list: restore whether the developer left it open (the list itself re-seeds from /api/bg).
+-      _bgDockOpen = uiState.get('bgDockOpen', false) === true;
+-      _agDockOpen = !_bgDockOpen && uiState.get('agDockOpen', false) === true;
+@@ 13489 -1 +1
+-        renderAgentsIcon(); if (_agDockOpen) renderAgentsDock();
++        renderAgentsIcon(); renderRunning();
+@@ 13499 -1 +1
+-        renderBgIcon(); if (_bgDockOpen) renderBgDock();
++        renderBgIcon(); renderRunning();
+@@ 13753 -1 +1
+-        _bgProcs = []; _bgBuffers.clear(); renderBgIcon(); if (_bgDockOpen) renderBgDock();
++        _bgProcs = []; _bgBuffers.clear(); renderBgIcon(); renderRunning();
+@@ 14032 -0 +1
++      if (el.classList.contains('wc-live') && el.dataset.evId) continue;   // (a running check, pinned below the rows that come while it checks - pinLiveCheck)
+@@ 16270 -0 +44
++  // COPY WHAT THE WINDOW SHOWS (the developer, 2026-11-12: "a copy button ... that copies the diffs (or suggested commit
++  // messages w/ diffs) to the clipboard in a formatted way"): Markdown - on the changes page every file's diff, on the
++  // suggestions each commit's message (checked or left out) over its own files' diffs. A diff not read yet is asked for.
++  function commitDiffMd(ids, units) {
++    const byFile = new Map();
++    for (const id of ids) { const u = units[id]; if (!u) continue; if (!byFile.has(u.file)) byFile.set(u.file, []); byFile.get(u.file).push(u); }
++    const out = [];
++    for (const [file, us] of byFile) {
++      const lines = [];
++      for (const u of us) {
++        if (u.notShown) { lines.push('(not shown: not text, or over 256 KB)'); continue; }
++        if (u.header) lines.push(u.header);
++        for (const l of u.lines || []) lines.push(l);
++        if (u.more) lines.push(`… ${u.more} more line(s)`);
++      }
++      while (lines.length && lines[lines.length - 1] === '') lines.pop();   // (git's last empty line)
++      out.push(`### ${file}${us[0].untracked ? ' (new file)' : ''}`, '', '```diff', ...lines, '```', '');
++    }
++    return out.join('\n');
++  }
++  async function copyCommitView(btn) {
++    const repo = _commitRepo;
++    if (!repo) return;
++    let units = _commitDiffs, order = null;
++    try {
++      const d = await fetch('/api/git-commit-diffs?path=' + encodeURIComponent(repo)).then((r) => r.json());
++      if (d && d.units) { units = d.units; order = d.order || Object.keys(d.units); }
++    } catch {}
++    if (!units) { showToast('The changes are not read yet - try again in a moment.'); return; }
++    const name = repo.split(/[\\/]/).filter(Boolean).pop() || repo;
++    let md;
++    if (_commitPage === 'commits' && _commitRecs && _commitRecs.length) {
++      md = [`# Suggested commits - ${name}`, ''];
++      _commitRecs.forEach((c, i) => {
++        md.push(`## ${i + 1}. ${c.message || '(no message)'}${c.selected === false ? ' (left out)' : ''}`, '');
++        md.push(commitDiffMd(c.units || [], units));
++      });
++      if (_commitMore) md.push('_(more commits were still being suggested)_', '');
++    } else {
++      md = [`# Changes - ${name}`, '', commitDiffMd(order || Object.keys(units), units)];
++    }
++    copyText(md.join('\n').replace(/\n{3,}/g, '\n\n').trim() + '\n');
++    if (btn) { btn.textContent = '✓'; btn.classList.add('copied'); setTimeout(() => { btn.textContent = '⧉'; btn.classList.remove('copied'); }, 1100); }
++  }
+@@ 16869 -0 +1
++  try { initPanelResizers(); } catch (e) { console.warn('panel resizers', e); }
+=== add test/_panels-preview.mjs
+new d8c1235aeb741ef7a30e450d
++// A code_boss to LOOK AT the layout (the three columns, 2026-11-12): a scripted model, a fresh home, a small git project.
++// Run: node test/_panels-preview.mjs   (then open http://127.0.0.1:29571)
++import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
++import { execFileSync } from 'node:child_process';
++import { tmpdir } from 'node:os';
++import path from 'node:path';
++import { fileURLToPath } from 'node:url';
++
++const __dirname = path.dirname(fileURLToPath(import.meta.url));
++process.env.CB_HOME = mkdtempSync(path.join(tmpdir(), 'cb-panels-home-'));
++process.env.CB_BOOKKEEPER = '0';
++const { startServer } = await import('../src/server.mjs');
++const { createHttpAdapter } = await import('../src/llm/openai-http.mjs');
++const { startGatewaySim } = await import('./_gateway-sim.mjs');
++
++const proj = mkdtempSync(path.join(tmpdir(), 'cb-panels-proj-'));
++const g = (...a) => execFileSync('git', a, { cwd: proj, encoding: 'utf8' });
++g('init', '-q'); g('config', 'user.email', 't@example.invalid'); g('config', 'user.name', 'T'); g('config', 'commit.gpgsign', 'false');
++writeFileSync(path.join(proj, 'a.js'), 'module.exports = 1;\n');
++g('add', '.'); g('commit', '-q', '-m', 'init');
++writeFileSync(path.join(proj, 'b.js'), 'x\n');
++writeFileSync(path.join(proj, 'a.js'), 'module.exports = 2;\n');
++
++const script = async (msgs) => {
++  const last = msgs[msgs.length - 1].content;
++  // the commit window's suggestion: a.js's change, then the new b.js
++  if (/Choose ONLY the NEXT commit/.test(last)) return /ALREADY PLANNED/.test(last) ? '{"message":"Add b.js","units":["b.js"]}' : '{"message":"Export 2 from a.js","units":["a.js#0"]}';
++  const tag = (/--- you ([0-9a-z]{4}) ---\s*$/.exec(last) || [])[1] || 'xxxx';
++  const close = `\n/--- you ${tag} ---`;
++  if (/<remote-workspace-result/.test(last.slice(-4000))) return 'Started it. <hand-over/>' + close;
++  if (/serve/i.test(last)) return 'Starting a server.\n<remote-workspace><js background="true">await node(["-e", "setInterval(() => console.log(new Date().toISOString()), 1000)"]);</js></remote-workspace>' + close;
++  if (/diagram/i.test(last)) return 'Here:\n```mermaid\ngraph TD\n  A[Start] --> B[Panels]\n  B --> C[Done]\n```\n<hand-over/>' + close;
++  return 'Understood. <hand-over/>' + close;
++};
++const gw = await startGatewaySim({ backend: script });
++const PORT = Number(process.env.PORT || 29571);
++const MODEL = 'gemini-3.1-pro-preview';
++const adapter = createHttpAdapter({ baseURL: gw.url, apiKey: 'x', maxRetries: 1 });
++await startServer({ html: readFileSync(path.join(__dirname, '..', 'src', 'ui.html'), 'utf8'), baseURL: gw.url, apiKey: 'x', gitlabCreds: { user: 't', token: 't' }, defaultModel: MODEL, port: PORT, adapter, modelsList: [{ id: MODEL }, { id: 'other-model' }], initialProject: proj, apiFormat: 'openai' });
++console.log(`READY http://127.0.0.1:${PORT}`);
++
+=== change test/pii-contest/lexicon.json
+base febdd60cc669fa09bd7c7185
+new 8b771f5c8b384f73d7763c23
+@@ 2 -1 +1
+-"built": "2026-11-09",
++"built": "2026-11-12",
+@@ 72775 -0 +1
++"unregister",
+@@ 72776 -0 +1
++"unregisters",
+@@ 78148 -1 +0
+-"line",
+@@ 78150 -1 +0
+-"lines",
+@@ 78356 -1 +0
+-"numbers",
+@@ 78544 -1 +0
+-"register",
+@@ 79028 -1 +0
+-"welcome",
+@@ 94285 -1 +0
+-"line",
+@@ 118911 -0 +1
++"atter",
+=== change test/pii-contest/piishape.mjs
+base 3b10addabb117c150f736629
+new 3980d8ed5d1c207abaa16005
+@@ 819 -0 +1
++  const NO_VOWEL = /^[b-df-hj-np-tv-xz]+$/i;
+@@ 830 -0 +15
++    // A TERMINAL COLOUR CODE runs into the word after it: ESC[32mflow is one run, "32mflow" (prod feedback, 2026-11-11:
++    // tsc's coloured output hid an identifier that way). The code's own digits and m are split off and shown.
++    if (text.includes('\x1b[')) {
++      for (let i = 0; i < runs.length; i++) {
++        const r = runs[i];
++        const sgr = /^(\d{1,3})m/.exec(r.t);
++        if (!sgr || !/\x1b\[(?:\d{1,3};)*$/.test(text.slice(Math.max(0, r.s - 16), r.s))) continue;
++        const n = sgr[0].length;
++        const code = { ...r, e: r.s + n, t: r.t.slice(0, n), show: true, why: 'ansi' };
++        if (n === r.t.length) { runs[i] = code; continue; }
++        const rest = { ...r, s: r.s + n, t: r.t.slice(n), pos: L.pos[r.s + n] };
++        runs.splice(i, 1, code, rest);
++        i++;
++      }
++    }
+@@ 916 -0 +1
++          else if (NO_VOWEL.test(r.t)) { r.show = true; r.why = 'no-vowel'; }
+@@ 929 -0 +3
++        // CONSONANTS ONLY - fns, TRS, CDP, LLM, px, nm (the developer, 2026-11-11: "let's unmask any sequence of consonants
++        // only"): an abbreviation, a unit, an acronym. A name has a vowel; y counts as one, so Lynn and Flynn stay masked.
++        if (NO_VOWEL.test(r.t)) { r.show = true; r.why = 'no-vowel'; return; }
+@@ 1116 -1 +4
+-          if (STANDARDS.has(before) && lens.every((n) => n <= 5) && r.pos !== VALUE) decide(true, 'standard-number');   // ISO 3166-1, RFC 2616
++          // THREE DIGITS OR FEWER IN ALL - CSS's "flex: 1 1 30px", "1/2" (prod feedback, 2026-11-11): the rule above for one
++          // number, kept for a group
++          if (lens.reduce((a, n) => a + n, 0) <= 3) decide(true, 'short-numbers');
++          else if (STANDARDS.has(before) && lens.every((n) => n <= 5) && r.pos !== VALUE) decide(true, 'standard-number');   // ISO 3166-1, RFC 2616
+@@ 1189 -0 +17
++      // A BASE64 BLOB IS HIDDEN WHOLE (prod feedback, 2026-11-11: a JWT's signature in an Authorization header reached the
++      // model nearly unmasked - split at + and /, its pieces read as words, short letter runs, consonants). 16 or more
++      // characters of base64 or base64url with upper case, lower case and a digit, whose case and digit changes come
++      // every few characters: random bytes do, an identifier (getUserById2) or a path changes once a word.
++      for (const b of text.matchAll(/[A-Za-z0-9+/=_-]{16,}/g)) {
++        const t = b[0];
++        if (!/[A-Z]/.test(t) || !/[a-z]/.test(t) || !/[0-9]/.test(t)) continue;
++        const kind = (c) => (/[A-Z]/.test(c) ? 1 : /[a-z]/.test(c) ? 2 : /[0-9]/.test(c) ? 3 : 0);
++        let changes = 0;
++        for (let k = 1; k < t.length; k++) { const p = kind(t[k - 1]), q = kind(t[k]); if (p && q && p !== q) changes++; }
++        if (changes * 4 < t.length) continue;
++        // ...and an identifier is made of words: get User Account By Id. Half its pieces words, and it is one.
++        const pieces = t.match(/[A-Z]?[a-z]+|[A-Z]+(?![a-z])/g) || [];
++        const wordy = pieces.filter((p) => p.length >= 2 && (strict(p.toLowerCase()) || JARGON.has(p.toLowerCase()))).length;
++        if (pieces.length && wordy * 2 >= pieces.length) continue;
++        for (const r of runsIn(b.index, b.index + t.length)) hide(r, 'base64');
++      }
+=== change test/pii-contest/vocab.mjs
+base 55b48a7242efcfc3f4a9f9d9
+new d46fcef69e232a885b078be5
+@@ 92 -0 +1
++  bigint bigints attrs attr ripple toolbar jspx popstate llm llms
+@@ 141 -0 +1
++  register registers unregister unregisters line lines welcome numbers
+=== remove test/test-bg-procs-view-e2e.mjs
+base 2dc1308c87c2db9f1d0b8039
+=== add test/test-bg-procs-view-e2e.mjs
+new 7bcb3918bb19e143d7077c56
++/**
++ * The developer's view of the agent's background processes: since 2026-11-12 ONE list at the top of the right panel,
++ * with the sub-agents (no ▶ icon, nothing in the chat) - one ordinary tool row per process, click it (like any tool)
++ * for LIVE output, a Stop button, the ended ones under "Finished". Drives the real UI with a scripted model that spawns
++ * a ticker.
++ * Run: node test/test-bg-procs-view-e2e.mjs
++ */
++import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises';
++import { cleanupDir } from './_helpers.mjs';
++import { existsSync, mkdtempSync } from 'node:fs';
++import { tmpdir } from 'node:os';
++import path from 'node:path';
++import { fileURLToPath } from 'node:url';
++import puppeteer from 'puppeteer-core';
++// the test data is in the store OUTSIDE the container (vault.mjs) - for a test, a folder under its own CB_HOME
++const tdFam = () => path.join(process.env.CB_HOME, '.code_boss', 'secure', 'plugins', 'pii-testdata', 'families');
++
++process.env.CB_HOME = mkdtempSync(path.join(tmpdir(), 'cb-bgv-home-'));   // isolate prefs (uiState) before server loads
++const { startServer } = await import('../src/server.mjs');
++const { reapAllBackground } = await import('../src/agent/bg-procs.mjs');
++
++const __dirname = path.dirname(fileURLToPath(import.meta.url));
++const ROOT = path.resolve(__dirname, '..');
++const PORT = 29233;
++let pass = 0, fail = 0;
++const ok = (c, l) => { if (c) { pass++; console.log('  ok', l); } else { fail++; console.log('  FAIL', l); } };
++const chrome = ['C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe', (process.env.LOCALAPPDATA || '') + '\\Google\\Chrome\\Application\\chrome.exe'].find((p) => { try { return p && existsSync(p); } catch { return false; } });
++const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
++
++// Turn 1 starts a ticker that prints a marker every 150ms — a background process is started with a snippet's
++// node([...], { background: true }), which hands it to the spawn_background registry; turn 2 answers.
++const TURNS = [
++  // The ticker also prints a value that is in the project's test-data store — the dock and the /api/bg seed must show
++  // its TOKEN, never the value (an app server's log prints exactly what the store masks everywhere else).
++  'Starting a ticker in the background. <remote-workspace><js>const h = await node(["-e", "setInterval(()=>console.log(\'ticking\', \'Okonkwo-Zed\'),150)"], { background: true, label: "ticker" }); return h.id;</js></remote-workspace>',
++  'Started the ticker. TICKER_FINAL',
++];
++let call = 0;
++const adapter = {
++  async *completeStream() { const t = TURNS[Math.min(call++, TURNS.length - 1)]; yield { choices: [{ delta: { content: t } }] }; },
++  async complete() { return { choices: [{ message: { content: 'ok' } }] }; },
++  async listModels() { return [{ id: 'm' }]; },
++};
++
++async function main() {
++  if (!chrome) { console.log('SKIP — Chrome not found'); process.exit(0); }
++  const projectDir = await mkdtemp(path.join(tmpdir(), 'cb-bgv-proj-'));
++  await writeFile(path.join(projectDir, 'README.md'), 'hello\n');
++  // A test-data family (pii-testdata ships enabled): the ticker prints its sponsor's last name.
++  await mkdir(tdFam(), { recursive: true });
++  await writeFile(path.join(tdFam(), 'bgv.json'), JSON.stringify({ label: 'bgv', family: {}, members: { sponsor: { last_name: 'Okonkwo-Zed' } } }));
++  const html = (await readFile(path.join(ROOT, 'src', 'ui.html'), 'utf8'))
++    .replace('</head>', '<script>window.SERVER_CONFIG=' + JSON.stringify({ defaultModel: 'm', baseURL: '(mock)' }) + ';</script></head>');
++  const { server } = await startServer({ html, baseURL: '(mock)', apiKey: 'k', gitlabCreds: { user: 't', token: 't' }, defaultModel: 'm', port: PORT, adapter, modelsList: [{ id: 'm' }], initialProject: projectDir });
++  const browser = await puppeteer.launch({ executablePath: chrome, headless: 'new', args: ['--no-sandbox'] });
++  try {
++    const page = await browser.newPage();
++    await page.setViewport({ width: 1200, height: 800 });
++    const errs = []; page.on('pageerror', (e) => errs.push(e.message));
++    await page.goto(`http://127.0.0.1:${PORT}/`);
++    await page.waitForSelector('#chat:not(.hidden)', { timeout: 15000 });
++    // real values on screen is the default now (build 1981); this test asserts what the SERVER sends is masked, by reading the page, so it switches the display swap off first
++    await page.evaluate(async () => { if (revealOn()) await toggleReveal(); });
++    // WHAT RUNS IS ONE LIST AT THE TOP OF THE RIGHT PANEL (the developer, 2026-11-12): no ▶ in the bar, no dock in the chat
++    const idle = await page.evaluate(() => ({ icon: !!document.getElementById('bgProcsBtn'), text: document.getElementById('rpRunning')?.textContent || '', count: document.getElementById('rpCount')?.textContent }));
++    ok(!idle.icon && /Nothing running/.test(idle.text) && idle.count === '', `no processes yet: no ▶ icon, and the panel's list says nothing runs (${JSON.stringify(idle).slice(0, 160)})`);
++
++    console.log('\n[A] the agent spawns a process: it is in the right panel\'s list, counted, never in the chat');
++    await page.type('#input', 'start a ticker');
++    await page.keyboard.press('Enter');
++    await page.waitForFunction(() => document.body.innerText.includes('TICKER_FINAL'), { timeout: 20000 });
++    await page.waitForFunction(() => document.querySelectorAll('#rpRunning .bg-row.bg-alive').length === 1, { timeout: 6000 }).catch(() => {});
++    const dock = await page.evaluate(() => {
++      const d = document.getElementById('rpRunning');
++      return { inPanel: !!d.closest('#rightPanel'), rows: d.querySelectorAll('.bg-row').length, text: d.textContent, count: document.getElementById('rpCount').textContent, inChat: !!document.querySelector('#log .bg-dock, #logScroll .bg-dock, #logScroll .ag-dock') };
++    });
++    ok(dock.inPanel && dock.rows === 1 && /ticker/.test(dock.text) && dock.count === '1', `the list in the right panel holds the one process, labelled "ticker", counted 1 (${dock.text.slice(0, 80)})`);
++    ok(!dock.inChat, 'nothing of it is drawn in the conversation');
++    const shownCmd = await page.evaluate(() => { const b = document.querySelector('#rpRunning .bg-row .row-body'); return { text: b.textContent, title: b.title }; });
++    ok(/^ticker — node -e /.test(shownCmd.text) && !/[\\/]/.test(shownCmd.text.split(' -e ')[0]) && /node/i.test(shownCmd.title), `the program is shown by its name, the full command on hover (${JSON.stringify(shownCmd).slice(0, 160)})`);
++
++    console.log('\n[C] clicking the entry (like any tool) shows LIVE output');
++    await page.click('#rpRunning .row-result');
++    await page.waitForFunction(() => /ticking/.test(document.querySelector('#rpRunning .row-result pre')?.textContent || ''), { timeout: 6000 }).catch(() => {});
++    const out = await page.evaluate(() => document.querySelector('#rpRunning .row-result pre')?.textContent || '');
++    ok(/ticking/.test(out), `live output is streaming into the expanded box (${JSON.stringify(out.slice(-40))})`);
++    // PII never reaches a screenshot: the stored value the ticker prints shows as its TOKEN in the list (the live
++    // pushes) and in the /api/bg seed the box opens with - never as the value.
++    const seed = (await (await fetch(`http://127.0.0.1:${PORT}/api/bg`)).json()).processes.map((p) => String(p.output || '')).join('\n');
++    ok(/#@bgv\.sponsor\.last_name(~[^#]*)?#[0-9a-z]{7}/.test(out) && !/Okonkwo-Zed/.test(out), `the list shows the test-data TOKEN, never the value (${JSON.stringify(out.slice(-60))})`);
++    ok(/#@bgv\.sponsor\.last_name(~[^#]*)?#[0-9a-z]{7}/.test(seed) && !/Okonkwo-Zed/.test(seed), `the /api/bg output seed is masked the same way (${JSON.stringify(seed.slice(-60))})`);
++
++    console.log('\n[D] Stop kills the process: it settles as stopped, under "Finished", and the count goes');
++    await page.click('#rpRunning .bg-stop');
++    await page.waitForFunction(() => (window._bgProcs || []).length && (window._bgProcs || []).every((p) => !p.alive), { timeout: 8000 }).catch(() => {});
++    await page.waitForFunction(() => /▸ Finished \(1\)/.test(document.getElementById('rpRunning')?.textContent || ''), { timeout: 4000 }).catch(() => {});
++    const folded = await page.evaluate(() => ({ text: document.getElementById('rpRunning').textContent, rows: document.querySelectorAll('#rpRunning .bg-row:not(.bg-fin-head)').length, count: document.getElementById('rpCount').textContent }));
++    ok(/▸ Finished \(1\)/.test(folded.text) && folded.rows === 0 && /Nothing running now/.test(folded.text) && folded.count === '', `stopped, it left the list into "Finished", folded, and the count went (${folded.text.slice(0, 120)})`);
++    await page.click('#rpRunning .bg-fin-head');
++    await page.waitForFunction(() => document.querySelectorAll('#rpRunning .bg-row:not(.bg-fin-head)').length === 1, { timeout: 4000 }).catch(() => {});
++    const after = await page.evaluate(() => ({ alive: (window._bgProcs || []).filter((p) => p.alive).length, rowRunning: !!document.querySelector('#rpRunning .bg-row.bg-alive'), rowErr: !!document.querySelector('#rpRunning .bg-row.tool-err'), rowText: document.querySelector('#rpRunning .bg-row:not(.bg-fin-head)')?.textContent || '' }));
++    ok(after.alive === 0 && !after.rowRunning, `no process is alive after Stop, and its row stopped pulsing (${after.rowText.slice(0, 60)})`);
++    // A kill exits non-zero, but the developer STOPPED it on purpose - that must not paint like a failed tool.
++    ok(!after.rowErr && /stopped/.test(after.rowText), 'a process the developer stopped is NOT red - it reads "stopped"');
++
++    ok(errs.length === 0, `no page errors (${errs.slice(0, 2).join(' | ')})`);
++  } catch (e) { fail++; console.log('  FAIL harness:', e?.message || e); }
++  finally { try { reapAllBackground(); } catch {} await browser.close(); try { server.close(); } catch {} await cleanupDir(projectDir); }
++  console.log(`\n${pass} passed, ${fail} failed`);
++  process.exit(fail === 0 ? 0 : 1);
++}
++main();
++
+=== change test/test-bg-reaped-note-e2e.mjs
+base fba0c3399dd4602be2c6e78f
+new 95709a6c254d0c9f08134407
+@@ 85 -6 +6
+-    // A switch arrives as a reset, not a reconnect — the ▶ badge must not keep counting the reaped process
+-    // (it did: _bughunt-latest [4] found the tab holding alive=1 while the server had 0).
+-    // ▶ is in the bar only while something runs (2026-10-10): after the switch it goes, with its badge and live count.
+-    await page.waitForFunction(() => getComputedStyle(document.getElementById('bgProcsBtn')).display === 'none', { timeout: 4000 }).catch(() => {});
+-    const badge = await page.evaluate(() => ({ hidden: getComputedStyle(document.getElementById('bgProcsBtn')).display === 'none', badgeShown: getComputedStyle(document.getElementById('bgProcsBadge')).display !== 'none', alive: (window._bgProcs || []).filter((p) => p.alive).length }));
+-    ok(badge.hidden && badge.alive === 0, `the ▶ is gone after the switch — the tab re-read the new project's list (${JSON.stringify(badge)})`);
++    // A switch arrives as a reset, not a reconnect - the running list must not keep counting the reaped process
++    // (it did: _bughunt-latest [4] found the tab holding alive=1 while the server had 0). The list is the right panel's
++    // since 2026-11-12: after the switch nothing is counted and nothing runs.
++    await page.waitForFunction(() => (document.getElementById('rpCount')?.textContent || '') === '' && !document.querySelector('#rpRunning .bg-alive'), { timeout: 4000 }).catch(() => {});
++    const badge = await page.evaluate(() => ({ count: document.getElementById('rpCount')?.textContent, running: document.querySelectorAll('#rpRunning .bg-alive').length, alive: (window._bgProcs || []).filter((p) => p.alive).length }));
++    ok(badge.count === '' && badge.running === 0 && badge.alive === 0, `nothing is counted as running after the switch - the tab re-read the new project's list (${JSON.stringify(badge)})`);
+=== change test/test-commit-modal-e2e.mjs
+base 31ec1686780d31b1651a804b
+new 05ffb1d820893615839b76a9
+@@ 169 -0 +4
++  // THE COPY BUTTON (the developer, 2026-11-12): the suggested messages over their diffs, as Markdown; a left-out one says so
++  const copied = await page.evaluate(async () => { let got = null; const o = window.copyText; window.copyText = (s) => { got = s; }; try { await copyCommitView(document.getElementById('commitCopy')); } finally { window.copyText = o; } return { got, shown: getComputedStyle(document.getElementById('commitCopy')).display !== 'none' }; });
++  const cg = copied.got || '';
++  ok(copied.shown && /^# Suggested commits - /.test(cg) && (cg.match(/^## \d\. /gm) || []).length === 3 && /\(left out\)/.test(cg) && /```diff\n[\s\S]*?\n```/.test(cg) && !/\n\n```\n/.test(cg), `⧉ copies the three messages, the unchecked one marked, each over its diffs (${JSON.stringify(cg.slice(0, 160))})`);
+=== add test/test-commit-no-repo.mjs
+new caec1978f6c93cfc3c1e482e
++// commit() IN A FOLDER WITH NO REPOSITORY (prod feedback, 2026-11-11: "git add exited 128 fatal: not a git repository"
++// came back as a bare failure): a refusal that says so, says nothing was committed, and says what to do next.
++// Run: node test/test-commit-no-repo.mjs
++import { mkdtempSync, writeFileSync } from 'node:fs';
++import { tmpdir } from 'node:os';
++import path from 'node:path';
++
++process.env.CB_HOME = mkdtempSync(path.join(tmpdir(), 'cb-commit-norepo-home-'));
++process.env.GIT_CEILING_DIRECTORIES = tmpdir();
++const { buildJsHostFns } = await import('../src/agent/tools.mjs');
++
++let pass = 0, fail = 0;
++const ok = (c, l) => { if (c) { pass++; console.log('  ok', l); } else { fail++; console.log('  FAIL', l); } };
++
++const dir = mkdtempSync(path.join(tmpdir(), 'cb-commit-norepo-'));
++writeFileSync(path.join(dir, 'a.txt'), 'x\n');
++const fns = buildJsHostFns({ cwd: dir, projectDir: dir }, new Set(), [], []);
++const args = { message: 'm', complexity: 2, review: 'r', certify: 'c' };
++for (const [label, opt] of [['with files', { ...args, files: ['a.txt'] }], ['without files', args]]) {
++  let e = null;
++  try { await fns.commit([opt]); } catch (x) { e = x; }
++  const msg = String(e && e.message || '');
++  ok(e && /not in a git repository/.test(msg) && /nothing was committed/.test(msg) && /git init/.test(msg) && !/exited 128/.test(msg), `${label}: refused in plain words (${msg.slice(0, 160)})`);
++}
++console.log(`\n${pass} passed, ${fail} failed`);
++process.exit(fail ? 1 : 0);
++
+=== change test/test-docked-chrome-layout.mjs
+base e84198c1459d0294d2d9219d
+new 7da30a39c0b99a030b7b8d55
+@@ 54 -1 +1
+-    await page.evaluate(() => setSidePanelCollapsed(true));
++    await page.evaluate(() => { setSidePanelCollapsed(true); setRightPanelCollapsed(true); });   // (the chat at full width, the bar docked under it)
+@@ 133 -1 +1
+-    await page.evaluate((r) => { setSidePanelCollapsed(false); renderGitProjects(r); }, repos(14));
++    await page.evaluate((r) => { setRightPanelCollapsed(false); renderGitProjects(r); }, repos(14));
+@@ 136 -1 +1
+-    await page.evaluate(() => setSidePanelCollapsed(true));
++    await page.evaluate(() => setRightPanelCollapsed(true));
+=== change test/test-git-commit-pregen.mjs
+base 31223dc068d8ff6baacde1ba
+new 5ceb48461962615fce304f7a
+@@ 2 -6 +6
+- * COMMIT SUGGESTIONS ARE READY BEFORE THE CLICK (the developer, 2026-10-15: "It's never worked well where it's supposed
+- * to pregenerate commit messages when it starts up. Every time I click on a branch that has a number bubble, it calls
+- * the LLM and takes forever.") - counts the model calls a click makes, in each way a click used to wait for one:
+- *   [1] at startup, a dirty repo's suggestions are made once; clicking (twice) makes no call
+- *   [2] a suggestion that failed is not made again by every click - it says so, and the background tries once more
+- *   [3] the agent changes files during a run: the suggestions are made when the run ends, not at the click
++ * COMMIT SUGGESTIONS ARE MADE WHEN THE WINDOW OPENS, AND ONLY THEN (the developer, 2026-11-12: "not generate a new commit
++ * suggestion round every time there's a change. Let's just have it do it when the modal is opened" - before, they were
++ * made ahead of the click, after every scan and run). Counts the model calls:
++ *   [1] at startup nothing is made unasked; opening makes one; opening again with the same changes makes none
++ *   [2] a suggestion that failed is not made again by every opening, nor behind it; Try again makes it
++ *   [3] the agent changes files during a run: nothing is made when the run ends; the next opening makes one
+@@ 22 -1 +0
+-process.env.CB_COMMIT_RECS_RETRY_MS = '1500';    // the one background retry after a failure, soon
+@@ 80 -0 +3
++    await sleep(2500);
++    ok(recCalls === 0 && !(await recsOf()), `nothing is made before the window opens (${recCalls} calls)`);
++    await click(proj);
+@@ 81 -3 +3
+-    ok(r && r.status === 'ready' && recCalls === 1, `the dirty repo's suggestions were made once, unasked (${r && r.status}, ${recCalls} call)`);
+-    const c1 = await click(proj), c2 = await click(proj);
+-    ok(c1.status === 'ready' && c2.status === 'ready' && recCalls === 1, `two clicks: ready at once, no model call (${recCalls} calls in all)`);
++    ok(r && r.status === 'ready' && recCalls === 1, `opening the window makes them, once (${r && r.status}, ${recCalls} call)`);
++    const c2 = await click(proj);
++    ok(c2.status === 'ready' && recCalls === 1, `opened again with the same changes: ready at once, no model call (${recCalls} calls in all)`);
+@@ 88 -0 +1
++    await sleep(1500);
+@@ 89 -1 +2
+-    const f1 = await click(proj);   // the changes moved: this click starts one (it fails)
++    ok(recCalls === before2 && (await recsOf()).status === 'ready', 'a new change makes nothing by itself');
++    await click(proj);   // the changes moved: opening starts one (it fails)
+@@ 93 -1 +1
+-    ok(f2.status === 'error' && /gateway timeout/.test(f2.error || '') && recCalls === before2 + 1, `the next click shows the failure, and makes no call (${f2.status}, ${recCalls - before2} call)`);
++    ok(f2.status === 'error' && /gateway timeout/.test(f2.error || '') && recCalls === before2 + 1, `the next opening shows the failure, and makes no call (${f2.status}, ${recCalls - before2} call)`);
+@@ 95 -0 +2
++    ok((await recsOf()).status === 'error' && recCalls === before2 + 1, `nothing tries again behind it (${recCalls - before2} call)`);
++    await fetch(BASE + '/api/git-commit-recs?path=' + encodeURIComponent(proj) + '&retry=1');
+@@ 96 -3 +1
+-    ok(r && r.status === 'ready' && recCalls === before2 + 2, `the background tried once more, and now they are ready (${r && r.status}, ${recCalls - before2} calls)`);
+-    const retry = await fetch(BASE + '/api/git-commit-recs?path=' + encodeURIComponent(proj) + '&retry=1').then((x) => x.json());
+-    ok(retry.status === 'ready' && recCalls === before2 + 2, 'a retry asked for when they are ready makes no call');
++    ok(r && r.status === 'ready' && recCalls === before2 + 2, `Try again makes it (${r && r.status}, ${recCalls - before2} calls)`);
+@@ 105 -3 +4
+-    let after3 = null;
+-    for (let i = 0; i < 60; i++) { after3 = await recsOf(); if (after3 && after3.status === 'ready' && recCalls > before3) break; await sleep(150); }
+-    ok(after3 && after3.status === 'ready' && recCalls === before3 + 1, `the run's new file got suggestions when the run ended, before any click (${after3 && after3.status}, ${recCalls - before3} call)`);
++    await sleep(2000);
++    ok(recCalls === before3, `the run's end made nothing (${recCalls - before3} calls)`);
++    await click(proj);
++    const after3 = await settled();
+@@ 109 -1 +1
+-    ok(c3.status === 'ready' && recCalls === before3 + 1 && JSON.stringify(c3.commits).includes('from-run.js'), `the click after the run: ready, the run's file in it, no call (${recCalls - before3} call)`);
++    ok(after3 && after3.status === 'ready' && recCalls === before3 + 1 && JSON.stringify(c3.commits || []).includes('from-run.js'), `the next opening makes them, the run's file in them (${after3 && after3.status}, ${recCalls - before3} call)`);
+@@ 116 -2 +2
+-    r = await settled();
+-    const c4 = await click(proj);
++    await sleep(1500);
++    const c4 = await click(proj); r = await settled();
+@@ 120 -2 +2
+-    const c5 = await click(proj); r = await settled();
+-    ok(r && r.status === 'ready' && recCalls === before4 + 1, `a new change still gets new suggestions (${recCalls - before4} call)`);
++    await click(proj); r = await settled();
++    ok(r && r.status === 'ready' && recCalls === before4 + 1, `a new change gets new suggestions at the next opening (${recCalls - before4} call)`);
+@@ 144 -1 +1
+-      failNext = 2;   // the first suggestion fails, and so does its one background retry
++      failNext = 1;   // the suggestion the opening asks for fails
+@@ 157 -4 +1
+-        // wait out the failure and its background retry
+-        for (let i = 0; i < 80; i++) { const s = (await state()).gitCommitRecs?.[app]; if (s && s.status === 'error' && failNext === 0) break; await sleep(150); }
+-        await sleep(300);
+-        const calls6 = recCalls;
++        const calls0 = recCalls;
+@@ 162 -1 +1
+-        await page.waitForFunction(() => /failed/.test((document.querySelector('#commitBody .cm-error') || {}).textContent || ''), { timeout: 8000 }).catch(() => {});
++        await page.waitForFunction(() => /failed/.test((document.querySelector('#commitBody .cm-error') || {}).textContent || ''), { timeout: 10000 }).catch(() => {});
+@@ 164 -1 +2
+-        ok(/The suggestion failed: gateway timeout/.test(shown.err) && shown.retry && recCalls === calls6, `the click shows the failure and a Try again button, and made no call (${shown.err.slice(0, 70)}; ${recCalls - calls6} calls)`);
++        ok(/The suggestion failed: gateway timeout/.test(shown.err) && shown.retry && recCalls === calls0 + 1, `opening made one call; it failed, and the window says so with a Try again button (${shown.err.slice(0, 70)}; ${recCalls - calls0} call)`);
++        const calls6 = recCalls;
+=== change test/test-git-pills-lift-e2e.mjs
+base ad112379e3725289cc7509f2
+new 67de9aecb075075e13e237d7
+@@ 49 -0 +1
++    await page.evaluate(() => { setSidePanelCollapsed(true); setRightPanelCollapsed(true); });   // (the bar docks under the input when the RIGHT panel is collapsed, since 2026-11-12)
+@@ 50 -1 +1
+-    ok(await page.evaluate(() => document.getElementById('sideChrome').classList.contains('docked')), 'the status line is docked (side panel collapsed) — the layout under test');
++    ok(await page.evaluate(() => document.getElementById('sideChrome').classList.contains('docked')), 'the status line is docked (right panel collapsed) — the layout under test');
+=== add test/test-model-switch-midrun.mjs
+new fd1dc6f35ca4fa3ee438ef0b
++// A MODEL CHOSEN IN SETTINGS WHILE A RUN GOES TAKES EFFECT AT THE RUN'S NEXT CALL (the developer, 2026-11-12: "let's have
++// a mid-run model switch work"). Turn 1 runs a slow snippet; the model is changed while it runs; turn 2 must go to the
++// new model, and the next run starts on it.
++// Run: node test/test-model-switch-midrun.mjs
++import { mkdtempSync, writeFileSync } from 'node:fs';
++import { tmpdir } from 'node:os';
++import path from 'node:path';
++
++process.env.CB_HOME = mkdtempSync(path.join(tmpdir(), 'cb-modelswitch-home-'));
++process.env.CB_BOOKKEEPER = '0';
++const { startServer } = await import('../src/server.mjs');
++
++let pass = 0, fail = 0;
++const ok = (c, l) => { if (c) { pass++; console.log('  ok', l); } else { fail++; console.log('  FAIL', l); } };
++const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
++
++const seen = [];   // the model of each main-agent call, in order
++let turn = 0;
++const adapter = {
++  async *completeStream(o) {
++    const all = (o.messages || []).map((m) => String(m.content || '')).join('\n');
++    if (/YOU ARE A SUB-AGENT|Heads up|bookkeeper/i.test(all.slice(0, 4000))) { yield { choices: [{ delta: { content: 'ok' } }] }; return; }
++    seen.push(o.model);
++    turn++;
++    const t = turn === 1 ? 'Waiting a moment. <remote-workspace><js>await new Promise((r) => setTimeout(r, 2500)); return "waited";</js></remote-workspace>'
++      : 'Done. <hand-over/>';
++    yield { choices: [{ delta: { content: t } }] };
++  },
++  async complete() { return { choices: [{ message: { content: 'ok' } }] }; },
++  async listModels() { return [{ id: 'model-a' }, { id: 'model-b' }]; },
++};
++
++const proj = mkdtempSync(path.join(tmpdir(), 'cb-modelswitch-proj-'));
++writeFileSync(path.join(proj, 'a.txt'), 'x\n');
++const PORT = 29577, BASE = `http://127.0.0.1:${PORT}`;
++const { server } = await startServer({ html: '<!doctype html><body>x</body>', baseURL: '(mock)', apiKey: 'k', gitlabCreds: { user: 't', token: 't' }, defaultModel: 'model-a', port: PORT, adapter, modelsList: [{ id: 'model-a' }, { id: 'model-b' }], initialProject: proj });
++const post = async (p, body) => { const r = await fetch(BASE + p, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }); return r.status; };
++const idle = async (ms = 30000) => { const t0 = Date.now(); await sleep(300); while (Date.now() - t0 < ms) { const s = await (await fetch(BASE + '/api/state?limit=50')).json(); if (s.status !== 'running') return true; await sleep(150); } return false; };
++
++try {
++  await post('/api/message', { text: 'wait a moment', model: 'model-a' });
++  for (let i = 0; i < 60 && seen.length < 1; i++) await sleep(100);
++  ok(seen[0] === 'model-a', `the run starts on the model chosen (${seen[0]})`);
++  ok((await post('/api/tuning', { model: 'model-b' })) === 200, 'the model is changed in Settings while the snippet runs');
++  await idle();
++  ok(seen.length >= 2 && seen[1] === 'model-b', `the run's NEXT call goes to the new model (${seen.join(' -> ')})`);
++  turn = 0;
++  await post('/api/message', { text: 'again', model: 'model-b' });
++  await idle();
++  ok(seen[seen.length - 1] === 'model-b', `and the next run starts on it (${seen.join(' -> ')})`);
++} catch (e) { fail++; console.log('  FAIL harness:', e?.stack || e); }
++finally { try { server.close(); } catch {} }
++console.log(`\n${pass} passed, ${fail} failed`);
++process.exit(fail ? 1 : 0);
++
+=== change test/test-notes-and-paste-e2e.mjs
+base 71c0d788f7e6740ee41746ae
+new f5fe705dcb69c990f5e3355d
+@@ 115 -2 +2
+-  ok(notes.fill.every((c) => c === 'rgb(121, 114, 201)') && notes.btnText.every((c) => c === 'rgb(147, 141, 214)') && notes.btnBg[0] === notes.btnBg[1], `a note's main button wears its purple - edge and text, on the other buttons' grey - not the app's orange (${JSON.stringify({ edge: notes.fill, text: notes.btnText, bg: notes.btnBg })})`);
+-  ok(notes.hl.every((c) => c === 'rgb(147, 141, 214)'), `its \`code\` and list markers are highlighted in its purple (the text tone), as the chat's are in gold (${JSON.stringify(notes.hl)})`);
++  ok(notes.fill.every((c) => c === 'rgb(121, 117, 190)') && notes.btnText.every((c) => c === 'rgb(147, 143, 205)') && notes.btnBg[0] === notes.btnBg[1], `a note's main button wears its purple - edge and text, on the other buttons' grey - not the app's orange (${JSON.stringify({ edge: notes.fill, text: notes.btnText, bg: notes.btnBg })})`);
++  ok(notes.hl.every((c) => c === 'rgb(147, 143, 205)'), `its \`code\` and list markers are highlighted in its purple (the text tone), as the chat's are in gold (${JSON.stringify(notes.hl)})`);
+@@ 121 -1 +1
+-  ok(notes.stripe[0] === notes.stripe[1] && notes.stripe[0] === 'rgb(121, 114, 201)' && notes.edge[0] === notes.edge[1] && notes.edge[0] !== notes.accent, `the Heads up and the dev check look alike: a blue stripe, a quiet edge - not the developer's gold (${JSON.stringify({ stripe: notes.stripe, edge: notes.edge, accent: notes.accent })})`);
++  ok(notes.stripe[0] === notes.stripe[1] && notes.stripe[0] === 'rgb(121, 117, 190)' && notes.edge[0] === notes.edge[1] && notes.edge[0] !== notes.accent, `the Heads up and the dev check look alike: a blue stripe, a quiet edge - not the developer's gold (${JSON.stringify({ stripe: notes.stripe, edge: notes.edge, accent: notes.accent })})`);
+=== change test/test-piishape-contest.mjs
+base 5fcc21bc7b178fa86eb627c6
+new a2284443a7a371be998b22e0
+@@ 66 -1 +2
+-  for (const value of ['1/2/3', '45/67', '12/3456', 'v1/12/25', '0/0']) {
++  // (1/2/3 and 0/0 are shown since 2805: three digits or fewer in all, the developer's rule for a single number)
++  for (const value of ['1/2/345', '45/67', '12/3456', 'v1/12/25', '00/0000']) {
+@@ 116 -0 +31
++// CONSONANTS ONLY are shown (the developer, 2026-11-11): fns, TRS, CDP, px. A vowel - y among them - keeps a word to the
++// other rules, so Lynn and Flynn stay masked
++{
++  const c = m.maskText('I just added a bunch of fns. The TRS and TRR plans, CDP, 30px, LLM, nm', { filePath: '' });
++  ok(!/#/.test(c), `consonant-only runs are shown (${c})`);
++  const n = m.maskText('{"note": "Lynn Flynn called"}', { filePath: 'out.json' });
++  ok((n.match(/#Xxxx+#/g) || []).length === 2, `a run with a y in it is not consonants only (${n})`);
++  const code = m.maskText('const fns = [];', { filePath: 'a.js' });
++  ok(code === 'const fns = [];', `in code too (${code})`);
++}
++
++// PROD FEEDBACK, 2026-11-11
++{
++  // a JWT is hidden whole: no piece of its signature is shown, though + and / split it into word-like pieces
++  const sig = 'Qm9vay9tb3JlL2NhdGFsb2cvaW5kZXgrYmlnK3dvcmRz/x8SVAQRFDvyng+aBBeCSV';
++  const jwt = m.maskText('Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.' + sig, { filePath: '' });
++  ok(!/aBBeCSV|SVAQRF|Dvyng/.test(jwt) && /^Authorization: Bearer #/.test(jwt), `a JWT is masked whole (${jwt})`);
++  const ident = m.maskText('we call getUserAccountById2 then readConfigFromDiskV3 and src/agent/tools.mjs', { filePath: '' });
++  ok(!/#/.test(ident), `an identifier or a path is not taken for base64 (${ident})`);
++  // a terminal colour code is split from the word it runs into
++  const ansi = '\x1b[32mflow.name\x1b[37m and \x1b[1;32mHavisham\x1b[0m';
++  const a2 = m.maskText(ansi, { filePath: '' });
++  ok(a2.includes('\x1b[32mflow.name') && !a2.includes('Havisham') && m.unmaskText(a2) === ansi, `ESC[32m is split off the word after it, and it still round-trips (${JSON.stringify(a2)})`);
++  // three digits or fewer in a group
++  const css = m.maskText('flex: 1 1 30px; ratio 1/2', { filePath: '' });
++  ok(!/#/.test(css), `numbers of three digits in all are shown in a group too (${css})`);
++  // words seen masked
++  const w = m.maskText('scan: [register, unregister, hits], line 3, non-numbers, bigint and attrs, <welcome-file>index.jspx</welcome-file>, mat-toolbar', { filePath: '' });
++  ok(!/#/.test(w), `register, line, numbers, welcome, bigint, attrs, jspx, toolbar are shown (${w})`);
++}
++
+=== change test/test-piishape-plugin.mjs
+base 04a94745c9bed9997b413b1e
+new 0ec24ff1cdeab10876b7cc06
+@@ 241 -1 +1
+-    const line = 'badge = "ZQ-88231"';
++    const line = 'badge = "ZQA-88231"';
+@@ 244 -1 +1
+-    const recorded = 'the badge is ZQ-88231, as conf/badge.properties says; ZQ-88231 again, and #Xxxxx#zzzzzzz is some other token';
++    const recorded = 'the badge is ZQA-88231, as conf/badge.properties says; ZQA-88231 again, and #Xxxxx#zzzzzzz is some other token';
+@@ 246 -1 +1
+-    ok(!/88231|ZQ/.test(back.replace(/#[Xx0]+#[0-9a-z]{7}/g, '')) && ids(back).filter((x) => x === id).length === 2, `both places it was recorded are tokens again (${back.slice(0, 90)})`);
++    ok(!/88231|ZQA/.test(back.replace(/#[Xx0]+#[0-9a-z]{7}/g, '')) && ids(back).filter((x) => x === id).length === 2, `both places it was recorded are tokens again (${back.slice(0, 90)})`);
+@@ 335 -0 +4
++    // ...but a worked example from code_boss's own instructions is text (prod feedback, 2026-11-11: docs quoting one
++    // could not be written)
++    const doc = 'a token looks like #Xxxx0#k2j4q7m or #000-00-0000#a4ut5k2';
++    ok(P.unmaskText(doc, ctx) === doc, 'the examples\' ids are written as they are');
+@@ 419 -1 +1
+-    const out = mask('ticket = "CRM-4821"', { filePath: 'notes/ticket.properties' });
++    const out = mask('ticket = "CRA-4821"', { filePath: 'notes/ticket.properties' });
+@@ 426 -1 +1
+-    ok(!JSON.stringify(stored).includes('CRM'), 'and the file itself discloses nothing — ids are hashes');
++    ok(!JSON.stringify(stored).includes('CRA'), 'and the file itself discloses nothing — ids are hashes');
+@@ 430 -1 +1
+-    ok(!/#/.test(P.maskText('ticket = "CRM-4821"', { homeDir: HOME, projectDir: PROJ, filePath: 'notes/ticket.properties' })),
++    ok(!/#/.test(P.maskText('ticket = "CRA-4821"', { homeDir: HOME, projectDir: PROJ, filePath: 'notes/ticket.properties' })),
+@@ 433 -1 +1
+-    ok(/#/.test(P.maskText('ticket = "CRM-4821"', { homeDir: HOME, projectDir: PROJ, filePath: 'notes/ticket.properties' })),
++    ok(/#/.test(P.maskText('ticket = "CRA-4821"', { homeDir: HOME, projectDir: PROJ, filePath: 'notes/ticket.properties' })),
+=== change test/test-review-loop-e2e.mjs
+base 394e8cdb451ae0f282988843
+new 011ee60a3cac5c88db0a7255
+@@ 217 -1 +1
+-      ok(lines.length === wcN && lines.some((t) => /^Checked my work: the plan$/.test(t.trim())) && lines.some((t) => /^Checked my work: the diagnosis \(round 4\)$/.test(t.trim())), `done: a line for each check, its steps folded under it (${lines.length} of ${wcN}: ${lines[0]})`);
++      ok(lines.length === wcN && lines.some((t) => /^Checked the plan$/.test(t.trim())) && lines.some((t) => /^Checked the diagnosis \(round 4\)$/.test(t.trim())), `done: a line for each check, its steps folded under it (${lines.length} of ${wcN}: ${lines[0]})`);
+@@ 256 -2 +12
+-      ok(/Checking my work: the plan/.test(live.head) && live.pulse && live.stepUnder && live.top === 0, `its line pulses, and its steps come under it, open, from the start (top level: ${live.top})`);
+-      ok(live.tint && live.tint !== live.plain && /rgba\(121, 114, 201, 0\.12\)/.test(live.tint), `tinted a little, apart from the agent's other rows (${live.tint} vs ${live.plain})`);
++      ok(/Checking the plan/.test(live.head) && live.pulse && live.stepUnder && live.top === 0, `its line pulses, and its steps come under it, open, from the start (top level: ${live.top})`);
++      // PINNED TO THE BOTTOM WHILE IT CHECKS (the developer, 2026-11-12: the agent's last message came in below it): a row
++      // drawn after it goes above it
++      const pinned = await page.evaluate((n) => {
++        const w = [...document.querySelectorAll('#log .work-check')][n], log = document.getElementById('log');
++        const probe = document.createElement('div'); probe.className = 'row assistant'; probe.textContent = 'A LATER ROW'; log.appendChild(probe); mainChat.rc.afterRow();
++        const after = [...log.children].filter((el) => !el.classList.contains('status') && !el.classList.contains('pending-steer') && !el.classList.contains('tbar'));
++        const r = { last: after[after.length - 1] === w, probeAbove: !!(w && (probe.compareDocumentPosition(w) & Node.DOCUMENT_POSITION_FOLLOWING)) };
++        probe.remove(); return r;
++      }, nCards);
++      ok(pinned.last && pinned.probeAbove, `a running check stays the last node: a row drawn while it checks goes above it (${JSON.stringify(pinned)})`);
++      ok(live.tint && live.tint !== live.plain && /rgba\(121, 117, 190, 0\.12\)/.test(live.tint), `tinted a little, apart from the agent's other rows (${live.tint} vs ${live.plain})`);
+@@ 261 -1 +1
+-      ok(!done.pulse && !done.open && /^Checked my work: the plan$/.test(done.head.trim()) && done.top === 0 && done.under > 0 && /Nothing to fix/.test(done.next), `then its steps fold under its line, with what it came to (${done.head.trim()} / ${done.next.trim()})`);
++      ok(!done.pulse && !done.open && /^Checked the plan$/.test(done.head.trim()) && done.top === 0 && done.under > 0 && /Nothing to fix/.test(done.next), `then its steps fold under its line, with what it came to (${done.head.trim()} / ${done.next.trim()})`);
+=== change test/test-review-loop.mjs
+base 38898389c27f1e86f2bc9518
+new adb5ebf56f28f9a3570d17eb
+@@ 85 -1 +1
+-  ok(/^Small things I noticed checking my plan \(2\)$/.test(mn.title) && /^Small things I noticed checking my plan - each small/.test(mn.description) && /Yours to use or not/.test(mn.description) && /- a low\/high thing\n  How I know:/.test(mn.description) && /I am not sure of this one: a medium\/low thing/.test(mn.description) && voice(mn), 'below the bar: a box of its own, the developer\'s to use or not, in the agent\'s voice');
++  ok(/^Small things I noticed checking my plan \(2\)$/.test(mn.title) && /^- /.test(mn.description) && !/Small things|Yours to use/.test(mn.description) && /- a low\/high thing\n  How I know:/.test(mn.description) && /I am not sure of this one: a medium\/low thing/.test(mn.description) && voice(mn), 'below the bar: a box of its own, the developer\'s to use or not, in the agent\'s voice');
+=== change test/test-sandbox-install-window-e2e.mjs
+base b6f02fd2dcdeb3afbaf3eb25
+new 30aac0069903b3ddbaae0b4e
+@@ 200 -1 +1
+-  ok(look.bg === 'rgb(24, 22, 21)' && look.top === 'rgb(121, 114, 201)' && look.btn === 'rgb(121, 114, 201)' && look.ink === 'rgb(147, 141, 214)' && look.over <= 0, `the management page is code_boss's dark background with the container's purple highlight: ${JSON.stringify(look)}`);
++  ok(look.bg === 'rgb(24, 22, 21)' && look.top === 'rgb(121, 117, 190)' && look.btn === 'rgb(121, 117, 190)' && look.ink === 'rgb(147, 143, 205)' && look.over <= 0, `the management page is code_boss's dark background with the container's purple highlight: ${JSON.stringify(look)}`);
+=== change test/test-status-badge-parity.mjs
+base c0c5b9165d9b9bb429d488a9
+new bdb66e2ccaea03289befc2b1
+@@ 54 -0 +2
++    // (on ONE line: the bar docked under the input - in the right panel the branches are a row above the icons, 2026-11-12)
++    await page.evaluate(() => setRightPanelCollapsed(true)); await new Promise((r) => setTimeout(r, 300));
+=== change test/test-status-bar-consistency.mjs
+base 4ebff60164ec57de615f8bf8
+new 15bd89b27d7f0aa5802e217a
+@@ 8 -1 +1
+- *   ICON   14px full strength — a plugin item, the background-process arrow, the plugin-status glyph, the gear,
++ *   ICON   14px full strength — a plugin item, the plugin-status glyph, the gear,
+@@ 48 -1 +0
+-  'the background-process arrow': '#bgProcsBtn .ps-text',
+@@ 73 -2 +0
+-      // ▶ shows only while a background process runs (2026-10-10): one is running, as far as the bar knows
+-      _bgProcs = [{ id: 'bg-1', alive: true, label: 'build' }]; renderBgIcon();
+@@ 121 -3 +16
+-    console.log('\n[5] and everything in the bar sits on one line');
+-    const mids = [text['the project path'].mid, text['a branch name'].mid, text['the Edit toggle'].mid, text['the token count'].mid, icon['a plugin item'].mid, icon['the settings gear'].mid, icon['the branch glyph'].mid];
+-    ok(Math.max(...mids) - Math.min(...mids) < 0.75, `every element is centred on the same line (spread ${(Math.max(...mids) - Math.min(...mids)).toFixed(2)}px)`);
++    // IN THE RIGHT PANEL the bar is three rows, bottom up (2026-11-12): the path; the icons, to the right; the branches
++    console.log('\n[5] in the right panel: the icons on one line, right-aligned, over the path; the branches above them');
++    const spread = (xs) => Math.max(...xs) - Math.min(...xs);
++    const iconMids = [text['the Edit toggle'].mid, text['the token count'].mid, icon['a plugin item'].mid, icon['the settings gear'].mid];
++    ok(spread(iconMids) < 0.75, `the icons are centred on one line (spread ${spread(iconMids).toFixed(2)}px)`);
++    ok(text['the project path'].mid > icon['the settings gear'].mid && icon['the settings gear'].mid > icon['the branch glyph'].mid, 'the path is the bottom row, the icons above it, the branches above them');
++    const edge = await page.evaluate(() => Math.round(document.getElementById('rightPanel').getBoundingClientRect().right - document.getElementById('settingsBtn').getBoundingClientRect().right));
++    ok(edge >= 0 && edge <= 12, `the icons are to the right: the gear is at the panel's right edge (${edge}px in)`);
++
++    console.log('\n[6] the right panel collapsed: the bar docks under the input, everything on one line');
++    await page.evaluate(() => setRightPanelCollapsed(true));
++    await new Promise((r) => setTimeout(r, 400));
++    const docked = {};
++    for (const [label, sel] of Object.entries({ ...TEXT, ...ICON })) docked[label] = await read(sel);
++    const mids = ['the project path', 'a branch name', 'the Edit toggle', 'the token count', 'a plugin item', 'the settings gear', 'the branch glyph'].map((k) => docked[k].mid);
++    ok(spread(mids) < 0.75 && await page.evaluate(() => document.getElementById('sideChrome').closest('footer') !== null), `docked under the input, every element is centred on the same line (spread ${spread(mids).toFixed(2)}px)`);
+=== change test/test-subagents-ui-e2e.mjs
+base 61c2abbd477e2951cb78fccc
+new 61ad82784c52ce841048d308
+@@ 89 -14 +12
+-    console.log('\n[3] the agents dock (the developer, 2026-10-23: "a separate icon like background processes for agents ... If you expand an agent node, it shows the conversation nodes just like the main conversation. There can only be 1 panel showing")');
+-    // its icon is a person, shown while one works - this one is done already, as ▶ hides when nothing runs
+-    const icon = await page.evaluate(() => ({ svg: !!document.querySelector('#agentsBtn svg.ag-person'), shown: getComputedStyle(document.getElementById('agentsBtn')).display !== 'none' }));
+-    ok(icon.svg && !icon.shown, `the icon is a person, and it is hidden with no sub-agent working (${JSON.stringify(icon)})`);
+-    await page.evaluate(() => toggleAgentsDock(true));
+-    await page.waitForFunction(() => /Finished \(1\)/.test(document.querySelector('#logScroll > .ag-dock')?.textContent || ''), { timeout: 8000 }).catch(() => {});
+-    const dock = await page.evaluate(() => { const d = document.querySelector('#logScroll > .ag-dock'); return d ? { text: d.textContent, afterLog: d.previousElementSibling && d.previousElementSibling.id === 'log', shown: getComputedStyle(document.getElementById('agentsBtn')).display !== 'none' } : null; });
+-    ok(dock && /No sub-agent is working/.test(dock.text) && /▸ Finished \(1\)/.test(dock.text) && !/thing-hunt/.test(dock.text) && dock.afterLog && dock.shown, `opened, a finished one has left the list into "Finished", folded, just after the chat; the icon shows while open (${dock && dock.text.slice(0, 140)})`);
+-    await page.evaluate(() => document.querySelector('#logScroll > .ag-dock .ag-fin-head').click());
+-    await page.waitForFunction(() => /thing-hunt/.test(document.querySelector('#logScroll > .ag-dock')?.textContent || ''), { timeout: 4000 }).catch(() => {});
+-    ok(/thing-hunt\s*· done · 1 step/.test(await page.evaluate(() => document.querySelector('#logScroll > .ag-dock').textContent)), '"Finished" opened: it is there, done after 1 step');
+-    await page.evaluate(() => [...document.querySelectorAll('#logScroll > .ag-dock .ag-row')].find((r) => /thing-hunt/.test(r.textContent)).click());
+-    await page.waitForFunction(() => /Found the thing/.test(document.querySelector('#logScroll > .ag-dock .ag-convo')?.textContent || ''), { timeout: 8000 }).catch(() => {});
+-    const convo = await page.evaluate(() => { const c = document.querySelector('#logScroll > .ag-dock .ag-convo'); return c ? { text: c.textContent, toolRows: c.querySelectorAll('.row.tool').length, bubbles: c.querySelectorAll('.bubble.user').length } : null; });
++    console.log('\n[3] the running list in the right panel (2026-11-12: "1 list of bg processes and agents running ... we won\'t display either in the conversation area"); an agent opens to its conversation, drawn as the main chat draws one');
++    const L = '#rightPanel #rpRunning';
++    await page.waitForFunction((sel) => /Finished \(1\)/.test(document.querySelector(sel)?.textContent || ''), { timeout: 8000 }, L).catch(() => {});
++    const dock = await page.evaluate((sel) => { const d = document.querySelector(sel); return d ? { text: d.textContent, icon: !!document.getElementById('agentsBtn'), inChat: !!document.querySelector('#logScroll .ag-dock, #log .ag-dock') } : null; }, L);
++    ok(dock && /Nothing running/.test(dock.text) && /▸ Finished \(1\)/.test(dock.text) && !/thing-hunt/.test(dock.text) && !dock.icon && !dock.inChat, `a finished one has left the list into "Finished", folded; no agents icon, nothing in the chat (${dock && dock.text.slice(0, 140)})`);
++    await page.evaluate((sel) => document.querySelector(sel + ' .bg-fin-head').click(), L);
++    await page.waitForFunction((sel) => /thing-hunt/.test(document.querySelector(sel)?.textContent || ''), { timeout: 4000 }, L).catch(() => {});
++    ok(/thing-hunt\s*· done · 1 step/.test(await page.evaluate((sel) => document.querySelector(sel).textContent, L)), '"Finished" opened: it is there, done after 1 step');
++    const agRow = (sel) => [...document.querySelectorAll(sel + ' .ag-row')].find((r) => /thing-hunt/.test(r.textContent));
++    await page.evaluate((sel) => [...document.querySelectorAll(sel + ' .ag-row')].find((r) => /thing-hunt/.test(r.textContent)).click(), L);
++    await page.waitForFunction((sel) => /Found the thing/.test(document.querySelector(sel + ' .ag-convo')?.textContent || ''), { timeout: 8000 }, L).catch(() => {});
++    const convo = await page.evaluate((sel) => { const c = document.querySelector(sel + ' .ag-convo'); return c ? { text: c.textContent, toolRows: c.querySelectorAll('.row.tool').length, bubbles: c.querySelectorAll('.bubble.user').length } : null; }, L);
+@@ 106 -2 +1
+-    const agRow = () => [...document.querySelectorAll('#logScroll > .ag-dock .ag-row')].find((r) => /thing-hunt/.test(r.textContent));
+-    await page.evaluate((f) => { session.events.push({ type: 'retract-assistant', taskId: 'conv', turn: 2, reason: 'nudge' }); [...document.querySelectorAll('#logScroll > .ag-dock .ag-row')].find((r) => /thing-hunt/.test(r.textContent)).click(); });
++    await page.evaluate((sel) => { session.events.push({ type: 'retract-assistant', taskId: 'conv', turn: 2, reason: 'nudge' }); [...document.querySelectorAll(sel + ' .ag-row')].find((r) => /thing-hunt/.test(r.textContent)).click(); }, L);
+@@ 109 -3 +3
+-    await page.evaluate(() => [...document.querySelectorAll('#logScroll > .ag-dock .ag-row')].find((r) => /thing-hunt/.test(r.textContent)).click());
+-    await page.waitForFunction(() => /Found the thing/.test(document.querySelector('#logScroll > .ag-dock .ag-convo')?.textContent || ''), { timeout: 8000 }).catch(() => {});
+-    ok(/Found the thing in src\/Thing\.java:7/.test(await page.evaluate(() => document.querySelector('#logScroll > .ag-dock .ag-convo')?.textContent || '')), 'a turn the main chat retracted does not hide the agent\'s reply of the same number');
++    await page.evaluate((sel) => [...document.querySelectorAll(sel + ' .ag-row')].find((r) => /thing-hunt/.test(r.textContent)).click(), L);
++    await page.waitForFunction((sel) => /Found the thing/.test(document.querySelector(sel + ' .ag-convo')?.textContent || ''), { timeout: 8000 }, L).catch(() => {});
++    ok(/Found the thing in src\/Thing\.java:7/.test(await page.evaluate((sel) => document.querySelector(sel + ' .ag-convo')?.textContent || '', L)), 'a turn the main chat retracted does not hide the agent\'s reply of the same number');
+@@ 114 -9 +0
+-    // one dock at a time
+-    await page.evaluate(() => toggleBgDock(true));
+-    await sleep(200);
+-    const one = await page.evaluate(() => ({ ag: !!document.querySelector('#logScroll > .ag-dock'), bg: !!document.querySelector('#log .bg-dock') }));
+-    ok(one.bg && !one.ag, `the background list opened: the agents dock closes (${JSON.stringify(one)})`);
+-    await page.evaluate(() => toggleAgentsDock(true));
+-    await sleep(300);
+-    const two = await page.evaluate(() => ({ ag: !!document.querySelector('#logScroll > .ag-dock'), bg: !!document.querySelector('#log .bg-dock') }));
+-    ok(two.ag && !two.bg, `and the other way round (${JSON.stringify(two)})`);
+=== change test/test-ui-state-persist-e2e.mjs
+base 55bb7367c0ddc896bfb0c127
+new 902751f51bdb11650b4d22f0
+@@ 51 -1 +2
+-    const defaults = await page.evaluate(() => ({
++    // BOTH PANELS OPEN BY DEFAULT, 25% of the window each (the developer, 2026-11-12)
++        const defaults = await page.evaluate(() => ({
+@@ 54 -0 +2
++      right: document.getElementById('rightPanel')?.classList.contains('collapsed'),
++      lw: Math.round(document.getElementById('sidePanel').getBoundingClientRect().width), rw: Math.round(document.getElementById('rightPanel').getBoundingClientRect().width),
+@@ 55 -1 +1
+-    ok(defaults.editOff === false && defaults.collapsed === true, `defaults: edit ON, side collapsed (${JSON.stringify(defaults)})`);
++    ok(defaults.editOff === false && defaults.collapsed === false && defaults.right === false && Math.abs(defaults.lw - 300) <= 2 && Math.abs(defaults.rw - 300) <= 2, `defaults: edit ON, both panels open at 25% of 1200 (${JSON.stringify(defaults)})`);
+@@ 58 -1 +4
+-    await page.evaluate(() => toggleSidePanel());                      // side → expanded
++    await page.evaluate(() => toggleSidePanel());                      // left → collapsed
++    await page.evaluate(() => toggleRightPanel());                     // right → collapsed
++    // the right panel's width, dragged: kept for this project (set the way the drag sets it)
++    await page.evaluate(() => { savePanelSize(activeProject, 'r', 33); applyPanelSizes(activeProject); });
+@@ 64 -1 +2
+-    ok(server1.sideCollapsed === false, `sideCollapsed persisted (${server1.sideCollapsed})`);
++    ok(server1.sideCollapsed === true && server1.rightCollapsed === true, `each panel's collapse persisted (${server1.sideCollapsed}, ${server1.rightCollapsed})`);
++    ok(Object.values(server1.panelSizes || {}).some((v) => v.r === 33), `the right panel's width persisted for the project (${JSON.stringify(server1.panelSizes)})`);
+@@ 74 -0 +1
++      right: document.getElementById('rightPanel')?.classList.contains('collapsed'),
+@@ 76 -1 +5
+-    ok(after.collapsed === false, 'the side panel is STILL expanded after reload');
++    ok(after.collapsed === true && after.right === true, 'both panels are STILL collapsed after reload');
++    await page.evaluate(() => toggleRightPanel());
++    await sleep(300);
++    const rw = await page.evaluate(() => Math.round(document.getElementById('rightPanel').getBoundingClientRect().width));
++    ok(Math.abs(rw - 396) <= 3, `reopened, the right panel has the project's width again: 33% of 1200 (${rw}px)`);
 === end
