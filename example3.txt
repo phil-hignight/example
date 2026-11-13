@@ -1,261 +1,1769 @@
 code_boss chunk 1
-number 25
-made 2026-11-11T22:42:55.896Z
-message A server inside the container can be opened in the browser outside
-before 68c6b106aecf72af20921b19
-after e2b9c94115466a69d316876d
-files 11
+number 29
+made 2026-11-13T20:07:48.589Z
+message 14 changes
+message
+message - A stopped snippet gives the write slot up; the one holding it is always listed
+message - A snippet that has ended starts no new call and never takes the write slot back
+message - Edges of the cheat sheet blanks and the thinking merge: a one-line blank stays one line; the merge looks only at thinking rows
+message - bgKill finds a snippet however the project folder is spelled
+message - The thinking cut takes a count as an answer: "...66 orders." + "66 orders."
+message - Nothing under the side chat's message box
+message - Push window: put whitespace back as committed, and Push all; one bookkeeper at a time; mainChat before a message number; Thinking level with its bullet; the console keeps the box's width
+message - Help suggestions: x to take one away, Clear all; their pencils stand over the box's >_
+message - Suggestions: a 2px border on hover, the pencil takes the suggestion out of the list, 41px segments; the running list shows a command's first 60 characters, a click for all of it
+message - The branch's bubble counts the commits a push would send; with none, the uncommitted files in gray
+message - The data set functions are datasetX: datasetCreate, datasetPage, datasetRows, datasetShow and the rest
+message - No toast when a new Code Boss window is opened
+message - The agent's step sentences say what they are about: never a bare "Reproduced."
+message - A plan card's header is the plan's own title, not "Plan 3"
+before 9338d7df19a43d6f71b463a8
+after 866e6192d8dac85d07fd26f0
+files 40
 left 0
-check 45fc3fab558daa06
+check 799fc8355219227c
 
-=== change SANDBOX-SPEC.md
-base 19a3b3b81f255fd830a24d11
-new 31ffbbe85314498c5163ac8e
-@@ 208 -0 +4
-+- **A server of the agent's, for that Chrome** (2026-11-11): `POST /v1/port/publish {port}` listens on a FREE port out
-+  here (loopback ports are the machine's: the inside port's number is taken out here too) and carries it to the port
-+  inside; `GET /v1/port`, `POST /v1/port/unpublish {port}` (only ones asked for - never code_boss's or WebLogic's); 20 at
-+  most; gone when the bridge goes. Plugins: `host.container.ports`; snippets: `publishPort(port)` -> `browserUrl`.
-=== change sandbox-launcher/src/main/java/cb/sandbox/Api.java
-base e471ae7b02be34c0a5385a46
-new 3d6f05b64a7b40090646cf36
-@@ 70 -0 +8
-+        // A SERVER INSIDE, REACHED FROM OUT HERE (the agent's own test app, for the Chrome above): any free port out here
-+        if ("/v1/port".equals(path) && "GET".equals(method)) { Map<String, Object> m = new LinkedHashMap<String, Object>(); m.put("ok", Boolean.TRUE); m.put("published", Container.published()); Manager.json(x, 200, m); return; }
-+        if ("/v1/port/publish".equals(path) && "POST".equals(method)) { Manager.json(x, 200, publishPort(Json.integer(bodyOf(x).get("port")))); return; }
-+        if ("/v1/port/unpublish".equals(path) && "POST".equals(method)) {
-+          int p = Json.integer(bodyOf(x).get("port"));
-+          Map<String, Object> m = new LinkedHashMap<String, Object>(); m.put("ok", Boolean.TRUE); m.put("closed", Boolean.valueOf(p > 0 && Container.unpublishAsked(p)));
-+          Manager.json(x, 200, m); return;
-+        }
+=== change DATA-SETS-SPEC.md
+base f4510af28c9c8aff04570d44
+new 17c4ef840e4eca75b2e9d521
+@@ 54 -1 +1
+-    dsCreate(data, { sensitive: [column, ...], path? })   -> a new set
++    datasetCreate(data, { sensitive: [column, ...], path? })   -> a new set
+@@ 57 -3 +3
+-    dsList(folder?)                       -> [{ id, path?, columns, rows, expires? }]
+-    dsInfo(set)                           -> { columns: [{ name, masking }], rows, createdBy, expires? }
+-    dsRows(set, { where, columns, offset, limit, orderBy })
++    datasetList(folder?)                       -> [{ id, path?, columns, rows, expires? }]
++    datasetInfo(set)                           -> { columns: [{ name, masking }], rows, createdBy, expires? }
++    datasetRows(set, { where, columns, offset, limit, orderBy })
+@@ 61 -8 +8
+-    dsCount(set, { where })               -> number
+-    dsUpdate(set, { where | rows, set: { column: value | (row) => value } })   -> { updated }
+-    dsInsert(set, rows)                   -> { inserted, rowIds }
+-    dsDelete(set, { where | rows })       -> { deleted }
+-    dsCopy(set, { path? })                -> a new set with the same columns and rules
+-    dsKeep(set, path)                     -> the set made permanent at path ("customers/smith-2026-10.ds")
+-    dsMove(path, newPath)  dsRemove(set)  dsMkdir(folder)
+-    dsExport(set, { as: 'json' | 'jsonl' | 'array', file? })
++    datasetCount(set, { where })               -> number
++    datasetUpdate(set, { where | rows, set: { column: value | (row) => value } })   -> { updated }
++    datasetInsert(set, rows)                   -> { inserted, rowIds }
++    datasetDelete(set, { where | rows })       -> { deleted }
++    datasetCopy(set, { path? })                -> a new set with the same columns and rules
++    datasetKeep(set, path)                     -> the set made permanent at path ("customers/smith-2026-10.ds")
++    datasetMove(path, newPath)  datasetRemove(set)  datasetMkdir(folder)
++    datasetExport(set, { as: 'json' | 'jsonl' | 'array', file? })
+@@ 90 -1 +1
+-`dsRows` returns sensitive columns as named tokens, `#@ds.<set>.<column>~<format>#<id>` (issued through the token
++`datasetRows` returns sensitive columns as named tokens, `#@ds.<set>.<column>~<format>#<id>` (issued through the token
 @@ 106 -1 +1
--  static final String[] OFFERS = {"GET /v1/container", "GET /v1/weblogic", "POST /v1/weblogic/start", "POST /v1/weblogic/stop", "POST /v1/codeboss/new", "GET /v1/browser", "POST /v1/browser/open", "POST /v1/browser/close", "GET /v1/secure/version", "GET /v1/secure/snapshot", "POST /v1/secure/put", "POST /v1/secure/delete", "POST /v1/secure/append", "POST /v1/secure/merge", "POST /v1/datasets/get", "POST /v1/datasets/put", "POST /v1/datasets/delete"};
-+  static final String[] OFFERS = {"GET /v1/container", "GET /v1/weblogic", "POST /v1/weblogic/start", "POST /v1/weblogic/stop", "POST /v1/codeboss/new", "GET /v1/browser", "POST /v1/browser/open", "POST /v1/browser/close", "GET /v1/port", "POST /v1/port/publish", "POST /v1/port/unpublish", "GET /v1/secure/version", "GET /v1/secure/snapshot", "POST /v1/secure/put", "POST /v1/secure/delete", "POST /v1/secure/append", "POST /v1/secure/merge", "POST /v1/datasets/get", "POST /v1/datasets/put", "POST /v1/datasets/delete"};
-@@ 115 -0 +14
-+  /** A port inside published to a free port out here: { ok, insidePort, insideUrl, browserPort, browserUrl } or why not. */
-+  static Map<String, Object> publishPort(int port) {
-+    if (port < 1024 || port > 65535) return error("port: the port inside the container that a server listens on, 1024-65535 (was " + port + ").");
-+    if (port == INSIDE_PORT) return error("Port " + port + " inside is this API's own way out; it is not published.");
-+    try {
-+      int out = Container.publishAsked(port);
-+      Map<String, Object> m = new LinkedHashMap<String, Object>();
-+      m.put("ok", Boolean.TRUE);
-+      m.put("insidePort", Integer.valueOf(port)); m.put("insideUrl", "http://127.0.0.1:" + port);
-+      m.put("browserPort", Integer.valueOf(out)); m.put("browserUrl", "http://localhost:" + out);
-+      return m;
-+    } catch (Sandbox.Failure f) { return error(f.getMessage()); }
-+  }
-+
-=== change sandbox-launcher/src/main/java/cb/sandbox/Container.java
-base e628df997098a899bdedaaa1
-new 79938e21e1e44bf85511b631
-@@ 738 -0 +3
-+  // the ones asked for from inside (Api POST /v1/port/publish): a port inside -> the port out here it was given
-+  private static final Map<Integer, Integer> ASKED = new LinkedHashMap<Integer, Integer>();
-+  static final int ASKED_MAX = 20;
-@@ 803 -0 +33
-+  /**
-+   * A PORT ASKED FOR FROM INSIDE (the developer, 2026-11-11: the agent's own test server - a Node app it wrote - reached by
-+   * the Chrome the manager starts out here). The port out here is any free one: loopback ports are the machine's, so a
-+   * server inside that holds 3456 has 3456 out here too, and the same number cannot be listened on twice. A port that is
-+   * already published (code_boss's own, WebLogic's) is answered with the port it has. Returns the port out here.
-+   */
-+  static int publishAsked(int insidePort) throws Sandbox.Failure {
-+    synchronized (BRIDGE_LOCK) {
-+      Integer had = ASKED.get(Integer.valueOf(insidePort));
-+      if (had != null && PUBLISHED.containsKey(had)) return had.intValue();
-+      ASKED.remove(Integer.valueOf(insidePort));
-+      for (Map.Entry<Integer, Integer> e : PUBLISHED.entrySet()) if (e.getValue().intValue() == insidePort) return e.getKey().intValue();
-+      if (ASKED.size() >= ASKED_MAX) throw new Sandbox.Failure(ASKED_MAX + " ports are published for what runs inside already - unpublish one first.");
-+      Mux m = bridge();
-+      int out;
-+      try { out = m.listen(0, insidePort); }
-+      catch (IOException e) { throw new Sandbox.Failure("No port out here could be listened on for port " + insidePort + ": " + e.getMessage()); }
-+      PUBLISHED.put(Integer.valueOf(out), Integer.valueOf(insidePort));
-+      ASKED.put(Integer.valueOf(insidePort), Integer.valueOf(out));
-+      return out;
-+    }
-+  }
-+
-+  /** One asked for from inside, by its port inside - never code_boss's own or WebLogic's. Whether one was published. */
-+  static boolean unpublishAsked(int insidePort) {
-+    synchronized (BRIDGE_LOCK) {
-+      Integer out = ASKED.remove(Integer.valueOf(insidePort));
-+      if (out == null) return false;
-+      unpublish(out.intValue());
-+      return true;
-+    }
-+  }
-+
-@@ 841 -0 +1
-+      ASKED.clear();
+-  - `dsCopy` and `dsExport` as a string or an array keep the mark (an exported file is masked strictly anyway);
++  - `datasetCopy` and `datasetExport` as a string or an array keep the mark (an exported file is masked strictly anyway);
+@@ 117 -1 +1
+-  listed, moved, renamed and removed like a file (`dsList`, `dsMove`, `dsRemove`, `dsMkdir`).
++  listed, moved, renamed and removed like a file (`datasetList`, `datasetMove`, `datasetRemove`, `datasetMkdir`).
+=== change examples/plugins/pii-testdata__1.mjs
+base 57796f127826360b87dc00c9
+new 8c6b4b9effb886a2ae4069a6
+@@ 756 -1 +1
+-      verb: 'testdata_get', name: 'testdata_get',
++      verb: 'testdata_get', name: 'testdata_get', readOnly: true,   // (looks only: takes no write slot, waits behind no change)
+@@ 785 -1 +1
+-      verb: 'testdata_list', name: 'testdata_list',
++      verb: 'testdata_list', name: 'testdata_list', readOnly: true,   // (looks only: takes no write slot, waits behind no change)
+@@ 796 -1 +1
+-      verb: 'testdata_fields', name: 'testdata_fields',
++      verb: 'testdata_fields', name: 'testdata_fields', readOnly: true,   // (looks only: takes no write slot, waits behind no change)
+@@ 818 -1 +1
+-      verb: 'testdata_expand', name: 'testdata_expand',
++      verb: 'testdata_expand', name: 'testdata_expand', readOnly: true,   // (looks only: takes no write slot, waits behind no change)
+=== change examples/plugins/piishape__1.mjs
+base 2fe6907af2dea2ed81d446e8
+new 33905eb94418726dd6c01fb8
+@@ 181337 -2 +2
+-// (show / shows / shown, 2026-10-15: code_boss's own "dsList() shows what there is" reached the agent as
+-// "dsList() #xxxxx# what there is" - a word right after a call is judged as code)
++// (show / shows / shown, 2026-10-15: code_boss's own "datasetList() shows what there is" reached the agent as
++// "datasetList() #xxxxx# what there is" - a word right after a call is judged as code)
 === change scripts/build-number.txt
-base e8f73157af54133665886b95
-new 94255a0453a7f7fb08e7213f
+base a26b60066782d2f05f03ce48
+new 8817dd880282fa3d160de441
 @@ 1 -1 +1
--2802
-+2803
-=== change src/agent/js-eval.mjs
-base 70ee702d091b0c8c8e4e1b0c
-new 44d11d0c309fbce652e2cbef
-@@ 771 -1 +1
--  historyAsk: 'read', developerMessage: 'read', mainChat: 'read',
-+  historyAsk: 'read', developerMessage: 'read', mainChat: 'read', publishPort: 'exec', unpublishPort: 'exec',
-=== change src/agent/tools.mjs
-base 102d3a085f5cfb791ccfc7ab
-new dc394a3d37cd4d337327069e
-@@ 39 -0 +1
-+import { pcContainerHost } from '../plugins/container.mjs';
-@@ 2466 -1 +1
--function buildJsHostFns(ctx, children, adoptedHere, spawnedHere) {
-+export function buildJsHostFns(ctx, children, adoptedHere, spawnedHere) {
-@@ 3122 -0 +17
-+    // A SERVER OF THE AGENT'S, FOR A BROWSER (the developer, 2026-11-11: a test app it wrote, for the browser plugin to
-+    // drive): in the container the browser is OUTSIDE and 127.0.0.1 does not cross over, so the manager carries a free
-+    // port out there to this one (host.container.ports). On a plain machine the browser reaches the port as it is.
-+    publishPort: async ([port]) => {
-+      const p = Number(port);
-+      if (!Number.isInteger(p) || p < 1024 || p > 65535) throw new Error('publishPort(port): the port your server listens on, an integer 1024-65535.');
-+      const c = pcContainerHost();
-+      if (!c.available) return { insidePort: p, browserPort: p, browserUrl: 'http://localhost:' + p, container: false, note: 'not in a container: a browser on this machine reaches the port as it is' };
-+      const r = await c.ports.publish(p);
-+      return { insidePort: r.insidePort, browserPort: r.browserPort, browserUrl: r.browserUrl, container: true, note: 'open browserUrl in the browser; your own code (curl, tests) keeps using http://127.0.0.1:' + p };
-+    },
-+    unpublishPort: async ([port]) => {
-+      const c = pcContainerHost();
-+      if (!c.available) return { closed: false, container: false };
-+      const r = await c.ports.unpublish(Number(port));
-+      return { closed: !!r.closed, container: true };
-+    },
-=== change src/agent/worker-prompt.mjs
-base 259553f853ace274d1824ee5
-new 4876a2c3631ed919c0d0b82d
-@@ 312 -0 +1
-+  [['publishPort', 'unpublishPort'], '(a server of yours, for a browser: publishPort(port) gives the browserUrl to open - in a container the browser is outside and needs it; your own curl keeps 127.0.0.1)'],
-=== change src/plugins/authoring.mjs
-base 1b780cee90a634da472a0000
-new 8f62193dd60a3f98d63be27a
-@@ 685 -0 +2
-+  a server of yours    host.container.ports.publish(port) / unpublish(port) / list() - a port inside, reached by
-+                       that Chrome: it is OUTSIDE, and 127.0.0.1 does not cross over, so open the browserUrl it gives
-@@ 799 -0 +3
-+A PAGE SERVED IN HERE (a test app on 127.0.0.1:3456): the Chrome cannot reach 127.0.0.1:3456 - publish it first:
-+    const p = await host.container.ports.publish(3456);   // { browserPort, browserUrl: "http://localhost:<free port>" }
-+    await host.container.browser.open({ url: p.browserUrl, label: "test" });   // your own requests keep 127.0.0.1:3456
-=== change src/plugins/container.mjs
-base 3b50fc309bf4cf8db9403254
-new c3cc99693f134d8b8b785c23
-@@ 95 -0 +14
-+    // A SERVER INSIDE, REACHED FROM OUT HERE (the developer, 2026-11-11: the agent's own test app, opened in the Chrome
-+    // above). A connection to 127.0.0.1 does not cross the container's boundary, so the manager listens on a free port
-+    // out here and carries it in. Absent on a plain machine: there the browser reaches the port itself.
-+    ports: available ? {
-+      /** { ok, insidePort, insideUrl, browserPort, browserUrl } - or throws, with the manager's sentence. */
-+      publish: async (port) => {
-+        const r = await call('POST', '/v1/port/publish', { port: Number(port) });
-+        if (!r.ok) throw new Error(r.error || 'the container did not publish the port');
-+        return r;
-+      },
-+      /** By its port inside. { ok, closed } - one that was not published is not an error. */
-+      unpublish: async (port) => call('POST', '/v1/port/unpublish', { port: Number(port) }),
-+      list: async () => (await call('GET', '/v1/port')).published || [],
-+    } : undefined,
-=== change test/test-plugin-container-host.mjs
-base ba416de00d547f854d92dcd2
-new b7ec868e035a12d1fc2dab35
-@@ 52 -0 +44
-+console.log('\n[2d] a server inside, for that browser: ports.publish / list / unpublish, and the snippet\'s publishPort()');
-+{
-+  const seen = [];
-+  const srv = http.createServer((req, res) => {
-+    let body = '';
-+    req.on('data', (d) => { body += d; });
-+    req.on('end', () => {
-+      seen.push(`${req.method} ${req.url} ${req.headers['x-cb-container']} ${body}`);
-+      res.writeHead(200, { 'content-type': 'application/json' });
-+      const j = body ? JSON.parse(body) : {};
-+      if (req.url === '/v1/port/publish') res.end(JSON.stringify(j.port === 80 ? { ok: false, error: 'port: the port inside the container that a server listens on, 1024-65535 (was 80).' } : { ok: true, insidePort: j.port, insideUrl: 'http://127.0.0.1:' + j.port, browserPort: 51234, browserUrl: 'http://localhost:51234' }));
-+      else if (req.url === '/v1/port') res.end(JSON.stringify({ ok: true, published: [{ browserPort: 51234, insidePort: 3456 }] }));
-+      else res.end(JSON.stringify({ ok: true, closed: true }));
-+    });
-+  });
-+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
-+  const env = { CB_IN_CONTAINER: '1', CB_CONTAINER_API: `http://127.0.0.1:${srv.address().port}`, CB_CONTAINER_TOKEN: 'tok-p' };
-+  const c = pcContainerHost(env);
-+  const p = await c.ports.publish(3456);
-+  const l = await c.ports.list();
-+  const u = await c.ports.unpublish(3456);
-+  ok(p.browserUrl === 'http://localhost:51234' && p.insidePort === 3456 && l.length === 1 && u.closed === true
-+    && seen.join(' | ') === 'POST /v1/port/publish tok-p {"port":3456} | GET /v1/port tok-p  | POST /v1/port/unpublish tok-p {"port":3456}', `publish(), list() and unpublish() are the container's three requests: ${seen.join(' | ')}`);
-+  let said = '';
-+  try { await c.ports.publish(80); } catch (e) { said = e.message; }
-+  ok(/1024-65535/.test(said), `a refused publish() THROWS the manager's sentence: ${said}`);
-+  ok(pcContainerHost({}).ports === undefined, 'host.container.ports is ABSENT on a plain machine: there the browser reaches the port itself');
-+  // the snippet's own: publishPort(port) (tools.mjs), which reads the environment code_boss runs in
-+  const { buildJsHostFns } = await import('../src/agent/tools.mjs');
-+  const keep = {}; for (const k of Object.keys(env)) { keep[k] = process.env[k]; delete process.env[k]; }
-+  const fns = buildJsHostFns({}, new Set(), [], []);
-+  const plain = await fns.publishPort([3456]);
-+  ok(plain.container === false && plain.browserUrl === 'http://localhost:3456', `publishPort() on a plain machine: the port as it is (${JSON.stringify(plain)})`);
-+  Object.assign(process.env, env);
-+  const inC = await fns.publishPort([3456]);
-+  const un = await fns.unpublishPort([3456]);
-+  ok(inC.container === true && inC.browserUrl === 'http://localhost:51234' && /127\.0\.0\.1:3456/.test(inC.note) && un.closed === true, `publishPort() in the container: the browserUrl the manager gave (${JSON.stringify(inC)})`);
-+  let bad = '';
-+  try { await fns.publishPort(['abc']); } catch (e) { bad = e.message; }
-+  ok(/1024-65535/.test(bad), `a port that is not one is refused before anything is asked: ${bad}`);
-+  for (const k of Object.keys(env)) { if (keep[k] === undefined) delete process.env[k]; else process.env[k] = keep[k]; }
-+  await new Promise((r) => srv.close(r));
+-2838
++2852
+=== change src/agent/ds-brief.mjs
+base 3a71086652854d14c55fd9cb
+new e0e8d842903868491a962664
+@@ 5 -2 +2
+-  'A set is named by its reference #@ds#… (or what dsCreate/dsCopy return, which carries it) or the path it is kept at; dsList() finds them again in a later snippet.',
+-  'dsRows(set, { where, orderBy, columns, offset, limit }) -> { rows: [{ _row, ...columns }], total } (rows: 200 unless limit asks for more; total: every row that matched).',
++  'A set is named by its reference #@ds#… (or what datasetCreate/datasetCopy return, which carries it) or the path it is kept at; datasetList() finds them again in a later snippet.',
++  'datasetRows(set, { where, orderBy, columns, offset, limit }) -> { rows: [{ _row, ...columns }], total } (rows: 200 unless limit asks for more; total: every row that matched).',
+@@ 8 -5 +5
+-  'dsShow(set, { where, orderBy, columns, limit, title }) - SHOW the developer rows as a table in the chat, which they can sort and filter (you are told only how many were shown). Use it when they ask to see data, rather than pasting rows into your reply; show the set itself, filtered and sorted here - a set you make from its rows has every column masked. Its orderBy takes ANY column, sorted by the real values ("-col" descending): the 10 biggest by a column you cannot see are dsShow(set, { orderBy: "-revenue", limit: 10 }) - the developer sees them; you are not told which rows they were.',
+-  'dsCount(set, { where }) · dsUpdate(set, { where | rows, set: { column: value | (row) => value } }) - a token you write is stored as the real value and stays masked · dsInsert(set, rows) · dsDelete(set, { where | rows }) · dsCopy(set) -> { set }',
+-  'dsCreate(data, { sensitive: [columns] }) -> { set, rows, columns } (data: an array of objects, JSON, JSONL or a .json/.jsonl file; unmarked columns are masked as a file\'s would be)',
+-  'dsList(folder) · dsInfo(set) · dsKeep(set, path) (a set not kept goes 24 hours after it was made) · dsMove(from, to) · dsMkdir(folder) · dsRemove(set)',
+-  'dsExport(set, { as: "array" | "json" | "jsonl", file }) (with a file: the real values, written to the project, masked like any file from then on).',
++  'datasetShow(set, { where, orderBy, columns, limit, title }) - SHOW the developer rows as a table in the chat, which they can sort and filter (you are told only how many were shown). Use it when they ask to see data, rather than pasting rows into your reply; show the set itself, filtered and sorted here - a set you make from its rows has every column masked. Its orderBy takes ANY column, sorted by the real values ("-col" descending): the 10 biggest by a column you cannot see are datasetShow(set, { orderBy: "-revenue", limit: 10 }) - the developer sees them; you are not told which rows they were.',
++  'datasetCount(set, { where }) · datasetUpdate(set, { where | rows, set: { column: value | (row) => value } }) - a token you write is stored as the real value and stays masked · datasetInsert(set, rows) · datasetDelete(set, { where | rows }) · datasetCopy(set) -> { set }',
++  'datasetCreate(data, { sensitive: [columns] }) -> { set, rows, columns } (data: an array of objects, JSON, JSONL or a .json/.jsonl file; unmarked columns are masked as a file\'s would be)',
++  'datasetList(folder) · datasetInfo(set) · datasetKeep(set, path) (a set not kept goes 24 hours after it was made) · datasetMove(from, to) · datasetMkdir(folder) · datasetRemove(set)',
++  'datasetExport(set, { as: "array" | "json" | "jsonl", file }) (with a file: the real values, written to the project, masked like any file from then on).',
+=== change src/agent/git-commit.mjs
+base 9447d1eafbdd0fe6a6e4c2e9
+new 9678f1ab714660fc1128d4d5
+@@ 13 -0 +1
++import { diffLines } from './diff.mjs';
+@@ 236 -1 +3
+-async function gcGitAsync(repoDir, args) {
++// (`env`: added to the process's - a push's credentials for that call; `timeoutMs`; stderr is kept too, for a push's own
++// words when it is refused)
++async function gcGitAsync(repoDir, args, { env = null, timeoutMs = 60000 } = {}) {
+@@ 239 -2 +2
+-    let out = '', done = false, timer = null;
+-    const finish = (status) => { if (done) return; done = true; if (timer) clearTimeout(timer); resolve({ status, stdout: out }); };
++    let out = '', err = '', done = false, timer = null;
++    const finish = (status) => { if (done) return; done = true; if (timer) clearTimeout(timer); resolve({ status, stdout: out, stderr: err }); };
+@@ 242 -2 +2
+-      const child = spawn('git', gcArgs(repoDir, args, jgit), { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
+-      child.stdout.setEncoding('utf8');
++      const child = spawn('git', gcArgs(repoDir, args, jgit), { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], ...(env ? { env: { ...process.env, ...env } } : {}) });
++      child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
+@@ 245 -0 +1
++      child.stderr.on('data', (d) => { if (err.length < 64 * 1024) err += d; });
+@@ 247 -1 +1
+-      timer = setTimeout(() => { try { child.kill(); } catch { /* gone */ } finish(null); }, 60000);
++      timer = setTimeout(() => { try { child.kill(); } catch { /* gone */ } finish(null); }, timeoutMs);
+@@ 251 -0 +65
++
++/**
++ * WHITESPACE-ONLY CHANGES PUT BACK (the developer, 2026-11-13: "in general we don't want to checkin whitespace only
++ * changes, so we should make it easy to reverse it on disk, so it matches the repo"). The file on disk, each line that
++ * differs from its last committed version only in whitespace (indentation, spaces at the end, its line ending) as it is
++ * committed; the real changes kept, in the committed version's line ending. Lines are matched on their text with every
++ * space, tab and CR taken out - gcWhitespaceOnlyLines' rule - in order (a line diff of those). Refused, nothing written,
++ * when the file is not UTF-8 text or not in the last commit; put back byte for byte when it would not make the diff
++ * smaller. { ok, changed, before, after } (changed lines in the diff) or { ok: false, problem }.
++ */
++export async function gcRevertWhitespace(repoDir, relPath) {
++  const rel = String(relPath || '').replace(/\\/g, '/');
++  const abs = path.resolve(repoDir, rel);
++  if (!rel || isCodeBoss(rel) || !abs.toLowerCase().startsWith(path.resolve(repoDir).toLowerCase() + path.sep)) return { ok: false, problem: 'not a file of this repo' };
++  const head = await gcGitAsync(repoDir, ['show', 'HEAD:' + rel]);
++  if (head.status !== 0) return { ok: false, problem: `${rel} is not in the last commit` };
++  let before;
++  try { before = readFileSync(abs); } catch { return { ok: false, problem: `${rel} could not be read` }; }
++  const text = before.toString('utf8');
++  if (before.includes(0) || !Buffer.from(text, 'utf8').equals(before)) return { ok: false, problem: `${rel} is not UTF-8 text` };
++  // lines with their own endings ('' on a last line with none)
++  const split = (s) => { const out = []; const re = /([^\r\n]*)(\r\n|\n|\r|$)/g; let m; while ((m = re.exec(s)) && (m[0] || re.lastIndex < s.length)) { out.push({ t: m[1], e: m[2] }); if (!m[2]) break; } return out; };
++  const A = split(head.stdout), B = split(text);
++  const crlf = (head.stdout.match(/\r\n/g) || []).length, lf = (head.stdout.match(/\n/g) || []).length;
++  const eol = lf && crlf * 2 >= lf ? '\r\n' : '\n';   // (the committed version's own, by most of its lines)
++  const key = (l) => l.t.replace(/\s+/g, '');
++  const steps = diffLines(A.map(key).join('\n'), B.map(key).join('\n'));
++  const out = []; let ia = 0, ib = 0;
++  for (const s of steps) {
++    if (s.type === 'same') { out.push({ ...A[ia] }); ia++; ib++; }   // (a blank line too: its ending, or spaces left on it, are whitespace)
++    else if (s.type === 'del') ia++;
++    else { out.push({ t: B[ib].t, e: B[ib].e ? eol : '' }); ib++; }
++  }
++  // every line but the last ends; the last as the file on disk does
++  for (let i = 0; i < out.length - 1; i++) if (!out[i].e) out[i].e = eol;
++  if (out.length) out[out.length - 1].e = B.length && B[B.length - 1].e ? (out[out.length - 1].e || eol) : '';
++  const after = out.map((l) => l.t + l.e).join('');
++  if (after === text) return { ok: true, changed: false };
++  const changedLines = async () => {
++    const d = await gcGitAsync(repoDir, ['diff', 'HEAD', '--', rel]);
++    const f = d.status === 0 ? parseDiffFiles(d.stdout)[0] : null;
++    return f ? f.hunks.reduce((n, h) => n + h.body.filter((l) => l[0] === '+' || l[0] === '-').length, 0) : 0;
++  };
++  const n0 = await changedLines();
++  writeFileSync(abs, after, 'utf8');
++  const n1 = await changedLines();
++  if (n1 >= n0) { writeFileSync(abs, before); return { ok: false, problem: `putting back ${rel}'s whitespace did not make its diff smaller (${n0} -> ${n1} lines), so it was left as it was` }; }
++  return { ok: true, changed: true, before: n0, after: n1 };
 +}
 +
-=== change test/test-sandbox-browser-e2e.mjs
-base 5253ade29259367b5c9d6b35
-new 3dbf3f883e19265293023f02
-@@ 115 -0 +35
-+// A SERVER OF ITS OWN, INSIDE (the developer, 2026-11-11: the agent's test app, for the browser plugin): published, then
-+// opened in the Chrome out here, which cannot reach 127.0.0.1 in here by itself
-+await writeFile(path.join(PP, 'served.mjs'), `import { pcContainerHost } from './container.mjs';
++/**
++ * PUSH ALL (the developer, 2026-11-13: "a Push all button on the push modal that pushes all the commits"): the branch to
++ * its remote - `git push` when it has an upstream, else to origin under its own name. `env`: the credentials for this
++ * call (tools.mjs gitCredEnv). { ok, output } - git's own words either way.
++ */
++export async function gcPushAsync(repoDir, env = null) {
++  const br = await gcGitAsync(repoDir, ['rev-parse', '--abbrev-ref', 'HEAD']);
++  const branch = br.status === 0 ? String(br.stdout || '').trim() : '';
++  if (!branch || branch === 'HEAD') return { ok: false, output: 'Not on a branch (a detached HEAD): there is nothing to push it to.' };
++  const up = await gcGitAsync(repoDir, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}']);
++  const hasUp = up.status === 0 && String(up.stdout || '').trim() && !/@\{u\}/.test(up.stdout);
++  const r = await gcGitAsync(repoDir, hasUp ? ['push'] : ['push', 'origin', branch], { env, timeoutMs: 180000 });
++  const output = (String(r.stderr || '') + String(r.stdout || '')).trim();
++  return { ok: r.status === 0, output: output || (r.status === 0 ? 'Pushed.' : r.status == null ? 'git did not finish (3 minutes).' : `git push exited ${r.status}.`), branch };
++}
+=== change src/agent/git-projects.mjs
+base 94cf5ec6bd64b6056255cfb6
+new fbde47896862cdb9a2407095
+@@ 70 -1 +18
+-  return { branch, uncommitted: gpCountUncommitted(porcelain) };
++  return { branch, uncommitted: gpCountUncommitted(porcelain), unpushed: await gpUnpushedAsync(repoDir, branch) };
++}
++// COMMITS NOT ON THE REMOTE (the developer, 2026-11-13: "for the number bubble on the branch name, let's have it count the
++// unpushed commits, not the uncommitted changes"): against the branch's upstream, else origin/<branch> - as the push
++// window reads it (git-commit.mjs collectOutgoingAsync). null when there is no remote branch to count against, or git
++// could not say.
++async function gpUnpushedAsync(repoDir, branch) {
++  let up = await gpGitAsync(repoDir, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}']);
++  up = up == null ? '' : up.trim();
++  if (!up || /@\{u\}/.test(up)) {
++    if (!branch || /^\(|^HEAD$/.test(branch)) return null;
++    const o = await gpGitAsync(repoDir, ['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${branch}`]);
++    if (o == null || !o.trim()) return null;
++    up = `origin/${branch}`;
++  }
++  const n = await gpGitAsync(repoDir, ['rev-list', '--count', `${up}..HEAD`]);
++  const v = n == null ? NaN : parseInt(n.trim(), 10);
++  return Number.isFinite(v) ? v : null;
+@@ 74 -1 +1
+-  for (const h of (hitList || [])) { const info = await gitRepoInfoAsync(h.path); out.push({ path: h.path, name: h.name, branch: info.branch, uncommitted: info.uncommitted }); }
++  for (const h of (hitList || [])) { const info = await gitRepoInfoAsync(h.path); out.push({ path: h.path, name: h.name, branch: info.branch, uncommitted: info.uncommitted, unpushed: info.unpushed }); }
+@@ 99 -1 +1
+-  return (projects || []).map((p) => `${p.path}|${p.branch}|${p.uncommitted}`).join('\n');
++  return (projects || []).map((p) => `${p.path}|${p.branch}|${p.uncommitted}|${p.unpushed}`).join('\n');
+=== change src/agent/js-eval.mjs
+base f0b99d6b0cc8030622c80dd1
+new eb6cc59c0e1d402cb5105ee1
+@@ 266 -1 +1
+-    // A PAGE THAT IS NOT ALL OF IT says so, as dsRows does (said here: a sentence with numbers in it would be masked)
++    // A PAGE THAT IS NOT ALL OF IT says so, as datasetRows does (said here: a sentence with numbers in it would be masked)
+@@ 376 -1 +1
+-// DATA SETS - the filtering runs HERE, over the masked rows the host hands over (dsPage), never over real values. A
++// DATA SETS - the filtering runs HERE, over the masked rows the host hands over (datasetPage), never over real values. A
+@@ 449 -1 +1
+-    const pg = await rpc('dsPage', [set, narrow ? { offset: off, limit: 5000, columns: cols } : { offset: off, limit: 1000 }]);
++    const pg = await rpc('datasetPage', [set, narrow ? { offset: off, limit: 5000, columns: cols } : { offset: off, limit: 1000 }]);
+@@ 466 -1 +1
+-async function dsRows(set, opt) {
++async function datasetRows(set, opt) {
+@@ 470 -1 +1
+-    const pg = await rpc('dsPage', [set, { offset: offset, limit: limit, columns: opt.columns }]);
++    const pg = await rpc('datasetPage', [set, { offset: offset, limit: limit, columns: opt.columns }]);
+@@ 480 -1 +1
+-    for (const k of keys) if (scan.shown.indexOf(k.c) < 0) throw new Error('dsRows: orderBy "' + k.c + '" - only a shown column can be sorted by; sorting by a masked one would give away its order');
++    for (const k of keys) if (scan.shown.indexOf(k.c) < 0) throw new Error('datasetRows: orderBy "' + k.c + '" - only a shown column can be sorted by; sorting by a masked one would give away its order');
+@@ 496 -1 +1
+-    const got = await rpc('dsPage', [set, { rows: kept.slice(k, k + 2000).map(function (r) { return r._row; }), columns: opt.columns }]);
++    const got = await rpc('datasetPage', [set, { rows: kept.slice(k, k + 2000).map(function (r) { return r._row; }), columns: opt.columns }]);
+@@ 501 -1 +1
+-async function dsCount(set, opt) { let n = 0; const w = opt && opt.where; const need = dsWhereCols(w); await dsEach(set, w, function () { n++; }, need && need.length ? need : (w ? null : ['_none_'])); return n; }
++async function datasetCount(set, opt) { let n = 0; const w = opt && opt.where; const need = dsWhereCols(w); await dsEach(set, w, function () { n++; }, need && need.length ? need : (w ? null : ['_none_'])); return n; }
+@@ 508 -1 +1
+-async function dsUpdate(set, opt) {
++async function datasetUpdate(set, opt) {
+@@ 510 -1 +1
+-  if (!opt.set || typeof opt.set !== 'object') throw new Error('dsUpdate(set, { where, set: { column: value or function } })');
++  if (!opt.set || typeof opt.set !== 'object') throw new Error('datasetUpdate(set, { where, set: { column: value or function } })');
+@@ 521 -1 +1
+-    const ids = await dsTargets(set, opt, 'dsUpdate');
++    const ids = await dsTargets(set, opt, 'datasetUpdate');
+@@ 526 -1 +1
+-  for (let k = 0; k < writes.length; k += 2000) updated += (await rpc('dsWrite', [set, writes.slice(k, k + 2000)])).updated;
++  for (let k = 0; k < writes.length; k += 2000) updated += (await rpc('datasetWrite', [set, writes.slice(k, k + 2000)])).updated;
+@@ 529 -1 +1
+-async function dsShow(set, opt) {
++async function datasetShow(set, opt) {
+@@ 532 -1 +1
+-  // a table for the developer may be ordered by any column, by its REAL values: the host sorts (dsShowRows), and the
++  // a table for the developer may be ordered by any column, by its REAL values: the host sorts (datasetShowRows), and the
+@@ 538 -1 +1
+-    return rpc('dsShowRows', [set, { title: opt.title, columns: opt.columns, orderBy: keys, ids: ids, offset: opt.offset, limit: limit }]);
++    return rpc('datasetShowRows', [set, { title: opt.title, columns: opt.columns, orderBy: keys, ids: ids, offset: opt.offset, limit: limit }]);
+@@ 540 -2 +2
+-  const r = await dsRows(set, { where: opt.where, columns: opt.columns, offset: opt.offset, limit: limit });
+-  return rpc('dsShowRows', [set, { title: opt.title, columns: opt.columns, rows: r.rows, total: r.total }]);
++  const r = await datasetRows(set, { where: opt.where, columns: opt.columns, offset: opt.offset, limit: limit });
++  return rpc('datasetShowRows', [set, { title: opt.title, columns: opt.columns, rows: r.rows, total: r.total }]);
+@@ 543 -2 +6
+-async function dsDelete(set, opt) { const ids = await dsTargets(set, opt, 'dsDelete'); return rpc('dsDeleteRows', [set, ids]); }
+-if (fnNames.indexOf('dsPage') >= 0) { api.dsRows = dsRows; api.dsCount = dsCount; api.dsUpdate = dsUpdate; api.dsDelete = dsDelete; api.dsShow = dsShow; }
++async function datasetDelete(set, opt) { const ids = await dsTargets(set, opt, 'datasetDelete'); return rpc('datasetDeleteRows', [set, ids]); }
++if (fnNames.indexOf('datasetPage') >= 0) { api.datasetRows = datasetRows; api.datasetCount = datasetCount; api.datasetUpdate = datasetUpdate; api.datasetDelete = datasetDelete; api.datasetShow = datasetShow; }
++// THE OLD NAMES STILL WORK (the developer, 2026-11-13: "they're called things like dsPage. Let's change to datasetPage, so
++// it's more obvious to the user what's happening"): dsPage and the rest, as a skill or an older conversation wrote them,
++// run the new function - so the step shows its new name. Not listed anywhere.
++for (const k of Object.keys(api)) { if (/^dataset[A-Z]/.test(k)) { const old = 'ds' + k.slice(7); if (!(old in api)) api[old] = api[k]; } }
+@@ 775 -2 +2
+-  dsList: 'read', dsInfo: 'read', dsPage: 'read', dsShowRows: 'read', piiBatch: 'read',
+-  dsCreate: 'write', dsWrite: 'write', dsInsert: 'write', dsDeleteRows: 'write', dsCopy: 'write', dsKeep: 'write', dsMove: 'write', dsRemove: 'write', dsMkdir: 'write', dsExport: 'write',
++  datasetList: 'read', datasetInfo: 'read', datasetPage: 'read', datasetShowRows: 'read', piiBatch: 'read',
++  datasetCreate: 'write', datasetWrite: 'write', datasetInsert: 'write', datasetDeleteRows: 'write', datasetCopy: 'write', datasetKeep: 'write', datasetMove: 'write', datasetRemove: 'write', datasetMkdir: 'write', datasetExport: 'write',
+=== change src/agent/minimal-worker.mjs
+base 784183dc1d0b64a6eb7f59fc
+new c7547b7f3685fd84f0fd1a7d
+@@ 113 -1 +1
+-const DS_FNS = new Set(['dsCreate', 'dsList', 'dsInfo', 'dsPage', 'dsWrite', 'dsInsert', 'dsDeleteRows', 'dsCopy', 'dsKeep', 'dsMove', 'dsRemove', 'dsMkdir', 'dsExport', 'dsShowRows']);
++const DS_FNS = new Set(['datasetCreate', 'datasetList', 'datasetInfo', 'datasetPage', 'datasetWrite', 'datasetInsert', 'datasetDeleteRows', 'datasetCopy', 'datasetKeep', 'datasetMove', 'datasetRemove', 'datasetMkdir', 'datasetExport', 'datasetShowRows']);
+@@ 605 -1 +1
+-  let dsTableSeq = 0;   // the tables dsShow put in the chat this run
++  let dsTableSeq = 0;   // the tables datasetShow put in the chat this run
+@@ 864 -0 +4
++          // (a stopped snippet starts no new call - its slot has gone to the next one: snippet-jobs killSnippetJob)
++          // (nor one that has ENDED - timed out, its body still running on: a late call of it took the write slot back after
++          // its end had let it go, and nothing ever let it go again; prod, 2026-11-13, js-166)
++          if (job && (job.killed || job.state === 'done' || job.state === 'killed')) throw new Error(job.killed || job.state === 'killed' ? `${job.id} was stopped` : `${job.id} has already ended (its result was given) - this later call was not run`);
+@@ 923 -1 +1
+-          // A TABLE FOR THE DEVELOPER (dsShow): the rows go into the chat - masked as the agent saw them, revealed there by
++          // A TABLE FOR THE DEVELOPER (datasetShow): the rows go into the chat - masked as the agent saw them, revealed there by
+@@ 925 -1 +1
+-          if (String(fn) === 'dsShowRows' && value && typeof value === 'object' && value.table) {
++          if (String(fn) === 'datasetShowRows' && value && typeof value === 'object' && value.table) {
+=== change src/agent/prose-sanitizer.mjs
+base 96b1f914dd8d0c7e29dbcdfe
+new 184d533a193922234bfadfd1
+@@ 175 -1 +3
+-const answerStarts = (s, b) => { const c = s[b] || ''; return /[\p{Lu}`*#"'(\[>|_~]/u.test(c) || (/\d/.test(c) && /^\d{1,3}[.)]\s/.test(s.slice(b, b + 6))) || (c === '-' && s[b + 1] === ' '); };
++// (a count is an answer too, after a sentence's end - "...So valve has 66 orders." + "66 orders." stayed whole, the
++// reasoning shown as the reply; live, 2026-11-13: a stop after a LETTER, then a number and a word - not "v1." + "5.2")
++const answerStarts = (s, b) => { const c = s[b] || ''; return /[\p{Lu}`*#"'(\[>|_~]/u.test(c) || (/\d/.test(c) && /^\d{1,3}[.)]\s/.test(s.slice(b, b + 6))) || (/\d/.test(c) && /\p{L}/u.test(s[b - 2] || '') && SEAM_STOP.test(s[b - 1] || '') && /^\d[\d,.]*%?\s+\p{L}/u.test(s.slice(b, b + 32))) || (c === '-' && s[b + 1] === ' '); };
+=== change src/agent/run-record.mjs
+base d5000bef24dbd69d7fe0d4ea
+new 3d5f8318a76718366eaedbe5
+@@ 73 -1 +1
+-// THE CALLS A DATA SET SCAN MAKES FOR THE SNIPPET, IN ONE LINE EACH. dsRows, dsCount and dsUpdate read a set a page at
++// THE CALLS A DATA SET SCAN MAKES FOR THE SNIPPET, IN ONE LINE EACH. datasetRows, datasetCount and datasetUpdate read a set a page at
+@@ 79 -1 +1
+-    if (fn === 'dsPage' && value && typeof value === 'object' && Array.isArray(value.rows)) {
++    if (fn === 'datasetPage' && value && typeof value === 'object' && Array.isArray(value.rows)) {
+=== change src/agent/snippet-jobs.mjs
+base 1d52f2e07b8948ce5b9c45fc
+new 6c99dee2f9f562e725840515
+@@ 18 -0 +8
++// ONE KEY FOR A PROJECT, however its folder is spelled: the worker made a job under "D:/tmp/x" and bgKill looked it up
++// under path.resolve's backslashed "D:\\tmp\\x" - "no snippet js-1" while js-1 ran (live, 2026-11-13). Slashes one way, no trailing
++// one, and on Windows one case.
++export function snippetKey(k) {
++  let s = String(k || '').replace(/\\/g, '/').replace(/\/+$/, '');
++  if (process.platform === 'win32') s = s.toLowerCase();
++  return s;
++}
+@@ 33 -1 +1
+-    id, key: String(key || ''), callId: String(callId || ''), mode: 'read',
++    id, key: String(key || ''), nk: snippetKey(key), callId: String(callId || ''), mode: 'read',
+@@ 56 -1 +8
+-  const holder = _slot.get(job.key);
++  // an ENDED job never takes the slot again (a timed-out snippet's body ran on; its late call took the slot after its end
++  // had freed it, and held it for good - prod, 2026-11-13). The worker refuses such a call before it gets here.
++  if (job.killed || job.state === 'done' || job.state === 'killed') return { immediate: true, ahead: null, promise: Promise.resolve(), ended: true };
++  let holder = _slot.get(job.nk);
++  // (a STOPPED holder gives the slot up: stopped while stuck in a call that never returned, it never reached its end,
++  // kept the slot, and every later snippet that changed anything - or called a plugin tool - waited behind it for good;
++  // prod, 2026-11-13)
++  if (holder && holder !== job && (holder.killed || holder.state === 'done' || holder.state === 'killed')) { releaseWrite(holder); holder = _slot.get(job.nk); }
+@@ 59 -2 +2
+-  const q = _waiters.get(job.key) || [];
+-  if (!holder && !q.length) { _slot.set(job.key, job); job.mode = 'write'; changed(job.key); return { immediate: true, ahead: null, promise: Promise.resolve() }; }
++  const q = _waiters.get(job.nk) || [];
++  if (!holder && !q.length) { _slot.set(job.nk, job); job.mode = 'write'; changed(job.key); return { immediate: true, ahead: null, promise: Promise.resolve() }; }
+@@ 64 -1 +1
+-  job._writeP = new Promise((resolve) => { q.push({ job, resolve }); _waiters.set(job.key, q); });
++  job._writeP = new Promise((resolve) => { q.push({ job, resolve }); _waiters.set(job.nk, q); });
+@@ 69 -3 +3
+-  if (_slot.get(job.key) !== job) return;
+-  _slot.delete(job.key);
+-  const q = _waiters.get(job.key) || [];
++  if (_slot.get(job.nk) !== job) return;
++  _slot.delete(job.nk);
++  const q = _waiters.get(job.nk) || [];
+@@ 75 -1 +1
+-    _slot.set(job.key, next.job); next.job.mode = 'write'; next.job.state = 'running'; next.job.waitingFor = null; next.job._writeP = null;
++    _slot.set(job.nk, next.job); next.job.mode = 'write'; next.job.state = 'running'; next.job.waitingFor = null; next.job._writeP = null;
+@@ 79 -1 +1
+-  if (!q.length) _waiters.delete(job.key);
++  if (!q.length) _waiters.delete(job.nk);
+@@ 90 -2 +2
+-  const q = _waiters.get(job.key);
+-  if (q) { const i = q.findIndex((w) => w.job === job); if (i >= 0) { const [w] = q.splice(i, 1); w.resolve(); } if (!q.length) _waiters.delete(job.key); }
++  const q = _waiters.get(job.nk);
++  if (q) { const i = q.findIndex((w) => w.job === job); if (i >= 0) { const [w] = q.splice(i, 1); w.resolve(); } if (!q.length) _waiters.delete(job.nk); }
+@@ 102 -1 +1
+-  if (!job || (key && job.key !== String(key))) return { ok: false, error: `no snippet ${id}` };
++  if (!job || (key && job.nk !== snippetKey(key))) return { ok: false, error: `no snippet ${id}` };
+@@ 108 -2 +5
+-  const q = _waiters.get(job.key);
+-  if (q) { const i = q.findIndex((w) => w.job === job); if (i >= 0) { const [w] = q.splice(i, 1); w.resolve(); } if (!q.length) _waiters.delete(job.key); }
++  const q = _waiters.get(job.nk);
++  if (q) { const i = q.findIndex((w) => w.job === job); if (i >= 0) { const [w] = q.splice(i, 1); w.resolve(); } if (!q.length) _waiters.delete(job.nk); }
++  // and the write slot goes to the next one now, not when the stopped snippet's last call comes back - it may never
++  // (the worker starts no new call of a stopped job: beforeStep)
++  releaseWrite(job);
+@@ 129 -1 +1
+-    .filter((j) => (!key || j.key === String(key)) && (includeDone || j.state === 'running' || j.state === 'waiting' || j.state === 'queued'))
++    .filter((j) => (!key || j.nk === snippetKey(key)) && (includeDone || j.state === 'running' || j.state === 'waiting' || j.state === 'queued'))
+@@ 140 -1 +4
+-  const live = listSnippetJobs(key, { includeDone: false }).filter((j) => j.background);
++  // (and the one holding the write slot even when it is not a background one - another chat's, or one stopped and not
++  // yet ended: a snippet "WAITING for js-166" while the list said "none now" left the agent nothing to stop; prod, 2026-11-13)
++  const holders = new Set([..._slot.entries()].filter(([k]) => !key || k === snippetKey(key)).map(([, j]) => j.id));
++  const live = listSnippetJobs(key, { includeDone: false }).filter((j) => j.background || holders.has(j.id));
+=== change src/agent/tools.mjs
+base 78b75a8ba45f38e767b4a9dc
+new fdf145293dee017eb76bb9d2
+@@ 2433 -1 +1
+-const WRITE_FNS = new Set(['commit', 'write', 'edit', 'mkdir', 'copy', 'move', 'remove', 'unzip', 'clone', 'git_clone', 'mvn', 'npm', 'node', 'java', 'javac', 'javap', 'deployToContainer', 'restartContainer', 'rollbackContainer', 'dsCreate', 'dsWrite', 'dsInsert', 'dsDeleteRows', 'dsCopy', 'dsKeep', 'dsMove', 'dsRemove', 'dsMkdir', 'dsExport']);
++const WRITE_FNS = new Set(['commit', 'write', 'edit', 'mkdir', 'copy', 'move', 'remove', 'unzip', 'clone', 'git_clone', 'mvn', 'npm', 'node', 'java', 'javac', 'javap', 'deployToContainer', 'restartContainer', 'rollbackContainer', 'datasetCreate', 'datasetWrite', 'datasetInsert', 'datasetDeleteRows', 'datasetCopy', 'datasetKeep', 'datasetMove', 'datasetRemove', 'datasetMkdir', 'datasetExport']);
+@@ 3086 -3 +3
+-    // Arguments arrive as written (the view resolves the tokens in them); what comes back is masked already. dsRows,
+-    // dsCount, dsUpdate and dsDelete are the snippet's own (js-eval.mjs): they filter the masked rows these hand over.
+-    dsCreate: async ([data, opt]) => {
++    // Arguments arrive as written (the view resolves the tokens in them); what comes back is masked already. datasetRows,
++    // datasetCount, datasetUpdate and datasetDelete are the snippet's own (js-eval.mjs): they filter the masked rows these hand over.
++    datasetCreate: async ([data, opt]) => {
+@@ 3115 -12 +12
+-    dsList: async ([folder]) => dsOf(ctx).list(folder == null ? null : String(folder)),
+-    dsInfo: async ([set]) => dsOf(ctx).info(set),
+-    dsPage: async ([set, opt]) => dsOf(ctx).page(set, { ...(opt && typeof opt === 'object' ? opt : {}), projectDir: toolRoot(ctx) }),
+-    dsWrite: async ([set, writes]) => dsOf(ctx).write(set, Array.isArray(writes) ? writes : [], { projectDir: toolRoot(ctx) }),
+-    dsInsert: async ([set, rows]) => dsOf(ctx).insert(set, rows, { projectDir: toolRoot(ctx) }),
+-    dsDeleteRows: async ([set, rowIds]) => dsOf(ctx).remove(set, (Array.isArray(rowIds) ? rowIds : [rowIds]).map(Number)),
+-    dsCopy: async ([set, opt]) => dsOf(ctx).copy(set, { path: (opt && opt.path) ?? null }),
+-    dsKeep: async ([set, p]) => dsOf(ctx).keep(set, String(p || '')),
+-    dsMove: async ([from, to]) => dsOf(ctx).move(String(from || ''), String(to || '')),
+-    dsRemove: async ([set]) => dsOf(ctx).drop(set),
+-    dsMkdir: async ([folder]) => dsOf(ctx).mkdir(String(folder || '')),
+-    // dsShowRows - dsShow's host half (js-eval.mjs): the rows it chose, masked as the agent saw them, become a table in
++    datasetList: async ([folder]) => dsOf(ctx).list(folder == null ? null : String(folder)),
++    datasetInfo: async ([set]) => dsOf(ctx).info(set),
++    datasetPage: async ([set, opt]) => dsOf(ctx).page(set, { ...(opt && typeof opt === 'object' ? opt : {}), projectDir: toolRoot(ctx) }),
++    datasetWrite: async ([set, writes]) => dsOf(ctx).write(set, Array.isArray(writes) ? writes : [], { projectDir: toolRoot(ctx) }),
++    datasetInsert: async ([set, rows]) => dsOf(ctx).insert(set, rows, { projectDir: toolRoot(ctx) }),
++    datasetDeleteRows: async ([set, rowIds]) => dsOf(ctx).remove(set, (Array.isArray(rowIds) ? rowIds : [rowIds]).map(Number)),
++    datasetCopy: async ([set, opt]) => dsOf(ctx).copy(set, { path: (opt && opt.path) ?? null }),
++    datasetKeep: async ([set, p]) => dsOf(ctx).keep(set, String(p || '')),
++    datasetMove: async ([from, to]) => dsOf(ctx).move(String(from || ''), String(to || '')),
++    datasetRemove: async ([set]) => dsOf(ctx).drop(set),
++    datasetMkdir: async ([folder]) => dsOf(ctx).mkdir(String(folder || '')),
++    // datasetShowRows - datasetShow's host half (js-eval.mjs): the rows it chose, masked as the agent saw them, become a table in
+@@ 3128 -1 +1
+-    dsShowRows: async ([set, t]) => {
++    datasetShowRows: async ([set, t]) => {
+@@ 3145 -1 +1
+-    // dsExport(set, { as: 'array' | 'json' | 'jsonl', file }) - without a file, the set as dsRows shows it; with one, the
++    // datasetExport(set, { as: 'array' | 'json' | 'jsonl', file }) - without a file, the set as datasetRows shows it; with one, the
+@@ 3147 -1 +1
+-    dsExport: async ([set, opt]) => {
++    datasetExport: async ([set, opt]) => {
+=== change src/agent/worker-prompt.mjs
+base cae1a4e99e00ededa3036c14
+new ea23ca1fda45eb8be9add2b1
+@@ 116 -1 +1
+-    '  DATA SETS — tables kept outside the project, each column masked by its own rule (a plugin\'s query results come as one): dsList · dsInfo · dsRows · dsCount · dsShow (show the developer a table they can sort) · dsCreate · dsInsert · dsUpdate · dsDelete · dsCopy · dsKeep · dsMove · dsMkdir · dsRemove · dsExport. Call dsBrief() for how they work before you use them.',
++    '  DATA SETS — tables kept outside the project, each column masked by its own rule (a plugin\'s query results come as one): datasetList · datasetInfo · datasetRows · datasetCount · datasetShow (show the developer a table they can sort) · datasetCreate · datasetInsert · datasetUpdate · datasetDelete · datasetCopy · datasetKeep · datasetMove · datasetMkdir · datasetRemove · datasetExport. Call dsBrief() for how they work before you use them.',
+@@ 235 -0 +2
++      // (the developer, 2026-11-13: 'Sometimes the agent just says "Reproduced."... reproduced what?')
++      '  - A SENTENCE OF YOURS SAYS WHAT IT IS ABOUT, so it stands on its own: never a bare word - "Reproduced.", "Done.", "Fixed.", "Confirmed." say nothing to someone who did not follow every step. Name the thing and what you found: "Reproduced the date shift: the 2026-11-12 order is listed under 11-11, as reported." - then what you do next.',
+@@ 327 -1 +1
+-  [['dsList', 'dsInfo', 'dsRows', 'dsCount', 'dsShow', 'dsCreate', 'dsInsert', 'dsUpdate', 'dsDelete', 'dsCopy', 'dsKeep', 'dsMove', 'dsMkdir', 'dsRemove', 'dsExport', 'dsBrief'], '(data sets)'],
++  [['datasetList', 'datasetInfo', 'datasetRows', 'datasetCount', 'datasetShow', 'datasetCreate', 'datasetInsert', 'datasetUpdate', 'datasetDelete', 'datasetCopy', 'datasetKeep', 'datasetMove', 'datasetMkdir', 'datasetRemove', 'datasetExport', 'dsBrief'], '(data sets)'],
+=== change src/datasets-view.mjs
+base 3a6e1d68a1f6d38d90fdcf24
+new 25c04a003ba81417eb20e528
+@@ 28 -2 +2
+-    // what dsCreate / dsCopy / dsKeep return ({ set, ... }) names its set as well as the reference itself does (live: the
+-    // agent passed dsCopy's result straight on)
++    // what datasetCreate / datasetCopy / datasetKeep return ({ set, ... }) names its set as well as the reference itself does (live: the
++    // agent passed datasetCopy's result straight on)
+@@ 32 -1 +1
+-    if (!r) throw new Error('which data set? Give its reference (#@ds#…, as dsCreate or dsList gave it) or the path it is kept at');
++    if (!r) throw new Error('which data set? Give its reference (#@ds#…, as datasetCreate or datasetList gave it) or the path it is kept at');
+@@ 42 -1 +1
+-    if (/^#@ds#/i.test(r) && !/^#@ds#[0-9a-z]{7}$/.test(r)) throw new Error(`${r} is not a data set reference - one is #@ds# and seven letters and digits (#@ds#7k1izwk), exactly as create() or dsCreate() returned it or dsList() shows it. Never put one together by hand: keep the one you were given (in host.state, say), or find the set again with list() by its path.`);
++    if (/^#@ds#/i.test(r) && !/^#@ds#[0-9a-z]{7}$/.test(r)) throw new Error(`${r} is not a data set reference - one is #@ds# and seven letters and digits (#@ds#7k1izwk), exactly as create() or datasetCreate() returned it or datasetList() shows it. Never put one together by hand: keep the one you were given (in host.state, say), or find the set again with list() by its path.`);
+@@ 46 -1 +1
+-      if (!e || p.name !== 'ds') throw new Error(`${r} is not a data set reference this install issued - dsList() shows the sets there are`);
++      if (!e || p.name !== 'ds') throw new Error(`${r} is not a data set reference this install issued - datasetList() shows the sets there are`);
+@@ 79 -1 +1
+-        const masked = await filter.maskDeep(unmarked.map(([o, c]) => o[c]), { hook: 'tool-result', toolName: 'dsRows', projectDir });
++        const masked = await filter.maskDeep(unmarked.map(([o, c]) => o[c]), { hook: 'tool-result', toolName: 'datasetRows', projectDir });
+@@ 113 -1 +1
+-  // the row again (dsRows)", the agent read it again from a set that had expired, and took dsRows for an array):
++  // the row again (datasetRows)", the agent read it again from a set that had expired, and took datasetRows for an array):
+@@ 158 -1 +1
+-    return { set: refOf(made.id), rows: made.rows, columns: made.columns.map((c) => ({ name: c.name, masking: c.mark || 'masked as a file' })), ...(p ? { path: p } : { expires: 'in 24 hours - dsKeep(set, path) keeps it' }) };
++    return { set: refOf(made.id), rows: made.rows, columns: made.columns.map((c) => ({ name: c.name, masking: c.mark || 'masked as a file' })), ...(p ? { path: p } : { expires: 'in 24 hours - datasetKeep(set, path) keeps it' }) };
+@@ 163 -1 +1
+-    return { value: await filter.unmask(s, { hook: 'tool-args', toolName: 'dsUpdate', projectDir }), token: true };
++    return { value: await filter.unmask(s, { hook: 'tool-args', toolName: 'datasetUpdate', projectDir }), token: true };
+@@ 186 -2 +2
+-   * Row ids ordered by the REAL values of some columns - for a table the DEVELOPER is shown (dsShow), never for rows
+-   * handed to the agent: dsRows sorts by shown columns only, as the order of masked values would give them away (the
++   * Row ids ordered by the REAL values of some columns - for a table the DEVELOPER is shown (datasetShow), never for rows
++   * handed to the agent: datasetRows sorts by shown columns only, as the order of masked values would give them away (the
+@@ 194 -1 +1
+-    for (const k of keys) if (!names.has(k.c)) throw new Error(`dsShow: orderBy "${k.c}" - the set has no such column (${[...names].join(', ')})`);
++    for (const k of keys) if (!names.has(k.c)) throw new Error(`datasetShow: orderBy "${k.c}" - the set has no such column (${[...names].join(', ')})`);
+@@ 224 -1 +1
+-  async function copy(ref, { path: p = null } = {}) { const r = await dataSets.copy(await dataSets.resolve(idOf(ref)), { path: p }); return { set: refOf(r.id), ...(p ? { path: p } : { expires: 'in 24 hours - dsKeep(set, path) keeps it' }) }; }
++  async function copy(ref, { path: p = null } = {}) { const r = await dataSets.copy(await dataSets.resolve(idOf(ref)), { path: p }); return { set: refOf(r.id), ...(p ? { path: p } : { expires: 'in 24 hours - datasetKeep(set, path) keeps it' }) }; }
+@@ 229 -1 +1
+-  /** The whole set, masked as dsRows shows it: an array of objects, a JSON string or JSONL. */
++  /** The whole set, masked as datasetRows shows it: an array of objects, a JSON string or JSONL. */
+=== change src/datasets.mjs
+base b3b00123fcc50bde456f818e
+new d243dd1dc173dabf878e29e5
+@@ 107 -1 +1
+-    throw new Error(`no data set "${r}" - it may have expired (a set not kept is removed 24 hours after it was made). dsList() shows what there is.`);
++    throw new Error(`no data set "${r}" - it may have expired (a set not kept is removed 24 hours after it was made). datasetList() shows what there is.`);
+=== change src/plugins/authoring.mjs
+base 4492f08aa7ab38e6b6c41067
+new 7607b2aab9f8b01d579bb3c2
+@@ 527 -1 +1
+-  table in the chat (dsShow), and your push tool reads it back.
++  table in the chat (datasetShow), and your push tool reads it back.
+=== change src/server.mjs
+base 84f601d9fc6dccd61072c118
+new a0ecee1bb5e9c332154c31eb
+@@ 78 -1 +1
+-import { collectRepoChangesAsync, applyCommitsAsync, buildNextCommitPrompt, parseNextCommitRec, allUnitIds, lastCommitTimeMsAsync, COMMIT_REC_HUNK_LINES, gcEolOnlyLines, gcMatchRepoEol, collectOutgoingAsync, commitFilesAsync } from './agent/git-commit.mjs';
++import { collectRepoChangesAsync, applyCommitsAsync, buildNextCommitPrompt, parseNextCommitRec, allUnitIds, lastCommitTimeMsAsync, COMMIT_REC_HUNK_LINES, gcEolOnlyLines, gcMatchRepoEol, gcRevertWhitespace, gcPushAsync, collectOutgoingAsync, commitFilesAsync } from './agent/git-commit.mjs';
+@@ 424 -1 +1
+-import { backgroundToolCall, extendToolCall } from './agent/tools.mjs';
++import { backgroundToolCall, extendToolCall, gitCredEnv } from './agent/tools.mjs';
+@@ 6423 -0 +10
++  // ONE BOOKKEEPER AT A TIME, in the whole server (the developer, 2026-11-13: "in prod, I see 2 bookkeepers running at the
++  // same time. Let's make sure only 1 at a time can run"): a pass of a chat already waited for that chat's last one
++  // (session._streamPass), but the upgrade's lane ran beside it, and the main chat's and the side chat's ran side by side.
++  // Every pass and every upgrade chunk now waits here for the one before it, whichever chat or lane it came from.
++  let _bkChain = Promise.resolve();
++  function bkOneAtATime(fn) {
++    const run = _bkChain.catch(() => {}).then(() => fn());
++    _bkChain = run.catch(() => {});
++    return run;
++  }
+@@ 6429 -1 +1
+-    const p = (session._streamPass || Promise.resolve()).catch(() => {}).then(async () => {
++    const p = (session._streamPass || Promise.resolve()).catch(() => {}).then(() => bkOneAtATime(async () => {
+@@ 6476 -1 +1
+-    }).catch((e) => { fileLog(`bookkeeper: pass (${why}) failed: ${String(e?.message || e).slice(0, 200)}`); return null; });
++    })).catch((e) => { fileLog(`bookkeeper: pass (${why}) failed: ${String(e?.message || e).slice(0, 200)}`); return null; });
+@@ 6583 -1 +1
+-          const r = await runStreamPass({ st, events, callParts: streamCall(model, ctrl.signal, STREAM_PASS_LABEL, sideLineOf('_bkUpLine', 'bookkeeper upgrade')), budgetChars: streamBkGoal() * tokenRatio().charsPerToken, upgrade: chunk });
++          const r = await bkOneAtATime(() => runStreamPass({ st, events, callParts: streamCall(model, ctrl.signal, STREAM_PASS_LABEL, sideLineOf('_bkUpLine', 'bookkeeper upgrade')), budgetChars: streamBkGoal() * tokenRatio().charsPerToken, upgrade: chunk }));
+@@ 7047 -1 +4
+-        if ((q.at != null && /^e\d+$/.test(String(q.at))) || q.before != null) return recordPart(q, 'THE MAIN CONVERSATION\'S WHOLE RECORD, faded parts too.');
++        // (before: a MESSAGE NUMBER as the view shows them - "#285" - or a record id - "e12": prod, 2026-11-13, the agent
++        // read #0..#n here and asked mainChat({ before: 285, max: 20 }), and was told the record had no item "285")
++        const bNum = q.before != null && /^#?\d+$/.test(String(q.before).trim()) ? Number(String(q.before).trim().replace(/^#/, '')) : null;
++        if ((q.at != null && /^e\d+$/.test(String(q.at))) || (q.before != null && bNum == null)) return recordPart(q, 'THE MAIN CONVERSATION\'S WHOLE RECORD, faded parts too.');
+@@ 7065 -1 +6
+-        const last = Math.min(Math.max(1, Math.round(Number(q.last)) || 10), 80);
++        const last = Math.min(Math.max(1, Math.round(Number(q.last ?? q.max)) || 10), 80);   // (max: the same, as agents write it)
++        if (bNum != null) {
++          if (bNum < 1 || bNum > n) throw new Error(`mainChat({ before: ${bNum} }): a message number from #1 to #${n} (the ones before it are shown) - or a record id like "e12" for the whole record`);
++          const from = Math.max(0, bNum - last);
++          return head + `\n\n#${from} to #${bNum - 1}:\n\n` + within(all.slice(from, bNum).map((m, k) => show(m, from + k, MAIN_CHAT_EACH))) + (from > 0 ? `\n\n(earlier: mainChat({ before: ${from} }))` : '');
++        }
+@@ 7528 -1 +1
+-  const CB_DS_FN_NAMES = ['dsCreate', 'dsList', 'dsInfo', 'dsRows', 'dsCount', 'dsUpdate', 'dsInsert', 'dsDelete', 'dsCopy', 'dsKeep', 'dsMove', 'dsRemove', 'dsMkdir', 'dsExport', 'dsShow'];
++  const CB_DS_FN_NAMES = ['datasetCreate', 'datasetList', 'datasetInfo', 'datasetRows', 'datasetCount', 'datasetUpdate', 'datasetInsert', 'datasetDelete', 'datasetCopy', 'datasetKeep', 'datasetMove', 'datasetRemove', 'datasetMkdir', 'datasetExport', 'datasetShow'];
+@@ 8883 -0 +12
++      // THE HELP AGENT'S SUGGESTIONS TAKEN AWAY (the developer, 2026-11-13: "I don't know how to remove them. We need remove
++      // buttons"): one by its id, or all of them
++      if (req.method === 'POST' && path === '/api/help-suggestions/remove') {
++        let b; try { b = JSON.parse(await readBody(req)) || {}; } catch { return sendJson(res, 400, { error: 'bad json' }); }
++        const cur = _sessionBase.helpSuggestions || [];
++        const left = b.all ? [] : cur.filter((s) => s.id !== String(b.id || ''));
++        if (left.length !== cur.length) {
++          _sessionBase.helpSuggestions = left;
++          try { chatContext.run(mainChat, () => broadcast({ type: 'help-suggestions', suggestions: left })); } catch {}
++        }
++        return sendJson(res, 200, { ok: true, suggestions: left });
++      }
+@@ 9042 -1 +1
+-            // the agent's data sets too (live, 2026-10-30: dsList() in the console said "data sets are not available here")
++            // the agent's data sets too (live, 2026-10-30: datasetList() in the console said "data sets are not available here")
+@@ 9275 -0 +31
++      // WHITESPACE-ONLY CHANGES PUT BACK, one file or several (the developer, 2026-11-13: "make it easy to reverse it on
++      // disk, so it matches the repo"): gcRevertWhitespace each; what came of each said
++      if (req.method === 'POST' && path === '/api/git-revert-ws') {
++        let b; try { b = JSON.parse(await readBody(req)) || {}; } catch { return sendJson(res, 400, { error: 'bad json' }); }
++        const repoPath = String(b.path || '');
++        if (!repoPath || !(session.gitProjects || []).some((p) => p.path === repoPath)) return sendJson(res, 400, { error: 'unknown repo' });
++        if (_committing.has(repoPath)) return sendJson(res, 409, { error: 'A commit of this repo is running - try again when it is done.' });
++        const files = (Array.isArray(b.files) ? b.files : [b.file]).map((f) => String(f || '')).filter(Boolean).slice(0, 500);
++        if (!files.length) return sendJson(res, 400, { error: 'no file named' });
++        const results = [];
++        for (const f of files) {
++          const r = await gcRevertWhitespace(repoPath, f);
++          if (r.ok && r.changed) logInfo('git', `${repoPath}: ${f} - whitespace-only changes put back (${r.before} -> ${r.after} changed lines)`);
++          results.push({ file: f, ...r });
++        }
++        rescanGitProjects().catch(() => {});
++        return sendJson(res, 200, { results });
++      }
++      // PUSH ALL (the developer, 2026-11-13): the branch to its remote, with the developer's GitLab credentials for this
++      // one call (gitCredEnv - the same as the agent's git push)
++      if (req.method === 'POST' && path === '/api/git-push') {
++        let b; try { b = JSON.parse(await readBody(req)) || {}; } catch { return sendJson(res, 400, { error: 'bad json' }); }
++        const repoPath = String(b.path || '');
++        if (!repoPath || !(session.gitProjects || []).some((p) => p.path === repoPath)) return sendJson(res, 400, { error: 'unknown repo' });
++        if (_committing.has(repoPath)) return sendJson(res, 409, { error: 'A commit of this repo is running - try again when it is done.' });
++        let env = null; try { env = gitCredEnv(['push'], session.gitlabCreds || null); } catch { env = null; }
++        const r = await gcPushAsync(repoPath, env);
++        logInfo('git', `${repoPath}: push ${r.ok ? 'done' : 'refused'} - ${String(r.output).split('\n').slice(-1)[0].slice(0, 200)}`);
++        try { await rescanGitProjects(); } catch {}
++        return sendJson(res, 200, r);
++      }
+=== change src/tokens.mjs
+base 17da8e7994d1dbcbae782ac1
+new 7ab498767746c954d37579b3
+@@ 230 -4 +4
+-    // (the set's reference is #@ds#<the tag in the cell's token>; dsRows answers { rows, total }, not an array - prod,
+-    // 2026-11-02: told only "read the row again (dsRows)", the agent took rows[0] of it)
+-    const ref = `#@ds#${cell[1]}`, read = `(await dsRows("${ref}", { offset: ${cell[3]}, limit: 1 })).rows[0].${cell[2]}`;
+-    if (why === 'gone') return `${t} is a cell of the data set ${ref}, and that set is gone - a set not kept is removed 24 hours after it was made (dsKeep keeps one). Nothing ran. Make the set again (run what made it) and use the tokens it gives now.`;
++    // (the set's reference is #@ds#<the tag in the cell's token>; datasetRows answers { rows, total }, not an array - prod,
++    // 2026-11-02: told only "read the row again (datasetRows)", the agent took rows[0] of it)
++    const ref = `#@ds#${cell[1]}`, read = `(await datasetRows("${ref}", { offset: ${cell[3]}, limit: 1 })).rows[0].${cell[2]}`;
++    if (why === 'gone') return `${t} is a cell of the data set ${ref}, and that set is gone - a set not kept is removed 24 hours after it was made (datasetKeep keeps one). Nothing ran. Make the set again (run what made it) and use the tokens it gives now.`;
+@@ 235 -1 +1
+-    return `${t} is a data set cell's token, and that cell has changed since (or its set is gone). Nothing ran. Read it again - ${read} (dsRows answers { rows, total }) - or, if the set is gone, make it again.`;
++    return `${t} is a data set cell's token, and that cell has changed since (or its set is gone). Nothing ran. Read it again - ${read} (datasetRows answers { rows, total }) - or, if the set is gone, make it again.`;
+=== change src/ui.html
+base 5aa070ffdf03804f37b13b43
+new 5ef03d841722c85f00b16d7e
+@@ 20 -0 +2
++    --seg-w: 41px;   /* a segment at the box's right end - the >_ - and the help suggestions' pencils over it (between the
++                        pencil's old 35px and the >_'s old 47px: the developer, 2026-11-13, "maybe between the 2") */
+@@ 99 -2 +15
+-  .suggest-chip .suggest-edit { background: none; border: 0; border-left: 1px solid var(--border); color: var(--muted); padding: 0 10px; cursor: pointer; font-size: 13.5px; }
+-  .suggest-chip .suggest-edit:hover { color: var(--accent-text); }
++  /* hovered: the box's 2px border, as the message box has when it is in use - its 1px border and a 1px ring over it, so
++     nothing in it moves (the developer, 2026-11-13) */
++  .suggest-chip { position: relative; }
++  .suggest-chip:hover { border-color: var(--accent); }
++  .suggest-chip:hover::after { content: ''; position: absolute; inset: 0; border-radius: 7px; box-shadow: var(--accent-ring); pointer-events: none; z-index: 1; }
++  /* ITS BUTTONS ARE SEGMENTS LIKE THE BOX'S >_ (the developer, 2026-11-13: "the edit buttons on the suggestion popups don't
++     line up w/ the repl button ... make it so they go together visually"): the same width (--seg-w), the same line on
++     their left and the same tint, so the pencils stand in a column over >_; the x to take one away just left of it */
++  .suggest-chip .suggest-edit, .suggest-chip .suggest-remove { flex: none; width: var(--seg-w); display: flex; align-items: center; justify-content: center; padding: 0;
++    border: 0; border-left: 1px solid var(--border); background: rgba(255, 255, 255, 0.035); color: var(--muted); cursor: pointer; font-size: 13.5px; line-height: 1; }
++  .suggest-chip .suggest-edit:hover, .suggest-chip .suggest-remove:hover { background: rgba(255, 255, 255, 0.07); color: var(--fg); }
++  .suggest-chip .suggest-remove { font-size: 15px; }
++  .suggest-head { display: flex; align-items: baseline; }
++  .suggest-head .suggest-clear { margin-left: auto; background: none; border: 0; padding: 0 2px; font: inherit; font-size: 11px; color: var(--muted); cursor: pointer; }
++  .suggest-head .suggest-clear:hover { color: var(--accent-text); text-decoration: underline; }
+@@ 509 -0 +2
++  #rightPanel .rp-running .bg-row .row-body.bg-cmd-more { cursor: pointer; }
++  #rightPanel .rp-running .bg-row .row-body.bg-cmd-more:hover { color: var(--fg); }
+@@ 521 -1 +3
+-  .body > .thought-fold.in-step > summary { display: inline-block; }
++  /* (its line as tall as a reply's first line - 13.5px at 1.55 = 20.9px - so "Thinking" sits level with the step's bullet:
++     at its own 12px x 1.55 it was 18.6px, and its text rode a pixel high; the developer, 2026-11-13) */
++  .body > .thought-fold.in-step > summary { display: inline-block; line-height: 1.744; }
+@@ 552 -0 +4
++  /* (nor its bar, wherever it is: with the right panel closed the bar docks under the message box, and the side chat's
++     page read that shared state and docked its own there - branches, Edit, the token count and the gear under the side
++     chat's box; prod, 2026-11-13. Nothing goes under the side chat's box.) */
++  html.side-mode #sideChrome { display: none !important; }
+@@ 2555 -0 +3
++  /* (nothing to push, changes not committed: their count in a GRAY bubble - the gold one is for commits a push would send;
++     the developer, 2026-11-13) */
++  html .gp-badge.gp-local .gp-count { background: var(--muted); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--muted) 70%, white); }
+@@ 2569 -0 +15
++  /* PUT THE WHITESPACE BACK (2026-11-13): a small outlined pill beside the count it acts on, in the warning's colour -
++     quiet until hovered; the section's one for all files sits at the header's right */
++  .og-ws-undo { flex: none; font: inherit; font-size: 11px; line-height: 1.4; padding: 1px 8px; border-radius: 999px; cursor: pointer;
++    color: var(--warn); background: transparent; border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent); white-space: nowrap; }
++  .og-ws-undo:hover:not(:disabled) { background: color-mix(in srgb, var(--warn) 14%, transparent); border-color: var(--warn); }
++  .og-ws-undo:disabled { opacity: 0.6; cursor: default; }
++  .og-head .og-ws-all { float: right; text-transform: none; letter-spacing: 0; font-weight: 500; margin-top: -2px; }
++  .og-note { font-size: 12px; margin: 0 2px 10px; padding: 6px 10px; border-radius: 6px; color: var(--fg);
++    background: color-mix(in srgb, var(--diff-add) 10%, transparent); border: 1px solid color-mix(in srgb, var(--diff-add) 35%, transparent); }
++  .og-note.bad { background: color-mix(in srgb, var(--diff-del) 10%, transparent); border-color: color-mix(in srgb, var(--diff-del) 40%, transparent); }
++  /* PUSH ALL: the window's footer - what a push sends, and the button */
++  .og-foot { display: flex; align-items: center; gap: 12px; padding: 10px 16px; border-top: 1px solid var(--border); }
++  .og-foot[hidden] { display: none; }
++  .og-foot-info { flex: 1 1 auto; min-width: 0; font-size: 11px; color: var(--muted); }
++  .og-foot .og-push { flex: none; }
+@@ 2856 -1 +2
+-    order: 99; align-self: stretch; display: flex; align-items: center; margin: -6px -10px -6px 4px; padding: 0 15px;
++    order: 99; align-self: stretch; display: flex; align-items: center; justify-content: center; margin: -6px -10px -6px 4px;
++    width: var(--seg-w); flex: none; padding: 0 2px 0 0;   /* (a set width, the help suggestions' pencils above it the same; the glyph 1px left of centre: ">" narrows to a point and the right end is rounded, so an even split read as more space on the left - the developer, 2026-11-13) */
+@@ 4303 -0 +1
++    <div class="og-foot" id="commitFoot" hidden></div>
+@@ 4611 -1 +4
+-    const sb = _logScrollEl ? Math.max(0, _logScrollEl.offsetWidth - _logScrollEl.clientWidth) : 0;
++    // (not while the conversation is hidden - the >_ console in its place: it measured 0 then, and the message box grew by
++    // a scrollbar's width; the developer, 2026-11-13: "it should stay the same size")
++    if (!_logScrollEl || _logScrollEl.offsetParent === null) return;
++    const sb =_logScrollEl ? Math.max(0, _logScrollEl.offsetWidth - _logScrollEl.clientWidth) : 0;
+@@ 6669 -1 +1
+-  // ── a data set table in the chat (the agent's dsShow) ──
++  // ── a data set table in the chat (the agent's datasetShow) ──
+@@ 6726 -1 +1
+-    if (!j.sets.length) { box.innerHTML = '<span class="ds-empty">No data sets yet. A plugin makes one from a query, or the agent does with dsCreate().</span>'; return; }
++    if (!j.sets.length) { box.innerHTML = '<span class="ds-empty">No data sets yet. A plugin makes one from a query, or the agent does with datasetCreate().</span>'; return; }
+@@ 6986 -0 +2
++  const BG_CMD_PREVIEW = 60;          // characters of a process's command shown before a click opens all of it
++  const _bgCmdOpen = new Set();       // processes whose whole command is shown (kept across the list's redraws)
+@@ 6996 -2 +13
+-    body.textContent = label + (bgCommandShown(p.command) || '(process)') + (p.alive ? '' : (p.stopped ? '  · stopped' : (p.exitCode == null ? '  · ended' : `  · exit ${p.exitCode}`)));
+-    if (p.command) body.title = p.command;
++    // A PREVIEW OF THE COMMAND, a click for all of it (the developer, 2026-11-13: "the bg processes listed in the upper
++    // right are taking too much space. maybe show x chars as a preview and click to expand and see the command fully")
++    const cmd = label + (bgCommandShown(p.command) || '(process)');
++    const tail = p.alive ? '' : (p.stopped ? '  · stopped' : (p.exitCode == null ? '  · ended' : `  · exit ${p.exitCode}`));
++    const long = cmd.length > BG_CMD_PREVIEW;
++    const paintCmd = () => { body.textContent = (long && !_bgCmdOpen.has(p.id) ? cmd.slice(0, BG_CMD_PREVIEW).trimEnd() + '…' : cmd) + tail; };
++    paintCmd();
++    if (long) {
++      body.classList.add('bg-cmd-more');
++      const tip = () => (p.command || cmd) + '\n\n' + (_bgCmdOpen.has(p.id) ? 'Click to shorten it' : 'Click to show all of it');
++      body.title = tip();
++      body.onclick = (e) => { e.stopPropagation(); if (_bgCmdOpen.has(p.id)) _bgCmdOpen.delete(p.id); else _bgCmdOpen.add(p.id); paintCmd(); body.title = tip(); };
++    } else if (p.command) body.title = p.command;
+@@ 8229 -1 +1
+-    if (chrome && footer) {
++    if (chrome && footer && !SIDE_MODE) {   // (the side chat's page has no bar: it stays in its hidden panel)
+@@ 8978 -1 +2
+-      showToast('Opening a new Code Boss window… it starts on the project screen.');
++      // (no toast: the window opening says so - the developer, 2026-11-13: "remove the notification for when a new
++      // codeboss window is opened")
+@@ 9339 -2 +4
+-    for (const t of [...RC.log.children]) {
+-      if (!t.isConnected || !t.classList.contains('thought') || t.dataset.live) continue;
++    // (only the thinking rows still standing on their own - a few at most: walking every row of the chat on every event
++    // cost a long chat 1 ms an event, growing with its length; the profile of 2026-11-13)
++    for (const t of RC.log.querySelectorAll(':scope > .row.thought')) {
++      if (!t.isConnected || t.dataset.live) continue;
+@@ 9523 -1 +1
+-  // need to show the actual tool names"): a read, a list, a mainChat, a historyAsk, a dsPage ... each counts as itself,
++  // need to show the actual tool names"): a read, a list, a mainChat, a historyAsk, a datasetPage ... each counts as itself,
+@@ 12327 -0 +9
++  // THE PLAN'S OWN TITLE IN THE HEADER (the developer, 2026-11-13: 'the header says things like "Plan 3" which isn't too
++  // helpful, then below will say "Plan: <actual helpful title>". Let's put the helpful title in the header and omit the
++  // numbered plan title'): a first line "Plan: ..." - plain, bold or a heading - is the title, and leaves the body
++  function planTitleSplit(md) {
++    const s = String(md || '');
++    const m = /^\s*(?:#{1,6}[ \t]*)?(?:\*\*|__)?[ \t]*plan[ \t]*[:\-–—][ \t]*([^\n]+?)[ \t]*(?:\*\*|__)?[ \t]*(?:\r?\n|$)/i.exec(s);
++    if (!m) return { title: '', rest: s };
++    return { title: m[1].replace(/(?:\*\*|__)\s*$/, '').trim(), rest: s.slice(m[0].length).replace(/^\s*\n/, '') };
++  }
+@@ 12330 -3 +4
+-    const full = renderInline(helpShown(ev.content || ''));
+-    const changes = v > 1 && p.prev != null ? planTrackChangesHtml(p.prev, ev.content || '') : undefined;
+-    const head = `<div class="pv-head"><span class="pv-glyph">${_DOC_GLYPH}</span><span class="pv-title">Plan ${escapeHtml(String(p.id || ''))}</span>`
++    const cur = planTitleSplit(ev.content || ''), prevSplit = p.prev != null ? planTitleSplit(p.prev) : null;
++    const full = renderInline(helpShown(cur.rest));
++    const changes = v > 1 && prevSplit ? planTrackChangesHtml(prevSplit.rest, cur.rest) : undefined;
++    const head = `<div class="pv-head"><span class="pv-glyph">${_DOC_GLYPH}</span><span class="pv-title">${cur.title ? renderInline(cur.title) : 'Plan'}</span>`
+@@ 14753 -1 +1
+-        // A DATA SET SHOWN TO THE DEVELOPER (the agent's dsShow): the rows as the agent saw them - the "real values"
++        // A DATA SET SHOWN TO THE DEVELOPER (the agent's datasetShow): the rows as the agent saw them - the "real values"
+@@ 16308 -1 +8
+-            f.addEventListener('input', () => { vals[k] = f.textContent; if (!f.textContent) f.textContent = ''; });
++            f.addEventListener('input', () => {
++              // (a one-line blank stays one line: a paste or a drop with line breaks in it goes in with spaces)
++              if (!block && /[\r\n]/.test(f.textContent)) {
++                f.textContent = f.textContent.replace(/\s*[\r\n]+\s*/g, ' ').trim();
++                try { const r = document.createRange(); r.selectNodeContents(f); r.collapse(false); const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r); } catch {}
++              }
++              vals[k] = f.textContent; if (!f.textContent) f.textContent = '';
++            });
+@@ 16722 -1 +10
+-    const head = document.createElement('div'); head.className = 'suggest-head'; head.textContent = 'Suggested by the help agent'; bar.appendChild(head);
++    const head = document.createElement('div'); head.className = 'suggest-head';
++    const ht = document.createElement('span'); ht.textContent = 'Suggested by the help agent'; head.appendChild(ht);
++    // TAKEN AWAY (the developer, 2026-11-13: "I don't know how to remove them. We need remove buttons"): x on each, and
++    // Clear all once there are several
++    if (items.length > 1) {
++      const ca = document.createElement('button'); ca.type = 'button'; ca.className = 'suggest-clear'; ca.textContent = 'Clear all'; ca.title = 'Take all the suggestions away';
++      ca.onclick = () => removeSuggestion(null);
++      head.appendChild(ca);
++    }
++    bar.appendChild(head);
+@@ 16727 -0 +2
++      const rm = document.createElement('button'); rm.type = 'button'; rm.className = 'suggest-remove'; rm.textContent = '\u00d7'; rm.title = 'Take this suggestion away'; rm.setAttribute('aria-label', 'Take this suggestion away');
++      rm.onclick = () => removeSuggestion(sg.id, chip);
+@@ 16728 -2 +4
+-      ed.onclick = () => useSuggestion(sg.text, false);
+-      chip.append(t, ed); bar.appendChild(chip);
++      // (in the box now: taken out of the list - the developer, 2026-11-13: "if I click the edit button on a suggestion and it
++      // adds it to the textbox content, we should remove the suggestion")
++      ed.onclick = () => { useSuggestion(sg.text, false); removeSuggestion(sg.id, chip); };
++      chip.append(t, rm, ed); bar.appendChild(chip);
+@@ 16733 -0 +10
++  // one (by its id) or all (null): gone at once here, and on the server - which tells every page
++  async function removeSuggestion(id, chip) {
++    const bar = document.getElementById('suggestBar');
++    if (id == null) { if (bar) { bar.innerHTML = ''; bar.classList.add('hidden'); } }
++    else if (chip) { chip.remove(); if (bar && !bar.querySelector('.suggest-chip')) { bar.innerHTML = ''; bar.classList.add('hidden'); } }
++    try {
++      const r = await fetchWithTimeout('/api/help-suggestions/remove', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(id == null ? { all: true } : { id }) }, 8000).then((x) => x.json());
++      if (r && Array.isArray(r.suggestions)) renderSuggestions(r.suggestions);
++    } catch { showToast('Could not take the suggestion away - try again.'); }
++  }
+@@ 17058 -1 +8
+-      const n = g && typeof g.uncommitted === 'number' ? g.uncommitted : null;
++      // THE BUBBLE COUNTS WHAT A PUSH WOULD SEND (the developer, 2026-11-13: "let's have it count the unpushed commits, not
++      // the uncommitted changes. If there are no unpushed changes, then let's count the uncommitted changes, but in a gray
++      // bubble instead of orange"): unpushed commits in the gold bubble; none (or no remote to count against), the
++      // uncommitted files in a gray one
++      const nU = g && typeof g.uncommitted === 'number' ? g.uncommitted : null;
++      const nP = g && typeof g.unpushed === 'number' ? g.unpushed : null;
++      const pushing = nP != null && nP > 0;
++      const n = pushing ? nP : nU;
+@@ 17063 -2 +2
+-      b.className = 'gp-badge' + (n === 0 ? ' clean' : '') + (n == null ? ' unknown' : '');
+-      b.title = g.path + (g.branch ? '  ·  ' + g.branch : '') + (n == null ? '  ·  its git status could not be read (git failed or timed out) - it is read again every minute' : '  ·  ' + n + ' uncommitted') + '  ·  click: what a push would send';
++      b.className = 'gp-badge' + (n === 0 ? ' clean' : '') + (n == null ? ' unknown' : '') + (!pushing && n ? ' gp-local' : '');
++      b.title = g.path + (g.branch ? '  ·  ' + g.branch : '') + (nP ? `  ·  ${nP} commit${nP === 1 ? '' : 's'} not pushed` : nP === 0 ? '  ·  nothing to push' : '') + (nU == null ? '  ·  its git status could not be read (git failed or timed out) - it is read again every minute' : '  ·  ' + nU + ' uncommitted') + '  ·  click: what a push would send';
+@@ 17126 -0 +1
++    { const f = document.getElementById('commitFoot'); if (f) { f.hidden = true; f.innerHTML = ''; } }
+@@ 17161 -0 +9
++    // ...and, not committed yet, a button that puts that whitespace back as the repo has it (the developer, 2026-11-13: "in
++    // general we don't want to checkin whitespace only changes, so we should make it easy to reverse it on disk")
++    let wsUndo = null;   // (after the count it acts on)
++    if (f.wsOnly > 0 && ref.uncommitted) {
++      const u = wsUndo = document.createElement('button'); u.type = 'button'; u.className = 'og-ws-undo';
++      u.textContent = f.wsOnly >= (f.adds || 0) && f.wsOnly >= (f.dels || 0) ? '↺ Put back as committed' : '↺ Put back whitespace';
++      u.title = `Put the ${f.wsOnly} whitespace-only line${f.wsOnly === 1 ? '' : 's'} back as the last commit has ${f.wsOnly === 1 ? 'it' : 'them'} - indentation, spaces, line endings. The real changes stay.`;
++      u.onclick = (e) => { e.preventDefault(); e.stopPropagation(); outRevertWs([f.path], u); };
++    }
+@@ 17162 -0 +1
++    if (wsUndo) s.appendChild(wsUndo);
+@@ 17181 -0 +1
++    outFooter(d);
+@@ 17190 -0 +9
++      // (several files with whitespace-only lines: one button for all of them)
++      const ws = files.filter((f) => f.wsOnly > 0);
++      if (ws.length > 1) {
++        const all = document.createElement('button'); all.type = 'button'; all.className = 'og-ws-undo og-ws-all';
++        all.textContent = `↺ Put back whitespace in ${ws.length} files`;
++        all.title = 'In every file below with whitespace-only lines: put them back as the last commit has them. The real changes stay.';
++        all.onclick = () => outRevertWs(ws.map((f) => f.path), all);
++        h.appendChild(all);
++      }
+@@ 17191 -1 +1
+-      for (const f of files) sec.appendChild(outFileEl(f, { title: 'Talk about this change (not committed yet): add it to your message', text: `[about ${f.path}, not committed yet, in ${repo}]` }));
++      for (const f of files) sec.appendChild(outFileEl(f, { title: 'Talk about this change (not committed yet): add it to your message', text: `[about ${f.path}, not committed yet, in ${repo}]`, uncommitted: true }));
+@@ 17227 -0 +53
++  // read again and drawn again, where it was scrolled to; `note` said over it (what was just done), `bad` in red
++  function outReload(note, bad) {
++    const repoPath = _commitRepo; if (!repoPath) return Promise.resolve();
++    const scroller = document.querySelector('#commitModal .modal-body'), top = scroller ? scroller.scrollTop : 0;
++    return fetch('/api/git-outgoing?path=' + encodeURIComponent(repoPath)).then((r) => r.json()).then((d) => {
++      if (repoPath !== _commitRepo) return;
++      _outFiles.clear(); renderOutgoing(d);
++      if (scroller) scroller.scrollTop = top;
++      if (note) outNote(note, bad);
++    }).catch(() => { if (repoPath === _commitRepo) outNote('Could not read the commits again.', true); });
++  }
++  function outNote(text, bad) {
++    const body = document.getElementById('commitBody'); if (!body) return;
++    let n = document.getElementById('ogNote');
++    if (!n) { n = document.createElement('div'); n.id = 'ogNote'; body.prepend(n); }
++    n.className = 'og-note' + (bad ? ' bad' : ''); n.textContent = text;
++  }
++  // PUT THE WHITESPACE BACK, in these files (gcRevertWhitespace on the server), then the window again
++  async function outRevertWs(paths, btn) {
++    const repoPath = _commitRepo; if (!repoPath || !paths.length) return;
++    const was = btn ? btn.textContent : '';
++    if (btn) { btn.disabled = true; btn.textContent = 'Putting it back…'; }
++    let j = null;
++    try { j = await fetch('/api/git-revert-ws', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: repoPath, files: paths }) }).then((r) => r.json()); } catch { j = null; }
++    if (!j || j.error || !Array.isArray(j.results)) { if (btn) { btn.disabled = false; btn.textContent = was; } outNote((j && j.error) || 'Could not put the whitespace back.', true); return; }
++    const done = j.results.filter((r) => r.ok && r.changed), refused = j.results.filter((r) => !r.ok);
++    const lines = done.reduce((n, r) => n + Math.max(0, (r.before || 0) - (r.after || 0)), 0);
++    const note = (done.length ? `Whitespace put back as committed in ${done.length === 1 ? done[0].file : done.length + ' files'}: ${lines} changed line${lines === 1 ? '' : 's'} fewer.` : 'Nothing to put back.')
++      + (refused.length ? ' Left as they were: ' + refused.map((r) => `${r.file} (${r.problem})`).join('; ') : '');
++    await outReload(note, !done.length && refused.length > 0);
++  }
++  // PUSH ALL (the developer, 2026-11-13: "can we put a Push all button on the push modal that pushes all the commits?")
++  function outFooter(d) {
++    const foot = document.getElementById('commitFoot'); if (!foot) return;
++    foot.innerHTML = '';
++    const n = d && !d.error ? d.commits.length : 0;
++    foot.hidden = !n;
++    if (!n) return;
++    const info = document.createElement('span'); info.className = 'og-foot-info';
++    info.textContent = d.behind ? `The remote has ${d.behind} commit${d.behind === 1 ? '' : 's'} you have not pulled: pull first, or the push is refused.` : d.noRemote ? `${d.branch} goes to origin as a new branch.` : `${n}${d.more ? '+' : ''} commit${n === 1 ? '' : 's'} to ${d.upstream}.`;
++    const b = document.createElement('button'); b.type = 'button'; b.className = 'btn primary og-push';
++    b.textContent = n === 1 ? 'Push 1 commit' : `Push all ${n}${d.more ? '+' : ''} commits`;
++    b.disabled = !!d.behind;
++    b.onclick = async () => {
++      const repoPath = _commitRepo; if (!repoPath) return;
++      b.disabled = true; b.textContent = 'Pushing…';
++      let r = null;
++      try { r = await fetch('/api/git-push', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: repoPath }) }).then((x) => x.json()); } catch { r = null; }
++      const said = r && r.output ? String(r.output).split('\n').filter(Boolean).slice(-3).join(' · ') : '';
++      await outReload(r && r.ok ? `Pushed ${n === 1 ? 'the commit' : 'all ' + n + ' commits'}.` : `The push did not go through${said ? ': ' + said : (r && r.error ? ': ' + r.error : '.')}`, !(r && r.ok));
++    };
++    foot.append(info, b);
++  }
+=== add test/_prof-chat.mjs
+new 6f2c87a63adacac243617af6
++// _prof-chat.mjs - profile the chat renderer over a long chat: which functions grow with its length. node test/_prof-chat.mjs [main|detached]
++import { mkdtemp, mkdir, readFile } from 'node:fs/promises';
++import { mkdtempSync } from 'node:fs';
++import { tmpdir } from 'node:os';
++import path from 'node:path';
 +import puppeteer from 'puppeteer-core';
-+import http from 'node:http';
-+const c = pcContainerHost(process.env);
-+const out = { hasPorts: !!c.ports, hits: [] };
-+const srv = http.createServer((req, res) => { out.hits.push(req.url); res.writeHead(200, { 'content-type': 'text/html', connection: 'close' }); res.end('<!doctype html><title>served from inside</title><p id="p">inside</p>'); });
-+await new Promise((r) => srv.listen(0, '127.0.0.1', r));
-+const port = srv.address().port;
-+out.insidePort = port;
-+const tryIt = async (f) => { try { return { r: await f() }; } catch (e) { return { e: e.message }; } };
-+out.bad80 = await tryIt(() => c.ports.publish(80));
-+out.badApi = await tryIt(() => c.ports.publish(28900));
-+const p = await c.ports.publish(port);
-+out.pub = p;
-+out.again = await c.ports.publish(port);
-+out.list = await c.ports.list();
-+const b = await c.browser.open({ url: p.browserUrl, label: 's' });
-+const browser = await puppeteer.connect({ browserURL: b.cdpUrl, defaultViewport: null });
-+const page = (await browser.pages()).find((x) => x.url().startsWith(p.browserUrl)) || (await browser.pages())[0];
-+await page.waitForSelector('#p', { timeout: 15000 }).catch(() => {});
-+out.title = await page.title();
-+out.pText = await page.$eval('#p', (e) => e.textContent).catch((e) => 'no #p: ' + e.message);
-+out.un = await c.ports.unpublish(port);
-+out.unAgain = await c.ports.unpublish(port);
-+out.listAfter = await c.ports.list();
-+const before = out.hits.length;
-+out.reload = await page.goto(p.browserUrl + '/after', { timeout: 10000 }).then(() => 'loaded').catch((e) => 'failed: ' + e.message.slice(0, 80));
-+out.hitsAfterUnpublish = out.hits.length - before;
-+browser.disconnect();
-+await c.browser.close(b.id);
-+srv.close();
-+console.log('RESULT ' + JSON.stringify(out));
-+`);
-@@ 270 -0 +10
-+  console.log('\n[3b] a server INSIDE, published, opened in the Chrome out here');
-+  const sv = await inside('node pp\\served.mjs');
-+  if (!sv.pub) console.log('  (inside said: ' + String(sv.text || sv.refused).slice(-1500) + ')');
-+  ok(sv.hasPorts === true && sv.bad80 && /1024-65535/.test(sv.bad80.e || '') && sv.badApi && /own way out/.test(sv.badApi.e || ''), `host.container.ports is there; port 80 and the API's own port are refused with a sentence (${sv.bad80 && sv.bad80.e} | ${sv.badApi && sv.badApi.e})`);
-+  ok(sv.pub && sv.pub.ok === true && sv.pub.insidePort === sv.insidePort && sv.pub.browserPort !== sv.insidePort && sv.pub.browserUrl === `http://localhost:${sv.pub.browserPort}`, `publish(${sv.insidePort}) gives a free port out here: ${sv.pub && sv.pub.browserUrl}`);
-+  ok(sv.again && sv.again.browserPort === sv.pub.browserPort && Array.isArray(sv.list) && sv.list.some((x) => x.insidePort === sv.insidePort && x.browserPort === sv.pub.browserPort), `asked again it is the same port, and list() has it`);
-+  ok(sv.title === 'served from inside' && sv.pText === 'inside' && sv.hits.includes('/'), `Chrome OUT HERE loaded the page from the server INSIDE: "${sv.title}", ${sv.hits.length} request(s) reached it `);
-+  ok(sv.un && sv.un.closed === true && sv.unAgain && sv.unAgain.closed === false && !(sv.listAfter || []).some((x) => x.insidePort === sv.insidePort), `unpublish() closes it; again is not an error (closed:false); list() no longer has it`);
-+  ok(/^failed/.test(String(sv.reload)) && sv.hitsAfterUnpublish === 0, `after it, Chrome can no longer reach the server (${sv.reload}; ${sv.hitsAfterUnpublish} request(s) arrived)`);
++const ROOT = 'D:/code/code_boss';
++process.env.CB_HOME = mkdtempSync(path.join(tmpdir(), 'cb-prof-home-'));
++process.env.CB_HEADS_UP_IDLE_MS = '0';
++const { startServer } = await import('file:///D:/code/code_boss/src/server.mjs');
++const proj = await mkdtemp(path.join(tmpdir(), 'cb-prof-proj-'));
++await mkdir(path.join(proj, '.code_boss'), { recursive: true });
++const adapter = { async *completeStream() { yield { choices: [{ delta: { content: 'x' } }] }; }, async complete() { return { choices: [{ message: { content: '' } }] }; }, async listModels() { return [{ id: 'm' }]; } };
++const html = (await readFile(path.join(ROOT, 'src', 'ui.html'), 'utf8')).replace('</head>', '<script>window.SERVER_CONFIG=' + JSON.stringify({ defaultModel: 'm', baseURL: '(mock)' }) + ';</script></head>');
++const PORT = 29461;
++const { server } = await startServer({ html, baseURL: '(mock)', apiKey: 'k', gitlabCreds: { user: 't', token: 't' }, defaultModel: 'm', port: PORT, adapter, modelsList: [{ id: 'm' }], initialProject: proj });
++const browser = await puppeteer.launch({ executablePath: 'C:/Program Files/Google/Chrome/Application/chrome.exe', headless: 'new', args: ['--no-sandbox'] });
++const page = await browser.newPage();
++await page.goto(`http://127.0.0.1:${PORT}/`);
++await page.waitForSelector('#chat:not(.hidden)', { timeout: 15000 });
++const mode = process.argv[2] || 'detached';
++await page.evaluate((mode) => {
++  let log, scroll;
++  if (mode === 'main') { log = mainChat.rc.log; scroll = mainChat.rc.scroll; window.__chat = mainChat; }
++  else { log = document.createElement('div'); scroll = document.createElement('div'); scroll.appendChild(log); document.body.appendChild(scroll); window.__chat = createChatComponent({ rc: { log, scroll, isIntake: false, afterRow: null, clearStatus: null } }); }
++  window.__n = 0;
++  window.__batch = (from, to) => { const t0 = performance.now(); for (let i = from; i < to; i++) { const r = (e) => window.__chat.render({ id: 'p' + (++window.__n), taskId: 'conv', ts: Date.now(), ...e }); r({ type: 'user-message', turn: 2 * i, content: 'msg ' + i }); r({ type: 'assistant-text', turn: 2 * i + 1, content: 'reply ' + i }); r({ type: 'assistant-text', turn: 2 * i + 1, segmentIndex: 1, content: 'more ' + i }); } return performance.now() - t0; };
++}, mode);
++console.log('first 100:', (await page.evaluate(() => __batch(0, 100))).toFixed(0), 'ms');
++await page.evaluate(() => __batch(100, 500));
++const cdp = await page.createCDPSession();
++await cdp.send('Profiler.enable'); await cdp.send('Profiler.start');
++console.log('100 at 500+:', (await page.evaluate(() => __batch(500, 600))).toFixed(0), 'ms');
++const { profile } = await cdp.send('Profiler.stop');
++const self = new Map(); const byId = new Map(profile.nodes.map((n) => [n.id, n]));
++const dt = profile.timeDeltas; const counts = new Map();
++profile.samples.forEach((id, i) => counts.set(id, (counts.get(id) || 0) + (dt[i] || 0)));
++for (const [id, us] of counts) { const n = byId.get(id); const k = (n.callFrame.functionName || '(anon)') + ':' + n.callFrame.lineNumber; self.set(k, (self.get(k) || 0) + us); }
++console.log([...self].sort((a, b) => b[1] - a[1]).slice(0, 15).map(([k, us]) => `${(us / 1000).toFixed(0).padStart(6)} ms  ${k}`).join('\n'));
++// inclusive: walk parents
++const parent = new Map(); for (const n of profile.nodes) for (const c of n.children || []) parent.set(c, n.id);
++const incl = new Map();
++for (const [id, us] of counts) { const seen = new Set(); let cur = id; while (cur != null) { const n = byId.get(cur); const k = (n.callFrame.functionName || '(anon)') + ':' + n.callFrame.lineNumber; if (!seen.has(k)) { incl.set(k, (incl.get(k) || 0) + us); seen.add(k); } cur = parent.get(cur); } }
++console.log('--- inclusive');
++console.log([...incl].sort((a, b) => b[1] - a[1]).slice(0, 25).map(([k, us]) => `${(us / 1000).toFixed(0).padStart(6)} ms  ${k}`).join('\n'));
++await browser.close(); server.close(); process.exit(0);
 +
+=== change test/live-datasets.mjs
+base 8928f3661fd86428a7fe98d4
+new 2e016d90daffe3a7ec5edb32
+@@ 44 -1 +1
+-      schema: { description: 'Run a SQL query against the enrollment database. Returns a data set reference (#@ds#...): read it with dsRows etc. The ssn column is sensitive; member_id, status, plan and note are shown; name is masked as a file would be.', parameters: { type: 'object', properties: { sql: { type: 'string' } }, required: ['sql'] } },
++      schema: { description: 'Run a SQL query against the enrollment database. Returns a data set reference (#@ds#...): read it with datasetRows etc. The ssn column is sensitive; member_id, status, plan and note are shown; name is masked as a file would be.', parameters: { type: 'object', properties: { sql: { type: 'string' } }, required: ['sql'] } },
+@@ 108 -1 +1
+-    ok(/dsRows|dsCount/.test(t1.code), 'it used the data set functions');
++    ok(/datasetRows|datasetCount/.test(t1.code), 'it used the data set functions');
+@@ 121 -1 +1
+-    // dsShow (build 2345): asked to SEE data, the agent shows a table rather than pasting rows
++    // datasetShow (build 2345): asked to SEE data, the agent shows a table rather than pasting rows
+@@ 126 -1 +1
+-    ok(/dsShow\(/.test(t5.code), 'by dsShow');
++    ok(/datasetShow\(/.test(t5.code), 'by datasetShow');
+=== change test/test-bg-procs-view-e2e.mjs
+base 7bcb3918bb19e143d7077c56
+new ec66f94b0f802e85986e8b0e
+@@ 82 -0 +10
++    // A PREVIEW OF THE COMMAND, A CLICK FOR ALL OF IT (the developer, 2026-11-13: "taking too much space ... show x chars as
++    // a preview and click to expand")
++    const pv = await page.evaluate(async () => {
++      const b = () => document.querySelector('#rpRunning .bg-row .row-body');
++      const short = b().textContent; b().click(); await new Promise((r) => setTimeout(r, 50));
++      const whole = b().textContent; b().click(); await new Promise((r) => setTimeout(r, 50));
++      return { short, whole, again: b().textContent, more: b().classList.contains('bg-cmd-more') };
++    });
++    ok(pv.more && pv.short.length <= 62 && pv.short.endsWith('…') && pv.whole.length > pv.short.length && pv.whole.startsWith(pv.short.slice(0, -1).trimEnd()) && pv.again === pv.short, `the command is a 60-character preview; a click shows all of it, another shortens it (${JSON.stringify(pv).slice(0, 220)})`);
++
+=== add test/test-cheatsheet-edges-e2e.mjs
+new 8e229620fd12cf250e1d96a4
++/**
++ * EDGES AND VOLUME of build 2837's pieces (the developer, 2026-11-13: "another round of unit testing ... for edge cases
++ * and volume"). Through the real page:
++ *   [1] the prompt blanks: emptied again -> the faded example is back; text pasted with line breaks into a one-line
++ *       blank stays one line; < > | & and emoji copied as typed; a very long value wraps (nothing wider than the sheet);
++ *       what was typed survives closing the item and the filter redrawing the list; Shift+Tab from the first blank
++ *       stays put; Enter breaks a line only in the ticket's blank; every prompt copied untouched = itself with each
++ *       blank as <name>
++ *   [2] thinking merge: three in a row -> one fold, in order; thinking, a step, thinking -> two folds, each in its own
++ *       step; a thought still being written is not swallowed; 600 replies of two thoughts each - every pair one fold,
++ *       and the last replies draw no slower than the first (no cost growing with the length of the chat)
++ *   [3] copy buttons: clicked twice inside the two seconds -> back to the icon two seconds after the second, not stuck
++ *       on the check mark; a button with markup gets its markup back; a failed copy says so and comes back; a button
++ *       taken off the page meanwhile -> no error
++ * Run: node test/test-cheatsheet-edges-e2e.mjs
++ */
++import { mkdtemp, mkdir, readFile } from 'node:fs/promises';
++import { existsSync, mkdtempSync } from 'node:fs';
++import { tmpdir } from 'node:os';
++import path from 'node:path';
++import { fileURLToPath } from 'node:url';
++import puppeteer from 'puppeteer-core';
++
++process.env.CB_HOME = mkdtempSync(path.join(tmpdir(), 'cb-csedge-home-'));
++process.env.CB_HEADS_UP_IDLE_MS = '0';
++process.env.CB_SKILLS_MAINTAINER ??= '0';
++const { startServer } = await import('../src/server.mjs');
++const { PROMPT_SNIPPETS } = await import('../src/cheatsheet-content.mjs');
++
++const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
++const PORT = 29411 + Math.floor(Math.random() * 20);
++let pass = 0, fail = 0;
++const ok = (c, l) => { if (c) { pass++; console.log('  ok', l); } else { fail++; console.log('  FAIL', l); } };
++const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
++const chrome = ['C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe', (process.env.LOCALAPPDATA || '') + '\\Google\\Chrome\\Application\\chrome.exe'].find((p) => { try { return p && existsSync(p); } catch { return false; } });
++if (!chrome) { console.log('SKIP - Chrome not found'); process.exit(0); }
++
++const proj = await mkdtemp(path.join(tmpdir(), 'cb-csedge-proj-'));
++await mkdir(path.join(proj, '.code_boss'), { recursive: true });
++const adapter = {
++  async *completeStream() { yield { choices: [{ delta: { content: 'Done.' } }] }; },
++  async complete() { return { choices: [{ message: { content: '' } }] }; },
++  async listModels() { return [{ id: 'm' }]; },
++};
++const html = (await readFile(path.join(ROOT, 'src', 'ui.html'), 'utf8')).replace('</head>', '<script>window.SERVER_CONFIG=' + JSON.stringify({ defaultModel: 'm', baseURL: '(mock)' }) + ';</script></head>');
++const { server } = await startServer({ html, baseURL: '(mock)', apiKey: 'k', gitlabCreds: { user: 't', token: 't' }, defaultModel: 'm', port: PORT, adapter, modelsList: [{ id: 'm' }], initialProject: proj });
++const browser = await puppeteer.launch({ executablePath: chrome, headless: 'new', args: ['--no-sandbox'] });
++try {
++  const page = await browser.newPage();
++  await page.setViewport({ width: 1200, height: 850 });
++  const errors = []; page.on('pageerror', (e) => errors.push(String(e.message || e)));
++  await page.goto(`http://127.0.0.1:${PORT}/`);
++  await page.waitForSelector('#chat:not(.hidden)', { timeout: 15000 });
++  await page.evaluate(() => { window.__got = null; try { Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: async (t) => { window.__got = t; } } }); } catch {} });
++  await page.evaluate(() => openCheatSheet('prompts'));
++  await page.waitForFunction(() => document.querySelectorAll('#csBody .cs-item').length > 0, { timeout: 8000 });
++  const item = (t) => `[...document.querySelectorAll('#csBody .cs-item')].find((x) => x.querySelector('b').textContent === ${JSON.stringify(t)})`;
++  const open = (t) => page.evaluate((t) => { const it = [...document.querySelectorAll('#csBody .cs-item')].find((x) => x.querySelector('b').textContent === t); if (it.getAttribute('aria-expanded') !== 'true') it.click(); }, t);
++  const blanksOf = (t) => page.evaluate((t) => { const it = [...document.querySelectorAll('#csBody .cs-item')].find((x) => x.querySelector('b').textContent === t); return [...(it.nextElementSibling?.querySelectorAll('.cs-blank') || [])].map((b) => b.textContent); }, t);
++  const copyOf = async (t) => { await page.evaluate((t) => { window.__got = null; const it = [...document.querySelectorAll('#csBody .cs-item')].find((x) => x.querySelector('b').textContent === t); it.nextElementSibling.querySelector('.cs-copy').click(); }, t); await sleep(60); return page.evaluate(() => window.__got); };
++
++  console.log('\n[1] the prompt blanks');
++  await open('Write tests');
++  await page.keyboard.type('abc');
++  for (let i = 0; i < 3; i++) await page.keyboard.press('Backspace');
++  const back = await page.evaluate(() => { const f = document.activeElement; return { cls: f.className, html: f.innerHTML, before: getComputedStyle(f, '::before').content }; });
++  ok(/cs-blank/.test(back.cls) && back.html === '' && /discount\.js/.test(back.before), `typed and deleted again: the faded example is back (${JSON.stringify(back)})`);
++  // (a paste goes in as inserted text - CDP's insertText is the same path as a paste of plain text)
++  const cdp = await page.createCDPSession();
++  await cdp.send('Input.insertText', { text: 'src/a.js\nsrc/b.js' });
++  await sleep(50);
++  const pasted = await page.evaluate(() => document.activeElement.textContent);
++  ok(!/\n/.test(pasted) && /src\/a\.js.*src\/b\.js/.test(pasted), `line breaks pasted into a one-line blank: one line (${JSON.stringify(pasted)})`);
++  await page.keyboard.press('Enter');
++  ok(!/\n/.test(await page.evaluate(() => document.activeElement.textContent)), 'Enter adds no line there');
++  await page.keyboard.down('Shift'); await page.keyboard.press('Tab'); await page.keyboard.up('Shift');
++  ok(await page.evaluate(() => document.activeElement?.dataset?.name === 'file'), 'Shift+Tab from the first blank stays on it');
++  // odd characters
++  await page.evaluate(() => { const f = document.activeElement; f.textContent = ''; f.dispatchEvent(new Event('input')); });
++  const odd = 'a<b>|c & "d" ✓🙂 `e` $f';
++  await page.keyboard.type(odd);
++  const oddCopy = await copyOf('Write tests');
++  ok(oddCopy && oddCopy.includes(odd), `< > | & quotes and emoji copied as typed (${JSON.stringify(oddCopy)})`);
++  // survives closing the item and the filter redrawing
++  await page.evaluate((s) => eval(s).click(), item('Write tests'));
++  await open('Write tests');
++  ok((await blanksOf('Write tests'))[0] === odd, 'closed and opened again: what was typed is still there');
++  await page.evaluate(() => { const f = document.getElementById('csFilter'); f.value = 'tests'; f.dispatchEvent(new Event('input')); });
++  await sleep(150);
++  await page.evaluate(() => { const f = document.getElementById('csFilter'); f.value = ''; f.dispatchEvent(new Event('input')); });
++  await sleep(150);
++  await open('Write tests');
++  ok((await blanksOf('Write tests'))[0] === odd, 'the filter redrew the list: still there');
++  // very long
++  const long = 'x'.repeat(40) + ' ' + 'word '.repeat(900) + 'END';
++  await page.evaluate((v) => { const it = [...document.querySelectorAll('#csBody .cs-item')].find((x) => x.querySelector('b').textContent === 'Write tests'); const f = it.nextElementSibling.querySelector('.cs-blank'); f.textContent = v; f.dispatchEvent(new Event('input')); }, long);
++  const wide = await page.evaluate(() => { const b = document.getElementById('csBody'); const it = [...document.querySelectorAll('#csBody .cs-item')].find((x) => x.querySelector('b').textContent === 'Write tests'); const pre = it.nextElementSibling.querySelector('pre'); return { pre: pre.scrollWidth - pre.clientWidth, body: b.scrollWidth - b.clientWidth, page: document.documentElement.scrollWidth - innerWidth }; });
++  ok(wide.pre <= 1 && wide.body <= 1 && wide.page <= 1, `a value ${long.length} long wraps - nothing wider than the sheet (${JSON.stringify(wide)})`);
++  const longCopy = await copyOf('Write tests');
++  ok(longCopy && longCopy.includes(long.trim()), 'and is copied whole');
++  // Enter in the ticket's blank
++  await open('Work from a Jira ticket');
++  await page.evaluate(() => { const it = [...document.querySelectorAll('#csBody .cs-item')].find((x) => x.querySelector('b').textContent === 'Work from a Jira ticket'); it.nextElementSibling.querySelector('.cs-blank').focus(); });
++  await page.keyboard.type('line one'); await page.keyboard.press('Enter'); await page.keyboard.type('line two');
++  const tk = await copyOf('Work from a Jira ticket');
++  ok(/line one\nline two/.test(tk || ''), `the ticket's blank takes several lines (${JSON.stringify((tk || '').slice(0, 120))})`);
++  // every prompt, untouched
++  const all = PROMPT_SNIPPETS.flatMap((s) => s.items);
++  const bad = [];
++  for (const it of all) {
++    const want = it.prompt.replace(/<([^<>|\n]+)(?:\|[^<>\n]*)?>/g, (_, n) => '<' + n.trim() + '>');
++    if (['Write tests', 'Work from a Jira ticket'].includes(it.title)) continue;   // (typed into above)
++    await open(it.title);
++    const got = await copyOf(it.title);
++    if (got !== want) bad.push(`${it.title}: ${JSON.stringify(got)} vs ${JSON.stringify(want)}`);
++  }
++  ok(!bad.length, `all ${all.length - 2} other prompts copied untouched = the prompt, each blank as <name> (${bad.join(' | ').slice(0, 400)})`);
++  await page.keyboard.press('Escape'); await sleep(200);
++
++  console.log('\n[2] thinking merge');
++  const th = await page.evaluate(() => {
++    const mk = () => { const log = document.createElement('div'), scroll = document.createElement('div'); scroll.appendChild(log); document.body.appendChild(scroll); const chat = createChatComponent({ rc: { log, scroll, isIntake: false, afterRow: null, clearStatus: null } }); let n = 0; return { log, scroll, r: (e) => chat.render({ id: 'e' + (++n) + Math.random(), taskId: 'conv', ts: Date.now(), ...e }) }; };
++    const out = {};
++    { const c = mk(); c.r({ type: 'assistant-thought', turn: 1, content: 'ONE' }); c.r({ type: 'assistant-thought', turn: 2, content: 'TWO' }); c.r({ type: 'assistant-thought', turn: 3, content: 'THREE' }); c.r({ type: 'assistant-text', turn: 3, content: 'Answer.' });
++      const f = [...c.log.querySelectorAll('.thought-fold')]; const t = f[0]?.textContent || ''; out.three = { folds: f.length, order: t.indexOf('ONE') < t.indexOf('TWO') && t.indexOf('TWO') < t.indexOf('THREE'), standalone: c.log.querySelectorAll(':scope > .row.thought').length }; c.scroll.remove(); }
++    { const c = mk(); c.r({ type: 'assistant-thought', turn: 1, content: 'BEFORE-TOOL' });
++      c.r({ type: 'assistant-text', turn: 1, content: 'Reading it.' });
++      c.r({ type: 'assistant-thought', turn: 2, content: 'AFTER-TOOL' }); c.r({ type: 'assistant-text', turn: 2, content: 'Done.' });
++      const f = [...c.log.querySelectorAll('.thought-fold')]; out.split = { folds: f.length, a: f[0]?.textContent.includes('BEFORE-TOOL') && !f[0]?.textContent.includes('AFTER-TOOL'), b: f[1]?.textContent.includes('AFTER-TOOL') && !f[1]?.textContent.includes('BEFORE-TOOL'), inStep: f.every((x) => x.classList.contains('in-step')) }; c.scroll.remove(); }
++    { const was = _joinedMidStream; _joinedMidStream = false;   // (as in a run being watched from its start)
++      const c = mk(); c.r({ type: 'assistant-thought', turn: 1, content: 'DONE-THINKING' }); c.r({ type: 'assistant-thought-chunk', turn: 2, content: 'STILL-WRITING' }); c.r({ type: 'assistant-thought-chunk', turn: 2, content: ' MORE' });
++      const live = c.log.querySelector('.row.thought[data-live="1"]'); out.live = { liveKept: !!live && live.textContent.includes('STILL-WRITING MORE'), doneOnce: (c.log.textContent.match(/DONE-THINKING/g) || []).length };
++      c.r({ type: 'assistant-thought', turn: 2, content: 'STILL-WRITING MORE.' }); c.r({ type: 'assistant-text', turn: 2, content: 'Reply.' });
++      const f = [...c.log.querySelectorAll('.thought-fold')]; const t = f[0]?.textContent || '';
++      out.live.after = { folds: f.length, both: t.indexOf('DONE-THINKING') >= 0 && t.indexOf('DONE-THINKING') < t.indexOf('STILL-WRITING'), inStep: !!f[0]?.classList.contains('in-step') };
++      _joinedMidStream = was; c.scroll.remove(); }
++    return out;
++  });
++  ok(th.three.folds === 1 && th.three.order && th.three.standalone === 0, `three in a row: one fold, in order, in the step (${JSON.stringify(th.three)})`);
++  ok(th.split.folds === 2 && th.split.a && th.split.b && th.split.inStep, `thinking, a reply, thinking: two folds, each in its own step (${JSON.stringify(th.split)})`);
++  ok(th.live.liveKept && th.live.doneOnce === 1, `a thought still being written is left alone, the finished one shown once (${JSON.stringify(th.live)})`);
++  ok(th.live.after.folds === 1 && th.live.after.both && th.live.after.inStep, `once it is finished, the two are one fold in the reply's step (${JSON.stringify(th.live.after)})`);
++  const vol = await page.evaluate(() => {
++    const log = document.createElement('div'), scroll = document.createElement('div'); scroll.appendChild(log); document.body.appendChild(scroll);
++    const chat = createChatComponent({ rc: { log, scroll, isIntake: false, afterRow: null, clearStatus: null } });
++    let n = 0; const r = (e) => chat.render({ id: 'v' + (++n), taskId: 'conv', ts: Date.now(), ...e });
++    const N = 600, times = [];
++    for (let i = 0; i < N; i++) { const t0 = performance.now(); r({ type: 'user-message', turn: 2 * i, content: 'msg ' + i }); r({ type: 'assistant-thought', turn: 2 * i, content: 'A' + i }); r({ type: 'assistant-thought', turn: 2 * i + 1, content: 'B' + i }); r({ type: 'assistant-text', turn: 2 * i + 1, content: 'reply ' + i }); times.push(performance.now() - t0); }
++    // (the same chat with no thinking in it: how much a reply's cost grows anyway, with the length of the chat)
++    const log2 = document.createElement('div'), scroll2 = document.createElement('div'); scroll2.appendChild(log2); document.body.appendChild(scroll2);
++    const chat2 = createChatComponent({ rc: { log: log2, scroll: scroll2, isIntake: false, afterRow: null, clearStatus: null } });
++    const base = [];
++    for (let i = 0; i < N; i++) { const t0 = performance.now(); chat2.render({ id: 'w' + (++n), taskId: 'conv', ts: Date.now(), type: 'user-message', turn: 2 * i, content: 'msg ' + i }); chat2.render({ id: 'w' + (++n), taskId: 'conv', ts: Date.now(), type: 'assistant-text', turn: 2 * i + 1, content: 'reply ' + i }); chat2.render({ id: 'w' + (++n), taskId: 'conv', ts: Date.now(), type: 'assistant-text', turn: 2 * i + 1, segmentIndex: 1, content: 'more ' + i }); base.push(performance.now() - t0); }
++    scroll2.remove();
++    const folds = [...log.querySelectorAll('.thought-fold')];
++    const paired = folds.filter((f, i) => f.textContent.includes('A' + i) && f.textContent.includes('B' + i)).length;
++    const avg = (a) => a.reduce((s, x) => s + x, 0) / a.length;
++    const out = { folds: folds.length, paired, first: +avg(times.slice(20, 120)).toFixed(2), last: +avg(times.slice(-100)).toFixed(2), total: Math.round(times.reduce((s, x) => s + x, 0)), baseFirst: +avg(base.slice(20, 120)).toFixed(2), baseLast: +avg(base.slice(-100)).toFixed(2) };
++    scroll.remove();
++    return out;
++  });
++  ok(vol.folds === 600 && vol.paired === 600, `600 replies of two thoughts: 600 folds, each its own pair (${vol.folds}, ${vol.paired})`);
++  // (what the thinking adds: a reply's cost over the same chat's without it - that must not grow with the chat's length)
++  const extraFirst = vol.first - vol.baseFirst, extraLast = vol.last - vol.baseLast;
++  ok(extraLast < Math.max(3, 0.3 * vol.baseLast),`the thinking adds no more to the last replies than to the first (${vol.first} ms -> ${vol.last} ms a reply; without thinking ${vol.baseFirst} -> ${vol.baseLast}; added ${extraFirst.toFixed(2)} -> ${extraLast.toFixed(2)}; ${vol.total} ms in all)`);
++
++  console.log('\n[3] copy buttons');
++  const cp = await page.evaluate(async () => {
++    const wait = (ms) => new Promise((r) => setTimeout(r, ms));
++    const b = document.createElement('button'); b.textContent = '⧉'; document.body.appendChild(b);
++    copyWithTick(b, 'x'); await wait(1200); copyWithTick(b, 'x');
++    await wait(1200); const mid = b.textContent; await wait(1000); const end = b.textContent;
++    const h = document.createElement('button'); h.innerHTML = '<span class="ic">⧉</span> Copy'; document.body.appendChild(h); const was = h.innerHTML;
++    copyWithTick(h, 'y'); const during = h.textContent; await wait(2200); const restored = h.innerHTML === was;
++    const f = document.createElement('button'); f.textContent = 'Copy link'; document.body.appendChild(f); copyTick(f, false); const failed = f.textContent; await wait(2200); const fb = f.textContent;
++    const g = document.createElement('button'); g.textContent = '⧉'; document.body.appendChild(g); copyWithTick(g, 'z'); g.remove(); await wait(2200);
++    b.remove(); h.remove(); f.remove();
++    return { mid, end, during, restored, failed, fb };
++  });
++  ok(cp.mid === '✓' && cp.end === '⧉', `clicked twice: a check mark until two seconds after the second, then the icon - not stuck (${cp.mid} -> ${cp.end})`);
++  ok(/✓/.test(cp.during) && cp.restored, `a button with markup gets its markup back (${cp.during})`);
++  ok(cp.failed === 'Copy failed' && cp.fb === 'Copy link', `a failed copy says so, then comes back (${cp.failed} -> ${cp.fb})`);
++  ok(!errors.length, `no page errors (${errors.join('; ').slice(0, 300)})`);
++} catch (e) { fail++; console.log('  FAIL harness:', e?.stack || e); }
++finally { await browser.close(); server.close(); }
++console.log(`\n${pass} passed, ${fail} failed`);
++process.exit(fail ? 1 : 0);
++
+=== change test/test-datasets-panel-e2e.mjs
+base 125bb96e24f07d9d95f76681
+new c1bd38cd9661f979297162c0
+@@ 130 -1 +1
+-    console.log('\n[F] a table the agent showed in the chat (dsShow): revealed, sorted by a click, filtered as typed');
++    console.log('\n[F] a table the agent showed in the chat (datasetShow): revealed, sorted by a click, filtered as typed');
+=== change test/test-datasets-volume-e2e.mjs
+base 8f6ca58bf146a3c70684982b
+new 77528040bc51a81ff738c9eb
+@@ 129 -1 +1
+-    let r = await step('count', `return await dsCount("${BIGR}", { where: { status: "ACTIVE" } });`);
++    let r = await step('count', `return await datasetCount("${BIGR}", { where: { status: "ACTIVE" } });`);
+@@ 131 -1 +1
+-    r = await step('masked', `const x = await dsRows("${MIDR}", { where: { ssn: (v) => v.matches("^900-00-1") }, columns: ["id"], limit: 1000 }); return { n: x.total, first: x.rows[0] && x.rows[0].id };`);
++    r = await step('masked', `const x = await datasetRows("${MIDR}", { where: { ssn: (v) => v.matches("^900-00-1") }, columns: ["id"], limit: 1000 }); return { n: x.total, first: x.rows[0] && x.rows[0].id };`);
+@@ 139 -1 +1
+-    r = await step('asking', `const pg = await dsRows("${MIDR}", { columns: ["ssn"], limit: 3000 }); let loose = 0;
++    r = await step('asking', `const pg = await datasetRows("${MIDR}", { columns: ["ssn"], limit: 3000 }); let loose = 0;
+@@ 146 -1 +1
+-    r = await step('sort',`const x = await dsRows("${BIGR}", { orderBy: "-amount", columns: ["id", "amount"], limit: 3 }); return x.rows.map((r) => r.amount);`);
++    r = await step('sort',`const x = await datasetRows("${BIGR}", { orderBy: "-amount", columns: ["id", "amount"], limit: 3 }); return x.rows.map((r) => r.amount);`);
+@@ 149 -1 +1
+-    r = await step('show', `return await dsShow("${BIGR}", { where: { plan: "GOLD" }, orderBy: "id", limit: 2000, title: "Gold" });`);
++    r = await step('show', `return await datasetShow("${BIGR}", { where: { plan: "GOLD" }, orderBy: "id", limit: 2000, title: "Gold" });`);
+@@ 151 -1 +1
+-    ok(j && j.shown === 2000 && j.of > 30000, `dsShow: 2,000 of ${j && j.of} rows into the chat; the model told only the count (${(r.ms / 1000).toFixed(1)} s)`);
++    ok(j && j.shown === 2000 && j.of > 30000, `datasetShow: 2,000 of ${j && j.of} rows into the chat; the model told only the count (${(r.ms / 1000).toFixed(1)} s)`);
+@@ 173 -1 +1
+-    r = await step('copying', `const t0 = Date.now(); const c = await dsCopy("${BIGR}"); const t1 = Date.now(); const u = await dsUpdate(c, { where: { status: "INACTIVE" }, set: { plan: "CLOSED" } }); const t2 = Date.now(); const n = await dsCount(c, { where: { plan: "CLOSED" } }); return { updated: u.updated, closed: n, copyMs: t1 - t0, updateMs: t2 - t1, countMs: Date.now() - t2 };`);
++    r = await step('copying', `const t0 = Date.now(); const c = await datasetCopy("${BIGR}"); const t1 = Date.now(); const u = await datasetUpdate(c, { where: { status: "INACTIVE" }, set: { plan: "CLOSED" } }); const t2 = Date.now(); const n = await datasetCount(c, { where: { plan: "CLOSED" } }); return { updated: u.updated, closed: n, copyMs: t1 - t0, updateMs: t2 - t1, countMs: Date.now() - t2 };`);
+@@ 177 -1 +1
+-    r = await step('export', `return await dsExport("${BIGR}", { file: "out/big.jsonl" });`);
++    r = await step('export', `return await datasetExport("${BIGR}", { file: "out/big.jsonl" });`);
+@@ 184 -1 +1
+-    r = await step('showing', `return await dsShow("${EDGER}", { title: "Edge <i>cases</i>" });`);
++    r = await step('showing', `return await datasetShow("${EDGER}", { title: "Edge <i>cases</i>" });`);
+@@ 197 -1 +1
+-    r = await step('rows', `const x = await dsRows("${EDGER}"); const r0 = x.rows[0], r1 = x.rows[1];
++    r = await step('rows', `const x = await datasetRows("${EDGER}"); const r0 = x.rows[0], r1 = x.rows[1];
+@@ 207 -3 +3
+-    r = await step('moving', `const c = await dsCopy("${EDGER}"); const x = await dsRows(c); const r0 = x.rows[0];
+-      await dsUpdate(c, { rows: [0], set: { note: r0.quoted, "a.b": r0.big_secret } });
+-      const y = (await dsRows(c)).rows[0]; return { c: c.set, note: y.note.slice(0, 30), ab: y["a.b"].slice(0, 30) };`);
++    r = await step('moving', `const c = await datasetCopy("${EDGER}"); const x = await datasetRows(c); const r0 = x.rows[0];
++      await datasetUpdate(c, { rows: [0], set: { note: r0.quoted, "a.b": r0.big_secret } });
++      const y = (await datasetRows(c)).rows[0]; return { c: c.set, note: y.note.slice(0, 30), ab: y["a.b"].slice(0, 30) };`);
+@@ 225 -1 +1
+-    r = await step('cells', `const c = await dsCopy("${EDGER}"); return { c: c.set };`);
++    r = await step('cells', `const c = await datasetCopy("${EDGER}"); return { c: c.set };`);
+@@ 228 -2 +2
+-    r = await step('parallel', `const c = await dsCopy("${MIDR}"); const r = await parallel({ a: () => dsUpdate(c, { where: { id: (v) => Number(v) < 1500 }, set: { status: "A" } }), b: () => dsUpdate(c, { where: { id: (v) => Number(v) >= 1500 }, set: { status: "B" } }) });
+-      return { a: r.a.updated, b: r.b.updated, na: await dsCount(c, { where: { status: "A" } }), nb: await dsCount(c, { where: { status: "B" } }) };`);
++    r = await step('parallel', `const c = await datasetCopy("${MIDR}"); const r = await parallel({ a: () => datasetUpdate(c, { where: { id: (v) => Number(v) < 1500 }, set: { status: "A" } }), b: () => datasetUpdate(c, { where: { id: (v) => Number(v) >= 1500 }, set: { status: "B" } }) });
++      return { a: r.a.updated, b: r.b.updated, na: await datasetCount(c, { where: { status: "A" } }), nb: await datasetCount(c, { where: { status: "B" } }) };`);
+@@ 233 -10 +10
+-      try { await dsRows("nope"); } catch (e) { out.nope = e.message.slice(0, 60); }
+-      try { await dsRows("#@ds#zzzzzzz"); } catch (e) { out.fake = e.message.slice(0, 60); }
+-      try { await dsKeep("${MIDR}", "../escape"); } catch (e) { out.dots = e.message.slice(0, 60); }
+-      try { await dsKeep("${MIDR}", "edge/one"); } catch (e) { out.dup = e.message.slice(0, 60); }
+-      try { await dsCreate([{ a: 1 }], { sensitive: "a" }); out.sensStr = "made"; } catch (e) { out.sensStr = e.message.slice(0, 60); }
+-      const e = await dsCreate([{ a: "1" }, { a: "2" }]); await dsDelete(e, { where: { a: (v) => true } });
+-      out.empty = await dsRows(e); out.emptyCount = await dsCount(e); out.past = (await dsRows("${MIDR}", { offset: 99999 })).rows.length;
+-      out.show = await dsShow(e);
+-      out.sentence = await dsCount("query ran: 0 rows in data set " + e.set + ".");
+-      try { await dsCount("sets " + e.set + " and " + (await dsCopy(e)).set); out.two = "counted"; } catch (x) { out.two = x.message.slice(0, 60); }
++      try { await datasetRows("nope"); } catch (e) { out.nope = e.message.slice(0, 60); }
++      try { await datasetRows("#@ds#zzzzzzz"); } catch (e) { out.fake = e.message.slice(0, 60); }
++      try { await datasetKeep("${MIDR}", "../escape"); } catch (e) { out.dots = e.message.slice(0, 60); }
++      try { await datasetKeep("${MIDR}", "edge/one"); } catch (e) { out.dup = e.message.slice(0, 60); }
++      try { await datasetCreate([{ a: 1 }], { sensitive: "a" }); out.sensStr = "made"; } catch (e) { out.sensStr = e.message.slice(0, 60); }
++      const e = await datasetCreate([{ a: "1" }, { a: "2" }]); await datasetDelete(e, { where: { a: (v) => true } });
++      out.empty = await datasetRows(e); out.emptyCount = await datasetCount(e); out.past = (await datasetRows("${MIDR}", { offset: 99999 })).rows.length;
++      out.show = await datasetShow(e);
++      out.sentence = await datasetCount("query ran: 0 rows in data set " + e.set + ".");
++      try { await datasetCount("sets " + e.set + " and " + (await datasetCopy(e)).set); out.two = "counted"; } catch (x) { out.two = x.message.slice(0, 60); }
+@@ 248 -1 +1
+-    note(`dsCreate with sensitive given as a string: ${j && j.sensStr}`);
++    note(`datasetCreate with sensitive given as a string: ${j && j.sensStr}`);
+=== change test/test-datasets.mjs
+base 62f4a748ede27b8aad952408
+new 905e5baa737395812c162557
+@@ 104 -1 +1
+-  const { results: [r], sent } = await run([`const p = await dsRows("${SET}"); return p;`]);
++  const { results: [r], sent } = await run([`const p = await datasetRows("${SET}"); return p;`]);
+@@ 115 -7 +7
+-    const active = await dsRows("${SET}", { where: { status: (v) => v === "ACTIVE" }, orderBy: "-city" });
+-    const nines = await dsRows("${SET}", { where: { ssn: (v) => v.matches("^9") } });
+-    const n = await dsCount("${SET}", { where: { status: "ACTIVE" } });
+-    const first = (await dsRows("${SET}", { limit: 1 })).rows[0];
+-    const same = await dsCount("${SET}", { where: { ssn: first.ssn } });
+-    let sortErr = ""; try { await dsRows("${SET}", { orderBy: "ssn" }); } catch (e) { sortErr = e.message; }
+-    let sawValue = ""; await dsRows("${SET}", { where: { ssn: (v) => { sawValue = typeof v === "object" ? "masked:" + v.id : v; return true; } } });
++    const active = await datasetRows("${SET}", { where: { status: (v) => v === "ACTIVE" }, orderBy: "-city" });
++    const nines = await datasetRows("${SET}", { where: { ssn: (v) => v.matches("^9") } });
++    const n = await datasetCount("${SET}", { where: { status: "ACTIVE" } });
++    const first = (await datasetRows("${SET}", { limit: 1 })).rows[0];
++    const same = await datasetCount("${SET}", { where: { ssn: first.ssn } });
++    let sortErr = ""; try { await datasetRows("${SET}", { orderBy: "ssn" }); } catch (e) { sortErr = e.message; }
++    let sawValue = ""; await datasetRows("${SET}", { where: { ssn: (v) => { sawValue = typeof v === "object" ? "masked:" + v.id : v; return true; } } });
+@@ 135 -7 +7
+-    const cp = await dsCopy("${SET}");
+-    const one = (await dsRows(cp, { where: { id: "1" } })).rows[0];   // (the object dsCopy returns names the set too)
+-    await dsUpdate(cp.set, { where: { id: "1" }, set: { status: one.ssn } });
+-    await dsUpdate(cp.set, { where: { id: "2" }, set: { status: "PENDING", city: (row) => row.city + " VA" } });
+-    await dsInsert(cp.set, [{ id: "4", name: "Ann Lee", ssn: one.ssn, status: "NEW", city: "Vinton" }]);
+-    await dsDelete(cp.set, { where: { id: "3" } });
+-    const rows = (await dsRows(cp.set)).rows;
++    const cp = await datasetCopy("${SET}");
++    const one = (await datasetRows(cp, { where: { id: "1" } })).rows[0];   // (the object datasetCopy returns names the set too)
++    await datasetUpdate(cp.set, { where: { id: "1" }, set: { status: one.ssn } });
++    await datasetUpdate(cp.set, { where: { id: "2" }, set: { status: "PENDING", city: (row) => row.city + " VA" } });
++    await datasetInsert(cp.set, [{ id: "4", name: "Ann Lee", ssn: one.ssn, status: "NEW", city: "Vinton" }]);
++    await datasetDelete(cp.set, { where: { id: "3" } });
++    const rows = (await datasetRows(cp.set)).rows;
+@@ 151 -1 +1
+-  const { results: [r2] } = await run([`await dsUpdate("${setTok}", { where: { id: "1" }, set: { status: "ACTIVE" } }); return (await dsRows("${setTok}", { where: { id: "1" } })).rows[0].status;`]);
++  const { results: [r2] } = await run([`await datasetUpdate("${setTok}", { where: { id: "1" }, set: { status: "ACTIVE" } }); return (await datasetRows("${setTok}", { where: { id: "1" } })).rows[0].status;`]);
+@@ 157 -1 +1
+-  const { results: [r], sent } = await run([`const a = await dsExport("${SET}"); const f = await dsExport("${SET}", { file: "out/rows.jsonl" }); return { n: a.length, ssn: a[0].ssn, f };`]);
++  const { results: [r], sent } = await run([`const a = await datasetExport("${SET}"); const f = await datasetExport("${SET}", { file: "out/rows.jsonl" }); return { n: a.length, ssn: a[0].ssn, f };`]);
+@@ 182 -2 +2
+-  ok(/that cell holds another value now/.test(refused) && refused.includes(`(await dsRows("#@ds#${tok2.split('.')[1]}", { offset: 10, limit: 1 })).rows[0].secret`), `a cell written since refuses its old token, with the exact call that reads it again (${refused.slice(0, 220)})`);
+-  // (prod, 2026-11-02: an expired set's token was refused with "read the row again (dsRows)" - which could not work)
++  ok(/that cell holds another value now/.test(refused) && refused.includes(`(await datasetRows("#@ds#${tok2.split('.')[1]}", { offset: 10, limit: 1 })).rows[0].secret`), `a cell written since refuses its old token, with the exact call that reads it again (${refused.slice(0, 220)})`);
++  // (prod, 2026-11-02: an expired set's token was refused with "read the row again (datasetRows)" - which could not work)
+@@ 188 -1 +1
+-  ok(/that set is gone/.test(gone) && /Make the set again/.test(gone) && !/dsRows/.test(gone), `a token of a set that is gone says so, and does not send the agent to read it again (${gone.slice(0, 200)})`);
++  ok(/that set is gone/.test(gone) && /Make the set again/.test(gone) && !/datasetRows/.test(gone), `a token of a set that is gone says so, and does not send the agent to read it again (${gone.slice(0, 200)})`);
+@@ 196 -1 +1
+-console.log('\n[7] dsShow - a table in the chat for the developer; the model is told only how many');
++console.log('\n[7] datasetShow - a table in the chat for the developer; the model is told only how many');
+@@ 198 -1 +1
+-  const { results: [r], events, sent } = await run([`return await dsShow("${SET}", { where: { status: "ACTIVE" }, orderBy: "city", title: "Active members" });`]);
++  const { results: [r], events, sent } = await run([`return await datasetShow("${SET}", { where: { status: "ACTIVE" }, orderBy: "city", title: "Active members" });`]);
+@@ 208 -2 +2
+-// dsRows refused orderBy and dsShow with it; the developer: "No prob sorting on the real value for that")
+-console.log('\n[7b] dsShow orders the developer\'s table by ANY column, by the real values; the agent still cannot');
++// datasetRows refused orderBy and datasetShow with it; the developer: "No prob sorting on the real value for that")
++console.log('\n[7b] datasetShow orders the developer\'s table by ANY column, by the real values; the agent still cannot');
+@@ 211 -2 +2
+-  const mk = `const s = await dsCreate([{ order_id: "1", revenue: "9.5" }, { order_id: "2", revenue: "159.63" }, { order_id: "3", revenue: "100" }, { order_id: "4", revenue: "12" }]);`;
+-  const { results: [r], events } = await run([`${mk} return await dsShow(s.set, { orderBy: "-revenue", limit: 3, title: "Top" });`]);
++  const mk = `const s = await datasetCreate([{ order_id: "1", revenue: "9.5" }, { order_id: "2", revenue: "159.63" }, { order_id: "3", revenue: "100" }, { order_id: "4", revenue: "12" }]);`;
++  const { results: [r], events } = await run([`${mk} return await datasetShow(s.set, { orderBy: "-revenue", limit: 3, title: "Top" });`]);
+@@ 217 -1 +1
+-  const { events: evw } = await run([`${mk} return await dsShow(s.set, { where: { order_id: (c) => c !== "2" }, orderBy: "revenue", title: "Small" });`]);
++  const { events: evw } = await run([`${mk} return await datasetShow(s.set, { where: { order_id: (c) => c !== "2" }, orderBy: "revenue", title: "Small" });`]);
+@@ 220 -3 +3
+-  const { results: [bad] } = await run([`${mk} try { await dsRows(s.set, { orderBy: "revenue" }); return "SORTED"; } catch (e) { return "refused: " + e.message; }`]);
+-  ok(/refused: .*only a shown column/.test(val(bad)), `dsRows - rows handed to the agent - still refuses to sort by a masked column (${val(bad).slice(0, 80)})`);
+-  const { results: [nc] } = await run([`${mk} try { await dsShow(s.set, { orderBy: "nope" }); return "OK"; } catch (e) { return "refused: " + e.message; }`]);
++  const { results: [bad] } = await run([`${mk} try { await datasetRows(s.set, { orderBy: "revenue" }); return "SORTED"; } catch (e) { return "refused: " + e.message; }`]);
++  ok(/refused: .*only a shown column/.test(val(bad)), `datasetRows - rows handed to the agent - still refuses to sort by a masked column (${val(bad).slice(0, 80)})`);
++  const { results: [nc] } = await run([`${mk} try { await datasetShow(s.set, { orderBy: "nope" }); return "OK"; } catch (e) { return "refused: " + e.message; }`]);
+@@ 224 -1 +1
+-  const { events: ev2 } = await run([`return await dsShow("${SET}", { orderBy: "-ssn", title: "By SSN" });`]);
++  const { events: ev2 } = await run([`return await datasetShow("${SET}", { orderBy: "-ssn", title: "By SSN" });`]);
+@@ 229 -0 +12
++// THE NEW NAMES, AND THE OLD ONES STILL WORKING (the developer, 2026-11-13: "they're called things like dsPage. Let's
++// change to datasetPage") - a skill or an older conversation that wrote dsCreate / dsShow runs the new function, and the
++// step is drawn under its new name
++console.log('\n[names] datasetPage and the rest; dsPage and the rest still run, shown by their new names');
++{
++  const { results: [r], events } = await run([`const s = await dsCreate([{ a: "1" }, { a: "2" }]); const p = await dsPage(s.set, { limit: 5 }); return { n: p.rows.length, same: dsPage === datasetPage && dsRows === datasetRows };`]);
++  const v = val(r);
++  const steps = events.filter((e) => e.type === 'js-step').map((e) => e.fn);
++  ok(/"n": *2/.test(v) && /"same": *true/.test(v), `the old names run the new functions (${v.replace(/\s+/g, ' ').slice(0, 80)})`);
++  ok(steps.includes('datasetCreate') && steps.includes('datasetPage') && !steps.some((f) => /^ds[A-Z]/.test(String(f))), `the steps show the new names (${[...new Set(steps)].join(', ')})`);
++}
++
+=== add test/test-git-window-e2e.mjs
+new 20c9570ec40b2aa7188776b8
++/**
++ * THE PUSH WINDOW'S BUTTONS, IN THE PAGE (the developer, 2026-11-13). A project that is a repo with a remote:
++ *   [1] a file changed only in whitespace and one with a real change too: each has its button, the section one for all;
++ *       the commits' own files have none (what is committed is not touched)
++ *   [2] the button: the whitespace put back on disk, the window read again - said what was done; the real change stays
++ *   [3] Push all: the footer says what goes and where; pushed, the window says so and has nothing left to push
++ *   [4] the remote moved on: the footer says pull first, and the button is off
++ * Run: node test/test-git-window-e2e.mjs
++ */
++import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises';
++import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
++import { tmpdir } from 'node:os';
++import path from 'node:path';
++import { fileURLToPath } from 'node:url';
++import { spawnSync } from 'node:child_process';
++import puppeteer from 'puppeteer-core';
++
++process.env.CB_HOME = mkdtempSync(path.join(tmpdir(), 'cb-gitwin-home-'));
++process.env.CB_HEADS_UP_IDLE_MS = '0';
++process.env.CB_SKILLS_MAINTAINER ??= '0';
++const ENV0 = { ...process.env };   // (Chrome keeps the real profile folders)
++const HOME = mkdtempSync(path.join(tmpdir(), 'cb-gitwin-ghome-'));
++await writeFile(path.join(HOME, '.gitconfig'), '[user]\n\tname = Test Dev\n\temail = dev@example.com\n[init]\n\tdefaultBranch = main\n[core]\n\tautocrlf = false\n');
++Object.assign(process.env, { HOME, USERPROFILE: HOME, GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0' });
++const { startServer } = await import('../src/server.mjs');
++
++const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
++const PORT = 29491 + Math.floor(Math.random() * 20);
++let pass = 0, fail = 0;
++const ok = (c, l) => { if (c) { pass++; console.log('  ok', l); } else { fail++; console.log('  FAIL', l); } };
++const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
++const chrome = ['C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe', (process.env.LOCALAPPDATA || '') + '\\Google\\Chrome\\Application\\chrome.exe'].find((p) => { try { return p && existsSync(p); } catch { return false; } });
++if (!chrome) { console.log('SKIP - Chrome not found'); process.exit(0); }
++const g = (cwd, ...args) => { const r = spawnSync('git', args, { cwd, encoding: 'utf8' }); if (r.status !== 0) throw new Error(`git ${args.join(' ')}: ${r.stderr}`); return r.stdout; };
++
++const work = await mkdtemp(path.join(tmpdir(), 'cb-gitwin-'));
++const BARE = path.join(work, 'origin.git'), proj = path.join(work, 'proj'), OTHER = path.join(work, 'other');
++g(work, 'init', '-q', '--bare', BARE);
++g(work, 'clone', '-q', BARE, proj);
++await mkdir(path.join(proj, '.code_boss'), { recursive: true });
++await writeFile(path.join(proj, '.gitignore'), '.code_boss/\n');
++await writeFile(path.join(proj, 'ws.js'), 'const a = 1;\r\nconst b = 2;\r\n');
++await writeFile(path.join(proj, 'mixed.js'), 'function f() {\r\n  return 1;\r\n}\r\n');
++g(proj, 'add', '-A'); g(proj, 'commit', '-q', '-m', 'start'); g(proj, 'push', '-q', '-u', 'origin', 'main');
++await writeFile(path.join(proj, 'c.txt'), 'c\n'); g(proj, 'add', '-A'); g(proj, 'commit', '-q', '-m', 'one');
++await writeFile(path.join(proj, 'd.txt'), 'd\n'); g(proj, 'add', '-A'); g(proj, 'commit', '-q', '-m', 'two');
++// not committed: ws.js only re-saved (LF, indented); mixed.js re-indented with a real change
++await writeFile(path.join(proj, 'ws.js'), 'const a = 1;\n    const b = 2;\n');
++await writeFile(path.join(proj, 'mixed.js'), 'function f() {\n\treturn 42;\n}\n');
++
++const adapter = { async *completeStream() { yield { choices: [{ delta: { content: 'Done.' } }] }; }, async complete() { return { choices: [{ message: { content: '' } }] }; }, async listModels() { return [{ id: 'm' }]; } };
++const html = (await readFile(path.join(ROOT, 'src', 'ui.html'), 'utf8')).replace('</head>', '<script>window.SERVER_CONFIG=' + JSON.stringify({ defaultModel: 'm', baseURL: '(mock)' }) + ';</script></head>');
++const { server } = await startServer({ html, baseURL: '(mock)', apiKey: 'k', gitlabCreds: { user: 't', token: 't' }, defaultModel: 'm', port: PORT, adapter, modelsList: [{ id: 'm' }], initialProject: proj });
++const browser = await puppeteer.launch({ executablePath: chrome, headless: 'new', args: ['--no-sandbox'], env: ENV0 });
++try {
++  const page = await browser.newPage();
++  await page.setViewport({ width: 1300, height: 900 });
++  const errors = []; page.on('pageerror', (e) => errors.push(String(e.message || e)));
++  await page.goto(`http://127.0.0.1:${PORT}/`);
++  await page.waitForSelector('#chat:not(.hidden)', { timeout: 15000 });
++  const repoPath = await page.waitForFunction(async () => { const s = await (await fetch('/api/state?limit=1')).json(); const p = (s.gitProjects || s.session?.gitProjects || []); return p.length ? p[0].path : null; }, { timeout: 15000, polling: 500 }).then((h) => h.jsonValue()).catch(() => null);
++  ok(!!repoPath, `the repo is found (${repoPath})`);
++  const view = () => page.evaluate(() => ({
++    files: [...document.querySelectorAll('#commitBody .og-sec')].flatMap((s) => [...s.querySelectorAll(':scope > .og-file')].map((f) => ({ path: f.querySelector('.cm-dname').textContent, undo: f.querySelector('.og-ws-undo')?.textContent || '', ws: f.querySelector('.og-ws')?.textContent || '' }))),
++    all: document.querySelector('#commitBody .og-ws-all')?.textContent || '',
++    note: document.getElementById('ogNote')?.textContent || '', bad: !!document.querySelector('#ogNote.bad'),
++    foot: document.getElementById('commitFoot').hidden ? null : { info: document.querySelector('#commitFoot .og-foot-info')?.textContent, btn: document.querySelector('#commitFoot .og-push')?.textContent, off: !!document.querySelector('#commitFoot .og-push')?.disabled },
++    commits: document.querySelectorAll('#commitBody .og-commit').length,
++  }));
++  const open = async () => { await page.evaluate((p) => openCommitAssistant(p), repoPath); await page.waitForFunction(() => !document.querySelector('#commitBody .cb-loading, #commitBody [class*="loading"]') && document.querySelector('#commitBody').children.length, { timeout: 15000 }); await sleep(200); };
++
++  // THE BRANCH'S BUBBLE COUNTS WHAT A PUSH SENDS (the developer, 2026-11-13): commits not pushed, gold; none, the
++  // uncommitted files in gray
++  const pill = () => page.evaluate(() => { const b = document.querySelector('#gitProjects .gp-badge'); return b ? { n: b.querySelector('.gp-count').textContent, gray: b.classList.contains('gp-local'), bg: getComputedStyle(b.querySelector('.gp-count')).backgroundColor, title: b.title } : null; });
++  await page.waitForFunction(() => document.querySelector('#gitProjects .gp-badge .gp-count')?.textContent, { timeout: 15000 }).catch(() => {});
++  const p0 = await pill();
++  ok(p0 && p0.n === '2' && !p0.gray && /2 commits not pushed/.test(p0.title), `the bubble: the 2 commits not pushed, in gold (${JSON.stringify(p0)})`);
++
++  console.log('\n[1] the buttons');
++  await open();
++  const v1 = await view();
++  const ws = v1.files.find((f) => f.path === 'ws.js'), mixed = v1.files.find((f) => f.path === 'mixed.js');
++  ok(ws && /Put back as committed/.test(ws.undo) && mixed && /Put back whitespace/.test(mixed.undo), `each file with whitespace-only lines has its button (${JSON.stringify([ws, mixed])})`);
++  ok(/in 2 files/.test(v1.all), `and the section one for both (${v1.all})`);
++  await page.evaluate(() => { const c = document.querySelector('#commitBody .og-commit'); c.open = true; c.dispatchEvent(new Event('toggle')); });
++  await page.waitForFunction(() => document.querySelector('#commitBody .og-commit .og-files .og-file'), { timeout: 10000 });
++  ok(!(await page.$('#commitBody .og-commit .og-ws-undo')), "a commit's own files have none");
++  const shot = path.join(work, 'window.png'); await page.screenshot({ path: shot }); console.log('  (screenshot: ' + shot + ')');
++
++  console.log('\n[2] putting it back');
++  await page.evaluate(() => document.querySelector('#commitBody .og-ws-all').click());
++  await page.waitForFunction(() => document.getElementById('ogNote'), { timeout: 15000 });
++  const v2 = await view();
++  ok(/Whitespace put back as committed in 2 files/.test(v2.note) && !v2.bad, `said what was done (${v2.note})`);
++  ok(!v2.files.some((f) => f.path === 'ws.js') && v2.files.find((f) => f.path === 'mixed.js') && !v2.files.find((f) => f.path === 'mixed.js').undo, `ws.js no longer changed; mixed.js still is, with no button left (${JSON.stringify(v2.files)})`);
++  ok(readFileSync(path.join(proj, 'ws.js'), 'utf8') === 'const a = 1;\r\nconst b = 2;\r\n' && readFileSync(path.join(proj, 'mixed.js'), 'utf8') === 'function f() {\r\n\treturn 42;\r\n}\r\n', 'on disk: as committed, the real change kept as written');
++
++  console.log('\n[3] push all');
++  ok(v2.foot && v2.foot.btn === 'Push all 2 commits' && /2 commits to origin\/main/.test(v2.foot.info) && !v2.foot.off, `the footer: what goes, where (${JSON.stringify(v2.foot)})`);
++  await page.evaluate(() => document.querySelector('#commitFoot .og-push').click());
++  await page.waitForFunction(() => /Pushed|did not go/.test(document.getElementById('ogNote')?.textContent || ''), { timeout: 30000 });
++  const v3 = await view();
++  ok(/Pushed all 2 commits/.test(v3.note) && v3.commits === 0 && v3.foot === null && g(BARE, 'log', '-1', '--format=%s', 'main').trim() === 'two', `pushed; nothing left to push, no footer (${JSON.stringify(v3)})`);
++
++  await page.waitForFunction(() => document.querySelector('#gitProjects .gp-badge')?.classList.contains('gp-local'), { timeout: 15000 }).catch(() => {});
++  const p1 = await pill();
++  ok(p1 && p1.n === '1' && p1.gray && p1.bg !== p0.bg && /nothing to push/.test(p1.title), `pushed: the bubble counts the 1 uncommitted file, in gray (${JSON.stringify(p1)})`);
++
++  console.log('\n[4] the remote moved on');
++  g(work, 'clone', '-q', BARE, OTHER); await writeFile(path.join(OTHER, 't.txt'), 't\n'); g(OTHER, 'add', '-A'); g(OTHER, 'commit', '-q', '-m', 'theirs'); g(OTHER, 'push', '-q');
++  g(proj, 'fetch', '-q');
++  await writeFile(path.join(proj, 'e.txt'), 'e\n'); g(proj, 'add', 'e.txt'); g(proj, 'commit', '-q', '-m', 'mine');
++  await open();
++  const v4 = await view();
++  ok(v4.foot && /pull first/.test(v4.foot.info) && v4.foot.off, `the footer says pull first, the button off (${JSON.stringify(v4.foot)})`);
++  ok(!errors.length, `no page errors (${errors.join('; ').slice(0, 200)})`);
++} catch (e) { fail++; console.log('  FAIL harness:', e?.stack || e); }
++finally { await browser.close(); server.close(); }
++console.log(`\n${pass} passed, ${fail} failed`);
++process.exit(fail ? 1 : 0);
++
+=== add test/test-git-ws-push.mjs
+new 020163a528d051a35377635e
++/**
++ * THE PUSH WINDOW'S TWO BUTTONS (the developer, 2026-11-13: "in general we don't want to checkin whitespace only changes,
++ * so we should make it easy to reverse it on disk, so it matches the repo" ... "a Push all button on the push modal that
++ * pushes all the commits"). On real repos:
++ *   [1] gcRevertWhitespace: a file re-saved with LF and re-indented, one real change - the whitespace as committed, the
++ *       real change kept (in the committed CRLF); `git diff` then only the real change
++ *   [2] all of it whitespace: the file byte for byte as committed - no diff left
++ *   [3] refused, nothing written: not UTF-8, not in the last commit, outside the repo; a file with no change: nothing done
++ *   [4] gcPushAsync: the commits to the bare remote (with an upstream, and a new branch with none); refused when the
++ *       remote moved on - git's words given back
++ * Run: node test/test-git-ws-push.mjs
++ */
++import { spawnSync } from 'node:child_process';
++import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
++import { tmpdir } from 'node:os';
++import path from 'node:path';
++import { gcRevertWhitespace, gcPushAsync, collectOutgoingAsync } from '../src/agent/git-commit.mjs';
++
++let pass = 0, fail = 0;
++const ok = (c, l) => { if (c) { pass++; console.log('  ok', l); } else { fail++; console.log('  FAIL', l); } };
++const work = mkdtempSync(path.join(tmpdir(), 'cb-wspush-'));
++const HOME = path.join(work, 'home');
++mkdirSync(HOME, { recursive: true });
++writeFileSync(path.join(HOME, '.gitconfig'), '[user]\n\tname = Test Dev\n\temail = dev@example.com\n[init]\n\tdefaultBranch = main\n[core]\n\tautocrlf = false\n');
++Object.assign(process.env, { HOME, USERPROFILE: HOME, GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0' });
++const g = (cwd, ...args) => { const r = spawnSync('git', args, { cwd, encoding: 'utf8' }); if (r.status !== 0) throw new Error(`git ${args.join(' ')}: ${r.stderr}`); return r.stdout; };
++const W = (dir, f, text) => { mkdirSync(path.dirname(path.join(dir, f)), { recursive: true }); writeFileSync(path.join(dir, f), text); };
++const R0 = (dir, f) => readFileSync(path.join(dir, f), 'utf8');
++
++const BARE = path.join(work, 'origin.git'), R = path.join(work, 'repo'), OTHER = path.join(work, 'other');
++g(work, 'init', '-q', '--bare', BARE);
++g(work, 'clone', '-q', BARE, R);
++const committed = ['function a() {', '  return 1;', '}', '', 'function b() {', '  return 2;', '}', ''].join('\r\n');
++W(R, 'app.js', committed);
++W(R, 'same.js', 'const x = 1;\r\nconst y = 2;\r\n');
++W(R, 'bin.dat', Buffer.from([0x66, 0x6f, 0xff, 0xfe, 0x0a]));
++g(R, 'add', '-A'); g(R, 'commit', '-q', '-m', 'start'); g(R, 'push', '-q', '-u', 'origin', 'main');
++
++try {
++  console.log('\n[1] whitespace put back, the real change kept');
++  // re-saved with LF, b() re-indented with a tab and trailing spaces, and one real change in a()
++  W(R, 'app.js', ['function a() {', '  return 100;', '}', '', 'function b() {', '\treturn 2;   ', '}', ''].join('\n'));
++  const r1 = await gcRevertWhitespace(R, 'app.js');
++  const t1 = R0(R, 'app.js');
++  ok(r1.ok && r1.changed && r1.after < r1.before, `done: the diff smaller (${JSON.stringify(r1)})`);
++  ok(t1 === committed.replace('  return 1;', '  return 100;'), `the file: as committed but for the real change, in CRLF (${JSON.stringify(t1)})`);
++  const d1 = g(R, 'diff', '--', 'app.js');
++  ok(/^-\s+return 1;\r?$/m.test(d1) && /^\+\s+return 100;\r?$/m.test(d1) && (d1.match(/^[+-](?![+-])/gm) || []).length === 2, `git diff: only the real change (${(d1.match(/^[+-](?![+-]).*$/gm) || []).join(' | ')})`);
++
++  console.log('\n[2] all of it whitespace');
++  W(R, 'same.js', 'const x = 1;\n    const y = 2;  \n');
++  const r2 = await gcRevertWhitespace(R, 'same.js');
++  ok(r2.ok && r2.changed && r2.after === 0 && R0(R, 'same.js') === 'const x = 1;\r\nconst y = 2;\r\n', `byte for byte as committed - no diff left (${JSON.stringify(r2)})`);
++  ok(g(R, 'status', '--porcelain', '--', 'same.js') === '', 'git status: clean');
++
++  console.log('\n[3] refused, or nothing to do');
++  W(R, 'bin.dat', Buffer.from([0x66, 0x6f, 0xff, 0xfe, 0x20, 0x0a]));
++  const before3 = readFileSync(path.join(R, 'bin.dat'));
++  const r3 = await gcRevertWhitespace(R, 'bin.dat');
++  ok(!r3.ok && /not UTF-8/.test(r3.problem) && readFileSync(path.join(R, 'bin.dat')).equals(before3), `not UTF-8: refused, not touched (${r3.problem})`);
++  W(R, 'new.txt', 'new\n');
++  const r4 = await gcRevertWhitespace(R, 'new.txt');
++  ok(!r4.ok && /not in the last commit/.test(r4.problem), `a new file: refused (${r4.problem})`);
++  const r5 = await gcRevertWhitespace(R, '../outside.txt');
++  ok(!r5.ok && /not a file of this repo/.test(r5.problem), `outside the repo: refused (${r5.problem})`);
++  const r6 = await gcRevertWhitespace(R, 'same.js');
++  ok(r6.ok && !r6.changed, 'no change left: nothing done');
++  g(R, 'checkout', '--', 'bin.dat'); spawnSync('git', ['clean', '-fdq'], { cwd: R });
++
++  console.log('\n[4] push all');
++  g(R, 'add', '-A'); g(R, 'commit', '-q', '-m', 'a returns 100');
++  W(R, 'more.txt', 'more\n'); g(R, 'add', '-A'); g(R, 'commit', '-q', '-m', 'more');
++  const o1 = await collectOutgoingAsync(R);
++  const p1 = await gcPushAsync(R);
++  const o2 = await collectOutgoingAsync(R);
++  ok(o1.commits.length === 2 && p1.ok && o2.commits.length === 0 && g(BARE, 'log', '-1', '--format=%s', 'main').trim() === 'more', `both commits pushed (${o1.commits.length} -> ${o2.commits.length}; ${p1.output.split('\n').pop()})`);
++  // a new branch, no upstream
++  g(R, 'checkout', '-q', '-b', 'feature/x'); W(R, 'f.txt', 'f\n'); g(R, 'add', '-A'); g(R, 'commit', '-q', '-m', 'feature');
++  const p2 = await gcPushAsync(R);
++  ok(p2.ok && g(BARE, 'log', '-1', '--format=%s', 'feature/x').trim() === 'feature', `a branch with no upstream goes to origin under its name (${p2.output.split('\n').pop()})`);
++  // the remote moved on: refused, and said
++  g(R, 'checkout', '-q', 'main');
++  g(work, 'clone', '-q', BARE, OTHER); W(OTHER, 'theirs.txt', 'theirs\n'); g(OTHER, 'add', '-A'); g(OTHER, 'commit', '-q', '-m', 'theirs'); g(OTHER, 'push', '-q');
++  W(R, 'mine.txt', 'mine\n'); g(R, 'add', '-A'); g(R, 'commit', '-q', '-m', 'mine');
++  const p3 = await gcPushAsync(R);
++  ok(!p3.ok && /rejected|fetch first|non-fast-forward/i.test(p3.output), `the remote moved on: refused, in git's words (${p3.output.split('\n').filter(Boolean).slice(-2).join(' | ').slice(0, 160)})`);
++} catch (e) { fail++; console.log('  FAIL harness:', e?.stack || e); }
++console.log(`\n${pass} passed, ${fail} failed`);
++process.exit(fail ? 1 : 0);
++
+=== change test/test-help-demo-e2e.mjs
+base b9eb78c8cb9f1931c8f8d308
+new fc571a2e5fc956cbbb652fb3
+@@ 112 -0 +3
++    await sleep(400);
++    const leftAfterEdit = await page.evaluate(() => [...document.querySelectorAll('#suggestBar .suggest-send')].map((b) => b.textContent));
++    ok(leftAfterEdit.length === 1 && leftAfterEdit[0] === 'Show me which tests fail, but change nothing yet.', `and takes it out of the list - it is in the box now (${leftAfterEdit.join(' | ')})`);
+@@ 113 -1 +1
+-    await page.click('#suggestBar .suggest-chip:nth-of-type(3) .suggest-send');
++    await page.click('#suggestBar .suggest-chip .suggest-send');
+@@ 134 -0 +12
++    // THE PENCILS OVER THE >_ AND THE x TO TAKE ONE AWAY (the developer, 2026-11-13)
++    const seg = await page.evaluate(() => { const e = [...document.querySelectorAll('#suggestBar .suggest-edit')].map((b) => b.getBoundingClientRect()); const r = document.getElementById('replToggle').getBoundingClientRect(); return { edits: e.map((x) => [Math.round(x.left), Math.round(x.right)]), repl: [Math.round(r.left), Math.round(r.right)], rm: document.querySelectorAll('#suggestBar .suggest-remove').length, clear: !!document.querySelector('#suggestBar .suggest-clear') }; });
++    ok(seg.edits.length === 3 && seg.edits.every(([l, r]) => Math.abs(l - seg.repl[0]) <= 1 && Math.abs(r - seg.repl[1]) <= 1), `each pencil stands right over the >_ (${JSON.stringify(seg)})`);
++    ok(seg.rm === 3 && seg.clear, 'each has an x, and the head a Clear all');
++    await page.click('#suggestBar .suggest-chip:nth-of-type(3) .suggest-remove');
++    await sleep(500);
++    const after1 = await page.evaluate(async () => ({ shown: [...document.querySelectorAll('#suggestBar .suggest-send')].map((b) => b.textContent), kept: ((await (await fetch('/api/state?limit=1')).json()).helpSuggestions || []).map((s) => s.text) }));
++    ok(after1.shown.length === 2 && after1.kept.length === 2 && !after1.shown.includes(dchips[1]) && !after1.kept.includes(dchips[1]), `x takes that one away, here and on the server (${JSON.stringify(after1)})`);
++    await page.click('#suggestBar .suggest-clear');
++    await sleep(500);
++    const after2 = await page.evaluate(async () => ({ hidden: document.getElementById('suggestBar').classList.contains('hidden'), kept: ((await (await fetch('/api/state?limit=1')).json()).helpSuggestions || []).length }));
++    ok(after2.hidden && after2.kept === 0, `Clear all: none left, here or on the server (${JSON.stringify(after2)})`);
+=== change test/test-plan-versions.mjs
+base fa7d495497e40a8de7b77993
+new 4334fc5e8bad25b2a0113053
+@@ 86 -1 +8
+-    ok(c1.title === 'Plan 3' && !c1.ver && !c1.toggle, `a card titled "Plan 3", no version line, no toggle (${JSON.stringify(c1)})`);
++    ok(c1.title === 'Plan' && !c1.ver && !c1.toggle, `with no title line, a card headed "Plan" - not its number - no version line, no toggle (${JSON.stringify(c1)})`);
++    // THE PLAN'S OWN TITLE IN THE HEADER, NOT "Plan 3" (the developer, 2026-11-13)
++    for (const line of ['**Plan: Keep the 11th item**', 'Plan: Keep the 11th item', '## Plan - Keep the 11th item']) {
++      const ct = await card({ content: line + '\n\n' + V1, plan: { id: '3', version: 1 } }, `return { title: d.querySelector('.pv-title')?.textContent, body: d.querySelector('.pv-full')?.textContent };`);
++      ok(ct.title === 'Keep the 11th item' && !/Plan[:\\-]/.test(ct.body) && /Reproduced: the cache/.test(ct.body), `"${line}": the header is the title, and the line is not repeated below (${JSON.stringify(ct).slice(0, 140)})`);
++    }
++    const cv = await card({ content: '**Plan: Keep the 11th item**\n\n' + V2, plan: { id: '3', version: 2, prev: '**Plan: Keep the 11th item**\n\n' + V1 } }, `return { title: d.querySelector('.pv-title')?.textContent, marks: [...d.querySelectorAll('.pv-changes del, .pv-changes ins')].map((x) => x.textContent).join('|') };`);
++    ok(cv.title === 'Keep the 11th item' && !/Plan:/.test(cv.marks), `a later version: the same title in the header, its line not in the changes (${JSON.stringify(cv).slice(0, 160)})`);
+=== change test/test-project-menu.mjs
+base 501dbfb82e7188ba4f9422ac
+new 97771a25e41f41ca8df334bf
+@@ 83 -2 +3
+-    await page.waitForFunction(() => document.body.innerText.includes('Opening a new Code Boss window'), { timeout: 5000 }).catch(() => {});
+-    ok(await page.evaluate(() => document.body.innerText.includes('Opening a new Code Boss window')), 'and this window says so');
++    // (no toast for it: the new window opening says so - the developer, 2026-11-13)
++    await sleep(600);
++    ok(!(await page.evaluate(() => document.body.innerText.includes('Opening a new Code Boss window') || !!document.querySelector('.cb-toast:not(.hidden), .toast.show'))), 'and this window shows no notification for it');
+=== change test/test-repl-console-e2e.mjs
+base 0d1440fe0330b860009d7493
+new b19385c2a94e1a0e20a87f5e
+@@ 56 -1 +1
+-  const browser = await puppeteer.launch({ executablePath: chrome, headless: 'new', args: ['--no-sandbox'] });
++  const browser = await puppeteer.launch({ executablePath: chrome, headless: 'new', args: ['--no-sandbox'], ignoreDefaultArgs: ['--hide-scrollbars'] });   // (real scrollbars: the box's width check)
+@@ 77 -0 +6
++    // (a conversation long enough for a scrollbar: the box is as wide as before when the console takes its place - the
++    // developer, 2026-11-13: "the text box gets a little wider, it should stay the same size")
++    await page.evaluate(() => { const log = document.getElementById('log'); for (let i = 0; i < 80; i++) { const d = document.createElement('div'); d.className = 'filler-row'; d.textContent = 'filler ' + i; d.style.height = '24px'; log.appendChild(d); } });
++    await sleep(300);
++    const boxW = () => page.evaluate(() => { const i = document.getElementById('input').closest('.input-row') || document.getElementById('input').parentElement; return Math.round(i.getBoundingClientRect().width * 10) / 10; });
++    const w0 = await boxW(), sb0 = await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--log-sb'));
+@@ 78 -0 +4
++    await sleep(300);
++    const w1 = await boxW();
++    ok(w0 === w1 && sb0 !== '0px', `the message box keeps its width when the console shows (${w0} -> ${w1}; the conversation's scrollbar ${sb0})`);
++    await page.evaluate(() => document.querySelectorAll('#log .filler-row').forEach((d) => d.remove()));
+@@ 103 -1 +1
+-    // the agent's data sets are the console's too (live, 2026-10-30: dsList() said "data sets are not available here")
++    // the agent's data sets are the console's too (live, 2026-10-30: datasetList() said "data sets are not available here")
+@@ 105 -1 +1
+-      const code = 'const s = await dsCreate([{ region: "west", qty: "3" }, { region: "east", qty: "5" }]); const l = await dsList(); const r = await dsRows(s.id || s.name || s, {}); return { listed: l.length, total: r.total };';
++      const code = 'const s = await datasetCreate([{ region: "west", qty: "3" }, { region: "east", qty: "5" }]); const l = await datasetList(); const r = await datasetRows(s.id || s.name || s, {}); return { listed: l.length, total: r.total };';
+=== change test/test-side-chat-e2e.mjs
+base e4bf6f8431b7df7f7b73b9f9
+new c75c38d866a55236d7cbc381
+@@ 191 -0 +15
++  // NOTHING UNDER THE SIDE CHAT'S BOX (prod, 2026-11-13: with the right panel closed, the bar docked under the side
++  // chat's box too - branches, Edit, the token count, the gear)
++  console.log('\n[9] the right panel closed: its bar under the main box, nothing under the side chat\'s');
++  await page.evaluate(() => setRightPanelCollapsed(true));
++  await page.evaluate(() => { const f = document.getElementById('sideFrame'); f.src = f.src; });
++  await page.waitForFunction(() => { const d = document.getElementById('sideFrame')?.contentDocument; return d && d.readyState === 'complete' && d.getElementById('input'); }, { timeout: 10000 });
++  await sleep(800);
++  const bars = await page.evaluate(() => {
++    const d = document.getElementById('sideFrame').contentDocument;
++    const sc = d.getElementById('sideChrome');
++    const main = document.getElementById('sideChrome');
++    return { side: !!sc && sc.getClientRects().length > 0, sideBranches: [...d.querySelectorAll('#gitProjects *')].some((e) => e.getClientRects().length), main: !!main && main.getClientRects().length > 0 && !!main.closest('#chatMain footer') };
++  });
++  ok(!bars.side && !bars.sideBranches && bars.main, `the main chat's bar docks under its box; the side chat shows none (${JSON.stringify(bars)})`);
++  await page.evaluate(() => setRightPanelCollapsed(false));
+=== change test/test-side-chat.mjs
+base aa8a6993b3c4252c5d1ace96
+new ad7189d03ea3f11c9c6332d2
+@@ 45 -1 +1
+-    if (/what did it do/i.test(newest)) return 'Reading the main chat.\n<remote-workspace><js>return await mainChat();</js></remote-workspace>' + close;
++    if (/what did it do/i.test(newest)) return 'Reading the main chat.\n<remote-workspace><js>return (await mainChat()) + " ---BEFORE--- " + (await mainChat({ before: 1, max: 5 })) + " ---HASH--- " + (await mainChat({ before: "#1" }));</js></remote-workspace>' + close;
+@@ 92 -0 +3
++  // (prod, 2026-11-13: mainChat({ before: 285, max: 20 }) - a message number as the view shows them - was looked up as a
++  // record id and refused)
++  ok(sideReq && /---BEFORE---[\s\S]*#0 to #0:[\s\S]*---HASH---[\s\S]*#0 to #0:/.test(sideReq.text) && !/has no such item/.test(sideReq.text), 'mainChat({ before: 1, max: 5 }) and { before: "#1" }: the messages before that number');
+=== change test/test-snippet-jobs.mjs
+base ddb3e0a1e07b7561dfc3f3a5
+new d2bdb5ee476e49c487531d42
+@@ 24 -1 +1
+-import { setSnippetJobDoneHandler, backgroundSnippetCall, listSnippetJobs } from '../src/agent/snippet-jobs.mjs';
++import { setSnippetJobDoneHandler, backgroundSnippetCall, listSnippetJobs, createSnippetJob, requestRun, acquireWrite, killSnippetJob, finishSnippetJob, describeSnippetJobs } from '../src/agent/snippet-jobs.mjs';
+@@ 148 -0 +49
++// A STOPPED SNIPPET GIVES THE WRITE SLOT UP (prod, 2026-11-13: one stopped while stuck in a call that never came back
++// kept the slot; every later snippet that called a plugin tool went to the background waiting for it, the list said
++// "none now", and the agent looped stopping and starting snippets)
++console.log('\n[7] the write slot of a stopped snippet');
++{
++  const K = 'slot-test-key';
++  const a = createSnippetJob({ key: K, callId: 'a' }); requestRun(a);
++  ok(acquireWrite(a).immediate, 'the first takes the slot');
++  const shown = describeSnippetJobs(K);
++  ok(new RegExp(a.id + ' RUNNING').test(shown), `the holder is listed though it is not a background one (${shown.trim()})`);
++  const b = createSnippetJob({ key: K, callId: 'b' }); requestRun(b);
++  const wb = acquireWrite(b);
++  ok(!wb.immediate && wb.ahead === a, 'the next one waits behind it');
++  killSnippetJob(K, a.id);   // (stopped; its stuck call never returns, so finishSnippetJob is never reached)
++  let got = false; await Promise.race([wb.promise.then(() => { got = true; }), sleep(500)]);
++  ok(got && b.mode === 'write', 'stopped: the slot goes to the waiting one at once, not when its last call comes back');
++  const c = createSnippetJob({ key: K, callId: 'c' }); requestRun(c);
++  const wc = acquireWrite(c);
++  ok(!wc.immediate && wc.ahead === b, 'the one after waits behind the new holder');
++  b.killed = true;   // (stopped some other way, the slot not handed on)
++  const d = createSnippetJob({ key: K, callId: 'd' }); requestRun(d);
++  ok(acquireWrite(d).immediate || c.mode === 'write', 'a holder marked stopped is passed over');
++  // a job that has ENDED (timed out, its body still running) and then makes a late call: it must not take the slot back
++  for (const j of [a, b, c, d]) finishSnippetJob(j, { status: 'ok', content: '' });
++  const e = createSnippetJob({ key: K, callId: 'e' }); requestRun(e);
++  ok(acquireWrite(e).immediate, 'a fresh one takes the free slot');
++  finishSnippetJob(e, { status: 'error', content: 'timed out' });
++  const late = acquireWrite(e);
++  const f = createSnippetJob({ key: K, callId: 'f' }); requestRun(f);
++  ok(late.ended && acquireWrite(f).immediate, `an ended job's late call does not take the slot back - the next one gets it (${JSON.stringify({ ended: late.ended })})`);
++  finishSnippetJob(f, { status: 'ok', content: '' });
++  ok(!describeSnippetJobs(K), 'all ended: nothing listed');
++}
++
++// ONE PROJECT, HOWEVER ITS FOLDER IS SPELLED (live, 2026-11-13: the worker made js-1 under "D:/tmp/x", bgKill looked it up
++// under "D:\tmp\x" and said "no snippet js-1" while it ran)
++console.log('\n[8] the project spelled two ways');
++{
++  const j = createSnippetJob({ key: 'D:/tmp/Proj-X', callId: 'k1' }); requestRun(j);
++  ok(acquireWrite(j).immediate, 'made under D:/tmp/Proj-X, it takes the slot');
++  ok(listSnippetJobs('D:\\tmp\\Proj-X\\', { includeDone: false }).some((x) => x.id === j.id), 'listed when asked with backslashes and a trailing one');
++  const j2 = createSnippetJob({ key: 'D:\\tmp\\Proj-X', callId: 'k2' }); requestRun(j2);
++  ok(!acquireWrite(j2).immediate, 'one made under D:\\tmp\\Proj-X waits for the same slot');
++  const r = killSnippetJob('D:\\tmp\\Proj-X', j.id);
++  ok(r.ok, `stopped by the backslashed spelling (${JSON.stringify(r)})`);
++  ok(j2.mode === 'write' || (await Promise.race([j2._writeP?.then(() => true), sleep(300).then(() => false)])), 'and the other has the slot');
++  finishSnippetJob(j, { status: 'ok', content: '' }); finishSnippetJob(j2, { status: 'ok', content: '' });
++}
++
+=== change test/test-status-badge-parity.mjs
+base bdb66e2ccaea03289befc2b1
+new 76222fc641d3911f74cab3fa
+@@ 52 -1 +1
+-    await page.evaluate(() => renderGitProjects([{ path: 'D:/x/demo', name: 'demo', branch: 'flat-transport', uncommitted: 3 }]));
++    await page.evaluate(() => renderGitProjects([{ path: 'D:/x/demo', name: 'demo', branch: 'flat-transport', uncommitted: 3, unpushed: 3 }]));
+@@ 95 -0 +3
++    // (a branch with nothing to push counts its uncommitted files in a GRAY bubble of the same shape - the developer, 2026-11-13)
++    const gray = await page.evaluate(() => { renderGitProjects([{ path: 'D:/x/demo', name: 'demo', branch: 'flat-transport', uncommitted: 3, unpushed: 0 }]); const c = document.querySelector('#gitProjects .gp-badge .gp-count'); const r = c.getBoundingClientRect(); const out = { bg: getComputedStyle(c).backgroundColor, w: r.width, h: r.height, n: c.textContent }; renderGitProjects([{ path: 'D:/x/demo', name: 'demo', branch: 'flat-transport', uncommitted: 3, unpushed: 3 }]); return out; });
++    ok(gray.bg !== m.git.bg && gray.n === '3' && Math.abs(gray.h - m.git.h) < 0.5, `nothing to push: the uncommitted count in a gray bubble, the same size (${JSON.stringify(gray)})`);
+@@ 155 -1 +1
+-        renderGitProjects([{ path: 'D:/x/demo', name: 'demo', branch: 'flat-transport', uncommitted: n }, { path: 'D:/x/other', name: 'other', branch: 'main', uncommitted: 0 }]);
++        renderGitProjects([{ path: 'D:/x/demo', name: 'demo', branch: 'flat-transport', uncommitted: n, unpushed: n }, { path: 'D:/x/other', name: 'other', branch: 'main', uncommitted: 0 }]);
+@@ 163 -1 +1
+-    await page.evaluate(() => renderGitProjects([{ path: 'D:/x/demo', name: 'demo', branch: 'flat-transport', uncommitted: 3 }]));
++    await page.evaluate(() => renderGitProjects([{ path: 'D:/x/demo', name: 'demo', branch: 'flat-transport', uncommitted: 3, unpushed: 3 }]));
+=== change test/test-thought-cut-unit.mjs
+base e3c46c8e801605bf4659a71b
+new 777e5006929058975dc1da31
+@@ 117 -0 +13
++// AN ANSWER THAT IS A COUNT (live, 2026-11-13: "...So valve has 66 orders." + "66 orders." stayed whole - the reasoning
++// shown as the reply, "66 orders.66 orders." at its end)
++{
++  const cut = (th, ans) => splitLeadingThought(H + th + ans, { bounds: [0, H.length, H.length + th.length] });
++  const a = cut('From the earlier output, valve has 66. So valve has 66 orders.', '66 orders.');
++  ok(a && a.seam === 'chunk' && a.answer === '66 orders.', `a count after a sentence's end is an answer (${JSON.stringify(a && a.answer)})`);
++  const b = cut('Counted them all.', '1,204 files changed.');
++  ok(b && b.seam === 'chunk' && b.answer === '1,204 files changed.', `with a thousands comma (${JSON.stringify(b && b.answer)})`);
++  const c = cut('It is on version v1.', '5.2 now.');
++  ok(!c || c.seam !== 'chunk', `not a version cut in two: "v1." + "5.2" (${JSON.stringify(c && c.seam)})`);
++  const d = cut('The total was 66.', '5 more came later.');
++  ok(!d || d.seam !== 'chunk', `nor a stop after a number: "66." + "5 more" (${JSON.stringify(d && d.seam)})`);
++}
+=== change test/test-ui-behaviour-e2e.mjs
+base 657e7f3fe31df7c1697f3560
+new 8afb3434e4b015e77753c30d
+@@ 104 -1 +4
+-    const out = { folds: folds.length, text: folds[0]?.textContent || '', firstBefore: (folds[0]?.textContent || '').indexOf('FIRST') < (folds[0]?.textContent || '').indexOf('SECOND'), inStep: !!folds[0]?.classList.contains('in-step') };
++    // (its line as tall as the reply's first line, so "Thinking" sits level with the step's bullet - the developer, 2026-11-13)
++    const sum = folds[0]?.querySelector('summary'), body = folds[0]?.parentElement;
++    const lineH = sum && body ? { sum: Math.round(sum.getBoundingClientRect().height * 10) / 10, body: Math.round(parseFloat(getComputedStyle(body).lineHeight) * 10) / 10 } : null;
++    const out = { folds: folds.length, text: folds[0]?.textContent || '', firstBefore: (folds[0]?.textContent || '').indexOf('FIRST') < (folds[0]?.textContent || '').indexOf('SECOND'), inStep: !!folds[0]?.classList.contains('in-step'), lineH };
+@@ 109 -0 +1
++  ok(th.lineH && Math.abs(th.lineH.sum - th.lineH.body) <= 0.5, `"Thinking" first in a step: its line as tall as the reply's, level with the bullet (${JSON.stringify(th.lineH)})`);
+=== change test/test-worker-prompt.mjs
+base cd3088fc4eea3763b1d0fe5d
+new 828aa65e3ca155e845d6a3ea
+@@ 38 -0 +1
++ok(/A SENTENCE OF YOURS SAYS WHAT IT IS ABOUT/.test(P) && /never a bare word - "Reproduced.", "Done."/.test(P), 'a sentence names what it is about - never a bare "Reproduced." (the developer, 2026-11-13: "reproduced what?")');
+@@ 81 -1 +1
+-for (const v of ['list', 'read', 'search', 'find', 'info', 'write', 'edit', 'copy', 'move', 'mkdir', 'remove', 'unzip', 'clone', 'authorPlugins', 'deployPlugin', 'git', 'npm', 'node', 'bgStatus', 'bgLogs', 'spawnAgent', 'parallel', 'tmp', 'skillBrief', 'dsRows', 'dsBrief', 'tokenCheck']) {
++for (const v of ['list', 'read', 'search', 'find', 'info', 'write', 'edit', 'copy', 'move', 'mkdir', 'remove', 'unzip', 'clone', 'authorPlugins', 'deployPlugin', 'git', 'npm', 'node', 'bgStatus', 'bgLogs', 'spawnAgent', 'parallel', 'tmp', 'skillBrief', 'datasetRows', 'dsBrief', 'tokenCheck']) {
+@@ 90 -1 +1
+-    'dsPage', 'dsShowRows', 'dsWrite', 'dsDeleteRows', 'streamNext', 'streamAt', 'piiBatch', 'bgWaitFor', 'historyAsk', 'mainChat', 'deployToContainer', 'restartContainer', 'rollbackContainer']);
++    'datasetPage', 'datasetShowRows', 'datasetWrite', 'datasetDeleteRows', 'streamNext', 'streamAt', 'piiBatch', 'bgWaitFor', 'historyAsk', 'mainChat', 'deployToContainer', 'restartContainer', 'rollbackContainer']);
+@@ 93 -1 +1
+-  for (const w of ['parallel', 'dsRows', 'dsCount', 'dsUpdate', 'dsDelete', 'dsShow']) ok(listed.has(w), `and the sandbox's own ${w}`);
++  for (const w of ['parallel', 'datasetRows', 'datasetCount', 'datasetUpdate', 'datasetDelete', 'datasetShow']) ok(listed.has(w), `and the sandbox's own ${w}`);
 === end
