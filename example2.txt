@@ -1,782 +1,436 @@
 code_boss chunk 1
-number 32
-made 2026-11-14T15:30:37.070Z
-message 3 changes
+number 33
+made 2026-11-14T23:06:21.744Z
+message 2 changes
 message
-message - Panel tabs: a spinner where the agent is working in its browser; the chain line 1px with a gap at each dot
-message - The window's icon shows what code_boss is doing; the container's shortcut is "Code Boss"
-message - readJson(): a piece the masker breaks is masked again a part at a time, so what it hands over always parses
-before 6b0a339c2812bae4b7a4a634
-after 5fb2e7a2e018226368c92b2e
-files 16
+message - A snippet that runs long goes to the background instead of being killed; the dotted chain line 2px from each dot, a little lighter
+message - The setup and release windows are wizards: only the step to do now is open
+before 5fb2e7a2e018226368c92b2e
+after d8acc75b216006d4683b09ef
+files 10
 left 0
-check bf29088bd435a902
+check 8c9ad53b3d46a856
 
-=== change PANEL-TABS-SPEC.md
-base 93f8e181a509539ff1763acf
-new 862250c75c235aef6565b953
-@@ 24 -1 +1
--| `{ tab, label, url, show }` | put `url` in that tab - a NEW tab when `tab` is not open yet (with `label`). `show: true` brings the panel and that tab to the front. |
-+| `{ tab, label, url, show }` | put `url` in that tab - a NEW tab when `tab` is not open yet (with `label`). `show: true` brings that tab to the front INSIDE the browser; the right panel is switched to the browser (and opened) only when the browser OPENS - its first tab - and not after that (the developer, 2026-11-14: the busy spinner says the agent is using it). |
-@@ 29 -0 +1
-+| `{ tab, busy }` | the agent is doing something in the tab (`true`), or has stopped (`false`) - only a tab that is open; nothing is loaded or shown |
-@@ 35 -1 +1
--`session.panelTabs = [{ tab, label, url, title }]` (in the order they were opened) and `session.panelActiveTab` - in the
-+`session.panelTabs = [{ tab, label, url, title, busy? }]` (in the order they were opened; `busy` only while it is) and `session.panelActiveTab` - in the
-@@ 50 -0 +5
-+- A BUSY TAB (the developer, 2026-11-14: "when the agent is doing something in a browser, if the browser tab isn't
-+  selected, let's show a loading animation on or instead of the icon, if it is, then let's show loading on any tabs that
-+  have activity"): with the browser in view and its tab bar there, a spinner before each busy tab's title
-+  (`.rpb-tab.busy`, `data-cb-tab`); otherwise - another icon of the right panel selected, or one tab and so no bar - the
-+  spinner takes the browser icon's place (`#rpTabBrowser.busy`), or the « of a collapsed panel's (`#rightReopen.busy`).
-@@ 78 -0 +4
-+- A tab is BUSY while a plugin's connection sends it calls (and for 1.5 s after the last one) or while its page is
-+  loading (`Page.frameStartedLoading` to `frameStoppedLoading` of its own frame, seen by the watcher; a load that never
-+  says it stopped is over after 30 s). The broker tells the page when that changes: `{ tab, busy }`. The watcher's own
-+  calls (titles) and the broker's (attaching, framing) are not the agent's and do not count.
-=== change sandbox-launcher/src/main/java/cb/sandbox/PanelBroker.java
-base 09907a068939e7e6b7328a09
-new 957ca37896c97337a28a6c09
-@@ 86 -0 +2
-+  static final long BUSY_MS = 1500;    // a tab is busy for this long after a plugin's last call to it
-+  static final long LOAD_MS = 30000;   // a load that never says it stopped is over after this
-@@ 287 -0 +3
-+    volatile long workAt, loadAt;    // a plugin's last call to it (Broker.work); when its page started loading
-+    volatile boolean loading;        // its page is loading (the watcher saw it start)
-+    boolean toldBusy;                // what code_boss's page was last told of its activity (guarded by the tab)
-@@ 535 -0 +44
-+    /**
-+     * THE AGENT IS DOING SOMETHING IN A TAB (the developer, 2026-11-14: "when the agent is doing something in a browser,
-+     * if the browser tab isn't selected, let's show a loading animation on or instead of the icon, if it is, then let's
-+     * show loading on any tabs that have activity"): a plugin's call to it, and for BUSY_MS after the last one - or its
-+     * page loading. code_boss's page is told when that changes: { tab, busy } (off this thread: the POST blocks).
-+     */
-+    void work(Tab t) { t.workAt = System.currentTimeMillis(); busyNow(t); busyTick(); }
-+    void loadingIs(Tab t, boolean on) { if (on) t.loadAt = System.currentTimeMillis(); t.loading = on; busyNow(t); busyTick(); }
-+    void busyNow(final Tab t) {
-+      if (!isOpen(t)) return;
-+      long now = System.currentTimeMillis();
-+      if (t.loading && now - t.loadAt >= LOAD_MS) t.loading = false;
-+      boolean busy = t.loading || now - t.workAt < BUSY_MS;
-+      synchronized (t) { if (busy == t.toldBusy) return; t.toldBusy = busy; }
-+      // (what is said is what is true when it is sent: two of these may run in either order)
-+      try { ex.submit(new Runnable() { public void run() { Map<String, Object> body = Client.obj("tab", t.id); synchronized (t) { body.put("busy", Boolean.valueOf(t.toldBusy)); } tellPage(body); } }); }
-+      catch (java.util.concurrent.RejectedExecutionException e) { /* stopped */ }
-+    }
-+    private Thread busyTicker;   // while a tab is busy, every quarter second: is it still? (guarded by busyLock)
-+    private final Object busyLock = new Object();
-+    private void busyTick() {
-+      synchronized (busyLock) {
-+        if (busyTicker != null || stopped) return;
-+        Thread th = new Thread(new Runnable() { public void run() {
-+          try {
-+            for (;;) {
-+              Thread.sleep(250);
-+              if (stopped) break;
-+              for (Tab t : tabList()) busyNow(t);
-+              synchronized (busyLock) {   // (asked again under the lock: a tab made busy meanwhile keeps this going)
-+                boolean any = false;
-+                for (Tab t : tabList()) synchronized (t) { if (t.toldBusy) any = true; }
-+                if (!any) { busyTicker = null; return; }
-+              }
-+            }
-+          } catch (InterruptedException e) { /* stopped */ }
-+          synchronized (busyLock) { busyTicker = null; }
-+        } }, "cb-panel-broker-busy");
-+        th.setDaemon(true);
-+        busyTicker = th;
-+        th.start();
-+      }
-+    }
-+
-@@ 970 -0 +2
-+          // the tab's page loading (its own frame, not one inside it): the tab is busy until it stops
-+          if (("Page.frameStartedLoading".equals(method) || "Page.frameStoppedLoading".equals(method)) && ts.frameId != null && ts.frameId.equals(Json.string(p.get("frameId")))) br.loadingIs(ts.tab, "Page.frameStartedLoading".equals(method));
-@@ 1076 -0 +1
-+        br.work(ts.tab);
-@@ 1080 -1 +1
--      for (TabSession ts : sessions.values()) if (ts.children.contains(s)) { innerLevel(ts, id, method, p, s); return; }
-+      for (TabSession ts : sessions.values()) if (ts.children.contains(s)) { br.work(ts.tab); innerLevel(ts, id, method, p, s); return; }
-@@ 1083 -0 +1
-+      br.work(ts.tab);   // (the agent is doing something in this tab: the tab bar, or the panel's icon, says so)
 === change scripts/build-number.txt
-base ec59eeb28bb7d45d239b8c8c
-new 14f9b7e71b533c16275b8ba4
+base 14f9b7e71b533c16275b8ba4
+new 3840f7c45ddb32c37fa0e586
 @@ 1 -1 +1
--2888
-+2890
-=== change src/agent/panel-broker.mjs
-base 38b5521beadee9ba7f298ec0
-new 976f671e44835480540fbc26
-@@ 265 -0 +2
-+const BUSY_MS = 1500;    // a tab is busy for this long after a plugin's last call to it
-+const LOAD_MS = 30000;   // a load that never says it stopped is over after this
-@@ 277 -0 +4
-+    this.workAt = 0;         // a plugin's last call to it (Broker.work)
-+    this.loading = false;    // its page is loading (the watcher saw it start)
-+    this.toldBusy = false;   // what code_boss's page was last told of its activity
-+    this.timer = null;
-@@ 459 -0 +1
-+    if (t.timer) { clearTimeout(t.timer); t.timer = null; }
-@@ 474 -0 +19
-+  /**
-+   * THE AGENT IS DOING SOMETHING IN A TAB (the developer, 2026-11-14: "when the agent is doing something in a browser,
-+   * if the browser tab isn't selected, let's show a loading animation on or instead of the icon, if it is, then let's
-+   * show loading on any tabs that have activity"): a plugin's call to it, and for BUSY_MS after the last one - or its
-+   * page loading. code_boss's page is told when that changes: { tab, busy }.
-+   */
-+  work(t) { t.workAt = Date.now(); this.busyNow(t); }
-+  loadingIs(t, on) { t.loading = on; this.busyNow(t); }
-+  busyNow(t) {
-+    if (t.timer) { clearTimeout(t.timer); t.timer = null; }
-+    if (!this.tabs.has(t.id)) return;
-+    const left = BUSY_MS - (Date.now() - t.workAt);
-+    const busy = t.loading || left > 0;
-+    if (busy !== t.toldBusy) { t.toldBusy = busy; this.tellPage({ tab: t.id, busy }); }
-+    // (a load that never says it stopped - its frame went - is over after LOAD_MS)
-+    const wait = left > 0 ? left + 20 : t.loading ? LOAD_MS : 0;
-+    if (wait) { t.timer = setTimeout(() => { if (left <= 0) t.loading = false; this.busyNow(t); }, wait); if (t.timer.unref) t.timer.unref(); }
-+  }
-+
-@@ 809 -0 +2
-+    // the tab's page loading (its own frame, not one inside it): the tab is busy until it stops
-+    if ((method === 'Page.frameStartedLoading' || method === 'Page.frameStoppedLoading') && ts.frameId != null && pbStr(p.frameId) === ts.frameId) this.br.loadingIs(ts.tab, method === 'Page.frameStartedLoading');
-@@ 898 -0 +1
-+      this.br.work(ts.tab);
-@@ 902 -1 +1
--    for (const ts of this.sessions.values()) if (ts.children.has(s)) { this.innerLevel(ts, id, method, p, s); return; }
-+    for (const ts of this.sessions.values()) if (ts.children.has(s)) { this.br.work(ts.tab); this.innerLevel(ts, id, method, p, s); return; }
-@@ 905 -0 +1
-+    this.br.work(ts.tab);   // (the agent is doing something in this tab: the tab bar, or the panel's icon, says so)
-=== change src/agent/pii-return.mjs
-base 0c34bec9e8395bddd879bebb
-new 042bd2034469ea765926e934
-@@ 104 -0 +6
-+  // A PIECE THE MASKER BROKE (the developer's prod report, 2026-11-14: readJson() on the file a 77 KB parallel() result
-+  // was saved to failed with "masking turned part of this JSON into text that no longer parses" - code_boss's own file,
-+  // that it had just told the agent to read with readJson): masked again a smaller part at a time - each element, each
-+  // key with its value - down to one value; a value whose JSON text still breaks is masked as TEXT on its own (its key
-+  // as text too: a key can be personal data), and stays a string. What is handed over always parses, and nothing in it
-+  // went unmasked.
-@@ 107 -2 +30
--    try { return unwrap(parseJsonLoose(m), anc); }
--    catch { throw new Error('masking turned part of this JSON into text that no longer parses, so it is not handed over. open() the file and read it a part at a time instead.'); }
-+    try { return unwrap(parseJsonLoose(m), anc); } catch { /* broken by the masking: apart, below */ }
-+    return maskApart(v, anc);
-+  };
-+  const maskText = async (t) => { const m = String(await mask(String(t), null)); await letAppRun(); return m; };
-+  const maskApart = async (v, anc) => {
-+    if (v === null || typeof v === 'boolean') return v;
-+    if (typeof v === 'number') { const m = await maskText(v); return m === String(v) ? v : m; }
-+    if (typeof v === 'string') return maskText(v);
-+    if (Array.isArray(v)) {
-+      if (v.length === 1) return [await maskWhole(v[0], [...anc, { idx: true }])];
-+      const out = [];
-+      for (const el of v) out.push(...(await maskWhole([el], anc)));
-+      return out;
-+    }
-+    const ks = Object.keys(v);
-+    if (ks.length === 1) {
-+      const k = ks[0], val = v[k];
-+      if (val !== null && typeof val === 'object') return { [await maskText(k)]: await maskWhole(val, [...anc, { key: k }]) };
-+      // one key and a plain value, and their JSON text still breaks: each masked as text, the value beside its key
-+      // ("ssn: 123-45-6789" reads to the masker as the pair does) when the key comes back as it went in
-+      const pair = await maskText(k + ': ' + (typeof val === 'string' ? val : String(val)));
-+      const mk = await maskText(k);
-+      let mv = pair.startsWith(mk + ': ') ? pair.slice(mk.length + 2) : await maskText(val);
-+      if (typeof val === 'number' && mv === String(val)) mv = val;
-+      if (typeof val === 'boolean') mv = val;
-+      return { [mk]: mv };
-+    }
-+    const out = {};
-+    for (const k of ks) Object.assign(out, await maskWhole({ [k]: v[k] }, anc));
-+    return out;
-=== change src/agent/sandbox-cmd.mjs
-base 1ac8dee53454930ca1348a40
-new bc284e6c2cad7b1b3f00c9f4
-@@ 37 -1 +1
--import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, rmSync } from 'node:fs';
-+import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, rmSync, renameSync } from 'node:fs';
-@@ 44 -1 +1
--import { lcMakeShortcut } from '../launch-cmd.mjs';
-+import { lcMakeShortcut, lcLnkArguments, lcIsAppShortcut, LC_UNSAFE_SHORTCUT } from '../launch-cmd.mjs';
-@@ 253 -3 +5
-- * The three shortcuts, each this command with --tree and its own switches. "Code Boss" has a second name: the app's
-- * own launcher keeps a "Code Boss" shortcut of its own (code_boss outside the container) and makes it again every
-- * time it runs - that one is never written over or deleted, and the container's is then "Code Boss (container)".
-+ * The three shortcuts, each this command with --tree and its own switches. "Code Boss" is the CONTAINER'S (the
-+ * developer, 2026-11-14: "let's make the container the default shortcut and call the other one 'Code Boss (unsafe)'"):
-+ * the app's own launcher (code_boss outside the container) names its shortcut "Code Boss (unsafe)", and one it made
-+ * under the old name is renamed so when the container's is made. Only a "Code Boss" that is neither (someone else's)
-+ * is left alone, and the container's is then "Code Boss (container)".
-@@ 290 -16 +1
--export function sbcLnkArguments(b) {
--  try {
--    if (!b || b.length < 0x4c || b.readUInt32LE(0) !== 0x4c) return '';
--    const flags = b.readUInt32LE(0x14), wide = !!(flags & 0x80);
--    let at = 0x4c;
--    if (flags & 0x01) at += 2 + b.readUInt16LE(at);   // the item list
--    if (flags & 0x02) at += b.readUInt32LE(at);       // the link info
--    for (const bit of [0x04, 0x08, 0x10, 0x20]) {     // name, relative path, working folder, arguments
--      if (!(flags & bit)) { if (bit === 0x20) return ''; continue; }
--      const n = b.readUInt16LE(at), len = wide ? n * 2 : n;
--      if (bit === 0x20) return b.subarray(at + 2, at + 2 + len).toString(wide ? 'utf16le' : 'latin1');
--      at += 2 + len;
--    }
--  } catch { /* not a shell link */ }
--  return '';
--}
-+export function sbcLnkArguments(b) { return lcLnkArguments(b); }   // (the launcher reads its own the same way)
-@@ 348 -0 +8
-+  // the app's own launcher's "Code Boss" from before it was "Code Boss (unsafe)": renamed, so the name is the container's
-+  {
-+    const f = path.join(desktop, 'Code Boss.lnk'), to = path.join(desktop, LC_UNSAFE_SHORTCUT + '.lnk');
-+    if (existsSync(f) && lcIsAppShortcut(f)) {
-+      try { if (existsSync(to)) rmSync(f, { force: true }); else renameSync(f, to); log(`sandbox: the "Code Boss" that runs code_boss outside the container is "${LC_UNSAFE_SHORTCUT}" now`); }
-+      catch (e) { log(`sandbox: NOTE the old "Code Boss" (outside the container) could not be renamed: ${e.message}`); }
-+    }
-+  }
-@@ 349 -1 +1
--    // a name taken by something that is not a container shortcut (the app's own "Code Boss") is left alone
-+    // a name taken by something that is not a container shortcut (someone else's "Code Boss") is left alone
-@@ 361 -1 +1
--/** --uninstall: this folder's shortcuts go (another folder's, and the app's own "Code Boss", stay); and the icons, once no shortcut is left to show them. */
-+/** --uninstall: this folder's shortcuts go (another folder's, and the app's own "Code Boss (unsafe)", stay); and the icons, once no shortcut is left to show them. */
-=== change src/deploy-cmd.mjs
-base a7d76508698b3343c9c9f9e8
-new 08724bfbfa24563448f0a36d
-@@ 323 -1 +3
--    // (Re)point the "Code Boss" + "Stop Code Boss" desktop shortcuts at node.exe running `app\code-boss.mjs launch`,
-+    // (Re)point the "Code Boss (unsafe)" + "Stop Code Boss" desktop shortcuts at node.exe running `app\code-boss.mjs launch`,
-+    // ("Code Boss" is the container's - the developer, 2026-11-14; this one's old "Code Boss", node running this same
-+    // code-boss.mjs and nothing else, goes)
-@@ 338 -1 +2
--        `$s=$ws.CreateShortcut((Join-Path $d 'Code Boss.lnk')); ` +
-+        `$o=(Join-Path $d 'Code Boss.lnk'); if (Test-Path -LiteralPath $o) { $x=$ws.CreateShortcut($o); if ($x.Arguments -eq ${q('"' + appMjs + '"')}) { Remove-Item -LiteralPath $o -Force } }; ` +
-+        `$s=$ws.CreateShortcut((Join-Path $d 'Code Boss (unsafe).lnk')); $s.Description='Code Boss outside the container: not sandboxed'; ` +
-=== change src/launch-cmd.mjs
-base 3a7b36b20bf05bd5eacaf21b
-new 126522e6685d3fa96564f3b1
-@@ 475 -0 +33
-+// THE NAMES ON THE DESKTOP (the developer, 2026-11-14: "let's make the container the default shortcut and call the
-+// other one 'Code Boss (unsafe)'"): "Code Boss" is the container's (sandbox-cmd.mjs); this launcher's is
-+// "Code Boss (unsafe)" - code_boss with nothing between it and the machine. Its old "Code Boss" goes (only one that IS
-+// this launcher's: node running an installed code-boss.mjs and nothing else - never the container's).
-+export const LC_UNSAFE_SHORTCUT = LC_APP_NAME + ' (unsafe)';
-+/**
-+ * A .lnk file's arguments, read from the file itself ([MS-SHLLINK]): after the 76-byte header come the item list and
-+ * the link info when its flags say they are there, then the strings in a fixed order - name, relative path, working
-+ * folder, ARGUMENTS, icon - each a 16-bit count and that many characters (UTF-16 when the "unicode" flag is set).
-+ * '' when it is not there or the file is not a shell link.
-+ */
-+export function lcLnkArguments(b) {
-+  try {
-+    if (!b || b.length < 0x4c || b.readUInt32LE(0) !== 0x4c) return '';
-+    const flags = b.readUInt32LE(0x14), wide = !!(flags & 0x80);
-+    let at = 0x4c;
-+    if (flags & 0x01) at += 2 + b.readUInt16LE(at);   // the item list
-+    if (flags & 0x02) at += b.readUInt32LE(at);       // the link info
-+    for (const bit of [0x04, 0x08, 0x10, 0x20]) {     // name, relative path, working folder, arguments
-+      if (!(flags & bit)) { if (bit === 0x20) return ''; continue; }
-+      const n = b.readUInt16LE(at), len = wide ? n * 2 : n;
-+      if (bit === 0x20) return b.subarray(at + 2, at + 2 + len).toString(wide ? 'utf16le' : 'latin1');
-+      at += 2 + len;
-+    }
-+  } catch { /* not a shell link */ }
-+  return '';
-+}
-+/** The shortcut is this launcher's own "Code Boss": node running an installed code-boss.mjs, with nothing after it. */
-+export function lcIsAppShortcut(lnk) {
-+  let b;
-+  try { b = readFileSync(lnk); } catch { return false; }
-+  return /^"[^"]*[\\/]code-boss\.mjs"$/i.test(lcLnkArguments(b).trim());
-+}
-@@ 480 -1 +3
--  lcMakeShortcut(path.join(desktop, LC_APP_NAME + '.lnk'), process.execPath, `"${appMjs}"`, ctx.base, existsSync(ico) ? ico : '', LC_APP_NAME);
-+  const old = path.join(desktop, LC_APP_NAME + '.lnk');
-+  if (existsSync(old) && lcIsAppShortcut(old)) { try { unlinkSync(old); } catch { /* left: it still starts this */ } }
-+  lcMakeShortcut(path.join(desktop, LC_UNSAFE_SHORTCUT + '.lnk'), process.execPath, `"${appMjs}"`, ctx.base, existsSync(ico) ? ico : '', LC_APP_NAME + ' outside the container: not sandboxed (the container\'s is "' + LC_APP_NAME + '")');
-@@ 526 -1 +1
--  lines.push('shortcut   = node.exe "' + appMjs + '"  (Desktop\\' + LC_APP_NAME + '.lnk); Stop -> ... --kill');
-+  lines.push('shortcut   = node.exe "' + appMjs + '"  (Desktop\\' + LC_UNSAFE_SHORTCUT + '.lnk); Stop -> ... --kill');
-=== change src/server.mjs
-base 5caa9f037f3c6afb87cb2ea0
-new 6b7be5adf9df584c1ba64ed9
-@@ 6139 -1 +2
--    // (the address is checked BEFORE a tab is made for it: a refused body adds no tab)
-+    // THE AGENT IS DOING SOMETHING IN A TAB, or has stopped ({ tab, busy }): the tab bar, or the panel's icon, shows it.
-+    // Only a tab that is open; nothing is loaded or shown.
-@@ 6141 -0 +9
-+    if (typeof body.busy === 'boolean' && !hasUrl && body.title == null && body.label == null && body.show == null) {
-+      const bt = tabs.find((x) => x.tab === key);
-+      if (bt && !!bt.busy !== body.busy) {
-+        if (body.busy) bt.busy = true; else delete bt.busy;
-+        broadcast({ type: 'panel-browser', version: bumpVersion(), tab: key, busy: body.busy, tabs, active: session.panelActiveTab, url: session.panelBrowserUrl, show: false, at: false });
-+      }
-+      return { ok: true, tab: key, url: bt ? bt.url : '' };
-+    }
-+    // (the address is checked BEFORE a tab is made for it: a refused body adds no tab)
-=== change src/ui.html
-base f561b241e5f91866c8d000cf
-new f46ad3ad0facf5199c5b0436
-@@ 520 -0 +8
-+  /* THE RUNNING COUNT FLOATS ON ▶ (the developer, 2026-11-14: "let's use a number bubble that floats on top like we use
-+     elsewhere w/ an orange bubble"): the status bar's bubble (.ps-badge), on the icon's upper right */
-+  .rp-tab { position: relative; }
-+  #rpTabRunning .rp-count { position: absolute; min-width: 12px; height: 12px; top: calc(50% - 12px); left: calc(50% + 2px); padding: 0 2px; box-sizing: border-box; border-radius: 6px;
-+    font-size: 8.5px; font-weight: 900; line-height: 10px; text-align: center; z-index: 3; pointer-events: none;
-+    background: var(--accent); border: 0.5px solid rgba(24, 22, 21, 0.5); color: var(--bg); -webkit-text-fill-color: var(--bg);
-+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent-hover) 60%, var(--accent)); }
-+  #rpTabRunning .rp-count:empty { display: none; }
-@@ 569 -0 +10
-+  /* THE AGENT IS DOING SOMETHING IN A TAB (the developer, 2026-11-14): a plugin's calls to it, or its page loading -
-+     a spinner before the tab's title; with the browser not in view (another icon selected, the panel collapsed, or one
-+     tab and so no bar), the spinner takes the browser icon's place, or the panel's « (renderPanelBusy) */
-+  .rpb-spin, .rpb-tab.busy::before { display: inline-block; box-sizing: border-box; border: 1.5px solid var(--accent-text); border-top-color: transparent; border-radius: 50%; animation: cb-spin 0.8s linear infinite; }
-+  .rpb-tab.busy::before { content: ''; width: 9px; height: 9px; margin-right: 6px; vertical-align: -1px; }
-+  .rp-tab .rpb-spin { display: none; width: 12px; height: 12px; }
-+  .rp-tab.busy .rpb-spin { display: inline-block; }
-+  .rp-tab.busy .rp-ico { display: none; }
-+  #rightReopen.busy { font-size: 0; }
-+  #rightReopen.busy::before { content: ''; position: absolute; left: 4px; top: 7px; width: 10px; height: 10px; box-sizing: border-box; border: 1.5px solid var(--accent-text); border-top-color: transparent; border-radius: 50%; animation: cb-spin 0.8s linear infinite; }
-@@ 1370 -1 +5
--  .js-group.js-chain::before { content: ''; position: absolute; left: calc(var(--gutter) / 2 - 1px); top: var(--chain-top, 0); height: var(--chain-h, 0); width: 2px; background: repeating-linear-gradient(to bottom, color-mix(in srgb, var(--muted) 42%, transparent) 0 2px, transparent 2px 6px); pointer-events: none; }
-+  /* (and it stops a little short of each dot - the developer, 2026-11-14: the dots it ran into looked thinner than the
-+     others: the dashes touching a dot's top and bottom read as one stroke with it. jsChainLayout cuts a gap of 3px
-+     round each dot with --chain-mask) */
-+  .js-group.js-chain { --chain-w: 1px; }   /* 1px (the developer, 2026-11-14: "Maybe try a 1px?"); 2px is exactly centred at 100% */
-+  .js-group.js-chain::before { content: ''; position: absolute; left: calc(var(--gutter) / 2 - var(--chain-w) / 2); top: var(--chain-top, 0); height: var(--chain-h, 0); width: var(--chain-w); background: repeating-linear-gradient(to bottom, color-mix(in srgb, var(--muted) 42%, transparent) 0 2px, transparent 2px 6px); -webkit-mask-image: var(--chain-mask, none); mask-image: var(--chain-mask, none); pointer-events: none; }
-@@ 4040 -1 +1
--      <button class="rp-tab" id="rpTabBrowser" onclick="rpSelect('browser')" title="The agent's browser" style="display:none;"><svg class="rp-ico" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M1.5 5.5h13"/><circle cx="3.6" cy="4" r="0.55" fill="currentColor" stroke="none"/><circle cx="5.4" cy="4" r="0.55" fill="currentColor" stroke="none"/></svg></button>
-+      <button class="rp-tab" id="rpTabBrowser" onclick="rpSelect('browser')" title="The agent's browser" style="display:none;"><svg class="rp-ico" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M1.5 5.5h13"/><circle cx="3.6" cy="4" r="0.55" fill="currentColor" stroke="none"/><circle cx="5.4" cy="4" r="0.55" fill="currentColor" stroke="none"/></svg><span class="rpb-spin" aria-hidden="true"></span></button>
-@@ 8283 -0 +14
-+    renderPanelBusy();
-+  }
-+  // WHERE THE AGENT'S ACTIVITY IN THE BROWSER SHOWS (the developer, 2026-11-14: "if the browser tab isn't selected, let's
-+  // show a loading animation on or instead of the icon, if it is, then let's show loading on any tabs that have
-+  // activity"): the browser in view with its tab bar - on the busy tabs (renderPanelTabs); else on the browser icon, or
-+  // on the panel's « when the panel is collapsed
-+  function renderPanelBusy() {
-+    const ts = panelTabsOf(), any = ts.some((t) => t.busy);
-+    const ico = document.getElementById('rpTabBrowser');
-+    const p = document.getElementById('rightPanel'), collapsed = !!(p && p.classList.contains('collapsed'));
-+    const inView = !!(ico && ico.classList.contains('active')) && !collapsed && ts.length >= 2;
-+    if (ico) { const on = any && !inView && panelBrowserShown(); ico.classList.toggle('busy', on); ico.title = on ? "The agent's browser - the agent is using it" : "The agent's browser"; }
-+    const re = document.getElementById('rightReopen');
-+    if (re) re.classList.toggle('busy', any && collapsed && panelBrowserShown());
-@@ 8317 -0 +1
-+    renderPanelBusy();
-@@ 8342 -1 +1
--    const key = JSON.stringify(ts.map((t) => [t.tab, t.title || '', t.label || '', t.url || '', !!(act && act.tab === t.tab)]));
-+    const key = JSON.stringify(ts.map((t) => [t.tab, t.title || '', t.label || '', t.url || '', !!(act && act.tab === t.tab), !!t.busy]));
-@@ 8350 -1 +1
--      b.type = 'button'; b.className = 'rpb-tab' + (act && act.tab === t.tab ? ' active' : ''); b.setAttribute('role', 'tab');
-+      b.type = 'button'; b.className = 'rpb-tab' + (act && act.tab === t.tab ? ' active' : '') + (t.busy ? ' busy' : ''); b.setAttribute('role', 'tab'); b.dataset.cbTab = t.tab;
-@@ 8410 -0 +1
-+    const hadTabs = panelTabsOf().length > 0;
-@@ 8419 -1 +6
--    if (show && (url || tab) && panelBrowserShown()) { setRightPanelCollapsed(false); rpSelect('browser'); }
-+    // THE AGENT'S PAGE IS BROUGHT INTO VIEW ONCE: when the browser OPENS (no tab before this one), the panel shows it;
-+    // after that it is not (the developer, 2026-11-14: "when the agent does something in the iframe browser, it shows
-+    // it, even if I'm trying to look at the background processes. let's not do this, we have the loading animation now"
-+    // - then "if the agent first opens the browser, let's focus it, but then not after that"). Its tab still comes to
-+    // the front inside the browser, and the spinner says it is busy.
-+    if (show && !hadTabs && panelTabsOf().length > 0 && panelBrowserShown()) { setRightPanelCollapsed(false); rpSelect('browser'); }
-@@ 8440 -0 +1
-+    try { renderPanelBusy(); } catch {}
-@@ 9899 -2 +3
--    const a = mid(nodes[0]), b = mid(nodes[nodes.length - 1]);
--    const t = Math.round(a) + 'px', h = Math.max(0, Math.round(b - a)) + 'px';
-+    const mids = nodes.map(mid), a = mids[0], b = mids[mids.length - 1];
-+    const t0 = Math.round(a), H = Math.max(0, Math.round(b - a));
-+    const t = t0 + 'px', h = H + 'px';
-@@ 9903 -0 +14
-+    // a gap round each dot: the ● is about 0.6em across, and the line stops 3px short of it, above and below
-+    const d0 = nodes[0].querySelector(':scope > .dot');
-+    const r = (d0 ? parseFloat(getComputedStyle(d0).fontSize) || 13.5 : 13.5) * 0.3 + 3;
-+    const parts = []; let at = 0;
-+    for (const m of mids) {
-+      const y = m - t0, from = Math.max(0, Math.round(y - r)), to = Math.min(H, Math.round(y + r));
-+      if (to <= from) continue;
-+      if (from > at) parts.push('#000 ' + at + 'px ' + from + 'px');
-+      parts.push('transparent ' + Math.max(at, from) + 'px ' + to + 'px');
-+      at = Math.max(at, to);
-+    }
-+    if (at < H) parts.push('#000 ' + at + 'px ' + H + 'px');
-+    const mask = 'linear-gradient(to bottom, ' + (parts.length ? parts.join(', ') : '#000 0 0') + ')';
-+    if (el.style.getPropertyValue('--chain-mask') !== mask) el.style.setProperty('--chain-mask', mask);
-@@ 13759 -0 +48
-+  // THE WINDOW'S ICON SAYS WHAT CODE_BOSS IS DOING (the developer, 2026-11-14: "when code boss is working we can animate
-+  // or change the icon that docked on the bottom of the screen so you can tell the status w/o going to the window";
-+  // then "use the favicon to show status"). The taskbar button of code_boss's window IS its favicon (measured
-+  // 2026-11-14, Chrome 157: it follows within ~2 s, minimized too; a pinned window shows Chrome's instead). STILL icons,
-+  // one per state: an animated one is throttled to 1 frame a second when the window is minimized, so it would stall.
-+  //   working   - the star with a green dot: a run is going
-+  //   needs you - a red dot: a question or an approval is waiting
-+  //   done      - a blue dot: a run ended while the window was not in front; gone once it is looked at
-+  //   idle      - the star as it is
-+  // (the top window only: a side chat's page is inside the main one)
-+  const FAV_DOTS = { working: '--ok', ask: '--error', done: '#4c9aff' };
-+  let _favBase = null, _favState = '', _favDone = false, _favImg = null;
-+  const favLooking = () => !document.hidden && document.hasFocus();
-+  function favStateNow() {
-+    if (_pendingApprovalId) return 'ask';
-+    if (session && session.status === 'running') return 'working';
-+    return _favDone ? 'done' : 'idle';
-+  }
-+  function favRender() {
-+    if (window.top !== window) return;
-+    const st = favStateNow();
-+    if (st === _favState) return;
-+    const link = document.querySelector('link[rel="icon"]'); if (!link) return;
-+    if (_favBase == null) _favBase = link.href;
-+    _favState = st;
-+    document.documentElement.dataset.cbStatus = st;   // (what the icon says, for a test to read)
-+    if (st === 'idle') { link.href = _favBase; return; }
-+    const draw = () => {
-+      if (_favState !== st) return;
-+      const c = document.createElement('canvas'); c.width = c.height = 64;
-+      const x = c.getContext('2d');
-+      x.drawImage(_favImg, 0, 0, 64, 64);
-+      const v = FAV_DOTS[st], col = v.startsWith('--') ? (getComputedStyle(document.documentElement).getPropertyValue(v).trim() || '#5fb760') : v;
-+      // a dot on the lower right, parted from the star by a ring of the dark the app is drawn on
-+      x.beginPath(); x.arc(47, 47, 17, 0, Math.PI * 2); x.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--bg').trim() || '#0f0d0c'; x.fill();
-+      x.beginPath(); x.arc(47, 47, 13, 0, Math.PI * 2); x.fillStyle = col; x.fill();
-+      // (a new link each time: Chrome notices a replaced link at once)
-+      const l = document.createElement('link'); l.rel = 'icon'; l.type = 'image/png'; l.href = c.toDataURL('image/png');
-+      const now = document.querySelector('link[rel="icon"]'); if (now) now.replaceWith(l); else document.head.appendChild(l);
-+    };
-+    if (_favImg && _favImg.complete) draw();
-+    else { _favImg = new Image(); _favImg.onload = draw; _favImg.src = _favBase; }
-+  }
-+  function favRunEnded() { if (!favLooking()) _favDone = true; favRender(); }
-+  const favLooked = () => { if (_favDone && favLooking()) { _favDone = false; favRender(); } };
-+  window.addEventListener('focus', favLooked);
-+  document.addEventListener('visibilitychange', favLooked);
-+
-@@ 13763 -0 +1
-+    try { favRender(); } catch {}
-@@ 13893 -0 +1
-+    try { favRender(); } catch {}
-@@ 14113 -0 +1
-+    try { favRender(); } catch {}   // (the window's icon: the state just read)
-@@ 14372 -1 +1
--        session.status = msg.status;
-+        { const wasRunning = session.status === 'running'; session.status = msg.status; try { if (wasRunning && msg.status !== 'running') favRunEnded(); else favRender(); } catch {} }
-=== change test/test-panel-broker-e2e.mjs
-base 05e284a7f97bfb066bae35b0
-new 2d425dc9d45c88e51bfc4dea
-@@ 172 -2 +3
--  const seen = await win.evaluate((tab) => { const v = document.getElementById('rpBrowser'), f = document.querySelector('iframe[data-cb-tab="' + tab + '"]'); return { view: !v.classList.contains('hidden') && v.offsetWidth > 0, src: f.src, w: f.offsetWidth, k: f.style.transform, on: !!session.panelBrowser }; }, T);
--  ok(seen.view && /^http:\/\/localhost:\d+\/start$/.test(seen.src) && seen.w >= 1280, `the developer sees it: the panel's browser view is open on the app (${JSON.stringify(seen)})`);
-+  // (the developer opens the browser view: the agent's second tab does not take the panel - only its first does, 2026-11-14)
-+  const seen = await win.evaluate((tab) => { rpSelect('browser'); const v = document.getElementById('rpBrowser'), f = document.querySelector('iframe[data-cb-tab="' + tab + '"]'); return { view: !v.classList.contains('hidden') && v.offsetWidth > 0, src: f.src, w: f.offsetWidth, k: f.style.transform, on: !!session.panelBrowser }; }, T);
-+  ok(seen.view && /^http:\/\/localhost:\d+\/start$/.test(seen.src) && seen.w >= 1280, `the developer opens the browser and sees it: the panel's browser view is on the app (${JSON.stringify(seen)})`);
-=== change test/test-panel-tabs-e2e.mjs
-base 915a8cafa485eaa0d343be01
-new 11d5e921d86de6190f2d8240
-@@ 108 -1 +1
--const app = http.createServer((req, res) => {
-+const app = http.createServer(async (req, res) => {
-@@ 110 -0 +1
-+  if (name.startsWith('slow')) await sleep(4000);   // (a page that takes a while: the tab is busy while it loads)
-@@ 255 -0 +44
-+  console.log('\n[5b] the agent doing something in a tab: the tab bar, or the browser icon, shows it');
-+  // (the developer, 2026-11-14: "if the browser tab isn't selected, let's show a loading animation on or instead of
-+  // the icon, if it is, then let's show loading on any tabs that have activity")
-+  const busyOf = async (id) => !!(await state()).tabs.find((t) => t.tab === id)?.busy;
-+  ok(!(await busyOf(a.id)) && !(await busyOf(b.id)), 'no plugin calls for a while: no tab is busy');
-+  const look = () => win.evaluate((ids) => ({
-+    ico: document.getElementById('rpTabBrowser').classList.contains('busy'),
-+    icoSpin: getComputedStyle(document.querySelector('#rpTabBrowser .rpb-spin')).display !== 'none' && getComputedStyle(document.querySelector('#rpTabBrowser .rp-ico')).display === 'none',
-+    tabs: ids.map((id) => !!document.querySelector('#rpBrowserTabs .rpb-tab.busy[data-cb-tab="' + id + '"]')),
-+  }), [a.id, b.id]);
-+  await win.evaluate(() => { setRightPanelCollapsed(false); rpSelect('browser'); });   // (the developer is looking at the browser)
-+  let calls = true;
-+  const working = (async () => { while (calls) { await ev(c, SA, '1+1'); await sleep(200); } })();
-+  const aBusy = await until(async () => ((await busyOf(a.id)) ? true : null), 3000);
-+  const seen = await until(async () => { const l = await look(); return l.tabs[0] ? l : null; }, 3000);
-+  ok(aBusy === true && !(await busyOf(b.id)) && seen && seen.tabs[0] === true && seen.tabs[1] === false && !seen.ico,
-+    `a plugin's calls to app-a: app-a is busy, app-b is not; the browser in view, the spinner is on app-a's tab, not the icon (${JSON.stringify(seen)})`);
-+  await win.evaluate(() => rpSelect('running'));
-+  const icoBusy = await until(async () => { const l = await look(); return l.ico && l.icoSpin ? l : null; }, 2000);
-+  ok(!!icoBusy, `another icon selected: the browser icon is the spinner (${JSON.stringify(icoBusy || await look())})`);
-+  await win.evaluate(() => setRightPanelCollapsed(true));
-+  const reBusy = await until(async () => (await win.evaluate(() => document.getElementById('rightReopen').classList.contains('busy'))) || null, 2000);
-+  ok(reBusy === true, 'the panel collapsed: its \u00ab is the spinner');
-+  await win.evaluate(() => { setRightPanelCollapsed(false); rpSelect('browser'); });
-+  calls = false; await working;
-+  const stoppedAt = Date.now();
-+  const idle = await until(async () => ((await busyOf(a.id)) ? null : true), 5000);
-+  const idleMs = Date.now() - stoppedAt;
-+  await sleep(300);
-+  const after = await look();
-+  const reAfter = await win.evaluate(() => document.getElementById('rightReopen').classList.contains('busy'));
-+  ok(idle === true && idleMs >= 900 && idleMs < 4000 && !after.ico && !after.tabs[0] && !reAfter, `the calls stop: app-a is not busy about 1.5 s later (${idleMs} ms), and no spinner is left`);
-+  // its page loading (a page that takes 4 s): busy while it loads, long after the call that started it (not awaited:
-+  // Page.navigate answers when the page has, as in any Chrome)
-+  const nav = c.send('Page.navigate', { url: A('/slow-b') }, SB);
-+  await sleep(2400);
-+  const stillBusy = await busyOf(b.id);
-+  const loaded = await until(async () => ((await busyOf(b.id)) ? null : true), 6000);
-+  await nav;
-+  const where = await ev(c, SB, 'location.pathname');
-+  ok(stillBusy === true && loaded === true && where === '/slow-b', `a page that takes 4 s to load: app-b is busy 2.4 s after the call that started it (${stillBusy}), and not once it has loaded (${loaded}, ${where})`);
-+  await c.send('Page.navigate', { url: A('/b') }, SB);
-+  await until(async () => ((await ev(c, SB, 'location.pathname')) === '/b' && !(await busyOf(b.id))) || null, 6000);
-+
-=== change test/test-panel-tabs-unit.mjs
-base 76f6cb51399b88d7f9fde91d
-new ad5f63b4792694f8062b7b5f
-@@ 10 -1 +2
-- *   [6] the server: tabs added, titled, closed; the active one; an old broker's body; refusals; 60 tabs, 200 titles
-+ *   [6] the server: tabs added, titled, closed; the active one; an old broker's body; refusals; 60 tabs, 200 titles;
-+ *       a tab marked busy and not (nothing else changes; an unknown tab is not made)
-@@ 160 -0 +16
-+  // a tab the agent is doing something in ({ tab, busy }): marked, nothing else changes; an unknown tab is not made
-+  const before = await get();
-+  const rb = await post({ tab: 'L', busy: true });
-+  s = await get();
-+  const L = s.tabs.find((t) => t.tab === 'L');
-+  ok(rb.ok === true && L.busy === true && s.tabs.length === before.tabs.length && s.active === before.active && s.url === before.url && L.title === 'x'.repeat(300), `{ tab, busy: true }: that tab is busy, and nothing else changed (${s.tabs.length} tabs, active ${s.active})`);
-+  await post({ tab: 'NOPE', busy: true });
-+  s = await get();
-+  ok(!s.tabs.some((t) => t.tab === 'NOPE') && s.tabs.length === before.tabs.length, 'busy for a tab that is not open adds no tab');
-+  await post({ tab: 'L', busy: false });
-+  s = await get();
-+  ok(!('busy' in s.tabs.find((t) => t.tab === 'L')), '{ tab, busy: false }: not busy (the field goes)');
-+  const flips = []; for (let i = 0; i < 100; i++) flips.push(post({ tab: 'T' + String(i % 60).padStart(31, '0'), busy: i % 2 === 0 }));
-+  await Promise.all(flips);
-+  s = await get();
-+  ok(s.tabs.length === before.tabs.length && s.tabs.filter((t) => t.busy).length > 0, `100 busy changes at once: no tab made or lost (${s.tabs.filter((t) => t.busy).length} busy)`);
-=== add test/test-readjson-mask-fallback.mjs
-new cce1cca8b65ac370e7fe31a3
-+/**
-+ * readJson() ALWAYS HANDS OVER DATA THAT PARSES (the developer's prod report, 2026-11-14: readJson() on the file a 77 KB
-+ * parallel() result was saved to - code_boss's own .code_boss/tmp/result-call_*.txt, read as it told the agent to -
-+ * failed with "masking turned part of this JSON into text that no longer parses"). A piece whose JSON text the masker
-+ * breaks is masked again a part at a time, down to one value, masked as text on its own.
-+ *   [1] a masker that breaks the JSON text round one value: the result parses, every item is there, what is personal
-+ *       is masked - in the broken piece too (its values, its keys) - and numbers and booleans stay what they were
-+ *   [2] the break deep inside nested arrays and objects; at the top of the file; a top-level string
-+ *   [3] the real filter (piishape) on a result shaped like a parallel() of test runs, 400 KB: parses, nothing thrown
-+ * Run: node test/test-readjson-mask-fallback.mjs
-+ */
-+const { maskReturn } = await import('../src/agent/pii-return.mjs');
-+let pass = 0, fail = 0;
-+const ok = (c, l) => { if (c) { pass++; console.log('  ok', l); } else { fail++; console.log('  FAIL', l); } };
-+const P = '.code_boss/tmp/result-call_4f76e152014d42f9.txt';
-+const info = { fn: 'readJson', kind: 'read', path: P };
-+const read = async (value, mask) => { const out = await maskReturn('readJson', { __cb_json: true, path: P, text: JSON.stringify(value) }, info, mask); return JSON.parse(out.text); };
-+// a stand-in masker: SECRET is personal (a token in its place); "BREAKME" takes the closing quote after it with it,
-+// as a masker that reads a value across its quotes would - the JSON text no longer parses
-+let calls = 0;
-+const breaker = async (text) => { calls++; return String(text).replace(/SECRET/g, '#XXXXXX#a1b2c3d').replace(/BREAKME"/g, 'BREAKME'); };
-+
-+try {
-+  console.log('\n[1] a piece the masker breaks');
-+  const items = Array.from({ length: 400 }, (_, i) => ({ i, ok: i % 2 === 0, name: 'case ' + i + (i % 7 === 0 ? ' SECRET' : ''), out: 'x'.repeat(150) + (i === 123 ? ' BREAKME' : '') }));
-+  items[123].SECRETkey = 'by SECRET';
-+  const back = await read(items, breaker);
-+  const s = JSON.stringify(back);
-+  ok(Array.isArray(back) && back.length === 400 && back.every((x, i) => x.i === i), `it parses, and every item is there, in order (${back.length})`);
-+  ok(!s.includes('SECRET') && back[7].name === 'case 7 #XXXXXX#a1b2c3d', 'what is personal is masked everywhere, as before');
-+  const b = back[123];
-+  ok(b.i === 123 && b.ok === false && /BREAKME$/.test(b.out) && b['#XXXXXX#a1b2c3dkey'] === 'by #XXXXXX#a1b2c3d', `in the broken piece too: the value, the key - and the number and the boolean are still a number and a boolean (${JSON.stringify(b).slice(0, 120)}...)`);
-+  ok(back[124].out === 'x'.repeat(150) && back[122].name === 'case 122', 'the items beside it are as they were');
-+
-+  console.log('\n[2] deep, at the top, a string alone');
-+  const deep = { run: { cases: [[{ who: 'SECRET', log: ['fine', 'then BREAKME', 3] }], [{ who: 'ok' }]], total: 2 }, done: true };
-+  const d = await read(deep, breaker);
-+  ok(d.run.total === 2 && d.done === true && d.run.cases[0][0].who === '#XXXXXX#a1b2c3d' && d.run.cases[0][0].log[1] === 'then BREAKME' && d.run.cases[0][0].log[2] === 3 && d.run.cases[1][0].who === 'ok', `deep inside arrays and objects: parsed, masked, its numbers numbers (${JSON.stringify(d)})`);
-+  const top = await read({ only: 'BREAKME SECRET' }, breaker);
-+  ok(top.only === 'BREAKME #XXXXXX#a1b2c3d', `one key at the top of the file (${JSON.stringify(top)})`);
-+  const str = await read('a SECRET line BREAKME', breaker);
-+  ok(str === 'a #XXXXXX#a1b2c3d line BREAKME', `a file that is one string (${JSON.stringify(str)})`);
-+  const n = await read({ amount: 1234567, flag: false, none: null, BREAKME: 'x' }, breaker);
-+  ok(n.amount === 1234567 && n.flag === false && n.none === null && n.BREAKME === 'x', `numbers, booleans and null beside a broken key stay what they were (${JSON.stringify(n)})`);
-+  // a masker that never breaks: nothing is masked twice, and it is not asked more than the pieces need
-+  calls = 0;
-+  const plain = await read(items.map((x) => ({ ...x, out: 'x'.repeat(150) })), async (t) => { calls++; return String(t).replace(/SECRET/g, '#XXXXXX#a1b2c3d'); });
-+  ok(plain.length === 400 && calls <= 4, `with nothing broken it is masked in its usual pieces (${calls} calls for ${(JSON.stringify(items).length / 1024).toFixed(0)} KB)`);
-+
-+  console.log('\n[3] the real filter on a parallel() of test runs');
-+  const { createFilterPipeline } = await import('../src/plugins/filters.mjs');
-+  const piishape = (await import('../examples/plugins/piishape__1.mjs')).default;
-+  const pipe = createFilterPipeline(() => piishape.filters.map((f) => ({ ...f, plugin: 'piishape' })));
-+  const real = (text, filePath) => pipe.mask(text, { hook: 'tool-result', toolName: 'readJson', projectDir: process.cwd(), filePath });
-+  const names = ['John Smith', "Mary O'Brien", 'Carlos Diaz', 'Wei Zhang', 'Priya Patel'];
-+  const lines = (i) => [
-+    '\u001b[1;31m[ERROR]\u001b[m Tests run: ' + i + ', \u001b[1;32mBUILD\u001b[0;39m \u0007',
-+    `C:\\Users\\phili\\work\\portlet-enrollment\\target\\surefire-reports\\TEST-${i}.xml`,
-+    `expected:<"${names[i % 5]}"> but was:<"${names[(i + 1) % 5]}">`,
-+    `\tat com.example.enroll.Person.<init>(Person.java:${40 + i})`,
-+    `SSN 123-45-${String(6789 + i).slice(-4)} for ${names[i % 5]}, phone (555) 010-${1000 + i}, \\"quoted\\" and \\u0041`,
-+    `{"id": ${1000 + i}, "name": "${names[i % 5]}", "zip": "2770${i % 10}"}`,
-+  ].join('\n');
-+  const runs = Array.from({ length: 300 }, (_, i) => ({ ok: i % 3 !== 0, name: `case-${i} ${names[i % 5]}`, exit: i % 3 ? 0 : 1, stdout: lines(i), stderr: i % 4 ? '' : `ERROR: "${names[i % 5]}" not found at C:\\data\\x\\file.csv` }));
-+  const t0 = Date.now();
-+  let r = null, err = null;
-+  try { r = await read(runs, real); } catch (e) { err = e; }
-+  ok(!err && Array.isArray(r) && r.length === 300 && r.every((x) => typeof x.exit === 'number'), `${(JSON.stringify(runs).length / 1024).toFixed(0)} KB masked by piishape: it parses, 300 items (${Date.now() - t0} ms${err ? '; threw ' + err.message : ''})`);
-+} catch (e) { fail++; console.log('  FAIL threw: ' + (e && e.stack || e)); }
-+console.log(`\n${pass} passed, ${fail} failed`);
-+process.exit(fail ? 1 : 0);
-+
-=== change test/test-sandbox-cmd-e2e.mjs
-base 3555bbcf105e280db1544966
-new d384931735f6daaf37cf2f39
+-2890
++2891
+=== change src/agent/minimal-worker.mjs
+base 9c26973fd53588a9831a0d49
+new 2d934a5c05e0f43d53df7733
+@@ 219 -0 +9
++// A SNIPPET THAT RUNS LONG GOES TO THE BACKGROUND - IT IS NOT KILLED (the developer, 2026-11-14: "backgrounding the
++// process sounds better than killing it, so the agent [can] check on it and kill it if it wants to ... Maybe we should
++// just do it like claude code"). The agent was splitting test runs across snippets to stay under a 30-minute kill.
++// Now a snippet waits in the foreground SNIPPET_FG_MS (its own <js timeout_ms>, up to 30 min, if it gave one), then
++// carries on in the background, as the developer's ⇱ moves it; the agent is told, can look (bg_status) or stop it
++// (kill_background), and gets its result when it ends. A call in it that prints nothing for its quiet limit moves it
++// there too, instead of being killed as stuck. SNIPPET_BG_BUDGET_MS stays the far ceiling.
++const SNIPPET_FG_MS = Number(process.env.CB_SNIPPET_FG_MS) || 10 * 60 * 1000;
++const snippetForegroundMs = (args) => { const t = Number(args && args.timeout_ms); return t > 0 ? Math.min(Math.max(1000, t), 30 * 60 * 1000) : SNIPPET_FG_MS; };
+@@ 828 -1 +1
+-        ...(job ? { onBudgetControl: (ctl) => { job._extendBudget = ctl.extend; }, ...(job.background ? { jsBudgetMs: SNIPPET_BG_BUDGET_MS } : {}) } : {}),
++        ...(job ? { onBudgetControl: (ctl) => { job._extendBudget = ctl.extend; }, ...(job.background ? { jsBudgetMs: SNIPPET_BG_BUDGET_MS } : {}), toBackground: (why) => { try { job._toBackground?.(why); } catch {} } } : {}),
+@@ 1288 -0 +4
++          // (its time in the foreground: then the background - see SNIPPET_FG_MS)
++          const fgMs = snippetForegroundMs(c.args);
++          const fgTimer = setTimeout(() => { try { job._toBackground('time'); } catch {} }, fgMs);
++          if (fgTimer.unref) fgTimer.unref();
+@@ 1289 -0 +1
++          clearTimeout(fgTimer);
+@@ 1290 -1 +1
+-          if (winner === 'developer' || winner === 'wait') {
++          if (winner === 'developer' || winner === 'wait' || winner === 'time' || winner === 'quiet') {
+@@ 1295 -0 +1
++            const fgFor = fgMs >= 60000 ? Math.round(fgMs / 60000) + ' min' : Math.round(fgMs / 100) / 10 + ' s';
+@@ 1297 -0 +4
++              : winner === 'time'
++              ? `STILL RUNNING, in the background as ${job.id}: it ran ${fgFor} in the foreground, the most a snippet waits there, so it carries on in the background. Nothing failed and nothing was stopped. You get its result and the full record when it finishes — do not run it again or split it up. Meanwhile carry on with work that does not depend on it; bgStatus("${job.id}") shows how it is doing, and bgKill("${job.id}") stops it if it is stuck or no longer wanted.`
++              : winner === 'quiet'
++              ? `POSSIBLY STUCK, in the background as ${job.id}: a call in this snippet has printed nothing for its quiet limit, so we stopped waiting for it. It was NOT killed - it is still running (a long compile can be quiet). Look with bgStatus("${job.id}"); if it is stuck, bgKill("${job.id}"); if it is only quiet, leave it - you get its result and the full record when it finishes. Do not run it again.`
+=== change src/agent/tools.mjs
+base 37ca6a9f1fae0731f7411b2c
+new 72e9d25fbf316f8cea75db76
 @@ 23 -1 +1
--import { lcMakeShortcut } from '../src/launch-cmd.mjs';
-+import { lcMakeShortcut, lcIsAppShortcut } from '../src/launch-cmd.mjs';
-@@ 315 -3 +4
--    const old = readLnk(path.join(D2, 'Code Boss.lnk')), mine = readLnk(path.join(D2, 'Code Boss (container).lnk'));
--    ok(mA.made.length === 3 && old && old.args === `"${OLD}"` && mine && mine.args === `"${SELF[1]}" --tree "${A}" --no-pull --open-window` && sbcShortcutTree(path.join(D2, 'Code Boss.lnk')) === '',
--      'the app\'s own "Code Boss" shortcut is left as it is: the container\'s is "Code Boss (container)" beside it');
-+    // (the developer, 2026-11-14: "let's make the container the default shortcut and call the other one 'Code Boss (unsafe)'")
-+    const old = readLnk(path.join(D2, 'Code Boss (unsafe).lnk')), mine = readLnk(path.join(D2, 'Code Boss.lnk'));
-+    ok(mA.made.length === 3 && old && old.args === `"${OLD}"` && mine && mine.args === `"${SELF[1]}" --tree "${A}" --no-pull --open-window` && sbcShortcutTree(path.join(D2, 'Code Boss.lnk')) === A && !existsSync(path.join(D2, 'Code Boss (container).lnk')),
-+      'the container\'s shortcut is "Code Boss"; the app\'s own old "Code Boss" (outside the container) is "Code Boss (unsafe)" now, as it was');
-@@ 320 -0 +16
-+    // an install from before, whose container shortcut was "Code Boss (container)" beside the app's: the next makes it "Code Boss"
-+    {
-+      const D3 = path.join(root, 'Desktop three'); await mkdir(D3, { recursive: true });
-+      lcMakeShortcut(path.join(D3, 'Code Boss.lnk'), process.execPath, `"${OLD}"`, CBD, '', 'Code Boss');
-+      lcMakeShortcut(path.join(D3, 'Code Boss (container).lnk'), process.execPath, `"${SELF[1]}" --tree "${A}" --no-pull --open-window`, CBD, '', 'x');
-+      sbcMakeShortcuts({ desktop: D3, tree: A, cbDir: CBD, self: SELF });
-+      const names = readdirSync(D3).filter((f) => f.endsWith('.lnk')).sort();
-+      ok(names.join() === ['Code Boss (unsafe).lnk', 'Code Boss.lnk', 'Kill Container.lnk', 'Start Container.lnk'].join() && sbcShortcutTree(path.join(D3, 'Code Boss.lnk')) === A && readLnk(path.join(D3, 'Code Boss (unsafe).lnk')).args === `"${OLD}"`,
-+        `an older install's "Code Boss (container)" and the app's "Code Boss": the container's becomes "Code Boss", the app's "Code Boss (unsafe)" (${names.join(', ')})`);
-+      ok(lcIsAppShortcut(path.join(D3, 'Code Boss (unsafe).lnk')) && !lcIsAppShortcut(path.join(D3, 'Code Boss.lnk')) && !lcIsAppShortcut(path.join(D3, 'Kill Container.lnk')) && !lcIsAppShortcut(path.join(D3, 'nope.lnk')), 'the launcher knows its own shortcut (node running code-boss.mjs and nothing else) from the container\'s');
-+      // someone else's "Code Boss" (not code_boss's at all) is left alone: the container's is then "Code Boss (container)"
-+      const D4 = path.join(root, 'Desktop four'); await mkdir(D4, { recursive: true });
-+      lcMakeShortcut(path.join(D4, 'Code Boss.lnk'), process.execPath, '--version', CBD, '', 'not ours');
-+      sbcMakeShortcuts({ desktop: D4, tree: A, cbDir: CBD, self: SELF });
-+      ok(readLnk(path.join(D4, 'Code Boss.lnk')).args === '--version' && sbcShortcutTree(path.join(D4, 'Code Boss (container).lnk')) === A, 'a "Code Boss" that is not code_boss\'s is left alone: the container\'s is "Code Boss (container)" beside it');
-+    }
-@@ 326 -1 +1
--    ok(goneB.length === 3 && existsSync(path.join(D2, 'Code Boss.lnk')) && readdirSync(D2).length === 1 && !existsSync(path.join(CBD, 'sandbox-icons')), 'uninstalling the folder they are for removes its three, and the icons; the app\'s own "Code Boss" stays');
-+    ok(goneB.length === 3 && existsSync(path.join(D2, 'Code Boss (unsafe).lnk')) && readdirSync(D2).length === 1 && !existsSync(path.join(CBD, 'sandbox-icons')), 'uninstalling the folder they are for removes its three, and the icons; the app\'s own "Code Boss (unsafe)" stays');
-=== add test/test-window-status-e2e.mjs
-new 0fca7638f8b5e3ec93f3061d
+-import { killSnippetJob } from './snippet-jobs.mjs';
++import { killSnippetJob, listSnippetJobs } from './snippet-jobs.mjs';
+@@ 2049 -1 +1
+-function runArgv(file, argv, { cwd, stdin, timeoutMs, quietMs, onProgress, signal, useCmd, children, adoptChild, bgCallId, projectDir, env: extraEnv, jsBudget } = {}) {
++function runArgv(file, argv, { cwd, stdin, timeoutMs, quietMs, onProgress, signal, useCmd, children, adoptChild, bgCallId, projectDir, env: extraEnv, jsBudget, toBackground } = {}) {
+@@ 2071 -1 +1
+-    let lastOut = t0, raised = 0, stoppedQuiet = false;
++    let lastOut = t0, raised = 0, stoppedQuiet = false, movedQuiet = false;
+@@ 2163 -0 +7
++      // QUIET IN A SNIPPET THAT CAN GO TO THE BACKGROUND: it goes there, and this call runs on - the agent decides
++      // whether it is stuck (the developer, 2026-11-14: "backgrounding the process sounds better than killing it").
++      // Said once in what the call prints; a total limit still ends it.
++      if (quiet && !(limitMs && now - t0 >= limitMs) && typeof toBackground === 'function') {
++        if (!movedQuiet) { movedQuiet = true; err = (err ? err + '\n' : '') + `[no output for ${fmtLimit(quietLimit)}] still running - its snippet was moved to the background so the agent can check on it (bg_status) and stop it (kill_background) if it is stuck.`; try { toBackground('quiet'); } catch {} }
++        return;
++      }
+@@ 2272 -0 +4
++// (2026-11-14: in a snippet that can go to the background, a call is not cut at 30 min: the snippet goes to the
++// background after its time in the foreground (minimal-worker SNIPPET_FG_MS) and the call runs on, up to this ceiling -
++// the background snippet's own)
++const ARGV_BG_TIMEOUT_MS = 2 * 60 * 60 * 1000;   // 2 h
+@@ 2276 -1 +3
+-  return Math.min(Math.max(1000, Number(ms) || snippetDefault || def), BASH_MAX_TIMEOUT_MS);
++  const bg = !!(ctx && typeof ctx.toBackground === 'function');
++  if (bg && def === ARGV_DEFAULT_TIMEOUT_MS) def = ARGV_BG_TIMEOUT_MS;
++  return Math.min(Math.max(1000, Number(ms) || snippetDefault || def), bg ? ARGV_BG_TIMEOUT_MS : BASH_MAX_TIMEOUT_MS);
+@@ 2556 -1 +1
+-  const runProc = (file, argv, opts) => gated(() => runArgv(file, argv, { ...opts, children, adoptChild, bgCallId: ctx && ctx.callId, projectDir: toolRoot(ctx), jsBudget: ctx && ctx.jsBudget })
++  const runProc = (file, argv, opts) => gated(() => runArgv(file, argv, { ...opts, children, adoptChild, bgCallId: ctx && ctx.callId, projectDir: toolRoot(ctx), jsBudget: ctx && ctx.jsBudget, toBackground: ctx && ctx.toBackground })
+@@ 3256 -1 +11
+-    bgStatus: async ([id]) => { countOp(); return bgStatus({ key: toolRoot(ctx), id: String(id) }); },
++    // (a snippet's id - js-N, one that went to the background after its time in the foreground, 2026-11-14 - is the
++    // snippet's state: running or waiting, for how long, its last calls and the files it wrote)
++    bgStatus: async ([id]) => {
++      countOp();
++      if (/^js-\d+$/.test(String(id || ''))) {
++        const j = listSnippetJobs(toolRoot(ctx)).find((x) => x.id === String(id));
++        if (!j) return { id: String(id), state: 'unknown', note: 'No snippet ' + id + ' in this project (it may have ended long ago).' };
++        return { id: j.id, snippet: true, state: j.state, background: !!j.background, runningSec: Math.round(j.runningMs / 1000), lastCalls: j.calls, filesWritten: j.files, ...(j.waitingFor ? { waitingFor: j.waitingFor } : {}), ...(j.status ? { ended: j.status } : {}) };
++      }
++      return bgStatus({ key: toolRoot(ctx), id: String(id) });
++    },
+=== change src/agent/worker-prompt.mjs
+base 51baa71d8534d3a7ec614645
+new 8bf71ff30c6804acba236c86
+@@ 119 -1 +1
+-    '  TIME: a process call has TWO limits. It is KILLED when it prints NOTHING for 5 min - taken as stuck - or when it has run 30 min in all, and the call throws (with allowFail it answers timedOut:true). So do not silence a long build (no mvn -q): its output is what shows it is alive. A step that is quiet on purpose gets <js quiet_ms="900000"> (0 = no quiet limit) or {quietMs} on the call; a shorter total, <js timeout_ms="…"> or {timeoutMs}. Longer than 30 min, or anything that does not exit on its own, runs with {background:true} and is awaited across turns.',
++    '  TIME: nothing long is killed - it goes to the BACKGROUND. A snippet waits in the foreground up to 10 min (or its own <js timeout_ms="…">, up to 30 min); then it carries on in the background by itself, you are told ("STILL RUNNING, in the background as js-N"), and its result reaches you when it finishes. So run a long build or test suite WHOLE, in one snippet - never split it up to stay under a limit. A call that prints NOTHING for 5 min moves its snippet to the background too ("POSSIBLY STUCK") without killing it: look with bgStatus("js-N"), stop it with bgKill("js-N") if it is stuck. Do not silence a long build (no mvn -q): its output is what shows it is alive; a step quiet on purpose gets <js quiet_ms="900000"> (0 = no quiet limit) or {quietMs}. A server, or anything that does not exit on its own, runs with {background:true}.',
+=== change src/release-ui.mjs
+base 4f070e7b320ce122a4f8d20e
+new bc2ed0db9f6da1a9bb36871b
+@@ 480 -0 +1
++button.link{background:none;border:0;padding:2px 4px;color:var(--accent-text);text-decoration:underline;text-underline-offset:3px;flex:none}button.link:hover:not(:disabled){box-shadow:none;color:var(--accent-hover)}
+@@ 489 -1 +1
+-.err{color:var(--err)}.okc{color:var(--ok)}.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
++.err{color:var(--err)}.okc{color:var(--ok)}.warn{color:var(--accent-text)}.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+@@ 492 -0 +20
++label.chk{display:flex;gap:6px;grid-template-columns:none}
++.tabs{display:flex;gap:2px;margin:14px 0 0;border-bottom:1px solid var(--border)}
++.tab{border:0;border-bottom:2px solid transparent;border-radius:0;background:none;color:var(--muted);padding:6px 14px}.tab:hover:not(:disabled){box-shadow:none;color:var(--accent-text)}.tab.on{color:var(--accent-text);border-bottom-color:var(--accent);font-weight:600}
++.wiz{display:flex;align-items:center;gap:12px;margin:14px 0 0;font-size:12px;color:var(--muted)}.wiz b{color:var(--fg);font-weight:600}
++.bars{display:flex;gap:4px;flex:none}.bars i{display:block;width:26px;height:4px;border-radius:2px;background:var(--border)}.bars i.d{background:var(--ok)}.bars i.c{background:var(--accent)}
++ol.steps{list-style:none;margin:12px 0 0;padding:0;display:grid;grid-template-columns:minmax(0,1fr);gap:8px}
++.step{border:1px solid var(--border);border-radius:8px;background:var(--panel);padding:12px 16px 14px}
++.step.future{display:none}.step.open{border-color:var(--accent);box-shadow:var(--accent-ring)}
++.step.collapsed{padding:6px 12px;background:transparent;border-color:var(--cn-border)}
++.sh{display:flex;align-items:center;gap:10px;min-width:0}.sh h2{margin:0;border:0;padding:0;flex:none}
++.num{flex:none;width:20px;height:20px;border-radius:50%;border:1px solid var(--border);display:grid;place-items:center;font-size:11px;font-weight:700;color:var(--muted)}
++.step.open .num{background:var(--accent);border-color:var(--accent);color:var(--accent-fg)}.step.collapsed .num{border-color:var(--ok);color:var(--ok)}
++.step.collapsed h2{color:var(--muted)}
++.st{flex:1;font-size:12px;color:var(--fg);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}.step.open .st{visibility:hidden}.st.warn{color:var(--accent-text)}
++.back{display:none!important}.step.collapsed .back{display:inline-block!important}
++.sbody{margin-top:12px}.sbody h2{font-size:10.5px;color:var(--muted);margin:18px 0 6px;border-bottom-color:var(--cn-border)}.sbody>:first-child h2:first-child,.sbody>h2:first-child{margin-top:4px}
++.lead{margin:0 0 10px;font-size:13px}
++.nav{margin-top:16px;padding-top:10px;border-top:1px solid var(--cn-border)}.nav .sp{flex:1}
++#after:empty{display:none}#after{border:1px solid var(--ok);border-radius:6px;padding:8px 12px;margin:8px 0 0;font-size:12.5px}#after.bad{border-color:var(--err)}
++.foot{margin-top:22px;padding-top:12px;border-top:1px solid var(--cn-border)}
+@@ 494 -0 +9
++<!-- A WIZARD HERE TOO (the developer, 2026-11-14: "Same for the release window if it applies. Like a proper wizard";
++     "rework the setup and release ui's to be more ergonomic and clear"): where it goes, what ships, release - one step open
++     at a time, the ones done a line each above it; the releases and channels a tool of their own, in a tab beside it -->
++<div class="tabs" id="tabs" style="display:none"><button class="tab on" id="tabRel">Release</button><button class="tab" id="tabRels">Releases and channels</button></div>
++<div id="wizView">
++<div class="wiz"><span class="bars" id="bars"><i></i><i></i><i></i></span><span id="stepOf"></span></div>
++<ol class="steps">
++<li class="step" id="w1"><div class="sh"><span class="num">1</span><h2>Where it goes</h2><span class="st" id="w1st"></span><button class="link back" id="w1back">Change</button></div>
++<div class="sbody" id="w1body">
+@@ 495 -1 +0
+-<h2>Where it goes</h2>
+@@ 502 -2 +4
+-<div id="imgSec" style="display:none"><h2 id="imgHead" style="display:none">The container image</h2><div class="row"><button id="pasteCmd">Paste your image command...</button><span class="sub" id="pasteDone"></span></div><div class="row" id="withRow" style="display:none"><label style="display:flex;gap:6px;grid-template-columns:none"><input type="checkbox" id="withRelease"> each release makes the container image too, with the same build</label></div><div id="imgFields"></div><h2>Switches</h2><div id="imgChecks"></div></div>
+-<h2>Your plugins</h2>
++<div class="sub" id="w1need"></div></div></li>
++<li class="step" id="w2"><div class="sh"><span class="num">2</span><h2 id="w2name">What ships</h2><span class="st" id="w2st"></span><button class="link back" id="w2back">Change</button></div>
++<div class="sbody" id="w2body">
++<div id="plugSec"><h2>Your plugins</h2>
+@@ 507 -3 +6
+-<pre id="pview" style="display:none"></pre>
+-<div class="row" style="margin-top:10px"><button id="save">Save</button><span class="sub" id="saved"></span></div>
+-<div id="relSec"><h2>Release</h2>
++<pre id="pview" style="display:none"></pre></div>
++<div id="imgSec" style="display:none"><h2 id="imgHead" style="display:none">The container image</h2><div class="row" id="withRow" style="display:none"><label class="chk"><input type="checkbox" id="withRelease"> each release makes the container image too, with the same build</label></div><div class="row" style="margin-top:6px"><button id="pasteCmd">Paste your image command...</button><span class="sub" id="pasteDone"></span></div><div id="imgFields"></div><h2>Switches</h2><div id="imgChecks"></div></div>
++</div></li>
++<li class="step" id="w3"><div class="sh"><span class="num">3</span><h2 id="w3name">Release</h2><span class="st" id="w3st"></span></div>
++<div class="sbody" id="w3body">
++<div id="relSec"><div class="lead" id="relLead">Pick where it goes:</div>
+@@ 511 -2 +13
+-<label style="display:flex;gap:6px;grid-template-columns:none"><input type="checkbox" id="push" checked> push to GitLab</label></div>
+-<div class="sub">devtest: only this machine follows it, to try it yourself first. beta: whoever ticked Beta builds in the app's Settings. production: what everyone's code_boss updates to.</div></div>
++<label class="chk"><input type="checkbox" id="push" checked> push to GitLab</label></div>
++<div class="sub" style="margin-top:6px">devtest: only this machine follows it, to try it yourself first. beta: whoever ticked Beta builds in the app's Settings. production: what everyone's code_boss updates to.</div></div>
++<div id="imgAct" style="display:none"><div class="lead">Pick where it goes:</div>
++<div class="row"><button class="primary" id="imgDev">Build for devtest</button><button id="imgProd">Build for production</button>
++<label class="chk"><input type="checkbox" id="ipush"> push to GitLab</label></div>
++<div class="row"><label class="chk"><input type="checkbox" id="iuninstall"> take the container in the agent folder off this machine first (--uninstall, this run only)</label></div>
++<div class="row"><label class="chk"><input type="checkbox" id="iyes"> ask nothing (--yes, this run only)</label></div>
++<div class="sub">devtest: only this machine follows it. production: what everyone's container updates to. Not pushed: built and committed in the image clone only (with --run, installed from there).</div></div>
++<div id="jobBox"><div id="status" style="margin-top:12px"></div><pre id="log" style="display:none"></pre><div id="after"></div></div>
++</div></li>
++</ol>
++<div class="row nav" id="wnav"><button id="save">Save</button><span class="sub" id="saved"></span><span class="sp"></span><button class="primary" id="next">Continue</button></div>
++</div>
+@@ 516 -9 +3
+-<table id="rels"><thead><tr><th>Build</th><th>code_boss on</th><th>Container on</th><th>Move a channel here</th></tr></thead><tbody></tbody></table></div>
+-<div id="imgAct" style="display:none"><h2>Build the image</h2>
+-<div class="row"><button class="primary" id="imgDev">Build for devtest</button><button id="imgProd">Build for production</button>
+-<label style="display:flex;gap:6px;grid-template-columns:none"><input type="checkbox" id="ipush"> push to GitLab</label></div>
+-<div class="row"><label style="display:flex;gap:6px;grid-template-columns:none"><input type="checkbox" id="iuninstall"> take the container in the agent folder off this machine first (--uninstall, this run only)</label></div>
+-<div class="row"><label style="display:flex;gap:6px;grid-template-columns:none"><input type="checkbox" id="iyes"> ask nothing (--yes, this run only)</label></div>
+-<div class="sub">devtest: only this machine follows it. production: what everyone's container updates to. Not pushed: built and committed in the image clone only (with --run, installed from there).</div></div>
+-<div id="status"></div><pre id="log" style="display:none"></pre>
+-<div class="row" style="margin-top:18px"><button id="shortcut" style="display:none">Make the desktop shortcut</button><button id="close">Close</button><span class="sub" id="shortcutSays"></span></div>
++<table id="rels"><thead><tr><th>Build</th><th>code_boss on</th><th>Container on</th><th>Move a channel here</th></tr></thead><tbody></tbody></table>
++<div id="toolSlot"></div></div>
++<div class="row foot"><button id="shortcut" style="display:none">Make the desktop shortcut</button><button id="close">Close</button><span class="sub" id="shortcutSays"></span></div>
+@@ 537 -0 +3
++// THE WIZARD'S PLACE: reach, the furthest step come to (the one to do now); at, the step open; view, the wizard or the
++// releases and channels
++let reach=0,at=0,view='wiz';
+@@ 549 -0 +39
++const names=(s)=>s.mode==='image'?['','Where it goes','The image','Build']:['','Where it goes','What ships','Release'];
++const missingOf=(s)=>[!s.updateSource&&'the repository',!s.glUser&&'the GitLab user',!s.hasToken&&'the GitLab token'].filter(Boolean);
++function wiz(s){
++  const j=s.job,co=!!s.checkout,im=s.mode==='image',N=names(s),miss=missingOf(s);
++  // (where it opens: Where it goes when something is missing there, or the command line gave something to decide;
++  // else What ships, to look over before releasing)
++  if(!reach){reach=j.running?3:miss.length||s.notes.length?1:2;at=reach;}
++  // A RUN GOING ON STAYS IN SIGHT (2026-11-14): its own place, and nothing moves away from it until it ends
++  const tool=co&&(j.what==='move'||j.what==='image');
++  if(j.running){if(tool)view='rels';else{view='wiz';reach=3;at=3;}}
++  $('tabs').style.display=co?'':'none';
++  $('tabRel').classList.toggle('on',view==='wiz');$('tabRels').classList.toggle('on',view==='rels');
++  $('tabRel').disabled=j.running&&view!=='wiz';$('tabRels').disabled=j.running&&view!=='rels';
++  $('wizView').style.display=view==='wiz'?'':'none';$('relsSec').style.display=co&&view==='rels'?'':'none';
++  // (the run's line and log where the run was started from)
++  const slot=tool?$('toolSlot'):$('w3body');if($('jobBox').parentNode!==slot)slot.appendChild($('jobBox'));
++  for(const n of [1,2,3]){
++    const li=$('w'+n),full=n===at,line=!full&&n<reach;
++    li.classList.toggle('open',full);li.classList.toggle('collapsed',line);li.classList.toggle('future',!full&&!line);
++    li.querySelector('.num').textContent=line?'\u2713':String(n);
++    $('w'+n+'body').style.display=full?'':'none';
++    const b=$('w'+n+'back');if(b)b.disabled=j.running;
++  }
++  [...$('bars').children].forEach((b,i)=>{b.className=i+1===at?'c':i+1<reach?'d':'';});
++  $('w2name').textContent=N[2];$('w3name').textContent=N[3];
++  $('stepOf').innerHTML='Step <b>'+at+'</b> of 3: <b>'+esc(N[at])+'</b>'+(at<reach?' <span class="warn">- gone back; Continue returns to step '+reach+' ('+esc(N[reach])+')</span>':'');
++  // (Save, and Continue - which saves too - in the step open; not in the last)
++  const nav=$('wnav');if(at<3){if(nav.parentNode!==$('w'+at+'body'))$('w'+at+'body').appendChild(nav);nav.style.display='';}else nav.style.display='none';
++  const to=Math.max(at+1,reach);$('next').textContent='Continue to step '+to+': '+N[to];$('next').disabled=j.running;
++  // the lines of the steps done: what each settled
++  $('w1st').textContent=miss.length?'not set: '+miss.join(', '):s.updateSource+' as '+s.glUser+(im?'':co?'':' - from '+s.releaseDir);
++  $('w1st').className='st'+(miss.length?' warn':'');
++  $('w1need').innerHTML=miss.length?'<span class="warn">Still to fill in: '+esc(miss.join(', '))+'.</span> '+(im?'(Not needed to build without pushing.)':'A release is pushed to the repository with them.'):'';
++  const ships=s.plugins.rows.filter(r=>r.ship),changed=ships.filter(r=>r.changed||r.missing).length;
++  const pl=ships.length?ships.length+' plugin'+(ships.length===1?'':'s')+' ('+ships.map(r=>r.name+(r.enabled?'':' off by default')).join(', ')+')'+(changed?', '+changed+' new or changed since the last '+(im?'image':'release'):''):'no plugins';
++  $('w2st').textContent=im?s.image.fields.filter(f=>f.value).length+' paths; '+(s.image.checks.filter(c=>c.on).map(c=>'--'+c.key).join(' ')||'no switches')+'; '+pl:pl+(co?(s.image.withRelease?'; the container image too':'; no container image'):'');
++  $('w3st').textContent='';
++}
++function go(n){at=n;reach=Math.max(reach,n);if(st)fill(st);}
+@@ 557 -0 +2
++  // (the image window: its switches first, then the plugins it carries)
++  if(im&&$('imgSec').nextElementSibling!==$('plugSec'))$('plugSec').before($('imgSec'));
+@@ 558 -1 +1
+-  $('srcRow').style.display=$('distRow').style.display=$('imgHead').style.display=$('withRow').style.display=$('relsSec').style.display=$('coSays').style.display=co?'':'none';
++  $('srcRow').style.display=$('distRow').style.display=$('imgHead').style.display=$('withRow').style.display=$('coSays').style.display=co?'':'none';
+@@ 565 -1 +1
+-    $('imgChecks').innerHTML=s.image.checks.map(c=>'<div class="row"><label style="display:flex;gap:6px;grid-template-columns:none"><input type="checkbox" class="icheck" data-key="'+esc(c.key)+'"'+(c.on?' checked':'')+'> '+esc(c.label)+'</label></div>').join('');
++    $('imgChecks').innerHTML=s.image.checks.map(c=>'<div class="row"><label class="chk"><input type="checkbox" class="icheck" data-key="'+esc(c.key)+'"'+(c.on?' checked':'')+'> '+esc(c.label)+'</label></div>').join('');
+@@ 572 -0 +1
++  wiz(s);
+@@ 576 -0 +1
++  if(j.lines.length||j.running){$('log').style.display='';const atEnd=$('log').scrollTop+$('log').clientHeight>=$('log').scrollHeight-4;$('log').textContent=j.lines.join('\n');if(atEnd)$('log').scrollTop=$('log').scrollHeight;}
+@@ 577 -3 +1
+-    if(j.lines.length||j.running){$('log').style.display='';const at=$('log').scrollTop+$('log').clientHeight>=$('log').scrollHeight-4;$('log').textContent=j.lines.join('\n');if(at)$('log').scrollTop=$('log').scrollHeight;}
+-    return;}
+-  if(j.lines.length||j.running){$('log').style.display='';const at=$('log').scrollTop+$('log').clientHeight>=$('log').scrollHeight-4;$('log').textContent=j.lines.join('\n');if(at)$('log').scrollTop=$('log').scrollHeight;}
++    after(s);return;}
+@@ 581 -1 +1
+-    :(j.running?SP+'Making the image of build '+esc(j.build)+'...':j.code===0?'<span class="okc">The image of build '+esc(j.build)+' is made.</span>':'<span class="err">The image stopped (exit '+esc(j.code)+') - what it said is below.</span>'));return;}
++    :(j.running?SP+'Making the image of build '+esc(j.build)+'...':j.code===0?'<span class="okc">The image of build '+esc(j.build)+' is made.</span>':'<span class="err">The image stopped (exit '+esc(j.code)+') - what it said is below.</span>'));after(s);return;}
+@@ 583 -0 +14
++  after(s);
++}
++// WHAT TO DO NEXT, once a run has ended (2026-11-14: the result, and where to go from it)
++function after(s){
++  const j=s.job,im=s.mode==='image',co=!!s.checkout,tool=co&&(j.what==='move'||j.what==='image');
++  let h='';
++  if(!j.running&&j.code!=null&&!tool){
++    if(j.code!==0)h='Put right what the end of the log says, then '+(im?'build':'release')+' again.';
++    else if(!j.push)h=im?'Built and committed in the image clone only: nothing updates to it until it is pushed.':'Built and committed here, not pushed: nothing updates to it until it is pushed - release again with push to GitLab ticked.';
++    else{const who=j.channel==='devtest'?'only this machine follows devtest':j.channel==='beta'?'whoever ticked Beta builds gets it too':'everyone on production updates to it';
++      h=im?(s.image.checks.some(c=>c.key==='run'&&c.on)?'It is installed in the agent folder and started already (--run); next time, open it from its Desktop shortcut "Code Boss" ('+who+').':'Next: open the container from its Desktop shortcut "Code Boss" ('+who+').')
++        :(co&&s.image.withRelease?'Next: open the container from its Desktop shortcut "Code Boss" - it updates to this build ('+who+').':'Next: start code_boss - it updates to this build ('+who+').')+(j.channel==='devtest'?' Once it is right, release it to production from here.':'');}
++  }
++  put('after',h);$('after').classList.toggle('bad',j.code!=null&&j.code!==0);
+@@ 602 -0 +4
++// CONTINUE SAVES THE STEP (2026-11-14): nothing typed is lost going on - or going back, the fields stay as they are
++$('next').onclick=()=>busy($('next'),'saved',dirty?'Saving...':'',async()=>{if(dirty&&!(await save()))return;go(Math.max(at+1,reach));});
++$('w1back').onclick=()=>{at=1;if(st)fill(st);};$('w2back').onclick=()=>{at=2;if(st)fill(st);};
++$('tabRel').onclick=()=>{view='wiz';if(st)fill(st);};$('tabRels').onclick=()=>{view='rels';if(st)fill(st);};
+=== change src/ui.html
+base f46ad3ad0facf5199c5b0436
+new fb098ed3bf034e68dee4a272
+@@ 1389 -1 +1
+-     others: the dashes touching a dot's top and bottom read as one stroke with it. jsChainLayout cuts a gap of 3px
++     others: the dashes touching a dot's top and bottom read as one stroke with it. jsChainLayout cuts a gap of 2px
+@@ 1391 -0 +1
++  /* (the line a little lighter: 55% of --muted, was 42% - the developer, 2026-11-14) */
+@@ 1392 -1 +1
+-  .js-group.js-chain::before { content: ''; position: absolute; left: calc(var(--gutter) / 2 - var(--chain-w) / 2); top: var(--chain-top, 0); height: var(--chain-h, 0); width: var(--chain-w); background: repeating-linear-gradient(to bottom, color-mix(in srgb, var(--muted) 42%, transparent) 0 2px, transparent 2px 6px); -webkit-mask-image: var(--chain-mask, none); mask-image: var(--chain-mask, none); pointer-events: none; }
++  .js-group.js-chain::before { content: ''; position: absolute; left: calc(var(--gutter) / 2 - var(--chain-w) / 2); top: var(--chain-top, 0); height: var(--chain-h, 0); width: var(--chain-w); background: repeating-linear-gradient(to bottom, color-mix(in srgb, var(--muted) 55%, transparent) 0 2px, transparent 2px 6px); -webkit-mask-image: var(--chain-mask, none); mask-image: var(--chain-mask, none); pointer-events: none; }
+@@ 9948 -1 +2
+-    // a gap round each dot: the ● is about 0.6em across, and the line stops 3px short of it, above and below
++    // a gap round each dot: the ● is about 0.6em across, and the line stops 2px short of it, above and below (3px read
++    // as too much - the developer, 2026-11-14)
+@@ 9950 -1 +1
+-    const r = (d0 ? parseFloat(getComputedStyle(d0).fontSize) || 13.5 : 13.5) * 0.3 + 3;
++    const r = (d0 ? parseFloat(getComputedStyle(d0).fontSize) || 13.5 : 13.5) * 0.3 + 2;
+=== change test/test-image-window-e2e.mjs
+base 31152697226b2f10d3148949
+new cda8da9457e6e13b60b2eeca
+@@ 87 -0 +8
++  // (a wizard, the developer, 2026-11-14: "Same for the release window if it applies": the notes open Where it goes;
++  // Continue to The image, Continue to Build)
++  const seen = () => page.evaluate(() => [1, 2, 3].map((n) => { const li = document.getElementById('w' + n); return getComputedStyle(li).display === 'none' ? '-' : li.classList.contains('collapsed') ? 'line' : 'open'; }).join(','));
++  const s0 = await seen();
++  await page.click('#next');
++  const s1 = await seen();
++  await page.click('#next');
++  ok(s0 === 'open,-,-' && s1 === 'line,open,-' && await seen() === 'line,line,open' && /Step 3 of 3: Build/.test(await page.$eval('#stepOf', (e) => e.textContent)) && await page.$eval('#imgDev', (e) => !!e.offsetParent), `the steps one at a time: Where it goes, The image, Build (${s0} / ${s1} / ${await seen()})`);
+@@ 97 -1 +3
+-  // the window's own change: --run off, saved
++  ok(/Next: open the container from its Desktop shortcut/.test(await page.$eval('#after', (e) => e.textContent)) || /nothing updates to it until it is pushed/.test(await page.$eval('#after', (e) => e.textContent)), `what to do next, said (${await page.$eval('#after', (e) => e.textContent)})`);
++  // the window's own change: --run off, saved (back at The image: "Change" on its line)
++  await page.click('#w2back');
+=== change test/test-release-window-checkout-e2e.mjs
+base cdcc0a338527cc4769df486b
+new 39ec00fa32e72ab9f1406b30
+@@ 98 -0 +6
++  // (a wizard, the developer, 2026-11-14: "Same for the release window if it applies. Like a proper wizard" - What ships
++  // is open, with the container image's settings; Continue saves it and opens Release)
++  const seen = () => page.evaluate(() => [1, 2, 3].map((n) => { const li = document.getElementById('w' + n); return getComputedStyle(li).display === 'none' ? '-' : li.classList.contains('collapsed') ? 'line' : 'open'; }).join(','));
++  ok(await seen() === 'line,open,-' && await page.$eval('#withRelease', (e) => !!e.offsetParent) && await page.$eval('#rels', (e) => !e.offsetParent), `What ships open with the container image; the releases and channels not in the way (${await seen()})`);
++  await page.click('#next');
++  ok(await seen() === 'line,line,open' && /the container image too/.test(await text('#w2st')), `Continue: Release open (${await text('#w2st')})`);
+@@ 107 -0 +1
++  ok(/open the container from its Desktop shortcut "Code Boss"/.test(await text('#after')), `what to do next, said (${await text('#after')})`);
+@@ 109 -0 +3
++  // (the releases and channels: a tool of their own, in the tab beside the wizard)
++  await page.click('#tabRels');
++  ok(await page.$eval('#rels', (e) => !!e.offsetParent) && await page.$eval('#wizView', (e) => getComputedStyle(e).display === 'none'), 'its tab shows the releases and channels, the wizard out of the way');
+@@ 114 -0 +1
++  ok(await page.$eval('#status', (e) => !!e.offsetParent && document.getElementById('relsSec').contains(e)), 'the move\'s line and log are in its own tab');
+@@ 157 -0 +2
++    // (a note still to decide opens the wizard at Where it goes: Continue to What ships, where the image's settings are)
++    if (!(await page.$eval('#pasteCmd', (e) => !!e.offsetParent))) await page.click('#next');
+=== change test/test-release-window-e2e.mjs
+base 1b90a6fb531eb78e655b8e0c
+new e8aa6c3f36121646444352d8
+@@ 62 -0 +4
++  // A WIZARD (the developer, 2026-11-14: "Same for the release window if it applies. Like a proper wizard"): where it
++  // goes is all filled in, so it is one line; What ships is open; Release is not on the page until it is come to
++  const seen = (p) => p.evaluate(() => [1, 2, 3].map((n) => { const li = document.getElementById('w' + n); return getComputedStyle(li).display === 'none' ? '-' : li.classList.contains('collapsed') ? 'line' : 'open'; }).join(','));
++  ok(await seen(page) === 'line,open,-' && /gitlab\.x\/g\/cb as me/.test(await page.$eval('#w1st', (e) => e.textContent)), `step 1 a line (what it settled), step 2 open, step 3 not shown (${await seen(page)})`);
+@@ 78 -0 +3
++  await page.click('#next');
++  await page.waitForFunction(() => getComputedStyle(document.getElementById('w3')).display !== 'none' && !!document.getElementById('relDev').offsetParent, { timeout: 5000 });
++  ok(await seen(page) === 'line,line,open' && /2 plugins \(lint, report off by default\)/.test(await page.$eval('#w2st', (e) => e.textContent)), `Continue: step 3 open, What ships a line saying what ships (${await page.$eval('#w2st', (e) => e.textContent)})`);
+@@ 80 -0 +1
++  ok(/Next: start code_boss/.test(await page.$eval('#after', (e) => e.textContent)), `and what to do next (${await page.$eval('#after', (e) => e.textContent)})`);
+@@ 116 -0 +1
++  ok(await seen(p2) === 'open,-,-', `something to decide in where it goes: step 1 opens (${await seen(p2)})`);
+=== add test/test-snippet-time-to-background.mjs
+new b8ca18ce0198c6ca7e25d74f
 +/**
-+ * THE WINDOW SAYS WHAT CODE_BOSS IS DOING, AND THE RIGHT PANEL STAYS WHERE THE DEVELOPER PUT IT (the developer,
-+ * 2026-11-14).
-+ *   [1] the window's icon (its taskbar button): the star at rest; a green dot while a run goes; a blue dot when a run
-+ *       ended while the window was behind another, gone once it is in front; a red dot while a question waits
-+ *   [2] the running count on ▶ is the status bar's orange bubble, floating on the icon; none at 0
-+ *   [3] the agent's browser takes the panel once, when it opens; after that a page or tab it opens does not
-+ * Run: node test/test-window-status-e2e.mjs
++ * A SNIPPET THAT RUNS LONG GOES TO THE BACKGROUND - IT IS NOT KILLED (the developer, 2026-11-14: "backgrounding the
++ * process sounds better than killing it, so the agent [can] check on it and kill it if it wants to ... Maybe we should
++ * just do it like claude code"). The agent had been splitting test runs across snippets to stay under a 30-min kill.
++ *   [1] past its time in the foreground (CB_SNIPPET_FG_MS, 1.5 s here) a snippet carries on in the background: the call
++ *       returns "STILL RUNNING, in the background", the run goes on, and the result is delivered when it ends
++ *   [2] its own <js timeout_ms> is its time in the foreground: a 2 s snippet given 4 s finishes in the foreground
++ *   [3] a call that prints nothing for its quiet limit is NOT killed: its snippet goes to the background ("POSSIBLY
++ *       STUCK"), the process runs to its end, and what it printed late is in the delivered result
++ *   [4] a time-backgrounded snippet is stopped by kill_background, as any background snippet is
++ * Run: node test/test-snippet-time-to-background.mjs
 + */
-+import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
-+import { existsSync, mkdtempSync } from 'node:fs';
++process.env.CB_SNIPPET_FG_MS = '1500';   // (read when minimal-worker loads)
++import { mkdtemp, writeFile } from 'node:fs/promises';
 +import { tmpdir } from 'node:os';
++import { execFileSync } from 'node:child_process';
 +import path from 'node:path';
-+import { fileURLToPath } from 'node:url';
-+import puppeteer from 'puppeteer-core';
++const { runMinimalWorker } = await import('../src/agent/minimal-worker.mjs');
++const { setSnippetJobDoneHandler, killSnippetJob } = await import('../src/agent/snippet-jobs.mjs');
 +
-+process.env.CB_HOME = mkdtempSync(path.join(tmpdir(), 'cb-winstatus-home-'));
-+const { startServer } = await import('../src/server.mjs');
-+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-+const PORT = 29659;
 +let pass = 0, fail = 0;
 +const ok = (c, l) => { if (c) { pass++; console.log('  ok', l); } else { fail++; console.log('  FAIL', l); } };
 +const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-+const chrome = ['C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe', (process.env.LOCALAPPDATA || '') + '\\Google\\Chrome\\Application\\chrome.exe'].find((p) => p && existsSync(p));
-+const SLOW = 2500;
-+const adapter = {
-+  async *completeStream() { await sleep(SLOW); yield { choices: [{ delta: { content: 'done.' } }] }; },
-+  async complete() { await sleep(SLOW); return { choices: [{ message: { content: 'done.' } }] }; },
-+  async listModels() { return [{ id: 'm' }]; },
-+};
-+const projectDir = await mkdtemp(path.join(tmpdir(), 'cb-winstatus-proj-'));
-+await writeFile(path.join(projectDir, 'README.md'), 'x\n');
-+const html = (await readFile(path.join(ROOT, 'src', 'ui.html'), 'utf8')).replace('</head>', '<script>window.SERVER_CONFIG=' + JSON.stringify({ defaultModel: 'm', baseURL: '(mock)' }) + ';</script></head>');
-+const { server } = await startServer({ html, baseURL: '(mock)', apiKey: 'k', gitlabCreds: { user: 't', token: 't' }, defaultModel: 'm', port: PORT, adapter, modelsList: [{ id: 'm' }], initialProject: projectDir });
-+const browser = await puppeteer.launch({ executablePath: chrome, headless: 'new', args: ['--no-sandbox'] });
++const C = '/--- you ab12 ---';
++const delivered = [];
++setSnippetJobDoneHandler((job) => delivered.push({ id: job.id, status: job.result.status, content: String(job.result.content), at: Date.now() }));
++const deliveredFor = async (id, ms = 15000) => { const t0 = Date.now(); while (Date.now() - t0 < ms) { const d = delivered.find((x) => x.id === id); if (d) return d; await sleep(50); } return null; };
++async function run(dir, replies) {
++  let i = 0;
++  const adapter = { async *completeStream() { yield { choices: [{ delta: { content: replies[Math.min(i++, replies.length - 1)] } }] }; } };
++  const events = [];
++  const result = await runMinimalWorker({ adapter, model: 't', signal: { aborted: false }, messages: [{ content: 'go' }], projectDir: dir,
++    requireBranch: () => 'ok', requireApproval: () => true, onChatEvent: (e) => events.push(e), onPhase: () => {}, onLog: () => {} });
++  return { events, result, results: events.filter((e) => e.type === 'tool-result' && e.name === 'js_eval') };
++}
++const js = (code, attrs = '') => `<remote-workspace><js${attrs}>${code}</js></remote-workspace>`;
++const idOf = (s) => (/as (js-\d+)/.exec(String(s)) || [])[1];
++
++const dir = await mkdtemp(path.join(tmpdir(), 'cb-fgbg-'));
++await writeFile(path.join(dir, 'a.txt'), 'hello');
++try { execFileSync('git', ['init', '-q'], { cwd: dir }); } catch {}
++
 +try {
-+  const page = await browser.newPage();
-+  await page.setViewport({ width: 1400, height: 900 });
-+  await page.goto(`http://localhost:${PORT}/`);
-+  await page.waitForSelector('#chat:not(.hidden)', { timeout: 15000 });
-+  await sleep(800);
-+  const until = async (f, ms = 8000) => { const t = Date.now(); let v; while (Date.now() - t < ms) { v = await f(); if (v) return v; await sleep(100); } return v; };
-+  // what the icon says, and the colour at the dot's centre (the star's own colour there when there is no dot)
-+  const icon = () => page.evaluate(async () => {
-+    const l = document.querySelector('link[rel="icon"]');
-+    const img = new Image(); img.src = l.href; await img.decode();
-+    const c = document.createElement('canvas'); c.width = c.height = 64; const x = c.getContext('2d'); x.drawImage(img, 0, 0, 64, 64);
-+    const [r, g, b] = x.getImageData(47, 47, 1, 1).data;
-+    return { st: document.documentElement.dataset.cbStatus || '', rgb: [r, g, b], links: document.querySelectorAll('link[rel="icon"]').length };
-+  });
-+  const send = async (text) => { await page.click('#input'); await page.keyboard.type(text); await page.keyboard.press('Enter'); };
-+  const runOver = () => until(async () => ((await (await fetch(`http://127.0.0.1:${PORT}/api/state?limit=1`)).json()).status !== 'running') || null, 15000);
++  console.log('\n[1] past its time in the foreground: the background');
++  {
++    const t0 = Date.now();
++    const { results } = await run(dir, [js('await new Promise((r) => setTimeout(r, 3500)); return "LONG_DONE"'), 'It is running.\n' + C]);
++    const r = results[0], back = Date.now() - t0, id = idOf(r && r.content);
++    ok(r && /^STILL RUNNING, in the background as js-\d+: it ran 1.5 s in the foreground/.test(r.content) && back < 3000, `the call came back after its time in the foreground (${back} ms): ${String(r && r.content).slice(0, 90)}`);
++    ok(r && /Nothing failed and nothing was stopped/.test(r.content) && /bgStatus\("js-\d+"\)/.test(r.content) && /bgKill\("js-\d+"\)/.test(r.content) && /do not run it again or split it up/.test(r.content), 'it says nothing was stopped, how to look and how to stop it, and not to split the work');
++    const d = await deliveredFor(id);
++    ok(d && d.status === 'ok' && /^LONG_DONE/.test(d.content), `it ran to its end and its result was delivered (${d ? d.content.slice(0, 30) : 'nothing'})`);
++  }
 +
-+  console.log('\n[1] the window\'s icon');
-+  const rest = await icon();
-+  ok(rest.st === 'idle' && rest.links === 1, `at rest: the star (${JSON.stringify(rest)})`);
-+  await send('one');
-+  const busy = await until(async () => { const i = await icon(); return i.st === 'working' ? i : null; }, 4000);
-+  ok(!!busy && busy.rgb[1] > busy.rgb[0] && busy.rgb[1] > busy.rgb[2] && busy.links === 1, `a run going: a green dot (${JSON.stringify(busy)})`);
-+  await runOver();
-+  const after = await until(async () => { const i = await icon(); return i.st === 'idle' ? i : null; }, 4000);
-+  ok(!!after && after.rgb.join() === rest.rgb.join(), `the run ended with the window in front: the star again, no "done" (${JSON.stringify(after)})`);
-+  // the window behind another while a run ends: "done", until it is in front again
-+  await send('two');
-+  await until(async () => ((await icon()).st === 'working') || null, 4000);
-+  const other = await browser.newPage();
-+  await other.goto('about:blank'); await other.bringToFront();
-+  await runOver();
-+  const done = await until(async () => { const i = await icon(); return i.st === 'done' ? i : null; }, 4000);
-+  ok(!!done && done.rgb[2] > done.rgb[0] + 60 && done.rgb[2] > done.rgb[1], `the run ended while the window was behind another: a blue dot (${JSON.stringify(done)})`);
-+  await page.bringToFront();
-+  await page.evaluate(() => window.dispatchEvent(new Event('focus')));
-+  const seen = await until(async () => { const i = await icon(); return i.st === 'idle' ? i : null; }, 4000);
-+  ok(!!seen, `in front again: the blue dot goes (${JSON.stringify(seen || await icon())})`);
-+  await other.close();
-+  await page.evaluate(() => openApprovalModal({ id: 'q1', title: 'May I?', body: 'a question' }));
-+  const ask = await until(async () => { const i = await icon(); return i.st === 'ask' ? i : null; }, 3000);
-+  ok(!!ask && ask.rgb[0] > ask.rgb[1] + 40 && ask.rgb[0] > ask.rgb[2] + 40, `a question waiting: a red dot (${JSON.stringify(ask)})`);
-+  await page.evaluate(() => closeApprovalModal());
-+  const askGone = await until(async () => ((await icon()).st === 'idle') || null, 3000);
-+  ok(askGone === true, 'answered: the star again');
++  console.log('\n[2] its own timeout_ms is its time in the foreground');
++  {
++    const t0 = Date.now();
++    const { results } = await run(dir, [js('await new Promise((r) => setTimeout(r, 2000)); return "FG_DONE"', ' timeout_ms="4000"'), 'Done.\n' + C]);
++    const r = results[0];
++    ok(r && /FG_DONE/.test(r.content) && !/background/i.test(r.content.split('\n')[0]) && Date.now() - t0 >= 1900, `a 2 s snippet given timeout_ms 4000 finished in the foreground (${String(r && r.content).slice(0, 40)})`);
++  }
 +
-+  console.log('\n[2] the running count on ▶');
-+  const bubble = await page.evaluate(() => {
-+    const c = document.getElementById('rpCount'), ico = document.querySelector('#rpTabRunning .rp-ico');
-+    c.textContent = '3';
-+    const cs = getComputedStyle(c), r = c.getBoundingClientRect(), i = ico.getBoundingClientRect();
-+    const out = { pos: cs.position, bg: cs.backgroundColor, accent: getComputedStyle(document.documentElement).getPropertyValue('--accent').trim(), w: Math.round(r.width), h: Math.round(r.height), aboveIcon: r.top < i.top + 2, rightOfIconMid: r.left > i.left + i.width / 2 - 1, overlapsIcon: r.left < i.right && r.bottom > i.top };
-+    c.textContent = '';
-+    out.emptyShown = getComputedStyle(c).display !== 'none';
-+    return out;
-+  });
-+  ok(bubble.pos === 'absolute' && bubble.w >= 12 && bubble.h === 12 && bubble.aboveIcon && bubble.rightOfIconMid && bubble.overlapsIcon && !bubble.emptyShown, `a 12px bubble floating on the icon's upper right; none at 0 (${JSON.stringify(bubble)})`);
-+  const shot = await page.$('#rpTabRunning');
-+  await page.evaluate(() => { document.getElementById('rpCount').textContent = '3'; });
-+  if (shot) { const bb = await shot.boundingBox(); await page.screenshot({ path: path.join(tmpdir(), 'cb-rp-count-bubble.png'), clip: { x: bb.x - 10, y: Math.max(0, bb.y - 10), width: bb.width + 40, height: bb.height + 20 } }); }
-+  await page.evaluate(() => { document.getElementById('rpCount').textContent = ''; });
++  console.log('\n[3] a quiet call: its snippet goes to the background, the call is not killed');
++  {
++    const t0 = Date.now();
++    const code = 'const r = await node(["-e", "setTimeout(() => console.log(\'LATE_OUTPUT\'), 2600)"], { quietMs: 900 }); return r.stdout';
++    const { results } = await run(dir, [js(code, ' timeout_ms="20000"'), 'Looking.\n' + C]);
++    const r = results[0], back = Date.now() - t0, id = idOf(r && r.content);
++    ok(r && /^POSSIBLY STUCK, in the background as js-\d+/.test(r.content) && /was NOT killed/.test(r.content) && back < 2500, `it came back at the quiet limit (${back} ms): ${String(r && r.content).slice(0, 90)}`);
++    const d = await deliveredFor(id);
++    ok(d && d.status === 'ok' && /LATE_OUTPUT/.test(d.content) && !/\[stopped: no output\]/.test(d.content), `the process ran to its end - what it printed late is in the result (${d ? d.content.replace(/\s+/g, ' ').slice(0, 80) : 'nothing'})`);
++  }
 +
-+  console.log('\n[3] the agent\'s browser takes the panel once, when it opens');
-+  const stay = await page.evaluate(() => {
-+    session.panelBrowser = true; session.panelBrowserSupported = true; session.panelBrowserLive = true;
-+    renderPanelBrowser(); setRightPanelCollapsed(true); rpSelect('running');
-+    // the browser OPENS (no tab before): it is brought into view, once
-+    panelBrowserShow('http://127.0.0.1:9/w', { show: true, tabs: [{ tab: 'T1', label: 'a', url: 'http://127.0.0.1:9/w', title: '' }], active: 'T1', tab: 'T1' });
-+    const first = document.getElementById('rpTabBrowser').classList.contains('active') && !document.getElementById('rightPanel').classList.contains('collapsed');
-+    rpSelect('running');
-+    panelBrowserShow('http://127.0.0.1:9/x', { show: true, tabs: [{ tab: 'T1', label: 'a', url: 'http://127.0.0.1:9/x', title: '' }, { tab: 'T2', label: 'b', url: 'http://127.0.0.1:9/x', title: '' }], active: 'T2', tab: 'T2' });
-+    const running = document.getElementById('rpTabRunning').classList.contains('active');
-+    setRightPanelCollapsed(true);
-+    panelBrowserShow('http://127.0.0.1:9/y', { show: true, tabs: [{ tab: 'T1', label: 'a', url: 'http://127.0.0.1:9/y', title: '' }], active: 'T1', tab: 'T1' });
-+    const collapsed = document.getElementById('rightPanel').classList.contains('collapsed');
-+    setRightPanelCollapsed(false);
-+    return { first, running, collapsed };
-+  });
-+  ok(stay.first, `the browser OPENING (its first tab) brings it into view, the panel opened (${JSON.stringify(stay)})`);
-+  ok(stay.running && stay.collapsed, `after that, a page or a tab the agent opens leaves the running list in view, and a collapsed panel collapsed (${JSON.stringify(stay)})`);
++  console.log('\n[4] a time-backgrounded snippet can be stopped');
++  {
++    const { results } = await run(dir, [js('await new Promise((r) => setTimeout(r, 8000)); return "NEVER"'), 'Running.\n' + C]);
++    const id = idOf(results[0] && results[0].content);
++    ok(!!id, `it went to the background (${id})`);
++    killSnippetJob(dir, id);
++    const d = await deliveredFor(id, 5000);
++    ok(d && !/^NEVER/.test(d.content), `kill_background stops it; its delivery says so (${d ? d.content.slice(0, 60) : 'nothing'})`);
++  }
 +} catch (e) { fail++; console.log('  FAIL threw: ' + (e && e.stack || e)); }
-+finally { await browser.close(); server.close(); }
 +console.log(`\n${pass} passed, ${fail} failed`);
 +process.exit(fail ? 1 : 0);
 +
