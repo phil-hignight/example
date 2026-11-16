@@ -1,437 +1,135 @@
 code_boss chunk 1
-number 33
-made 2026-11-14T23:06:21.744Z
-message 2 changes
-message
-message - A snippet that runs long goes to the background instead of being killed; the dotted chain line 2px from each dot, a little lighter
-message - The setup and release windows are wizards: only the step to do now is open
-before 5fb2e7a2e018226368c92b2e
-after d8acc75b216006d4683b09ef
-files 10
+number 35
+made 2026-11-16T18:26:46.588Z
+message The release's own folders inside the project folder are not the project: out of its git, and the check skips them
+before b0b701620a0112950d93ce1f
+after 197f0d6f0ba5e068d0c568b5
+files 4
 left 0
-check 8c9ad53b3d46a856
+check d420a5e57baffd89
 
 === change scripts/build-number.txt
-base 14f9b7e71b533c16275b8ba4
-new 3840f7c45ddb32c37fa0e586
+base ae7cc2a518631bf86fc9c743
+new 8fd564ff268d2a79cdaa5fe8
 @@ 1 -1 +1
--2890
-+2891
-=== change src/agent/minimal-worker.mjs
-base 9c26973fd53588a9831a0d49
-new 2d934a5c05e0f43d53df7733
-@@ 219 -0 +9
-+// A SNIPPET THAT RUNS LONG GOES TO THE BACKGROUND - IT IS NOT KILLED (the developer, 2026-11-14: "backgrounding the
-+// process sounds better than killing it, so the agent [can] check on it and kill it if it wants to ... Maybe we should
-+// just do it like claude code"). The agent was splitting test runs across snippets to stay under a 30-minute kill.
-+// Now a snippet waits in the foreground SNIPPET_FG_MS (its own <js timeout_ms>, up to 30 min, if it gave one), then
-+// carries on in the background, as the developer's ⇱ moves it; the agent is told, can look (bg_status) or stop it
-+// (kill_background), and gets its result when it ends. A call in it that prints nothing for its quiet limit moves it
-+// there too, instead of being killed as stuck. SNIPPET_BG_BUDGET_MS stays the far ceiling.
-+const SNIPPET_FG_MS = Number(process.env.CB_SNIPPET_FG_MS) || 10 * 60 * 1000;
-+const snippetForegroundMs = (args) => { const t = Number(args && args.timeout_ms); return t > 0 ? Math.min(Math.max(1000, t), 30 * 60 * 1000) : SNIPPET_FG_MS; };
-@@ 828 -1 +1
--        ...(job ? { onBudgetControl: (ctl) => { job._extendBudget = ctl.extend; }, ...(job.background ? { jsBudgetMs: SNIPPET_BG_BUDGET_MS } : {}) } : {}),
-+        ...(job ? { onBudgetControl: (ctl) => { job._extendBudget = ctl.extend; }, ...(job.background ? { jsBudgetMs: SNIPPET_BG_BUDGET_MS } : {}), toBackground: (why) => { try { job._toBackground?.(why); } catch {} } } : {}),
-@@ 1288 -0 +4
-+          // (its time in the foreground: then the background - see SNIPPET_FG_MS)
-+          const fgMs = snippetForegroundMs(c.args);
-+          const fgTimer = setTimeout(() => { try { job._toBackground('time'); } catch {} }, fgMs);
-+          if (fgTimer.unref) fgTimer.unref();
-@@ 1289 -0 +1
-+          clearTimeout(fgTimer);
-@@ 1290 -1 +1
--          if (winner === 'developer' || winner === 'wait') {
-+          if (winner === 'developer' || winner === 'wait' || winner === 'time' || winner === 'quiet') {
-@@ 1295 -0 +1
-+            const fgFor = fgMs >= 60000 ? Math.round(fgMs / 60000) + ' min' : Math.round(fgMs / 100) / 10 + ' s';
-@@ 1297 -0 +4
-+              : winner === 'time'
-+              ? `STILL RUNNING, in the background as ${job.id}: it ran ${fgFor} in the foreground, the most a snippet waits there, so it carries on in the background. Nothing failed and nothing was stopped. You get its result and the full record when it finishes — do not run it again or split it up. Meanwhile carry on with work that does not depend on it; bgStatus("${job.id}") shows how it is doing, and bgKill("${job.id}") stops it if it is stuck or no longer wanted.`
-+              : winner === 'quiet'
-+              ? `POSSIBLY STUCK, in the background as ${job.id}: a call in this snippet has printed nothing for its quiet limit, so we stopped waiting for it. It was NOT killed - it is still running (a long compile can be quiet). Look with bgStatus("${job.id}"); if it is stuck, bgKill("${job.id}"); if it is only quiet, leave it - you get its result and the full record when it finishes. Do not run it again.`
-=== change src/agent/tools.mjs
-base 37ca6a9f1fae0731f7411b2c
-new 72e9d25fbf316f8cea75db76
-@@ 23 -1 +1
--import { killSnippetJob } from './snippet-jobs.mjs';
-+import { killSnippetJob, listSnippetJobs } from './snippet-jobs.mjs';
-@@ 2049 -1 +1
--function runArgv(file, argv, { cwd, stdin, timeoutMs, quietMs, onProgress, signal, useCmd, children, adoptChild, bgCallId, projectDir, env: extraEnv, jsBudget } = {}) {
-+function runArgv(file, argv, { cwd, stdin, timeoutMs, quietMs, onProgress, signal, useCmd, children, adoptChild, bgCallId, projectDir, env: extraEnv, jsBudget, toBackground } = {}) {
-@@ 2071 -1 +1
--    let lastOut = t0, raised = 0, stoppedQuiet = false;
-+    let lastOut = t0, raised = 0, stoppedQuiet = false, movedQuiet = false;
-@@ 2163 -0 +7
-+      // QUIET IN A SNIPPET THAT CAN GO TO THE BACKGROUND: it goes there, and this call runs on - the agent decides
-+      // whether it is stuck (the developer, 2026-11-14: "backgrounding the process sounds better than killing it").
-+      // Said once in what the call prints; a total limit still ends it.
-+      if (quiet && !(limitMs && now - t0 >= limitMs) && typeof toBackground === 'function') {
-+        if (!movedQuiet) { movedQuiet = true; err = (err ? err + '\n' : '') + `[no output for ${fmtLimit(quietLimit)}] still running - its snippet was moved to the background so the agent can check on it (bg_status) and stop it (kill_background) if it is stuck.`; try { toBackground('quiet'); } catch {} }
-+        return;
-+      }
-@@ 2272 -0 +4
-+// (2026-11-14: in a snippet that can go to the background, a call is not cut at 30 min: the snippet goes to the
-+// background after its time in the foreground (minimal-worker SNIPPET_FG_MS) and the call runs on, up to this ceiling -
-+// the background snippet's own)
-+const ARGV_BG_TIMEOUT_MS = 2 * 60 * 60 * 1000;   // 2 h
-@@ 2276 -1 +3
--  return Math.min(Math.max(1000, Number(ms) || snippetDefault || def), BASH_MAX_TIMEOUT_MS);
-+  const bg = !!(ctx && typeof ctx.toBackground === 'function');
-+  if (bg && def === ARGV_DEFAULT_TIMEOUT_MS) def = ARGV_BG_TIMEOUT_MS;
-+  return Math.min(Math.max(1000, Number(ms) || snippetDefault || def), bg ? ARGV_BG_TIMEOUT_MS : BASH_MAX_TIMEOUT_MS);
-@@ 2556 -1 +1
--  const runProc = (file, argv, opts) => gated(() => runArgv(file, argv, { ...opts, children, adoptChild, bgCallId: ctx && ctx.callId, projectDir: toolRoot(ctx), jsBudget: ctx && ctx.jsBudget })
-+  const runProc = (file, argv, opts) => gated(() => runArgv(file, argv, { ...opts, children, adoptChild, bgCallId: ctx && ctx.callId, projectDir: toolRoot(ctx), jsBudget: ctx && ctx.jsBudget, toBackground: ctx && ctx.toBackground })
-@@ 3256 -1 +11
--    bgStatus: async ([id]) => { countOp(); return bgStatus({ key: toolRoot(ctx), id: String(id) }); },
-+    // (a snippet's id - js-N, one that went to the background after its time in the foreground, 2026-11-14 - is the
-+    // snippet's state: running or waiting, for how long, its last calls and the files it wrote)
-+    bgStatus: async ([id]) => {
-+      countOp();
-+      if (/^js-\d+$/.test(String(id || ''))) {
-+        const j = listSnippetJobs(toolRoot(ctx)).find((x) => x.id === String(id));
-+        if (!j) return { id: String(id), state: 'unknown', note: 'No snippet ' + id + ' in this project (it may have ended long ago).' };
-+        return { id: j.id, snippet: true, state: j.state, background: !!j.background, runningSec: Math.round(j.runningMs / 1000), lastCalls: j.calls, filesWritten: j.files, ...(j.waitingFor ? { waitingFor: j.waitingFor } : {}), ...(j.status ? { ended: j.status } : {}) };
-+      }
-+      return bgStatus({ key: toolRoot(ctx), id: String(id) });
-+    },
-=== change src/agent/worker-prompt.mjs
-base 51baa71d8534d3a7ec614645
-new 8bf71ff30c6804acba236c86
-@@ 119 -1 +1
--    '  TIME: a process call has TWO limits. It is KILLED when it prints NOTHING for 5 min - taken as stuck - or when it has run 30 min in all, and the call throws (with allowFail it answers timedOut:true). So do not silence a long build (no mvn -q): its output is what shows it is alive. A step that is quiet on purpose gets <js quiet_ms="900000"> (0 = no quiet limit) or {quietMs} on the call; a shorter total, <js timeout_ms="…"> or {timeoutMs}. Longer than 30 min, or anything that does not exit on its own, runs with {background:true} and is awaited across turns.',
-+    '  TIME: nothing long is killed - it goes to the BACKGROUND. A snippet waits in the foreground up to 10 min (or its own <js timeout_ms="…">, up to 30 min); then it carries on in the background by itself, you are told ("STILL RUNNING, in the background as js-N"), and its result reaches you when it finishes. So run a long build or test suite WHOLE, in one snippet - never split it up to stay under a limit. A call that prints NOTHING for 5 min moves its snippet to the background too ("POSSIBLY STUCK") without killing it: look with bgStatus("js-N"), stop it with bgKill("js-N") if it is stuck. Do not silence a long build (no mvn -q): its output is what shows it is alive; a step quiet on purpose gets <js quiet_ms="900000"> (0 = no quiet limit) or {quietMs}. A server, or anything that does not exit on its own, runs with {background:true}.',
-=== change src/release-ui.mjs
-base 4f070e7b320ce122a4f8d20e
-new bc2ed0db9f6da1a9bb36871b
-@@ 480 -0 +1
-+button.link{background:none;border:0;padding:2px 4px;color:var(--accent-text);text-decoration:underline;text-underline-offset:3px;flex:none}button.link:hover:not(:disabled){box-shadow:none;color:var(--accent-hover)}
-@@ 489 -1 +1
--.err{color:var(--err)}.okc{color:var(--ok)}.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-+.err{color:var(--err)}.okc{color:var(--ok)}.warn{color:var(--accent-text)}.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-@@ 492 -0 +20
-+label.chk{display:flex;gap:6px;grid-template-columns:none}
-+.tabs{display:flex;gap:2px;margin:14px 0 0;border-bottom:1px solid var(--border)}
-+.tab{border:0;border-bottom:2px solid transparent;border-radius:0;background:none;color:var(--muted);padding:6px 14px}.tab:hover:not(:disabled){box-shadow:none;color:var(--accent-text)}.tab.on{color:var(--accent-text);border-bottom-color:var(--accent);font-weight:600}
-+.wiz{display:flex;align-items:center;gap:12px;margin:14px 0 0;font-size:12px;color:var(--muted)}.wiz b{color:var(--fg);font-weight:600}
-+.bars{display:flex;gap:4px;flex:none}.bars i{display:block;width:26px;height:4px;border-radius:2px;background:var(--border)}.bars i.d{background:var(--ok)}.bars i.c{background:var(--accent)}
-+ol.steps{list-style:none;margin:12px 0 0;padding:0;display:grid;grid-template-columns:minmax(0,1fr);gap:8px}
-+.step{border:1px solid var(--border);border-radius:8px;background:var(--panel);padding:12px 16px 14px}
-+.step.future{display:none}.step.open{border-color:var(--accent);box-shadow:var(--accent-ring)}
-+.step.collapsed{padding:6px 12px;background:transparent;border-color:var(--cn-border)}
-+.sh{display:flex;align-items:center;gap:10px;min-width:0}.sh h2{margin:0;border:0;padding:0;flex:none}
-+.num{flex:none;width:20px;height:20px;border-radius:50%;border:1px solid var(--border);display:grid;place-items:center;font-size:11px;font-weight:700;color:var(--muted)}
-+.step.open .num{background:var(--accent);border-color:var(--accent);color:var(--accent-fg)}.step.collapsed .num{border-color:var(--ok);color:var(--ok)}
-+.step.collapsed h2{color:var(--muted)}
-+.st{flex:1;font-size:12px;color:var(--fg);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}.step.open .st{visibility:hidden}.st.warn{color:var(--accent-text)}
-+.back{display:none!important}.step.collapsed .back{display:inline-block!important}
-+.sbody{margin-top:12px}.sbody h2{font-size:10.5px;color:var(--muted);margin:18px 0 6px;border-bottom-color:var(--cn-border)}.sbody>:first-child h2:first-child,.sbody>h2:first-child{margin-top:4px}
-+.lead{margin:0 0 10px;font-size:13px}
-+.nav{margin-top:16px;padding-top:10px;border-top:1px solid var(--cn-border)}.nav .sp{flex:1}
-+#after:empty{display:none}#after{border:1px solid var(--ok);border-radius:6px;padding:8px 12px;margin:8px 0 0;font-size:12.5px}#after.bad{border-color:var(--err)}
-+.foot{margin-top:22px;padding-top:12px;border-top:1px solid var(--cn-border)}
-@@ 494 -0 +9
-+<!-- A WIZARD HERE TOO (the developer, 2026-11-14: "Same for the release window if it applies. Like a proper wizard";
-+     "rework the setup and release ui's to be more ergonomic and clear"): where it goes, what ships, release - one step open
-+     at a time, the ones done a line each above it; the releases and channels a tool of their own, in a tab beside it -->
-+<div class="tabs" id="tabs" style="display:none"><button class="tab on" id="tabRel">Release</button><button class="tab" id="tabRels">Releases and channels</button></div>
-+<div id="wizView">
-+<div class="wiz"><span class="bars" id="bars"><i></i><i></i><i></i></span><span id="stepOf"></span></div>
-+<ol class="steps">
-+<li class="step" id="w1"><div class="sh"><span class="num">1</span><h2>Where it goes</h2><span class="st" id="w1st"></span><button class="link back" id="w1back">Change</button></div>
-+<div class="sbody" id="w1body">
-@@ 495 -1 +0
--<h2>Where it goes</h2>
-@@ 502 -2 +4
--<div id="imgSec" style="display:none"><h2 id="imgHead" style="display:none">The container image</h2><div class="row"><button id="pasteCmd">Paste your image command...</button><span class="sub" id="pasteDone"></span></div><div class="row" id="withRow" style="display:none"><label style="display:flex;gap:6px;grid-template-columns:none"><input type="checkbox" id="withRelease"> each release makes the container image too, with the same build</label></div><div id="imgFields"></div><h2>Switches</h2><div id="imgChecks"></div></div>
--<h2>Your plugins</h2>
-+<div class="sub" id="w1need"></div></div></li>
-+<li class="step" id="w2"><div class="sh"><span class="num">2</span><h2 id="w2name">What ships</h2><span class="st" id="w2st"></span><button class="link back" id="w2back">Change</button></div>
-+<div class="sbody" id="w2body">
-+<div id="plugSec"><h2>Your plugins</h2>
-@@ 507 -3 +6
--<pre id="pview" style="display:none"></pre>
--<div class="row" style="margin-top:10px"><button id="save">Save</button><span class="sub" id="saved"></span></div>
--<div id="relSec"><h2>Release</h2>
-+<pre id="pview" style="display:none"></pre></div>
-+<div id="imgSec" style="display:none"><h2 id="imgHead" style="display:none">The container image</h2><div class="row" id="withRow" style="display:none"><label class="chk"><input type="checkbox" id="withRelease"> each release makes the container image too, with the same build</label></div><div class="row" style="margin-top:6px"><button id="pasteCmd">Paste your image command...</button><span class="sub" id="pasteDone"></span></div><div id="imgFields"></div><h2>Switches</h2><div id="imgChecks"></div></div>
-+</div></li>
-+<li class="step" id="w3"><div class="sh"><span class="num">3</span><h2 id="w3name">Release</h2><span class="st" id="w3st"></span></div>
-+<div class="sbody" id="w3body">
-+<div id="relSec"><div class="lead" id="relLead">Pick where it goes:</div>
-@@ 511 -2 +13
--<label style="display:flex;gap:6px;grid-template-columns:none"><input type="checkbox" id="push" checked> push to GitLab</label></div>
--<div class="sub">devtest: only this machine follows it, to try it yourself first. beta: whoever ticked Beta builds in the app's Settings. production: what everyone's code_boss updates to.</div></div>
-+<label class="chk"><input type="checkbox" id="push" checked> push to GitLab</label></div>
-+<div class="sub" style="margin-top:6px">devtest: only this machine follows it, to try it yourself first. beta: whoever ticked Beta builds in the app's Settings. production: what everyone's code_boss updates to.</div></div>
-+<div id="imgAct" style="display:none"><div class="lead">Pick where it goes:</div>
-+<div class="row"><button class="primary" id="imgDev">Build for devtest</button><button id="imgProd">Build for production</button>
-+<label class="chk"><input type="checkbox" id="ipush"> push to GitLab</label></div>
-+<div class="row"><label class="chk"><input type="checkbox" id="iuninstall"> take the container in the agent folder off this machine first (--uninstall, this run only)</label></div>
-+<div class="row"><label class="chk"><input type="checkbox" id="iyes"> ask nothing (--yes, this run only)</label></div>
-+<div class="sub">devtest: only this machine follows it. production: what everyone's container updates to. Not pushed: built and committed in the image clone only (with --run, installed from there).</div></div>
-+<div id="jobBox"><div id="status" style="margin-top:12px"></div><pre id="log" style="display:none"></pre><div id="after"></div></div>
-+</div></li>
-+</ol>
-+<div class="row nav" id="wnav"><button id="save">Save</button><span class="sub" id="saved"></span><span class="sp"></span><button class="primary" id="next">Continue</button></div>
-+</div>
-@@ 516 -9 +3
--<table id="rels"><thead><tr><th>Build</th><th>code_boss on</th><th>Container on</th><th>Move a channel here</th></tr></thead><tbody></tbody></table></div>
--<div id="imgAct" style="display:none"><h2>Build the image</h2>
--<div class="row"><button class="primary" id="imgDev">Build for devtest</button><button id="imgProd">Build for production</button>
--<label style="display:flex;gap:6px;grid-template-columns:none"><input type="checkbox" id="ipush"> push to GitLab</label></div>
--<div class="row"><label style="display:flex;gap:6px;grid-template-columns:none"><input type="checkbox" id="iuninstall"> take the container in the agent folder off this machine first (--uninstall, this run only)</label></div>
--<div class="row"><label style="display:flex;gap:6px;grid-template-columns:none"><input type="checkbox" id="iyes"> ask nothing (--yes, this run only)</label></div>
--<div class="sub">devtest: only this machine follows it. production: what everyone's container updates to. Not pushed: built and committed in the image clone only (with --run, installed from there).</div></div>
--<div id="status"></div><pre id="log" style="display:none"></pre>
--<div class="row" style="margin-top:18px"><button id="shortcut" style="display:none">Make the desktop shortcut</button><button id="close">Close</button><span class="sub" id="shortcutSays"></span></div>
-+<table id="rels"><thead><tr><th>Build</th><th>code_boss on</th><th>Container on</th><th>Move a channel here</th></tr></thead><tbody></tbody></table>
-+<div id="toolSlot"></div></div>
-+<div class="row foot"><button id="shortcut" style="display:none">Make the desktop shortcut</button><button id="close">Close</button><span class="sub" id="shortcutSays"></span></div>
-@@ 537 -0 +3
-+// THE WIZARD'S PLACE: reach, the furthest step come to (the one to do now); at, the step open; view, the wizard or the
-+// releases and channels
-+let reach=0,at=0,view='wiz';
-@@ 549 -0 +39
-+const names=(s)=>s.mode==='image'?['','Where it goes','The image','Build']:['','Where it goes','What ships','Release'];
-+const missingOf=(s)=>[!s.updateSource&&'the repository',!s.glUser&&'the GitLab user',!s.hasToken&&'the GitLab token'].filter(Boolean);
-+function wiz(s){
-+  const j=s.job,co=!!s.checkout,im=s.mode==='image',N=names(s),miss=missingOf(s);
-+  // (where it opens: Where it goes when something is missing there, or the command line gave something to decide;
-+  // else What ships, to look over before releasing)
-+  if(!reach){reach=j.running?3:miss.length||s.notes.length?1:2;at=reach;}
-+  // A RUN GOING ON STAYS IN SIGHT (2026-11-14): its own place, and nothing moves away from it until it ends
-+  const tool=co&&(j.what==='move'||j.what==='image');
-+  if(j.running){if(tool)view='rels';else{view='wiz';reach=3;at=3;}}
-+  $('tabs').style.display=co?'':'none';
-+  $('tabRel').classList.toggle('on',view==='wiz');$('tabRels').classList.toggle('on',view==='rels');
-+  $('tabRel').disabled=j.running&&view!=='wiz';$('tabRels').disabled=j.running&&view!=='rels';
-+  $('wizView').style.display=view==='wiz'?'':'none';$('relsSec').style.display=co&&view==='rels'?'':'none';
-+  // (the run's line and log where the run was started from)
-+  const slot=tool?$('toolSlot'):$('w3body');if($('jobBox').parentNode!==slot)slot.appendChild($('jobBox'));
-+  for(const n of [1,2,3]){
-+    const li=$('w'+n),full=n===at,line=!full&&n<reach;
-+    li.classList.toggle('open',full);li.classList.toggle('collapsed',line);li.classList.toggle('future',!full&&!line);
-+    li.querySelector('.num').textContent=line?'\u2713':String(n);
-+    $('w'+n+'body').style.display=full?'':'none';
-+    const b=$('w'+n+'back');if(b)b.disabled=j.running;
-+  }
-+  [...$('bars').children].forEach((b,i)=>{b.className=i+1===at?'c':i+1<reach?'d':'';});
-+  $('w2name').textContent=N[2];$('w3name').textContent=N[3];
-+  $('stepOf').innerHTML='Step <b>'+at+'</b> of 3: <b>'+esc(N[at])+'</b>'+(at<reach?' <span class="warn">- gone back; Continue returns to step '+reach+' ('+esc(N[reach])+')</span>':'');
-+  // (Save, and Continue - which saves too - in the step open; not in the last)
-+  const nav=$('wnav');if(at<3){if(nav.parentNode!==$('w'+at+'body'))$('w'+at+'body').appendChild(nav);nav.style.display='';}else nav.style.display='none';
-+  const to=Math.max(at+1,reach);$('next').textContent='Continue to step '+to+': '+N[to];$('next').disabled=j.running;
-+  // the lines of the steps done: what each settled
-+  $('w1st').textContent=miss.length?'not set: '+miss.join(', '):s.updateSource+' as '+s.glUser+(im?'':co?'':' - from '+s.releaseDir);
-+  $('w1st').className='st'+(miss.length?' warn':'');
-+  $('w1need').innerHTML=miss.length?'<span class="warn">Still to fill in: '+esc(miss.join(', '))+'.</span> '+(im?'(Not needed to build without pushing.)':'A release is pushed to the repository with them.'):'';
-+  const ships=s.plugins.rows.filter(r=>r.ship),changed=ships.filter(r=>r.changed||r.missing).length;
-+  const pl=ships.length?ships.length+' plugin'+(ships.length===1?'':'s')+' ('+ships.map(r=>r.name+(r.enabled?'':' off by default')).join(', ')+')'+(changed?', '+changed+' new or changed since the last '+(im?'image':'release'):''):'no plugins';
-+  $('w2st').textContent=im?s.image.fields.filter(f=>f.value).length+' paths; '+(s.image.checks.filter(c=>c.on).map(c=>'--'+c.key).join(' ')||'no switches')+'; '+pl:pl+(co?(s.image.withRelease?'; the container image too':'; no container image'):'');
-+  $('w3st').textContent='';
-+}
-+function go(n){at=n;reach=Math.max(reach,n);if(st)fill(st);}
-@@ 557 -0 +2
-+  // (the image window: its switches first, then the plugins it carries)
-+  if(im&&$('imgSec').nextElementSibling!==$('plugSec'))$('plugSec').before($('imgSec'));
-@@ 558 -1 +1
--  $('srcRow').style.display=$('distRow').style.display=$('imgHead').style.display=$('withRow').style.display=$('relsSec').style.display=$('coSays').style.display=co?'':'none';
-+  $('srcRow').style.display=$('distRow').style.display=$('imgHead').style.display=$('withRow').style.display=$('coSays').style.display=co?'':'none';
-@@ 565 -1 +1
--    $('imgChecks').innerHTML=s.image.checks.map(c=>'<div class="row"><label style="display:flex;gap:6px;grid-template-columns:none"><input type="checkbox" class="icheck" data-key="'+esc(c.key)+'"'+(c.on?' checked':'')+'> '+esc(c.label)+'</label></div>').join('');
-+    $('imgChecks').innerHTML=s.image.checks.map(c=>'<div class="row"><label class="chk"><input type="checkbox" class="icheck" data-key="'+esc(c.key)+'"'+(c.on?' checked':'')+'> '+esc(c.label)+'</label></div>').join('');
-@@ 572 -0 +1
-+  wiz(s);
-@@ 576 -0 +1
-+  if(j.lines.length||j.running){$('log').style.display='';const atEnd=$('log').scrollTop+$('log').clientHeight>=$('log').scrollHeight-4;$('log').textContent=j.lines.join('\n');if(atEnd)$('log').scrollTop=$('log').scrollHeight;}
-@@ 577 -3 +1
--    if(j.lines.length||j.running){$('log').style.display='';const at=$('log').scrollTop+$('log').clientHeight>=$('log').scrollHeight-4;$('log').textContent=j.lines.join('\n');if(at)$('log').scrollTop=$('log').scrollHeight;}
--    return;}
--  if(j.lines.length||j.running){$('log').style.display='';const at=$('log').scrollTop+$('log').clientHeight>=$('log').scrollHeight-4;$('log').textContent=j.lines.join('\n');if(at)$('log').scrollTop=$('log').scrollHeight;}
-+    after(s);return;}
-@@ 581 -1 +1
--    :(j.running?SP+'Making the image of build '+esc(j.build)+'...':j.code===0?'<span class="okc">The image of build '+esc(j.build)+' is made.</span>':'<span class="err">The image stopped (exit '+esc(j.code)+') - what it said is below.</span>'));return;}
-+    :(j.running?SP+'Making the image of build '+esc(j.build)+'...':j.code===0?'<span class="okc">The image of build '+esc(j.build)+' is made.</span>':'<span class="err">The image stopped (exit '+esc(j.code)+') - what it said is below.</span>'));after(s);return;}
-@@ 583 -0 +14
-+  after(s);
-+}
-+// WHAT TO DO NEXT, once a run has ended (2026-11-14: the result, and where to go from it)
-+function after(s){
-+  const j=s.job,im=s.mode==='image',co=!!s.checkout,tool=co&&(j.what==='move'||j.what==='image');
-+  let h='';
-+  if(!j.running&&j.code!=null&&!tool){
-+    if(j.code!==0)h='Put right what the end of the log says, then '+(im?'build':'release')+' again.';
-+    else if(!j.push)h=im?'Built and committed in the image clone only: nothing updates to it until it is pushed.':'Built and committed here, not pushed: nothing updates to it until it is pushed - release again with push to GitLab ticked.';
-+    else{const who=j.channel==='devtest'?'only this machine follows devtest':j.channel==='beta'?'whoever ticked Beta builds gets it too':'everyone on production updates to it';
-+      h=im?(s.image.checks.some(c=>c.key==='run'&&c.on)?'It is installed in the agent folder and started already (--run); next time, open it from its Desktop shortcut "Code Boss" ('+who+').':'Next: open the container from its Desktop shortcut "Code Boss" ('+who+').')
-+        :(co&&s.image.withRelease?'Next: open the container from its Desktop shortcut "Code Boss" - it updates to this build ('+who+').':'Next: start code_boss - it updates to this build ('+who+').')+(j.channel==='devtest'?' Once it is right, release it to production from here.':'');}
-+  }
-+  put('after',h);$('after').classList.toggle('bad',j.code!=null&&j.code!==0);
-@@ 602 -0 +4
-+// CONTINUE SAVES THE STEP (2026-11-14): nothing typed is lost going on - or going back, the fields stay as they are
-+$('next').onclick=()=>busy($('next'),'saved',dirty?'Saving...':'',async()=>{if(dirty&&!(await save()))return;go(Math.max(at+1,reach));});
-+$('w1back').onclick=()=>{at=1;if(st)fill(st);};$('w2back').onclick=()=>{at=2;if(st)fill(st);};
-+$('tabRel').onclick=()=>{view='wiz';if(st)fill(st);};$('tabRels').onclick=()=>{view='rels';if(st)fill(st);};
-=== change src/ui.html
-base f46ad3ad0facf5199c5b0436
-new fb098ed3bf034e68dee4a272
-@@ 1389 -1 +1
--     others: the dashes touching a dot's top and bottom read as one stroke with it. jsChainLayout cuts a gap of 3px
-+     others: the dashes touching a dot's top and bottom read as one stroke with it. jsChainLayout cuts a gap of 2px
-@@ 1391 -0 +1
-+  /* (the line a little lighter: 55% of --muted, was 42% - the developer, 2026-11-14) */
-@@ 1392 -1 +1
--  .js-group.js-chain::before { content: ''; position: absolute; left: calc(var(--gutter) / 2 - var(--chain-w) / 2); top: var(--chain-top, 0); height: var(--chain-h, 0); width: var(--chain-w); background: repeating-linear-gradient(to bottom, color-mix(in srgb, var(--muted) 42%, transparent) 0 2px, transparent 2px 6px); -webkit-mask-image: var(--chain-mask, none); mask-image: var(--chain-mask, none); pointer-events: none; }
-+  .js-group.js-chain::before { content: ''; position: absolute; left: calc(var(--gutter) / 2 - var(--chain-w) / 2); top: var(--chain-top, 0); height: var(--chain-h, 0); width: var(--chain-w); background: repeating-linear-gradient(to bottom, color-mix(in srgb, var(--muted) 55%, transparent) 0 2px, transparent 2px 6px); -webkit-mask-image: var(--chain-mask, none); mask-image: var(--chain-mask, none); pointer-events: none; }
-@@ 9948 -1 +2
--    // a gap round each dot: the ● is about 0.6em across, and the line stops 3px short of it, above and below
-+    // a gap round each dot: the ● is about 0.6em across, and the line stops 2px short of it, above and below (3px read
-+    // as too much - the developer, 2026-11-14)
-@@ 9950 -1 +1
--    const r = (d0 ? parseFloat(getComputedStyle(d0).fontSize) || 13.5 : 13.5) * 0.3 + 3;
-+    const r = (d0 ? parseFloat(getComputedStyle(d0).fontSize) || 13.5 : 13.5) * 0.3 + 2;
-=== change test/test-image-window-e2e.mjs
-base 31152697226b2f10d3148949
-new cda8da9457e6e13b60b2eeca
-@@ 87 -0 +8
-+  // (a wizard, the developer, 2026-11-14: "Same for the release window if it applies": the notes open Where it goes;
-+  // Continue to The image, Continue to Build)
-+  const seen = () => page.evaluate(() => [1, 2, 3].map((n) => { const li = document.getElementById('w' + n); return getComputedStyle(li).display === 'none' ? '-' : li.classList.contains('collapsed') ? 'line' : 'open'; }).join(','));
-+  const s0 = await seen();
-+  await page.click('#next');
-+  const s1 = await seen();
-+  await page.click('#next');
-+  ok(s0 === 'open,-,-' && s1 === 'line,open,-' && await seen() === 'line,line,open' && /Step 3 of 3: Build/.test(await page.$eval('#stepOf', (e) => e.textContent)) && await page.$eval('#imgDev', (e) => !!e.offsetParent), `the steps one at a time: Where it goes, The image, Build (${s0} / ${s1} / ${await seen()})`);
-@@ 97 -1 +3
--  // the window's own change: --run off, saved
-+  ok(/Next: open the container from its Desktop shortcut/.test(await page.$eval('#after', (e) => e.textContent)) || /nothing updates to it until it is pushed/.test(await page.$eval('#after', (e) => e.textContent)), `what to do next, said (${await page.$eval('#after', (e) => e.textContent)})`);
-+  // the window's own change: --run off, saved (back at The image: "Change" on its line)
-+  await page.click('#w2back');
-=== change test/test-release-window-checkout-e2e.mjs
-base cdcc0a338527cc4769df486b
-new 39ec00fa32e72ab9f1406b30
-@@ 98 -0 +6
-+  // (a wizard, the developer, 2026-11-14: "Same for the release window if it applies. Like a proper wizard" - What ships
-+  // is open, with the container image's settings; Continue saves it and opens Release)
-+  const seen = () => page.evaluate(() => [1, 2, 3].map((n) => { const li = document.getElementById('w' + n); return getComputedStyle(li).display === 'none' ? '-' : li.classList.contains('collapsed') ? 'line' : 'open'; }).join(','));
-+  ok(await seen() === 'line,open,-' && await page.$eval('#withRelease', (e) => !!e.offsetParent) && await page.$eval('#rels', (e) => !e.offsetParent), `What ships open with the container image; the releases and channels not in the way (${await seen()})`);
-+  await page.click('#next');
-+  ok(await seen() === 'line,line,open' && /the container image too/.test(await text('#w2st')), `Continue: Release open (${await text('#w2st')})`);
-@@ 107 -0 +1
-+  ok(/open the container from its Desktop shortcut "Code Boss"/.test(await text('#after')), `what to do next, said (${await text('#after')})`);
-@@ 109 -0 +3
-+  // (the releases and channels: a tool of their own, in the tab beside the wizard)
-+  await page.click('#tabRels');
-+  ok(await page.$eval('#rels', (e) => !!e.offsetParent) && await page.$eval('#wizView', (e) => getComputedStyle(e).display === 'none'), 'its tab shows the releases and channels, the wizard out of the way');
-@@ 114 -0 +1
-+  ok(await page.$eval('#status', (e) => !!e.offsetParent && document.getElementById('relsSec').contains(e)), 'the move\'s line and log are in its own tab');
-@@ 157 -0 +2
-+    // (a note still to decide opens the wizard at Where it goes: Continue to What ships, where the image's settings are)
-+    if (!(await page.$eval('#pasteCmd', (e) => !!e.offsetParent))) await page.click('#next');
-=== change test/test-release-window-e2e.mjs
-base 1b90a6fb531eb78e655b8e0c
-new e8aa6c3f36121646444352d8
-@@ 62 -0 +4
-+  // A WIZARD (the developer, 2026-11-14: "Same for the release window if it applies. Like a proper wizard"): where it
-+  // goes is all filled in, so it is one line; What ships is open; Release is not on the page until it is come to
-+  const seen = (p) => p.evaluate(() => [1, 2, 3].map((n) => { const li = document.getElementById('w' + n); return getComputedStyle(li).display === 'none' ? '-' : li.classList.contains('collapsed') ? 'line' : 'open'; }).join(','));
-+  ok(await seen(page) === 'line,open,-' && /gitlab\.x\/g\/cb as me/.test(await page.$eval('#w1st', (e) => e.textContent)), `step 1 a line (what it settled), step 2 open, step 3 not shown (${await seen(page)})`);
-@@ 78 -0 +3
-+  await page.click('#next');
-+  await page.waitForFunction(() => getComputedStyle(document.getElementById('w3')).display !== 'none' && !!document.getElementById('relDev').offsetParent, { timeout: 5000 });
-+  ok(await seen(page) === 'line,line,open' && /2 plugins \(lint, report off by default\)/.test(await page.$eval('#w2st', (e) => e.textContent)), `Continue: step 3 open, What ships a line saying what ships (${await page.$eval('#w2st', (e) => e.textContent)})`);
-@@ 80 -0 +1
-+  ok(/Next: start code_boss/.test(await page.$eval('#after', (e) => e.textContent)), `and what to do next (${await page.$eval('#after', (e) => e.textContent)})`);
-@@ 116 -0 +1
-+  ok(await seen(p2) === 'open,-,-', `something to decide in where it goes: step 1 opens (${await seen(p2)})`);
-=== add test/test-snippet-time-to-background.mjs
-new b8ca18ce0198c6ca7e25d74f
+-2898
++2899
+=== change src/release-run.mjs
+base 75787b8744bba9fdc4c77ec2
+new 41019a36130a6c043de131f6
+@@ 25 -1 +1
+-import { rsReadJson, rsCfgPath, rsCredsPath, relReleaseProblem } from './release-settings.mjs';
++import { rsReadJson, rsCfgPath, rsCredsPath, relReleaseProblem, rsReleaseDir, rsDistDir, rsFoldersInside, rsUnderFolders, rsKeepFoldersOut } from './release-settings.mjs';
+@@ 33 -1 +1
+-export const rrReleaseDir = (checkout) => rsReadJson(rsCfgPath()).releaseDir || path.join(path.dirname(path.resolve(checkout)), 'code_boss-src');
++export const rrReleaseDir = (checkout) => rsReleaseDir(checkout);
+@@ 35 -1 +1
+-export const rrDistDir = (checkout) => String(rsReadJson(rsCfgPath()).distDir || '').trim() || path.join(path.dirname(rrReleaseDir(checkout)), 'code_boss-dist');
++export const rrDistDir = (checkout) => rsDistDir(checkout);
+@@ 48 -1 +3
+-  const lines = String(rrGit(checkout, ['status', '--porcelain', '--ignore-submodules=all']).stdout || '').split(/\r?\n/).filter(Boolean);
++  // (nor are the release's own folders when they sit inside it: a release rewrites them - rsFoldersInside)
++  const inside = rsFoldersInside(checkout);
++  const lines = String(rrGit(checkout, ['status', '--porcelain', '--ignore-submodules=all']).stdout || '').split(/\r?\n/).filter(Boolean).filter((l) => !rsUnderFolders(l.slice(3), inside));
+@@ 118 -0 +1
++  const inside = rsFoldersInside(checkout);
+@@ 119 -0 +1
++    if (rsUnderFolders(p, inside)) return false;   // (the release's own folders: rsFoldersInside)
+@@ 166 -0 +2
++  // (a commit from before the release's own folders were taken out of git still lists them: not part of the build)
++  for (const d of rsFoldersInside(checkout)) rmSync(path.join(buildDir, ...d.split('/')), { recursive: true, force: true });
+@@ 287 -1 +5
+-  if (st.changed.length || dropped.length) {
++  // ...and the release's own folders, when they sit inside the checkout and git lists their files (rsFoldersInside)
++  let keptOut = [];
++  try { keptOut = rsKeepFoldersOut(checkout, (a) => rrGit(checkout, a)); } catch (e) { log('Nothing was released: ' + rrHide(e.message)); return 1; }
++  if (keptOut.length) log(`${keptOut.join(', ')}: the release's own folder, inside the checkout - taken out of git's list (the folder is left as it is)`);
++  if (st.changed.length || dropped.length || keptOut.length) {
+@@ 290 -1 +1
+-    log(`committed on ${st.branch}: ${st.changed.length + dropped.length} changed file(s), "Source of build ${build}"`);
++    log(`committed on ${st.branch}: ${st.changed.length + dropped.length} changed file(s)${keptOut.length ? `, ${keptOut.join(', ')} out of git` : ''}, "Source of build ${build}"`);
+=== change src/release-settings.mjs
+base 7001c2d610a9d63f97a686b3
+new 983c903e823098690234f641
+@@ 17 -0 +51
++// ── THE RELEASE'S OWN FOLDERS: never part of the project, even when they sit inside its folder ─────────────────
++/** Where the release builds (the setup file's extract): the saved one, else code_boss-src beside the checkout. */
++export const rsReleaseDir = (checkout) => rsReadJson(rsCfgPath()).releaseDir || path.join(path.dirname(path.resolve(checkout)), 'code_boss-src');
++/** The dist folder (release-channels.mjs): the saved one, else code_boss-dist beside the release folder. */
++export const rsDistDir = (checkout) => String(rsReadJson(rsCfgPath()).distDir || '').trim() || path.join(path.dirname(rsReleaseDir(checkout)), 'code_boss-dist');
 +/**
-+ * A SNIPPET THAT RUNS LONG GOES TO THE BACKGROUND - IT IS NOT KILLED (the developer, 2026-11-14: "backgrounding the
-+ * process sounds better than killing it, so the agent [can] check on it and kill it if it wants to ... Maybe we should
-+ * just do it like claude code"). The agent had been splitting test runs across snippets to stay under a 30-min kill.
-+ *   [1] past its time in the foreground (CB_SNIPPET_FG_MS, 1.5 s here) a snippet carries on in the background: the call
-+ *       returns "STILL RUNNING, in the background", the run goes on, and the result is delivered when it ends
-+ *   [2] its own <js timeout_ms> is its time in the foreground: a 2 s snippet given 4 s finishes in the foreground
-+ *   [3] a call that prints nothing for its quiet limit is NOT killed: its snippet goes to the background ("POSSIBLY
-+ *       STUCK"), the process runs to its end, and what it printed late is in the delivered result
-+ *   [4] a time-backgrounded snippet is stopped by kill_background, as any background snippet is
-+ * Run: node test/test-snippet-time-to-background.mjs
++ * THOSE OF THEM INSIDE THE CHECKOUT, as git names them ('code_boss-src'), [] when none. Prod, 2026-11-16: the release
++ * folder was D:\code\code_boss\code_boss-project\code_boss-src, inside the project folder; the setup window's `git add -A`
++ * had put its files in the project's git, so every release - which rewrites that folder - left 25 "changed" files, and
++ * the next release was refused for them ("This folder gets its files from chunks, and 25 of them are not committed").
 + */
-+process.env.CB_SNIPPET_FG_MS = '1500';   // (read when minimal-worker loads)
-+import { mkdtemp, writeFile } from 'node:fs/promises';
-+import { tmpdir } from 'node:os';
-+import { execFileSync } from 'node:child_process';
-+import path from 'node:path';
-+const { runMinimalWorker } = await import('../src/agent/minimal-worker.mjs');
-+const { setSnippetJobDoneHandler, killSnippetJob } = await import('../src/agent/snippet-jobs.mjs');
-+
-+let pass = 0, fail = 0;
-+const ok = (c, l) => { if (c) { pass++; console.log('  ok', l); } else { fail++; console.log('  FAIL', l); } };
-+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-+const C = '/--- you ab12 ---';
-+const delivered = [];
-+setSnippetJobDoneHandler((job) => delivered.push({ id: job.id, status: job.result.status, content: String(job.result.content), at: Date.now() }));
-+const deliveredFor = async (id, ms = 15000) => { const t0 = Date.now(); while (Date.now() - t0 < ms) { const d = delivered.find((x) => x.id === id); if (d) return d; await sleep(50); } return null; };
-+async function run(dir, replies) {
-+  let i = 0;
-+  const adapter = { async *completeStream() { yield { choices: [{ delta: { content: replies[Math.min(i++, replies.length - 1)] } }] }; } };
-+  const events = [];
-+  const result = await runMinimalWorker({ adapter, model: 't', signal: { aborted: false }, messages: [{ content: 'go' }], projectDir: dir,
-+    requireBranch: () => 'ok', requireApproval: () => true, onChatEvent: (e) => events.push(e), onPhase: () => {}, onLog: () => {} });
-+  return { events, result, results: events.filter((e) => e.type === 'tool-result' && e.name === 'js_eval') };
++export function rsFoldersInside(checkout) {
++  if (!checkout) return [];
++  const out = [];
++  for (const d of [rsReleaseDir(checkout), rsDistDir(checkout)]) {
++    const rel = path.relative(path.resolve(checkout), path.resolve(d));
++    if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) continue;
++    const p = rel.split(path.sep).join('/');
++    if (!out.some((o) => o.toLowerCase() === p.toLowerCase())) out.push(p);
++  }
++  return out;
 +}
-+const js = (code, attrs = '') => `<remote-workspace><js${attrs}>${code}</js></remote-workspace>`;
-+const idOf = (s) => (/as (js-\d+)/.exec(String(s)) || [])[1];
-+
-+const dir = await mkdtemp(path.join(tmpdir(), 'cb-fgbg-'));
-+await writeFile(path.join(dir, 'a.txt'), 'hello');
-+try { execFileSync('git', ['init', '-q'], { cwd: dir }); } catch {}
-+
-+try {
-+  console.log('\n[1] past its time in the foreground: the background');
-+  {
-+    const t0 = Date.now();
-+    const { results } = await run(dir, [js('await new Promise((r) => setTimeout(r, 3500)); return "LONG_DONE"'), 'It is running.\n' + C]);
-+    const r = results[0], back = Date.now() - t0, id = idOf(r && r.content);
-+    ok(r && /^STILL RUNNING, in the background as js-\d+: it ran 1.5 s in the foreground/.test(r.content) && back < 3000, `the call came back after its time in the foreground (${back} ms): ${String(r && r.content).slice(0, 90)}`);
-+    ok(r && /Nothing failed and nothing was stopped/.test(r.content) && /bgStatus\("js-\d+"\)/.test(r.content) && /bgKill\("js-\d+"\)/.test(r.content) && /do not run it again or split it up/.test(r.content), 'it says nothing was stopped, how to look and how to stop it, and not to split the work');
-+    const d = await deliveredFor(id);
-+    ok(d && d.status === 'ok' && /^LONG_DONE/.test(d.content), `it ran to its end and its result was delivered (${d ? d.content.slice(0, 30) : 'nothing'})`);
++/** A path as git names it, in one of those folders? */
++export const rsUnderFolders = (p, dirs) => {
++  const l = String(p).replace(/^"|"$/g, '').toLowerCase();
++  return dirs.some((d) => { const x = d.toLowerCase(); return l === x || l.startsWith(x + '/'); });
++};
++/**
++ * Those folders taken out of the checkout's git (git rm --cached: the files stay where they are) and kept out
++ * (.git/info/exclude, so a `git add -A` does not put them back). git: (args) => a spawnSync result in the checkout.
++ * The folders that were in git's list. Throws when git cannot take one out.
++ */
++export function rsKeepFoldersOut(checkout, git) {
++  const dirs = rsFoldersInside(checkout), dropped = [];
++  for (const d of dirs) {
++    const ls = git(['ls-files', '-z', '--', d]);
++    if (ls.status !== 0 || !String(ls.stdout || '').length) continue;
++    const r = git(['rm', '-r', '--cached', '-q', '--', d]);
++    if (r.status !== 0) throw new Error(`git could not take ${d} out of its list: ${String(r.stderr || r.stdout || '').trim().slice(0, 300)}`);
++    dropped.push(d);
 +  }
-+
-+  console.log('\n[2] its own timeout_ms is its time in the foreground');
-+  {
-+    const t0 = Date.now();
-+    const { results } = await run(dir, [js('await new Promise((r) => setTimeout(r, 2000)); return "FG_DONE"', ' timeout_ms="4000"'), 'Done.\n' + C]);
-+    const r = results[0];
-+    ok(r && /FG_DONE/.test(r.content) && !/background/i.test(r.content.split('\n')[0]) && Date.now() - t0 >= 1900, `a 2 s snippet given timeout_ms 4000 finished in the foreground (${String(r && r.content).slice(0, 40)})`);
++  if (dirs.length) {
++    const ex = path.join(checkout, '.git', 'info', 'exclude');
++    const t = existsSync(ex) ? readFileSync(ex, 'utf8') : '';
++    const have = t.split(/\r?\n/);
++    const add = dirs.map((d) => `/${d}/`).filter((l) => !have.includes(l));
++    if (add.length) { mkdirSync(path.dirname(ex), { recursive: true }); writeFileSync(ex, t + (t && !t.endsWith('\n') ? '\n' : '') + add.join('\n') + '\n'); }
 +  }
++  return dropped;
++}
 +
-+  console.log('\n[3] a quiet call: its snippet goes to the background, the call is not killed');
-+  {
-+    const t0 = Date.now();
-+    const code = 'const r = await node(["-e", "setTimeout(() => console.log(\'LATE_OUTPUT\'), 2600)"], { quietMs: 900 }); return r.stdout';
-+    const { results } = await run(dir, [js(code, ' timeout_ms="20000"'), 'Looking.\n' + C]);
-+    const r = results[0], back = Date.now() - t0, id = idOf(r && r.content);
-+    ok(r && /^POSSIBLY STUCK, in the background as js-\d+/.test(r.content) && /was NOT killed/.test(r.content) && back < 2500, `it came back at the quiet limit (${back} ms): ${String(r && r.content).slice(0, 90)}`);
-+    const d = await deliveredFor(id);
-+    ok(d && d.status === 'ok' && /LATE_OUTPUT/.test(d.content) && !/\[stopped: no output\]/.test(d.content), `the process ran to its end - what it printed late is in the result (${d ? d.content.replace(/\s+/g, ' ').slice(0, 80) : 'nothing'})`);
-+  }
-+
-+  console.log('\n[4] a time-backgrounded snippet can be stopped');
-+  {
-+    const { results } = await run(dir, [js('await new Promise((r) => setTimeout(r, 8000)); return "NEVER"'), 'Running.\n' + C]);
-+    const id = idOf(results[0] && results[0].content);
-+    ok(!!id, `it went to the background (${id})`);
-+    killSnippetJob(dir, id);
-+    const d = await deliveredFor(id, 5000);
-+    ok(d && !/^NEVER/.test(d.content), `kill_background stops it; its delivery says so (${d ? d.content.slice(0, 60) : 'nothing'})`);
-+  }
-+} catch (e) { fail++; console.log('  FAIL threw: ' + (e && e.stack || e)); }
-+console.log(`\n${pass} passed, ${fail} failed`);
-+process.exit(fail ? 1 : 0);
+=== change test/test-release-run.mjs
+base 576b0a05929e9d2bfccb88b8
+new f37cbb2e3ab9848fb46ead69
+@@ 141 -0 +25
++console.log('\n[7] the release folder inside the checkout, its files in git\'s list (prod, 2026-11-16: 25 "not committed" after a release)');
++const co7 = path.join(work, 'checkout7'); git(work, 'clone', '-q', bare, co7);
++const cfgPath = path.join(home, 'build-config.json'), cfg0 = readFileSync(cfgPath, 'utf8');
++writeFileSync(cfgPath, JSON.stringify({ ...JSON.parse(cfg0), releaseDir: path.join(co7, 'code_boss-src') }));
++const man7 = path.join(co7, 'code_boss-src', 'releases', 'manifest.json');
++mkdirSync(path.dirname(man7), { recursive: true }); writeFileSync(man7, '{"build":1}\n');
++writeFileSync(path.join(co7, '.cb-sync.json'), JSON.stringify({ files: { 'scripts/build-number.txt': 'x' }, chunk: 34 }));
++writeFileSync(path.join(co7, '.git', 'info', 'exclude'), '/.cb-sync.json\n');
++git(co7, 'add', '-A'); git(co7, 'commit', '-q', '-m', 'the setup window committed everything'); git(co7, 'push', '-q', 'origin', 'HEAD:main');
++ok(/code_boss-src\/releases\/manifest\.json/.test(git(co7, 'ls-files').stdout), 'set up: the release folder\'s files are in the checkout\'s git');
++writeFileSync(man7, '{"build":2}\n'); writeFileSync(path.join(co7, 'code_boss-src', 'new.mjs'), 'x\n');   // (as a release rewrites it)
++const s7 = rrCheckoutState(co7);
++ok(s7.ok && s7.changed.length === 0 && s7.untracked === 0, `what a release did to its folder is not a change of the checkout (${JSON.stringify(s7.changed || s7.problem)})`);
++said.length = 0;
++const r7 = runCheckoutRelease({ checkout: co7, channel: 'devtest', withImage: false, log: (m) => said.push(m) });
++ok(r7 === 0, `released (${said.slice(-2).join(' / ')})`);
++ok(said.some((m) => /code_boss-src: the release's own folder, inside the checkout - taken out of git's list/.test(m)), 'and it says what it took out');
++ok(!/code_boss-src/.test(git(bare, 'ls-tree', '-r', '--name-only', 'main').stdout), 'the pushed source no longer has it');
++ok(readFileSync(path.join(co7, '.git', 'info', 'exclude'), 'utf8').includes('/code_boss-src/') && existsSync(man7), 'kept out of `git add -A` from now on; the folder itself still there');
++const s7b = rrCheckoutState(co7);
++ok(s7b.ok && s7b.changed.length === 0, `after the release: nothing to commit, the next release is not refused (${JSON.stringify(s7b.changed || s7b.problem)})`);
++git(co7, 'add', '-A');
++ok(!/code_boss-src/.test(git(co7, 'ls-files').stdout), 'a later `git add -A` does not put it back');
++writeFileSync(cfgPath, cfg0);
 +
 === end
