@@ -1,1350 +1,237 @@
 code_boss chunk 1
-number 46
-made 2026-11-27T17:45:46.106Z
-message 16 changes
+number 48
+made 2026-11-27T22:16:53.184Z
+message 3 changes
 message
-message - Clearing the conversation clears the checklist too; a todo kept through the Clear brings its list back when the agent marks it
-message - A Heads up box sits below the checklist at the end of the chat
-message - While the agent works, the checklist's current item turns even when the agent did not mark it, and Certify sits above a running check
-message - The first-use disclaimer keeps only "You own every change"; the part about not opening a project with PII is gone
-message - A demo waits for Next with nothing moving: a step ends once the agent has stopped or waits on a later step's reply, a waitIdle no longer lets later steps' replies through, and the working line is hidden while it waits
-message - The agent is taught only todo(id, "done"): the checklist shows the todo under way by itself
-message - The checklist's item under way: the next planned of the newest request, chosen by the server and not while the list is behind; the agent marks doing only when it starts one out of order
-message - The checklist leaves out an older request held open only by its developer-certifies step; the newest request keeps its list for it
-message - A request over the size limit answers 413 saying so; a diagram drawn as its reply arrives is one artifact; a call the snippet caught after it ended is muted; tests waiting on what they read
-message - piishape: a word in alternating case of four or more tiny parts is not code - qAvAnAgH was shown as an identifier; isNaN and CSS colours still are
-message - Heads up boxes in the chat show one at a time with a pager again; the agent's doing on a todo already done leaves it done
-message - A todo names no item ids: sent back once, then taken without them
-message - The status bar names a devtest or beta build, right of the icons
-message - A reply's pieces that arrive together are read as one: a 2 MB reply in 1-byte pieces ends in ~70 s, not 190-440
-message - The API key unlock page opens in its own window again, not in a frame in the dialog
-message - The folder hash is shown in Settings only, not in the status bar
-before b066fb5a0e8676885e89fe38
-after 9043fb11d86fee33ecb71c59
-files 32
+message - The sandbox command keeps every run's words in sandbox-log.txt, and a run that fails or shows nothing waits for Enter
+message - An installed container run again with its saved GitLab token refused opens the install window to ask for one, not ends
+message - A GitLab user and token entered in the install window are saved once GitLab accepts them
+before 28746387d69d8ee07f56b2cc
+after ab0ab842ccf400fb97d708bb
+files 5
 left 0
-check 58676eb5a452e278
+check 9150f233165b9115
 
-=== change examples/plugins/piishape__1.mjs
-base 28b87b871ad57c63639e3652
-new 54cd0425ee01958b014b2dcb
-@@ 182951 -0 +5
-+    // A WORD IN ALTERNATING CASE IS NOT AN IDENTIFIER (test-tokens-edges-volume, 2026-11-26: "qAvAnAgH" split into
-+    // q, Av, An, Ag, H - each "2 letters or fewer", so a surname reached the model): letters only, four or more parts and
-+    // not one longer than 2 is no word anyone wrote as code. (Three was measured too many on petclinic and algos: isNaN,
-+    // isROp, and every CSS colour - f8f9fa - would have gone; a colour has digits, isNaN three parts.)
-+    if (/^\p{L}+$/u.test(run) && parts.length >= 4 && parts.every((p) => p.length <= 2)) return null;
 === change scripts/build-number.txt
-base 25de8ad0cdc0695683aa2e66
-new c10f4b13e23a630046e920cc
+base 8ebbb2ca1dd46145acf3ec82
+new 6bf920d7f5d19223bbc2889b
 @@ 1 -1 +1
--2975
-+2989
-=== change src/agent/prose-sanitizer.mjs
-base 8424ddfe473103d5b4cf7920
-new 3d9c19dcb780e1d965fcf038
-@@ 213 -0 +10
-+/**
-+ * WHETHER THE JOINT BETWEEN TWO PIECES COULD BE THE SEAM (coalesceStream, turn-stream.mjs, 2026-11-27): pieces that arrive
-+ * together are read as one, but not across a joint splitLeadingThought may need - the end of a sentence, then what an
-+ * answer opens with - so the chunk boundary it looks for is still there. (More joints than seams: harmless, they are
-+ * only not joined.)
-+ */
-+export function seamJoint(before, after) {
-+  const pre = String(before || '').slice(-2), s = pre + String(after || '').slice(0, 32), b = pre.length;
-+  return b > 0 && b < s.length && seamBefore(s, b) && answerStarts(s, b);
-+}
-=== change src/agent/stream-pass.mjs
-base 99a2ba275c8c963a761c9d9b
-new 8834bb380fb08decc6d7991a
-@@ 121 -1 +1
--  '- UNDER WAY: THE AGENT MARKS ITS OWN WORK - a todo doing when it starts it, done when it finishes it (todo(7, "doing"), todo(7, "done") among its steps). Never set a todo doing. A todo the agent hands to a sub-agent (it starts one for that work: spawnAgent with its name) is waiting with waits="sub-agent its name" while the sub-agent works, so several can be under way at once; when its report is in, set waits="" - the agent marks it done, or doing as it goes on with it.',
-+  '- UNDER WAY: THE AGENT MARKS ITS OWN WORK done when it finishes it (todo(7, "done") among its steps), and doing only when it starts one out of order; otherwise the next planned shows as under way by itself - so keep the planned todos in the order they are to be done. Never set a todo doing. A todo the agent hands to a sub-agent (it starts one for that work: spawnAgent with its name) is waiting with waits="sub-agent its name" while the sub-agent works, so several can be under way at once; when its report is in, set waits="" - the agent marks it done.',
-=== change src/agent/stream.mjs
-base 924fff2a33ee9a5abd7abb9e
-new e267ecfc05d3e15e462f250c
-@@ 685 -1 +1
--export function streamTodoList(st, running = [], { newestDev = null } = {}) {
-+export function streamTodoList(st, running = [], { newestDev = null, since = null, latestDev = null } = {}) {
-@@ 688 -1 +14
--  const reqs = [...new Set(todos.filter((t) => TODO_OPEN.has(t.state)).map((t) => t.from || ''))];
-+  // A CLEAR STARTS IT EMPTY (the developer, 2026-11-25: "when you clear the conversation, it doesn't clear the checklist
-+  // in the ui"): `since`, the newest Clear's event - a request from before it shows again only once one of its todos is
-+  // marked after it (the open todos a Clear keeps are still the agent's; the chat's list starts empty)
-+  const cut = sEvNum(since);
-+  const after = (t) => Math.max(sEvNum(t.after), sEvNum(t.seen)) > cut;
-+  const fresh = (f) => cut < 0 || sEvNum(f) > cut || todos.some((t) => (t.from || '') === f && after(t));
-+  // AN OLDER REQUEST LEFT OPEN ONLY BY ITS "DEVELOPER CERTIFIES ..." IS NOT OPEN WORK (live 2026-11-25: the bookkeeper
-+  // closed one such step when the developer moved on and left another waiting for good, and that request's ticked list
-+  // stood above every later one's; the page's own Certify row - the newest change's - is the certification): only the
-+  // newest request keeps its list for it
-+  const certStep = (t) => /certif/i.test(String(t.text || '')) && (/^(?:the\s+)?developer\b/i.test(String(t.text || '')) || (t.state === 'waiting' && /^(?:the\s+)?developer\b/i.test(String(t.waits || 'developer'))));
-+  const newestReq = todos.map((t) => t.from || '').filter(fresh).sort((a, b) => sEvNum(b) - sEvNum(a))[0];
-+  const reqs = [...new Set(todos.filter((t) => TODO_OPEN.has(t.state)).map((t) => t.from || ''))].filter(fresh)
-+    .filter((f) => f === newestReq || todos.some((t) => (t.from || '') === f && TODO_OPEN.has(t.state) && !certStep(t)));
-@@ 714 -1 +1
--      const fin = todos.filter((t) => t.state === 'done').sort((a, b) => (sEvNum(b.after) - sEvNum(a.after)) || (b.id - a.id))[0];
-+      const fin = todos.filter((t) => t.state === 'done' && (cut < 0 || after(t))).sort((a, b) => (sEvNum(b.after) - sEvNum(a.after)) || (b.id - a.id))[0];
-@@ 719 -1 +1
--    if (keep.length && at >= sEvNum(newestDev)) return { show: true, finished: true, items: keep };
-+    if (keep.length && at >= sEvNum(newestDev)) return { show: true, finished: true, items: keep, guess: null };
-@@ 721 -1 +13
--  return { show, items };
-+  // THE ONE UNDER WAY WHEN THE AGENT HAS MARKED NONE (the developer, 2026-11-25: "We want responsiveness but also
-+  // accuracy"): the next planned of the newest request with work open, in plan order - the bookkeeper orders them as they
-+  // are to be done; the agent marks doing only when it starts another. None while the bookkeeper has not read the
-+  // developer's newest message yet (`latestDev`: the list is a step behind, and an older request's would show), nor when
-+  // the agent has marked one itself. The page shows it only while the agent works; the agent is never told it.
-+  let guess = null;
-+  const behind = latestDev != null && sEvNum(st && st.marked) < sEvNum(latestDev);
-+  if (!behind && reqs.length && !todos.some((t) => t.state === 'doing' && !t.waits && reqs.includes(t.from || ''))) {
-+    const newest = reqs[reqs.length - 1];
-+    const next = todos.filter((t) => (t.from || '') === newest && t.state === 'planned' && !/^(?:the\s+)?developer\b/i.test(String(t.text || ''))).sort((a, b) => a.id - b.id)[0];
-+    if (next) guess = next.id;
-+  }
-+  return { show, items, guess };
-@@ 780 -0 +7
-+  // DOING ON A TODO ALREADY DONE: it stays done (live 2026-11-27: the agent wrote `todo(84, "done"); todo(85, "done");
-+  // todo(86, "doing")` ahead of its commit in one snippet - 86 was done the turn before - and the checklist's ring went
-+  // back from Commit to the CHANGELOG step while it committed). Said, not thrown: a throw would stop the commit after it
-+  if (s === 'doing' && t.state === 'done') {
-+    const next = st.todos.filter((x) => x.from === t.from && x.state === 'planned' && !x.waits).sort((a, b) => a.id - b.id)[0];
-+    return { text: `todo ${t.id} is done already - left done: ${t.text}${next ? ` · next planned: [${next.id}] ${next.text}` : ''}` };
-+  }
-@@ 975 -0 +3
-+      // (live 2026-11-27: "Verify --min with a negative value is an error (confirmed in e83468: ...)" on the developer's
-+      // checklist - an id neither the developer nor the agent can see)
-+      if (o.body && /\be\d+\b/.test(o.body)) out.push(`<todo> "${sClip(o.body, 60)}": name no item ids in a todo - it shows on the developer's checklist; say the work`);
-@@ 979 -0 +1
-+      if (o.body && /\be\d+\b/.test(o.body)) out.push(`<todo-set todo="${a.todo}">: name no item ids in a todo - it shows on the developer's checklist; say the work`);
-@@ 984 -0 +13
-+/**
-+ * A TODO NAMES NO ITEM IDS (live 2026-11-27: "Verify --min with a negative value is an error (confirmed in e83468: exits
-+ * 1 with correct stderr)" on the developer's checklist, beside the same todo without it - an id neither the developer
-+ * nor the agent can see; and the two did not read as the same). Sent back once (the check above); what still comes is
-+ * taken without them: a bracket that names one goes, then "in e123" / "e123:".
-+ */
-+export function todoNoIds(s) {
-+  return String(s || '')
-+    .replace(/\s*\([^()]*\be\d+\b[^()]*\)/g, '')
-+    .replace(/\s*\b(?:in|at|see|per|from|by)?\s*\be\d+\b:?/gi, '')
-+    .replace(/\s{2,}/g, ' ').replace(/\s+([,.;:])/g, '$1').trim();
-+}
-+
-@@ 1036 -0 +1
-+        if (o.body) o.body = todoNoIds(o.body);
-@@ 1062 -0 +1
-+        if (o.body) o.body = todoNoIds(o.body);
-=== change src/agent/tools.mjs
-base b698fa1cac0f1c842c6d59ae
-new 6360a119267d64eb2ced7ca8
-@@ 3456 -1 +3
--    // todo(7, 'doing') when it starts todo 7, todo(7, 'done') when it is done. The bookkeeper still writes the todos.
-+    // todo(7, 'done') when todo 7 is done. The bookkeeper still writes the todos. Since 2026-11-25 todo(7, 'doing') is
-+    // taught only for a todo started out of order: the page shows the next planned one under way by itself
-+    // (streamTodoList `guess`)
-=== change src/agent/turn-stream.mjs
-base 1cb3d64de477537c140221cc
-new c9a3faad73b38754dadccbf4
-@@ 104 -0 +1
-+import { seamJoint } from './prose-sanitizer.mjs';
-@@ 410 -0 +71
-+/**
-+ * WHAT ARRIVED TOGETHER IS READ AS ONE PIECE (2026-11-27, the developer agreeing: "The real fix would be merging tiny
-+ * reply pieces into fewer chat events ... That makes sense"): every piece of a reply cost ~100 µs on its way to the
-+ * page - the lexer, the footer and boundary looks, a chat event appended and broadcast - so a 2 MB reply in 1-byte
-+ * pieces took 190-440 s. A source's next() is awaited for one piece; then, while the next pieces are already there
-+ * (they settle before the event loop turns - one network read parsed into many, a burst from the gateway), they are
-+ * taken too and their text joined. The turn ending is seen by ONE setImmediate per piece read, not one per pull. Only a
-+ * plain text piece joins (one choice, a delta of content and maybe its role, no finish, nothing else at the top): the
-+ * one that is anything else is held and given by itself next; nor across a joint that may be the seam between the
-+ * model's leading reasoning and its answer (seamJoint - splitLeadingThought finds it at a chunk boundary). At most COALESCE_MAX characters a piece. A joined piece
-+ * says how many it holds (`pieces`, not enumerable) so the counts stay what arrived.
-+ * The source's end, an error and return() pass through; a pull still out when it is returned is left to the abort that
-+ * ended it (as the loop below does with its own).
-+ */
-+const COALESCE_MAX = 64 * 1024;
-+const COALESCE_TOP = new Set(['id', 'object', 'created', 'model', 'choices', 'system_fingerprint', 'service_tier']);
-+const COALESCE_CHOICE = new Set(['index', 'delta', 'finish_reason', 'logprobs']);
-+function coalescibleText(c) {
-+  if (!c || typeof c !== 'object' || !Array.isArray(c.choices) || c.choices.length !== 1) return null;
-+  for (const k of Object.keys(c)) if (!COALESCE_TOP.has(k)) return null;
-+  const ch = c.choices[0];
-+  if (!ch || typeof ch !== 'object' || ch.finish_reason != null || ch.logprobs != null) return null;
-+  for (const k of Object.keys(ch)) if (!COALESCE_CHOICE.has(k)) return null;
-+  const d = ch.delta;
-+  if (!d || typeof d !== 'object' || typeof d.content !== 'string' || !d.content) return null;
-+  for (const k of Object.keys(d)) if (k !== 'content' && k !== 'role') return null;
-+  return d.content;
-+}
-+export function coalesceStream(src, { max = COALESCE_MAX } = {}) {
-+  let held = null;   // a pull out, or settled with a piece that does not join: given first next time
-+  let heldOut = false;   // (held is a pull still out)
-+  let finished = false;
-+  const pull = () => src.next().then((r) => ({ r }), (e) => ({ e }));
-+  return {
-+    [Symbol.asyncIterator]() { return this; },
-+    async next() {
-+      if (finished) return { done: true, value: undefined };
-+      const first = await (held || pull()); held = null; heldOut = false;
-+      if (first.e) { finished = true; throw first.e; }
-+      if (first.r.done) { finished = true; return first.r; }
-+      let text = coalescibleText(first.r.value);
-+      if (text === null) return first.r;
-+      let turned = false;
-+      const turnP = new Promise((res) => setImmediate(() => { turned = true; res(null); }));
-+      let pieces = 1;
-+      while (text.length < max) {
-+        const p = pull();
-+        const got = await Promise.race([p, turnP]);
-+        if (got === null || turned) { held = p; heldOut = true; break; }   // (the turn ended: what comes is the next piece's)
-+        const t = !got.e && !got.r.done ? coalescibleText(got.r.value) : null;
-+        // (nor across a joint that may be where the model's reasoning ends and its answer begins - prose-sanitizer seamJoint)
-+        if (t === null || seamJoint(text, t)) { held = Promise.resolve(got); break; }
-+        text += t; pieces++;
+-2995
++2998
+=== change src/agent/sandbox-cmd.mjs
+base e2bbafe19e73f3a001e4b670
+new b08aafaef5b9042cc1a6cb03
+@@ 37 -1 +1
+-import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, rmSync, renameSync } from 'node:fs';
++import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, rmSync, renameSync, appendFileSync, statSync } from 'node:fs';
+@@ 43 -1 +1
+-import { runSetupWindow, sbuOpenWindow, sbuFindChrome, sbuBrowserProfile } from './sandbox-setup-ui.mjs';
++import { runSetupWindow, sbuOpenWindow, sbuFindChrome, sbuBrowserProfile, sbuTokenRefused } from './sandbox-setup-ui.mjs';
+@@ 745 -3 +19
+-  const r = await sbcCommand(argv, opts);
+-  const o = sbcParseArgs(argv);
+-  if (opts.hold && r.code !== 0 && ['open-window', 'start-container', 'kill'].some((f) => o.flags.has(f))) await sbcPressEnter(opts.log);
++  // EVERY RUN'S WORDS ARE KEPT, in .code_boss\sandbox-log.txt (production, 2026-11-27, a developer re-running the
++  // installer: "the terminal window displays for a second, writes some status text, then disappears, and nothing else
++  // happens" - what it said was gone with the window)
++  const base = opts.log || ((s) => console.log(s));
++  const home = opts.home || (opts.env || process.env).CB_HOME || homedir();
++  const logFile = path.join(home, '.code_boss', 'sandbox-log.txt');
++  try {
++    mkdirSync(path.dirname(logFile), { recursive: true });
++    if (existsSync(logFile) && statSync(logFile).size > 512 * 1024) { const t = readFileSync(logFile, 'utf8'); writeFileSync(logFile, t.slice(-256 * 1024)); }
++    appendFileSync(logFile, `\n=== ${new Date().toISOString()} sandbox ${argv.join(' ')}\n`);
++  } catch { /* the console still has it */ }
++  const log = (s) => { base(s); try { appendFileSync(logFile, String(s) + '\n'); } catch { /* the console still has it */ } };
++  let noWindow = false;
++  const r = { ...(await sbcCommand(argv, { ...opts, log, onNoWindow: () => { noWindow = true; } })) };
++  if (noWindow) r.noWindow = true;
++  try { appendFileSync(logFile, `=== exit ${r.code}${r.noWindow ? ' (no window was opened)' : ''}\n`); } catch { /* as above */ }
++  // A RUN THAT FAILED, OR SHOWED NOTHING, WAITS FOR ENTER - its window would otherwise close with the reason in it. Every
++  // run started by hand, not only the shortcuts' (sbcPressEnter: only with somebody at a terminal)
++  if (opts.hold && (r.code !== 0 || r.noWindow)) { log(`         (all of this is also in ${logFile})`); await sbcPressEnter(log); }
+@@ 751 -1 +1
+-async function sbcCommand(argv, { log = (s) => console.log(s), env = process.env, home = env.CB_HOME || homedir(), updateSource = '', confirm = sbcConfirm, self = sbcSelfCommand() } = {}) {
++async function sbcCommand(argv, { log = (s) => console.log(s), env = process.env, home = env.CB_HOME || homedir(), updateSource = '', confirm = sbcConfirm, self = sbcSelfCommand(), onNoWindow = () => {} } = {}) {
+@@ 779 -1 +1
+-    if (window && !opened) log('         (Google Chrome was not found, so no window was opened for you)');
++    if (window && !opened) { log('         (Google Chrome was not found, so no window was opened for you)'); onNoWindow(); }
+@@ 859 -1 +2
+-  const needSource = !source, needToken = /^https?:/i.test(source) && !creds.token;
++  const needSource = !source;
++  let needToken = /^https?:/i.test(source) && !creds.token, refusedToken = false;
+@@ 878 -2 +16
+-    catch (e) { log(`sandbox: could not get the image at '${tag}': ${e.message}`); return { code: 2 }; }
+-    if (!remote) { log(`sandbox: could not get the image at '${tag}': there is no such tag in the repository`); noImageHint(); return { code: 2 }; }
++    catch (e) {
++      // GITLAB TURNED THE SAVED TOKEN DOWN (production, 2026-11-27, an installed developer running it again: "could not
++      // get the image at 'sandbox-production': the repository could not be reached: ... fatal: could not read Username
++      // for 'https://...': terminal prompts disabled" - and the command ended there, with nothing to fix it from): the
++      // install window opens and asks for a GitLab user and token first, as an install whose download was refused does
++      if (sbuTokenRefused(source, e.message) && window && !o.flags.has('yes')) {
++        log(`sandbox: GitLab did not accept the GitLab access token saved on this machine (${path.join(cbDir, 'gitlab-creds.json')}) - the install window asks for one`);
++        needToken = true; refusedToken = true;
++      } else {
++        log(`sandbox: could not get the image at '${tag}': ${e.message}`);
++        if (sbuTokenRefused(source, e.message)) log(`         (GitLab did not accept the token saved in ${path.join(cbDir, 'gitlab-creds.json')}: pass --gl-user and --gl-token, or run it without --yes / --no-browser to be asked for one)`);
++        return { code: 2 };
 +      }
-+      if (pieces === 1) return first.r;
-+      const c = first.r.value, ch = c.choices[0];
-+      const value = { ...c, choices: [{ ...ch, delta: { ...ch.delta, content: text } }] };
-+      Object.defineProperty(value, 'pieces', { value: pieces, enumerable: false });
-+      return { done: false, value };
-+    },
-+    async return(v) {
-+      finished = true;
-+      const out = heldOut ? held : null; held = null; heldOut = false;
-+      // (a pull out - it never rejects, pull() catches: the abort that ended the loop ends the source; once it settles the
-+      // source is returned too, in case it was not aborted)
-+      if (out) { out.then(() => { try { src.return?.()?.catch?.(() => {}); } catch {} }); return { done: true, value: v }; }
-+      return src.return ? src.return(v) : { done: true, value: v };
-+    },
-+  };
++    }
++    if (refusedToken) { /* asked for in the install window, below */ }
++    else if (!remote) { log(`sandbox: could not get the image at '${tag}': there is no such tag in the repository`); noImageHint(); return { code: 2 }; }
+@@ 890 -1 +1
+-  if (installed && pending) log(`sandbox: a newer image is on channel ${tag}`);
++  if (installed && pending && !refusedToken) log(`sandbox: a newer image is on channel ${tag}`);
+@@ 904 -0 +2
++      // (a user and token entered in the window that GitLab took: kept for the next run - anything else in the file stays)
++      saveCreds: (c) => { const f = path.join(cbDir, 'gitlab-creds.json'); writeFileSync(f, JSON.stringify({ ...sbcReadJson(f), user: String(c.user || ''), token: String(c.token || '') }, null, 2) + '\n'); },
+=== change src/agent/sandbox-setup-ui.mjs
+base 88dadce21501ed72a1de81b8
+new b988e0b4b6dcbe3a1c4f9eba
+@@ 26 -0 +8
++/**
++ * Whether git's words say GitLab turned the token down (or there was none it could use): git falls back to asking for a
++ * user name it may not ask for ("could not read Username ... terminal prompts disabled"), or says 401/403 outright.
++ */
++export function sbuTokenRefused(source, message) {
++  return /^https?:/i.test(String(source || '')) && /could not read Username|could not read Password|Authentication failed|HTTP Basic: Access denied|returned error: 40[13]|\b40[13] (Unauthorized|Forbidden)/i.test(String(message || ''));
 +}
 +
-@@ 799 -1 +3
--    const it = adapter.completeStream(streamOpts)[Symbol.asyncIterator]();
-+    // (what arrived together, as one piece: coalesceStream; CB_COALESCE=0 reads them one by one, as before)
-+    const raw = adapter.completeStream(streamOpts)[Symbol.asyncIterator]();
-+    const it = process.env.CB_COALESCE === '0' ? raw : coalesceStream(raw);
-@@ 835 -2 +2
--        chunkCount++;
--        if (chunkCount === 1) firstChunkAt = Date.now();
-+        if (chunkCount === 0) firstChunkAt = Date.now();
-+        chunkCount += chunk.pieces || 1;
-@@ 867 -1 +10
--          { const c = openingClaim(T.slice(0, CANT_RUN_HOLD + 200)); if (c) { cantRunHit = { ...c, kept: T.len }; try { ac.abort(); } catch {} break; } }
-+          { const c = openingClaim(T.slice(0, CANT_RUN_HOLD + 200));
-+            if (c) {
-+              // CUT WHERE THE PHRASE BECAME WHOLE, not at the end of the piece that carried it (2026-11-27: pieces that
-+              // arrive together are one now - coalesceStream - and a burst kept everything after the phrase): the
-+              // shortest opening that still holds it, found by halves (it holds from there on, as text only grows)
-+              let lo = Math.max(0, T.len - d.length), hi = T.len;
-+              while (lo < hi) { const mid = (lo + hi) >> 1; if (openingClaim(T.slice(0, Math.min(mid, CANT_RUN_HOLD + 200)))) hi = mid; else lo = mid + 1; }
-+              if (hi < T.len) { T.reset(T.slice(0, hi)); if (proseSent > T.len) proseSent = T.len; }
-+              cantRunHit = { ...c, kept: T.len }; try { ac.abort(); } catch {} break;
-+            } }
-=== change src/agent/worker-prompt.mjs
-base 1ddc92730c82825d13bb1550
-new c4d18f00deab52f31876fd60
-@@ 313 -1 +3
--    lines.push('THE CHECKLIST IS YOURS TO MARK: the todos under "What\'s open" are numbered, and the developer watches them at the end of the chat. In the snippet that starts a todo\'s work, call todo(7, "doing"); in the one that finishes it - the result is in, the test passed - todo(7, "done"). Mark it beside the work, in the same snippet, never in a snippet of its own. A todo of answering or showing something is done by the reply that answers it: mark it in your last snippet before that reply. The bookkeeper writes the todos and keeps their other states (waiting, held, dropped); it does not mark what you are doing or what you finished.');
-+    // (DOING ONLY OUT OF ORDER, since 2026-11-25 - the developer: "We want responsiveness but also accuracy": while you
-+    // work, the checklist shows the next todo planned as under way by itself; you correct it when you are on another)
-+    lines.push('THE CHECKLIST IS YOURS TO MARK: the todos under "What\'s open" are numbered, and the developer watches them at the end of the chat. While you work, the next todo planned, in its order, shows as under way by itself. If you start a different one - out of order, or another request\'s - call todo(7, "doing") in the snippet that starts it. In the snippet that finishes a todo - the result is in, the test passed - call todo(7, "done"). Mark beside the work, in the same snippet, never in a snippet of its own. A todo of answering or showing something is done by the reply that answers it: mark it in your last snippet before that reply. The bookkeeper writes the todos and keeps their other states (waiting, held, dropped); it does not mark what you are on or what you finished.');
-@@ 380 -1 +1
--        : fullRoster({ pluginFns }) + (todoMarks ? ' · todo(7, "doing") · todo(7, "done") (the checklist: mark the todo you start and the one you finish, beside the work)' : '') + (historyAsk ? ' · historyAsk("question") (earlier work of this session, faded parts too: a helper finds and reads it, and says where it found it)' : '')));
-+        : fullRoster({ pluginFns }) + (todoMarks ? ' · todo(7, "done") · todo(7, "doing") (the checklist: mark the todo you finish, beside the work; doing only for one you start out of order)' : '') + (historyAsk ? ' · historyAsk("question") (earlier work of this session, faded parts too: a helper finds and reads it, and says where it found it)' : '')));
-@@ 441 -1 +1
--    lines.push('code_boss keeps these from the conversation after each of your replies: the developer\'s requests not done yet, with their todos, and the rules, decisions and test cases in force. They can be a step behind you; the conversation above is what happened.' + (todoMarks ? ' A todo\'s doing and done are yours to mark, with todo(id, state).' : ' You do not edit them.'));
-+    lines.push('code_boss keeps these from the conversation after each of your replies: the developer\'s requests not done yet, with their todos, and the rules, decisions and test cases in force. They can be a step behind you; the conversation above is what happened.' + (todoMarks ? ' A todo\'s done is yours to mark, with todo(id, "done") - and doing, with todo(id, "doing"), when you start one out of order.' : ' You do not edit them.'));
-=== change src/server.mjs
-base c418413ea87194ec27f671e6
-new afa712bd5116e9c259edf3db
-@@ 24 -1 +1
--import { streamDiagSnapshot } from './agent/turn-stream.mjs';   // in-memory stream facts for snapshot #69   // UI-transparency verbs that must never enter model history
-+import { streamDiagSnapshot, coalesceStream } from './agent/turn-stream.mjs';   // in-memory stream facts for snapshot #69   // UI-transparency verbs that must never enter model history
-@@ 2802 -0 +5
-+// THE CHANNEL THIS BUILD CAME FROM (the developer, 2026-11-27: "if the version being run is devtest or beta, we put that
-+// label to the right of the icons in the status bar"): the channel file the launcher read to pick the build (setup writes
-+// devtest; Settings' Beta builds writes beta; none is production) - read once, at start, so a Beta box ticked since
-+// does not relabel the build still running. Shown only for devtest and beta.
-+const CHANNEL_AT_START = (() => { try { const c = readFileSync(path.join(USER_CONFIG_DIR, 'channel'), 'utf8').trim().toLowerCase(); return c === 'devtest' || c === 'beta' ? c : ''; } catch { return ''; } })();
-@@ 2997 -2 +5
--  // (the step the page is playing, and whether a waitIdle has let the run go on to its end: a reply is held until then)
--  let _demoReplySteps = [], _demoCheckSteps = [], _demoStep = -1, _demoOpen = false;
-+  // (the step the page is playing: a reply is held until its step plays - never sooner, a waitIdle's too (the developer,
-+  // 2026-11-25: "on the demo, it seems to keep going when it's supposed to be waiting for the next button": a waitIdle let
-+  // the next steps' replies through, and they played before Next). _demoHeld: the agent is waiting on a later step's
-+  // reply now - the page counts that as the agent having stopped, for its step's end and a waitIdle)
-+  let _demoReplySteps = [], _demoCheckSteps = [], _demoStep = -1, _demoHeld = 0;
-@@ 3001 -2 +4
--    if (need == null) return;
--    while (!_demoOpen && _demoStep < need && !(signal && signal.aborted)) await new Promise((r) => setTimeout(r, 80));
-+    if (need == null || _demoStep >= need) return;
-+    _demoHeld++;
-+    try { while (_demoStep < need && !(signal && signal.aborted)) await new Promise((r) => setTimeout(r, 80)); }
-+    finally { _demoHeld--; }
-@@ 4862 -1 +1
--      build: { version: BUILD_VERSION_RUNTIME, source: SOURCE_ID_RUNTIME },   // the running build number — surfaced in the UI so a stale install is visible (was absent → header showed nothing/"?")
-+      build: { version: BUILD_VERSION_RUNTIME, source: SOURCE_ID_RUNTIME, channel: CHANNEL_AT_START },   // the running build number — surfaced in the UI so a stale install is visible (was absent → header showed nothing/"?")
-@@ 6512 -1 +1
--    const a = wrapAdapterForBudget(wrapAdapterForFilter(wrapAdapterForHedge(inner, { quiet: true })), { level: 3 });   // (the dev check: with the rest)
-+    const a = wrapAdapterForBudget(wrapAdapterForFilter(wrapAdapterForHedge(wrapAdapterForCoalesce(inner), { quiet: true })), { level: 3 });   // (the dev check: with the rest)
-@@ 7383 -1 +1
--    let newestDev = null;
-+    let newestDev = null, since = null;
-@@ 7385 -0 +2
-+    // (the newest Clear: the list starts empty after it - streamTodoList `since`)
-+    for (let i = (session.chatEvents || []).length - 1; i >= 0; i--) { const e = session.chatEvents[i]; if (e && e.type === 'conversation-break') { since = e.id; break; } }
-@@ 7389 -1 +1
--    const v = streamTodoList(st, running, { newestDev: hold.open && hold.dev != null ? hold.dev : (hold.run != null ? hold.run : newestDev) });
-+    const v = streamTodoList(st, running, { since, latestDev: newestDev, newestDev: hold.open && hold.dev != null ? hold.dev : (hold.run != null ? hold.run : newestDev) });
-@@ 8498 -1 +3
--            const closedTurn = !natural && /(?:^|\n)[ \t]*\/---[ \t]*you(?:[ \t]+[0-9a-z]{3,8})?[ \t]*---[ \t]*(?:\r?\n|$)/.test(text);
-+            // (whether or not the stream then ended by itself: what arrived together is read as one piece - coalesceStream,
-+            // 2026-11-27 - so a close and the stream's end that came together are both read before the worker stops)
-+            const closedTurn = /(?:^|\n)[ \t]*\/---[ \t]*you(?:[ \t]+[0-9a-z]{3,8})?[ \t]*---[ \t]*(?:\r?\n|$)/.test(text);
-@@ 8806 -0 +9
-+  // WHAT ARRIVED TOGETHER, ONE PIECE, FROM HERE OUT (2026-11-27: a 2 MB reply in 1-byte pieces took 190-440 s; turn-stream's
-+  // own merge took it to ~70 s, the rest was these wrappers - hedge, filter, activity, budget - each an async generator
-+  // touching every piece): just above the adapter, so every layer and every reader sees the joined pieces, while the raw
-+  // log's shape of the stream - recorded inside the adapter, and by wrapAdapterForTx under this - still sees each one as
-+  // it came. coalesceStream (turn-stream.mjs) joins plain text pieces only; CB_COALESCE=0 leaves them apart.
-+  const wrapAdapterForCoalesce = (inner) => {
-+    if (!inner || typeof inner.completeStream !== 'function' || process.env.CB_COALESCE === '0') return inner;
-+    return { ...inner, completeStream: (request) => coalesceStream(inner.completeStream(request)[Symbol.asyncIterator]()) };
-+  };
-@@ 8916 -1 +1
--  const adapter = wrapAdapterForBudget(wrapAdapterForActivity(wrapAdapterForFilter(wrapAdapterForHedge(providedAdapter ? wrapAdapterForTx(providedAdapter, _adapterOpts.onTransaction) : _makeAdapter(_adapterOpts)))));
-+  const adapter = wrapAdapterForBudget(wrapAdapterForActivity(wrapAdapterForFilter(wrapAdapterForHedge(wrapAdapterForCoalesce(providedAdapter ? wrapAdapterForTx(providedAdapter, _adapterOpts.onTransaction) : _makeAdapter(_adapterOpts))))));
-@@ 8959 -1 +1
--    return wrapAdapterForBudget(wrapAdapterForActivity(wrapAdapterForFilter(wrapAdapterForHedge(inner, { quiet: true })), { sub: rec }), { level: 2 });
-+    return wrapAdapterForBudget(wrapAdapterForActivity(wrapAdapterForFilter(wrapAdapterForHedge(wrapAdapterForCoalesce(inner), { quiet: true })), { sub: rec }), { level: 2 });
-@@ 9553 -0 +3
-+    // TOO LARGE IS SAID, NOT A RESET SOCKET (test-api-edges-volume, 2026-11-26: the client saw ECONNRESET and could not
-+    // tell why): past the cap nothing more is kept, the rest is read and let go, and the answer is a 413 that says so.
-+    // Far past it (4x) the socket is still cut - reading a flood to the end is its own cost.
-@@ 9554 -1 +1
--    let total = 0;
-+    let total = 0, over = false;
-@@ 9557 -1 +2
--      if (total > maxBytes) { try { req.destroy(); } catch {} throw new Error(`request body too large (>${maxBytes} bytes)`); }
-+      if (total > maxBytes * 4) { try { req.destroy(); } catch {} throw new Error(`request body too large (>${maxBytes} bytes)`); }
-+      if (total > maxBytes) { over = true; chunks.length = 0; continue; }
-@@ 9560 -0 +2
-+    const size = (n) => (n >= 1048576 ? Math.round(n / 1048576) + ' MB' : Math.ceil(n / 1024) + ' KB');
-+    if (over) { const e = new Error(`The request is too large: ${size(total)}, past the ${size(maxBytes)} limit. Send a smaller one - for a big file, have the agent read it from disk.`); e.httpStatus = 413; throw e; }
-@@ 10084 -1 +2
--      if (req.method === 'POST' && path === '/api/demo-mode/step' && DEMO_ID) { let b = {}; try { b = JSON.parse((await readBody(req)) || '{}'); } catch {} if (Number.isInteger(b.at)) _demoStep = Math.max(_demoStep, b.at); if (typeof b.open === 'boolean') _demoOpen = b.open; return sendJson(res, 200, { ok: true, at: _demoStep }); }
-+      if (req.method === 'POST' && path === '/api/demo-mode/step' && DEMO_ID) { let b = {}; try { b = JSON.parse((await readBody(req)) || '{}'); } catch {} if (Number.isInteger(b.at)) _demoStep = Math.max(_demoStep, b.at); return sendJson(res, 200, { ok: true, at: _demoStep, held: _demoHeld > 0 }); }
-+      if (req.method === 'GET' && path === '/api/demo-mode/step' && DEMO_ID) return sendJson(res, 200, { ok: true, at: _demoStep, held: _demoHeld > 0 });
-@@ 10934 -1 +1
--          const insAdapter = wrapAdapterForBudget(wrapAdapterForFilter(wrapAdapterForHedge(inner, { quiet: true })), { level: 0 });   // (the developer is waiting)
-+          const insAdapter = wrapAdapterForBudget(wrapAdapterForFilter(wrapAdapterForHedge(wrapAdapterForCoalesce(inner), { quiet: true })), { level: 0 });   // (the developer is waiting)
-@@ 12612 -0 +1
-+      const tooLarge = e?.httpStatus === 413;
-@@ 12613 -0 +1
-+      else if (tooLarge) { logInfo('http', `${req.method} ${req.url}: ${e.message}`, { ref }); }
-@@ 12617 -1 +1
--          res.end(JSON.stringify({ error: aborted ? 'Request aborted.' : 'Something went wrong handling this request — see ~/.code_boss/diag.log.', ref }));
-+          res.end(JSON.stringify({ error: aborted ? 'Request aborted.' : tooLarge ? e.message : 'Something went wrong handling this request — see ~/.code_boss/diag.log.', ref }));
-=== change src/ui.html
-base 36f1d048bb8086ed6c57d1c8
-new 6193b136c88c508aa3ec0f50
-@@ 198 -0 +4
-+  /* (waiting for Next, the agent may be held for a later step's reply: its working line - a spinner and a clock - is
-+     hidden, so nothing on the screen moves; the developer, 2026-11-25: "it seems to keep going when it's supposed to be
-+     waiting for the next button") */
-+  body.demo-paused #log > .status { display: none; }
-@@ 742 -0 +3
-+  /* one at a time (notePage): the others wait, hidden; the pager sits at the top of the shown one */
-+  #log > .bn-off { display: none !important; }
-+  .note-pager { margin: -2px 0 6px; }
-@@ 1219 -2 +4
--  .source-ver { flex-shrink: 0; color: var(--muted); font-size: 11px; user-select: text; }
--  .source-ver:empty { display: none; }
-+  /* the build's channel when it is not production (server.mjs CHANNEL_AT_START), right of the icons */
-+  .channel-label { flex-shrink: 0; font-size: 10px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; line-height: 1; padding: 2px 6px; border-radius: 4px; border: 1px solid var(--accent); color: var(--accent); }
-+  .channel-label:empty { display: none; }
-+  .side-chrome:not(.docked) .channel-label { order: -1; }   /* (the bar there is row-reverse: first is right-most) */
-@@ 4390 -1 +3
--        <span class="source-ver" id="sourceVer" title="The version of code_boss in this window: the folder hash the setup window shows"></span>
-+        <!-- devtest or beta: the channel this build came from (session.build.channel); production shows none -->
-+        <span class="channel-label" id="channelLabel"></span>
-+        <!-- (the folder hash is in Settings only - "build N · hash" - not here: the developer, 2026-11-27) -->
-@@ 4715 -1 +1
--      <div><strong>No PII, classified, or sensitive data.</strong> code_boss sends your prompts and your code to an AI service. Do not open or work on any project that contains PII (personally identifiable information), classified/controlled data, or other sensitive data — it must never go through the AI.</div>
-+      <!-- (the part about not opening a project with PII was taken out - the developer, 2026-11-25) -->
-@@ 4781 -1 +0
--<style>#initModal.unlock-wide { width: min(980px, calc(100vw - 48px)); max-width: none; }</style>
-@@ 5243 -1 +2
--        if (c.classList.contains('todo-list') || c.classList.contains('pending-steer') || c.classList.contains('bg-dock') || c.classList.contains('ag-dock')) at = c;
-+        // (and a Heads up box, under the checklist since 2026-11-25)
-+        if (c.classList.contains('todo-list') || c.classList.contains('pending-steer') || c.classList.contains('bg-dock') || c.classList.contains('ag-dock') || isPinnedNote(c)) at = c;
-@@ 5821 -1 +0
--    document.getElementById('initModal')?.classList.remove('unlock-wide');
-@@ 5886 -1 +0
--    document.getElementById('initModal')?.classList.remove('unlock-wide');
-@@ 6002 -4 +0
--    // THE UNLOCK PAGE IN THE DIALOG (the developer, 2026-11-18: "let's change the api key unlock to open the page in a
--    // modal iframe instead of an external browser"): signed in / approved right here, then "I'm finished". A sign-in
--    // page may refuse to be shown in a frame (X-Frame-Options / frame-ancestors), or need cookies a frame is not
--    // given: then the frame is blank or says it refused, and "Open in its own window" is the way it was before.
-@@ 6007 -1 +0
--    document.getElementById('initModal')?.classList.add('unlock-wide');
-@@ 6009 -3 +3
--      <p style="margin: 0 0 8px; color: var(--fg); font-size: 13.5px;">
--        The endpoint needs you to unlock the API key. Sign in or approve it below - the request in flight is paused,
--        and goes on the moment you click <strong>I'm finished</strong>.
-+      <p style="margin: 0 0 10px; color: var(--fg); font-size: 13.5px;">
-+        The endpoint needs you to unlock the API key in your browser. The request
-+        in flight is paused — it resumes the moment you click <strong>I'm finished</strong>.
-@@ 6013 -7 +9
--      <iframe id="unlockFrame" title="The API key unlock page" referrerpolicy="no-referrer"
--              style="display: block; width: 100%; height: min(64vh, 620px); border: 1px solid var(--border); border-radius: 6px; background: #fff;"></iframe>
--      <div style="margin: 6px 0 10px; font-family: var(--mono); font-size: 11px; color: var(--muted); word-break: break-all;">${escapeHtml(url)}</div>
--      <div style="display: flex; gap: 8px; align-items: center;">
--        <span style="flex: 1; color: var(--muted); font-size: 11.5px;">Blank, or it says it refused to connect? Some sign-in pages cannot be shown inside code_boss.</span>
--        <button id="unlockOwn" class="btn">Open in its own window</button>
--        <button id="unlockReopen" class="btn" title="Load the page again">Reload</button>
-+      <div style="margin: 0 0 12px; padding: 6px 8px; background: var(--panel-alt);
-+                  border: 1px solid var(--border); border-radius: 4px;
-+                  font-family: var(--mono); font-size: 11px; color: var(--muted);
-+                  word-break: break-all;">${escapeHtml(url)}</div>
-+      <div id="unlockStage1" style="display: flex; gap: 8px; justify-content: flex-end;">
-+        <button id="unlockOpen" class="btn primary">Open unlock page</button>
-+      </div>
-+      <div id="unlockStage2" style="display: none; gap: 8px; justify-content: flex-end;">
-+        <button id="unlockReopen" class="btn">Reopen</button>
-@@ 6025 -6 +6
--    const frame = document.getElementById('unlockFrame');
--    frame.src = url;
--    // (its own window, as before the frame: its OWN app window via the server - no address bar, the app's Chrome
--    // profile - else a browser tab)
--    const openOwn = async () => {
--      let how = 'tab';
-+    // NOT IN A FRAME (the developer, 2026-11-27: "the key unlock page cannot be loaded inside an iframe. We're going to
-+    // have to go back to the external browser for that" - the dialog's frame of 2026-11-18 was taken back out)
-+    // Prefer its OWN app window (no address bar, shares the app's Chrome profile) via the
-+    // server; fall back to a browser tab if Chrome can't be launched that way. Returns
-+    // 'window' | 'tab'.
-+    const openPage = async () => {
-@@ 6033 -1 +1
--        if (r && r.ok) how = 'window';
-+        if (r && r.ok) return 'window';
-@@ 6035 -2 +10
--      if (how === 'tab') window.open(url, '_blank', 'noopener');
--      document.getElementById('unlockMsg').textContent = (how === 'window' ? 'Opened in its own window.' : 'Opened in a new tab.') + ' Sign in / approve there, then click "I\'m finished".';
-+      window.open(url, '_blank', 'noopener');
-+      return 'tab';
-+    };
-+    document.getElementById('unlockOpen').onclick = async () => {
-+      const how = await openPage();
-+      document.getElementById('unlockStage1').style.display = 'none';
-+      document.getElementById('unlockStage2').style.display = 'flex';
-+      document.getElementById('unlockMsg').textContent = (how === 'window'
-+        ? 'Opened in its own window. Sign in / approve there, then click "I\'m finished".'
-+        : 'Opened in a new tab. Sign in / approve there, then click "I\'m finished".') + ' (Didn\'t open? Use Reopen.)';
-@@ 6038 -2 +1
--    document.getElementById('unlockOwn').onclick = openOwn;
--    document.getElementById('unlockReopen').onclick = () => { frame.src = 'about:blank'; setTimeout(() => { frame.src = url; }, 50); };
-+    document.getElementById('unlockReopen').onclick = openPage;
-@@ 6055 -2 +0
--      document.getElementById('initModal')?.classList.remove('unlock-wide');
--      try { document.getElementById('unlockFrame').src = 'about:blank'; } catch {}
-@@ 7629 -3 +3
--        // (a Heads up box goes above it too, since they are in the history - 2026-11-19; the checklist and the certify
--        // box stay under it, at the very end)
--        if (!n.classList.contains('status') && !n.classList.contains('pending-steer') && !n.classList.contains('work-check') && !n.classList.contains('check-step-el') && !n.classList.contains('todo-list') && !n.classList.contains('certify-box')) w.before(n);
-+        // (the checklist, the certify box and - since 2026-11-25, under the checklist - a Heads up box stay under it, at
-+        // the very end)
-+        if (!n.classList.contains('status') && !n.classList.contains('pending-steer') && !n.classList.contains('work-check') && !n.classList.contains('check-step-el') && !n.classList.contains('todo-list') && !n.classList.contains('certify-box') && !isPinnedNote(n)) w.before(n);
-@@ 9972 -1 +1
--      if (!(c.classList.contains('status') || c.classList.contains('todo-list') || c.classList.contains('pending-steer') || c.classList.contains('bg-dock') || c.classList.contains('ag-dock'))) break;
-+      if (!(c.classList.contains('status') || c.classList.contains('todo-list') || c.classList.contains('pending-steer') || c.classList.contains('bg-dock') || c.classList.contains('ag-dock') || isPinnedNote(c))) break;
-@@ 10846 -0 +3
-+    // (a failed call whose end lands AFTER its snippet finished - the snippet caught it, as settleJsGroup paints the
-+    // ones it saw: test-js-step-rows-expand-e2e, 2026-11-26, the read's end came after the snippet's result)
-+    if (g.done && !g.error && !g.stopped && ev.status === 'error' && !expected) jsStepPaintCaught(stepEntry);
-@@ 11705 -1 +9
--    for (const it of items) {
-+    // THE ITEM UNDER WAY WHILE THE AGENT WORKS (the developer, 2026-11-25: "I don't always see the loading circle for the
-+    // normal checklist items ... if the agent is working, just mark the current item active"; then "We want
-+    // responsiveness but also accuracy"): the agent marks doing only when it starts one out of order - the bookkeeper's
-+    // doing is not taken - and otherwise the server's guess, the next planned of the newest request (streamTodoList
-+    // `guess`: none while the list is a step behind), is shown under way while it runs. Shown only: nothing is marked
-+    const running = !!(session && session.status === 'running');
-+    const devStep = (it) => /^(?:the\s+)?developer\b/i.test(String(it.text || ''));
-+    const current = running && v && v.guess != null && !items.some((it) => it.state === 'active' && !it.who) ? items.find((it) => it.id === v.guess && it.state === 'planned') : null;
-+    for (const it0 of items) {
-@@ 11709 -1 +2
--      if (cw && it.state !== 'done' && /certif/i.test(String(it.text || '')) && ((it.state === 'waiting' && /^(?:the\s+)?developer\b/i.test(String(it.waits || 'developer'))) || /^(?:the\s+)?developer\b/i.test(String(it.text || '')))) continue;
-+      if (cw && it0.state !== 'done' && /certif/i.test(String(it0.text || '')) && ((it0.state === 'waiting' && /^(?:the\s+)?developer\b/i.test(String(it0.waits || 'developer'))) || devStep(it0))) continue;
-+      const it = it0 === current ? { ...it0, state: 'active', who: '' } : it0;
-@@ 11714 -1 +1
--      if (it.state === 'active' && (it.who || (session && session.status === 'running'))) r.classList.add('tl-spin');
-+      if (it.state === 'active' && (it.who || running)) r.classList.add('tl-spin');
-@@ 11724 -10 +0
--    // THE CHECK, A ROW OF ITS OWN while it runs (the developer, 2026-11-20) - set apart like the certify row, turning
--    for (const c of checks) {
--      const r = document.createElement('div'); r.className = 'tl-row tl-check tl-active tl-spin'; r.setAttribute('role', 'listitem');
--      const m = document.createElement('span'); m.className = 'tl-mark'; m.setAttribute('aria-hidden', 'true');
--      const t = document.createElement('span'); t.className = 'tl-text'; t.textContent = `Checking ${CERTIFY_WHAT[c.kind] || 'the work'}${c.sha ? ' (commit ' + String(c.sha).slice(0, 7) + ')' : ''}`;
--      r.append(m, t);
--      if (Number(c.round) > 1) { const n = document.createElement('span'); n.className = 'tl-who'; n.textContent = ' \u00b7 round ' + c.round; r.appendChild(n); }
--      r.title = 'code_boss checks the agent\'s work before it is yours - another agent, reading what was done';
--      el.appendChild(r);
--    }
-@@ 11763 -0 +12
-+    // THE CHECK, A ROW OF ITS OWN while it runs (the developer, 2026-11-20) - set apart like the certify row, turning;
-+    // UNDER A CERTIFICATION WAITING (the developer, 2026-11-25: "I always want the certification checklist items to be
-+    // above the checking items ... Because checks always run before we ask for certification")
-+    for (const c of checks) {
-+      const r = document.createElement('div'); r.className = 'tl-row tl-check tl-active tl-spin'; r.setAttribute('role', 'listitem');
-+      const m = document.createElement('span'); m.className = 'tl-mark'; m.setAttribute('aria-hidden', 'true');
-+      const t = document.createElement('span'); t.className = 'tl-text'; t.textContent = `Checking ${CERTIFY_WHAT[c.kind] || 'the work'}${c.sha ? ' (commit ' + String(c.sha).slice(0, 7) + ')' : ''}`;
-+      r.append(m, t);
-+      if (Number(c.round) > 1) { const n = document.createElement('span'); n.className = 'tl-who'; n.textContent = ' · round ' + c.round; r.appendChild(n); }
-+      r.title = 'code_boss checks the agent\'s work before it is yours - another agent, reading what was done';
-+      el.appendChild(r);
-+    }
-@@ 11770 -1 +2
--    // last among the rows, under the working line: before a message waiting for the agent and the docks
-+    // last among the rows, under the working line: before a Heads up box (pinHeadsUp: under the checklist), a message
-+    // waiting for the agent and the docks
-@@ 11772 -1 +1
--    for (const c of log.children) { if (c !== el && (c.classList.contains('pending-steer') || c.classList.contains('bg-dock') || c.classList.contains('ag-dock'))) { at = c; break; } }
-+    for (const c of log.children) { if (c !== el && (isPinnedNote(c) || c.classList.contains('pending-steer') || c.classList.contains('bg-dock') || c.classList.contains('ag-dock'))) { at = c; break; } }
-@@ 11940 -4 +44
--    const last = [...log.children].filter((el) => !el.classList.contains('status') && !el.classList.contains('bg-dock') && !el.classList.contains('ag-dock') && !el.classList.contains('pending-steer') && !el.classList.contains('todo-list') && !el.classList.contains('certify-box') && !el.classList.contains('wc-live') && !el.classList.contains('heads-up-row') && !(el.classList.contains('cb-banner') && el.classList.contains('note')) || el.classList.contains('done')).pop();
--    // (after the last row of the history, above the checklist, the certify box, the working line and the docks)
--    const tailAt = () => [...log.children].find((c) => !open.includes(c) && (c.classList.contains('wc-live') || c.classList.contains('todo-list') || c.classList.contains('certify-box') || c.classList.contains('status') || c.classList.contains('pending-steer') || c.classList.contains('bg-dock') || c.classList.contains('ag-dock'))) || null;
--    for (const row of open) { if (last && row.compareDocumentPosition(last) & Node.DOCUMENT_POSITION_FOLLOWING) log.insertBefore(row, tailAt()); }
-+    // BELOW THE CHECKLIST (the developer, 2026-11-25: "move the heads up box to below the checklist"): after the history,
-+    // the working line and the checklist; above only a message waiting for the agent and the docks
-+    const at = [...log.children].find((c) => !open.includes(c) && (c.classList.contains('pending-steer') || c.classList.contains('bg-dock') || c.classList.contains('ag-dock'))) || null;
-+    let n = at ? at.previousElementSibling : log.lastElementChild, there = true;
-+    for (let i = open.length - 1; i >= 0; i--, n = n && n.previousElementSibling) if (n !== open[i]) { there = false; break; }
-+    if (!there) for (const row of open) log.insertBefore(row, at);
-+    notePage();
-+  }
-+  // ONE AT A TIME IN THE CHAT TOO (the developer, 2026-11-27: "There are like 5 heads up boxes visible. We should just
-+  // show 1 at a time w/ paging. I thought we were" - the pager of 2026-11-13 stayed with the stack over the message box
-+  // when the boxes moved into the history on 2026-11-19): the open boxes at the end of the chat show one - the top one,
-+  // or the one paged to; a box that comes meanwhile does not take its place - with "‹ 1 of N ›" inside it; answered
-+  // (removed), the next one shows. The pager sits in the shown box, so the log gets no row of its own
-+  const _nPage = { cur: null, paged: false };
-+  const _nPageWatched = new WeakSet();
-+  function notePage() {
-+    const log = mainChat && mainChat.rc && mainChat.rc.log;
-+    if (!log) return;
-+    if (!_nPageWatched.has(log) && typeof MutationObserver === 'function') { _nPageWatched.add(log); try { new MutationObserver(() => { try { notePage(); } catch {} }).observe(log, { childList: true }); } catch {} }
-+    const items = [...log.querySelectorAll(PINNED_NOTE_SEL)];
-+    if (_nPage.cur && !items.includes(_nPage.cur)) { _nPage.cur = null; _nPage.paged = false; }
-+    const cur = _nPage.paged && _nPage.cur ? _nPage.cur : items[0] || null;
-+    _nPage.cur = cur;
-+    for (const el of items) { const off = items.length > 1 && el !== cur; if (el.classList.contains('bn-off') !== off) el.classList.toggle('bn-off', off); }
-+    for (const p of log.querySelectorAll('.note-pager')) if (items.length <= 1 || p.parentElement !== cur) p.remove();
-+    if (items.length <= 1 || !cur) return;
-+    let pager = cur.querySelector(':scope > .note-pager');
-+    if (!pager) {
-+      pager = document.createElement('div'); pager.className = 'cb-pager note-pager';
-+      pager.innerHTML = '<button type="button" data-np="-1" title="The one before" aria-label="The one before">‹</button><span class="cb-pager-n"></span><button type="button" data-np="1" title="The next one" aria-label="The next one">›</button>';
-+      pager.addEventListener('click', (e) => {
-+        const b = e.target.closest('[data-np]'); if (!b) return;
-+        e.preventDefault(); e.stopPropagation();   // (not the box's own summary toggle)
-+        const list = [...log.querySelectorAll(PINNED_NOTE_SEL)];
-+        const i = Math.max(0, Math.min(list.length - 1, list.indexOf(_nPage.cur) + Number(b.dataset.np)));
-+        _nPage.cur = list[i]; _nPage.paged = true; notePage();
-+      });
-+      cur.insertBefore(pager, cur.firstChild);
-+    }
-+    const idx = items.indexOf(cur);
-+    const txt = `${idx + 1} of ${items.length}`;
-+    const n = pager.querySelector('.cb-pager-n'); if (n.textContent !== txt) n.textContent = txt;
-+    pager.querySelector('[data-np="-1"]').disabled = idx === 0;
-+    pager.querySelector('[data-np="1"]').disabled = idx === items.length - 1;
-@@ 11945 -0 +2
-+  // (a Heads up box or the dev check's note while open - PINNED_NOTE_SEL; a declaration: the working line's pin uses it)
-+  function isPinnedNote(c) { return !!c && !!c.classList && (c.classList.contains('heads-up-row') && !c.classList.contains('done') || c.classList.contains('cb-banner') && c.classList.contains('note')); }
-@@ 13520 -0 +5
-+    // A DIAGRAM STILL BEING DRAWN IS ONE ARTIFACT (2026-11-26: a reply drawn as it arrives renders its fence at every
-+    // step, and "flowchart LR / A[Order " parsed as a node titled "A" - the list kept a second, broken "A" beside the
-+    // finished one): an entry whose source this one only extends was a step of it
-+    const s = String(src || '').trim();
-+    for (let k = _mmArtifacts.length - 1; k >= 0; k--) { const p = String(_mmArtifacts[k].src || '').trim(); if (p && p.length < s.length && s.startsWith(p)) _mmArtifacts.splice(k, 1); }
-@@ 14424 -1 +1
--        if (msg.session.build && msg.session.build.version) { const _bv = document.getElementById('settingsBuild'); if (_bv) _bv.textContent = 'build ' + msg.session.build.version + (msg.session.build.source ? ' \u00b7 ' + msg.session.build.source : ''); const _sv = document.getElementById('sourceVer'); if (_sv) _sv.textContent = msg.session.build.source || ''; }
-+        if (msg.session.build && msg.session.build.version) { const _bv = document.getElementById('settingsBuild'); if (_bv) _bv.textContent = 'build ' + msg.session.build.version + (msg.session.build.source ? ' \u00b7 ' + msg.session.build.source : ''); const _ch = document.getElementById('channelLabel'); if (_ch) { const c = msg.session.build.channel === 'devtest' || msg.session.build.channel === 'beta' ? msg.session.build.channel : ''; _ch.textContent = c; _ch.title = c ? `This is a ${c} build${c === 'beta' ? ' (Settings: Beta builds)' : ' (deployed by setup, not yet released to users)'}` : ''; } }
-@@ 18928 -0 +1
-+        document.body.classList.add('demo-paused');
-@@ 18931 -0 +1
-+        document.body.classList.remove('demo-paused');
-@@ 18971 -0 +24
-+  /**
-+   * UNTIL THE AGENT HAS STOPPED (the developer, 2026-11-25: "on the demo, it seems to keep going when it's supposed to be
-+   * waiting for the next button"): its run ended, or it waits on a reply written in a later step (the server holds that
-+   * until its step plays - /api/demo-mode/step `held`). A waitIdle, and the end of every step before its Next: what a
-+   * step's replies do is on the screen before the pause, and nothing moves in it. True; false after `lim` ms.
-+   */
-+  async function demoSettle(lim = 60000) {
-+    const t0 = Date.now();
-+    let quiet = 0, held = 0, checked = false;
-+    // (a check of its work is part of it: commit() and done() end the run while it goes, and what it finds starts another
-+    // a moment after it ends - so longer quiet once there has been one; and a message just sent is not running yet)
-+    while (quiet < (checked ? 12 : 3) && held < 2) {
-+      if (Date.now() - t0 > lim) return false;
-+      await new Promise((r) => setTimeout(r, demoQuick() ? 60 : 250));
-+      const checking = !!document.querySelector('#log .work-check.wc-live');
-+      if (checking) checked = true;
-+      const busy = session?.status === 'running' || checking;
-+      let h = false;
-+      if (busy) { try { h = !!(await (await fetch('/api/demo-mode/step')).json()).held; } catch { h = false; } }
-+      held = h ? held + 1 : 0;
-+      quiet = busy || Date.now() - t0 < 700 ? 0 : quiet + 1;
-+    }
-+    return true;
-+  }
-@@ 19011 -16 +2
--      const lim = Number(s.timeout) || 60000, t0 = Date.now();
--      let quiet = 0;
--      // (waiting for the run to end lets its replies come, whichever step they were written in)
--      await demoTellServer({ open: true });
--      try {
--        // (a check of its work is part of it: commit() and done() end the run while it goes, and what it finds starts
--        // another a moment after it ends - so longer quiet once there has been one)
--        let checked = false;
--        while (quiet < (checked ? 12 : 3)) {
--          if (Date.now() - t0 > lim) throw new Error(`the agent was still working after ${Math.round(lim / 1000)} s`);
--          await new Promise((r) => setTimeout(r, 250));
--          const checking = !!document.querySelector('#log .work-check.wc-live');
--          if (checking) checked = true;
--          quiet = session?.status === 'running' || checking || Date.now() - t0 < 700 ? 0 : quiet + 1;
--        }
--      } finally { await demoTellServer({ open: false }); }
-+      const lim = Number(s.timeout) || 60000;
-+      if (!(await demoSettle(lim))) throw new Error(`the agent was still working after ${Math.round(lim / 1000)} s`);
-@@ 19092 -1 +5
--        if (await demoRunStep(_dp.at)) _dp.at++;
-+        if (await demoRunStep(_dp.at)) {
-+          // (what the step's replies do, done before its pause - a step without a waitIdle too)
-+          await demoSettle(60000);
-+          _dp.at++;
+@@ 144 -0 +1
++ *   hooks.saveCreds({ user, token })   a user and token entered in the window that GitLab accepted, kept for the next run
+@@ 184 -0 +7
++        // A GITLAB USER AND TOKEN ENTERED HERE THAT GITLAB TOOK ARE KEPT (the developer, 2026-11-27: yes to "Save a token
++        // typed in the install window once GitLab accepts it?" - the saved one had been refused, and the next run would
++        // have been refused again): .code_boss\gitlab-creds.json, where the next run reads them. Never one refused.
++        if (st.needToken && creds.token && typeof hooks.saveCreds === 'function') {
++          try { hooks.saveCreds({ user: creds.user, token: creds.token }); st.needToken = false; log('sandbox: GitLab accepted the user and token entered - saved on this machine for the next run'); }
++          catch (e) { log(`sandbox: GitLab accepted the token entered, but it could not be saved - ${e.message}`); }
 +        }
-@@ 19117 -1 +1
--      for (let i = 0; i < to; i++) { _dp.at = i; demoTell(); if (!(await demoRunStep(i))) { note.remove(); demoTell(); return; } }
-+      for (let i = 0; i < to; i++) { _dp.at = i; demoTell(); if (!(await demoRunStep(i))) { note.remove(); demoTell(); return; } await demoSettle(60000); }
-=== change test/_edge-unlock-midrun.mjs
-base 03af358994d0d46ee60c60f6
-new f00166b34d3c6ec9f3dd4157
-@@ 115 -1 +0
--    // (since 2026-11-18 the page is IN the dialog, in a frame; its own window is a button away)
-@@ 117 -3 +3
--      url: document.getElementById('initModalBody')?.textContent || '',
--      frame: document.getElementById('unlockFrame')?.getAttribute('src') || '',
--      done: !!document.getElementById('unlockDone'),
-+      url: document.querySelector('#initModalBody div')?.textContent || '',
-+      s1: document.getElementById('unlockStage1')?.style.display !== 'none',
-+      s2: document.getElementById('unlockStage2')?.style.display === 'none',
-@@ 122 -1 +1
--    ok(stage1.frame === UNLOCK_URL && stage1.done, 'the unlock page is in the dialog\'s frame, with "I\'m finished" beside it');
-+    ok(stage1.s1 && stage1.s2, 'two-stage UI starts at stage 1 (only "Open unlock page")');
-@@ 134 -1 +1
--    await page.click('#unlockOwn');
-+    await page.click('#unlockOpen');
-@@ 137 -1 +1
--    ok(opened.length === 1 && opened[0] === UNLOCK_URL, `"Open in its own window" opened exactly the unlock_url (got ${JSON.stringify(opened)})`);
-+    ok(opened.length === 1 && opened[0] === UNLOCK_URL, `"Open unlock page" opened exactly the unlock_url (got ${JSON.stringify(opened)})`);
-=== change test/_edge-unlock-vs-changekey.mjs
-base 0102f24515e30913c301e182
-new 600c3af336f7c4b40e9e8f8f
-@@ 138 -1 +1
--      unlockOpenThere: !!document.getElementById('unlockFrame'),
-+      unlockOpenThere: !!document.getElementById('unlockOpen'),
-@@ 147 -1 +1
--    await page.click('#unlockOwn');
-+    await page.click('#unlockOpen');
-=== change test/pii-contest/piishape.mjs
-base fee1d1dd9b8cef8ffbb02f9e
-new 8e59800cb9748d501ec88ea3
-@@ 839 -0 +5
-+    // A WORD IN ALTERNATING CASE IS NOT AN IDENTIFIER (test-tokens-edges-volume, 2026-11-26: "qAvAnAgH" split into
-+    // q, Av, An, Ag, H - each "2 letters or fewer", so a surname reached the model): letters only, four or more parts and
-+    // not one longer than 2 is no word anyone wrote as code. (Three was measured too many on petclinic and algos: isNaN,
-+    // isROp, and every CSS colour - f8f9fa - would have gone; a colour has digits, isNaN three parts.)
-+    if (/^\p{L}+$/u.test(run) && parts.length >= 4 && parts.every((p) => p.length <= 2)) return null;
-=== change test/test-api-edges-volume.mjs
-base d42f6eeef85dd087c898b3ae
-new e663e2acc6a96b83a697eaa8
-@@ 79 -0 +3
-+    // (and it says it finished, as an endpoint does: a reply ending mid-line with no finish_reason is taken for one CUT
-+    // OFF - the run takes it back and asks again, and the chat's last reply was that next one - 2026-11-26)
-+    yield { choices: [{ delta: {}, finish_reason: 'stop' }] };
-@@ 116 -1 +4
--const health = async () => (await get('/api/health', { timeout: 5000 })).status === 200;
-+// (one retry on a CONNECTION error, not a timeout: under the full suite's load the first request after the stress
-+// cases was once refused in 17 ms - a reused keep-alive socket - and every one after it answered in a few ms; a server that
-+// does not answer still fails it - 2026-11-26)
-+const health = async () => { const h = await get('/api/health', { timeout: 5000 }); if (h.status === 200) return true; if (h.err === 'TIMEOUT') return false; return (await get('/api/health', { timeout: 5000 })).status === 200; };
-=== change test/test-busy-send-ux.mjs
-base 53be1fc0c56e70258ebfe017
-new 769f756679bcf75cd9f76773
-@@ 41 -0 +3
-+// (`streaming`: the first step is really out - a message typed before it is folded into that step, rightly, and
-+// nothing waits; the run's start takes a second or two now, and the test typed into that gap - 2026-11-26)
-+let streaming = false;
-@@ 42 -1 +1
--  async *completeStream() { for (let i = 0; i < 100; i++) { await sleep(150); yield { choices: [{ delta: { content: 'working… ' } }] }; } },
-+  async *completeStream() { streaming = true; for (let i = 0; i < 100; i++) { await sleep(150); yield { choices: [{ delta: { content: 'working… ' } }] }; } },
-@@ 67 -0 +2
-+    for (let i = 0; i < 100 && !streaming; i++) await sleep(100);
-+    ok(streaming, 'its first step is out to the model');
-=== change test/test-cant-run-cut.mjs
-base e6ca00802d602af76157c65c
-new 3c20bc6782615f87ec7d04e8
-@@ 24 -1 +3
--const streamOf = (text, size = 20) => {
-+// (the event loop turns between pieces, as a network delivers them: pieces that come together are read as one -
-+// coalesceStream, 2026-11-27 - so without a turn the whole reply "had arrived" and was read; `burst` gives it at once)
-+const streamOf = (text, size = 20, { burst = false } = {}) => {
-@@ 29 -0 +1
-+        if (!burst) await new Promise((r) => setImmediate(r));
-@@ 48 -0 +8
+@@ 192 -1 +1
+-        if (/^https?:/i.test(source) && /could not read Username|could not read Password|Authentication failed|HTTP Basic: Access denied|returned error: 40[13]|\b40[13] (Unauthorized|Forbidden)/i.test(e.message)) {
++        if (sbuTokenRefused(source, e.message)) {
+=== change test/test-sandbox-cmd-e2e.mjs
+base 344e6a36d66cc2101e1998d9
+new 388cc72231173a92b335d2d0
+@@ 156 -0 +4
++  // (production, 2026-11-27: "the terminal window displays for a second, writes some status text, then disappears" - each
++  // run's words are kept in .code_boss\sandbox-log.txt)
++  { const lg = readFileSync(path.join(HOME, '.code_boss', 'sandbox-log.txt'), 'utf8'); const lastRun = lg.slice(lg.lastIndexOf('=== 2'));
++    ok(/sandbox --channel devtest --yes --no-browser --no-tray/.test(lastRun) && /could not get the image at 'sandbox-devtest'/.test(lastRun) && /=== exit 2\n?$/.test(lastRun.trimEnd() + '\n'), `the run that failed is in sandbox-log.txt, with what it said and its exit (${lastRun.split('\n').length} lines)`); }
+=== change test/test-sandbox-token-refused.mjs
+base 623c53a6f8b33b3bbc45adfe
+new b8e6aea4b5080b98d4217123
+@@ 29 -1 +2
+-const done = runSetupWindow({ tree: path.join(dir, 'tree'), source, creds: { user: 'someone', token: 'glpat-SAVED-BAD' }, tag: 'sandbox-beta', gitDir: path.join(dir, 'git'), cbDir: path.join(dir, 'cb'), profile: dir, ask: true, needToken: false, openWindow: false, headless: false, idleMs: 60000, onUrl: (u) => { url = u; } });
++const savedCreds = [];   // (hooks.saveCreds: a token is kept only once GitLab took it)
++const done = runSetupWindow({ tree: path.join(dir, 'tree'), source, creds: { user: 'someone', token: 'glpat-SAVED-BAD' }, tag: 'sandbox-beta', gitDir: path.join(dir, 'git'), cbDir: path.join(dir, 'cb'), profile: dir, ask: true, needToken: false, openWindow: false, headless: false, idleMs: 60000, onUrl: (u) => { url = u; }, hooks: { saveCreds: (c) => savedCreds.push(c) } });
+@@ 56 -0 +1
++  ok(savedCreds.length === 0, 'a token GitLab refused is never saved');
+@@ 76 -0 +106
++
++console.log('\n[5] an INSTALLED container run again, its saved token refused: the install window asks for one');
 +{
-+  // (all of it at once - one piece: cut where the phrase became whole, not after everything that came with it)
-+  const long = CLAIM + ' ' + 'and then more words '.repeat(200);
-+  const { adapter } = streamOf(long, 20, { burst: true });
-+  const shown = []; let cut = null;
-+  const text = await ts.runTurnStreaming(adapter, { model: 'm', messages: [] }, { cantRunCut: true, onProseChunk: (c) => shown.push(c.content), onProseSegmentEnd: (c) => shown.push('[end]' + c.content), onCantRunCut: (c) => { cut = c; } });
-+  ok(cut && cut.kept === text.length && text.length <= CLAIM.length + 1 && !shown.length, `a burst: cut where the phrase became whole (${text.length} characters kept, the phrase ${CLAIM.length})`);
-+}
-=== add test/test-channel-label-e2e.mjs
-new edcccedd42f220f9bf65224a
-+/**
-+ * End-to-end: the status bar names the channel the running build came from when it is devtest or beta (the developer,
-+ * 2026-11-27: "if the version being run is devtest or beta, we put that label to the right of the icons in the status
-+ * bar"). The server reads <CB_HOME>/.code_boss/channel once, at start (server.mjs CHANNEL_AT_START): production (no file)
-+ * shows nothing, and ticking Beta builds after the start does not relabel the build still running.
-+ * Run: node test/test-channel-label-e2e.mjs
-+ */
-+import { mkdtemp, mkdir, writeFile, readFile } from 'node:fs/promises';
-+import { existsSync } from 'node:fs';
-+import { tmpdir } from 'node:os';
-+import path from 'node:path';
-+import { fileURLToPath } from 'node:url';
-+import { spawn } from 'node:child_process';
-+import puppeteer from 'puppeteer-core';
-+import { cleanupDir } from './_helpers.mjs';
-+
-+const __dirname = path.dirname(fileURLToPath(import.meta.url));
-+const ROOT = path.resolve(__dirname, '..');
-+let pass = 0, fail = 0;
-+const ok = (c, l) => { if (c) { pass++; console.log('  ok', l); } else { fail++; console.log('  FAIL', l); } };
-+const chrome = ['C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe', (process.env.LOCALAPPDATA || '') + '\\Google\\Chrome\\Application\\chrome.exe'].find((p) => { try { return p && existsSync(p); } catch { return false; } });
-+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-+
-+// (the channel is read when server.mjs loads, so each case is its own process with its own CB_HOME)
-+if (process.argv[2] === '--serve') {
-+  const [, , , port, proj] = process.argv;
-+  const html = await readFile(path.join(ROOT, 'src', 'ui.html'), 'utf8');
-+  const { startServer } = await import('../src/server.mjs');
-+  await startServer({ html: html.replace('</head>', '<script>window.SERVER_CONFIG=' + JSON.stringify({ defaultModel: 'm', baseURL: '(mock)' }) + ';</script></head>'), baseURL: '(mock)', apiKey: 'k', gitlabCreds: { user: 't', token: 't' }, defaultModel: 'm', port: Number(port), adapter: { async *completeStream() { yield { choices: [{ delta: { content: 'ok' }, finish_reason: 'stop' }] }; }, async complete() { return { choices: [{ message: { content: '' } }] }; } }, modelsList: [{ id: 'm' }], initialProject: proj });
-+  console.log('READY');
-+} else {
-+  if (!chrome) { console.error('Chrome not found'); process.exit(2); }
-+  const browser = await puppeteer.launch({ executablePath: chrome, headless: 'new', args: ['--no-sandbox'] });
-+  const dirs = [];
-+  const label = async (channel, port, after) => {
-+    const home = await mkdtemp(path.join(tmpdir(), 'cb-chan-home-')); const proj = await mkdtemp(path.join(tmpdir(), 'cb-chan-proj-')); dirs.push(home, proj);
-+    if (channel) { await mkdir(path.join(home, '.code_boss'), { recursive: true }); await writeFile(path.join(home, '.code_boss', 'channel'), channel + '\n'); }
-+    const child = spawn(process.execPath, [fileURLToPath(import.meta.url), '--serve', String(port), proj], { env: { ...process.env, CB_HOME: home, CB_SOURCE_ID: 'abcd1234' }, stdio: ['ignore', 'pipe', 'pipe'] });
-+    await new Promise((res, rej) => { const t = setTimeout(() => rej(new Error('server did not start')), 60000); child.stdout.on('data', (d) => { if (/READY/.test(String(d))) { clearTimeout(t); res(); } }); });
-+    try {
-+      if (after) await after(port);
-+      const page = await browser.newPage();
-+      await page.setViewport({ width: 1300, height: 800 });
-+      await page.goto(`http://127.0.0.1:${port}/`);
-+      await page.waitForSelector('#chat:not(.hidden)', { timeout: 15000 });
-+      await page.waitForFunction(() => document.getElementById('settingsBuild')?.textContent, { timeout: 10000 }).catch(() => {});
-+      await sleep(300);
-+      const r = await page.evaluate(() => { const el = document.getElementById('channelLabel'); const icons = document.getElementById('statusIcons'); const bar = document.querySelector('.sc-right')?.textContent || ''; return { hashInBar: /abcd1234/.test(bar), hashInSettings: /abcd1234/.test(document.getElementById('settingsBuild')?.textContent || ''), text: el?.textContent || '', shown: !!el && el.offsetParent !== null && getComputedStyle(el).display !== 'none', rightOfIcons: !!el && !!icons && el.getBoundingClientRect().left >= icons.getBoundingClientRect().right - 1 && Math.abs((el.getBoundingClientRect().top + el.getBoundingClientRect().bottom) - (icons.getBoundingClientRect().top + icons.getBoundingClientRect().bottom)) < 30 }; });
-+      if (process.env.CB_CHAN_SHOT) await page.screenshot({ path: process.env.CB_CHAN_SHOT.replace('.png', '-' + port + '.png'), clip: { x: 850, y: 700, width: 450, height: 100 } });
-+      await page.close();
-+      return r;
-+    } finally { child.kill(); }
-+  };
-+  try {
-+    console.log('\n[1] beta: the label shows, right of the icons');
-+    const b = await label('beta', 29361);
-+    ok(b.text === 'beta' && b.shown && b.rightOfIcons, `"beta" right of the icons (${JSON.stringify(b)})`);
-+    // (the developer, 2026-11-27: "let's not put the build hash in the status bar and just keep it visible inside the settings modal")
-+    ok(!b.hashInBar && b.hashInSettings, `the folder hash is in Settings, not the status bar (${JSON.stringify({ bar: b.hashInBar, settings: b.hashInSettings })})`);
-+    console.log('\n[2] devtest');
-+    const d = await label('devtest', 29362);
-+    ok(d.text === 'devtest' && d.shown, `"devtest" (${JSON.stringify(d)})`);
-+    console.log('\n[3] production (no channel file): nothing');
-+    const p = await label('', 29363);
-+    ok(p.text === '' && !p.shown, `no label (${JSON.stringify(p)})`);
-+    console.log('\n[4] Beta builds ticked after the start: the running build keeps its label');
-+    const t = await label('', 29364, async (port) => { await fetch(`http://127.0.0.1:${port}/api/update-channel`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ beta: true }) }); });
-+    ok(t.text === '' && !t.shown, `still no label until it restarts on the beta build (${JSON.stringify(t)})`);
-+  } catch (e) { fail++; console.log('  FAIL harness:', e?.message || e); }
-+  finally { await browser.close(); for (const x of dirs) await cleanupDir(x).catch(() => {}); }
-+  console.log(`\n${pass} passed, ${fail} failed`);
-+  process.exit(fail === 0 ? 0 : 1);
-+}
-+
-=== add test/test-coalesce-stream.mjs
-new 8380f6f415274482464be084
-+/**
-+ * coalesceStream (turn-stream.mjs): the pieces of a reply that arrive together are read as one - what settles before
-+ * the event loop turns - and nothing else changes: the text and its order, a piece that is not plain text (the finish,
-+ * tool calls, reasoning, usage) given by itself, a piece that comes later given when it comes, an error and the end.
-+ * Run: node test/test-coalesce-stream.mjs
-+ */
-+import { coalesceStream } from '../src/agent/turn-stream.mjs';
-+
-+let pass = 0, fail = 0;
-+const ok = (c, l) => { if (c) { pass++; console.log('  ok', l); } else { fail++; console.log('  FAIL', l); } };
-+const txt = (s) => ({ id: 'x', object: 'chat.completion.chunk', choices: [{ index: 0, delta: { content: s } }] });
-+const tick = () => new Promise((r) => setImmediate(r));
-+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-+const all = async (it) => { const out = []; for await (const c of it) out.push(c); return out; };
-+const textOf = (cs) => cs.map((c) => c?.choices?.[0]?.delta?.content || '').join('');
-+const piecesOf = (cs) => cs.reduce((n, c) => n + (c.pieces || 1), 0);
-+
-+console.log('\n[1] a burst: one piece');
-+{
-+  async function* src() { for (let i = 0; i < 1000; i++) yield txt(String(i % 10)); }
-+  const got = await all(coalesceStream(src()));
-+  ok(got.length === 1 && textOf(got) === '0123456789'.repeat(100) && got[0].pieces === 1000, `1000 pieces at once read as ${got.length}, the text whole, pieces ${got[0]?.pieces}`);
-+  ok(got[0].id === 'x' && got[0].choices[0].index === 0 && !Object.keys(got[0]).includes('pieces'), 'the rest of the first piece is kept; pieces is not enumerable');
-+}
-+
-+console.log('\n[2] the event loop turning between them: as they come');
-+{
-+  async function* src() { for (const s of ['a', 'b', 'c']) { await tick(); yield txt(s); } }
-+  const got = await all(coalesceStream(src()));
-+  ok(got.length === 3 && textOf(got) === 'abc', `three apart: three (${got.length})`);
-+  async function* slow() { yield txt('first'); await sleep(40); yield txt('later'); }
-+  const it = coalesceStream(slow()); const t0 = Date.now();
-+  const a = await it.next(); const ta = Date.now() - t0; const b = await it.next();
-+  ok(a.value.choices[0].delta.content === 'first' && ta < 30 && b.value.choices[0].delta.content === 'later', `what came is given without waiting for what comes later (${ta} ms)`);
-+}
-+
-+console.log('\n[3] what is not plain text is given by itself, in its place');
-+{
-+  const fin = { choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] };
-+  const tool = { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { name: 'f' } }] } }] };
-+  const reas = { choices: [{ index: 0, delta: { content: 'r', reasoning_content: 'think' } }] };
-+  const usage = { choices: [], usage: { total_tokens: 5 } };
-+  const withFin = { choices: [{ index: 0, delta: { content: 'z' }, finish_reason: 'stop' }] };
-+  async function* src() { yield txt('a'); yield txt('b'); yield tool; yield txt('c'); yield reas; yield txt('d'); yield txt('e'); yield withFin; yield fin; yield usage; }
-+  const got = await all(coalesceStream(src()));
-+  ok(textOf(got) === 'abcrdez' && got.length === 8, `order and text kept: ${got.map((c) => JSON.stringify(c.choices?.[0]?.delta || c.usage)).join(' ')}`);
-+  ok(got[1] === tool && got[3] === reas && got[5] === withFin && got[6] === fin && got[7] === usage, 'the tool call, reasoning, a piece with its finish, the finish and usage: each itself');
-+  ok(piecesOf(got) === 10, `the counts add up to what arrived (${piecesOf(got)})`);
-+}
-+
-+console.log('\n[4] at most max characters a piece');
-+{
-+  async function* src() { for (let i = 0; i < 100; i++) yield txt('xxxxxxxxxx'); }
-+  const got = await all(coalesceStream(src(), { max: 250 }));
-+  ok(got.every((c) => c.choices[0].delta.content.length <= 260) && textOf(got).length === 1000 && got.length >= 4, `cut at the size (${got.map((c) => c.choices[0].delta.content.length).join(',')})`);
-+}
-+
-+console.log('\n[5] an error and the end pass through, after the text before them');
-+{
-+  async function* src() { yield txt('a'); yield txt('b'); throw new Error('boom'); }
-+  const it = coalesceStream(src());
-+  const a = await it.next(); let e = null; try { await it.next(); } catch (x) { e = x; }
-+  ok(a.value.choices[0].delta.content === 'ab' && e && e.message === 'boom', `"ab", then the error (${e && e.message})`);
-+  const d = await it.next();
-+  ok(d.done === true, 'then done');
-+  async function* empty() {}
-+  const g = await all(coalesceStream(empty()));
-+  ok(g.length === 0, 'an empty source: nothing');
-+}
-+
-+console.log('\n[6] return(): the source is finished');
-+{
-+  let finished = 0;
-+  async function* src() { try { for (let i = 0; ; i++) { if (i % 3 === 0) await tick(); yield txt('p'); } } finally { finished++; } }
-+  const it = coalesceStream(src());
-+  await it.next(); await it.next();
-+  await it.return();
-+  await sleep(20);
-+  ok(finished === 1, `its finally ran (${finished})`);
-+  const after = await it.next();
-+  ok(after.done === true, 'and nothing more is read');
-+}
-+
-+console.log(`\n${pass} passed, ${fail} failed`);
-+process.exit(fail ? 1 : 0);
-+
-=== add test/test-demo-pauses-e2e.mjs
-new 6f331b83bd5b4d7aa0f3d3c4
-+/**
-+ * A DEMO WAITS FOR NEXT, AND NOTHING MOVES WHILE IT DOES (the developer, 2026-11-25: "on the demo, it seems to keep going
-+ * when it's supposed to be waiting for the next button. Please do lots of testing around this being careful to see the
-+ * live movement"). Played in a real page, every pause watched for some seconds:
-+ *   - the demo's chat does not change while Next is lit (rows, text, the agent's state)
-+ *   - each step's replies are on the screen by its pause, and no later step's (a waitIdle let them all through, and a step
-+ *     without one lit Next while its replies were still coming)
-+ *   - "watch": replies in the steps they belong to, a step without waitIdle, a run going on into the next step's replies
-+ *   - "check": commit() and its check, which sends the agent back once
-+ * Run: node test/test-demo-pauses-e2e.mjs   (one demo: --one watch|check; DW_PAUSE / DW_GOTO / DW_FORWARD as _demo-watch)
-+ */
-+import { spawnSync } from 'node:child_process';
-+import { fileURLToPath } from 'node:url';
-+import { mkdtemp, mkdir, writeFile, readFile } from 'node:fs/promises';
-+import { existsSync } from 'node:fs';
-+import { tmpdir } from 'node:os';
-+import { execSync } from 'node:child_process';
-+import path from 'node:path';
-+import puppeteer from 'puppeteer-core';
-+
-+if (!process.argv.includes('--one')) {
-+  let failed = 0, passed = 0;
-+  for (const k of ['watch', 'check']) {
-+    const r = spawnSync(process.execPath, [fileURLToPath(import.meta.url), '--one', k], { encoding: 'utf8', timeout: 600000 });
-+    const lines = String(r.stdout || '').split('\n').filter((l) => /^\s+(ok|FAIL)\b|^\[\d|^ {3}\S/.test(l));
-+    console.log(`\n[${k}]`); for (const l of lines) console.log(l);
-+    // (a run that ended without saying FAIL - a crash - fails too)
-+    const crashed = r.status !== 0 && !lines.some((l) => /FAIL/.test(l));
-+    if (crashed) console.log('  FAIL it ended with', r.status, String(r.stderr || '').slice(-400));
-+    passed += lines.filter((l) => /^\s+ok\b/.test(l)).length; failed += lines.filter((l) => /^\s+FAIL\b/.test(l)).length + (crashed ? 1 : 0);
++  // (production, 2026-11-27: "sandbox: could not get the image at 'sandbox-production': the repository could not be
++  // reached: ... fatal: could not read Username for 'https://git-...': terminal prompts disabled" - and it ended there)
++  const { runSandbox } = await import('../src/agent/sandbox-cmd.mjs');
++  const { mkdirSync, writeFileSync } = await import('node:fs');
++  // (a GitLab of its own, in another process: the image check asks git and WAITS for it - spawnSync - so a stand-in in
++  // this process could never answer it)
++  const { spawn } = await import('node:child_process');
++  const glp = spawn(process.execPath, ['-e', "const s=require('http').createServer((q,r)=>{r.writeHead(401,{'WWW-Authenticate':'Basic realm=\"GitLab\"','Content-Type':'text/plain'});r.end('HTTP Basic: Access denied')});s.listen(0,'127.0.0.1',()=>console.log('PORT '+s.address().port))"], { stdio: ['ignore', 'pipe', 'inherit'] });
++  const port5 = await new Promise((r) => glp.stdout.on('data', (d) => { const m = /PORT (\d+)/.exec(String(d)); if (m) r(Number(m[1])); }));
++  const source = `http://127.0.0.1:${port5}/incubator/sandbox/tools.git`;
++  const home = path.join(dir, 'home5'), tree = path.join(dir, 'agent5'), noChrome = path.join(dir, 'no-chrome');
++  mkdirSync(path.join(home, '.code_boss'), { recursive: true });
++  writeFileSync(path.join(home, '.code_boss', 'gitlab-creds.json'), JSON.stringify({ user: 'someone', token: 'glpat-SAVED-EXPIRED' }));
++  mkdirSync(path.join(tree, 'tools', 'launcher', 'classes', 'cb', 'sandbox'), { recursive: true });
++  writeFileSync(path.join(tree, 'image.json'), '{"build":"1"}');
++  writeFileSync(path.join(tree, 'tools', 'launcher', 'classes', 'cb', 'sandbox', 'Manager.class'), 'x');
++  const lines = []; let url5 = '';
++  const env5 = { ...process.env, CB_HOME: home, LOCALAPPDATA: noChrome, ProgramFiles: noChrome, 'ProgramFiles(x86)': noChrome, CB_SANDBOX_IDLE_MS: '4000' };
++  const run5 = runSandbox(['--tree', tree, '--source', source, '--no-tray'], { log: (s) => { lines.push(s); const m = /open this address to (?:install|update) the sandbox - (\S+)/.exec(s); if (m) url5 = m[1]; }, env: env5, home });
++  for (let i = 0; i < 200 && !url5; i++) await sleep(50);
++  ok(!!url5 && lines.some((l) => /GitLab did not accept the GitLab access token saved on this machine .* the install window asks for one/.test(l)) && !lines.some((l) => /could not get the image/.test(l)), `it does not end at "could not get the image": it says the saved token was refused and opens the install window (${lines.slice(-2).join(' | ').slice(0, 160)})`);
++  if (url5) {
++    const b5 = url5.split('/?')[0], t5 = new URL(url5).searchParams.get('t');
++    const s5 = await (await fetch(b5 + '/api/state', { headers: { 'x-cb-token': t5 } })).json();
++    ok(s5.phase === 'ask' && s5.needToken === true, `its first screen asks for a GitLab user and token (${s5.phase}, needToken ${s5.needToken})`);
 +  }
-+  console.log(`\n${passed} passed, ${failed} failed`);
-+  process.exit(failed ? 1 : 0);
++  const r5 = await Promise.race([run5, sleep(15000).then(() => null)]);
++  ok(r5 && r5.code !== 0, 'nobody answered the window: it ends there, as an install left open does');
++  // with --yes (nobody to ask): said, with what to do
++  const lines6 = [];
++  const r6 = await runSandbox(['--tree', tree, '--source', source, '--no-tray', '--yes', '--no-browser'], { log: (s) => lines6.push(s), env: env5, home });
++  ok(r6.code === 2 && lines6.some((l) => /pass --gl-user and --gl-token, or run it without --yes/.test(l)), `with --yes it ends, saying the token was refused and what to do (${lines6.slice(-1)[0].trim().slice(0, 100)})`);
++  glp.kill();
 +}
-+const HOME = await mkdtemp(path.join(tmpdir(), 'cb-dw-home-')), PROJ = await mkdtemp(path.join(tmpdir(), 'cb-dw-proj-'));
-+process.env.CB_HOME = HOME;
-+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-+const chrome = ['C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe', (process.env.LOCALAPPDATA || '') + '\\Google\\Chrome\\Application\\chrome.exe'].find((p) => existsSync(p));
-+await writeFile(path.join(PROJ, 'README.md'), '# mine\n');
-+execSync('git init -q && git config user.email t@t && git config user.name t && git add -A && git commit -qm base', { cwd: PROJ, shell: true });
-+const R = (s) => JSON.stringify(s);
-+const KIND = process.argv.includes('--one') ? process.argv[process.argv.indexOf('--one') + 1] : '';
-+const commitJs = (file, text, msg) => `await write(${R(file)}, ${R(text)}); return await commit({ message: ${R(msg)}, complexity: 1, review: "a small change", certify: "I made it", different: "none", choices: "none", checked: "none", files: [${R(file)}] });`;
-+const DEMOS = {
-+  watch: `{ name: 'Watch', description: 'watched', files: { 'a.txt': 'one\\n', 'README.md': '# w\\n' },
-+  steps: [
-+    { title: 'Ask', ops: [{ say: 'Asking.', ms: 1200 }, { click: '#input' }, { type: 'Read a.txt and tell me.' }, { key: 'Enter' }] },
-+    { title: 'It reads', ops: [
-+      { reply: ${R('S2-R1 reading.\n<remote-workspace><js>return await read("a.txt");</js></remote-workspace>')} },
-+      { reply: ${R('S2-R2 it says one. ' + 'x'.repeat(600))} },
-+      { say: 'It read the file.', ms: 800 } ] },
-+    { title: 'Ask again', ops: [{ click: '#input' }, { type: 'Now change it and check the README.' }, { key: 'Enter' }] },
-+    { title: 'It changes it', ops: [
-+      { reply: ${R('S4-R1 changing.\n<remote-workspace><js>await write("a.txt", "two\\n"); return "ok";</js></remote-workspace>')} },
-+      { reply: ${R('S4-R2 changed. Now the README.\n<remote-workspace><js>return await read("README.md");</js></remote-workspace>')} },
-+      { waitIdle: true, timeout: 30000 } ] },
-+    { title: 'It checks the README', ops: [
-+      { reply: ${R('S5-R1 the README is fine.\n<remote-workspace><js>return await read("a.txt");</js></remote-workspace>')} },
-+      { reply: ${R('S5-R2 all done. ' + 'y'.repeat(400))} },
-+      { say: 'Done.', ms: 800 } ] },
-+    { title: 'End', ops: [{ say: 'The end.', ms: 600 }] },
-+  ] }`,
-+  check: `{ name: 'Check', description: 'commits and checks', files: { 'README.md': '# c\\n' },
-+  steps: [
-+    { title: 'Ask', ops: [{ click: '#input' }, { type: 'Add a.txt and commit it.' }, { key: 'Enter' }] },
-+    { title: 'It commits; the check sends it back', ops: [
-+      { reply: 'S2-R1 adding it.', js: ${R(commitJs('a.txt', 'one\n', 'add a'))} },
-+      { check: { findings: ['Say why a.txt is there.'] } },
-+      { reply: 'S2-R2 the check asked why - adding a note.', js: ${R(commitJs('a.txt', 'one - the build reads it\n', 'say why a is there'))} },
-+      { check: 'passes' },
-+      { say: 'It committed, and its work was checked.', ms: 800 } ] },
-+    { title: 'Ask again', ops: [{ click: '#input' }, { type: 'Add b.txt too.' }, { key: 'Enter' }] },
-+    { title: 'Second commit', ops: [
-+      { reply: 'S4-R1 adding b.', js: ${R(commitJs('b.txt', 'two\n', 'add b'))} },
-+      { check: 'passes' },
-+      { waitIdle: true, timeout: 60000 } ] },
-+    { title: 'End', ops: [{ say: 'The end.', ms: 600 }] },
-+  ] }`,
-+};
-+const MARKS = { watch: ['S2-R1', 'S2-R2', 'S4-R1', 'S4-R2', 'S5-R1', 'S5-R2'], check: ['S2-R1', 'S2-R2', 'S4-R1'], fix: [] }[KIND];
-+await mkdir(path.join(HOME, '.code_boss', 'plugins'), { recursive: true });
-+if (KIND === 'fix') { const { FIX_DEMO_PLUGIN_SOURCE } = await import('./fixtures/demos/fix-a-failing-test.mjs'); await writeFile(path.join(HOME, '.code_boss', 'plugins', 'cbdemo__1.mjs'), FIX_DEMO_PLUGIN_SOURCE); }
-+else await writeFile(path.join(HOME, '.code_boss', 'plugins', 'dwatch__1.mjs'), `export default { name: 'dwatch', description: 'x', tools: [], demos: [${DEMOS[KIND]}] };\n`);
-+const adapter = { async *completeStream() { yield { choices: [{ delta: { content: 'MAIN' } }] }; }, async complete() { return { choices: [{ message: { content: 'ok' } }] }; } };
-+const { startServer } = await import('../src/server.mjs');
-+const html = (await readFile('src/ui.html', 'utf8')).replace('</head>', '<script>window.SERVER_CONFIG=' + JSON.stringify({ defaultModel: 'm', baseURL: '(mock)' }) + ';</script></head>');
-+const PORT = 29871 + Math.floor(Math.random() * 60);
-+const { server } = await startServer({ html, baseURL: '(mock)', apiKey: 'k', gitlabCreds: { user: 't', token: 't' }, defaultModel: 'm', port: PORT, adapter, modelsList: [{ id: 'm' }], initialProject: PROJ });
-+const browser = await puppeteer.launch({ executablePath: chrome, headless: 'new', args: ['--no-sandbox'] });
-+const PAUSE_MS = Number(process.env.DW_PAUSE || 5000);
-+const [gotoAt, gotoTo] = String(process.env.DW_GOTO || '').split(':').map(Number);
-+const FORWARD = Number(process.env.DW_FORWARD || 0);
-+let bad = 0, jumped = false, forwarded = false;
-+const stepOf = (m) => Number(m.slice(1, m.indexOf('-')));
-+try {
-+  const page = await browser.newPage();
-+  await page.setViewport({ width: 1400, height: 860 });
-+  await page.goto(`http://127.0.0.1:${PORT}/`, { waitUntil: 'domcontentloaded' });
-+  await page.waitForFunction(() => typeof runSlashCommand === 'function', { timeout: 20000 });
-+  await sleep(2500);
-+  await page.evaluate(() => runSlashCommand('demo'));
-+  await page.waitForFunction(() => document.querySelector('#demoFrameBg.show iframe'), { timeout: 60000 });
-+  const frame = () => page.frames().find((f) => /demo\./.test(f.url()) && /demo=1/.test(f.url()));
-+  for (let i = 0; i < 300; i++) { const ok = await page.evaluate(() => { const b = document.querySelector('#demoFrameBg .demo-start .ds-play'); if (b && !b.disabled) { b.click(); return true; } return false; }); if (ok) break; await sleep(200); }
-+  const snap = () => (frame() ? frame().evaluate(() => { const log = document.getElementById('log'); const rows = log ? [...log.children].filter((c) => !c.classList.contains('status')) : []; return { waiting: _dp.waiting, playing: _dp.playing, at: _dp.at, done: _dp.done, err: _dp.error, status: session && session.status, rows: rows.length, text: log ? log.innerText.replace(/\s+/g, ' ').length : 0, line: (() => { const st = log && log.querySelector(':scope > .status'); return !!st && getComputedStyle(st).display !== 'none'; })(), said: [...(log ? log.textContent.matchAll(/S\d-R\d/g) : [])].map((m) => m[0]).filter((v, i, a) => a.indexOf(v) === i) }; }).catch(() => null) : Promise.resolve(null));
-+  const t0 = Date.now();
-+  const ts = () => ((Date.now() - t0) / 1000).toFixed(1) + 's';
-+  let pauses = 0;
-+  for (;;) {
-+    const s = await snap();
-+    if (!s) { await sleep(150); continue; }
-+    if (s.err) { console.log('  FAIL the demo stopped: ' + s.err); bad++; break; }
-+    if (s.done) { const miss = MARKS.filter((m) => !s.said.includes(m)); console.log(`${miss.length ? '  FAIL' : '  ok'} it played to the end, every reply shown (${s.said.join(',')}${miss.length ? '; missing ' + miss.join(',') : ''})`); if (miss.length) bad++; break; }
-+    if (FORWARD && !forwarded && s.playing && s.at + 1 === FORWARD) { forwarded = true; await sleep(400); console.log(`[${ts()}] FORWARD pressed in step ${FORWARD}`); await page.evaluate(() => document.querySelector('#demoFrameBg [data-dp="next"]').click()); }
-+    if (s.waiting) {
-+      pauses++;
-+      const first = s, moves = [];
-+      const until = Date.now() + PAUSE_MS;
-+      while (Date.now() < until) { await sleep(120); const n = await snap(); if (n && (n.rows !== first.rows || n.text !== first.text || n.status !== first.status)) moves.push(`${ts()} rows ${first.rows}->${n.rows} text ${first.text}->${n.text} status ${n.status} shown ${n.said.join(',')}`); }
-+      const last = await snap();
-+      // (each step's replies shown by its pause, and none of a later step's)
-+      const done = s.at;   // steps played: 1..done
-+      const early = first.said.filter((m) => stepOf(m) > done), late = MARKS.filter((m) => stepOf(m) <= done && !first.said.includes(m));
-+      console.log(`[${ts()}] PAUSE before step ${s.at + 1}: status ${first.status}, shown ${first.said.join(',') || '-'}${moves.length ? `\n   MOVED during the pause (${moves.length} samples): first ${moves[0]}\n   last ${moves[moves.length - 1]}` : ' - still'}${early.length ? `\n   A LATER STEP'S REPLIES ALREADY SHOWN: ${early.join(',')}` : ''}${late.length ? `\n   THIS STEP'S REPLIES NOT SHOWN YET: ${late.join(',')}` : ''}${last.said.join() !== first.said.join() ? `\n   NEW REPLIES during the pause: ${last.said.join(',')}` : ''}`);
-+      if (moves.length || early.length || late.length) bad++;
-+      // (held for a later step's reply, the agent is still running: its working line - a spinner and a clock - is hidden)
-+      if (first.status === 'running') { console.log(`${first.line ? '  FAIL' : '  ok'} the pause before step ${s.at + 1}: the agent held for the next step, its working line is not shown`); if (first.line) bad++; }
-+      console.log(`${moves.length || early.length || late.length ? '  FAIL' : '  ok'} the pause before step ${s.at + 1}: nothing moved in ${PAUSE_MS / 1000} s, the steps played so far all shown and no later one`);
-+      if (gotoAt && !jumped && s.at + 1 === gotoAt) {
-+        jumped = true;
-+        console.log(`[${ts()}] GOTO step ${gotoTo} from the player`);
-+        await page.evaluate((n) => document.querySelectorAll('#demoFrameBg .dp-step')[n - 1].click(), gotoTo);
-+        await sleep(1500);
-+        continue;
-+      }
-+      await frame().evaluate(() => document.querySelector('#demoCaption .demo-next:not([disabled])')?.click());
-+      await sleep(300);
-+      continue;
-+    }
-+    await sleep(120);
-+    if (Date.now() - t0 > 300000) { console.log('  FAIL timed out', JSON.stringify(s)); bad++; break; }
++
++console.log('\n[6] a user and token entered in the window that GitLab takes: saved for the next run');
++{
++  // (the developer, 2026-11-27: yes to "Save a token typed in the install window once GitLab accepts it?") - a GitLab that
++  // serves a real repository (git http-backend) to one token only, in a process of its own
++  const { mkdirSync, writeFileSync } = await import('node:fs');
++  const { spawn, execFileSync } = await import('node:child_process');
++  const root6 = path.join(dir, 'gl6'), work6 = path.join(dir, 'work6');
++  mkdirSync(path.join(work6, 'agent'), { recursive: true });
++  writeFileSync(path.join(work6, 'agent', 'image.json'), '{"build":"9"}');
++  const g = (cwd, ...a) => execFileSync('git', a, { cwd, stdio: 'pipe' });
++  g(dir, 'init', '-q', '--bare', path.join(root6, 'tools.git'));
++  g(work6, 'init', '-q'); g(work6, 'config', 'user.email', 't@t'); g(work6, 'config', 'user.name', 't'); g(work6, 'add', '-A'); g(work6, 'commit', '-qm', 'image');
++  g(work6, 'tag', 'sandbox-beta'); g(work6, 'push', '-q', path.join(root6, 'tools.git'), 'refs/tags/sandbox-beta');
++  const auth = 'Basic ' + Buffer.from('dev:glpat-GOOD').toString('base64');
++  const srv = path.join(dir, 'gl6-server.mjs');
++  writeFileSync(srv, [
++    "import http from 'node:http'; import { spawn } from 'node:child_process';",
++    'const [root, auth] = process.argv.slice(2);',
++    'http.createServer((req, res) => {',
++    "  if (req.headers.authorization !== auth) { res.writeHead(401, { 'WWW-Authenticate': 'Basic realm=\"GitLab\"' }); return res.end('HTTP Basic: Access denied'); }",
++    "  const u = new URL(req.url, 'http://x');",
++    "  const env = { ...process.env, GIT_PROJECT_ROOT: root, GIT_HTTP_EXPORT_ALL: '1', PATH_INFO: u.pathname, QUERY_STRING: u.search.slice(1), REQUEST_METHOD: req.method, CONTENT_TYPE: req.headers['content-type'] || '', REMOTE_USER: 'dev', REMOTE_ADDR: '127.0.0.1', GIT_PROTOCOL: req.headers['git-protocol'] || '', HTTP_CONTENT_ENCODING: req.headers['content-encoding'] || '' };",
++    "  const p = spawn('git', ['http-backend'], { env }); req.pipe(p.stdin);",
++    '  let buf = Buffer.alloc(0), head = false;',
++    "  p.stdout.on('data', (d) => { if (head) return res.write(d); buf = Buffer.concat([buf, d]); const i = buf.indexOf('\\r\\n\\r\\n'); if (i < 0) return; head = true; let status = 200; const h = {}; for (const l of buf.slice(0, i).toString().split('\\r\\n')) { const k = l.slice(0, l.indexOf(':')), v = l.slice(l.indexOf(':') + 1).trim(); if (/^status$/i.test(k)) status = parseInt(v, 10); else if (k) h[k] = v; } res.writeHead(status, h); res.write(buf.slice(i + 4)); });",
++    "  p.stdout.on('end', () => res.end());",
++    "}).listen(0, '127.0.0.1', function () { console.log('PORT ' + this.address().port); });",
++  ].join('\n'));
++  const glp = spawn(process.execPath, [srv, root6, auth], { stdio: ['ignore', 'pipe', 'inherit'] });
++  const port6 = await new Promise((r) => glp.stdout.on('data', (d) => { const m = /PORT (\d+)/.exec(String(d)); if (m) r(Number(m[1])); }));
++  const source6 = `http://127.0.0.1:${port6}/tools.git`;
++  const kept = []; let url6 = '';
++  const d6 = runSetupWindow({ tree: path.join(dir, 'tree6'), source: source6, creds: { user: 'someone', token: 'glpat-SAVED-EXPIRED' }, tag: 'sandbox-beta', gitDir: path.join(dir, 'git6'), cbDir: path.join(dir, 'cb6'), profile: dir, ask: true, needToken: true, openWindow: false, headless: false, idleMs: 60000, onUrl: (u) => { url6 = u; }, hooks: { saveCreds: (c) => kept.push(c) } });
++  for (let i = 0; i < 50 && !url6; i++) await sleep(50);
++  const b6 = url6.split('/?')[0], t6 = new URL(url6).searchParams.get('t');
++  const api6 = async (p, body) => (await fetch(b6 + p, { method: body ? 'POST' : 'GET', headers: { 'x-cb-token': t6, 'content-type': 'application/json' }, ...(body ? { body: JSON.stringify(body) } : {}) })).json();
++  await api6('/api/begin', { tree: path.join(dir, 'tree6'), glUser: 'dev', glToken: 'glpat-GOOD' });
++  const s6 = await until(async () => { const s = await api6('/api/state'); const dl = (s.steps || []).find((x) => x.id === 'download'); return dl && (dl.state === 'done' || dl.state === 'fail') ? { s, dl } : null; }, 60000);
++  ok(s6 && s6.dl.state === 'done', `the token entered was taken: the image downloaded (${s6 && s6.dl.state} ${s6 && s6.dl.detail})`);
++  ok(kept.length === 1 && kept[0].user === 'dev' && kept[0].token === 'glpat-GOOD', `and it is saved for the next run - the one entered, not the refused one (${JSON.stringify(kept.map((c) => c.user))})`);
++  try { await fetch(b6 + '/api/quit', { method: 'POST', headers: { 'x-cb-token': t6 } }); } catch {}
++  await Promise.race([d6, sleep(2000)]);
++  // THROUGH THE COMMAND, as he will run it: installed, its saved token refused, the window asks, the one typed is taken -
++  // and .code_boss\gitlab-creds.json holds it after (what else was in the file stays)
++  const { runSandbox } = await import('../src/agent/sandbox-cmd.mjs');
++  const { readFileSync } = await import('node:fs');
++  const home7 = path.join(dir, 'home7'), tree7 = path.join(dir, 'agent7'), noChrome = path.join(dir, 'no-chrome');
++  mkdirSync(path.join(home7, '.code_boss'), { recursive: true });
++  const credsFile = path.join(home7, '.code_boss', 'gitlab-creds.json');
++  writeFileSync(credsFile, JSON.stringify({ user: 'dev', token: 'glpat-EXPIRED', note: 'kept' }));
++  mkdirSync(path.join(tree7, 'tools', 'launcher', 'classes', 'cb', 'sandbox'), { recursive: true });
++  writeFileSync(path.join(tree7, 'image.json'), '{"build":"1"}');
++  writeFileSync(path.join(tree7, 'tools', 'launcher', 'classes', 'cb', 'sandbox', 'Manager.class'), 'x');
++  let url7 = '';
++  const run7 = runSandbox(['--tree', tree7, '--source', source6, '--channel', 'beta', '--no-tray'], { log: (s) => { const m = /open this address to (?:install|update) the sandbox - (\S+)/.exec(s); if (m) url7 = m[1]; }, env: { ...process.env, CB_HOME: home7, LOCALAPPDATA: noChrome, ProgramFiles: noChrome, 'ProgramFiles(x86)': noChrome, CB_SANDBOX_IDLE_MS: '5000' }, home: home7 });
++  for (let i = 0; i < 300 && !url7; i++) await sleep(50);
++  if (url7) {
++    const b7 = url7.split('/?')[0], t7 = new URL(url7).searchParams.get('t');
++    const api7 = async (p, body) => (await fetch(b7 + p, { method: body ? 'POST' : 'GET', headers: { 'x-cb-token': t7, 'content-type': 'application/json' }, ...(body ? { body: JSON.stringify(body) } : {}) })).json();
++    await api7('/api/begin', { tree: tree7, glUser: 'dev', glToken: 'glpat-GOOD' });
++    await until(async () => { const s = await api7('/api/state'); const dl = (s.steps || []).find((x) => x.id === 'download'); return dl && (dl.state === 'done' || dl.state === 'fail'); }, 60000);
++    try { await fetch(b7 + '/api/quit', { method: 'POST', headers: { 'x-cb-token': t7 } }); } catch {}
 +  }
-+  const want = { watch: 5, check: 4 }[KIND] || 1;
-+  console.log(`${pauses >= want ? '  ok' : '  FAIL'} ${pauses} pauses (one after every step but the last: ${want})`);
-+  if (pauses < want) bad++;
-+} finally { await browser.close().catch(() => {}); server.close(); }
-+process.exit(bad ? 1 : 0);
-+
-=== change test/test-heads-up-e2e.mjs
-base d356c9c5609fe4d964f7f18c
-new c977a590c34a1415d753c2e4
-@@ 140 -0 +14
-+  // BELOW THE CHECKLIST (the developer, 2026-11-25: "move the heads up box to below the checklist"): with a checklist
-+  // and the working line at the end, and another reply after, the box comes after the checklist
-+  const order = await page.evaluate((s) => {
-+    session.todoList = { show: true, items: [{ id: 1, text: 'write the fix', state: 'done' }, { id: 2, text: 'run the tests', state: 'planned' }] };
-+    renderTodoList();
-+    safeRenderEvent({ type: 'assistant-text', taskId: 'later2', turn: 100, segmentIndex: 0, content: 'one more reply after the checklist' });
-+    const kids = [...document.getElementById('log').children];
-+    const at = (el) => kids.indexOf(el);
-+    const box = document.querySelector(s), list = document.querySelector('#log > .todo-list');
-+    const reply = [...document.querySelectorAll('#log .row.assistant')].find((x) => /one more reply after the checklist/.test(x.textContent));
-+    return { reply: at(reply && reply.closest('#log > *')), list: at(list), box: at(box), last: kids.slice(at(box) + 1).map((k) => k.className.split(' ')[0]) };
-+  }, sel);
-+  ok(order.reply >= 0 && order.reply < order.list && order.list < order.box && order.last.every((c) => /pending-steer|bg-dock|ag-dock/.test(c)), `the box is under the checklist, the newest reply above both, nothing but a waiting message or a dock under it (${JSON.stringify(order)})`);
-+  await page.evaluate(() => { session.todoList = null; renderTodoList(); });
-@@ 237 -0 +29
-+
-+  // ONE AT A TIME IN THE CHAT (the developer, 2026-11-27: "There are like 5 heads up boxes visible. We should just show 1
-+  // at a time w/ paging"): notePage
-+  console.log('\n[8] three open boxes in the chat: one shows, with a pager');
-+  await page.evaluate(() => document.querySelectorAll('#log > .heads-up-row').forEach((r) => r.remove()));
-+  const vis = () => page.evaluate(() => ({
-+    shown: [...document.querySelectorAll('#log > .heads-up-row')].filter((r) => r.offsetParent !== null).map((r) => r.dataset.headsUpId),
-+    pager: [...document.querySelectorAll('#log .note-pager')].filter((p) => p.offsetParent !== null).map((p) => p.querySelector('.cb-pager-n').textContent),
-+    prev: document.querySelector('#log .note-pager [data-np="-1"]')?.disabled, next: document.querySelector('#log .note-pager [data-np="1"]')?.disabled,
-+  }));
-+  await page.evaluate(() => { for (const id of [9811, 9812, 9813]) window.renderEvent({ id: 'e' + id, type: 'heads-up', taskId: 'conv', noteId: id, title: 'box ' + id, description: 'about ' + id }); });
-+  await page.waitForFunction(() => document.querySelectorAll('#log .note-pager').length === 1, { timeout: 5000 }).catch(() => {});
-+  let v8 = await vis();
-+  ok(v8.shown.length === 1 && v8.shown[0] === '9811' && v8.pager.join() === '1 of 3' && v8.prev === true && v8.next === false, `one box shows, the first, "1 of 3" (${JSON.stringify(v8)})`);
-+  await page.click('#log .note-pager [data-np="1"]');
-+  v8 = await vis();
-+  ok(v8.shown.join() === '9812' && v8.pager.join() === '2 of 3' && v8.prev === false, `› pages to the next (${JSON.stringify(v8)})`);
-+  await page.evaluate(() => window.renderEvent({ id: 'e9814', type: 'heads-up', taskId: 'conv', noteId: 9814, title: 'box 9814', description: 'about 9814' }));
-+  await page.waitForFunction(() => /of 4/.test(document.querySelector('#log .note-pager .cb-pager-n')?.textContent || ''), { timeout: 5000 }).catch(() => {});
-+  v8 = await vis();
-+  ok(v8.shown.join() === '9812' && v8.pager.join() === '2 of 4', `a box that comes meanwhile does not take its place (${JSON.stringify(v8)})`);
-+  await page.evaluate(() => document.querySelector('.heads-up-row[data-heads-up-id="9812"]').remove());
-+  await page.waitForFunction(() => /of 3/.test(document.querySelector('#log .note-pager .cb-pager-n')?.textContent || ''), { timeout: 5000 }).catch(() => {});
-+  v8 = await vis();
-+  ok(v8.shown.length === 1 && v8.shown[0] === '9811' && v8.pager.join() === '1 of 3', `answered (gone), the next one shows (${JSON.stringify(v8)})`);
-+  await page.evaluate(() => { for (const id of ['9811', '9813']) document.querySelector(`.heads-up-row[data-heads-up-id="${id}"]`).remove(); });
-+  await page.waitForFunction(() => !document.querySelector('#log .note-pager'), { timeout: 5000 }).catch(() => {});
-+  v8 = await vis();
-+  ok(v8.shown.join() === '9814' && v8.pager.length === 0, `one left: shown, no pager (${JSON.stringify(v8)})`);
-=== change test/test-leading-thought.mjs
-base 48265a3187429327859403e7
-new d551fbac5c32e30221d83b48
-@@ 54 -1 +3
--    async *completeStream(req) { seen.push('x'); for (const c of CHUNKS) yield { choices: [{ delta: { content: c } }] }; yield { choices: [{ delta: {}, finish_reason: 'stop' }] }; },
-+    // (the event loop turns between them, as the gateway's chunks come: ones that arrive together are read as one -
-+    // coalesceStream, 2026-11-27 - except across a joint that may be the seam)
-+    async *completeStream(req) { seen.push('x'); for (const c of CHUNKS) { await new Promise((r) => setImmediate(r)); yield { choices: [{ delta: { content: c } }] }; } yield { choices: [{ delta: {}, finish_reason: 'stop' }] }; },
-=== change test/test-piiscan-reproduce.mjs
-base 527b83a883cf6081e842f882
-new 0dcd73a0e55e64dd7715b809
-@@ 106 -1 +2
--  const contentFilter = createFilterPipeline(() => [{ name: 'piiscan', plugin: 'piiscan', mask: f.mask, unmask: f.unmask }]);
-+  // (with its isToken, as the host loads it: a [PII:...] token no filter vouches for is broken up as text - filters.mjs)
-+  const contentFilter = createFilterPipeline(() => [{ name: 'piiscan', plugin: 'piiscan', mask: f.mask, unmask: f.unmask, isToken: f.isToken }]);
-=== change test/test-piishape-plugin.mjs
-base c3bb65ecec83f842ba721bcb
-new 158483bf40915b0342f66b17
-@@ 670 -0 +3
-+    // (2026-11-26: a surname in alternating case was "an identifier of parts of 2 letters or fewer"; isNaN and a colour stay code)
-+    const alt = mask('signed by qAvAnAgH; if (isNaN(x)) color: #f8f9fa; isROp');
-+    ok(!/qAvAnAgH/i.test(alt) && /isNaN/.test(alt) && /f8f9fa/.test(alt) && /isROp/.test(alt), `a word in alternating case is masked; isNaN, a CSS colour and isROp are shown (${alt})`);
-=== change test/test-raw-log-esc-e2e.mjs
-base c683a73b2a6b0916d04317f4
-new cf95c2e4d1130eaad4ddce03
-@@ 67 -0 +2
-+    // (the page shows a reply's words as they come, paced: the last of them land a moment after the run is done - 2026-11-26)
-+    await page.waitForFunction(() => /streaming slowly right now here/.test([...document.querySelectorAll('.row.assistant')].map((e) => e.querySelector('.body')?.textContent || '').join(' ').replace(/\s+/g, ' ')), { timeout: 10000 }).catch(() => {});
-=== change test/test-raw-log-hardening.mjs
-base bfbe7219bba59fd919b5cf85
-new fa1d7dd65255d98a44ae58ed
-@@ 61 -1 +4
--  const liveSize = (await rd(logPath)).length;
-+  // (it rotates right AFTER the write that takes it past the cap, and one entry is ~25 KB now - the prompt - so a read
-+  // between the two saw that entry; bounded = back under the cap once the write's rotation ran - 2026-11-27)
-+  let liveSize = (await rd(logPath)).length;
-+  for (let t0 = Date.now(); liveSize > 2000 * 3 && Date.now() - t0 < 5000; liveSize = (await rd(logPath)).length) await new Promise((r) => setTimeout(r, 100));
-=== change test/test-readbody-limit.mjs
-base a59a556f821bf91420ee0572
-new ae10effa9c6e9f42a0316122
-@@ 4 -2 +2
-- * cap is configurable via CB_MAX_BODY_BYTES; over it, the socket is destroyed
-- * and the request rejected (the handler's outer catch returns 500), and the
-+ * cap is configurable via CB_MAX_BODY_BYTES; over it, the request is refused
-+ * with a 413 that says why (far over it, 4x, the socket is destroyed), and the
-@@ 21 -1 +1
--async function post(p, body) {
-+async function post(p, body, json = false) {
-@@ 24 -0 +1
-+    if (json) { const j = await r.json().catch(() => ({})); return { status: r.status, error: j.error }; }
-@@ 38 -1 +4
--    ok(r1.status === 500 || r1.status === 'neterr', `over-cap POST rejected (got ${JSON.stringify(r1)})`);
-+    ok(r1.status === 500 || r1.status === 'neterr' || r1.status === 413, `far over the cap (4x): rejected, the socket cut (got ${JSON.stringify(r1)})`);
-+    // (2026-11-26: over the cap but not by much - a 413 that says so, not a reset socket the client cannot read)
-+    const r1b = await post('/api/message', JSON.stringify({ text: 'x'.repeat(3500) }), true);
-+    ok(r1b.status === 413 && /too large: 4 KB, past the 2 KB limit/.test(r1b.error || ''), `over the cap: 413 with why (got ${JSON.stringify(r1b)})`);
-=== change test/test-review-loop-e2e.mjs
-base 6f9055ef7e5b0a07c292c68b
-new 1c618deeac978b03d4e200a6
-@@ 271 -1 +2
--        const after = [...log.children].filter((el) => !el.classList.contains('status') && !el.classList.contains('pending-steer') && !el.classList.contains('tbar') && !el.classList.contains('todo-list'));
-+        // (and the Heads up notes, pinned under the checklist since 2026-11-25 - isPinnedNote)
-+        const after = [...log.children].filter((el) => !el.classList.contains('status') && !el.classList.contains('pending-steer') && !el.classList.contains('tbar') && !el.classList.contains('todo-list') && !isPinnedNote(el));
-=== change test/test-stream-server.mjs
-base dcd83935b883134391e21925
-new 616a5238507c6d7a39797018
-@@ 319 -2 +2
--  await sleep(500);
--  ok(td.status === 200 && (await marks()).todos.some((t) => t.text === 'write the README section' && t.state === 'planned' && t.from === from), 'a todo typed in the tab is planned for that request');
-+  // (waits on what it reads: a fixed 500 ms missed it under the full suite's load, 2026-11-27)
-+  ok(td.status === 200 && !!(await until(async () => (await marks()).todos.some((t) => t.text === 'write the README section' && t.state === 'planned' && t.from === from), 10000)), 'a todo typed in the tab is planned for that request');
-@@ 359 -2 +1
--  await sleep(500);
--  ok(cl2.json && cl2.json.stream === 'cleared' && !Object.values((await marks()).items).some((x) => x.kind && !x.dropped && x.scope === 'workspace'), 'Clear them too: what stood is dropped as well');
-+  ok(cl2.json && cl2.json.stream === 'cleared' && !!(await until(async () => !Object.values((await marks()).items).some((x) => x.kind && !x.dropped && x.scope === 'workspace'), 10000)), 'Clear them too: what stood is dropped as well');
-=== change test/test-stream.mjs
-base 154b5d53b7996704634e6ad1
-new 2b6357d9f4494810d9978feb
-@@ 70 -0 +7
-+  // (live 2026-11-27: "Verify --min with a negative value is an error (confirmed in e83468: exits 1 ...)" beside the
-+  // same todo without it, both on the developer's checklist)
-+  const idp = s.streamOpsProblems(st, ops('<todo>Verify it (confirmed in e5: exits 1)</todo><todo-set todo="1">done, see e4</todo-set>'), { units }).join(' | ');
-+  ok(/<todo> "Verify it.*name no item ids in a todo/.test(idp) && /<todo-set todo="1">: name no item ids/.test(idp), `a todo naming an item id is sent back (${idp})`);
-+  ok(s.todoNoIds('Verify --min with a negative value is an error (confirmed in e83468: exits 1 with correct stderr)') === 'Verify --min with a negative value is an error' && s.todoNoIds('Rerun the tests, as in e12: all pass') === 'Rerun the tests, as all pass' && s.todoNoIds('Run the e2e suite') === 'Run the e2e suite', 'what still comes is taken without them (e2e is a word)');
-+  const nid = s.applyStreamOps(st, ops('<todo>test it on a copy (asked in e3), if they want</todo>'), { units, through: 'e6', newestDev: 'e3' });
-+  ok(st.todos.length === 2 && /says that already/.test(nid.refused.join()), `without the id, a repeat is seen as one (${nid.refused.join()})`);
-@@ 584 -0 +12
-+  // AN OLDER REQUEST LEFT OPEN ONLY BY ITS "DEVELOPER CERTIFIES ..." (live 2026-11-25: it stood above every later list)
-+  const stale = { marked: 'e40', todos: [
-+    { id: 1, from: 'e10', state: 'done', text: 'regions', after: 'e12' }, { id: 2, from: 'e10', state: 'waiting', waits: 'developer', text: 'Developer certifies regions commit (bff1462)', seen: 'e12' },
-+    { id: 3, from: 'e20', state: 'done', text: 'script', after: 'e22' }, { id: 4, from: 'e20', state: 'waiting', waits: 'developer', text: 'Developer certifies script commit (d24b4c5)', seen: 'e22' },
-+    { id: 5, from: 'e30', state: 'done', text: 'pct flag', after: 'e32' }, { id: 6, from: 'e30', state: 'planned', text: 'pct tests' }] };
-+  const sv = s.streamTodoList(stale, [], { latestDev: 'e30', newestDev: 'e30' });
-+  ok(sv.show && sv.items.map((i) => i.id).join() === '5,6' && sv.guess === 6, `older requests open only for a certification: not shown, the newest's is (${sv.items.map((i) => i.id).join()})`);
-+  stale.todos[5] = { ...stale.todos[5], state: 'done', after: 'e34' }; stale.todos.push({ id: 7, from: 'e30', state: 'waiting', waits: 'developer', text: 'Developer certifies pct commit (ee1e3f3)', seen: 'e34' });
-+  const sf = s.streamTodoList(stale, [], { latestDev: 'e30', newestDev: 'e30' });
-+  ok(sf.show && sf.items.map((i) => i.id).join() === '5,6,7', `the newest one finished, its certification waiting: its own list only (${sf.items.map((i) => i.id).join()})`);
-+  stale.todos[1] = { ...stale.todos[1], text: 'Fix the parser' };
-+  ok(s.streamTodoList(stale, [], { latestDev: 'e30', newestDev: 'e30' }).items.some((i) => i.id === 1), 'an older request with a real wait on the developer: still shown');
-@@ 604 -0 +19
-+  // A CLEAR STARTS IT EMPTY (the developer, 2026-11-25: "when you clear the conversation, it doesn't clear the checklist")
-+  ok(!s.streamTodoList(fin, [], { newestDev: 'e10', since: 'e19' }).show, 'cleared after a finished list: gone');
-+  const kept = { todos: [{ id: 1, from: 'e10', state: 'done', text: 'a', after: 'e14' }, { id: 2, from: 'e10', state: 'planned', text: 'b' }, { id: 3, from: 'e10', state: 'doing', text: 'c', seen: 'e15' }] };
-+  ok(s.streamTodoList(kept).show && !s.streamTodoList(kept, [], { since: 'e19' }).show && s.streamTodoList(kept, [], { since: 'e19' }).items.length === 0, 'cleared with open todos kept: the list starts empty (they are still the agent\'s)');
-+  kept.todos[2].seen = 'e22';
-+  const back = s.streamTodoList(kept, [], { since: 'e19' });
-+  ok(back.show && back.items.map((i) => i.id).join() === '1,2,3', `one of them marked after the Clear: its request's list is back (${back.items.map((i) => i.id + ':' + i.state).join()})`);
-+  const later = s.streamTodoList({ todos: [...kept.todos.map((t) => ({ ...t, seen: 'e15' })), { id: 4, from: 'e25', state: 'planned', text: 'new work' }] }, [], { since: 'e19' });
-+  ok(later.show && later.items.map((i) => i.id).join() === '4', `a request after the Clear: only its own (${later.items.map((i) => i.id).join()})`);
-+  // THE ONE UNDER WAY WHEN THE AGENT MARKED NONE (the developer, 2026-11-25: "We want responsiveness but also accuracy")
-+  const two = { marked: 'e30', todos: [
-+    { id: 1, from: 'e10', state: 'done', text: 'old a', after: 'e12' }, { id: 2, from: 'e10', state: 'planned', text: 'old b' },
-+    { id: 5, from: 'e20', state: 'done', text: 'new a', after: 'e22' }, { id: 7, from: 'e20', state: 'planned', text: 'new c' }, { id: 6, from: 'e20', state: 'planned', text: 'new b' }, { id: 8, from: 'e20', state: 'planned', text: 'the developer certifies it' }] };
-+  ok(s.streamTodoList(two, [], { latestDev: 'e20' }).guess === 6, `the next planned of the newest request, in plan order: 6 (${s.streamTodoList(two, [], { latestDev: 'e20' }).guess})`);
-+  ok(s.streamTodoList({ ...two, marked: 'e19' }, [], { latestDev: 'e20' }).guess === null, 'the bookkeeper has not read the newest message yet: none (the list is a step behind)');
-+  ok(s.streamTodoList(two, [], { latestDev: 'e20' }).guess === 6 && s.streamTodoList({ ...two, marked: 'e25' }, [], { latestDev: 'e24' }).guess === 6, 'read it - and a newest message with no todos of its own: the newest request with work open still');
-+  const agentOn = { ...two, todos: two.todos.map((t) => (t.id === 2 ? { ...t, state: 'doing' } : t)) };
-+  ok(s.streamTodoList(agentOn, [], { latestDev: 'e20' }).guess === null, 'the agent marked one doing itself: no guess');
-+  ok(s.streamTodoList({ marked: 'e30', todos: [{ id: 1, from: 'e20', state: 'done', text: 'a', after: 'e22' }, { id: 2, from: 'e20', state: 'planned', text: 'the developer certifies it' }] }, [], { latestDev: 'e20' }).guess === null, 'only a step of the developer\'s left: none');
-@@ 622 -0 +4
-+  // (live 2026-11-27: todo(86, "doing") written ahead of a commit, 86 done the turn before - the ring went back to it)
-+  const seq0 = st.seq;
-+  r = s.streamAgentTodo(st, 2, 'doing');
-+  ok(st.todos[1].state === 'done' && st.seq === seq0 && /todo 2 is done already - left done/.test(r.text) && /next planned: \[1\]/.test(r.text), `doing on a todo already done: it stays done, said (${r.text})`);
-=== change test/test-todo-agent-marks-e2e.mjs
-base fcefc8c153ccc1513b5e0ec5
-new 7ce1b0ec8e851e79dd55872f
-@@ 120 -0 +16
-+    // (looked at before the Clear below takes the rows away)
-+    ok(/todo/.test(await page.evaluate(() => document.getElementById('log').innerText)), 'the calls are among the snippet\'s steps');
-+
-+    console.log('\n[3-clear] Clear: the checklist goes with the chat; the agent marking a kept todo brings its list back');
-+    // (the developer, 2026-11-25: "when you clear the conversation, it doesn't clear the checklist in the ui") - cleared
-+    // the way they do it: the button's dialogs, "Clear", then "Keep them" for the open todos
-+    const clickBtn = async (label) => { for (let t = 0; t < 5000; t += 100) { const done = await page.evaluate((l) => { const b = [...document.querySelectorAll('button')].find((x) => x.offsetParent && x.textContent.trim() === l); if (b) { b.click(); return true; } return false; }, label); if (done) return true; await sleep(100); } return false; };
-+    await page.evaluate(() => { clearConversation(); });
-+    ok(await clickBtn('Clear') && await clickBtn('Keep them'), 'Clear, keeping the open todos');
-+    r = await waitRows(page, (x) => x.length === 0);
-+    ok(r.length === 0, `the checklist is gone with the chat (${r.join(' / ')})`);
-+    await page.reload(); await page.waitForSelector('#chat:not(.hidden)', { timeout: 15000 }); await sleep(1200);
-+    r = await rows(page);
-+    ok(r.length === 0, `and after a reload (${r.join(' / ')})`);
-+    m = JSON.parse(await readFile(marksFile, 'utf8'));
-+    ok(m.todos.find((x) => x.id === 3)?.state === 'doing', 'todo 3 is still the agent\'s, kept');
-@@ 126 -2 +3
--    r = await waitRows(page, (x) => x[2] === 'tl-active tl-spin:run the tests', 8000);
--    ok(r[2] === 'tl-active tl-spin:run the tests', `going on: it turns while the agent works (${r.join(' / ')})`);
-+    // (after the Clear the list shows again once the agent marks one of its todos - here, done at the snippet's end)
-+    r = await waitRows(page, (x) => x.length === 3 && x.every((y) => y.startsWith('tl-done')), 15000);
-+    ok(r.join(' / ') === 'tl-done:read the formatter / tl-done:write the fix / tl-done:run the tests', `going on: the agent marks todo 3 done, and its request's list is back (${r.join(' / ')})`);
-@@ 133 -0 +8
-+    // ...and a Clear ends it too (nothing open: one dialog)
-+    await page.evaluate(() => { clearConversation(); });
-+    ok(await clickBtn('Clear'), 'Clear, with nothing open');
-+    r = await waitRows(page, (x) => x.length === 0);
-+    ok(r.length === 0, `a finished list goes with the Clear (${r.join(' / ')})`);
-+    await page.reload(); await page.waitForSelector('#chat:not(.hidden)', { timeout: 15000 }); await sleep(1200);
-+    r = await rows(page);
-+    ok(r.length === 0, `and stays gone after a reload (${r.join(' / ')})`);
-@@ 164 -4 +27
--    ok(/todo\(7, \\"doing\\"\)/.test(p0) && /\[2\] planned: write the fix/.test(p0), 'its prompt teaches todo() and shows the numbered todos');
--    ok(/doing and done are yours to mark/.test(p0) && !/You do not edit them/.test(p0), 'the live state says the doing and done are its to mark');
--    const rowText = await page.evaluate(() => document.getElementById('log').innerText);
--    ok(/todo/.test(rowText), 'the calls are among the snippet\'s steps');
-+    // (since 2026-11-25: done, and doing only for one started out of order - the next in order shows by itself: [5])
-+    ok(/todo\(7, \\"done\\"\)/.test(p0) && /If you start a different one - out of order, or another request.s - call todo\(7, \\"doing\\"\)/.test(p0) && /\[2\] planned: write the fix/.test(p0), 'its prompt teaches todo(id, "done"), and "doing" only out of order, and shows the numbered todos');
-+    ok(/done is yours to mark/.test(p0) && /when you start one out of order/.test(p0) && !/You do not edit them/.test(p0), 'the live state says the same');
-+    console.log('\n[5] while the agent works, the item under way turns even when it marked none; Certify above a check');
-+    // (the developer, 2026-11-25: "I don't always see the loading circle for the normal checklist items (just the checking
-+    // one) ... if the agent is working, just mark the current item active"; "I always want the certification checklist
-+    // items to be above the checking items")
-+    const drawn = (todoList, status, certify) => page.evaluate((tl, s, c) => {
-+      const was = { tl: session.todoList, st: session.status, cw: _certifyWait };
-+      session.todoList = tl; session.status = s; _certifyWait = c; renderTodoList();
-+      const out = [...document.querySelectorAll('#log > .todo-list .tl-row')].map((r) => r.className.replace('tl-row ', '').replace(' tl-expandable', '') + ':' + r.querySelector('.tl-text').textContent);
-+      session.todoList = was.tl; session.status = was.st; _certifyWait = was.cw; renderTodoList();
-+      return out;
-+    }, todoList, status, certify);
-+    // (the guess is the server's - streamTodoList `guess`, test-stream: the next planned of the newest request, none while
-+    // the list is a step behind; the page shows it while the agent works)
-+    const three = { show: true, guess: 2, items: [{ id: 1, text: 'read it', state: 'done' }, { id: 2, text: 'fix it', state: 'planned' }, { id: 3, text: 'the developer certifies it', state: 'planned' }, { id: 4, text: 'test it', state: 'planned' }] };
-+    let d = await drawn(three, 'running', null);
-+    ok(d.join(' / ') === 'tl-done:read it / tl-active tl-spin:fix it / tl-planned:the developer certifies it / tl-planned:test it', `running, none marked: the server's guess turns (${d.join(' / ')})`);
-+    d = await drawn(three, 'idle', null);
-+    ok(d.join(' / ') === 'tl-done:read it / tl-planned:fix it / tl-planned:the developer certifies it / tl-planned:test it', `not running: nothing turns (${d.join(' / ')})`);
-+    d = await drawn({ ...three, guess: null }, 'running', null);
-+    ok(d.join(' / ') === 'tl-done:read it / tl-planned:fix it / tl-planned:the developer certifies it / tl-planned:test it', `no guess (the list a step behind): nothing turns, rather than the wrong one (${d.join(' / ')})`);
-+    d = await drawn({ show: true, guess: 2, items: [{ id: 1, text: 'read it', state: 'done' }, { id: 2, text: 'fix it', state: 'planned' }, { id: 4, text: 'test it', state: 'active', who: '' }] }, 'running', null);
-+    ok(d.join(' / ') === 'tl-done:read it / tl-planned:fix it / tl-active tl-spin:test it', `the agent marked one out of order: that one, no other (${d.join(' / ')})`);
-+    d = await drawn({ show: true, items: [{ id: 1, text: 'fix it', state: 'done' }], checks: [{ kind: 'change', round: 1, sha: 'def5678' }] }, 'idle', { kind: 'plan', sha: '', id: 'e1', text: 'the plan', questions: [], answered: false });
-+    ok(d.length === 3 && /^tl-certify:Certify/.test(d[1]) && /^tl-check tl-active tl-spin:Checking/.test(d[2]), `Certify above the check that is running (${d.join(' / ')})`);
-=== add test/test-todo-clear.mjs
-new c14ebd8e5df6bffcbffa0b4c
-+/**
-+ * A CLEAR STARTS THE CHECKLIST EMPTY (the developer, 2026-11-25: "when you clear the conversation, it doesn't clear the
-+ * checklist in the ui"). The server's checklist (todoListView -> streamTodoList `since`) after /api/clear-conversation:
-+ *   [1] open todos kept ("Keep them"): the list is empty, the todos still the agent's
-+ *   [2] a finished list (all ticked, kept until the developer's next message): empty - a Clear ends it too
-+ *   [3] the open todos cleared too: empty
-+ * (Before the fix [1] and [2] still sent the old list; the page lost it at the Clear's reset and drew it again at the
-+ * next update. test-todo-agent-marks-e2e [3-clear] drives the same in the page.)
-+ * Run: node test/test-todo-clear.mjs
-+ */
-+import { mkdtemp, mkdir, writeFile, readFile } from 'node:fs/promises';
-+import { tmpdir } from 'node:os';
-+import path from 'node:path';
-+
-+const { startServer } = await import('../src/server.mjs');
-+let pass = 0, fail = 0;
-+const ok = (c, l) => { if (c) { pass++; console.log('  ok', l); } else { fail++; console.log('  FAIL', l); } };
-+const adapter = { async *completeStream() { yield { choices: [{ delta: { content: 'ok' } }] }; }, async complete() { return { choices: [{ message: { content: 'ok' } }] }; }, async listModels() { return [{ id: 'm' }]; } };
-+const say = (id, type, content) => ({ id, type, taskId: 'conv', content, ts: Date.now() });
-+
-+async function run(label, todos, stream, port) {
-+  console.log(`\n${label}`);
-+  const proj = await mkdtemp(path.join(tmpdir(), 'cb-todoclear-'));
-+  await mkdir(path.join(proj, '.code_boss'), { recursive: true });
-+  await writeFile(path.join(proj, '.code_boss', 'conversation.jsonl'), [say('e1', 'user-message', 'fix the dates'), say('e2', 'assistant-text', 'on it')].map((e) => JSON.stringify(e)).join('\n') + '\n');
-+  await writeFile(path.join(proj, '.code_boss', 'conversation.meta.json'), JSON.stringify({ version: 2, nextEventId: 3 }));
-+  const marks = path.join(proj, '.code_boss', 'stream-marks.json');
-+  await writeFile(marks, JSON.stringify({ v: 2, seq: 1, nextTodo: 3, marked: 'e2', changes: [], refused: [], faded: {}, bkFaded: {}, items: { e1: { kind: 'request' } }, todos }));
-+  const { server } = await startServer({ html: '<html></html>', baseURL: '(mock)', apiKey: 'k', gitlabCreds: { user: 't', token: 't' }, defaultModel: 'm', port, adapter, modelsList: [{ id: 'm' }], initialProject: proj });
-+  try {
-+    const B = `http://127.0.0.1:${port}`;
-+    const list = async () => (await (await fetch(B + '/api/state?limit=1')).json()).todoList || {};
-+    const before = await list();
-+    ok(before.show && before.items.length === 2, `before: the list shows (${before.items.map((i) => i.state).join(', ')})`);
-+    const r = await fetch(B + '/api/clear-conversation', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ stream }) });
-+    ok(r.status === 200, `cleared (${stream})`);
-+    const after = await list();
-+    ok(!after.show && !(after.items || []).length, `after: nothing in it (${JSON.stringify(after)})`);
-+    // (the marks are written a moment later)
-+    let saved = [];
-+    for (let i = 0; i < 40; i++) { try { saved = JSON.parse(await readFile(marks, 'utf8')).todos; } catch { /* mid-write */ } if (stream !== 'clear' || saved.some((x) => x.state === 'dropped')) break; await new Promise((res) => setTimeout(res, 100)); }
-+    return saved;
-+  } finally { server.close(); }
++  await Promise.race([run7, sleep(15000)]);
++  let after = {}; try { after = JSON.parse(readFileSync(credsFile, 'utf8')); } catch { /* checked below */ }
++  ok(!!url7 && after.user === 'dev' && after.token === 'glpat-GOOD' && after.note === 'kept', `the command, start to end: the window asked, the token typed was taken and saved in .code_boss\\gitlab-creds.json (user ${after.user}, the rest of the file kept: ${after.note})`);
++  glp.kill();
 +}
-+
-+const open = [{ id: 1, from: 'e1', after: null, state: 'done', text: 'read it' }, { id: 2, from: 'e1', after: null, state: 'planned', text: 'fix it' }];
-+let t = await run('[1] open todos, kept', open, 'keep', 29811);
-+ok(t.find((x) => x.id === 2)?.state === 'planned', 'the open todo is still the agent\'s');
-+await run('[2] a finished list', [{ id: 1, from: 'e1', after: 'e2', state: 'done', text: 'read it' }, { id: 2, from: 'e1', after: 'e2', state: 'done', text: 'fix it' }], 'keep', 29812);
-+t = await run('[3] open todos, cleared too', open, 'clear', 29813);
-+ok(t.find((x) => x.id === 2)?.state === 'dropped', 'the open todo is dropped');
-+console.log(`\n${pass} passed, ${fail} failed`);
-+process.exit(fail ? 1 : 0);
-+
-=== change test/test-unlock-flow.mjs
-base 3823cf436d30e22bbe4ceaef
-new 2f7b33fd3193bb4e8cc343ae
-@@ 190 -7 +0
--    // (since 2026-11-18 the page is IN the dialog, in a frame - the developer: "open the page in a modal iframe instead
--    // of an external browser"; its own window is a button away, for a page that will not be framed)
--    {
--      const fr = await page.evaluate(() => { const f = document.getElementById('unlockFrame'); return f ? f.getAttribute('src') || '' : null; });
--      ok(fr !== null && fr.endsWith(TEST_UNLOCK_URL), `the dialog shows the configured key page in a frame, not the URL the 401 carried (${fr})`);
--      ok(!/:\d+\/unlock$/.test(fr || ''), 'and the mock\'s own unlock_url was NOT used');
--    }
-@@ 198 -1 +1
--    await page.click('#unlockOwn');
-+    await page.click('#unlockOpen');
-@@ 202 -1 +2
--        `"Open in its own window" opens the same key page (${opened.join(', ') || 'nothing opened'})`);
-+        `the unlock page opened is the configured key page, not the URL the 401 carried (${opened.join(', ') || 'nothing opened'})`);
-+      ok(!opened.some((u) => /:\d+\/unlock$/.test(u)), 'and the mock\'s own unlock_url was NOT used');
-@@ 302 -0 +2
-+      await stubOpen(page);   // this flow stubbed only window.open, and /api/open-window is tried FIRST
-+      await page.click('#unlockOpen');
 === end
